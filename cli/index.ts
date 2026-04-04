@@ -492,6 +492,80 @@ switch (cmd) {
     console.error("hipfire updated ✓");
     break;
   }
+  case "diag": {
+    console.log("hipfire diagnostics\n");
+
+    // 1. Check daemon binary
+    const bins = [
+      resolve(__dirname, "../target/release/examples/daemon"),
+      join(HIPFIRE_DIR, "bin", "daemon"),
+    ];
+    const daemonBin = bins.find(p => existsSync(p));
+    console.log(`daemon binary: ${daemonBin ? "found" : "NOT FOUND"}`);
+    if (!daemonBin) { console.log("  Install: hipfire update\n"); process.exit(1); }
+
+    // 2. Check local models
+    const models = listLocal();
+    console.log(`local models:  ${models.length}`);
+    for (const m of models) console.log(`  ${m.name.padEnd(35)} ${m.size.padStart(6)}`);
+
+    // 3. Check pre-compiled kernels
+    const binDir = join(HIPFIRE_DIR, "bin");
+    const kernelBase = join(binDir, "kernels", "compiled");
+    const cwdKernelBase = resolve(__dirname, "../kernels/compiled");
+    const kBase = existsSync(kernelBase) ? kernelBase : existsSync(cwdKernelBase) ? cwdKernelBase : null;
+    if (kBase) {
+      const arches = readdirSync(kBase).filter(d => d.startsWith("gfx"));
+      for (const arch of arches) {
+        const dir = join(kBase, arch);
+        const hsaco = readdirSync(dir).filter(f => f.endsWith(".hsaco")).length;
+        const hashes = readdirSync(dir).filter(f => f.endsWith(".hash")).length;
+        console.log(`kernels/${arch}: ${hsaco} blobs, ${hashes} hashes${hashes < hsaco ? " (INCOMPLETE)" : ""}`);
+      }
+    } else {
+      console.log("kernels:       NOT FOUND");
+    }
+
+    // 4. Probe daemon for GPU info
+    console.log("\nProbing GPU via daemon...");
+    try {
+      const e = new Engine();
+      await e.start();
+      await e.send({ type: "ping" }); await e.recv();
+      await e.send({ type: "diag" });
+      const diag = await e.recv();
+      if (diag.type === "diag") {
+        console.log(`  GPU arch:    ${diag.arch}`);
+        console.log(`  HIP version: ${diag.hip_version}`);
+        console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
+        console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
+        console.log(`  Model:       ${diag.model_loaded ? diag.model_arch : "none loaded"}`);
+        console.log(`  Kernels:     ${diag.kernels} blobs, ${diag.kernel_hashes} hashes`);
+
+        // Recommendations
+        console.log("");
+        if (diag.vram_total_mb < 8000) {
+          console.log("TIP: <8GB VRAM — use qwen3.5:4b or qwen3.5:0.8b");
+        } else if (diag.vram_total_mb < 16000) {
+          console.log("TIP: 8-16GB VRAM — qwen3.5:9b is your best option");
+        } else {
+          console.log("TIP: 16GB+ VRAM — try qwen3.5:27b-hfq6 for best quality");
+        }
+        if (models.length === 0) {
+          console.log("TIP: No models downloaded. Run: hipfire pull qwen3.5:9b");
+        }
+      } else {
+        console.log(`  Error: ${diag.message || "unexpected response"}`);
+      }
+      await e.stop();
+    } catch (err: any) {
+      console.log(`  Failed to start daemon: ${err.message}`);
+      console.log("  Check: ROCm/HIP installed? AMD GPU visible? /dev/kfd accessible?");
+    }
+
+    console.log("\nDone.");
+    break;
+  }
   case "rm": {
     const tag = rest[0] || "";
     const resolved = resolveModelTag(tag);
@@ -512,6 +586,7 @@ switch (cmd) {
   run <model> [prompt]  Generate text (auto-pulls if needed)
   serve [port]          Start OpenAI-compatible server (default: ${DEFAULT_PORT})
   list [-r]             Show local models (-r: show available too)
+  diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   rm <model>            Delete model
   update                Pull latest code, rebuild, update kernels
 
