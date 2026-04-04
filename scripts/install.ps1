@@ -77,23 +77,44 @@ if (Test-Path $HipDllDest) {
     $HipDllFound = $true
 }
 
-# Check %HIP_PATH%\bin
+# Check %HIP_PATH%\bin (unversioned and versioned)
 if (-not $HipDllFound -and $env:HIP_PATH) {
-    $candidate = Join-Path $env:HIP_PATH "bin\amdhip64.dll"
-    if (Test-Path $candidate) {
-        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
-        Copy-Item $candidate $HipDllDest -Force
-        $HipDllFound = $true
+    foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
+        $candidate = Join-Path $env:HIP_PATH "bin\$dllName"
+        if (Test-Path $candidate) {
+            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Copy-Item $candidate $HipDllDest -Force
+            $HipDllFound = $true
+            break
+        }
     }
 }
 
-# Check standard ROCm install location
+# Check standard ROCm install locations (unversioned and versioned)
 if (-not $HipDllFound) {
-    $candidate = "C:\Program Files\AMD\ROCm\bin\amdhip64.dll"
-    if (Test-Path $candidate) {
-        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
-        Copy-Item $candidate $HipDllDest -Force
-        $HipDllFound = $true
+    foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
+        # Check versioned ROCm dirs (e.g. C:\Program Files\AMD\ROCm\7.1\bin\)
+        $rocmBase = "C:\Program Files\AMD\ROCm"
+        if (Test-Path $rocmBase) {
+            foreach ($verDir in (Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+                $candidate = Join-Path $verDir.FullName "bin\$dllName"
+                if (Test-Path $candidate) {
+                    Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+                    Copy-Item $candidate $HipDllDest -Force
+                    $HipDllFound = $true
+                    break
+                }
+            }
+            if ($HipDllFound) { break }
+        }
+        # Also check flat layout
+        $candidate = "C:\Program Files\AMD\ROCm\bin\$dllName"
+        if (Test-Path $candidate) {
+            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Copy-Item $candidate $HipDllDest -Force
+            $HipDllFound = $true
+            break
+        }
     }
 }
 
