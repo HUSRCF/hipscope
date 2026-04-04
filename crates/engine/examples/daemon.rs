@@ -118,13 +118,14 @@ fn main() {
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, max_tokens, repeat_penalty, repeat_window);
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, max_tokens, repeat_penalty, repeat_window);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 }
             }
 
@@ -213,7 +214,7 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Build ChatML prompt
@@ -253,7 +254,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         // Generate
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, 0.8);
+        let mut next_token = llama::sample_top_p(&logits, temp, top_p);
         let mut generated = 0;
         let mut token_history = prompt_tokens.clone();
 
@@ -272,7 +273,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             logits = gpu.download_f32(&scratch.logits).unwrap();
             llama::apply_ngram_block(&mut logits, &token_history);
             llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
-            next_token = llama::sample_top_p(&logits, temp, 0.8);
+            next_token = llama::sample_top_p(&logits, temp, top_p);
         }
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
@@ -287,7 +288,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         let mut rng_state = 42u32;
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, 0.8, rng_state, 0, 1.0).unwrap();
+            let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
             rng_state = rng;
         }
 
@@ -317,7 +318,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 
             let pos = prompt_tokens.len() + generated - 1;
-            let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, 0.8, rng_state, hist_slice.len(), repeat_penalty).unwrap();
+            let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, top_p, rng_state, hist_slice.len(), repeat_penalty).unwrap();
             next_token = tok;
             rng_state = rng;
         }
@@ -328,7 +329,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -397,7 +398,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // Generate
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::sample_top_p(&logits, temp, 0.8);
+    let mut next_token = llama::sample_top_p(&logits, temp, top_p);
     let mut generated = 0;
     let mut token_history = prompt_tokens.clone();
 
@@ -416,7 +417,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &token_history);
         llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
-        next_token = llama::sample_top_p(&logits, temp, 0.8);
+        next_token = llama::sample_top_p(&logits, temp, top_p);
     }
 
     let tok_s = generated as f64 / t0.elapsed().as_secs_f64();

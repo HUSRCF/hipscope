@@ -202,7 +202,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -238,7 +238,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
-    repeat_penalty: repeatPenalty,
+    repeat_penalty: repeatPenalty, top_p: topP,
   };
   if (image) {
     genMsg.image = resolve(image);
@@ -377,18 +377,41 @@ switch (cmd) {
   case "serve": await serve(parseInt(rest[0]) || DEFAULT_PORT); break;
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [--repeat-penalty 1.3] [prompt]\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:27b --repeat-penalty 1.5 \"Write a story\""); process.exit(1); }
-    const imgIdx = rest.indexOf("--image");
-    const image = imgIdx >= 0 ? rest[imgIdx + 1] : undefined;
-    const rpIdx = rest.indexOf("--repeat-penalty");
-    const repeatPenalty = rpIdx >= 0 ? parseFloat(rest[rpIdx + 1]) : 1.3;
-    const filtered = rest.slice(1).filter((_, i) => {
-      if (imgIdx >= 0 && (i === imgIdx - 1 || i === imgIdx)) return false;
-      if (rpIdx >= 0 && (i === rpIdx - 1 || i === rpIdx)) return false;
-      return true;
-    });
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.3)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    // Parse --key value flags
+    const flagDefs: Record<string, { default: number | string | undefined }> = {
+      "--image": { default: undefined }, "--temp": { default: 0.3 },
+      "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.3 },
+      "--max-tokens": { default: 512 },
+    };
+    const flags: Record<string, string> = {};
+    const flagIndices = new Set<number>();
+    for (const key of Object.keys(flagDefs)) {
+      const idx = rest.indexOf(key);
+      if (idx >= 0 && idx + 1 < rest.length) {
+        const val = rest[idx + 1];
+        // Reject flag values that look like other flags
+        if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
+        // Validate numeric flags
+        if (key !== "--image" && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
+        flags[key] = val;
+        flagIndices.add(idx); flagIndices.add(idx + 1);
+      } else if (idx >= 0) {
+        console.error(`Error: ${key} requires a value`); process.exit(1);
+      }
+    }
+    const image = flags["--image"];
+    const temp = Number(flags["--temp"] ?? 0.3);
+    const topP = Number(flags["--top-p"] ?? 0.8);
+    const repeatPenalty = Number(flags["--repeat-penalty"] ?? 1.3);
+    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? 512));
+    if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
+    if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
+    if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
+    if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
+    const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, undefined, undefined, repeatPenalty);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
     break;
   }
   case "pull": {
