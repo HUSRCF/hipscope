@@ -82,6 +82,7 @@ function downloadUrl(entry: ModelEntry): string {
 
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private lines: string[] = [];
   private buffer = "";
 
@@ -94,6 +95,7 @@ class Engine {
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+    this.reader = this.proc.stdout!.getReader();
   }
 
   async send(msg: object) {
@@ -103,20 +105,17 @@ class Engine {
   }
 
   async recv(): Promise<any> {
-    if (!this.proc?.stdout) throw new Error("not running");
-    const reader = this.proc.stdout.getReader();
+    if (!this.reader) throw new Error("not running");
     while (true) {
       if (this.lines.length > 0) {
-        reader.releaseLock();
         return JSON.parse(this.lines.shift()!);
       }
-      const { value, done } = await reader.read();
+      const { value, done } = await this.reader.read();
       if (done) throw new Error("daemon closed");
       this.buffer += new TextDecoder().decode(value);
       const parts = this.buffer.split("\n");
       this.buffer = parts.pop() || "";
       this.lines.push(...parts.filter(l => l.trim()));
-      reader.releaseLock();
     }
   }
 
@@ -131,6 +130,8 @@ class Engine {
 
   async stop() {
     try { await this.send({ type: "unload" }); } catch {}
+    this.reader?.releaseLock();
+    this.reader = null;
     this.proc?.kill();
   }
 }
