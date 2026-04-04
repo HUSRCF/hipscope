@@ -15,6 +15,7 @@ pub struct KernelCompiler {
     arch: String,
     compiled: HashMap<String, PathBuf>,
     precompiled_dir: Option<PathBuf>,
+    has_hipcc: bool,
 }
 
 impl KernelCompiler {
@@ -38,27 +39,60 @@ impl KernelCompiler {
             eprintln!("  pre-compiled kernels: {}", dir.display());
         }
 
+        // Probe for hipcc once at init, not per-kernel
+        let has_hipcc = Command::new("hipcc").arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
             compiled: HashMap::new(),
             precompiled_dir,
+            has_hipcc,
         })
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
-    /// Tries pre-compiled blob first, falls back to runtime hipcc compilation.
+    /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
         if self.compiled.contains_key(name) {
             return Ok(&self.compiled[name]);
         }
 
-        // Try pre-compiled .hsaco first
+        // Hash source + arch for cache validation (used by both pre-compiled and runtime paths)
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        self.arch.hash(&mut hasher);
+        let src_hash = format!("{:016x}", hasher.finish());
+
+        // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
+        // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
+        // If hipcc is unavailable (packaged install), use the blob as-is.
+        // See: https://github.com/Kaden-Schutt/hipfire/issues/2
         if let Some(ref dir) = self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
+            let hash_file = dir.join(format!("{name}.hash"));
             if precompiled.exists() {
-                self.compiled.insert(name.to_string(), precompiled);
-                return Ok(&self.compiled[name]);
+                let hash_ok = hash_file.exists() && {
+                    let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
+                    stored.trim() == src_hash
+                };
+                if hash_ok {
+                    self.compiled.insert(name.to_string(), precompiled);
+                    return Ok(&self.compiled[name]);
+                }
+                // No valid hash — only reject if hipcc can recompile
+                if !self.has_hipcc {
+                    eprintln!("  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)");
+                    eprintln!("           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.");
+                    self.compiled.insert(name.to_string(), precompiled);
+                    return Ok(&self.compiled[name]);
+                }
+                eprintln!("  {name}: pre-compiled blob has no hash file, recompiling");
             }
         }
 
@@ -66,11 +100,6 @@ impl KernelCompiler {
         let src_path = self.cache_dir.join(format!("{name}.hip"));
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
-
-        let mut hasher = DefaultHasher::new();
-        source.hash(&mut hasher);
-        self.arch.hash(&mut hasher);
-        let src_hash = format!("{:016x}", hasher.finish());
 
         let cache_valid = obj_path.exists() && hash_path.exists()
             && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;

@@ -354,8 +354,9 @@ if [ "$GPU_ARCH" != "unknown" ]; then
 
     if [ -d "$REPO_DIR/kernels/compiled/$GPU_ARCH" ]; then
         cp "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hsaco "$KERNEL_DEST/" 2>/dev/null
+        cp "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hash "$KERNEL_DEST/" 2>/dev/null
         count=$(ls "$KERNEL_DEST"/*.hsaco 2>/dev/null | wc -l)
-        echo "  Copied $count kernels to $KERNEL_DEST/ ✓"
+        echo "  Copied $count kernels + hashes to $KERNEL_DEST/ ✓"
     else
         echo "  WARNING: No pre-compiled kernels for $GPU_ARCH in repo."
         echo "  Compile them: cd $REPO_DIR && scripts/compile-kernels.sh $GPU_ARCH"

@@ -2919,7 +2919,7 @@ impl Gpu {
         signs1: &GpuTensor, signs2: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("kv_cache_write_turbo4_v256", kernels::KV_CACHE_WRITE_TURBO4_V256_SRC, "kv_cache_write_turbo4_v256")?;
+        self.ensure_turbo_kernel("kv_cache_write_turbo4_v256", kernels::KV_CACHE_WRITE_TURBO4_V256_SRC, "kv_cache_write_turbo4_v256")?;
         let func = &self.functions["kv_cache_write_turbo4_v256"];
         let mut vd = v_dst.buf.as_ptr();
         let mut vs = v_src.buf.as_ptr();
@@ -2945,7 +2945,7 @@ impl Gpu {
         signs1: &GpuTensor, signs2: &GpuTensor,
         seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("attention_q8k_turbo4v_256", kernels::ATTENTION_Q8K_TURBO4V_256_SRC, "attention_q8k_turbo4v_256")?;
+        self.ensure_turbo_kernel("attention_q8k_turbo4v_256", kernels::ATTENTION_Q8K_TURBO4V_256_SRC, "attention_q8k_turbo4v_256")?;
         let func = &self.functions["attention_q8k_turbo4v_256"];
         let mut qp = q.buf.as_ptr();
         let mut kp = k_q8.buf.as_ptr();

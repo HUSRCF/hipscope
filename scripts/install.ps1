@@ -345,7 +345,8 @@ if ($GpuArch -ne "unknown") {
         $Hsacos = Get-ChildItem "$KernelSrc\*.hsaco" -ErrorAction SilentlyContinue
         if ($Hsacos.Count -gt 0) {
             Copy-Item "$KernelSrc\*.hsaco" $KernelDest -Force
-            Write-Host "  Copied $($Hsacos.Count) kernels to $KernelDest ✓" -ForegroundColor Green
+            Copy-Item "$KernelSrc\*.hash" $KernelDest -Force -ErrorAction SilentlyContinue
+            Write-Host "  Copied $($Hsacos.Count) kernels + hashes to $KernelDest ✓" -ForegroundColor Green
         } else {
             Write-Host "  WARNING: No .hsaco files found in $KernelSrc" -ForegroundColor Yellow
         }
