@@ -121,11 +121,8 @@ extern "C" __global__ void noop_kernel() {
     }
 
     // DISPATCH_DIRECT
-    // Check if kernel requests wave32 via kernel_code_properties bit 8
-    let wave32 = (kcp >> 8) & 1 == 1;
-    eprintln!("wave32={} (from kernel_code_properties)", wave32);
-    let mut di = (1u32 << 0) | (1 << 2); // CS_EN | FORCE_START_AT_000
-    if wave32 { di |= 1 << 15; } // CS_W32_EN only if kernel requests it
+    // HIP on RDNA defaults to wave32 — KD flag 0 means "use default", not "wave64"
+    let di = (1u32 << 0) | (1 << 2) | (1 << 15); // CS_EN | FORCE_START_AT_000 | CS_W32_EN
     pm4.push(hdr(0x15, 4));
     pm4.push(1); // 1 group
     pm4.push(1);
