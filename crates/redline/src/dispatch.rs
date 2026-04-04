@@ -176,32 +176,14 @@ impl CommandBuffer {
         d.push(di);
     }
 
-    /// Insert a barrier between dispatches — ensures previous writes are visible.
-    /// Uses RELEASE_MEM (flush caches) + ACQUIRE_MEM (invalidate caches).
+    /// Insert a barrier between dispatches — waits for previous compute to finish.
+    /// Uses CS_PARTIAL_FLUSH event. On same-context dispatch, L2 coherency is
+    /// maintained by the hardware for write→read dependencies.
     pub fn barrier(&mut self) {
         let d = &mut self.dwords;
-
-        // RELEASE_MEM: flush L2 writeback, signal nothing
-        // Opcode 0x49, GFX10 format: 7 body dwords
-        d.push(pkt3(RELEASE_MEM, 7));
-        d.push((3 << 12) | (1 << 25)); // EVENT_TYPE=cache_flush_and_inv_ts, EVENT_INDEX=5? DATA_SEL=0
-        d.push(0); // addr lo
-        d.push(0); // addr hi
-        d.push(0); // data lo
-        d.push(0); // data hi
-        d.push(0); // int_ctxid
-        d.push(0); // reserved
-
-        // ACQUIRE_MEM: invalidate all shader caches (GFX10: 7 body dwords)
-        d.push(pkt3(ACQUIRE_MEM, 7));
-        d.push(0);              // CP_COHER_CNTL (unused on GFX10)
-        d.push(0xFFFF_FFFF);    // CP_COHER_SIZE
-        d.push(0x00FF_FFFF);    // CP_COHER_SIZE_HI
-        d.push(0);              // CP_COHER_BASE
-        d.push(0);              // CP_COHER_BASE_HI
-        d.push(0);              // POLL_INTERVAL
-        // GCR_CNTL: invalidate L1i, L1d, L2, vector, scalar, constant caches
-        d.push((1 << 0) | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 15) | (1 << 16));
+        // CS_PARTIAL_FLUSH: wait for all outstanding compute shaders on this context
+        d.push(pkt3(0x46, 1));
+        d.push(7); // EVENT_TYPE=CS_PARTIAL_FLUSH
     }
 
     /// Number of PM4 dwords in this command buffer.
