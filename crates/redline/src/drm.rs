@@ -114,9 +114,57 @@ pub struct DrmLib {
     pub bo_va_op: unsafe extern "C" fn(bo: AmdgpuBoHandle, offset: u64, size: u64, addr: u64, flags: u64, ops: u32) -> i32,
     pub va_range_alloc: unsafe extern "C" fn(device: AmdgpuDeviceHandle, va_type: u32, size: u64, align: u64, base_required: u64, base_allocated: *mut u64, va_handle: *mut AmdgpuVaHandle, flags: u64) -> i32,
     pub va_range_free: unsafe extern "C" fn(va_handle: AmdgpuVaHandle) -> i32,
-    // Context
+    // Context + submission
     pub cs_ctx_create2: unsafe extern "C" fn(device: AmdgpuDeviceHandle, priority: u32, ctx: *mut AmdgpuContext) -> i32,
     pub cs_ctx_free: unsafe extern "C" fn(ctx: AmdgpuContext) -> i32,
+    pub cs_submit: unsafe extern "C" fn(ctx: AmdgpuContext, flags: u64, request: *mut CsRequest, num_requests: u32) -> i32,
+    pub cs_query_fence_status: unsafe extern "C" fn(fence: *mut CsFence, timeout_ns: u64, flags: u64, expired: *mut u32) -> i32,
+    // BO list
+    pub bo_list_create: unsafe extern "C" fn(device: AmdgpuDeviceHandle, num: u32, resources: *const AmdgpuBoHandle, prios: *const u8, result: *mut AmdgpuBoListHandle) -> i32,
+    pub bo_list_destroy: unsafe extern "C" fn(list: AmdgpuBoListHandle) -> i32,
+}
+
+pub type AmdgpuBoListHandle = *mut c_void;
+
+/// amdgpu_cs_ib_info — matches amdgpu.h
+#[repr(C)]
+pub struct CsIbInfo {
+    pub flags: u64,
+    pub ib_mc_address: u64,
+    pub size: u32,   // in dwords
+    pub _pad: u32,
+}
+
+/// amdgpu_cs_request — matches amdgpu.h
+#[repr(C)]
+pub struct CsRequest {
+    pub flags: u64,
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub number_of_ibs: u32,
+    pub ibs: *mut CsIbInfo,
+    pub seq_no: u64,
+    pub fence_info: CsFenceInfo,
+}
+
+/// amdgpu_cs_fence_info
+#[repr(C)]
+#[derive(Default)]
+pub struct CsFenceInfo {
+    pub handle: AmdgpuBoHandle,
+    pub offset: u64,
+}
+
+/// amdgpu_cs_fence
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct CsFence {
+    pub context: AmdgpuContext,
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub fence: u64,
 }
 
 impl DrmLib {
@@ -151,6 +199,10 @@ impl DrmLib {
                 va_range_free: sym!("va_range_free", unsafe extern "C" fn(AmdgpuVaHandle) -> i32),
                 cs_ctx_create2: sym!("cs_ctx_create2", unsafe extern "C" fn(AmdgpuDeviceHandle, u32, *mut AmdgpuContext) -> i32),
                 cs_ctx_free: sym!("cs_ctx_free", unsafe extern "C" fn(AmdgpuContext) -> i32),
+                cs_submit: sym!("cs_submit", unsafe extern "C" fn(AmdgpuContext, u64, *mut CsRequest, u32) -> i32),
+                cs_query_fence_status: sym!("cs_query_fence_status", unsafe extern "C" fn(*mut CsFence, u64, u64, *mut u32) -> i32),
+                bo_list_create: sym!("bo_list_create", unsafe extern "C" fn(AmdgpuDeviceHandle, u32, *const AmdgpuBoHandle, *const u8, *mut AmdgpuBoListHandle) -> i32),
+                bo_list_destroy: sym!("bo_list_destroy", unsafe extern "C" fn(AmdgpuBoListHandle) -> i32),
                 _lib: lib,
             })
         }

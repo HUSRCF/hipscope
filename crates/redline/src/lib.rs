@@ -36,6 +36,8 @@
 pub mod drm;
 pub mod device;
 pub mod hsaco;
+pub mod pm4;
+pub mod queue;
 
 /// Redline error type.
 #[derive(Debug)]
