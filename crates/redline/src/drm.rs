@@ -36,56 +36,42 @@ pub struct AmdgpuBoAllocRequest {
     pub flags: u64,
 }
 
-// GPU info — matches amdgpu.h (note: rb_pipes is u32, not padding)
+// GPU info — matches /opt/amdgpu/include/libdrm/amdgpu.h exactly (416 bytes)
+// Verified with gcc offsetof: cu_active_number@324, vram_type@396, pci_rev_id@412
 #[repr(C)]
 #[derive(Default)]
 pub struct AmdgpuGpuInfo {
-    pub asic_id: u32,
-    pub chip_rev: u32,
-    pub chip_external_rev: u32,
-    pub family_id: u32,
-    pub ids_flags: u64,
-    pub max_engine_clk: u64,
-    pub max_memory_clk: u64,
-    pub num_shader_engines: u32,
-    pub num_shader_arrays_per_engine: u32,
-    pub avail_quad_shader_pipes: u32,
-    pub max_quad_shader_pipes: u32,
-    pub cache_entries_per_quad_pipe: u32,
-    pub num_hw_gfx_contexts: u32,
-    pub rb_pipes: u32,
-    pub enabled_rb_pipes_mask: u32,
-    pub gb_addr_cfg: u32,
-    pub num_good_cu_per_sh: u32,
-    pub cu_active_number: u32,
-    pub cu_ao_mask: u32,
-    pub cu_bitmap: [[u32; 4]; 4],
-    pub vram_type: u32,
-    pub vram_bit_width: u32,
-    pub ce_ram_size: u32,
-    pub vce_harvest_config: u32,
-    pub gc_double_offchip_lds_buf: u32,
-    pub prim_buf_gpu_addr: u64,
-    pub pos_buf_gpu_addr: u64,
-    pub cntl_sb_buf_gpu_addr: u64,
-    pub param_buf_gpu_addr: u64,
-    pub prim_buf_size: u32,
-    pub pos_buf_size: u32,
-    pub cntl_sb_buf_size: u32,
-    pub param_buf_size: u32,
-    pub wave_front_size: u32,
-    pub num_shader_visible_vgprs: u32,
-    pub num_cu_per_sh: u32,
-    pub num_tcc_blocks: u32,
-    pub gs_vgt_table_depth: u32,
-    pub gs_prim_buffer_depth: u32,
-    pub max_gs_waves_per_vgt: u32,
-    pub _pad1: u32,
-    pub cu_ao_bitmap: [[u32; 4]; 4],
-    pub high_va_offset: u64,
-    pub high_va_max: u64,
-    pub pa_sc_tile_steering_override: u32,
-    pub tcc_disabled_mask: u64,
+    pub asic_id: u32,                          // 0
+    pub chip_rev: u32,                         // 4
+    pub chip_external_rev: u32,                // 8
+    pub family_id: u32,                        // 12
+    pub ids_flags: u64,                        // 16
+    pub max_engine_clk: u64,                   // 24
+    pub max_memory_clk: u64,                   // 32
+    pub num_shader_engines: u32,               // 40
+    pub num_shader_arrays_per_engine: u32,     // 44
+    pub avail_quad_shader_pipes: u32,          // 48
+    pub max_quad_shader_pipes: u32,            // 52
+    pub cache_entries_per_quad_pipe: u32,      // 56
+    pub num_hw_gfx_contexts: u32,             // 60
+    pub rb_pipes: u32,                         // 64
+    pub enabled_rb_pipes_mask: u32,            // 68
+    pub gpu_counter_freq: u32,                 // 72
+    pub backend_disable: [u32; 4],             // 76
+    pub mc_arb_ramcfg: u32,                    // 92
+    pub gb_addr_cfg: u32,                      // 96
+    pub gb_tile_mode: [u32; 32],               // 100
+    pub gb_macro_tile_mode: [u32; 16],         // 228
+    pub pa_sc_raster_cfg: [u32; 4],            // 292
+    pub pa_sc_raster_cfg1: [u32; 4],           // 308
+    pub cu_active_number: u32,                 // 324
+    pub cu_ao_mask: u32,                       // 328
+    pub cu_bitmap: [[u32; 4]; 4],              // 332
+    pub vram_type: u32,                        // 396
+    pub vram_bit_width: u32,                   // 400
+    pub ce_ram_size: u32,                      // 404
+    pub vce_harvest_config: u32,               // 408
+    pub pci_rev_id: u32,                       // 412
 }
 
 #[repr(C)]

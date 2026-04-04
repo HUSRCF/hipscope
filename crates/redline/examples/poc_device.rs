@@ -17,9 +17,9 @@ fn main() {
 
     eprintln!("\nGPU info:");
     eprintln!("  arch:       {}", dev.info.gfx_arch);
+    eprintln!("  asic_id:    0x{:x}", dev.info.asic_id);
     eprintln!("  CUs:        {}", dev.info.num_cu);
-    eprintln!("  VGPRs:      {}/SIMD", dev.info.num_vgprs);
-    eprintln!("  wave size:  {}", dev.info.wave_front_size);
+    eprintln!("  SEs:        {}", dev.info.num_shader_engines);
     eprintln!("  VRAM total: {:.1} GB", dev.info.vram_total_bytes as f64 / 1e9);
     eprintln!("  VRAM used:  {:.1} GB", dev.info.vram_used_bytes as f64 / 1e9);
     eprintln!("  VRAM free:  {:.1} GB", (dev.info.vram_total_bytes - dev.info.vram_used_bytes) as f64 / 1e9);

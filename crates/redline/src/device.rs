@@ -16,12 +16,12 @@ pub struct Device {
 /// Parsed GPU information.
 #[derive(Debug)]
 pub struct GpuInfo {
+    pub asic_id: u32,
     pub family_id: u32,
     pub chip_rev: u32,
     pub chip_external_rev: u32,
     pub num_cu: u32,
-    pub wave_front_size: u32,
-    pub num_vgprs: u32,
+    pub num_shader_engines: u32,
     pub vram_total_bytes: u64,
     pub vram_usable_bytes: u64,
     pub vram_used_bytes: u64,
@@ -75,35 +75,45 @@ impl Device {
             return Err(RedlineError { code: ret, message: format!("query_heap_info failed: {ret}") });
         }
 
-        // Map chip_external_rev to gfx arch string
+        // Map family_id + asic_id to gfx arch string
+        // family 143 (AMDGPU_FAMILY_NV) covers both RDNA1 and RDNA2
         let gfx_arch = match gpu_info.family_id {
-            141 => match gpu_info.chip_external_rev {
-                0x01 => "gfx1010",
-                0x02 => "gfx1011",
-                0x03 => "gfx1012",
-                _ => "gfx10xx",
+            141 => "gfx900",  // AMDGPU_FAMILY_AI (Vega)
+            142 => "gfx902",  // AMDGPU_FAMILY_RV (Raven Ridge)
+            143 => {
+                // AMDGPU_FAMILY_NV: distinguish by asic_id
+                // Navi10=0x731x, Navi12=0x736x, Navi14=0x734x (RDNA1)
+                // Navi21=0x73Ax, Navi22=0x73Cx, Navi23=0x73Ex (RDNA2)
+                match (gpu_info.asic_id >> 4) & 0xF {
+                    1 => "gfx1010",       // Navi 10 (RX 5600/5700)
+                    6 => "gfx1011",       // Navi 12
+                    3 | 4 => "gfx1012",   // Navi 14 (RX 5300/5500)
+                    0xA | 0xB => "gfx1030", // Navi 21 (RX 6800/6900)
+                    0xC | 0xD => "gfx1031", // Navi 22 (RX 6700)
+                    0xE | 0xF => "gfx1032", // Navi 23 (RX 6600)
+                    _ => "gfx10xx",
+                }
             },
-            143 => "gfx1030",
-            145 => "gfx1100",
-            148 | 149 => "gfx1200",
+            145 | 146 | 147 => "gfx1100", // RDNA3
+            148 | 149 => "gfx1200",        // RDNA4
             _ => "unknown",
         };
 
         let info = GpuInfo {
+            asic_id: gpu_info.asic_id,
             family_id: gpu_info.family_id,
             chip_rev: gpu_info.chip_rev,
             chip_external_rev: gpu_info.chip_external_rev,
             num_cu: gpu_info.cu_active_number,
-            wave_front_size: gpu_info.wave_front_size,
-            num_vgprs: gpu_info.num_shader_visible_vgprs,
+            num_shader_engines: gpu_info.num_shader_engines,
             vram_total_bytes: heap.total_heap_size,
             vram_usable_bytes: heap.usable_heap_size,
             vram_used_bytes: heap.heap_usage,
             gfx_arch: gfx_arch.to_string(),
         };
 
-        eprintln!("[redline] GPU: {} — {} CUs, {} VGPRs/SIMD, wave{}, {:.1} GB VRAM",
-            info.gfx_arch, info.num_cu, info.num_vgprs, info.wave_front_size,
+        eprintln!("[redline] GPU: {} (asic 0x{:x}) — {} CUs, {} SEs, {:.1} GB VRAM",
+            info.gfx_arch, info.asic_id, info.num_cu, info.num_shader_engines,
             info.vram_total_bytes as f64 / 1e9);
 
         Ok(Self { drm, handle, fd, info })

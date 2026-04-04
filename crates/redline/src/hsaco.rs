@@ -61,7 +61,26 @@ pub struct HsacoModule {
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const EM_AMDGPU: u16 = 224;
 const SHT_SYMTAB: u32 = 2;
+#[allow(dead_code)]
 const SHT_STRTAB: u32 = 3;
+const PT_LOAD: u32 = 1;
+
+/// A PT_LOAD segment mapping: VA range → file offset.
+struct LoadSegment {
+    vaddr: u64,
+    offset: u64,
+    filesz: u64,
+}
+
+/// Convert an ELF virtual address to a file offset using PT_LOAD segments.
+fn va_to_file_offset(segments: &[LoadSegment], va: u64) -> Option<u64> {
+    for seg in segments {
+        if va >= seg.vaddr && va < seg.vaddr + seg.filesz {
+            return Some(va - seg.vaddr + seg.offset);
+        }
+    }
+    None
+}
 
 impl HsacoModule {
     /// Parse an .hsaco file from bytes.
@@ -80,6 +99,23 @@ impl HsacoModule {
         }
         if u16_le(&data, 18) != EM_AMDGPU {
             return Err(RedlineError { code: -1, message: "not an AMDGPU ELF".into() });
+        }
+
+        // Parse program headers for VA → file offset mapping
+        let phoff = u64_le(&data, 32) as usize;
+        let phentsize = u16_le(&data, 54) as usize;
+        let phnum = u16_le(&data, 56) as usize;
+        let mut segments = Vec::new();
+        for i in 0..phnum {
+            let base = phoff + i * phentsize;
+            if base + phentsize > data.len() { break; }
+            let p_type = u32_le(&data, base);
+            if p_type == PT_LOAD {
+                let p_offset = u64_le(&data, base + 8);
+                let p_vaddr = u64_le(&data, base + 16);
+                let p_filesz = u64_le(&data, base + 32);
+                segments.push(LoadSegment { vaddr: p_vaddr, offset: p_offset, filesz: p_filesz });
+            }
         }
 
         let shoff = u64_le(&data, 40) as usize;
@@ -132,8 +168,10 @@ impl HsacoModule {
                 let name = read_cstr(&data, strtab_offset + st_name);
 
                 if name.ends_with(".kd") {
-                    // st_value is the ELF virtual address — for ET_DYN, this is the file offset
-                    let kd_off = st_value as usize;
+                    // st_value is an ELF virtual address — convert to file offset
+                    let kd_va = st_value;
+                    let kd_off = va_to_file_offset(&segments, kd_va)
+                        .unwrap_or(kd_va) as usize; // fallback to VA if no mapping
                     if kd_off + 64 <= data.len() {
                         // V3 kernel descriptor layout
                         let group_segment_size = u32_le(&data, kd_off);
@@ -143,7 +181,10 @@ impl HsacoModule {
                         let pgm_rsrc1 = u32_le(&data, kd_off + 48);
                         let pgm_rsrc2 = u32_le(&data, kd_off + 52);
 
-                        let code_offset = (kd_off as i64 + code_entry_rel) as u64;
+                        // code_entry_rel is relative to KD's VA, giving code's VA
+                        let code_va = (kd_va as i64 + code_entry_rel) as u64;
+                        let code_offset = va_to_file_offset(&segments, code_va)
+                            .unwrap_or(code_va);
                         let kernel_name = name.trim_end_matches(".kd").to_string();
 
                         kernels.push(KernelMeta {
