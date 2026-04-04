@@ -397,16 +397,29 @@ if (-not (Test-Path $ConfigFile)) {
 
 # ─── PATH ────────────────────────────────────────────────
 Write-Host ""
+$NoPath = $args -contains "--no-path"
 $CurrentUserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($CurrentUserPath -notlike "*$BinDir*") {
+if ($null -eq $CurrentUserPath) { $CurrentUserPath = "" }
+
+if ($NoPath) {
+    Write-Host "Skipping PATH modification (--no-path)" -ForegroundColor Yellow
+    Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
+} elseif ($CurrentUserPath -notlike "*$BinDir*") {
     Write-Host "hipfire bin dir is not in your user PATH." -ForegroundColor Yellow
     Write-Host "  $BinDir"
     $reply = Read-Host "Add to user PATH permanently? [Y/n]"
     if ($reply -notmatch "^[Nn]$") {
         $NewPath = "$BinDir;$CurrentUserPath"
-        [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
-        $env:PATH = "$BinDir;$env:PATH"
-        Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+        # Safety: warn if PATH would exceed Windows limit (2047 chars)
+        if ($NewPath.Length -gt 2040) {
+            Write-Host "  WARNING: User PATH would be $($NewPath.Length) chars (limit ~2047)." -ForegroundColor Red
+            Write-Host "  Skipping to avoid PATH truncation. Add manually:" -ForegroundColor Red
+            Write-Host "    $BinDir" -ForegroundColor Yellow
+        } else {
+            [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+            $env:PATH = "$BinDir;$env:PATH"
+            Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+        }
     } else {
         Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
     }
