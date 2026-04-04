@@ -2,7 +2,7 @@
 //! Measures per-dispatch latency, multi-dispatch throughput, startup time, and memory.
 
 use redline::device::Device;
-use redline::dispatch::{DispatchQueue, FastDispatch, KernargBuilder, Kernel};
+use redline::dispatch::{CommandBuffer, DispatchQueue, FastDispatch, KernargBuilder, Kernel};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -134,6 +134,77 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         fast_batch.as_secs_f64() * 1000.0, fast_batch.as_secs_f64() * 1_000_000.0 / 200.0);
 
     fd.destroy(&dev);
+
+    // --- Chained IB dispatch (single submit, 200 dispatches with barriers) ---
+    eprintln!("\n--- Chained IB dispatch ---");
+    {
+        let fence_buf = dev.alloc_vram(4096).unwrap();
+        dev.upload(&fence_buf, &vec![0u8; 4096]).unwrap();
+
+        // Need separate kernarg slots for each dispatch (they all use same args but need distinct VAs)
+        let chain_ka = dev.alloc_vram(64 * 1024).unwrap(); // 64KB for kernarg slots
+        let chain_fd = FastDispatch::new(&dev, &[&module.code_buf, &a_buf, &b_buf, &c_buf, &fence_buf, &chain_ka]).unwrap();
+
+        // Write same kernarg at 200 offsets (each 256 bytes apart)
+        let mut ka_full = vec![0u8; 64 * 1024];
+        for i in 0..200usize {
+            let off = i * 256;
+            ka_full[off..off + 8].copy_from_slice(&a_buf.gpu_addr.to_le_bytes());
+            ka_full[off + 8..off + 16].copy_from_slice(&b_buf.gpu_addr.to_le_bytes());
+            ka_full[off + 16..off + 24].copy_from_slice(&c_buf.gpu_addr.to_le_bytes());
+            ka_full[off + 24..off + 28].copy_from_slice(&n.to_le_bytes());
+            // Hidden args
+            let h = off + 32;
+            ka_full[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
+            ka_full[h + 4..h + 8].copy_from_slice(&1u32.to_le_bytes());
+            ka_full[h + 8..h + 12].copy_from_slice(&1u32.to_le_bytes());
+            ka_full[h + 12..h + 14].copy_from_slice(&256u16.to_le_bytes());
+            ka_full[h + 14..h + 16].copy_from_slice(&1u16.to_le_bytes());
+            ka_full[h + 16..h + 18].copy_from_slice(&1u16.to_le_bytes());
+        }
+        dev.upload(&chain_ka, &ka_full).unwrap();
+
+        // Warm up
+        let mut warmup_cb = CommandBuffer::new();
+        warmup_cb.dispatch(kernel, [1, 1, 1], [256, 1, 1], chain_ka.gpu_addr);
+        chain_fd.submit_cmdbuf(&dev, &warmup_cb).unwrap();
+
+        // Build chained IB with barriers — start with 10, scale up
+        for chain_count in [10u32, 50, 100, 200] {
+            let iters = 50;
+            let mut chain_latencies = Vec::with_capacity(iters);
+            let mut ok = true;
+            for _ in 0..iters {
+                dev.upload(&fence_buf, &vec![0u8; 4096]).unwrap();
+                let mut cb = CommandBuffer::new();
+                for i in 0..chain_count {
+                    cb.dispatch(kernel, [1, 1, 1], [256, 1, 1], chain_ka.gpu_addr + (i as u64 * 256));
+                    if i < chain_count - 1 {
+                        cb.barrier(fence_buf.gpu_addr + (i as u64 * 8), i + 1); // 8-byte spacing
+                    }
+                }
+                let t = std::time::Instant::now();
+                match chain_fd.submit_cmdbuf(&dev, &cb) {
+                    Ok(()) => chain_latencies.push(t.elapsed()),
+                    Err(e) => { eprintln!("  chain {} FAILED at iter: {e}", chain_count); ok = false; break; }
+                }
+            }
+            if ok && !chain_latencies.is_empty() {
+                chain_latencies.sort();
+                let med = chain_latencies[chain_latencies.len() / 2];
+                let total_ms = med.as_secs_f64() * 1000.0;
+                let per_kernel = med.as_secs_f64() * 1_000_000.0 / chain_count as f64;
+                eprintln!("[chain {}-dispatch] median: {:.2}ms, per-kernel: {:.2} µs",
+                    chain_count, total_ms, per_kernel);
+                if chain_count == 200 {
+                    println!("BENCH_REDLINE_CHAIN_TOTAL_MS={:.2}", total_ms);
+                    println!("BENCH_REDLINE_CHAIN_PER_KERNEL_US={:.2}", per_kernel);
+                }
+            }
+        }
+
+        chain_fd.destroy(&dev);
+    }
 
     // --- Memory overhead ---
     let rss = get_rss_kb();

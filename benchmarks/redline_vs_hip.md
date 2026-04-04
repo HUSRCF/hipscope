@@ -133,11 +133,30 @@ The remaining ~12µs gap is the irreducible `amdgpu_cs_submit` ioctl overhead (k
 - Need ROCm ecosystem (rocBLAS, MIOpen, etc.)
 - Officially supported hardware
 
+### Chained IB Dispatch (RELEASE_MEM + WAIT_REG_MEM barriers)
+
+Barriers work on gfx1010! Previous failures were a single-bit encoding error
+(SHADER_TYPE bit in PM4 header — must be 0 for RELEASE_MEM/WAIT_REG_MEM).
+
+| Chain Size | Total (median) | Per-Kernel (amortized) |
+|-----------|---------------|------------------------|
+| 10 dispatches | 0.61 ms | 60.8 µs |
+| 50 dispatches | 3.16 ms | 63.2 µs |
+| 100 dispatches | 6.35 ms | 63.5 µs |
+| 200 dispatches | 12.72 ms | 63.6 µs |
+
+**Finding: chained dispatch is SLOWER than sequential FastDispatch (31µs) for
+dependent kernels.** Each RELEASE_MEM + WAIT_REG_MEM barrier adds ~32µs of
+GPU-side overhead (cache flush + fence write + polling). The ioctl overhead
+from sequential dispatch (~12µs) is less than the barrier overhead.
+
+**Optimal strategy on gfx1010:** FastDispatch (31µs/kernel) for dependent
+dispatches. Chaining is only beneficial for INDEPENDENT dispatches that
+don't need inter-dispatch barriers.
+
 ### Path to parity with HIP
-The remaining 1.7x gap is the `amdgpu_cs_submit` ioctl (~12µs after optimization).
-- **AQL user-mode queues**: blocked on gfx1010 (`local_mem_size=0` in KFD, queue creation fails)
-- **IB chaining**: submit N dispatches per ioctl (barrier WIP — needs RELEASE_MEM + WAIT_REG_MEM)
-- **On gfx1100+ (7900 XTX)**: KFD should work, AQL queues would close the gap entirely
+- **AQL user-mode queues**: blocked on gfx1010 (`local_mem_size=0` in KFD)
+- **On gfx1100+ (7900 XTX)**: KFD should work, AQL queues eliminate ioctl + barrier overhead
 
 ## How to Reproduce
 
