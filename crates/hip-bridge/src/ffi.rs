@@ -117,10 +117,13 @@ impl HipRuntime {
                 .or_else(|_| Library::new("amdhip64_7.dll"))
                 .or_else(|_| Library::new("amdhip64_6.dll"))
                 .or_else(|_| {
-                    // Try versioned names in HIP_PATH and runtime dir
-                    let p1v7 = format!(r"{userprofile}\.hipfire\runtime\amdhip64_7.dll");
-                    let p2v7 = format!(r"{hip_path}\bin\amdhip64_7.dll");
-                    Library::new(&p1v7).or_else(|_| Library::new(&p2v7))
+                    // Try versioned names in explicit paths (runtime dir + HIP_PATH)
+                    let rt = format!(r"{userprofile}\.hipfire\runtime");
+                    let hp = format!(r"{hip_path}\bin");
+                    Library::new(&format!(r"{rt}\amdhip64_7.dll"))
+                        .or_else(|_| Library::new(&format!(r"{rt}\amdhip64_6.dll")))
+                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_7.dll")))
+                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_6.dll")))
                 })
                 .map_err(|e| {
                     HipError::new(
