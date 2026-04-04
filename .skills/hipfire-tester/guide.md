@@ -60,9 +60,11 @@ target/release/hipfire-quantize \
 | 2B | ~1.1GB | ~1.6GB | Yes | Yes | Yes |
 | 4B | ~2.1GB | ~3.1GB | Yes | Yes | Yes |
 | 9B | ~4.8GB | ~7.0GB | Yes | Yes | Yes |
-| 27B | ~14.3GB | ~21.1GB | No | Yes* | Yes |
+| 27B | ~14.3GB | ~21.1GB | No | HFQ4 only | Yes |
 
-*27B HFQ6 may not fit 16GB with full KV cache — use `--turbo4` to reduce KV VRAM.
+**27B quality note:** HFQ4 produces degraded output on coding/complex tasks (gibberish).
+Use HFQ6 for 27B if you have 24GB VRAM. HFQ4 is OK for simple Q&A only.
+`hipfire pull qwen3.5:27b-hfq6` for the quality variant.
 
 ## Running Inference
 
@@ -100,9 +102,24 @@ target/release/examples/infer models/qwen3.5-4b.q4.hfq --image photo.png "Descri
 hipfire pull qwen3.5:9b         # Download model
 hipfire run qwen3.5:9b "Hello"  # Run (auto-pulls if needed)
 hipfire serve                   # OpenAI-compatible API on port 11435
-hipfire run qwen3.5:4b --image img.png "Describe this"
+hipfire diag                    # GPU diagnostics — arch, VRAM, HIP version, kernels
 hipfire list -r                 # Show local + available models
+
+# Sampling flags (v0.1.2+)
+hipfire run qwen3.5:9b --temp 0.7 --top-p 0.95 "Write a poem"
+hipfire run qwen3.5:9b --repeat-penalty 1.5 --max-tokens 256 "Explain recursion"
+hipfire run qwen3.5:4b --image img.png "Describe this"
 ```
+
+### CLI sampling flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--temp` | 0.3 | Temperature (0 = greedy) |
+| `--top-p` | 0.8 | Nucleus sampling threshold |
+| `--repeat-penalty` | 1.3 | Repeat penalty (1.0 = disabled) |
+| `--max-tokens` | 512 | Max tokens to generate |
+| `--image` | — | Image path for VL models |
 
 ### KV mode summary
 
@@ -197,8 +214,9 @@ so the maintainers can include it in the next release.
 
 ## Troubleshooting
 
-For GPU detection, driver, and ROCm runtime issues, use the hipfire-diag skill:
-- Run `.skills/hipfire-diag/run-diagnostics.sh` and share the JSON output
+For GPU detection, driver, and ROCm runtime issues:
+- Run `hipfire diag` and share the output
+- Or run `.skills/hipfire-diag/run-diagnostics.sh` for detailed JSON output
 
 ### Common tester issues
 

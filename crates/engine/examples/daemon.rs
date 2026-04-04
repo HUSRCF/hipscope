@@ -143,6 +143,29 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "diag" => {
+                let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+                let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
+                let has_model = model.is_some();
+                let model_arch = model.as_ref().map(|m| if m.arch_id == 5 { "qwen3_5" } else { "qwen3" }).unwrap_or("none");
+                // Count pre-compiled kernels
+                let kernel_dir = std::env::current_exe().ok()
+                    .and_then(|e| e.parent().map(|p| p.join("kernels").join("compiled").join(&gpu.arch)))
+                    .filter(|p| p.is_dir());
+                let (hsaco_count, hash_count) = kernel_dir.map(|d| {
+                    let hsaco = std::fs::read_dir(&d).map(|r| r.filter(|e| e.as_ref().ok().map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false)).unwrap_or(false)).count()).unwrap_or(0);
+                    let hash = std::fs::read_dir(&d).map(|r| r.filter(|e| e.as_ref().ok().map(|e| e.path().extension().map(|x| x == "hash").unwrap_or(false)).unwrap_or(false)).count()).unwrap_or(0);
+                    (hsaco, hash)
+                }).unwrap_or((0, 0));
+                let _ = writeln!(stdout,
+                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
+                    gpu.arch, hip_ver.0, hip_ver.1,
+                    vram_free / (1024 * 1024), vram_total / (1024 * 1024),
+                    has_model, model_arch, hsaco_count, hash_count
+                );
+                let _ = stdout.flush();
+            }
+
             _ => {
                 let _ = writeln!(stdout, r#"{{"type":"error","message":"unknown type: {}"}}"#, msg_type);
                 let _ = stdout.flush();

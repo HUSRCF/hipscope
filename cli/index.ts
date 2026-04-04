@@ -492,6 +492,86 @@ switch (cmd) {
     console.error("hipfire updated ✓");
     break;
   }
+  case "diag": {
+    console.log("hipfire diagnostics\n");
+
+    // 1. Check daemon binary
+    const bins = [
+      resolve(__dirname, "../target/release/examples/daemon"),
+      join(HIPFIRE_DIR, "bin", "daemon"),
+    ];
+    const daemonBin = bins.find(p => existsSync(p));
+    console.log(`daemon binary: ${daemonBin ? "found" : "NOT FOUND"}`);
+    if (!daemonBin) { console.log("  Install: hipfire update\n"); process.exit(1); }
+
+    // 2. Check local models
+    const models = listLocal();
+    console.log(`local models:  ${models.length}`);
+    for (const m of models) console.log(`  ${m.name.padEnd(35)} ${m.size.padStart(6)}`);
+
+    // 3. Check pre-compiled kernels
+    const binDir = join(HIPFIRE_DIR, "bin");
+    const kernelBase = join(binDir, "kernels", "compiled");
+    const cwdKernelBase = resolve(__dirname, "../kernels/compiled");
+    const kBase = existsSync(kernelBase) ? kernelBase : existsSync(cwdKernelBase) ? cwdKernelBase : null;
+    if (kBase) {
+      const arches = readdirSync(kBase).filter(d => d.startsWith("gfx"));
+      for (const arch of arches) {
+        const dir = join(kBase, arch);
+        const hsaco = readdirSync(dir).filter(f => f.endsWith(".hsaco")).length;
+        const hashes = readdirSync(dir).filter(f => f.endsWith(".hash")).length;
+        console.log(`kernels/${arch}: ${hsaco} blobs, ${hashes} hashes${hashes < hsaco ? " (INCOMPLETE)" : ""}`);
+      }
+    } else {
+      console.log("kernels:       NOT FOUND");
+    }
+
+    // 4. Probe daemon for GPU info
+    console.log("\nProbing GPU via daemon...");
+    try {
+      const e = new Engine();
+      await e.start();
+      await e.send({ type: "ping" }); await e.recv();
+      await e.send({ type: "diag" });
+      const diag = await e.recv();
+      if (diag.type === "diag") {
+        console.log(`  GPU arch:    ${diag.arch}`);
+        console.log(`  HIP version: ${diag.hip_version}`);
+        console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
+        console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
+        console.log(`  Model:       ${diag.model_loaded ? diag.model_arch : "none loaded"}`);
+        console.log(`  Kernels:     ${diag.kernels} blobs, ${diag.kernel_hashes} hashes`);
+
+        // Recommendations based on total VRAM
+        const vram = diag.vram_total_mb;
+        console.log("");
+        if (vram < 4000) {
+          console.log("TIP: <4GB VRAM — use qwen3.5:0.8b (430MB)");
+        } else if (vram < 6000) {
+          console.log("TIP: 4-6GB VRAM — use qwen3.5:4b (2.1GB)");
+        } else if (vram < 16000) {
+          console.log("TIP: 6-16GB VRAM — qwen3.5:9b (4.5GB) is your best option");
+        } else if (vram < 24000) {
+          console.log("TIP: 16-24GB VRAM — qwen3.5:27b HFQ4 (14.3GB). Note: HFQ4 degrades on complex tasks");
+        } else {
+          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hfq6 (21.4GB) for best quality");
+        }
+        if (models.length === 0) {
+          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hfq6";
+          console.log(`TIP: No models downloaded. Run: hipfire pull ${rec}`);
+        }
+      } else {
+        console.log(`  Error: ${diag.message || "unexpected response"}`);
+      }
+      await e.stop();
+    } catch (err: any) {
+      console.log(`  Failed to start daemon: ${err.message}`);
+      console.log("  Check: ROCm/HIP installed? AMD GPU visible? /dev/kfd accessible?");
+    }
+
+    console.log("\nDone.");
+    break;
+  }
   case "rm": {
     const tag = rest[0] || "";
     const resolved = resolveModelTag(tag);
@@ -512,6 +592,7 @@ switch (cmd) {
   run <model> [prompt]  Generate text (auto-pulls if needed)
   serve [port]          Start OpenAI-compatible server (default: ${DEFAULT_PORT})
   list [-r]             Show local models (-r: show available too)
+  diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   rm <model>            Delete model
   update                Pull latest code, rebuild, update kernels
 

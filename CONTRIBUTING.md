@@ -112,6 +112,48 @@ scripts/test-kernels.sh
 3. Keep PRs focused — one logical change per PR
 4. Run `cargo fmt` and `cargo clippy` before submitting
 
+### Pre-push regression checklist
+
+Before pushing any change that touches kernels, dispatch, sampling, or the forward pass:
+
+```bash
+# 1. Build clean
+cargo build --release --features deltanet --example daemon --example infer -p engine
+
+# 2. Kernel tests (no model needed, ~30s)
+target/release/examples/test_kernels
+
+# 3. Speed regression — compare against documented baselines
+target/release/examples/infer models/qwen3.5-9b.q4.hfq --max-tokens 64 "Hello"
+# Expected: ~45 tok/s on gfx1010. Flag if >10% slower.
+
+# 4. Correctness — model should answer this correctly
+target/release/examples/infer models/qwen3.5-9b.q4.hfq --max-tokens 32 \
+  "What is the capital of France? One sentence."
+# Expected: output contains "Paris"
+
+# 5. Qwen3 path (if touching sampling or daemon)
+# Tests the non-DeltaNet code path + repeat_window clamping
+echo '{"type":"load","model":"models/qwen3-8b.q4.hfq"}' | timeout 15 target/release/examples/daemon
+```
+
+**Speed baselines (gfx1010 / RX 5700 XT):**
+
+| Model | Binary | Expected tok/s | Alarm if below |
+|-------|--------|----------------|----------------|
+| Qwen3.5-0.8B HFQ4 | infer | 220 | 180 |
+| Qwen3.5-9B HFQ4 | infer | 45 | 38 |
+| Qwen3.5-9B HFQ4 | daemon (turbo4) | 40 | 33 |
+| Qwen3-8B HFQ4 | daemon | 38 | 30 |
+
+**Multi-arch notes:**
+- We can only test gfx1010 locally. Changes to kernels, dispatch, or compilation
+  paths MUST be validated by a tester on gfx1100+ before release.
+- Kernel hash files must be regenerated after any `.hip` source change:
+  `cargo run --release -p rdna-compute --example gen_kernel_hashes`
+- Pre-compiled blobs without matching hashes are rejected at runtime (the engine
+  falls back to hipcc recompilation).
+
 ### Code style
 
 - `cargo fmt` — required, enforced in CI
