@@ -542,17 +542,23 @@ switch (cmd) {
         console.log(`  Model:       ${diag.model_loaded ? diag.model_arch : "none loaded"}`);
         console.log(`  Kernels:     ${diag.kernels} blobs, ${diag.kernel_hashes} hashes`);
 
-        // Recommendations
+        // Recommendations based on total VRAM
+        const vram = diag.vram_total_mb;
         console.log("");
-        if (diag.vram_total_mb < 8000) {
-          console.log("TIP: <8GB VRAM — use qwen3.5:4b or qwen3.5:0.8b");
-        } else if (diag.vram_total_mb < 16000) {
-          console.log("TIP: 8-16GB VRAM — qwen3.5:9b is your best option");
+        if (vram < 4000) {
+          console.log("TIP: <4GB VRAM — use qwen3.5:0.8b (430MB)");
+        } else if (vram < 6000) {
+          console.log("TIP: 4-6GB VRAM — use qwen3.5:4b (2.1GB)");
+        } else if (vram < 16000) {
+          console.log("TIP: 6-16GB VRAM — qwen3.5:9b (4.5GB) is your best option");
+        } else if (vram < 24000) {
+          console.log("TIP: 16-24GB VRAM — qwen3.5:27b HFQ4 (14.3GB). Note: HFQ4 degrades on complex tasks");
         } else {
-          console.log("TIP: 16GB+ VRAM — try qwen3.5:27b-hfq6 for best quality");
+          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hfq6 (21.4GB) for best quality");
         }
         if (models.length === 0) {
-          console.log("TIP: No models downloaded. Run: hipfire pull qwen3.5:9b");
+          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hfq6";
+          console.log(`TIP: No models downloaded. Run: hipfire pull ${rec}`);
         }
       } else {
         console.log(`  Error: ${diag.message || "unexpected response"}`);
