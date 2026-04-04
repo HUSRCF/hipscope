@@ -111,7 +111,7 @@ Bun CLI (hipfire serve/run)
 
 ## Contributing
 
-hipfire is in alpha (v0.0.2) — benchmarks, bug reports, and PRs are welcome.
+hipfire is in alpha (v0.1.1) — benchmarks, bug reports, and PRs are welcome.
 
 Technical deep-dive: [docs/DELTANET.md](docs/DELTANET.md) — how DeltaNet/Qwen3.5 works on AMD, kernel math, bug history, porting guide.
 
