@@ -41,7 +41,7 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
   "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
   "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
-  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "best quality, needs 16GB+" },
+  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, good for simple tasks (use -hfq6 for coding)" },
 
   // Qwen3.5 HFQ6
   "qwen3.5:0.8b-hfq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
@@ -152,6 +152,11 @@ async function pull(tag: string): Promise<string> {
     const sz = (statSync(dest).size / 1e9).toFixed(1);
     console.error(`Already downloaded: ${entry.file} (${sz}GB)`);
     return dest;
+  }
+
+  // Hint for 27B HFQ4: recommend HFQ6 for complex tasks
+  if (resolved === "qwen3.5:27b") {
+    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hfq6 (needs 24GB VRAM)`);
   }
 
   const url = downloadUrl(entry);
