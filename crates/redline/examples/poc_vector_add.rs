@@ -81,6 +81,11 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
     pm4.push(k.pgm_rsrc1);
     pm4.push(k.pgm_rsrc2);
 
+    // 2b. SET_SH_REG: COMPUTE_PGM_RSRC3 (GFX10 requires this)
+    pm4.push(hdr(0x76, 2));
+    pm4.push(0x0228);       // offset: COMPUTE_PGM_RSRC3
+    pm4.push(0);             // SHARED_VGPR_CNT = 0
+
     // 3. SET_SH_REG: COMPUTE_TMPRING_SIZE = 0 (no scratch)
     pm4.push(hdr(0x76, 2));
     pm4.push(0x0218);
@@ -110,6 +115,7 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // 7. DISPATCH_DIRECT
     let groups = (n + 255) / 256;
+    // Wave32 (gfx1010 HIP default) — CS_W32_EN at bit 15
     let di = (1u32 << 0) | (1 << 2) | (1 << 3) | (1 << 15); // CS_EN | FORCE_000 | ORDER | W32
     pm4.push(hdr(0x15, 4)); // DISPATCH_DIRECT, 4 body dwords
     pm4.push(groups);

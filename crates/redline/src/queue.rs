@@ -58,13 +58,19 @@ impl ComputeQueue {
             _pad: 0,
         };
 
-        // Build submission request
+        // Build submission request — MUST match amdgpu_cs_request layout exactly
         let mut request = CsRequest {
             flags: 0,
             ip_type: AMDGPU_HW_IP_COMPUTE,
             ip_instance: 0,
             ring: 0,
+            _pad0: 0,
+            resources: bo_list,
+            number_of_dependencies: 0,
+            _pad1: 0,
+            dependencies: std::ptr::null(),
             number_of_ibs: 1,
+            _pad2: 0,
             ibs: &mut ib,
             seq_no: 0,
             fence_info: CsFenceInfo::default(),

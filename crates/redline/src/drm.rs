@@ -135,17 +135,25 @@ pub struct CsIbInfo {
     pub _pad: u32,
 }
 
-/// amdgpu_cs_request — matches amdgpu.h
+/// amdgpu_cs_request — matches amdgpu.h EXACTLY
+/// Verified field order: flags, ip_type, ip_instance, ring, resources,
+/// number_of_dependencies, dependencies, number_of_ibs, ibs, seq_no, fence_info
 #[repr(C)]
 pub struct CsRequest {
-    pub flags: u64,
-    pub ip_type: u32,
-    pub ip_instance: u32,
-    pub ring: u32,
-    pub number_of_ibs: u32,
-    pub ibs: *mut CsIbInfo,
-    pub seq_no: u64,
-    pub fence_info: CsFenceInfo,
+    pub flags: u64,                       // 0
+    pub ip_type: u32,                     // 8   (unsigned)
+    pub ip_instance: u32,                 // 12  (unsigned)
+    pub ring: u32,                        // 16
+    pub _pad0: u32,                       // 20  (padding for pointer alignment)
+    pub resources: AmdgpuBoListHandle,    // 24  (pointer)
+    pub number_of_dependencies: u32,      // 32
+    pub _pad1: u32,                       // 36  (padding for pointer alignment)
+    pub dependencies: *const CsFence,     // 40  (pointer)
+    pub number_of_ibs: u32,              // 48
+    pub _pad2: u32,                       // 52  (padding for pointer alignment)
+    pub ibs: *mut CsIbInfo,              // 56  (pointer)
+    pub seq_no: u64,                      // 64  (output)
+    pub fence_info: CsFenceInfo,          // 72
 }
 
 /// amdgpu_cs_fence_info
