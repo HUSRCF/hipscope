@@ -309,7 +309,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            let hist_start = token_history.len().saturating_sub(repeat_window);
+            // Qwen3/LLaMA scratch repeat_buf is 64 slots — clamp window to fit
+            let rw = repeat_window.min(64);
+            let hist_start = token_history.len().saturating_sub(rw);
             let hist_slice = &token_history[hist_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
