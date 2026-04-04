@@ -196,7 +196,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -232,6 +232,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
+    repeat_penalty: repeatPenalty,
   };
   if (image) {
     genMsg.image = resolve(image);
@@ -370,12 +371,18 @@ switch (cmd) {
   case "serve": await serve(parseInt(rest[0]) || DEFAULT_PORT); break;
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [prompt]\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [--repeat-penalty 1.3] [prompt]\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:27b --repeat-penalty 1.5 \"Write a story\""); process.exit(1); }
     const imgIdx = rest.indexOf("--image");
     const image = imgIdx >= 0 ? rest[imgIdx + 1] : undefined;
-    const filtered = rest.slice(1).filter((_, i) => i !== imgIdx - 1 && i !== imgIdx);
+    const rpIdx = rest.indexOf("--repeat-penalty");
+    const repeatPenalty = rpIdx >= 0 ? parseFloat(rest[rpIdx + 1]) : 1.3;
+    const filtered = rest.slice(1).filter((_, i) => {
+      if (imgIdx >= 0 && (i === imgIdx - 1 || i === imgIdx)) return false;
+      if (rpIdx >= 0 && (i === rpIdx - 1 || i === rpIdx)) return false;
+      return true;
+    });
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image);
+    await run(model, prompt, image, undefined, undefined, repeatPenalty);
     break;
   }
   case "pull": {
