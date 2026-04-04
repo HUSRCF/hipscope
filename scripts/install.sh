@@ -119,7 +119,7 @@ done
 
 # Fallback: ask ldconfig if none of the hardcoded paths matched
 if ! $HIP_FOUND; then
-    ldconfig_hit=$(ldconfig -p 2>/dev/null | grep -m1 'libamdhip64.so ' | awk '{print $NF}')
+    ldconfig_hit=$(ldconfig -p 2>/dev/null | grep -m1 'libamdhip64.so ' | awk '{print $NF}' || true)
     if [ -n "$ldconfig_hit" ] && [ -f "$ldconfig_hit" ]; then
         echo "  libamdhip64.so: found via ldconfig at $ldconfig_hit ✓"
         HIP_FOUND=true
