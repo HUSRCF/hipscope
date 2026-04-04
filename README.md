@@ -89,9 +89,16 @@ hipfire list -r                              # Show local + available models
 hipfire rm qwen3.5:9b                        # Delete model
 ```
 
-## API
+## API (Server Mode)
+
+`hipfire serve` starts an OpenAI-compatible HTTP server. Works with Open WebUI, SillyTavern, and any OpenAI-compatible frontend.
+
+> **Status:** Server mode works but is less tested than `hipfire run`. Multi-arch stability is the current priority. If you hit issues, try `hipfire run` first to isolate whether the problem is the server or the model.
 
 ```bash
+hipfire serve                          # Default port 11435
+hipfire serve 8080                     # Custom port
+
 curl http://localhost:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-4b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
