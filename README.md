@@ -64,7 +64,8 @@ Compress the KV cache with FWHT + quantization for longer context in less VRAM:
 - **Vision-Language (VL)**: GPU vision encoder, `hipfire run model --image img.png "Describe this"`
 - **TurboQuant KV**: Symmetric turbo4/turbo2 with 256-dim FWHT, up to 15.5x compression
 - **Thinking mode**: `<think>` reasoning with n-gram loop prevention
-- **Pre-compiled kernels**: Ship .hsaco blobs, no ROCm SDK needed at runtime
+- **Pre-compiled kernels**: Ship .hsaco blobs with hash validation, no ROCm SDK needed at runtime
+- **Kernel integrity**: Source-hash sidecar files detect stale blobs, auto-recompile via hipcc if available
 - **4 GPU arches**: gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1200 (9070)
 - **Zero VRAM leak**: Explicit GPU free + pool drain for model eviction
 - **OpenAI-compatible API**: `hipfire serve` → `/v1/chat/completions` with SSE streaming
@@ -110,7 +111,9 @@ Bun CLI (hipfire serve/run)
 
 ## Contributing
 
-hipfire is in alpha — benchmarks, bug reports, and PRs are welcome.
+hipfire is in alpha (v0.0.2) — benchmarks, bug reports, and PRs are welcome.
+
+Technical deep-dive: [docs/DELTANET.md](docs/DELTANET.md) — how DeltaNet/Qwen3.5 works on AMD, kernel math, bug history, porting guide.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 - How to run and submit benchmarks
