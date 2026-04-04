@@ -33,11 +33,12 @@ echo '  },'
 
 # 2. Pre-compiled kernels
 echo '  "kernels": {'
-for arch in gfx1010 gfx1030 gfx1100 gfx1200; do
-    count=$(ls kernels/compiled/$arch/*.hsaco 2>/dev/null | wc -l)
-    echo "    \"$arch\": $count,"
+for arch in gfx1010 gfx1030 gfx1100 gfx1200 gfx1201; do
+    hsaco=$(ls kernels/compiled/$arch/*.hsaco 2>/dev/null | wc -l)
+    hashes=$(ls kernels/compiled/$arch/*.hash 2>/dev/null | wc -l)
+    echo "    \"$arch\": {\"blobs\": $hsaco, \"hashes\": $hashes},"
 done
-echo '    "_note": "0 means kernels not compiled for that arch"'
+echo '    "_note": "blobs=pre-compiled kernels, hashes=integrity sidecar files"'
 echo '  },'
 
 # 3. Kernel tests (no model needed)
