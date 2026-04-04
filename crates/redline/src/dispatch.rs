@@ -254,13 +254,29 @@ impl CommandBuffer {
     /// Insert a compute barrier: RELEASE_MEM (fence write + L2 flush) + WAIT_REG_MEM (poll).
     /// `fence_va`: GPU VA of a dword-aligned fence location.
     /// `fence_value`: value RELEASE_MEM writes; WAIT_REG_MEM polls for it.
-    pub fn barrier(&mut self, _fence_va: u64, _fence_value: u32) {
+    pub fn barrier(&mut self, fence_va: u64, fence_value: u32) {
         let d = &mut self.dwords;
-        // CS_PARTIAL_FLUSH only. On gfx1010, RELEASE_MEM and ACQUIRE_MEM both
-        // cause GPU resets in application IBs (privileged packets).
-        // CS_PARTIAL_FLUSH tells MEC to drain outstanding dispatches.
-        d.push(pkt3(0x46, 1));
-        d.push(7); // EVENT_TYPE=CS_PARTIAL_FLUSH(7)
+
+        // RELEASE_MEM: wait for prior dispatches + flush caches + write fence value.
+        // Encoding verified in C (test_release_mem.c + test_wrm.c).
+        // CRITICAL: header uses PACKET3() WITHOUT SHADER_TYPE bit.
+        d.push(0xC006_4900);  // PACKET3(RELEASE_MEM, 6), NO shader_type
+        d.push(0x0660_3514);  // event + GCR flags (from nvd.h, matches kernel driver)
+        d.push(0x2000_0000);  // DATA_SEL(1) = 32-bit write
+        d.push(fence_va as u32);
+        d.push((fence_va >> 32) as u32);
+        d.push(fence_value);
+        d.push(0);
+        d.push(0);
+
+        // WAIT_REG_MEM: poll fence_va until value == fence_value.
+        d.push(0xC005_3C00);  // PACKET3(WAIT_REG_MEM, 5), NO shader_type
+        d.push(0x0000_0013);  // MEM_SPACE=1(memory) | FUNCTION=3(equal)
+        d.push(fence_va as u32);
+        d.push((fence_va >> 32) as u32);
+        d.push(fence_value);
+        d.push(0xFFFF_FFFF);  // mask
+        d.push(4);             // poll interval
     }
 
     /// Number of PM4 dwords in this command buffer.
