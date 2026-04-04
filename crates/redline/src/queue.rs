@@ -2,6 +2,7 @@
 
 use crate::device::{Device, GpuBuffer};
 use crate::drm::*;
+pub use crate::drm::AmdgpuBoListHandle;
 use crate::{RedlineError, Result};
 
 pub const AMDGPU_HW_IP_COMPUTE: u32 = 1;
@@ -102,6 +103,60 @@ impl ComputeQueue {
             return Err(RedlineError { code: -1, message: "GPU timeout (10s)".into() });
         }
 
+        Ok(())
+    }
+
+    /// Submit with a pre-created BO list (avoids bo_list_create/destroy per dispatch).
+    pub fn submit_with_bo_list(
+        &self,
+        dev: &Device,
+        ib_buf: &GpuBuffer,
+        ib_size_dwords: u32,
+        bo_list: AmdgpuBoListHandle,
+    ) -> Result<()> {
+        let mut ib = CsIbInfo {
+            flags: 0,
+            ib_mc_address: ib_buf.gpu_addr,
+            size: ib_size_dwords,
+            _pad: 0,
+        };
+        let mut request = CsRequest {
+            flags: 0,
+            ip_type: AMDGPU_HW_IP_COMPUTE,
+            ip_instance: 0,
+            ring: 0,
+            _pad0: 0,
+            resources: bo_list,
+            number_of_dependencies: 0,
+            _pad1: 0,
+            dependencies: std::ptr::null(),
+            number_of_ibs: 1,
+            _pad2: 0,
+            ibs: &mut ib,
+            seq_no: 0,
+            fence_info: CsFenceInfo::default(),
+        };
+
+        let ret = unsafe { (dev.drm.cs_submit)(self.ctx, 0, &mut request, 1) };
+        if ret != 0 {
+            return Err(RedlineError { code: ret, message: format!("cs_submit failed: {ret}") });
+        }
+
+        let mut fence = CsFence {
+            context: self.ctx,
+            ip_type: AMDGPU_HW_IP_COMPUTE,
+            ip_instance: 0,
+            ring: 0,
+            fence: request.seq_no,
+        };
+        let mut expired = 0u32;
+        let ret = unsafe { (dev.drm.cs_query_fence_status)(&mut fence, 10_000_000_000, 0, &mut expired) };
+        if ret != 0 {
+            return Err(RedlineError { code: ret, message: format!("fence wait failed: {ret}") });
+        }
+        if expired == 0 {
+            return Err(RedlineError { code: -1, message: "GPU timeout (10s)".into() });
+        }
         Ok(())
     }
 

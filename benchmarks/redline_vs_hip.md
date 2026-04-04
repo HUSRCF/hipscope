@@ -88,13 +88,36 @@ The HIP binary is smaller because it's a thin C++ wrapper — all the work is in
 
 **Redline needs 3000x less library footprint.** `libdrm_amdgpu.so` ships with every system that has the amdgpu kernel driver — no ROCm installation required.
 
+## FastDispatch (Optimized Ioctl Path)
+
+After implementing persistent CPU-mapped IB/kernarg buffers and persistent BO lists,
+eliminating all per-dispatch heap allocations and memcpy overhead:
+
+| Backend | Median | Mean | P99 | Min |
+|---------|--------|------|-----|-----|
+| Redline (standard) | 69.2 µs | 70.9 µs | 95.0 µs | 65.1 µs |
+| **Redline (FastDispatch)** | **30.5 µs** | **31.0 µs** | **38.9 µs** | **27.7 µs** |
+| HIP | 18.0 µs | 17.6 µs | 21.0 µs | 13.9 µs |
+
+**FastDispatch is 2.3x faster than standard dispatch.** The gap with HIP narrowed from 3.8x to 1.7x.
+
+The remaining ~12µs gap is the irreducible `amdgpu_cs_submit` ioctl overhead (kernel entry, command validation, scheduler). HIP avoids this via user-mode AQL queues through `/dev/kfd`, but **KFD is not functional on gfx1010** (`local_mem_size=0` in KFD topology, causing queue creation to fail with EINVAL for all queue types).
+
+### 200-Dispatch Sequential Comparison
+
+| Method | Total | Per-Kernel |
+|--------|-------|------------|
+| HIP sequential | 3.39 ms | 16.9 µs |
+| **Redline FastDispatch** | **5.95 ms** | **29.8 µs** |
+| Redline standard | 13.67 ms | 68.3 µs |
+
 ## Summary
 
-| Metric | Redline | HIP | Winner |
+| Metric | Redline (fast) | HIP | Winner |
 |--------|---------|-----|--------|
-| Per-dispatch latency | 68 µs | 18 µs | HIP (3.8x) |
-| Startup time | 0.52 ms | 13.33 ms | **Redline (25x)** |
-| Memory footprint | 2.7 MB | 134.8 MB | **Redline (50x)** |
+| Per-dispatch latency | 30.5 µs | 18 µs | HIP (1.7x) |
+| Startup time | 0.50 ms | 13.33 ms | **Redline (27x)** |
+| Memory footprint | 2.8 MB | 134.8 MB | **Redline (48x)** |
 | Library deps | 55 KB | ~165 MB | **Redline (3000x)** |
 | Requires ROCm? | No | Yes | **Redline** |
 | Works on gfx1010 natively? | Yes | Unofficial | **Redline** |
@@ -110,10 +133,11 @@ The HIP binary is smaller because it's a thin C++ wrapper — all the work is in
 - Need ROCm ecosystem (rocBLAS, MIOpen, etc.)
 - Officially supported hardware
 
-### Future: closing the dispatch gap
-Redline's per-dispatch overhead is dominated by the `amdgpu_cs_submit` ioctl (~50µs). Two paths to fix:
-1. **IB chaining** — submit 100+ dispatches per ioctl (infrastructure built, barrier WIP)
-2. **User-mode queues** — use AQL doorbell submission like HIP does internally (eliminates ioctl entirely)
+### Path to parity with HIP
+The remaining 1.7x gap is the `amdgpu_cs_submit` ioctl (~12µs after optimization).
+- **AQL user-mode queues**: blocked on gfx1010 (`local_mem_size=0` in KFD, queue creation fails)
+- **IB chaining**: submit N dispatches per ioctl (barrier WIP — needs RELEASE_MEM + WAIT_REG_MEM)
+- **On gfx1100+ (7900 XTX)**: KFD should work, AQL queues would close the gap entirely
 
 ## How to Reproduce
 

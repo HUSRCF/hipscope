@@ -37,6 +37,7 @@ pub mod drm;
 pub mod device;
 pub mod dispatch;
 pub mod hsaco;
+pub mod kfd;
 pub mod pm4;
 pub mod queue;
 

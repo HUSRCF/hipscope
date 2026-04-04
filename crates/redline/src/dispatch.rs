@@ -377,6 +377,120 @@ impl DispatchQueue {
     }
 }
 
+/// Optimized dispatch path: persistent CPU-mapped IB and kernarg buffers.
+/// Eliminates per-dispatch heap allocations, memcpy overhead, and Vec creation.
+/// The ioctl overhead (~50µs) remains but everything around it is minimized.
+pub struct FastDispatch {
+    pub queue: ComputeQueue,
+    ib_buf: GpuBuffer,
+    ka_buf: GpuBuffer,
+    ib_ptr: *mut u8,    // persistent CPU mapping of IB
+    ka_ptr: *mut u8,    // persistent CPU mapping of kernarg
+    bo_list_handle: crate::drm::AmdgpuBoListHandle, // persistent BO list
+}
+
+unsafe impl Send for FastDispatch {}
+
+impl FastDispatch {
+    /// Create a fast dispatch context. `extra_bos` are buffers referenced by dispatches
+    /// (kernel code, data buffers) — included in a persistent BO list.
+    pub fn new(dev: &Device, extra_bos: &[&GpuBuffer]) -> Result<Self> {
+        let queue = ComputeQueue::new(dev)?;
+        let ib_buf = dev.alloc_vram(IB_SIZE)?;
+        let ka_buf = dev.alloc_vram(KA_SIZE)?;
+
+        // Persistent CPU mappings
+        let mut ib_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ret = unsafe { (dev.drm.bo_cpu_map)(ib_buf.handle, &mut ib_ptr) };
+        if ret != 0 {
+            return Err(RedlineError { code: ret, message: "map IB failed".into() });
+        }
+        let mut ka_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ret = unsafe { (dev.drm.bo_cpu_map)(ka_buf.handle, &mut ka_ptr) };
+        if ret != 0 {
+            return Err(RedlineError { code: ret, message: "map KA failed".into() });
+        }
+
+        // Persistent BO list including IB + KA + all extra buffers
+        let mut bo_handles: Vec<crate::drm::AmdgpuBoHandle> = vec![ib_buf.handle, ka_buf.handle];
+        bo_handles.extend(extra_bos.iter().map(|b| b.handle));
+        let prios = vec![0u8; bo_handles.len()];
+        let mut bo_list: crate::drm::AmdgpuBoListHandle = std::ptr::null_mut();
+        let ret = unsafe {
+            (dev.drm.bo_list_create)(dev.handle, bo_handles.len() as u32,
+                bo_handles.as_ptr(), prios.as_ptr(), &mut bo_list)
+        };
+        if ret != 0 {
+            return Err(RedlineError { code: ret, message: "bo_list_create failed".into() });
+        }
+
+        Ok(Self {
+            queue, ib_buf, ka_buf,
+            ib_ptr: ib_ptr as *mut u8,
+            ka_ptr: ka_ptr as *mut u8,
+            bo_list_handle: bo_list,
+        })
+    }
+
+    /// Fast dispatch: write PM4 + kernarg to persistent mappings, submit via ioctl.
+    /// No heap allocations in the hot path. Only the ioctl syscall remains.
+    pub fn dispatch(
+        &self,
+        dev: &Device,
+        kernel: &Kernel,
+        grid: [u32; 3],
+        block: [u32; 3],
+        args: &[u8],
+    ) -> Result<()> {
+        // Write kernarg directly to persistent mapping
+        let ka_size = std::cmp::max(kernel.kernarg_size as usize, args.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(args.as_ptr(), self.ka_ptr, args.len());
+            // Zero remaining
+            if ka_size > args.len() {
+                std::ptr::write_bytes(self.ka_ptr.add(args.len()), 0, ka_size - args.len());
+            }
+        }
+        // Hidden args
+        let hidden_off = (args.len() + 7) & !7;
+        if ka_size > hidden_off {
+            unsafe {
+                let p = self.ka_ptr;
+                (p.add(hidden_off) as *mut u32).write(grid[0]);
+                (p.add(hidden_off + 4) as *mut u32).write(grid[1]);
+                (p.add(hidden_off + 8) as *mut u32).write(grid[2]);
+                (p.add(hidden_off + 12) as *mut u16).write(block[0] as u16);
+                (p.add(hidden_off + 14) as *mut u16).write(block[1] as u16);
+                (p.add(hidden_off + 16) as *mut u16).write(block[2] as u16);
+            }
+        }
+
+        // Build PM4 directly into persistent IB mapping
+        let mut cb = CommandBuffer::new();
+        cb.dispatch(kernel, grid, block, self.ka_buf.gpu_addr);
+        let dwords = &cb.dwords;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                dwords.as_ptr() as *const u8,
+                self.ib_ptr,
+                dwords.len() * 4,
+            );
+        }
+
+        // Submit with persistent BO list — only the ioctl remains
+        self.queue.submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
+    }
+
+    pub fn destroy(self, dev: &Device) {
+        unsafe {
+            (dev.drm.bo_cpu_unmap)(self.ib_buf.handle);
+            (dev.drm.bo_cpu_unmap)(self.ka_buf.handle);
+            (dev.drm.bo_list_destroy)(self.bo_list_handle);
+        }
+        self.queue.destroy(dev);
+    }
+}
+
 /// Build a kernarg byte buffer from typed arguments.
 /// Each arg is written at the correct alignment.
 pub struct KernargBuilder {

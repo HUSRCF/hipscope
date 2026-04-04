@@ -2,7 +2,7 @@
 //! Measures per-dispatch latency, multi-dispatch throughput, startup time, and memory.
 
 use redline::device::Device;
-use redline::dispatch::{DispatchQueue, KernargBuilder, Kernel};
+use redline::dispatch::{DispatchQueue, FastDispatch, KernargBuilder, Kernel};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -98,6 +98,43 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     eprintln!("\n[{}-dispatch sequential] total: {:.2}ms, per-kernel: {:.1} µs",
         batch, batch_time.as_secs_f64() * 1000.0, per_kernel);
 
+    // --- FastDispatch (optimized path: persistent mappings, no per-dispatch alloc) ---
+    eprintln!("\n--- FastDispatch (optimized ioctl) ---");
+    let fd = FastDispatch::new(&dev, &[&module.code_buf, &a_buf, &b_buf, &c_buf]).unwrap();
+
+    // Warm up
+    for _ in 0..10 {
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+    }
+
+    let mut fast_latencies = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let t = std::time::Instant::now();
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+        fast_latencies.push(t.elapsed());
+    }
+    fast_latencies.sort();
+    let fast_median = to_us(fast_latencies[fast_latencies.len() / 2]);
+    let fast_mean = to_us(fast_latencies.iter().sum::<std::time::Duration>()) / fast_latencies.len() as f64;
+    let fast_p99 = to_us(fast_latencies[(fast_latencies.len() as f64 * 0.99) as usize]);
+    let fast_min = to_us(fast_latencies[0]);
+
+    eprintln!("[fast-dispatch] {} iterations:", iterations);
+    eprintln!("  median: {:.1} µs", fast_median);
+    eprintln!("  mean:   {:.1} µs", fast_mean);
+    eprintln!("  p99:    {:.1} µs", fast_p99);
+    eprintln!("  min:    {:.1} µs", fast_min);
+
+    let t_fast_batch = std::time::Instant::now();
+    for _ in 0..200 {
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+    }
+    let fast_batch = t_fast_batch.elapsed();
+    eprintln!("[fast 200-dispatch] total: {:.2}ms, per-kernel: {:.1} µs",
+        fast_batch.as_secs_f64() * 1000.0, fast_batch.as_secs_f64() * 1_000_000.0 / 200.0);
+
+    fd.destroy(&dev);
+
     // --- Memory overhead ---
     let rss = get_rss_kb();
     eprintln!("\n[memory] RSS: {} KB ({:.1} MB)", rss, rss as f64 / 1024.0);
@@ -119,6 +156,10 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     println!("BENCH_REDLINE_BATCH_PER_KERNEL_US={:.1}", per_kernel);
     println!("BENCH_REDLINE_STARTUP_MS={:.2}", startup_device.as_secs_f64() * 1000.0);
     println!("BENCH_REDLINE_RSS_KB={}", rss);
+    println!("BENCH_REDLINE_FAST_MEDIAN_US={:.1}", fast_median);
+    println!("BENCH_REDLINE_FAST_MEAN_US={:.1}", fast_mean);
+    println!("BENCH_REDLINE_FAST_P99_US={:.1}", fast_p99);
+    println!("BENCH_REDLINE_FAST_MIN_US={:.1}", fast_min);
 
     dq.destroy(&dev);
 }

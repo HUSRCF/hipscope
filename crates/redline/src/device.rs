@@ -9,7 +9,7 @@ use std::ffi::c_void;
 pub struct Device {
     pub(crate) drm: DrmLib,
     pub(crate) handle: AmdgpuDeviceHandle,
-    pub(crate) fd: i32,
+    pub fd: i32,
     pub info: GpuInfo,
 }
 
