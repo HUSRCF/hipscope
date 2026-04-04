@@ -94,7 +94,10 @@ fn main() {
                         model = Some(m);
                     }
                     Err(e) => {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}"}}"#, e);
+                        let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+                        let free_mb = vram_free / (1024 * 1024);
+                        let total_mb = vram_total / (1024 * 1024);
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}. GPU: {} ({} MB free / {} MB total)"}}"#, e, gpu.arch, free_mb, total_mb);
                     }
                 }
                 let _ = stdout.flush();
