@@ -473,7 +473,8 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // Prefill with vision token embedding for IMAGE_PAD positions
     let mut visual_idx = 0usize;
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
+    for (i, &token) in prompt_tokens.iter().enumerate() {
+        let pos = m.seq_pos + i;
         if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
             qwen35::forward_scratch_embed(gpu, weights, config, emb, pos, kv, dn, scratch)
@@ -484,16 +485,17 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
                 .expect("forward_scratch failed");
         }
     }
+    m.seq_pos += prompt_tokens.len();
+    m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     // Generate
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::sample_top_p(&logits, temp, top_p);
     let mut generated = 0;
-    let mut token_history = prompt_tokens.clone();
 
     for _ in 0..max_tokens {
         generated += 1;
-        token_history.push(next_token);
+        m.conversation_tokens.push(next_token);
         let text = tokenizer.decode(&[next_token]);
         let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
         let _ = stdout.flush();
@@ -501,13 +503,16 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
 
-        let pos = prompt_tokens.len() + generated - 1;
+        let pos = m.seq_pos + generated - 1;
         qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        llama::apply_ngram_block(&mut logits, &token_history);
-        llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
+        llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
         next_token = llama::sample_top_p(&logits, temp, top_p);
     }
+    m.seq_pos += generated;
+    m.conversation_tokens.extend_from_slice(&im_end);
+    m.conversation_tokens.extend_from_slice(&nl);
 
     let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
     let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
