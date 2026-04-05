@@ -13,10 +13,69 @@ import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
+const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
 mkdirSync(MODELS_DIR, { recursive: true });
+
+// ─── Persistent config ─────────────────────────────────
+interface HipfireConfig {
+  kv_cache: string;       // "q8" (default) or "turbo4", "turbo3", "turbo2"
+  default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
+  temperature: number;    // default temperature for run
+  top_p: number;
+  repeat_penalty: number;
+  max_tokens: number;
+  port: number;           // default serve port
+}
+
+const CONFIG_DEFAULTS: HipfireConfig = {
+  kv_cache: "q8",
+  default_model: "qwen3.5:9b",
+  temperature: 0.3,
+  top_p: 0.8,
+  repeat_penalty: 1.3,
+  max_tokens: 512,
+  port: DEFAULT_PORT,
+};
+
+function validateConfigValue(key: string, value: any): boolean {
+  switch (key) {
+    case "kv_cache": return ["q8", "turbo2", "turbo3", "turbo4"].includes(value);
+    case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
+    case "top_p": return typeof value === "number" && value > 0 && value <= 1;
+    case "repeat_penalty": return typeof value === "number" && value >= 1 && value <= 3;
+    case "max_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 32768;
+    case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+    case "default_model": return typeof value === "string" && value.trim().length > 0;
+    default: return false;
+  }
+}
+
+function loadConfig(): HipfireConfig {
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(CONFIG_PATH, "utf-8"));
+    const result = { ...CONFIG_DEFAULTS };
+    for (const key of Object.keys(CONFIG_DEFAULTS)) {
+      if (key in raw && validateConfigValue(key, raw[key])) {
+        (result as any)[key] = raw[key];
+      }
+    }
+    return result;
+  } catch { return { ...CONFIG_DEFAULTS }; }
+}
+
+function saveConfig(cfg: HipfireConfig) {
+  // Only write keys that differ from defaults
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(cfg)) {
+    if (v !== (CONFIG_DEFAULTS as any)[k]) out[k] = v;
+  }
+  require("fs").writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2) + "\n");
+}
+
+const cfg = loadConfig();
 
 // ─── Model Registry ─────────────────────────────────────
 // Maps "name:tag" → { repo, file, size_gb, min_vram_gb }
@@ -107,6 +166,8 @@ class Engine {
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
     this.reader = this.proc.stdout!.getReader();
+    this.buffer = "";
+    this.lines = [];
   }
 
   async send(msg: object) {
@@ -232,10 +293,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 
   if (image && !existsSync(image)) { console.error(`Image not found: ${image}`); process.exit(1); }
 
+  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: path, turbo: 4 });
+  await e.send({ type: "load", model: path, turbo: turboMode });
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -256,18 +318,62 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     console.error(`[VL: ${image}]`);
   }
 
+  let inThink = false;
+  let stripNextLeadingNl = false;
   for await (const msg of e.generate(genMsg)) {
-    if (msg.type === "token") process.stdout.write(msg.text);
+    if (msg.type === "token") {
+      let text = msg.text as string;
+      if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+      if (inThink) {
+        if (text.includes("</think>")) {
+          text = text.split("</think>").slice(1).join("</think>");
+          inThink = false;
+          stripNextLeadingNl = true; // strip newline between </think> and content
+        } else { continue; }
+      }
+      text = text.replace(/<\|im_end\|>/g, "");
+      if (!text) continue;
+      if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+      process.stdout.write(text);
+    }
     else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
   }
   await e.stop();
 }
 
 async function serve(port: number) {
+  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
+
+  // Pre-warm: load default model and compile kernels before accepting requests
+  const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
+  const warmPath = findModel(defaultModel);
+  if (warmPath) {
+    try {
+      console.error(`[hipfire] pre-warming ${defaultModel}...`);
+      await e.send({ type: "load", model: warmPath, turbo: turboMode });
+      const loadResult = await e.recv();
+      if (loadResult.type === "error") {
+        console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
+      } else {
+        for await (const msg of e.generate({ type: "generate", id: "warmup", prompt: "Hi", temperature: 0, max_tokens: 1 })) {
+          if (msg.type === "done") break;
+        }
+        await e.send({ type: "reset" }); await e.recv();
+        current = warmPath;
+        console.error(`[hipfire] warm-up complete`);
+      }
+    } catch (err: any) {
+      console.error(`[hipfire] pre-warm failed: ${err?.message} — restarting daemon`);
+      current = null;
+      try { await e.stop(); } catch {}
+      await e.start();
+      await e.send({ type: "ping" }); await e.recv();
+    }
+  }
 
   let busy = false;
   const queue: Array<{ resolve: () => void }> = [];
@@ -291,9 +397,14 @@ async function serve(port: number) {
       if (url.pathname === "/health") return Response.json({ status: "ok", model: current });
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
-      if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-        await acquireLock();
-        try {
+      if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
+        return Response.json({ error: "not found" }, { status: 404 });
+
+      await acquireLock();
+      let lockReleased = false;
+      const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
+
+      try {
         const body = await req.json();
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
@@ -328,7 +439,6 @@ async function serve(port: number) {
           if (m.role === "tool") {
             convParts.push(`<tool_response>\n${m.content}\n</tool_response>`);
           } else if (m.role === "assistant" && m.tool_calls) {
-            // Re-emit assistant tool calls so the model sees them in context
             let text = m.content || "";
             for (const tc of m.tool_calls) {
               const fn = tc.function || tc;
@@ -342,18 +452,19 @@ async function serve(port: number) {
         userPrompt = convParts.join("\n");
 
         const path = findModel(body.model || "default");
-        if (!path) { releaseLock(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        if (!path) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path, turbo: 4 }); await e.recv();
+          await e.send({ type: "load", model: path, turbo: turboMode }); await e.recv();
           current = path;
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
+        const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         const genParams: any = {
-          type: "generate", id: "api", prompt: userPrompt,
+          type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
           max_tokens: body.max_tokens ?? 512,
           repeat_penalty: body.repeat_penalty ?? body.frequency_penalty ? 1.0 + (body.frequency_penalty ?? 0) : 1.3,
@@ -387,38 +498,58 @@ async function serve(port: number) {
 
         if (body.stream) {
           const enc = new TextEncoder();
+          let streamCancelled = false;
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
-                let fullText = "";
+                let inThink = false;
+                let stripNextLeadingNl = false;
                 for await (const msg of e.generate(genParams)) {
+                  if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
-                    fullText += msg.text;
+                    let text = msg.text as string;
+                    if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+                    if (inThink) {
+                      if (text.includes("</think>")) {
+                        text = text.split("</think>").slice(1).join("</think>");
+                        inThink = false;
+                        stripNextLeadingNl = true;
+                      } else { continue; }
+                    }
+                    text = text.replace(/<\|im_end\|>/g, "");
+                    if (!text) continue;
+                    if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
-                      choices: [{ index: 0, delta: { content: msg.text }, finish_reason: null }]
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                      choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                     })}\n\n`));
                   } else if (msg.type === "done") {
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
                       choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
                     })}\n\n`));
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
                   }
                 }
-              } finally { releaseLock(); }
-            }
+              } finally { safeRelease(); }
+            },
+            cancel() { streamCancelled = true; } // lock released in finally after generation drains
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
         let content = "";
-        let promptTokens = 0;
         let completionTokens = 0;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prompt_tokens ?? 0; }
         }
+
+        // Strip think tags and special tokens.
+        // Greedy match: strip everything from first <think> to last </think>.
+        // If <think> is unclosed, strip from <think> to end of content.
+        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+          .replace(/<think>[\s\S]*$/, "") // unclosed think block
+          .replace(/<\|im_end\|>/g, "").trim();
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
@@ -429,14 +560,16 @@ async function serve(port: number) {
           choice.message = { role: "assistant", content };
         }
 
+        safeRelease();
         return Response.json({
-          id: reqId, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelName,
+          id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          usage: { prompt_tokens: 0, completion_tokens: completionTokens, total_tokens: completionTokens }
         });
-        } finally { releaseLock(); }
+      } catch (err: any) {
+        safeRelease();
+        return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
-      return Response.json({ error: "not found" }, { status: 404 });
     }
   });
 }
@@ -497,7 +630,7 @@ function listLocal() {
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
-  case "serve": await serve(parseInt(rest[0]) || DEFAULT_PORT); break;
+  case "serve": await serve(parseInt(rest[0]) || cfg.port); break;
   case "run": {
     const model = rest[0];
     if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.3)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
@@ -524,10 +657,10 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
-    const temp = Number(flags["--temp"] ?? 0.3);
-    const topP = Number(flags["--top-p"] ?? 0.8);
-    const repeatPenalty = Number(flags["--repeat-penalty"] ?? 1.3);
-    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? 512));
+    const temp = Number(flags["--temp"] ?? cfg.temperature);
+    const topP = Number(flags["--top-p"] ?? cfg.top_p);
+    const repeatPenalty = Number(flags["--repeat-penalty"] ?? cfg.repeat_penalty);
+    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? cfg.max_tokens));
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
@@ -634,6 +767,13 @@ switch (cmd) {
         }
       }
     } catch {}
+    // Pre-compile GPU kernels so `hipfire serve` starts instantly
+    const daemonForPrecompile = join(binDir, `daemon${exe}`) ;
+    if (existsSync(daemonForPrecompile)) {
+      console.error("Pre-compiling GPU kernels...");
+      const pc = Bun.spawnSync([daemonForPrecompile, "--precompile"], { stdio: ["inherit", "inherit", "inherit"] });
+      if (pc.exitCode !== 0) console.error("  Warning: kernel precompilation failed (serve will compile on first run)");
+    }
     console.error("hipfire updated ✓");
     break;
   }
@@ -731,13 +871,68 @@ switch (cmd) {
     }
     break;
   }
+  case "config": {
+    const [action, key, value] = rest;
+    const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+
+    if (!action || action === "list") {
+      // Show all config values, marking non-default ones
+      console.log(`Config: ${CONFIG_PATH}\n`);
+      for (const k of validKeys) {
+        const v = cfg[k];
+        const isDefault = v === CONFIG_DEFAULTS[k];
+        console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
+      }
+      console.log(`\nSet:   hipfire config set <key> <value>`);
+      console.log(`Reset: hipfire config reset [key]`);
+    } else if (action === "get") {
+      if (!key) { console.error("Usage: hipfire config get <key>"); process.exit(1); }
+      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
+      console.log(cfg[key as keyof HipfireConfig]);
+    } else if (action === "set") {
+      if (!key || value === undefined) { console.error("Usage: hipfire config set <key> <value>\n\nKeys:\n" + validKeys.map(k => `  ${k.padEnd(18)} (default: ${CONFIG_DEFAULTS[k]})`).join("\n")); process.exit(1); }
+      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
+      const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
+      const parsed = typeof defaultVal === "number" ? Number(value) : value;
+      if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
+      if (!validateConfigValue(key, parsed)) {
+        const hints: Record<string, string> = {
+          kv_cache: "one of: q8, turbo2, turbo3, turbo4",
+          temperature: "number between 0 and 2",
+          top_p: "number in (0, 1]",
+          repeat_penalty: "number between 1.0 and 3.0",
+          max_tokens: "integer between 1 and 32768",
+          port: "integer between 1 and 65535",
+          default_model: "non-empty model tag",
+        };
+        console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
+      }
+      (cfg as any)[key] = parsed;
+      saveConfig(cfg);
+      console.log(`${key} = ${parsed}`);
+    } else if (action === "reset") {
+      if (key) {
+        if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}`); process.exit(1); }
+        (cfg as any)[key] = CONFIG_DEFAULTS[key as keyof HipfireConfig];
+        saveConfig(cfg);
+        console.log(`${key} reset to ${CONFIG_DEFAULTS[key as keyof HipfireConfig]}`);
+      } else {
+        saveConfig({ ...CONFIG_DEFAULTS });
+        console.log("All config reset to defaults");
+      }
+    } else {
+      console.error("Usage: hipfire config [list|get|set|reset]");
+    }
+    break;
+  }
   default:
     console.log(`hipfire — LLM inference for AMD GPUs
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls if needed)
-  serve [port]          Start OpenAI-compatible server (default: ${DEFAULT_PORT})
+  serve [port]          Start OpenAI-compatible server (default: ${cfg.port})
   list [-r]             Show local models (-r: show available too)
+  config [list|set|get|reset]  Persistent settings (kv_cache, temperature, etc.)
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   rm <model>            Delete model
   update                Pull latest code, rebuild, update kernels

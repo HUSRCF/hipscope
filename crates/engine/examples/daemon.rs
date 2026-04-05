@@ -51,6 +51,25 @@ struct LoadedModel {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --precompile: compile all kernels for this GPU, write hash files, exit.
+    // Used by `hipfire update` so `hipfire serve` starts instantly.
+    if args.iter().any(|a| a == "--precompile") {
+        let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+        eprintln!("Pre-compiling kernels for {}...", gpu.arch);
+        // Cover both KV cache modes (Q8 default + turbo4 opt-in) × weight formats
+        for kv in &["q8", "turbo4"] {
+            for wq in &["hfq6", "hfq4", "q8"] {
+                if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
+                    eprintln!("  {wq}/{kv}: {e}");
+                }
+            }
+        }
+        eprintln!("Kernel precompilation done.");
+        return;
+    }
+
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     let mut model: Option<LoadedModel> = None;
 
@@ -355,13 +374,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
         let mut next_token = llama::sample_top_p(&logits, temp, top_p);
         let mut generated = 0;
+        let mut streamed_tokens: Vec<u32> = Vec::new();
+        let mut emitted_bytes = 0usize;
 
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            let text = tokenizer.decode(&[next_token]);
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
+            streamed_tokens.push(next_token);
+            // Incremental UTF-8: only emit complete sequences
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            if vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += vl;
+            }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
@@ -410,13 +439,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
 
         let mut generated = 0;
+        let mut streamed_tokens: Vec<u32> = Vec::new();
+        let mut emitted_bytes = 0usize;
 
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            let text = tokenizer.decode(&[next_token]);
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
+            streamed_tokens.push(next_token);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            if vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += vl;
+            }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }

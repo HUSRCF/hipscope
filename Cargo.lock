@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "hip-bridge"
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 dependencies = [
  "libloading",
  "thiserror",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -224,14 +224,14 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 dependencies = [
  "hip-bridge",
 ]
 
 [[package]]
 name = "redline"
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 dependencies = [
  "libc",
  "libloading",

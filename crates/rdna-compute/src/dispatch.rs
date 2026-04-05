@@ -127,6 +127,41 @@ impl Gpu {
         Ok(())
     }
 
+    /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
+    /// Each entry is (module_name, source, func_name). Turbo kernels should have
+    /// TURBO_COMMON_SRC already prepended in their source.
+    pub fn precompile_kernels(&mut self, specs: &[(&str, &str, &str)]) -> HipResult<()> {
+        // Collect (name, source) pairs for the compiler batch, skipping already-loaded
+        let batch: Vec<(&str, &str)> = specs.iter()
+            .filter(|(_, _, func)| !self.functions.contains_key(*func))
+            .map(|(module, source, _)| (*module, *source))
+            .collect();
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Parallel hipcc compilation
+        self.compiler.compile_batch(&batch)?;
+
+        // Now load modules + extract functions (must be sequential — GPU API calls)
+        for &(module_name, source, func_name) in specs {
+            if self.functions.contains_key(func_name) {
+                continue;
+            }
+            let obj_path = self.compiler.compile(module_name, source)?;
+            let obj_path_str = obj_path.to_str().unwrap().to_string();
+            if !self.modules.contains_key(module_name) {
+                let module = self.hip.module_load(&obj_path_str)?;
+                self.modules.insert(module_name.to_string(), module);
+            }
+            let module = &self.modules[module_name];
+            let func = self.hip.module_get_function(module, func_name)?;
+            self.functions.insert(func_name.to_string(), func);
+        }
+        Ok(())
+    }
+
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
@@ -3157,5 +3192,121 @@ impl Gpu {
         ];
         let shared_mem = (seq_len_hint * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Batch precompilation — compile all kernels a model needs in parallel
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Helper: compose turbo kernel source (prepend TURBO_COMMON_SRC).
+    fn turbo_source(body_src: &str) -> String {
+        let stripped = body_src.replace("#include \"turbo_common.h\"", "");
+        format!("{}\n{}", kernels::TURBO_COMMON_SRC, stripped)
+    }
+
+    /// Pre-compile all kernels needed for Qwen3.5 inference with a given
+    /// weight quantization and KV cache type. Runs hipcc in parallel.
+    #[cfg(feature = "deltanet")]
+    pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+        // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
+        let mut specs: Vec<(&str, String)> = vec![
+            ("rmsnorm",                  kernels::RMSNORM_SRC.to_string()),
+            ("add_inplace",              kernels::ADD_INPLACE_SRC.to_string()),
+            ("mul",                      kernels::MUL_SRC.to_string()),
+            ("silu_mul",                 kernels::SILU_MUL_SRC.to_string()),
+            ("sigmoid",                  kernels::SIGMOID_SRC.to_string()),
+            ("alpha_gate",               kernels::ALPHA_GATE_SRC.to_string()),
+            ("conv1d_silu",              kernels::CONV1D_SILU_SRC.to_string()),
+            ("l2_norm",                  kernels::L2_NORM_SRC.to_string()),
+            ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
+            ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
+            ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
+            // FullAttn: Q+gate deinterleave split
+            ("deinterleave",             kernels::DEINTERLEAVE_SRC.to_string()),
+        ];
+
+        // Weight-format-specific GEMV
+        match weight_quant {
+            "hfq6" => {
+                specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
+            }
+            "hfq4" => {
+                specs.push(("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC.to_string()));
+                specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
+            }
+            "q8" => {
+                specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
+            }
+            _ => {}
+        }
+
+        // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
+        specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
+        specs.push(("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC.to_string()));
+        specs.push(("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC.to_string()));
+
+        // DeltaNet kernels
+        specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
+
+        // KV cache kernels
+        match kv_type {
+            "turbo4" if head_dim == 256 => {
+                specs.push(("kv_cache_write_turbo4_256", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO4_256_SRC)));
+                specs.push(("attention_turbo4_kv_256",   Self::turbo_source(kernels::ATTENTION_TURBO4_KV_256_SRC)));
+            }
+            "turbo4" => {
+                specs.push(("kv_cache_write_turbo4", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO4_SRC)));
+                specs.push(("attention_turbo4_kv",   Self::turbo_source(kernels::ATTENTION_TURBO4_KV_SRC)));
+            }
+            "turbo2" if head_dim == 256 => {
+                specs.push(("kv_cache_write_turbo2_256", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO2_256_SRC)));
+                specs.push(("attention_turbo2_kv_256",   Self::turbo_source(kernels::ATTENTION_TURBO2_KV_256_SRC)));
+            }
+            "q8" | _ => {
+                specs.push(("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string()));
+                specs.push(("attention_q8_0_kv",   kernels::ATTENTION_Q8_0_KV_SRC.to_string()));
+            }
+        }
+
+        // Convert to (&str, &str) for the batch API
+        let batch: Vec<(&str, &str)> = specs.iter()
+            .map(|(name, src)| (*name, src.as_str()))
+            .collect();
+        self.compiler.compile_batch(&batch)?;
+
+        // Now load all modules + functions sequentially (GPU API)
+        for (name, src) in &specs {
+            // Map module name → function name (most are identical, a few differ)
+            let func_name = match *name {
+                "rmsnorm" => "rmsnorm_f32",
+                "add_inplace" => "add_inplace_f32",
+                "mul" => "mul_f32",
+                "silu_mul" => "silu_mul_f32",
+                "sigmoid" => "sigmoid_f32",
+                "alpha_gate" => "alpha_gate_f32",
+                "conv1d_silu" => "conv1d_silu_f32",
+                "l2_norm" => "l2_norm_f32",
+                "scale_f32" => "scale_f32",
+                "gated_norm" => "gated_norm_f32",
+                "rope_partial_interleaved" => "rope_partial_interleaved_f32",
+                "deinterleave" => "deinterleave_f32",
+                "gated_delta_net_q8" => "gated_delta_net_q8",
+                other => other,
+            };
+            if self.functions.contains_key(func_name) {
+                continue;
+            }
+            let obj_path = self.compiler.compile(name, src)?;
+            let obj_path_str = obj_path.to_str().unwrap().to_string();
+            if !self.modules.contains_key(*name) {
+                let module = self.hip.module_load(&obj_path_str)?;
+                self.modules.insert(name.to_string(), module);
+            }
+            let module = &self.modules[*name];
+            let func = self.hip.module_get_function(module, func_name)?;
+            self.functions.insert(func_name.to_string(), func);
+        }
+
+        Ok(())
     }
 }
