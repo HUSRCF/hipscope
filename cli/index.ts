@@ -50,9 +50,17 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:9b-hf6":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf6",       size_gb: 6.8,  min_vram_gb: 8,  desc: "34 tok/s, near-FP16" },
   "qwen3.5:27b-hf6":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf6",      size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
 
-  // Qwen3 HFQ4 (original quantizer filenames — see docs/MODELS.md for naming notes)
+  // Qwen3 (standard attention)
   "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",          size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
   "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
+
+  // Community finetunes (Qwen3.5 architecture, same engine)
+  "carnice:9b":      { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf4",     size_gb: 4.5, min_vram_gb: 6, desc: "Hermes tool-use finetune" },
+  "carnice:9b-hf6":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf6",     size_gb: 6.8, min_vram_gb: 8, desc: "Hermes tool-use, higher quality" },
+  "qwopus:9b":       { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf4",      size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3 finetune" },
+  "qwopus:9b-hf6":   { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf6",      size_gb: 6.8, min_vram_gb: 8, desc: "Qwopus3.5 v3, higher quality" },
+  "qwopus:4b":       { repo: "schuttdev/hipfire-qwopus-4b",    file: "qwopus-4b.hf4",      size_gb: 2.1, min_vram_gb: 4, desc: "Qwopus3.5 v3, 4B" },
+  "qwopus:27b":      { repo: "schuttdev/hipfire-qwopus-27b",   file: "qwopus-27b.hf4",     size_gb: 14.3, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B" },
 };
 
 // Aliases
