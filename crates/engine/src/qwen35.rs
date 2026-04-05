@@ -698,14 +698,9 @@ fn forward_from_x_gpu(
                 let q_dim = config.n_heads * config.head_dim;
                 let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 let gate_vec = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-                // Extract interleaved: for each head, copy head_dim floats with stride 2*head_dim
-                for h in 0..config.n_heads {
-                    let src_q_off = h * config.head_dim * 2 * 4;
-                    let src_g_off = (h * config.head_dim * 2 + config.head_dim) * 4;
-                    let dst_off = h * config.head_dim * 4;
-                    gpu.hip.memcpy_dtod_at(&q.buf, dst_off, &q_full.buf, src_q_off, config.head_dim * 4)?;
-                    gpu.hip.memcpy_dtod_at(&gate_vec.buf, dst_off, &q_full.buf, src_g_off, config.head_dim * 4)?;
-                }
+                // Deinterleave Q and gate with a single kernel dispatch
+                // (replaces per-head memcpy loop: n_heads × 2 ioctls → 1 dispatch)
+                gpu.deinterleave_f32(&q_full, &q, &gate_vec, config.n_heads, config.head_dim)?;
 
                 // Q norm
                 gpu.rmsnorm_batched(&q, &layer.q_norm, &q, config.n_heads, config.head_dim, config.norm_eps)?;
@@ -1046,14 +1041,8 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
                 weight_gemv(gpu, &layer.wq, &s.tmp, &s.fa_q_full)?;
 
-                // Split interleaved Q+gate
-                for h in 0..config.n_heads {
-                    let src_q = h * config.head_dim * 2 * 4;
-                    let src_g = (h * config.head_dim * 2 + config.head_dim) * 4;
-                    let dst = h * config.head_dim * 4;
-                    gpu.hip.memcpy_dtod_at(&s.fa_q.buf, dst, &s.fa_q_full.buf, src_q, config.head_dim * 4)?;
-                    gpu.hip.memcpy_dtod_at(&s.fa_gate.buf, dst, &s.fa_q_full.buf, src_g, config.head_dim * 4)?;
-                }
+                // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
+                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
 
                 gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
 
