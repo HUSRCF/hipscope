@@ -37,22 +37,22 @@ interface ModelEntry {
 
 const REGISTRY: Record<string, ModelEntry> = {
   // Qwen3.5 HFQ4 (default)
-  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.q4.hfq",  size_gb: 0.5,  min_vram_gb: 1,  desc: "222 tok/s, tiny & fast" },
-  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
-  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
-  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
-  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, good for simple tasks (use -hfq6 for coding)" },
+  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf4",     size_gb: 0.5,  min_vram_gb: 1,  desc: "190 tok/s, tiny & fast" },
+  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf4",       size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
+  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf4",       size_gb: 2.1,  min_vram_gb: 4,  desc: "61 tok/s, best balance" },
+  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf4",       size_gb: 4.5,  min_vram_gb: 6,  desc: "43 tok/s, best quality 8GB" },
+  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf4",      size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, use -hf6 for coding" },
 
   // Qwen3.5 HFQ6
-  "qwen3.5:0.8b-hfq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
-  "qwen3.5:2b-hfq6":   { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hfq6.hfq",   size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
-  "qwen3.5:4b-hfq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hfq6.hfq",   size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
-  "qwen3.5:9b-hfq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
-  "qwen3.5:27b-hfq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+  "qwen3.5:0.8b-hf6":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf6",     size_gb: 0.6,  min_vram_gb: 1,  desc: "180 tok/s, higher quality" },
+  "qwen3.5:2b-hf6":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf6",       size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
+  "qwen3.5:4b-hf6":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf6",       size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
+  "qwen3.5:9b-hf6":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf6",       size_gb: 6.8,  min_vram_gb: 8,  desc: "34 tok/s, near-FP16" },
+  "qwen3.5:27b-hf6":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf6",      size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
 
   // Qwen3 HFQ4 (original quantizer filenames — see docs/MODELS.md for naming notes)
-  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b-hfq4.hfq",    size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
-  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.q4.hfq",         size_gb: 4.1,  min_vram_gb: 6,  desc: "59.9 tok/s, standard attention" },
+  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",          size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
+  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
 };
 
 // Aliases
@@ -65,13 +65,15 @@ const ALIASES: Record<string, string> = {
 };
 
 function resolveModelTag(input: string): string {
+  // Backward compat: old hfq4/hfq6 tags → hf4/hf6
+  const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
   // Direct registry match
-  if (REGISTRY[input]) return input;
+  if (REGISTRY[normalized]) return normalized;
   // Alias
-  if (ALIASES[input]) return ALIASES[input];
+  if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
-  if (REGISTRY[`qwen3.5:${input}`]) return `qwen3.5:${input}`;
-  return input;
+  if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
+  return normalized;
 }
 
 function downloadUrl(entry: ModelEntry): string {
@@ -157,7 +159,7 @@ async function pull(tag: string): Promise<string> {
 
   // Hint for 27B HFQ4: recommend HFQ6 for complex tasks
   if (resolved === "qwen3.5:27b") {
-    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hfq6 (needs 24GB VRAM)`);
+    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hf6 (needs 24GB VRAM)`);
   }
 
   const url = downloadUrl(entry);
@@ -342,13 +344,17 @@ function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
+    // Backward compat: try old .hfq naming
+    const oldName = entry.file.replace(/\.hf4$/, ".q4.hfq").replace(/\.hf6$/, ".hfq6.hfq");
+    const op = join(MODELS_DIR, oldName);
+    if (existsSync(op)) return op;
   }
 
   // Fuzzy search local dirs
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   for (const dir of dirs) {
     try { for (const f of readdirSync(dir)) {
-      if (f.endsWith(".hfq") && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
     }} catch {}
   }
   return null;
@@ -359,7 +365,7 @@ function listLocal() {
   const seen = new Set<string>();
   for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
     try { for (const f of readdirSync(dir)) {
-      if (f.endsWith(".hfq") && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && !seen.has(f)) {
         seen.add(f);
         const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
         // Find matching registry tag
@@ -417,7 +423,7 @@ switch (cmd) {
   }
   case "pull": {
     const tag = rest[0];
-    if (!tag) { console.error("Usage: hipfire pull <model>\n\nExamples:\n  hipfire pull qwen3.5:9b\n  hipfire pull qwen3.5:4b-hfq6\n  hipfire pull qwen3.5:27b\n\nAvailable:\n" + Object.entries(REGISTRY).map(([t, e]) => `  ${t.padEnd(22)} ${e.size_gb.toString().padStart(5)}GB  ${e.desc}`).join("\n")); process.exit(1); }
+    if (!tag) { console.error("Usage: hipfire pull <model>\n\nExamples:\n  hipfire pull qwen3.5:9b\n  hipfire pull qwen3.5:4b-hf6\n  hipfire pull qwen3.5:27b\n\nAvailable:\n" + Object.entries(REGISTRY).map(([t, e]) => `  ${t.padEnd(22)} ${e.size_gb.toString().padStart(5)}GB  ${e.desc}`).join("\n")); process.exit(1); }
     await pull(tag);
     break;
   }
@@ -560,10 +566,10 @@ switch (cmd) {
         } else if (vram < 24000) {
           console.log("TIP: 16-24GB VRAM — qwen3.5:27b HFQ4 (14.3GB). Note: HFQ4 degrades on complex tasks");
         } else {
-          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hfq6 (21.4GB) for best quality");
+          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hf6 (21.4GB) for best quality");
         }
         if (models.length === 0) {
-          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hfq6";
+          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hf6";
           console.log(`TIP: No models downloaded. Run: hipfire pull ${rec}`);
         }
       } else {
@@ -606,7 +612,7 @@ Models:
   hipfire pull qwen3.5:9b            # 4.5GB, best quality for 8GB cards
   hipfire pull qwen3.5:4b            # 2.1GB, best speed/quality balance
   hipfire pull qwen3.5:27b           # 14.3GB, needs 16GB+ VRAM
-  hipfire pull qwen3.5:9b-hfq6      # 6.8GB, higher quality (6-bit)
+  hipfire pull qwen3.5:9b-hf6      # 6.8GB, higher quality (6-bit)
 
 Quick start:
   hipfire pull qwen3.5:4b
