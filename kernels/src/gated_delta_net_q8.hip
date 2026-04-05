@@ -71,7 +71,11 @@ __global__ void gated_delta_net_q8(
         }
     }
 
-    // Requant FP32 → Q8
+    // Requant FP32 → Q8 with stochastic rounding.
+    // Deterministic roundf systematically crushes small values to 0, causing
+    // cumulative state corruption over hundreds of tokens.
+    // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
+    // PRNG: position-derived LCG — deterministic, no shared state, no extra registers.
     for (int r = 0; r < TILE_ROWS; r++) {
         float* sr = S_tile + r * HD + col;
         float my_max = fmaxf(fmaxf(fabsf(sr[0]), fabsf(sr[1])), fmaxf(fabsf(sr[2]), fabsf(sr[3])));
@@ -80,10 +84,22 @@ __global__ void gated_delta_net_q8(
 
         float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
         signed char* dst = sq_base + r * HD + col;
-        dst[0] = (signed char)fminf(fmaxf(roundf(sr[0] * inv_s), -128.0f), 127.0f);
-        dst[1] = (signed char)fminf(fmaxf(roundf(sr[1] * inv_s), -128.0f), 127.0f);
-        dst[2] = (signed char)fminf(fmaxf(roundf(sr[2] * inv_s), -128.0f), 127.0f);
-        dst[3] = (signed char)fminf(fmaxf(roundf(sr[3] * inv_s), -128.0f), 127.0f);
+
+        // Stochastic rounding: generate 4 uniform random values in [0, 1)
+        // Seed from position + row max (changes every token, independent of individual values)
+        unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
+                         + col * 214013u + __float_as_uint(my_max) * 2531011u);
+        #define STOCH_ROUND(val) ({ \
+            rng = rng * 1664525u + 1013904223u; \
+            float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
+            float scaled = (val) * inv_s; \
+            (signed char)fminf(fmaxf(floorf(scaled + noise), -128.0f), 127.0f); \
+        })
+        dst[0] = STOCH_ROUND(sr[0]);
+        dst[1] = STOCH_ROUND(sr[1]);
+        dst[2] = STOCH_ROUND(sr[2]);
+        dst[3] = STOCH_ROUND(sr[3]);
+        #undef STOCH_ROUND
         if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
     }
 }

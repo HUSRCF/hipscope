@@ -86,9 +86,15 @@ extern "C" __global__ void gated_delta_net_q4(
     float new_scale = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
     float inv_scale = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
 
+    // Stochastic rounding: eliminates systematic bias that crushes small state values
+    unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u + __float_as_uint(amax) * 2531011u);
     for (int j = 0; j < HD; j += 2) {
-        int v0 = (int)roundf(S_local[j] * inv_scale) + 8;
-        int v1 = (int)roundf(S_local[j+1] * inv_scale) + 8;
+        rng = rng * 1664525u + 1013904223u;
+        float n0 = (float)(rng >> 8) * (1.0f / 16777216.0f);
+        rng = rng * 1664525u + 1013904223u;
+        float n1 = (float)(rng >> 8) * (1.0f / 16777216.0f);
+        int v0 = (int)floorf(S_local[j] * inv_scale + n0) + 8;
+        int v1 = (int)floorf(S_local[j+1] * inv_scale + n1) + 8;
         v0 = v0 < 0 ? 0 : (v0 > 15 ? 15 : v0);
         v1 = v1 < 0 ? 0 : (v1 > 15 ? 15 : v1);
         S_q4_row[j / 2] = (unsigned char)(v0 | (v1 << 4));

@@ -87,9 +87,10 @@ class Engine {
   private buffer = "";
 
   async start() {
+    const exe = process.platform === "win32" ? ".exe" : "";
     const bins = [
-      resolve(__dirname, "../target/release/examples/daemon"),
-      join(HIPFIRE_DIR, "bin", "daemon"),
+      resolve(__dirname, `../target/release/examples/daemon${exe}`),
+      join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
@@ -452,16 +453,18 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding...");
     const build = Bun.spawnSync(
-      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "-p", "engine"],
+      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
     // Recopy binaries
     const binDir = join(HIPFIRE_DIR, "bin");
     const { copyFileSync } = await import("fs");
-    for (const bin of ["daemon", "infer"]) {
-      const src = join(repoDir, "target/release/examples", bin);
-      if (existsSync(src)) { copyFileSync(src, join(binDir, bin)); }
+    const exe = process.platform === "win32" ? ".exe" : "";
+    for (const bin of ["daemon", "infer", "run"]) {
+      const src = join(repoDir, `target/release/examples/${bin}${exe}`);
+      const dst = join(binDir, `${bin}${exe}`);
+      if (existsSync(src)) { copyFileSync(src, dst); }
     }
     // Recopy CLI
     copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
@@ -496,9 +499,10 @@ switch (cmd) {
     console.log("hipfire diagnostics\n");
 
     // 1. Check daemon binary
+    const exe2 = process.platform === "win32" ? ".exe" : "";
     const bins = [
-      resolve(__dirname, "../target/release/examples/daemon"),
-      join(HIPFIRE_DIR, "bin", "daemon"),
+      resolve(__dirname, `../target/release/examples/daemon${exe2}`),
+      join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
     const daemonBin = bins.find(p => existsSync(p));
     console.log(`daemon binary: ${daemonBin ? "found" : "NOT FOUND"}`);

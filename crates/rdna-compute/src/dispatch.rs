@@ -2245,6 +2245,30 @@ impl Gpu {
 
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
+    /// Deinterleave: split [A_h0(hd), B_h0(hd), A_h1(hd), B_h1(hd), ...] into A and B.
+    /// Replaces per-head memcpy loop (n_heads × 2 ioctls → 1 dispatch).
+    pub fn deinterleave_f32(&mut self, interleaved: &GpuTensor, out_a: &GpuTensor, out_b: &GpuTensor,
+                            n_heads: usize, head_dim: usize) -> HipResult<()> {
+        self.ensure_kernel("deinterleave", kernels::DEINTERLEAVE_SRC, "deinterleave_f32")?;
+        let func = &self.functions["deinterleave_f32"];
+        let mut inp = interleaved.buf.as_ptr();
+        let mut ap = out_a.buf.as_ptr();
+        let mut bp = out_b.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let total = (n_heads * head_dim) as u32;
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;
         let func = &self.functions["sigmoid_f32"];
