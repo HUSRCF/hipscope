@@ -87,7 +87,7 @@ extern "C" __global__ void gated_delta_net_q4(
     float inv_scale = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
 
     // Stochastic rounding: eliminates systematic bias that crushes small state values
-    unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u + n_tokens * 2531011u);
+    unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u + __float_as_uint(S_local[0]) * 2531011u);
     for (int j = 0; j < HD; j += 2) {
         rng = rng * 1664525u + 1013904223u;
         float n0 = (float)(rng >> 8) * (1.0f / 16777216.0f);

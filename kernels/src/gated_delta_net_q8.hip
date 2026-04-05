@@ -86,9 +86,9 @@ __global__ void gated_delta_net_q8(
         signed char* dst = sq_base + r * HD + col;
 
         // Stochastic rounding: generate 4 uniform random values in [0, 1)
-        // Seed from position (h, tile, r, col, n_tokens) for determinism
+        // Seed from position + state values (state changes every token, so seed varies)
         unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
-                         + col * 214013u + n_tokens * 2531011u);
+                         + col * 214013u + __float_as_uint(sr[0]) * 2531011u);
         #define STOCH_ROUND(val) ({ \
             rng = rng * 1664525u + 1013904223u; \
             float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
