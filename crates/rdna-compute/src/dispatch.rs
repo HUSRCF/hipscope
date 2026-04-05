@@ -2998,6 +2998,57 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], shared, self.stream_ref(), &mut params) }
     }
 
+    // ═══ HF4-V: hipfire-native 4-bit V cache (no FWHT, RDNA-optimized) ═══
+
+    /// Write V to HF4 format: L2-normalize, affine 4-bit quantize, store norm+scale+min+nibbles.
+    pub fn kv_cache_write_hf4v_256(
+        &mut self, v_dst: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_hf4v_256", kernels::KV_CACHE_WRITE_HF4V_256_SRC, "kv_cache_write_hf4v_256")?;
+        let func = &self.functions["kv_cache_write_hf4v_256"];
+        let mut sp = v_src.buf.as_ptr();
+        let mut dp = v_dst.buf.as_ptr();
+        let mut pb = pos_buf.as_ptr();
+        let mut nk = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as _, &mut dp as *mut _ as _,
+            &mut pb as *mut _ as _, &mut nk as *mut _ as _, &mut hd as *mut _ as _,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Asymmetric attention: Q8 K + HF4 V, head_dim=256.
+    /// Dequant: 1 FMA per V element, no FWHT inverse. 32 VGPRs.
+    pub fn attention_q8k_hf4v_256(
+        &mut self, q: &GpuTensor, k_q8: &GpuTensor, v_hf4: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8k_hf4v_256", kernels::ATTENTION_Q8K_HF4V_256_SRC, "attention_q8k_hf4v_256")?;
+        let func = &self.functions["attention_q8k_hf4v_256"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_q8.buf.as_ptr();
+        let mut vp = v_hf4.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut pb = pos_buf.as_ptr();
+        let mut sl = seq_len as i32;
+        let mut nh = n_heads as i32;
+        let mut nk = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as _, &mut kp as *mut _ as _, &mut vp as *mut _ as _,
+            &mut op as *mut _ as _, &mut pb as *mut _ as _,
+            &mut sl as *mut _ as _, &mut nh as *mut _ as _, &mut nk as *mut _ as _,
+            &mut hd as *mut _ as _, &mut ms as *mut _ as _, &mut scale as *mut _ as _,
+        ];
+        let shared = (seq_len * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], shared, self.stream_ref(), &mut params) }
+    }
+
     // ═══ Symmetric turbo for head_dim=256 ═══
 
     /// Fused K+V turbo4 write for head_dim=256. 32 threads × 8 dims.

@@ -565,5 +565,8 @@ pub const KV_CACHE_WRITE_TURBO4_V256_SRC: &str = include_str!("../../../kernels/
 pub const ATTENTION_Q8K_TURBO4V_256_SRC: &str = include_str!("../../../kernels/src/attention_q8k_turbo4v_256.hip");
 
 /// Deinterleave: split [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] into separate Q and Gate tensors.
-/// Replaces per-head memcpy loop (n_heads × 2 ioctls → 1 kernel dispatch).
 pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterleave.hip");
+
+/// HF4-V: hipfire-native 4-bit V cache (no FWHT, 1 FMA dequant, RDNA-optimized layout)
+pub const KV_CACHE_WRITE_HF4V_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_hf4v_256.hip");
+pub const ATTENTION_Q8K_HF4V_256_SRC: &str = include_str!("../../../kernels/src/attention_q8k_hf4v_256.hip");

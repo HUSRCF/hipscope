@@ -30,8 +30,10 @@ fn main() {
     eprintln!("FA layers: {n_kv_layers}, max_seq: {max_seq}\n");
 
     // Test Q8 and asymmetric at different prefilled context lengths
-    for mode in ["q8", "asym"] {
+    for mode in ["q8", "asym", "hf4"] {
         let mut kv = match mode {
+            "hf4" => llama::KvCache::new_gpu_q8k_hf4v(
+                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap(),
             "asym" => llama::KvCache::new_gpu_asym_q8k_turbo4v_boundary(
                 &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, 2, n_kv_layers).unwrap(),
             _ => llama::KvCache::new_gpu_q8(

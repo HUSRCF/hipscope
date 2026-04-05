@@ -1056,7 +1056,16 @@ fn forward_scratch_layers(
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
-                if kv_cache.quant_asym && kv_cache.is_boundary(kv_layer_idx) {
+                if kv_cache.quant_hf4v {
+                    // HF4-V: Q8 K + hipfire-native 4-bit V (no FWHT, 1 FMA dequant)
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_hf4v_256(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_q8k_hf4v_256(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                } else if kv_cache.quant_asym && kv_cache.is_boundary(kv_layer_idx) {
                     // Boundary layer (LA-V7): Q8 for both K and V (full quality)
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
