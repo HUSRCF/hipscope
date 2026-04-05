@@ -295,7 +295,43 @@ async function serve(port: number) {
         await acquireLock();
         try {
         const body = await req.json();
-        const prompt = (body.messages || []).map((m: any) => m.content).join("\n");
+        const messages: any[] = body.messages || [];
+        const tools: any[] = body.tools || [];
+
+        // Build prompt from messages with proper role handling
+        let systemPrompt = "";
+        let userPrompt = "";
+
+        // Extract system message
+        const sysMsg = messages.find((m: any) => m.role === "system");
+        if (sysMsg) systemPrompt = sysMsg.content;
+
+        // Format tools into system prompt (Hermes format)
+        if (tools.length > 0) {
+          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            + tools.map((t: any) => JSON.stringify(t)).join("\n")
+            + "\n</tools>\n\n"
+            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        }
+
+        // Build the user prompt from the last user message (daemon handles multi-turn)
+        const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
+        if (lastUser) {
+          // Include tool results if present before the user message
+          const toolResults = messages.filter((m: any) => m.role === "tool");
+          if (toolResults.length > 0) {
+            userPrompt = toolResults.map((t: any) =>
+              `<tool_response>\n${t.content}\n</tool_response>`
+            ).join("\n") + "\n\n" + (lastUser.content || "");
+          } else {
+            userPrompt = lastUser.content || "";
+          }
+        } else {
+          userPrompt = messages.filter((m: any) => m.role !== "system").map((m: any) => m.content).join("\n");
+        }
+
         const path = findModel(body.model || "default");
         if (!path) { releaseLock(); return Response.json({ error: "model not found" }, { status: 404 }); }
 
@@ -307,23 +343,48 @@ async function serve(port: number) {
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const modelName = body.model || "hipfire";
-        const genParams = {
-          type: "generate", id: "api", prompt,
+        const genParams: any = {
+          type: "generate", id: "api", prompt: userPrompt,
           temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
           max_tokens: body.max_tokens ?? 512,
           repeat_penalty: body.repeat_penalty ?? body.frequency_penalty ? 1.0 + (body.frequency_penalty ?? 0) : 1.3,
           top_p: body.top_p ?? 0.8,
         };
+        if (systemPrompt) genParams.system = systemPrompt;
+
+        // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
+        function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
+          if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
+          const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
+          const matches = [...text.matchAll(pattern)];
+          if (!matches.length) return { content: text, tool_calls: null };
+          const tool_calls: any[] = [];
+          for (const m of matches) {
+            const raw = (m[1] || m[2] || "").trim();
+            if (!raw) continue;
+            try {
+              const tc = JSON.parse(raw);
+              tool_calls.push({
+                id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                type: "function",
+                function: { name: tc.name, arguments: JSON.stringify(tc.arguments || {}) }
+              });
+            } catch {}
+          }
+          if (!tool_calls.length) return { content: text, tool_calls: null };
+          const before = text.slice(0, text.indexOf("<tool_call>")).trim();
+          return { content: before || null, tool_calls };
+        }
 
         if (body.stream) {
           const enc = new TextEncoder();
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
-                let tokens = 0;
+                let fullText = "";
                 for await (const msg of e.generate(genParams)) {
                   if (msg.type === "token") {
-                    tokens++;
+                    fullText += msg.text;
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                       id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
                       choices: [{ index: 0, delta: { content: msg.text }, finish_reason: null }]
@@ -349,9 +410,19 @@ async function serve(port: number) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
           else if (msg.type === "done") { promptTokens = msg.prompt_tokens ?? 0; }
         }
+
+        // Check for tool calls in response
+        const parsed = parseToolCalls(content);
+        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
+        if (parsed.tool_calls) {
+          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+        } else {
+          choice.message = { role: "assistant", content };
+        }
+
         return Response.json({
           id: reqId, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelName,
-          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          choices: [choice],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
         });
         } finally { releaseLock(); }
