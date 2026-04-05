@@ -44,6 +44,9 @@ struct LoadedModel {
     vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
     tokenizer: Option<engine::tokenizer::Tokenizer>,
+    // Multi-turn conversation state
+    seq_pos: usize,              // current position in KV cache / DeltaNet state
+    conversation_tokens: Vec<u32>, // full token history for repeat penalty
 }
 
 fn main() {
@@ -216,6 +219,7 @@ fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
+            seq_pos: 0, conversation_tokens: Vec::new(),
         })
     } else {
         // Qwen3 / LLaMA
@@ -236,6 +240,7 @@ fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
+            seq_pos: 0, conversation_tokens: Vec::new(),
         })
     }
 }
@@ -253,7 +258,7 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
-    // Build ChatML prompt
+    // Build ChatML turn: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
     let im_start = tokenizer.encode("<|im_start|>");
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -261,42 +266,45 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     let asst_tok = tokenizer.encode("assistant");
     let q_tokens = tokenizer.encode(prompt);
 
-    let mut prompt_tokens = Vec::new();
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&user_tok);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&q_tokens);
-    prompt_tokens.extend_from_slice(&im_end);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&asst_tok);
-    prompt_tokens.extend_from_slice(&nl);
+    let mut new_tokens = Vec::new();
+    new_tokens.extend_from_slice(&im_start);
+    new_tokens.extend_from_slice(&user_tok);
+    new_tokens.extend_from_slice(&nl);
+    new_tokens.extend_from_slice(&q_tokens);
+    new_tokens.extend_from_slice(&im_end);
+    new_tokens.extend_from_slice(&nl);
+    new_tokens.extend_from_slice(&im_start);
+    new_tokens.extend_from_slice(&asst_tok);
+    new_tokens.extend_from_slice(&nl);
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let t0 = Instant::now();
 
     if m.arch_id == 5 {
-        // Qwen3.5 path
+        // Qwen3.5 path — multi-turn: prefill only the NEW turn tokens,
+        // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();
         let scratch = m.q35_scratch.as_ref().unwrap();
         let kv = m.kv_cache.as_mut().unwrap();
         let dn = m.dn_state.as_mut().unwrap();
 
-        // Prefill
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+        // Prefill this turn's tokens at the correct position
+        for (i, &tok) in new_tokens.iter().enumerate() {
+            let pos = m.seq_pos + i;
             qwen35::forward_scratch(gpu, weights, config, tok, pos, kv, dn, scratch).unwrap();
         }
+        m.seq_pos += new_tokens.len();
+        m.conversation_tokens.extend_from_slice(&new_tokens);
 
         // Generate
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
         let mut next_token = llama::sample_top_p(&logits, temp, top_p);
         let mut generated = 0;
-        let mut token_history = prompt_tokens.clone();
 
         for _ in 0..max_tokens {
             generated += 1;
-            token_history.push(next_token);
+            m.conversation_tokens.push(next_token);
             let text = tokenizer.decode(&[next_token]);
             let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
             let _ = stdout.flush();
@@ -304,29 +312,41 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            let pos = prompt_tokens.len() + generated - 1;
+            let pos = m.seq_pos + generated - 1;
             qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_ngram_block(&mut logits, &token_history);
-            llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
+            llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+            llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
             next_token = llama::sample_top_p(&logits, temp, top_p);
+        }
+        m.seq_pos += generated;
+
+        // Append the im_end token to conversation so next turn sees clean boundary
+        if im_end_token.is_some() {
+            m.conversation_tokens.extend_from_slice(&im_end);
+            m.conversation_tokens.extend_from_slice(&nl);
+            // Don't need to run forward for these — they'll be part of next turn's "history"
+            // The KV cache doesn't need them since the model already generated past them
         }
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
         let _ = stdout.flush();
     } else {
-        // Qwen3 / LLaMA path
+        // Qwen3 / LLaMA path — multi-turn aware
         let config = m.llama_config.as_ref().unwrap();
         let weights = m.llama_weights.as_ref().unwrap();
         let scratch = m.llama_scratch.as_ref().unwrap();
         let kv = m.llama_kv.as_mut().unwrap();
 
         let mut rng_state = 42u32;
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+        for (i, &tok) in new_tokens.iter().enumerate() {
+            let pos = m.seq_pos + i;
             let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
             rng_state = rng;
         }
+        m.seq_pos += new_tokens.len();
+        m.conversation_tokens.extend_from_slice(&new_tokens);
 
         let mut out_bytes = [0u8; 8];
         gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
@@ -334,11 +354,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
 
         let mut generated = 0;
-        let mut token_history = prompt_tokens.clone();
 
         for _ in 0..max_tokens {
             generated += 1;
-            token_history.push(next_token);
+            m.conversation_tokens.push(next_token);
             let text = tokenizer.decode(&[next_token]);
             let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
             let _ = stdout.flush();
@@ -348,16 +367,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
             // Qwen3/LLaMA scratch repeat_buf is 64 slots — clamp window to fit
             let rw = repeat_window.min(64);
-            let hist_start = token_history.len().saturating_sub(rw);
-            let hist_slice = &token_history[hist_start..];
+            let hist_start = m.conversation_tokens.len().saturating_sub(rw);
+            let hist_slice = &m.conversation_tokens[hist_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 
-            let pos = prompt_tokens.len() + generated - 1;
+            let pos = m.seq_pos + generated - 1;
             let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, top_p, rng_state, hist_slice.len(), repeat_penalty).unwrap();
             next_token = tok;
             rng_state = rng;
         }
+        m.seq_pos += generated;
+        m.conversation_tokens.extend_from_slice(&im_end);
+        m.conversation_tokens.extend_from_slice(&nl);
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
