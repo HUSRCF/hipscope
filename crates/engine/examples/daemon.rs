@@ -374,9 +374,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             next_token = llama::sample_top_p(&logits, temp, top_p);
         }
         m.seq_pos += generated;
-        // Note: im_end token is already in conversation_tokens (pushed before break check).
-        // Don't append synthetic boundary tokens — they'd desync seq_pos vs conversation_tokens.
-        // Next turn's ChatML framing (<|im_start|>user\n...) provides the boundary.
+
+        // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
+        // and DeltaNet state stay in sync with seq_pos.
+        if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+            for &t in &nl {
+                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                m.seq_pos += 1;
+                m.conversation_tokens.push(t);
+            }
+        }
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
@@ -427,6 +434,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             rng_state = rng;
         }
         m.seq_pos += generated;
+
+        // ChatML \n boundary — run through forward to keep KV cache in sync
+        if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+            for &t in &nl {
+                let (_, rng2) = llama::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
+                rng_state = rng2;
+                m.seq_pos += 1;
+                m.conversation_tokens.push(t);
+            }
+        }
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
@@ -558,6 +575,15 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         next_token = llama::sample_top_p(&logits, temp, top_p);
     }
     m.seq_pos += generated;
+
+    // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
+    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+        for &t in &nl {
+            qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+            m.seq_pos += 1;
+            m.conversation_tokens.push(t);
+        }
+    }
 
     let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
     let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
