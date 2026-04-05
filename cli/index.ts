@@ -474,12 +474,14 @@ switch (cmd) {
     const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
     let gpuArch = "unknown";
     if (verMatch) {
-      const v = verMatch[1];
-      if (v === "100100") gpuArch = "gfx1010";
-      else if (v === "100300" || v === "100302") gpuArch = "gfx1030";
-      else if (v === "110000" || v === "110001") gpuArch = "gfx1100";
-      else if (v === "120000") gpuArch = "gfx1200";
-      else if (v === "120001") gpuArch = "gfx1201";
+      // Derive gfx arch from version number: e.g. 100100→gfx1010, 110001→gfx1100, 115100→gfx1151
+      const ver = parseInt(verMatch[1]);
+      const major = Math.floor(ver / 10000);
+      const minor = Math.floor((ver % 10000) / 100);
+      const step = ver % 100;
+      gpuArch = `gfx${major}${minor.toString().padStart(2, '0')}${step || '0'}`;
+      // Normalize: gfx10010 → gfx1010, gfx110000 stays gfx1100
+      gpuArch = gpuArch.replace(/^(gfx\d{4})0$/, '$1');
     }
     if (gpuArch !== "unknown") {
       const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
