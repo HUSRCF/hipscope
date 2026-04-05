@@ -140,6 +140,18 @@ fn main() {
                 if let Some(ref mut m) = model {
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
+                    // Zero DeltaNet recurrent state (Qwen3.5)
+                    if let Some(ref dn) = m.dn_state {
+                        for s in &dn.s_matrices {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.s_scales {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.conv_states {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -277,6 +289,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        // Zero DeltaNet state on reset
+        if let Some(ref dn) = m.dn_state {
+            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
     }
 
     let im_start = tokenizer.encode("<|im_start|>");
@@ -424,7 +442,20 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+    // Capacity guard — VL prompts are large (vision tokens + text)
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let prompt_est = tokenizer.encode(prompt).len() + 600; // ~500 vision tokens + ChatML overhead
+    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+        eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        // Zero DeltaNet state on reset
+        if let Some(ref dn) = m.dn_state {
+            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
+    }
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
     let vision_weights = m.vision_weights.as_ref().unwrap();
