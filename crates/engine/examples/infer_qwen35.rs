@@ -72,7 +72,13 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let mut kv_cache = llama::KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap();
+    let turbo_bits: u8 = std::env::var("TURBO").and_then(|v| v.parse().map_err(|_| std::env::VarError::NotPresent)).unwrap_or(0);
+    let mut kv_cache = if turbo_bits >= 2 && turbo_bits <= 4 {
+        eprintln!("KV cache: turbo{turbo_bits}");
+        llama::KvCache::new_gpu_turbo(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, turbo_bits).unwrap()
+    } else {
+        llama::KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap()
+    };
     let mut dn_state = if std::env::var("FP32_STATE").is_ok() {
         DeltaNetState::new_with_quant(&mut gpu, &config, engine::qwen35::StateQuant::FP32).unwrap()
     } else {
