@@ -1,8 +1,7 @@
-# Build
+# Build output (not binaries shipped in releases)
 /target
 *.o
 *.so
-*.exe
 *.dll
 
 # Editor
