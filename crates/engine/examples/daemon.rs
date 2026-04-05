@@ -46,6 +46,7 @@ struct LoadedModel {
     tokenizer: Option<engine::tokenizer::Tokenizer>,
     // Multi-turn conversation state
     seq_pos: usize,              // current position in KV cache / DeltaNet state
+    max_seq: usize,              // KV cache capacity
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
 }
 
@@ -134,6 +135,18 @@ fn main() {
                 }
             }
 
+            "reset" => {
+                // Reset conversation state without unloading the model
+                if let Some(ref mut m) = model {
+                    m.seq_pos = 0;
+                    m.conversation_tokens.clear();
+                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                } else {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                }
+                let _ = stdout.flush();
+            }
+
             "unload" => {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
@@ -220,7 +233,7 @@ fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, conversation_tokens: Vec::new(),
+            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
         })
     } else {
         // Qwen3 / LLaMA
@@ -241,7 +254,7 @@ fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, conversation_tokens: Vec::new(),
+            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
         })
     }
 }
@@ -257,7 +270,14 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 }
 
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+    // Check KV capacity — auto-reset if conversation would overflow
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let prompt_est = tokenizer.encode(prompt).len() + 20; // rough: tokens + ChatML overhead
+    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+        eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
 
     let im_start = tokenizer.encode("<|im_start|>");
     let im_end = tokenizer.encode("<|im_end|>");
