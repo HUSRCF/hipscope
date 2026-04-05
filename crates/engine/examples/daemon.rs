@@ -128,7 +128,7 @@ fn main() {
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
                     generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 }
@@ -403,7 +403,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -428,7 +428,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
         .expect("vision forward failed");
 
-    // Build VL prompt: <|im_start|>user\n<|vision_start|><|image_pad|>×N<|vision_end|>\n{question}<|im_end|>\n<|im_start|>assistant\n
+    // Build VL prompt
     let im_start = tokenizer.encode("<|im_start|>");
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -437,6 +437,21 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let q_tokens = tokenizer.encode(prompt);
 
     let mut prompt_tokens: Vec<u32> = Vec::new();
+
+    // System prompt on first turn
+    if m.seq_pos == 0 {
+        if let Some(sys) = system_prompt {
+            let sys_tok = tokenizer.encode("system");
+            let sys_content = tokenizer.encode(sys);
+            prompt_tokens.extend_from_slice(&im_start);
+            prompt_tokens.extend_from_slice(&sys_tok);
+            prompt_tokens.extend_from_slice(&nl);
+            prompt_tokens.extend_from_slice(&sys_content);
+            prompt_tokens.extend_from_slice(&im_end);
+            prompt_tokens.extend_from_slice(&nl);
+        }
+    }
+
     prompt_tokens.extend_from_slice(&im_start);
     prompt_tokens.extend_from_slice(&user_tok);
     prompt_tokens.extend_from_slice(&nl);
