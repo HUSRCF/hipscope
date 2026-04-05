@@ -507,6 +507,23 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓`);
       }
     }
+    // Rename legacy .hfq model files to .hf4/.hf6
+    const { renameSync } = await import("fs");
+    try {
+      for (const f of readdirSync(MODELS_DIR)) {
+        if (!f.endsWith(".hfq")) continue;
+        let newName = "";
+        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, ".hf4");
+        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, ".hf6");
+        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, ".hf4");
+        else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
+        else newName = f.replace(/\.hfq$/, ".hf4"); // bare .hfq → assume hf4
+        if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
+          renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
+          console.error(`  Renamed ${f} → ${newName}`);
+        }
+      }
+    } catch {}
     console.error("hipfire updated ✓");
     break;
   }
