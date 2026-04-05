@@ -298,6 +298,10 @@ async function serve(port: number) {
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
+        // OpenAI API is stateless: each request has the full conversation.
+        // Reset daemon state so prior requests don't bleed into this one.
+        await e.send({ type: "reset" }); await e.recv();
+
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
         let userPrompt = "";
@@ -316,21 +320,26 @@ async function serve(port: number) {
           systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
         }
 
-        // Build the user prompt from the last user message (daemon handles multi-turn)
-        const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
-        if (lastUser) {
-          // Include tool results if present before the user message
-          const toolResults = messages.filter((m: any) => m.role === "tool");
-          if (toolResults.length > 0) {
-            userPrompt = toolResults.map((t: any) =>
-              `<tool_response>\n${t.content}\n</tool_response>`
-            ).join("\n") + "\n\n" + (lastUser.content || "");
+        // Build conversation as a single prompt preserving message order.
+        // Skip the system message (handled separately), render everything else in order.
+        const convParts: string[] = [];
+        for (const m of messages) {
+          if (m.role === "system") continue;
+          if (m.role === "tool") {
+            convParts.push(`<tool_response>\n${m.content}\n</tool_response>`);
+          } else if (m.role === "assistant" && m.tool_calls) {
+            // Re-emit assistant tool calls so the model sees them in context
+            let text = m.content || "";
+            for (const tc of m.tool_calls) {
+              const fn = tc.function || tc;
+              text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+            }
+            convParts.push(text);
           } else {
-            userPrompt = lastUser.content || "";
+            convParts.push(m.content || "");
           }
-        } else {
-          userPrompt = messages.filter((m: any) => m.role !== "system").map((m: any) => m.content).join("\n");
         }
+        userPrompt = convParts.join("\n");
 
         const path = findModel(body.model || "default");
         if (!path) { releaseLock(); return Response.json({ error: "model not found" }, { status: 404 }); }
