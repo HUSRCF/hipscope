@@ -344,10 +344,18 @@ function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
-    // Backward compat: try old .hfq naming
-    const oldName = entry.file.replace(/\.hf4$/, ".q4.hfq").replace(/\.hf6$/, ".hfq6.hfq");
-    const op = join(MODELS_DIR, oldName);
-    if (existsSync(op)) return op;
+    // Backward compat: try all old .hfq naming variants
+    const base = entry.file.replace(/\.(hf4|hf6)$/, "");
+    const oldNames = [
+      base + ".q4.hfq",       // qwen3.5-9b.q4.hfq
+      base + ".hfq6.hfq",     // qwen3.5-9b.hfq6.hfq
+      base + "-hfq4.hfq",     // qwen3-0.6b-hfq4.hfq
+      base + ".hfq",          // bare .hfq
+    ];
+    for (const old of oldNames) {
+      const op = join(MODELS_DIR, old);
+      if (existsSync(op)) return op;
+    }
   }
 
   // Fuzzy search local dirs
@@ -368,8 +376,9 @@ function listLocal() {
       if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && !seen.has(f)) {
         seen.add(f);
         const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-        // Find matching registry tag
-        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f)?.[0] || "";
+        // Find matching registry tag (check new and old naming)
+        const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
+        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
         models.push({ name: f, tag, size: `${sz}GB` });
       }
     }} catch {}
