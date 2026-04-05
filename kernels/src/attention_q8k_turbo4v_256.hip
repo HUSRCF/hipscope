@@ -2,18 +2,22 @@
 #include "turbo_common.h"
 
 // Asymmetric attention: Q8 K cache + turbo4 V cache, head_dim=256.
-// Structurally matches attention_turbo4_kv_256.hip exactly — only the K dot
-// product differs (Q8 dequant instead of turbo centroid lookup, Q not rotated).
+// VGPR-optimized for RDNA wave32: targets ≤24 VGPRs for 10 waves/SIMD.
+//
+// Key optimizations vs previous version (40 VGPRs):
+// - K dot: no inner loop, direct block access (8 dims always in 1 Q8 block)
+// - V accumulate: vectorized u32 byte load instead of 4× individual
+// - Q values loaded per-position (L1 cached), not hoisted to registers
 // Grid: [n_heads]. Block: [32]. Shared: scores[seq_len].
-extern "C" __launch_bounds__(32, 8)
+extern "C" __launch_bounds__(32, 10)
 __global__ void attention_q8k_turbo4v_256(
-    const float* __restrict__ q,           // [n_heads * 256]
-    const unsigned char* __restrict__ k_q8, // Q8_0 format K cache
-    const unsigned char* __restrict__ v_t4, // turbo4 format V cache
-    float* __restrict__ out,               // [n_heads * 256]
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_q8,
+    const unsigned char* __restrict__ v_t4,
+    float* __restrict__ out,
     const int* __restrict__ pos_buf,
-    const float* __restrict__ signs1,      // [256]
-    const float* __restrict__ signs2,      // [256]
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
     int seq_len_hint,
     int n_heads, int n_kv_heads, int head_dim, int max_seq,
     float scale_attn
@@ -23,93 +27,83 @@ __global__ void attention_q8k_turbo4v_256(
     const int h = blockIdx.x;
     if (h >= n_heads) return;
 
-    const int kv_group = n_heads / n_kv_heads;
-    const int kv_h = h / kv_group;
+    const int kv_h = h / (n_heads / n_kv_heads);
     const int tid = threadIdx.x;
     const int d0 = tid * 8;
 
+    // Q8 K layout constants
+    const int q8_bph = (head_dim / 32) * 34;          // 272 bytes per head
+    const int q8_bpp = n_kv_heads * q8_bph;            // bytes per position
+    // Thread's Q8 block: d0/32 gives block index, d0%32 gives offset within block
+    const int blk_idx = d0 / 32;
+    const int blk_off = d0 % 32;
+    const int blk_byte_off = kv_h * q8_bph + blk_idx * 34;
+
+    // Turbo4 V layout constants
+    const int t4_bph = 4 + head_dim / 2;               // 132 bytes per head
+    const int t4_bpp = n_kv_heads * t4_bph;
+    const int t4_head_off = kv_h * t4_bph;
+
     float* scores = sdata;
+    const float* qh = q + h * head_dim + d0;
 
-    // Q8 K cache layout: [max_seq * n_kv_heads * (blocks_per_head * 34)]
-    // Each Q8_0 block: [f16 scale (2B)] [32 × int8 (32B)] = 34 bytes per 32 elements
-    const int q8_blocks_per_head = head_dim / 32;  // 8
-    const int q8_bytes_per_head = q8_blocks_per_head * 34;  // 272
-    const int q8_bytes_per_pos = n_kv_heads * q8_bytes_per_head;
-
-    // Turbo4 V cache layout: [max_seq * n_kv_heads * (4 + head_dim/2)]
-    const int t4_bytes_per_head = 4 + head_dim / 2;  // 132
-    const int t4_bytes_per_pos = n_kv_heads * t4_bytes_per_head;
-
-    // Load raw Q (NOT FWHT-rotated — K is stored as raw Q8, not turbo)
-    const float* q_head = q + h * head_dim;
-
-    // ── Phase 1: Q @ K^T with Q8 dequant ──
-    // Warp-cooperative: all 32 threads on each position, shuffle-reduce.
-    // Each thread handles 8 dims of the 256-dim dot product.
+    // ── Phase 1: Q @ K^T — Q8 dequant, no inner loop ──
     for (int t = 0; t < seq_len; t++) {
-        const unsigned char* kb = k_q8 + (size_t)t * q8_bytes_per_pos + kv_h * q8_bytes_per_head;
+        const unsigned char* blk = k_q8 + (size_t)t * q8_bpp + blk_byte_off;
+        float bs = (float)(*((const _Float16*)blk));
+        const signed char* v = (const signed char*)(blk + 2) + blk_off;
 
-        // Each thread dequants its 8 dims from Q8 blocks and dots with Q
-        float partial = 0.0f;
-        // tid*8 .. tid*8+7 spans across Q8 blocks: block = d/32, offset = d%32
-        for (int i = 0; i < 8; i++) {
-            int d = d0 + i;
-            int blk = d / 32;
-            int off = d % 32;
-            const unsigned char* block = kb + blk * 34;
-            float bscale = (float)(*((const _Float16*)block));
-            float k_val = bscale * (float)((const signed char*)(block + 2))[off];
-            partial += q_head[d] * k_val;
-        }
+        float p = qh[0] * (bs * (float)v[0])
+                + qh[1] * (bs * (float)v[1])
+                + qh[2] * (bs * (float)v[2])
+                + qh[3] * (bs * (float)v[3])
+                + qh[4] * (bs * (float)v[4])
+                + qh[5] * (bs * (float)v[5])
+                + qh[6] * (bs * (float)v[6])
+                + qh[7] * (bs * (float)v[7]);
 
-        // Warp shuffle reduce (32 → 1)
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0) scores[t] = partial * scale_attn;
+        for (int off = 16; off > 0; off >>= 1) p += __shfl_xor(p, off);
+        if (tid == 0) scores[t] = p * scale_attn;
     }
     __syncthreads();
 
-    // ── Softmax (warp shuffle, matches symmetric kernel exactly) ──
+    // ── Softmax (warp shuffle) ──
     float lmx = -1e30f;
     for (int t = tid; t < seq_len; t += 32) lmx = fmaxf(lmx, scores[t]);
     for (int off = 16; off > 0; off >>= 1) lmx = fmaxf(lmx, __shfl_xor(lmx, off));
-    float mx = lmx;
     float lsm = 0.0f;
     for (int t = tid; t < seq_len; t += 32) {
-        float e = expf(scores[t] - mx); scores[t] = e; lsm += e;
+        float e = expf(scores[t] - lmx); scores[t] = e; lsm += e;
     }
     for (int off = 16; off > 0; off >>= 1) lsm += __shfl_xor(lsm, off);
     __syncthreads();
-    float inv_sum = 1.0f / lsm;
-    for (int t = tid; t < seq_len; t += 32) scores[t] *= inv_sum;
+    float is = 1.0f / lsm;
+    for (int t = tid; t < seq_len; t += 32) scores[t] *= is;
     __syncthreads();
 
-    // ── Phase 2: V weighted sum (turbo4, identical to symmetric kernel) ──
-    float mv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // ── Phase 2: V weighted sum — turbo4 with sparse skip ──
+    float m0 = 0, m1 = 0, m2 = 0, m3 = 0, m4 = 0, m5 = 0, m6 = 0, m7 = 0;
     for (int t = 0; t < seq_len; t++) {
         float w = scores[t];
-        if (w < 1e-8f) continue;  // sparse V skip
-        const unsigned char* vb = v_t4 + (size_t)t * t4_bytes_per_pos + kv_h * t4_bytes_per_head;
+        if (w < 1e-8f) continue;
+        const unsigned char* vb = v_t4 + (size_t)t * t4_bpp + t4_head_off;
         float wn = w * *(const float*)vb;
-        unsigned char b0 = vb[4 + tid * 4];
-        unsigned char b1 = vb[4 + tid * 4 + 1];
-        unsigned char b2 = vb[4 + tid * 4 + 2];
-        unsigned char b3 = vb[4 + tid * 4 + 3];
-        mv[0] += wn * TURBO_C4_256[b0 & 0xF];
-        mv[1] += wn * TURBO_C4_256[b0 >> 4];
-        mv[2] += wn * TURBO_C4_256[b1 & 0xF];
-        mv[3] += wn * TURBO_C4_256[b1 >> 4];
-        mv[4] += wn * TURBO_C4_256[b2 & 0xF];
-        mv[5] += wn * TURBO_C4_256[b2 >> 4];
-        mv[6] += wn * TURBO_C4_256[b3 & 0xF];
-        mv[7] += wn * TURBO_C4_256[b3 >> 4];
+        // Vectorized 4-byte load
+        unsigned int pk = *(const unsigned int*)(vb + 4 + tid * 4);
+        m0 += wn * TURBO_C4_256[(pk)       & 0xF];
+        m1 += wn * TURBO_C4_256[(pk >> 4)  & 0xF];
+        m2 += wn * TURBO_C4_256[(pk >> 8)  & 0xF];
+        m3 += wn * TURBO_C4_256[(pk >> 12) & 0xF];
+        m4 += wn * TURBO_C4_256[(pk >> 16) & 0xF];
+        m5 += wn * TURBO_C4_256[(pk >> 20) & 0xF];
+        m6 += wn * TURBO_C4_256[(pk >> 24) & 0xF];
+        m7 += wn * TURBO_C4_256[(pk >> 28) & 0xF];
     }
 
-    // ── Inverse FWHT-256 on V (undo turbo4 rotation) ──
-    fwht_shfl_inverse_256(mv[0], mv[1], mv[2], mv[3], mv[4], mv[5], mv[6], mv[7],
-                          signs1, signs2, tid);
+    // ── Inverse FWHT-256 ──
+    fwht_shfl_inverse_256(m0, m1, m2, m3, m4, m5, m6, m7, signs1, signs2, tid);
 
-    float* oh = out + h * head_dim;
-    oh[d0] = mv[0]; oh[d0+1] = mv[1]; oh[d0+2] = mv[2]; oh[d0+3] = mv[3];
-    oh[d0+4] = mv[4]; oh[d0+5] = mv[5]; oh[d0+6] = mv[6]; oh[d0+7] = mv[7];
+    float* oh = out + h * head_dim + d0;
+    oh[0] = m0; oh[1] = m1; oh[2] = m2; oh[3] = m3;
+    oh[4] = m4; oh[5] = m5; oh[6] = m6; oh[7] = m7;
 }
