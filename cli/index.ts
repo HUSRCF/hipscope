@@ -344,14 +344,12 @@ function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
-    // Backward compat: try all old .hfq naming variants
+    // Backward compat: try old .hfq naming for the SAME quant level only
     const base = entry.file.replace(/\.(hf4|hf6)$/, "");
-    const oldNames = [
-      base + ".q4.hfq",       // qwen3.5-9b.q4.hfq
-      base + ".hfq6.hfq",     // qwen3.5-9b.hfq6.hfq
-      base + "-hfq4.hfq",     // qwen3-0.6b-hfq4.hfq
-      base + ".hfq",          // bare .hfq
-    ];
+    const isHf6 = entry.file.endsWith(".hf6");
+    const oldNames = isHf6
+      ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
+      : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
     for (const old of oldNames) {
       const op = join(MODELS_DIR, old);
       if (existsSync(op)) return op;
