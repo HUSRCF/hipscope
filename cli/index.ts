@@ -811,27 +811,24 @@ switch (cmd) {
       console.log("PCI GPUs:      (lspci not available)");
     }
 
-    // 2b. DRM render nodes
+    // 2b. DRM render nodes + /dev/dxg
     const driNodes = sh("ls /dev/dri/ 2>/dev/null");
     const hasRenderNode = driNodes.includes("renderD");
+    const hasDxg = existsSync("/dev/dxg");
     console.log(`/dev/dri/:     ${driNodes ? driNodes.replace(/\n/g, ", ") : "NOT FOUND"}`);
+    if (hasDxg) console.log(`/dev/dxg:      present (DirectX GPU paravirtualization)`);
 
-    // 2c. DRM driver backing the render node
+    // 2c. DRM driver backing the render node (sysfs-based)
     if (hasRenderNode) {
-      const renderNode = driNodes.split(/\s+/).find(n => n.startsWith("renderD")) || "renderD128";
-      const drmVersion = sh(`cat /sys/class/drm/${renderNode.replace("renderD", "card")}/device/driver/module/drivers/*/module_name 2>/dev/null || cat /sys/class/drm/card0/device/uevent 2>/dev/null | grep DRIVER`);
-      const drmDriver = sh(`test -r /dev/dri/${renderNode} && python3 -c "import fcntl,struct,os;fd=os.open('/dev/dri/${renderNode}',os.O_RDWR);buf=fcntl.ioctl(fd,0xc0406400,b'\\x00'*64);os.close(fd);print(buf[16:48].split(b'\\x00')[0].decode())" 2>/dev/null`) || "unknown";
-      console.log(`  DRM driver:  ${drmDriver}${drmVersion ? ` (${drmVersion})` : ""}`);
+      const drmDriver = sh("for c in /sys/class/drm/card[0-9]; do d=$(basename $(readlink -f $c/device/driver) 2>/dev/null); [ -n \"$d\" ] && echo $d && break; done")
+        || (hasDxg ? "dxg" : "unknown");
+      console.log(`  DRM driver:  ${drmDriver}`);
       if (drmDriver === "amdgpu") {
         console.log(`  Redline:     COMPATIBLE (libdrm_amdgpu path available)`);
-      } else if (isWsl) {
-        console.log(`  Redline:     BLOCKED (dxgkrnl, not amdgpu — need GPU passthrough)`);
+      } else if (drmDriver === "dxg" || (isWsl && drmDriver !== "amdgpu")) {
+        console.log(`  Redline:     NOT AVAILABLE (GPU-PV, not native amdgpu driver)`);
       }
     }
-
-    // 2d. /dev/dxg (WSL2 GPU-PV)
-    const hasDxg = existsSync("/dev/dxg");
-    if (hasDxg) console.log(`/dev/dxg:      present (DirectX GPU paravirtualization)`);
 
     // 2e. /dev/kfd (ROCm Kernel Fusion Driver)
     const hasKfd = existsSync("/dev/kfd");
@@ -839,8 +836,8 @@ switch (cmd) {
     console.log(`/dev/kfd:      ${hasKfd ? (kfdReadable ? "present, readable" : "present, NOT READABLE (permission denied)") : "NOT FOUND"}`);
 
     // 2f. sysfs GPU info
-    const vendor = sh("cat /sys/class/drm/card0/device/vendor 2>/dev/null || cat /sys/class/drm/card1/device/vendor 2>/dev/null");
-    const device = sh("cat /sys/class/drm/card0/device/device 2>/dev/null || cat /sys/class/drm/card1/device/device 2>/dev/null");
+    const vendor = sh("for c in /sys/class/drm/card[0-9]; do v=$(cat $c/device/vendor 2>/dev/null); [ -n \"$v\" ] && echo $v && break; done");
+    const device = sh("for c in /sys/class/drm/card[0-9]; do d=$(cat $c/device/device 2>/dev/null); [ -n \"$d\" ] && echo $d && break; done");
     if (vendor) console.log(`  vendor:      ${vendor}${vendor === "0x1002" ? " (AMD)" : vendor === "0x10de" ? " (NVIDIA — not supported)" : ""}`);
     if (device) console.log(`  device:      ${device}`);
 
@@ -927,10 +924,14 @@ switch (cmd) {
         } else if (isWsl) {
           if (!hasKfd && !hasRenderNode) {
             console.log("\n  No GPU device nodes found in WSL2.");
-            console.log("  Options:");
-            console.log("    1. Install AMD GPU driver for WSL2 (amdgpu-install --usecase=wsl)");
-            console.log("    2. Enable GPU passthrough (Windows 11 24H2+):");
-            console.log("       wsl --manage <distro> --set-gpu-passthrough on");
+            console.log("  Install the AMD GPU driver for WSL2:");
+            console.log("    sudo amdgpu-install --usecase=wsl");
+            console.log("  If amdgpu-install is not available, install ROCm:");
+            console.log("    https://rocm.docs.amd.com/en/latest/deploy/linux/os-native/install.html");
+            console.log("  Note: ROCm WSL2 support requires a compatible AMD GPU and recent Windows drivers.");
+          } else if (hasRenderNode && !hasKfd) {
+            console.log("\n  /dev/dri found but /dev/kfd missing. ROCm may not be installed:");
+            console.log("    sudo amdgpu-install --usecase=wsl");
           } else if (hasKfd) {
             console.log("\n  /dev/kfd found but HIP can't see GPU. Try:");
             console.log("    1. Verify ROCm version matches your GPU: apt list --installed | grep rocm");
