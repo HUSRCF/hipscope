@@ -119,6 +119,7 @@ fn main() {
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
@@ -129,7 +130,7 @@ fn main() {
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 }
             }
 
@@ -255,10 +256,9 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
-    // Build ChatML turn: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
     let im_start = tokenizer.encode("<|im_start|>");
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -267,6 +267,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     let q_tokens = tokenizer.encode(prompt);
 
     let mut new_tokens = Vec::new();
+
+    // System prompt: prepend on first turn only (seq_pos == 0)
+    if m.seq_pos == 0 {
+        if let Some(sys) = system_prompt {
+            let sys_tok = tokenizer.encode("system");
+            let sys_content = tokenizer.encode(sys);
+            new_tokens.extend_from_slice(&im_start);
+            new_tokens.extend_from_slice(&sys_tok);
+            new_tokens.extend_from_slice(&nl);
+            new_tokens.extend_from_slice(&sys_content);
+            new_tokens.extend_from_slice(&im_end);
+            new_tokens.extend_from_slice(&nl);
+        }
+    }
+
+    // User turn
     new_tokens.extend_from_slice(&im_start);
     new_tokens.extend_from_slice(&user_tok);
     new_tokens.extend_from_slice(&nl);
