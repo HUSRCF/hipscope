@@ -374,14 +374,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             next_token = llama::sample_top_p(&logits, temp, top_p);
         }
         m.seq_pos += generated;
-
-        // Append the im_end token to conversation so next turn sees clean boundary
-        if im_end_token.is_some() {
-            m.conversation_tokens.extend_from_slice(&im_end);
-            m.conversation_tokens.extend_from_slice(&nl);
-            // Don't need to run forward for these — they'll be part of next turn's "history"
-            // The KV cache doesn't need them since the model already generated past them
-        }
+        // Note: im_end token is already in conversation_tokens (pushed before break check).
+        // Don't append synthetic boundary tokens — they'd desync seq_pos vs conversation_tokens.
+        // Next turn's ChatML framing (<|im_start|>user\n...) provides the boundary.
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
@@ -432,8 +427,6 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             rng_state = rng;
         }
         m.seq_pos += generated;
-        m.conversation_tokens.extend_from_slice(&im_end);
-        m.conversation_tokens.extend_from_slice(&nl);
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
@@ -565,8 +558,6 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         next_token = llama::sample_top_p(&logits, temp, top_p);
     }
     m.seq_pos += generated;
-    m.conversation_tokens.extend_from_slice(&im_end);
-    m.conversation_tokens.extend_from_slice(&nl);
 
     let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
     let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
