@@ -2991,9 +2991,10 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
         ];
-        let block_size = std::cmp::min(256, std::cmp::max(seq_len, head_dim)) as u32;
-        let block_size = block_size.next_power_of_two();
-        let shared = ((seq_len + block_size as usize) * 4) as u32;
+        // Kernel uses exactly 32 threads: 32 × 8 dims = 256 head_dim.
+        // Shared memory: scores[seq_len] + workspace[32].
+        let block_size = 32u32;
+        let shared = ((seq_len + 32) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared, self.stream_ref(), &mut params) }
     }
 
