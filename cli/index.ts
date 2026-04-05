@@ -779,25 +779,105 @@ switch (cmd) {
   }
   case "diag": {
     console.log("hipfire diagnostics\n");
+    const sh = (cmd: string) => {
+      try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
+      catch { return ""; }
+    };
 
-    // 1. Check daemon binary
+    // ── 1. Platform detection ──────────────────────────────
+    const platform = process.platform;
+    const isWsl = existsSync("/proc/version") && (sh("cat /proc/version") || "").toLowerCase().includes("microsoft");
+    const isNativeLinux = platform === "linux" && !isWsl;
+    const isWindows = platform === "win32";
+    const platformLabel = isWsl ? "WSL2 (Windows Subsystem for Linux)" : isWindows ? "Windows (native)" : isNativeLinux ? "Linux (native)" : platform;
+    console.log(`platform:      ${platformLabel}`);
+    if (isWsl) {
+      const wslVer = sh("cat /proc/version");
+      const kernelMatch = wslVer.match(/(\d+\.\d+\.\d+)/);
+      if (kernelMatch) console.log(`  WSL kernel:  ${kernelMatch[1]}`);
+    }
+
+    // ── 2. GPU hardware detection (platform-independent) ──
+    console.log("");
+    let gpuDetected = false;
+
+    // 2a. PCIe — works on native Linux and WSL2
+    const lspci = sh("lspci 2>/dev/null | grep -i 'vga\\|display\\|3d'");
+    if (lspci) {
+      console.log("PCI GPUs:");
+      for (const line of lspci.split("\n")) console.log(`  ${line.trim()}`);
+      gpuDetected = lspci.toLowerCase().includes("amd") || lspci.toLowerCase().includes("radeon");
+    } else {
+      console.log("PCI GPUs:      (lspci not available)");
+    }
+
+    // 2b. DRM render nodes
+    const driNodes = sh("ls /dev/dri/ 2>/dev/null");
+    const hasRenderNode = driNodes.includes("renderD");
+    console.log(`/dev/dri/:     ${driNodes ? driNodes.replace(/\n/g, ", ") : "NOT FOUND"}`);
+
+    // 2c. DRM driver backing the render node
+    if (hasRenderNode) {
+      const renderNode = driNodes.split(/\s+/).find(n => n.startsWith("renderD")) || "renderD128";
+      const drmVersion = sh(`cat /sys/class/drm/${renderNode.replace("renderD", "card")}/device/driver/module/drivers/*/module_name 2>/dev/null || cat /sys/class/drm/card0/device/uevent 2>/dev/null | grep DRIVER`);
+      const drmDriver = sh(`test -r /dev/dri/${renderNode} && python3 -c "import fcntl,struct,os;fd=os.open('/dev/dri/${renderNode}',os.O_RDWR);buf=fcntl.ioctl(fd,0xc0406400,b'\\x00'*64);os.close(fd);print(buf[16:48].split(b'\\x00')[0].decode())" 2>/dev/null`) || "unknown";
+      console.log(`  DRM driver:  ${drmDriver}${drmVersion ? ` (${drmVersion})` : ""}`);
+      if (drmDriver === "amdgpu") {
+        console.log(`  Redline:     COMPATIBLE (libdrm_amdgpu path available)`);
+      } else if (isWsl) {
+        console.log(`  Redline:     BLOCKED (dxgkrnl, not amdgpu — need GPU passthrough)`);
+      }
+    }
+
+    // 2d. /dev/dxg (WSL2 GPU-PV)
+    const hasDxg = existsSync("/dev/dxg");
+    if (hasDxg) console.log(`/dev/dxg:      present (DirectX GPU paravirtualization)`);
+
+    // 2e. /dev/kfd (ROCm Kernel Fusion Driver)
+    const hasKfd = existsSync("/dev/kfd");
+    const kfdReadable = hasKfd && sh("test -r /dev/kfd && echo yes") === "yes";
+    console.log(`/dev/kfd:      ${hasKfd ? (kfdReadable ? "present, readable" : "present, NOT READABLE (permission denied)") : "NOT FOUND"}`);
+
+    // 2f. sysfs GPU info
+    const vendor = sh("cat /sys/class/drm/card0/device/vendor 2>/dev/null || cat /sys/class/drm/card1/device/vendor 2>/dev/null");
+    const device = sh("cat /sys/class/drm/card0/device/device 2>/dev/null || cat /sys/class/drm/card1/device/device 2>/dev/null");
+    if (vendor) console.log(`  vendor:      ${vendor}${vendor === "0x1002" ? " (AMD)" : vendor === "0x10de" ? " (NVIDIA — not supported)" : ""}`);
+    if (device) console.log(`  device:      ${device}`);
+
+    // 2g. amdgpu kernel module
+    const amdgpuLoaded = sh("lsmod 2>/dev/null | grep amdgpu | head -1");
+    console.log(`amdgpu module: ${amdgpuLoaded ? "loaded" : "NOT LOADED"}`);
+
+    // ── 3. ROCm / HIP runtime ──────────────────────────────
+    console.log("");
+    const hipccVer = sh("hipcc --version 2>&1 | head -3");
+    const rocminfoGpu = sh("rocminfo 2>/dev/null | grep -E 'Name:.*gfx|Marketing'");
+    const hipConfig = sh("hipconfig --full 2>/dev/null | head -5");
+    console.log(`hipcc:         ${hipccVer ? hipccVer.split("\n")[0] : "NOT FOUND"}`);
+    if (rocminfoGpu) {
+      console.log("rocminfo GPUs:");
+      for (const line of rocminfoGpu.split("\n").slice(0, 4)) console.log(`  ${line.trim()}`);
+    } else {
+      console.log(`rocminfo:      ${sh("which rocminfo 2>/dev/null") ? "installed but no GPUs detected" : "NOT FOUND"}`);
+    }
+
+    // ── 4. Daemon binary + models ──────────────────────────
+    console.log("");
     const exe2 = process.platform === "win32" ? ".exe" : "";
-    const bins = [
+    const daemonBins = [
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
-    const daemonBin = bins.find(p => existsSync(p));
-    console.log(`daemon binary: ${daemonBin ? "found" : "NOT FOUND"}`);
-    if (!daemonBin) { console.log("  Install: hipfire update\n"); process.exit(1); }
+    const daemonBin = daemonBins.find(p => existsSync(p));
+    console.log(`daemon:        ${daemonBin ? "found" : "NOT FOUND — run: hipfire update"}`);
 
-    // 2. Check local models
     const models = listLocal();
     console.log(`local models:  ${models.length}`);
     for (const m of models) console.log(`  ${m.name.padEnd(35)} ${m.size.padStart(6)}`);
 
-    // 3. Check pre-compiled kernels
-    const binDir = join(HIPFIRE_DIR, "bin");
-    const kernelBase = join(binDir, "kernels", "compiled");
+    // 5. Pre-compiled kernels
+    const binDir2 = join(HIPFIRE_DIR, "bin");
+    const kernelBase = join(binDir2, "kernels", "compiled");
     const cwdKernelBase = resolve(__dirname, "../kernels/compiled");
     const kBase = existsSync(kernelBase) ? kernelBase : existsSync(cwdKernelBase) ? cwdKernelBase : null;
     if (kBase) {
@@ -806,53 +886,78 @@ switch (cmd) {
         const dir = join(kBase, arch);
         const hsaco = readdirSync(dir).filter(f => f.endsWith(".hsaco")).length;
         const hashes = readdirSync(dir).filter(f => f.endsWith(".hash")).length;
-        console.log(`kernels/${arch}: ${hsaco} blobs, ${hashes} hashes${hashes < hsaco ? " (INCOMPLETE)" : ""}`);
+        console.log(`kernels/${arch}: ${hsaco} blobs, ${hashes} hashes${hashes < hsaco ? " (run: hipfire update)" : ""}`);
       }
     } else {
       console.log("kernels:       NOT FOUND");
     }
 
-    // 4. Probe daemon for GPU info
-    console.log("\nProbing GPU via daemon...");
-    try {
-      const e = new Engine();
-      await e.start();
-      await e.send({ type: "ping" }); await e.recv();
-      await e.send({ type: "diag" });
-      const diag = await e.recv();
-      if (diag.type === "diag") {
-        console.log(`  GPU arch:    ${diag.arch}`);
-        console.log(`  HIP version: ${diag.hip_version}`);
-        console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
-        console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
-        console.log(`  Model:       ${diag.model_loaded ? diag.model_arch : "none loaded"}`);
-        console.log(`  Kernels:     ${diag.kernels} blobs, ${diag.kernel_hashes} hashes`);
+    // ── 6. Live GPU probe via daemon ───────────────────────
+    if (daemonBin) {
+      console.log("\nProbing GPU via HIP runtime...");
+      try {
+        const de = new Engine();
+        await de.start();
+        await de.send({ type: "ping" }); await de.recv();
+        await de.send({ type: "diag" });
+        const diag = await de.recv();
+        if (diag.type === "diag") {
+          console.log(`  GPU arch:    ${diag.arch}`);
+          console.log(`  HIP version: ${diag.hip_version}`);
+          console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
+          console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 
-        // Recommendations based on total VRAM
-        const vram = diag.vram_total_mb;
-        console.log("");
-        if (vram < 4000) {
-          console.log("TIP: <4GB VRAM — use qwen3.5:0.8b (430MB)");
-        } else if (vram < 6000) {
-          console.log("TIP: 4-6GB VRAM — use qwen3.5:4b (2.1GB)");
-        } else if (vram < 16000) {
-          console.log("TIP: 6-16GB VRAM — qwen3.5:9b (4.5GB) is your best option");
-        } else if (vram < 24000) {
-          console.log("TIP: 16-24GB VRAM — qwen3.5:27b HFQ4 (14.3GB). Note: HFQ4 degrades on complex tasks");
+          const vram = diag.vram_total_mb;
+          if (models.length === 0 && vram > 0) {
+            const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hf6";
+            console.log(`\nTIP: No models downloaded. Run: hipfire pull ${rec}`);
+          }
         } else {
-          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hf6 (21.4GB) for best quality");
+          console.log(`  Error: ${diag.message || "unexpected response"}`);
         }
-        if (models.length === 0) {
-          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hf6";
-          console.log(`TIP: No models downloaded. Run: hipfire pull ${rec}`);
+        await de.stop();
+      } catch (err: any) {
+        console.log(`  HIP probe failed: ${err.message}`);
+        // Give actionable guidance based on what we found above
+        if (isWindows) {
+          console.log("\n  hipfire requires Linux. On Windows, use WSL2:");
+          console.log("    1. Install WSL2: wsl --install -d Ubuntu");
+          console.log("    2. Install ROCm in WSL2: https://rocm.docs.amd.com/en/latest/deploy/linux/os-native/install.html");
+          console.log("    3. Install hipfire inside WSL2");
+        } else if (isWsl) {
+          if (!hasKfd && !hasRenderNode) {
+            console.log("\n  No GPU device nodes found in WSL2.");
+            console.log("  Options:");
+            console.log("    1. Install AMD GPU driver for WSL2 (amdgpu-install --usecase=wsl)");
+            console.log("    2. Enable GPU passthrough (Windows 11 24H2+):");
+            console.log("       wsl --manage <distro> --set-gpu-passthrough on");
+          } else if (hasKfd) {
+            console.log("\n  /dev/kfd found but HIP can't see GPU. Try:");
+            console.log("    1. Verify ROCm version matches your GPU: apt list --installed | grep rocm");
+            console.log("    2. Check permissions: ls -la /dev/kfd /dev/dri/renderD*");
+            console.log("    3. Add user to render group: sudo usermod -aG render $USER");
+          }
+        } else {
+          if (!amdgpuLoaded) {
+            console.log("\n  amdgpu kernel module not loaded. Check:");
+            console.log("    1. dmesg | grep -i amdgpu");
+            console.log("    2. Is this an AMD GPU? (NVIDIA GPUs are not supported)");
+          } else if (!hasKfd) {
+            console.log("\n  amdgpu loaded but /dev/kfd missing. Install ROCm:");
+            console.log("    https://rocm.docs.amd.com/en/latest/deploy/linux/os-native/install.html");
+          } else if (!kfdReadable) {
+            console.log("\n  /dev/kfd not readable. Fix permissions:");
+            console.log("    sudo usermod -aG render $USER && newgrp render");
+          }
         }
-      } else {
-        console.log(`  Error: ${diag.message || "unexpected response"}`);
       }
-      await e.stop();
-    } catch (err: any) {
-      console.log(`  Failed to start daemon: ${err.message}`);
-      console.log("  Check: ROCm/HIP installed? AMD GPU visible? /dev/kfd accessible?");
+    }
+
+    // ── 7. Config ──────────────────────────────────────────
+    console.log(`\nconfig:        ${CONFIG_PATH}`);
+    for (const k of Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]) {
+      const v = cfg[k];
+      if (v !== CONFIG_DEFAULTS[k]) console.log(`  ${k} = ${v}`);
     }
 
     console.log("\nDone.");
