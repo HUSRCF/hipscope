@@ -214,6 +214,24 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "profile" => {
+                // Precompile kernels for common configurations so we have something to profile.
+                // If a model is loaded its kernels are already compiled; this fills in the rest.
+                #[cfg(feature = "deltanet")]
+                for kv in &["q8", "turbo4"] {
+                    for wq in &["hfq4", "hfq6", "q8"] {
+                        let _ = gpu.precompile_qwen35(wq, kv, 128);
+                    }
+                }
+                let (cap, kernels) = gpu.profile();
+                let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
+                let _ = writeln!(stdout,
+                    r#"{{"type":"profile","gpu":{},"kernels":[{}]}}"#,
+                    cap.to_json(), kernels_json.join(",")
+                );
+                let _ = stdout.flush();
+            }
+
             _ => {
                 let _ = writeln!(stdout, r#"{{"type":"error","message":"unknown type: {}"}}"#, msg_type);
                 let _ = stdout.flush();

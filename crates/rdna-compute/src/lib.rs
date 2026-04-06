@@ -4,6 +4,7 @@ mod compiler;
 mod dispatch;
 mod kernels;
 pub mod pool;
+pub mod profiler;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{DType, Gpu, GpuTensor};

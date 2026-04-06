@@ -62,6 +62,11 @@ impl KernelCompiler {
         })
     }
 
+    /// Returns a reference to all compiled kernel paths (name → .hsaco path).
+    pub fn compiled_kernels(&self) -> &HashMap<String, PathBuf> {
+        &self.compiled
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {

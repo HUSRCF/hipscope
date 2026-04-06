@@ -3317,4 +3317,14 @@ impl Gpu {
 
         Ok(())
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Kernel profiler
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Profile all compiled kernels: hardware caps + ISA metadata + occupancy.
+    pub fn profile(&self) -> (crate::profiler::GpuCapability, Vec<crate::profiler::KernelProfile>) {
+        let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
+        crate::profiler::profile_kernels(&self.arch, vram, self.compiler.compiled_kernels())
+    }
 }

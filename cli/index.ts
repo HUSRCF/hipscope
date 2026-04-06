@@ -896,6 +896,104 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   }
 }
 
+// ─── Profile ────────────────────────────────────────────
+
+async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined) {
+  // Start daemon — we need kernels compiled to profile them
+  const e = new Engine();
+  await e.start();
+  await e.send({ type: "ping" }); await e.recv();
+
+  // Load a model if specified (triggers kernel compilation for that model's quant type)
+  if (modelTag) {
+    let modelPath = findModel(modelTag);
+    if (!modelPath) {
+      const resolved = resolveModelTag(modelTag);
+      if (REGISTRY[resolved]) {
+        console.error(`Model not found locally. Pulling ${resolved}...`);
+        modelPath = await pull(modelTag);
+      }
+    }
+    if (modelPath) {
+      const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
+      await e.send({ type: "load", model: modelPath, turbo: turboMode });
+      const loaded = await e.recv();
+      if (loaded.type === "error") {
+        console.error(`Load failed: ${loaded.message}`);
+        await e.stop();
+        process.exit(1);
+      }
+    }
+  }
+
+  // Request profile data
+  await e.send({ type: "profile" });
+  const data = await e.recv();
+  await e.stop();
+
+  if (data.type !== "profile") {
+    console.error(data.message || "profile failed");
+    process.exit(1);
+  }
+
+  const gpu = data.gpu;
+  const kernels: any[] = data.kernels || [];
+
+  // Apply kernel filter
+  const filtered = kernelFilter
+    ? kernels.filter((k: any) => k.name.includes(kernelFilter))
+    : kernels;
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  // Pretty-print hardware summary
+  const icStr = gpu.infinity_cache_mb > 0 ? ` | IC: ${gpu.infinity_cache_mb}MB` : "";
+  console.log(`GPU: ${gpu.arch} (${gpu.generation})`);
+  console.log(`${gpu.cu_count} CUs | ${gpu.cu_count * gpu.simds_per_cu} SIMDs | Peak BW: ${gpu.peak_bw_gbs.toFixed(0)} GB/s | Boost: ${gpu.boost_clock_mhz} MHz`);
+  console.log(`VGPRs/SIMD: ${gpu.vgprs_per_simd} | LDS/CU: ${(gpu.lds_per_cu / 1024)}KB | L2: ${gpu.l2_cache_mb}MB${icStr} | VRAM: ${(gpu.vram_mb / 1024).toFixed(1)}GB`);
+  console.log(`Roofline ridge: ${gpu.ridge_point.toFixed(1)} FLOP/byte`);
+
+  if (filtered.length === 0) {
+    console.log("\nNo compiled kernels found. Load a model first: hipfire profile <model>");
+    return;
+  }
+
+  // Kernel table
+  console.log(`\nKernel Report (${filtered.length} kernels):`);
+  console.log("┌" + "─".repeat(26) + "┬───────┬───────┬─────────┬────────────┬───────────┐");
+  console.log("│ Kernel" + " ".repeat(19) + "│ VGPRs │ SGPRs │ LDS (B) │ Occupancy  │ Limiter   │");
+  console.log("├" + "─".repeat(26) + "┼───────┼───────┼─────────┼────────────┼───────────┤");
+
+  const bottlenecks: string[] = [];
+  for (const k of filtered) {
+    const occ = k.occupancy;
+    const occStr = `${String(occ.waves).padStart(2)}/${occ.max} ${occ.pct.toFixed(0).padStart(3)}%`;
+    const name = k.name.length > 24 ? k.name.slice(0, 24) + ".." : k.name.padEnd(24);
+    console.log(
+      `│ ${name} │ ${String(k.vgprs).padStart(5)} │ ${String(k.sgprs).padStart(5)} │ ${String(k.lds_bytes).padStart(7)} │ ${occStr.padStart(10)} │ ${occ.limiter.padEnd(9)} │`
+    );
+    if (occ.limiter !== "wave limit") {
+      bottlenecks.push(`${k.name}: occupancy limited by ${occ.limiter} (${k.vgprs} VGPRs → ${occ.waves}/${occ.max} waves)`);
+    }
+  }
+  console.log("└" + "─".repeat(26) + "┴───────┴───────┴─────────┴────────────┴───────────┘");
+
+  // Bottleneck analysis
+  if (bottlenecks.length > 0) {
+    console.log("\nBottleneck Analysis:");
+    for (const b of bottlenecks) {
+      console.log(`  ${b}`);
+    }
+  }
+
+  // Occupancy summary
+  const fullOcc = filtered.filter((k: any) => k.occupancy.limiter === "wave limit").length;
+  console.log(`\n${fullOcc}/${filtered.length} kernels at max occupancy`);
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -967,6 +1065,18 @@ switch (cmd) {
       }
       console.log("\nPull: hipfire pull <model>  (e.g. hipfire pull qwen3.5:9b)");
     }
+    break;
+  }
+  case "profile": {
+    const jsonFlag = rest.includes("--json");
+    const kernelIdx = rest.indexOf("--kernel");
+    const kernelFilter = kernelIdx >= 0 && kernelIdx + 1 < rest.length ? rest[kernelIdx + 1] : undefined;
+    const skipSet = new Set<number>();
+    if (jsonFlag) skipSet.add(rest.indexOf("--json"));
+    if (kernelIdx >= 0) { skipSet.add(kernelIdx); skipSet.add(kernelIdx + 1); }
+    const positional = rest.filter((_, i) => !skipSet.has(i));
+    const profileModel = positional[0]; // optional: model to load (triggers kernel compile)
+    await profile(profileModel, jsonFlag, kernelFilter);
     break;
   }
   case "update": {
@@ -1340,6 +1450,7 @@ Examples:
   run <model> [prompt]  Generate text (auto-pulls if needed)
   serve [port]          Start OpenAI-compatible server (default: ${cfg.port})
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
+  profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
   list [-r]             Show local models (-r: show available too)
   config [list|set|get|reset]  Persistent settings (kv_cache, temperature, etc.)
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
