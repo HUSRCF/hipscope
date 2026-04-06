@@ -847,7 +847,12 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
     // Warmup
     process.stderr.write("  warming up...");
-    await benchRun(e, "Hello", 16);
+    const warmup = await benchRun(e, "Hello", 16);
+    if (warmup.poisoned) {
+      console.error(" TIMEOUT — daemon unresponsive");
+      await e.stop();
+      process.exit(1);
+    }
     console.error(" done\n");
 
     const decodes: number[] = [];
