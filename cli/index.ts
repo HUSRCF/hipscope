@@ -703,50 +703,138 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   console.error(`  prompt: "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
 
   if (experimental && !isRdna2) {
-    console.error(`\n--exp requires RDNA2 (gfx1030/gfx1031), detected ${arch}. Running standard bench.`);
+    console.error(`\n--exp requires RDNA2 (gfx1030/gfx1031), detected ${gpuArch}. Running standard bench.`);
   }
 
-  // ── Standard bench ──
-  console.error(`  mode:   standard\n`);
+  const doExp = experimental && isRdna2;
 
-  // Warmup
-  process.stderr.write("  warming up...");
-  await benchRun(e, "Hello", 16);
-  console.error(" done\n");
+  if (doExp) {
+    // ── Experimental: RDNA2 variant comparison ──
+    // Each variant requires a daemon restart (env var read at kernel compile time)
+    const variants = [
+      { n: 1, name: "baseline-rdna2",   desc: "(32,16) 2x-unroll" },
+      { n: 2, name: "high-occupancy",   desc: "(32,20) 2x-unroll" },
+      { n: 3, name: "wide-unroll",      desc: "(32,12) 4x-unroll" },
+      { n: 4, name: "dp4a-packed",      desc: "(32,16) dp4a+factored" },
+      { n: 5, name: "cache-aggressive", desc: "(32,16) packed+factored" },
+    ];
 
-  const decodes: number[] = [];
-  const tokenCounts: number[] = [];
+    console.error(`  mode:   experimental (5 RDNA2 kernel variants x ${runs} runs)\n`);
+    await e.stop();
 
-  for (let r = 0; r < runs; r++) {
-    process.stderr.write(`  run ${r + 1}/${runs} `);
-    const res = await benchRun(e, prompt, 128);
-    if (!res.ok) {
-      console.error("FAIL");
-      continue;
+    const results: BenchResult[] = [];
+
+    for (const v of variants) {
+      // Clear kernel cache so variant recompiles
+      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/"); } catch {}
+
+      // Restart daemon with variant env var
+      process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
+      const ve = new Engine();
+      await ve.start();
+      await ve.send({ type: "ping" }); await ve.recv();
+      await ve.send({ type: "load", model: modelPath, turbo: turboMode });
+      const vloaded = await ve.recv();
+      if (vloaded.type === "error") {
+        console.error(`  v${v.n} ${v.name}: LOAD FAIL — ${vloaded.message}`);
+        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [] });
+        await ve.stop();
+        continue;
+      }
+
+      // Warmup
+      await benchRun(ve, "Hello", 16);
+
+      process.stderr.write(`  v${v.n} ${v.name.padEnd(18)} `);
+      const decodes: number[] = [];
+      const prefills: number[] = [];
+
+      for (let r = 0; r < runs; r++) {
+        const res = await benchRun(ve, prompt, 128);
+        if (!res.ok) {
+          process.stderr.write("FAIL ");
+          continue;
+        }
+        decodes.push(res.decode);
+        process.stderr.write(".");
+      }
+      console.error("");
+      results.push({ label: `v${v.n} ${v.name}`, decode: decodes, prefill: prefills });
+      await ve.stop();
     }
-    decodes.push(res.decode);
-    tokenCounts.push(res.tokens);
-    console.error(`${res.decode.toFixed(1)} tok/s (${res.tokens} tok)`);
+    delete process.env.HIPFIRE_RDNA2_VARIANT;
+
+    // Results table
+    console.log("");
+    console.log("  V  Name                       Decode tok/s");
+    console.log("     launch_bounds               mean   min   max   stdev");
+    console.log("  " + "─".repeat(60));
+
+    let bestMean = 0, bestLabel = "";
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const v = variants[i];
+      const d = stats(r.decode);
+      if (d.mean > bestMean) { bestMean = d.mean; bestLabel = r.label; }
+      if (r.decode.length === 0) {
+        console.log(`  ${v.n}  ${v.name.padEnd(18)} ${v.desc.padEnd(22)} FAIL`);
+      } else {
+        console.log(
+          `  ${v.n}  ${v.name.padEnd(18)} ${v.desc.padEnd(9)}` +
+          `${fmtNum(d.mean)}${fmtNum(d.min)}${fmtNum(d.max)}${fmtNum(d.stdev)}`
+        );
+      }
+    }
+
+    if (bestLabel) {
+      console.log(`\n  Best: ${bestLabel} at ${bestMean.toFixed(1)} tok/s`);
+      const bestV = bestLabel.match(/v(\d)/)?.[1] || "1";
+      console.log(`  Set default: export HIPFIRE_RDNA2_VARIANT=${bestV}`);
+    }
+
+  } else {
+    // ── Standard bench ──
+    console.error(`  mode:   standard\n`);
+
+    // Warmup
+    process.stderr.write("  warming up...");
+    await benchRun(e, "Hello", 16);
+    console.error(" done\n");
+
+    const decodes: number[] = [];
+    const tokenCounts: number[] = [];
+
+    for (let r = 0; r < runs; r++) {
+      process.stderr.write(`  run ${r + 1}/${runs} `);
+      const res = await benchRun(e, prompt, 128);
+      if (!res.ok) {
+        console.error("FAIL");
+        continue;
+      }
+      decodes.push(res.decode);
+      tokenCounts.push(res.tokens);
+      console.error(`${res.decode.toFixed(1)} tok/s (${res.tokens} tok)`);
+    }
+
+    const d = stats(decodes);
+
+    console.log("");
+    console.log("  Decode  tok/s");
+    console.log(`    mean:  ${d.mean.toFixed(1)}`);
+    console.log(`    min:   ${d.min.toFixed(1)}`);
+    console.log(`    max:   ${d.max.toFixed(1)}`);
+    console.log(`    stdev: ${d.stdev.toFixed(1)}`);
+
+    if (d.mean > 0) {
+      console.log(`    ms/tok: ${(1000 / d.mean).toFixed(1)}`);
+    }
+
+    if (isRdna2) {
+      console.log(`\n  Tip: Run 'hipfire bench --exp ${model}' to test RDNA2 kernel variants`);
+    }
+
+    await e.stop();
   }
-
-  const d = stats(decodes);
-
-  console.log("");
-  console.log("  Decode  tok/s");
-  console.log(`    mean:  ${d.mean.toFixed(1)}`);
-  console.log(`    min:   ${d.min.toFixed(1)}`);
-  console.log(`    max:   ${d.max.toFixed(1)}`);
-  console.log(`    stdev: ${d.stdev.toFixed(1)}`);
-
-  if (d.mean > 0) {
-    console.log(`    ms/tok: ${(1000 / d.mean).toFixed(1)}`);
-  }
-
-  if (isRdna2) {
-    console.log(`\n  Tip: Run 'hipfire bench --exp ${model}' to test RDNA2 kernel variants`);
-  }
-
-  await e.stop();
 }
 
 // ─── Main ───────────────────────────────────────────────
