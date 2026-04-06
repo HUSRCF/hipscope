@@ -219,7 +219,7 @@ fn main() {
                 // If a model is loaded its kernels are already compiled; this fills in the rest.
                 // Cover all KV modes × weight formats × head_dims to catch all kernel variants.
                 #[cfg(feature = "deltanet")]
-                for kv in &["q8", "turbo4", "turbo2"] {
+                for kv in &["q8", "turbo4", "turbo3", "turbo2"] {
                     for wq in &["hfq4", "hfq6", "q8"] {
                         for hd in &[128usize, 256] {
                             let _ = gpu.precompile_qwen35(wq, kv, *hd);

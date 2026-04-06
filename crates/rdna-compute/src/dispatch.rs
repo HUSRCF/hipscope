@@ -3264,6 +3264,10 @@ impl Gpu {
                 specs.push(("kv_cache_write_turbo4", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO4_SRC)));
                 specs.push(("attention_turbo4_kv",   Self::turbo_source(kernels::ATTENTION_TURBO4_KV_SRC)));
             }
+            "turbo3" => {
+                specs.push(("kv_cache_write_turbo3", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO3_SRC)));
+                specs.push(("attention_turbo3_kv",   Self::turbo_source(kernels::ATTENTION_TURBO3_KV_SRC)));
+            }
             "turbo2" if head_dim == 256 => {
                 specs.push(("kv_cache_write_turbo2_256", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO2_256_SRC)));
                 specs.push(("attention_turbo2_kv_256",   Self::turbo_source(kernels::ATTENTION_TURBO2_KV_256_SRC)));
