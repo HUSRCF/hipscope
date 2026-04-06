@@ -647,8 +647,18 @@ function fmtNum(n: number, w = 7): string {
   return n.toFixed(1).padStart(w);
 }
 
-async function benchRun(e: Engine, prompt: string, maxTokens: number): Promise<{ decode: number; prefill: number; tokens: number; ok: boolean }> {
-  await e.send({ type: "reset" }); await e.recv();
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
+  ]);
+}
+
+async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs = 120_000): Promise<{ decode: number; prefill: number; tokens: number; ok: boolean }> {
+  const fail = { decode: 0, prefill: 0, tokens: 0, ok: false };
+  try {
+    await withTimeout(e.send({ type: "reset" }).then(() => e.recv()), 10_000, "reset");
+  } catch { return fail; }
   const genMsg = {
     type: "generate", id: "bench", prompt,
     temperature: 0, max_tokens: maxTokens,
@@ -656,13 +666,16 @@ async function benchRun(e: Engine, prompt: string, maxTokens: number): Promise<{
   };
   let decode = 0, prefill = 0, tokens = 0;
   try {
-    for await (const msg of e.generate(genMsg)) {
-      if (msg.type === "done") {
-        decode = msg.tok_s || 0;
-        tokens = msg.tokens || 0;
+    const run = async () => {
+      for await (const msg of e.generate(genMsg)) {
+        if (msg.type === "done") {
+          decode = msg.tok_s || 0;
+          tokens = msg.tokens || 0;
+        }
       }
-    }
-  } catch { return { decode: 0, prefill: 0, tokens: 0, ok: false }; }
+    };
+    await withTimeout(run(), timeoutMs, "generate");
+  } catch { return fail; }
   return { decode, prefill, tokens, ok: decode > 0 };
 }
 
@@ -724,6 +737,9 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
     const results: BenchResult[] = [];
 
+    const LOAD_TIMEOUT = 120_000;  // 2min for kernel compile + model load
+    const RUN_TIMEOUT = 60_000;   // 1min per generation run
+
     for (const v of variants) {
       // Clear kernel cache so variant recompiles
       try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/"); } catch {}
@@ -731,26 +747,36 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
       const ve = new Engine();
-      await ve.start();
-      await ve.send({ type: "ping" }); await ve.recv();
-      await ve.send({ type: "load", model: modelPath, turbo: turboMode });
-      const vloaded = await ve.recv();
-      if (vloaded.type === "error") {
-        console.error(`  v${v.n} ${v.name}: LOAD FAIL — ${vloaded.message}`);
+      let variantOk = false;
+      try {
+        await ve.start();
+        await withTimeout(ve.send({ type: "ping" }).then(() => ve.recv()), 10_000, "ping");
+        await ve.send({ type: "load", model: modelPath, turbo: turboMode });
+        const vloaded = await withTimeout(ve.recv(), LOAD_TIMEOUT, `v${v.n} load`);
+        if (vloaded.type === "error") {
+          console.error(`  v${v.n} ${v.name}: LOAD FAIL — ${vloaded.message}`);
+        } else {
+          variantOk = true;
+        }
+      } catch (err: any) {
+        console.error(`  v${v.n} ${v.name}: ${err.message || "startup failed"}`);
+      }
+
+      if (!variantOk) {
         results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [] });
         await ve.stop();
         continue;
       }
 
       // Warmup
-      await benchRun(ve, "Hello", 16);
+      await benchRun(ve, "Hello", 16, 30_000);
 
       process.stderr.write(`  v${v.n} ${v.name.padEnd(18)} `);
       const decodes: number[] = [];
       const prefills: number[] = [];
 
       for (let r = 0; r < runs; r++) {
-        const res = await benchRun(ve, prompt, 128);
+        const res = await benchRun(ve, prompt, 128, RUN_TIMEOUT);
         if (!res.ok) {
           process.stderr.write("FAIL ");
           continue;
