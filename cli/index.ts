@@ -648,17 +648,23 @@ function fmtNum(n: number, w = 7): string {
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
+    promise.finally(() => clearTimeout(timer)),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+    }),
   ]);
 }
 
-async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs = 120_000): Promise<{ decode: number; prefill: number; tokens: number; ok: boolean }> {
-  const fail = { decode: 0, prefill: 0, tokens: 0, ok: false };
+// benchRun result + flag indicating the engine is poisoned (timed out mid-stream)
+interface BenchRunResult { decode: number; prefill: number; tokens: number; ok: boolean; poisoned: boolean }
+
+async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs = 120_000): Promise<BenchRunResult> {
+  const fail = { decode: 0, prefill: 0, tokens: 0, ok: false, poisoned: false };
   try {
     await withTimeout(e.send({ type: "reset" }).then(() => e.recv()), 10_000, "reset");
-  } catch { return fail; }
+  } catch { return { ...fail, poisoned: true }; }
   const genMsg = {
     type: "generate", id: "bench", prompt,
     temperature: 0, max_tokens: maxTokens,
@@ -675,8 +681,11 @@ async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs 
       }
     };
     await withTimeout(run(), timeoutMs, "generate");
-  } catch { return fail; }
-  return { decode, prefill, tokens, ok: decode > 0 };
+  } catch {
+    // Timed out mid-stream — daemon is reading/writing stale data, must be killed
+    return { ...fail, poisoned: true };
+  }
+  return { decode, prefill, tokens, ok: decode > 0, poisoned: false };
 }
 
 async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
@@ -769,14 +778,28 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       }
 
       // Warmup
-      await benchRun(ve, "Hello", 16, 30_000);
+      const warmup = await benchRun(ve, "Hello", 16, 30_000);
+      if (warmup.poisoned) {
+        console.error(`  v${v.n} ${v.name}: warmup timed out`);
+        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [] });
+        await ve.stop();
+        continue;
+      }
 
       process.stderr.write(`  v${v.n} ${v.name.padEnd(18)} `);
       const decodes: number[] = [];
       const prefills: number[] = [];
+      let abandoned = false;
 
       for (let r = 0; r < runs; r++) {
         const res = await benchRun(ve, prompt, 128, RUN_TIMEOUT);
+        if (res.poisoned) {
+          // Daemon stream is corrupt — kill it and abort this variant
+          process.stderr.write("TIMEOUT ");
+          await ve.stop();
+          abandoned = true;
+          break;
+        }
         if (!res.ok) {
           process.stderr.write("FAIL ");
           continue;
@@ -786,7 +809,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       }
       console.error("");
       results.push({ label: `v${v.n} ${v.name}`, decode: decodes, prefill: prefills });
-      await ve.stop();
+      if (!abandoned) await ve.stop();
     }
     delete process.env.HIPFIRE_RDNA2_VARIANT;
 
@@ -833,6 +856,11 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     for (let r = 0; r < runs; r++) {
       process.stderr.write(`  run ${r + 1}/${runs} `);
       const res = await benchRun(e, prompt, 128);
+      if (res.poisoned) {
+        console.error("TIMEOUT — daemon killed");
+        await e.stop();
+        break;
+      }
       if (!res.ok) {
         console.error("FAIL");
         continue;
