@@ -628,63 +628,10 @@ function listLocal() {
 
 // ─── Bench ──────────────────────────────────────────────
 
-function findInferBin(): string | null {
-  const exe = process.platform === "win32" ? ".exe" : "";
-  const bins = [
-    resolve(__dirname, `../target/release/examples/infer_hfq${exe}`),
-    join(HIPFIRE_DIR, "bin", `infer_hfq${exe}`),
-  ];
-  return bins.find(p => existsSync(p)) || null;
-}
-
-async function detectGpuArch(): Promise<string> {
-  for (const node of ["1", "0"]) {
-    try {
-      const props = await Bun.file(`/sys/class/kfd/kfd/topology/nodes/${node}/properties`).text();
-      const m = props.match(/gfx_target_version\s+(\d+)/);
-      if (m) {
-        const ver = parseInt(m[1]);
-        const major = Math.floor(ver / 10000);
-        const minor = Math.floor((ver % 10000) / 100);
-        const step = ver % 100;
-        let arch = `gfx${major}${minor.toString().padStart(2, "0")}${step || "0"}`;
-        return arch.replace(/^(gfx\d{4})0$/, "$1");
-      }
-    } catch {}
-  }
-  return "unknown";
-}
-
 interface BenchResult {
   label: string;
   decode: number[];
   prefill: number[];
-}
-
-function parseInferOutput(output: string): { decode: number; prefill: number } {
-  const decodeMatch = output.match(/=== Done: \d+ tokens in \d+ms \(([0-9.]+) tok\/s\)/);
-  const prefillMatch = output.match(/Prompt: \d+ms \(\d+ tokens, ([0-9.]+) tok\/s\)/);
-  return {
-    decode: decodeMatch ? parseFloat(decodeMatch[1]) : 0,
-    prefill: prefillMatch ? parseFloat(prefillMatch[1]) : 0,
-  };
-}
-
-async function runInfer(bin: string, modelPath: string, prompt: string, env?: Record<string, string>): Promise<{ decode: number; prefill: number; ok: boolean }> {
-  const proc = spawn([bin, modelPath, "--temp", "0", prompt], {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, ...env },
-  });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) return { decode: 0, prefill: 0, ok: false };
-  const parsed = parseInferOutput(stderr);
-  return { ...parsed, ok: true };
 }
 
 function stats(arr: number[]): { mean: number; min: number; max: number; stdev: number } {
@@ -700,13 +647,26 @@ function fmtNum(n: number, w = 7): string {
   return n.toFixed(1).padStart(w);
 }
 
-async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
-  const bin = findInferBin();
-  if (!bin) {
-    console.error("infer_hfq not found. Build: cargo build --release --example infer_hfq");
-    process.exit(1);
-  }
+async function benchRun(e: Engine, prompt: string, maxTokens: number): Promise<{ decode: number; prefill: number; tokens: number; ok: boolean }> {
+  await e.send({ type: "reset" }); await e.recv();
+  const genMsg = {
+    type: "generate", id: "bench", prompt,
+    temperature: 0, max_tokens: maxTokens,
+    repeat_penalty: 1.1, top_p: 1.0,
+  };
+  let decode = 0, prefill = 0, tokens = 0;
+  try {
+    for await (const msg of e.generate(genMsg)) {
+      if (msg.type === "done") {
+        decode = msg.tok_s || 0;
+        tokens = msg.tokens || 0;
+      }
+    }
+  } catch { return { decode: 0, prefill: 0, tokens: 0, ok: false }; }
+  return { decode, prefill, tokens, ok: decode > 0 };
+}
 
+async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
   let modelPath = findModel(model);
   if (!modelPath) {
     const resolved = resolveModelTag(model);
@@ -719,12 +679,26 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     }
   }
 
-  const arch = await detectGpuArch();
-  const isRdna2 = arch === "gfx1030" || arch === "gfx1031";
+  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
+
+  // Start daemon
+  const e = new Engine();
+  await e.start();
+  await e.send({ type: "ping" }); await e.recv();
+  await e.send({ type: "load", model: modelPath, turbo: turboMode });
+  const loaded = await e.recv();
+  if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
+
+  // Get real GPU arch from diag (loaded.arch is the model arch, not GPU)
+  await e.send({ type: "diag" });
+  const diag = await e.recv();
+  const gpuArch = diag.arch || "unknown";
+  const isRdna2 = gpuArch === "gfx1030" || gpuArch === "gfx1031";
 
   console.error(`hipfire bench`);
-  console.error(`  model:  ${basename(modelPath!)}`);
-  console.error(`  gpu:    ${arch}`);
+  console.error(`  model:  ${basename(modelPath!)}  [${loaded.arch}]`);
+  console.error(`  gpu:    ${gpuArch}`);
+  console.error(`  kv:     ${cfg.kv_cache}`);
   console.error(`  runs:   ${runs}`);
   console.error(`  prompt: "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
 
@@ -732,121 +706,47 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     console.error(`\n--exp requires RDNA2 (gfx1030/gfx1031), detected ${arch}. Running standard bench.`);
   }
 
-  const doExp = experimental && isRdna2;
+  // ── Standard bench ──
+  console.error(`  mode:   standard\n`);
 
-  if (doExp) {
-    // ── Experimental: RDNA2 variant comparison ──
-    const variants = [
-      { n: 1, name: "baseline-rdna2",   desc: "(32,16) 2x-unroll" },
-      { n: 2, name: "high-occupancy",   desc: "(32,20) 2x-unroll" },
-      { n: 3, name: "wide-unroll",      desc: "(32,12) 4x-unroll" },
-      { n: 4, name: "dp4a-packed",      desc: "(32,16) dp4a+factored" },
-      { n: 5, name: "cache-aggressive", desc: "(32,16) packed+factored" },
-    ];
+  // Warmup
+  process.stderr.write("  warming up...");
+  await benchRun(e, "Hello", 16);
+  console.error(" done\n");
 
-    console.error(`  mode:   experimental (5 RDNA2 kernel variants x ${runs} runs)\n`);
+  const decodes: number[] = [];
+  const tokenCounts: number[] = [];
 
-    // Warmup
-    process.stderr.write("  warming up...");
-    await runInfer(bin, modelPath!, "Hello", { HIPFIRE_RDNA2_VARIANT: "1" });
-    console.error(" done\n");
-
-    const results: BenchResult[] = [];
-
-    for (const v of variants) {
-      const env = { HIPFIRE_RDNA2_VARIANT: String(v.n) };
-      // Clear kernel cache so each variant compiles fresh
-      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/"); } catch {}
-
-      process.stderr.write(`  v${v.n} ${v.name.padEnd(18)} `);
-      const decodes: number[] = [];
-      const prefills: number[] = [];
-
-      for (let r = 0; r < runs; r++) {
-        const res = await runInfer(bin, modelPath!, prompt, env);
-        if (!res.ok) {
-          process.stderr.write("FAIL ");
-          continue;
-        }
-        decodes.push(res.decode);
-        prefills.push(res.prefill);
-        process.stderr.write(".");
-      }
-      console.error("");
-      results.push({ label: `v${v.n} ${v.name}`, decode: decodes, prefill: prefills });
+  for (let r = 0; r < runs; r++) {
+    process.stderr.write(`  run ${r + 1}/${runs} `);
+    const res = await benchRun(e, prompt, 128);
+    if (!res.ok) {
+      console.error("FAIL");
+      continue;
     }
-
-    // Results table
-    console.log("");
-    console.log("  V  Name                       Decode tok/s          Prefill tok/s");
-    console.log("     launch_bounds               mean   min   max      mean   min   max");
-    console.log("  " + "─".repeat(73));
-
-    let bestMean = 0, bestLabel = "";
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      const v = variants[i];
-      const d = stats(r.decode);
-      const p = stats(r.prefill);
-      if (d.mean > bestMean) { bestMean = d.mean; bestLabel = r.label; }
-      const marker = r.decode.length === 0 ? " FAIL" : "";
-      console.log(
-        `  ${v.n}  ${v.name.padEnd(18)} ${v.desc.padEnd(9)}` +
-        `${fmtNum(d.mean)}${fmtNum(d.min)}${fmtNum(d.max)}` +
-        `   ${fmtNum(p.mean)}${fmtNum(p.min)}${fmtNum(p.max)}${marker}`
-      );
-    }
-
-    if (bestLabel) {
-      console.log(`\n  Best decode: ${bestLabel} at ${bestMean.toFixed(1)} tok/s`);
-      const bestV = bestLabel.match(/v(\d)/)?.[1] || "1";
-      console.log(`  Set default: export HIPFIRE_RDNA2_VARIANT=${bestV}`);
-    }
-
-  } else {
-    // ── Standard bench: performance sweep ──
-    console.error(`  mode:   standard\n`);
-
-    // Warmup
-    process.stderr.write("  warming up...");
-    await runInfer(bin, modelPath!, "Hello");
-    console.error(" done\n");
-
-    const decodes: number[] = [];
-    const prefills: number[] = [];
-
-    for (let r = 0; r < runs; r++) {
-      process.stderr.write(`  run ${r + 1}/${runs} `);
-      const res = await runInfer(bin, modelPath!, prompt);
-      if (!res.ok) {
-        console.error("FAIL");
-        continue;
-      }
-      decodes.push(res.decode);
-      prefills.push(res.prefill);
-      console.error(`${res.decode.toFixed(1)} tok/s`);
-    }
-
-    const d = stats(decodes);
-    const p = stats(prefills);
-
-    console.log("");
-    console.log("  Decode  tok/s");
-    console.log(`    mean:  ${d.mean.toFixed(1)}`);
-    console.log(`    min:   ${d.min.toFixed(1)}`);
-    console.log(`    max:   ${d.max.toFixed(1)}`);
-    console.log(`    stdev: ${d.stdev.toFixed(1)}`);
-    console.log("");
-    console.log("  Prefill tok/s");
-    console.log(`    mean:  ${p.mean.toFixed(1)}`);
-    console.log(`    min:   ${p.min.toFixed(1)}`);
-    console.log(`    max:   ${p.max.toFixed(1)}`);
-    console.log(`    stdev: ${p.stdev.toFixed(1)}`);
-
-    if (isRdna2) {
-      console.log(`\n  Tip: Run 'hipfire bench --exp ${model}' to test RDNA2 kernel variants`);
-    }
+    decodes.push(res.decode);
+    tokenCounts.push(res.tokens);
+    console.error(`${res.decode.toFixed(1)} tok/s (${res.tokens} tok)`);
   }
+
+  const d = stats(decodes);
+
+  console.log("");
+  console.log("  Decode  tok/s");
+  console.log(`    mean:  ${d.mean.toFixed(1)}`);
+  console.log(`    min:   ${d.min.toFixed(1)}`);
+  console.log(`    max:   ${d.max.toFixed(1)}`);
+  console.log(`    stdev: ${d.stdev.toFixed(1)}`);
+
+  if (d.mean > 0) {
+    console.log(`    ms/tok: ${(1000 / d.mean).toFixed(1)}`);
+  }
+
+  if (isRdna2) {
+    console.log(`\n  Tip: Run 'hipfire bench --exp ${model}' to test RDNA2 kernel variants`);
+  }
+
+  await e.stop();
 }
 
 // ─── Main ───────────────────────────────────────────────
