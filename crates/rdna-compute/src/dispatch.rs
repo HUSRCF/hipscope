@@ -3272,6 +3272,10 @@ impl Gpu {
                 specs.push(("kv_cache_write_turbo2_256", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO2_256_SRC)));
                 specs.push(("attention_turbo2_kv_256",   Self::turbo_source(kernels::ATTENTION_TURBO2_KV_256_SRC)));
             }
+            "turbo2" => {
+                specs.push(("kv_cache_write_turbo2", Self::turbo_source(kernels::KV_CACHE_WRITE_TURBO2_SRC)));
+                specs.push(("attention_turbo2_kv",   Self::turbo_source(kernels::ATTENTION_TURBO2_KV_SRC)));
+            }
             "q8" | _ => {
                 specs.push(("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string()));
                 specs.push(("attention_q8_0_kv",   kernels::ATTENTION_Q8_0_KV_SRC.to_string()));
