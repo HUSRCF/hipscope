@@ -200,6 +200,20 @@ class Engine {
     }
   }
 
+  /// Drain any in-flight generation until "done" or "error". Call this after
+  /// a generate stream is interrupted (e.g., client disconnect) to resync
+  /// the daemon's stdout before sending the next command.
+  async drain() {
+    try {
+      while (true) {
+        const r = await this.recv();
+        if (r.type === "done" || r.type === "error") break;
+      }
+    } catch { /* daemon closed or timeout — nothing to drain */ }
+  }
+
+  generating = false;
+
   async stop() {
     try { await this.send({ type: "unload" }); } catch {}
     this.reader?.releaseLock();
@@ -350,7 +364,8 @@ async function serve(port: number) {
 
   // Pre-warm: load default model and compile kernels before accepting requests
   const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
-  const warmPath = findModel(defaultModel);
+  const rawWarmPath = findModel(defaultModel);
+  const warmPath = rawWarmPath ? resolve(rawWarmPath) : null;
   if (warmPath) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
@@ -404,6 +419,13 @@ async function serve(port: number) {
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
+      // If a previous generation was interrupted (client disconnect), drain
+      // remaining daemon output before sending new commands.
+      if (e.generating) {
+        await e.drain();
+        e.generating = false;
+      }
+
       try {
         const body = await req.json();
         const messages: any[] = body.messages || [];
@@ -451,8 +473,10 @@ async function serve(port: number) {
         }
         userPrompt = convParts.join("\n");
 
-        const path = findModel(body.model || "default");
-        if (!path) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        const rawPath = findModel(body.model || "default");
+        if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
+        const path = resolve(rawPath);
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
@@ -499,6 +523,7 @@ async function serve(port: number) {
         if (body.stream) {
           const enc = new TextEncoder();
           let streamCancelled = false;
+          e.generating = true;
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
@@ -532,6 +557,7 @@ async function serve(port: number) {
                     ctrl.close();
                   }
                 }
+                e.generating = false;
               } finally { safeRelease(); }
             },
             cancel() { streamCancelled = true; } // lock released in finally after generation drains
@@ -540,9 +566,11 @@ async function serve(port: number) {
 
         let content = "";
         let completionTokens = 0;
+        e.generating = true;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
         }
+        e.generating = false;
 
         // Strip think tags and special tokens.
         // Greedy match: strip everything from first <think> to last </think>.
