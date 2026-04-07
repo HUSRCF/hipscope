@@ -654,11 +654,18 @@ function findModel(name: string): string | null {
   const isModel = (f: string) => {
     if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq"))) return false;
     if (!(f.includes(name) || f.includes(searchName))) return false;
-    // If user didn't specify a quant, only match .hf4 or legacy Q4 .hfq files.
-    // Reject legacy HF6 files (.hfq6.hfq) to avoid loading the wrong quant.
+    // If user didn't specify a quant, only match the default (4-bit) variant.
+    // For .hf4: always OK. For .hf6: reject. For legacy .hfq: only accept
+    // canonical defaults ({base}.q4.hfq, {base}-hfq4.hfq, {base}.hfq).
+    // Reject non-default variants like hfq4g256, q8q4k, hfq6, etc.
     if (!hasQuantHint) {
       if (f.endsWith(".hf6")) return false;
-      if (f.endsWith(".hfq") && (f.includes("hfq6") || f.includes("hf6"))) return false;
+      if (f.endsWith(".hfq")) {
+        const stem = f.slice(0, -4); // strip .hfq
+        const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
+          || stem === searchName || stem === name;
+        if (!isDefaultQ4) return false;
+      }
     }
     return true;
   };
