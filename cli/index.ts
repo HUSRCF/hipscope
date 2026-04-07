@@ -648,8 +648,16 @@ function findModel(name: string): string | null {
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
+  // If the name includes a quant hint (hf4/hf6), match exactly. Otherwise prefer .hf4 (default quant).
   const searchName = name.replace(":", "-");
-  const isModel = (f: string) => (f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && (f.includes(name) || f.includes(searchName));
+  const hasQuantHint = /\.hf[46]$|-hf[46]$/.test(name);
+  const isModel = (f: string) => {
+    if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq"))) return false;
+    if (!(f.includes(name) || f.includes(searchName))) return false;
+    // If user didn't specify a quant, only match .hf4 (default) to avoid loading wrong quant
+    if (!hasQuantHint && !f.endsWith(".hf4") && !f.endsWith(".hfq")) return false;
+    return true;
+  };
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   for (const dir of dirs) {
     try {
