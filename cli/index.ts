@@ -203,13 +203,20 @@ class Engine {
   /// Drain any in-flight generation until "done" or "error". Call this after
   /// a generate stream is interrupted (e.g., client disconnect) to resync
   /// the daemon's stdout before sending the next command.
+  /// Times out after 30s to avoid deadlocking if daemon crashed mid-generation.
   async drain() {
+    const deadline = Date.now() + 30_000;
     try {
-      while (true) {
-        const r = await this.recv();
+      while (Date.now() < deadline) {
+        // Race recv() against a timeout so we don't block forever
+        const r = await Promise.race([
+          this.recv(),
+          new Promise<null>((res) => setTimeout(() => res(null), 5000)),
+        ]);
+        if (r === null) break; // timeout — daemon may be dead, stop waiting
         if (r.type === "done" || r.type === "error") break;
       }
-    } catch { /* daemon closed or timeout — nothing to drain */ }
+    } catch { /* daemon closed — nothing left to drain */ }
   }
 
   generating = false;
