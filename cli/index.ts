@@ -654,8 +654,12 @@ function findModel(name: string): string | null {
   const isModel = (f: string) => {
     if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq"))) return false;
     if (!(f.includes(name) || f.includes(searchName))) return false;
-    // If user didn't specify a quant, only match .hf4 (default) to avoid loading wrong quant
-    if (!hasQuantHint && !f.endsWith(".hf4") && !f.endsWith(".hfq")) return false;
+    // If user didn't specify a quant, only match .hf4 or legacy Q4 .hfq files.
+    // Reject legacy HF6 files (.hfq6.hfq) to avoid loading the wrong quant.
+    if (!hasQuantHint) {
+      if (f.endsWith(".hf6")) return false;
+      if (f.endsWith(".hfq") && (f.includes("hfq6") || f.includes("hf6"))) return false;
+    }
     return true;
   };
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
