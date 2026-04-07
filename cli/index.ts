@@ -203,20 +203,32 @@ class Engine {
   /// Drain any in-flight generation until "done" or "error". Call this after
   /// a generate stream is interrupted (e.g., client disconnect) to resync
   /// the daemon's stdout before sending the next command.
-  /// Times out after 30s to avoid deadlocking if daemon crashed mid-generation.
+  /// If drain times out, kills and restarts the daemon — a dangling recv()
+  /// on a killed process resolves with "daemon closed" harmlessly.
   async drain() {
-    const deadline = Date.now() + 30_000;
+    let drained = false;
     try {
-      while (Date.now() < deadline) {
-        // Race recv() against a timeout so we don't block forever
-        const r = await Promise.race([
-          this.recv(),
-          new Promise<null>((res) => setTimeout(() => res(null), 5000)),
-        ]);
-        if (r === null) break; // timeout — daemon may be dead, stop waiting
-        if (r.type === "done" || r.type === "error") break;
-      }
-    } catch { /* daemon closed — nothing left to drain */ }
+      // Use a single timeout for the entire drain operation
+      const result = await Promise.race([
+        (async () => {
+          while (true) {
+            const r = await this.recv();
+            if (r.type === "done" || r.type === "error") return true;
+          }
+        })(),
+        new Promise<false>((res) => setTimeout(() => res(false), 10_000)),
+      ]);
+      drained = result;
+    } catch { /* daemon closed — already clean */ drained = true; }
+
+    if (!drained) {
+      // Timed out — dangling recv() still holds the reader.
+      // Kill the daemon to cancel it, then restart fresh.
+      console.error("[hipfire] drain timed out — restarting daemon");
+      await this.stop();
+      await this.start();
+      await this.send({ type: "ping" }); await this.recv();
+    }
   }
 
   generating = false;
@@ -428,9 +440,11 @@ async function serve(port: number) {
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
+      // If drain restarts the daemon, clear current so model reloads.
       if (e.generating) {
         await e.drain();
         e.generating = false;
+        current = null; // daemon may have restarted — force model reload
       }
 
       try {
