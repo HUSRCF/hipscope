@@ -2238,11 +2238,11 @@ pub struct SamplingConfig {
 impl SamplingConfig {
     /// Text-only thinking model (Qwen3.5 text inference).
     pub fn text_thinking() -> Self {
-        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.3, repeat_window: 128 }
+        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.15, repeat_window: 128 }
     }
     /// VL thinking model.
     pub fn vl_thinking() -> Self {
-        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.3, repeat_window: 128 }
+        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.15, repeat_window: 128 }
     }
     /// Simple greedy-ish sampling (no think/answer split).
     pub fn simple() -> Self {
@@ -2253,12 +2253,33 @@ impl SamplingConfig {
 /// Apply repeat penalty to logits in-place.
 pub fn apply_repeat_penalty(logits: &mut [f32], history: &[u32], window: usize, penalty: f32) {
     let start = history.len().saturating_sub(window);
-    for &t in &history[start..] {
+    let recent = &history[start..];
+
+    // Count frequency of each token in the window, then apply penalty
+    // scaled by count. A token seen once gets penalty^1, seen 3 times
+    // gets penalty^3. This lets common words reappear naturally while
+    // strongly suppressing actual repetition loops.
+    // Also apply recency decay: tokens near the end of the window get
+    // full penalty, tokens near the start get reduced penalty.
+    let window_len = recent.len() as f32;
+    let mut counts = std::collections::HashMap::<u32, (u32, f32)>::new(); // (count, closest_position_ratio)
+    for (i, &t) in recent.iter().enumerate() {
+        let recency = (i as f32 + 1.0) / window_len; // 0→1, higher = more recent
+        let entry = counts.entry(t).or_insert((0, 0.0));
+        entry.0 += 1;
+        if recency > entry.1 { entry.1 = recency; }
+    }
+
+    for (&t, &(count, recency)) in &counts {
         if (t as usize) < logits.len() {
+            // Effective penalty: base^count scaled by recency
+            // A token seen once at the start of the window: penalty^(1 * 0.3) ≈ 1.015
+            // A token seen 3 times recently: penalty^(3 * 1.0) = penalty^3 ≈ 1.16
+            let effective = penalty.powf(count as f32 * recency);
             if logits[t as usize] > 0.0 {
-                logits[t as usize] /= penalty;
+                logits[t as usize] /= effective;
             } else {
-                logits[t as usize] *= penalty;
+                logits[t as usize] *= effective;
             }
         }
     }

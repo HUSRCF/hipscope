@@ -1,5 +1,17 @@
 #include <hip/hip_runtime.h>
 
+// Native ds_swizzle_b32 Hadamard butterfly: XOR swap + add/sub.
+// Replaces __shfl_xor (which compiles to ds_bpermute, needing a VGPR for the
+// lane index). ds_swizzle encodes the XOR pattern as an immediate — no VGPR,
+// no index computation, lower latency.
+// Pattern encoding: bit15=0, xor_mask in [14:10], or=0 in [9:5], and=0x1F in [4:0]
+#define HADAMARD_BFLY(v, pattern, stride, tid) do {                     \
+    float _p = __int_as_float(                                          \
+        __builtin_amdgcn_ds_swizzle(__float_as_int(v), (pattern)));     \
+    if ((tid) & (stride)) { (v) = _p - (v); }                          \
+    else                  { (v) = (v) + _p; }                           \
+} while(0)
+
 // Lloyd-Max optimal centroids for N(0, 1/128) after unit-norm + FWHT(1/sqrt(128))
 __constant__ float TURBO_C2[4] = {-0.133466f, -0.040022f, 0.040022f, 0.133466f};
 __constant__ float TURBO_C3[8] = {-0.190685f, -0.117832f, -0.065717f, -0.021460f, 0.021460f, 0.065717f, 0.117832f, 0.190685f};
@@ -77,14 +89,17 @@ __device__ void fwht_shfl_forward(float& a, float& b, float& c, float& d,
     t = b; b = b + d; d = t - d;
 
     // Wave-level butterfly: strides 4,8,16,32,64 → thread strides 1,2,4,8,16
-    for (int ts = 1; ts <= 16; ts <<= 1) {
-        float pa = __shfl_xor(a, ts);
-        float pb = __shfl_xor(b, ts);
-        float pc = __shfl_xor(c, ts);
-        float pd = __shfl_xor(d, ts);
-        if (tid & ts) { a = pa - a; b = pb - b; c = pc - c; d = pd - d; }
-        else          { a = a + pa; b = b + pb; c = c + pc; d = d + pd; }
-    }
+    // Unrolled with ds_swizzle_b32 (native XOR swap, no VGPR for lane index)
+    HADAMARD_BFLY(a, 0x041F, 1, tid); HADAMARD_BFLY(b, 0x041F, 1, tid);
+    HADAMARD_BFLY(c, 0x041F, 1, tid); HADAMARD_BFLY(d, 0x041F, 1, tid);
+    HADAMARD_BFLY(a, 0x081F, 2, tid); HADAMARD_BFLY(b, 0x081F, 2, tid);
+    HADAMARD_BFLY(c, 0x081F, 2, tid); HADAMARD_BFLY(d, 0x081F, 2, tid);
+    HADAMARD_BFLY(a, 0x101F, 4, tid); HADAMARD_BFLY(b, 0x101F, 4, tid);
+    HADAMARD_BFLY(c, 0x101F, 4, tid); HADAMARD_BFLY(d, 0x101F, 4, tid);
+    HADAMARD_BFLY(a, 0x201F, 8, tid); HADAMARD_BFLY(b, 0x201F, 8, tid);
+    HADAMARD_BFLY(c, 0x201F, 8, tid); HADAMARD_BFLY(d, 0x201F, 8, tid);
+    HADAMARD_BFLY(a, 0x401F, 16, tid); HADAMARD_BFLY(b, 0x401F, 16, tid);
+    HADAMARD_BFLY(c, 0x401F, 16, tid); HADAMARD_BFLY(d, 0x401F, 16, tid);
 
     // Scale by 1/sqrt(128) and apply signs2
     const float s = 0.08838834764831845f;
@@ -98,14 +113,16 @@ __device__ void fwht_shfl_inverse(float& a, float& b, float& c, float& d,
     int d0 = tid * 4;
     a *= signs2[d0]; b *= signs2[d0+1]; c *= signs2[d0+2]; d *= signs2[d0+3];
 
-    for (int ts = 1; ts <= 16; ts <<= 1) {
-        float pa = __shfl_xor(a, ts);
-        float pb = __shfl_xor(b, ts);
-        float pc = __shfl_xor(c, ts);
-        float pd = __shfl_xor(d, ts);
-        if (tid & ts) { a = pa - a; b = pb - b; c = pc - c; d = pd - d; }
-        else          { a = a + pa; b = b + pb; c = c + pc; d = d + pd; }
-    }
+    HADAMARD_BFLY(a, 0x041F, 1, tid); HADAMARD_BFLY(b, 0x041F, 1, tid);
+    HADAMARD_BFLY(c, 0x041F, 1, tid); HADAMARD_BFLY(d, 0x041F, 1, tid);
+    HADAMARD_BFLY(a, 0x081F, 2, tid); HADAMARD_BFLY(b, 0x081F, 2, tid);
+    HADAMARD_BFLY(c, 0x081F, 2, tid); HADAMARD_BFLY(d, 0x081F, 2, tid);
+    HADAMARD_BFLY(a, 0x101F, 4, tid); HADAMARD_BFLY(b, 0x101F, 4, tid);
+    HADAMARD_BFLY(c, 0x101F, 4, tid); HADAMARD_BFLY(d, 0x101F, 4, tid);
+    HADAMARD_BFLY(a, 0x201F, 8, tid); HADAMARD_BFLY(b, 0x201F, 8, tid);
+    HADAMARD_BFLY(c, 0x201F, 8, tid); HADAMARD_BFLY(d, 0x201F, 8, tid);
+    HADAMARD_BFLY(a, 0x401F, 16, tid); HADAMARD_BFLY(b, 0x401F, 16, tid);
+    HADAMARD_BFLY(c, 0x401F, 16, tid); HADAMARD_BFLY(d, 0x401F, 16, tid);
 
     float t;
     t = a; a = a + c; c = t - c;
@@ -178,24 +195,18 @@ __device__ void fwht_shfl_forward_256(
 
     // --- Passes 4-8: strides 8,16,32,64,128 in element space ---
     // Element stride 8 with 8 elements/thread = thread stride 1, etc.
-    // Thread strides: 1, 2, 4, 8, 16
-    for (int ts = 1; ts <= 16; ts <<= 1) {
-        float p0 = __shfl_xor(v0, ts);
-        float p1 = __shfl_xor(v1, ts);
-        float p2 = __shfl_xor(v2, ts);
-        float p3 = __shfl_xor(v3, ts);
-        float p4 = __shfl_xor(v4, ts);
-        float p5 = __shfl_xor(v5, ts);
-        float p6 = __shfl_xor(v6, ts);
-        float p7 = __shfl_xor(v7, ts);
-        if (tid & ts) {
-            v0 = p0 - v0; v1 = p1 - v1; v2 = p2 - v2; v3 = p3 - v3;
-            v4 = p4 - v4; v5 = p5 - v5; v6 = p6 - v6; v7 = p7 - v7;
-        } else {
-            v0 = v0 + p0; v1 = v1 + p1; v2 = v2 + p2; v3 = v3 + p3;
-            v4 = v4 + p4; v5 = v5 + p5; v6 = v6 + p6; v7 = v7 + p7;
-        }
-    }
+    // Thread strides: 1, 2, 4, 8, 16 — unrolled with ds_swizzle_b32
+    #define HBFLY8(pat, str) \
+        HADAMARD_BFLY(v0,(pat),(str),tid); HADAMARD_BFLY(v1,(pat),(str),tid); \
+        HADAMARD_BFLY(v2,(pat),(str),tid); HADAMARD_BFLY(v3,(pat),(str),tid); \
+        HADAMARD_BFLY(v4,(pat),(str),tid); HADAMARD_BFLY(v5,(pat),(str),tid); \
+        HADAMARD_BFLY(v6,(pat),(str),tid); HADAMARD_BFLY(v7,(pat),(str),tid)
+    HBFLY8(0x041F, 1);
+    HBFLY8(0x081F, 2);
+    HBFLY8(0x101F, 4);
+    HBFLY8(0x201F, 8);
+    HBFLY8(0x401F, 16);
+    #undef HBFLY8
 
     // Scale by 1/sqrt(256) = 1/16 = 0.0625 and apply signs2
     const float s = 0.0625f;
@@ -216,23 +227,17 @@ __device__ void fwht_shfl_inverse_256(
     v4 *= signs2[d0+4]; v5 *= signs2[d0+5]; v6 *= signs2[d0+6]; v7 *= signs2[d0+7];
 
     // --- Passes 4-8 (shuffle, same order as forward: WHT is self-inverse) ---
-    for (int ts = 1; ts <= 16; ts <<= 1) {
-        float p0 = __shfl_xor(v0, ts);
-        float p1 = __shfl_xor(v1, ts);
-        float p2 = __shfl_xor(v2, ts);
-        float p3 = __shfl_xor(v3, ts);
-        float p4 = __shfl_xor(v4, ts);
-        float p5 = __shfl_xor(v5, ts);
-        float p6 = __shfl_xor(v6, ts);
-        float p7 = __shfl_xor(v7, ts);
-        if (tid & ts) {
-            v0 = p0 - v0; v1 = p1 - v1; v2 = p2 - v2; v3 = p3 - v3;
-            v4 = p4 - v4; v5 = p5 - v5; v6 = p6 - v6; v7 = p7 - v7;
-        } else {
-            v0 = v0 + p0; v1 = v1 + p1; v2 = v2 + p2; v3 = v3 + p3;
-            v4 = v4 + p4; v5 = v5 + p5; v6 = v6 + p6; v7 = v7 + p7;
-        }
-    }
+    #define HBFLY8(pat, str) \
+        HADAMARD_BFLY(v0,(pat),(str),tid); HADAMARD_BFLY(v1,(pat),(str),tid); \
+        HADAMARD_BFLY(v2,(pat),(str),tid); HADAMARD_BFLY(v3,(pat),(str),tid); \
+        HADAMARD_BFLY(v4,(pat),(str),tid); HADAMARD_BFLY(v5,(pat),(str),tid); \
+        HADAMARD_BFLY(v6,(pat),(str),tid); HADAMARD_BFLY(v7,(pat),(str),tid)
+    HBFLY8(0x041F, 1);
+    HBFLY8(0x081F, 2);
+    HBFLY8(0x101F, 4);
+    HBFLY8(0x201F, 8);
+    HBFLY8(0x401F, 16);
+    #undef HBFLY8
 
     // --- Pass 3 (reverse): stride 4 --- pairs (0,4), (1,5), (2,6), (3,7)
     float t;

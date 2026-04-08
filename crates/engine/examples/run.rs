@@ -217,7 +217,7 @@ fn main() {
             qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch).unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
             llama::apply_ngram_block(&mut logits, &conversation_tokens);
-            llama::apply_repeat_penalty(&mut logits, &conversation_tokens, 128, 1.3);
+            llama::apply_repeat_penalty(&mut logits, &conversation_tokens, sc.repeat_window, sc.repeat_penalty);
             next_token = llama::sample_top_p(&logits, temp, sc.top_p);
         }
         seq_pos += generated;

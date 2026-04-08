@@ -6,9 +6,10 @@ members = [
     "crates/engine",
     "crates/hipfire-quantize",
     "crates/redline",
+    "magnum",
 ]
 
 [workspace.package]
-version = "0.1.3-alpha"
+version = "0.1.4-alpha"
 edition = "2021"
 license = "MIT"
