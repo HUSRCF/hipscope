@@ -17,6 +17,10 @@ fn main() {
     let dq = DispatchQueue::new(&dev).unwrap();
     let startup_device = t_start.elapsed();
 
+    // Auto-detect target arch from the open device
+    let arch = dev.info.gfx_arch.clone();
+    eprintln!("[bench] targeting {}", arch);
+
     // Compile vector_add with __launch_bounds__ (so no hidden arg overhead)
     let hip_src = r#"
 #include <hip/hip_runtime.h>
@@ -28,7 +32,7 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_bench_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
+        .args(["--genco", &format!("--offload-arch={arch}"), "-O3",
                "-o", "/tmp/redline_bench_va.hsaco", "/tmp/redline_bench_va.hip"])
         .output().expect("hipcc");
     assert!(out.status.success(), "hipcc: {}", String::from_utf8_lossy(&out.stderr));

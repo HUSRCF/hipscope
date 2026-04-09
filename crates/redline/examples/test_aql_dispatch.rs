@@ -9,6 +9,8 @@ fn main() {
     eprintln!("=== redline: AQL user-mode dispatch test ===\n");
 
     let dev = Device::open(None).unwrap();
+    let arch = dev.info.gfx_arch.clone();
+    eprintln!("[aql-test] targeting {}", arch);
 
     // Create AQL queue
     let aql = match AqlQueue::new(&dev) {
@@ -31,7 +33,7 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_aql_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
+        .args(["--genco", &format!("--offload-arch={arch}"), "-O3",
                "-o", "/tmp/redline_aql_va.hsaco", "/tmp/redline_aql_va.hip"])
         .output().expect("hipcc");
     assert!(out.status.success(), "hipcc: {}", String::from_utf8_lossy(&out.stderr));

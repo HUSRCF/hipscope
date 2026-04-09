@@ -105,6 +105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hsa-bridge"
+version = "0.1.4-alpha"
+dependencies = [
+ "hip-bridge",
+ "libloading",
+ "thiserror",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
