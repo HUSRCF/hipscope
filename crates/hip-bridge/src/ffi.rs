@@ -7,6 +7,71 @@ use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
 
+/// Per-thread accumulators for time spent inside HIP FFI calls. Used by
+/// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
+/// clock to specific HIP runtime calls.
+pub mod launch_counters {
+    use std::cell::Cell;
+
+    macro_rules! counter {
+        ($mod_name:ident) => {
+            pub mod $mod_name {
+                use std::cell::Cell;
+                thread_local! {
+                    pub(super) static TIME_NS: Cell<u64> = const { Cell::new(0) };
+                    pub(super) static COUNT: Cell<u64> = const { Cell::new(0) };
+                }
+                #[inline]
+                pub fn record(ns: u64) {
+                    TIME_NS.with(|c| c.set(c.get() + ns));
+                    COUNT.with(|c| c.set(c.get() + 1));
+                }
+                pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
+                pub fn count() -> u64 { COUNT.with(|c| c.get()) }
+                pub fn reset() {
+                    TIME_NS.with(|c| c.set(0));
+                    COUNT.with(|c| c.set(0));
+                }
+            }
+        };
+    }
+
+    // Existing counter — kept for back-compat with profile_host_vs_gpu.
+    thread_local! {
+        static TIME_NS: Cell<u64> = const { Cell::new(0) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[inline]
+    pub(super) fn record(ns: u64) {
+        TIME_NS.with(|c| c.set(c.get() + ns));
+        COUNT.with(|c| c.set(c.get() + 1));
+        launch_kernel::record(ns);
+    }
+
+    pub fn reset() {
+        TIME_NS.with(|c| c.set(0));
+        COUNT.with(|c| c.set(0));
+        launch_kernel::reset();
+        memcpy_dtod::reset();
+        memcpy_htod::reset();
+        memcpy_dtoh::reset();
+        memset::reset();
+        ensure_kernel_lookup::reset();
+    }
+
+    pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
+    pub fn count() -> u64 { COUNT.with(|c| c.get()) }
+
+    // Per-API counters
+    counter!(launch_kernel);
+    counter!(memcpy_dtod);
+    counter!(memcpy_htod);
+    counter!(memcpy_dtoh);
+    counter!(memset);
+    counter!(ensure_kernel_lookup);
+}
+
 // Opaque HIP handles (pointers to internal structs)
 type HipStream = *mut c_void;
 type HipModule = *mut c_void;
@@ -280,9 +345,11 @@ impl HipRuntime {
         assert!(src_offset + size <= src.size);
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy D2D at offset")
     }
 
@@ -297,6 +364,7 @@ impl HipRuntime {
         assert!(size <= dst.size, "size ({size}) exceeds dst ({})", dst.size);
         assert!(src_offset + size <= src.size, "src_offset+size exceeds src");
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.ptr,
@@ -305,6 +373,7 @@ impl HipRuntime {
                 MemcpyKind::DeviceToDevice as c_uint,
             )
         };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy D2D offset")
     }
 
@@ -315,6 +384,7 @@ impl HipRuntime {
             src.len(),
             dst.size
         );
+        let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.ptr,
@@ -323,6 +393,7 @@ impl HipRuntime {
                 MemcpyKind::HostToDevice as c_uint,
             )
         };
+        crate::ffi::launch_counters::memcpy_htod::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy H2D")
     }
 
@@ -333,6 +404,7 @@ impl HipRuntime {
             dst.len(),
             src.size
         );
+        let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -341,6 +413,7 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
+        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy D2H")
     }
 
@@ -351,6 +424,7 @@ impl HipRuntime {
         size: usize,
     ) -> HipResult<()> {
         assert!(size <= dst.size && size <= src.size);
+        let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.ptr,
@@ -359,12 +433,15 @@ impl HipRuntime {
                 MemcpyKind::DeviceToDevice as c_uint,
             )
         };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy D2D")
     }
 
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
         assert!(size <= buf.size);
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
+        crate::ffi::launch_counters::memset::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemset")
     }
 
@@ -431,6 +508,7 @@ impl HipRuntime {
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
         let code = (self.fn_module_launch_kernel)(
             func.0,
             grid[0],
@@ -444,6 +522,7 @@ impl HipRuntime {
             params.as_mut_ptr(),
             ptr::null_mut(),
         );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipModuleLaunchKernel")
     }
 

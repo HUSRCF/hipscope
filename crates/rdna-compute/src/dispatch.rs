@@ -2671,6 +2671,52 @@ impl Gpu {
 
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
+    /// Repeat-interleave Q and K key heads up to value heads count.
+    /// Replaces the per-head memcpy loop in DeltaNet for ratio>1 configs:
+    /// `dst[(kh*ratio+r)*hd + d] = src[kh*hd + d]`. Does Q and K together
+    /// in one launch. For Qwen3.5 9B (24 layers × 64 D2D each), this saves
+    /// ~1500 hipMemcpy calls per forward.
+    pub fn repeat_interleave_qk_f32(
+        &mut self,
+        q_src: &GpuTensor,
+        k_src: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_key_heads: usize,
+        ratio: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("repeat_interleave_qk", kernels::REPEAT_INTERLEAVE_QK_SRC, "repeat_interleave_qk_f32")?;
+        let func = &self.functions["repeat_interleave_qk_f32"];
+        let mut qsp = q_src.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr();
+        let mut qdp = q_dst.buf.as_ptr();
+        let mut kdp = k_dst.buf.as_ptr();
+        let mut nkh = n_key_heads as i32;
+        let mut r = ratio as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qsp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut qdp as *mut _ as *mut c_void,
+            &mut kdp as *mut _ as *mut c_void,
+            &mut nkh as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let total = (n_key_heads * ratio * head_dim) as u32;
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        let bytes = (n_key_heads * head_dim * 4) * 2 // Q/K reads
+                  + (n_key_heads * ratio * head_dim * 4) * 2; // Q/K writes
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "repeat_interleave_qk_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Deinterleave: split [A_h0(hd), B_h0(hd), A_h1(hd), B_h1(hd), ...] into A and B.
     /// Replaces per-head memcpy loop (n_heads × 2 ioctls → 1 dispatch).
     pub fn deinterleave_f32(&mut self, interleaved: &GpuTensor, out_a: &GpuTensor, out_b: &GpuTensor,
@@ -3647,6 +3693,8 @@ impl Gpu {
             ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
             // FullAttn: Q+gate deinterleave split
             ("deinterleave",             kernels::DEINTERLEAVE_SRC.to_string()),
+            // DeltaNet: Q/K repeat-interleave for asymmetric MQA (replaces 64+ memcpy_dtod calls per layer on 4B/9B)
+            ("repeat_interleave_qk",     kernels::REPEAT_INTERLEAVE_QK_SRC.to_string()),
         ];
 
         // Weight-format-specific GEMV
@@ -3723,6 +3771,7 @@ impl Gpu {
                 "gated_norm" => "gated_norm_f32",
                 "rope_partial_interleaved" => "rope_partial_interleaved_f32",
                 "deinterleave" => "deinterleave_f32",
+                "repeat_interleave_qk" => "repeat_interleave_qk_f32",
                 "gated_delta_net_q8" => "gated_delta_net_q8",
                 // RDNA2 variant module names → common function symbol
                 n if n.starts_with("gemv_hfq4g256_rdna2") => "gemv_hfq4g256",

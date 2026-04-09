@@ -6,6 +6,7 @@ mod error;
 
 pub use error::{HipError, HipResult};
 pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
+pub use ffi::launch_counters;
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

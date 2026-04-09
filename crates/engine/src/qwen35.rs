@@ -1212,17 +1212,16 @@ fn forward_scratch_layers(
                 gpu.l2_norm_f32(&s.dn_k_raw, config.linear_num_key_heads, hd, config.norm_eps)?;
                 gpu.scale_f32(&s.dn_q_raw, 1.0 / (hd as f32).sqrt())?;
 
-                // Repeat-interleave Q/K if needed
+                // Repeat-interleave Q/K if needed.
+                // Phase 3a-A fix: replace per-head memcpy loop with one fused kernel.
+                // For 9B (n_key=16, n_val=32, ratio=2): saves 64 hipMemcpy calls
+                // per layer × 24 layers = 1536 calls per forward, ~1.7 ms savings.
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
-                    for kh in 0..config.linear_num_key_heads {
-                        for r in 0..ratio {
-                            let dst = (kh * ratio + r) * hd * 4;
-                            let src = kh * hd * 4;
-                            gpu.hip.memcpy_dtod_at(&s.dn_q.buf, dst, &s.dn_q_raw.buf, src, hd * 4)?;
-                            gpu.hip.memcpy_dtod_at(&s.dn_k.buf, dst, &s.dn_k_raw.buf, src, hd * 4)?;
-                        }
-                    }
+                    gpu.repeat_interleave_qk_f32(
+                        &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
+                        config.linear_num_key_heads, ratio, hd,
+                    )?;
                 } else {
                     gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
                     gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
