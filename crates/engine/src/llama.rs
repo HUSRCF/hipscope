@@ -566,6 +566,47 @@ pub fn weight_gemv(
     }
 }
 
+/// Fused RMSNorm + FWHT rotation for a batch of MagnumQuant GEMVs sharing x.
+///
+/// Replaces the split `rmsnorm_f32` + `rotate_x_for_mq` pair with a single kernel
+/// launch (Phase 3.6 kernel fusion). The caller should subsequently use
+/// `weight_gemv_prerotated` with the returned `Option<&GpuTensor>`:
+///
+/// - MQ4 `sample_weight`: launches `fused_rmsnorm_rotate_mq`, writes FWHT(rmsnorm(x))
+///   into `x_rot_scratch`, returns `Some(x_rot_scratch)`.
+/// - MQ8 `sample_weight`: not yet supported by the fused kernel, falls back to
+///   plain `rmsnorm_f32` + `rotate_quantize_x_mq8` (the INT8 quantize step can't
+///   share LDS with rmsnorm the same way). Returns `None` — MQ8 consumes the
+///   internal `mq_x_q8` buffer inside `weight_gemv_prerotated`.
+/// - Any other dtype: plain `rmsnorm_f32` into `tmp`, returns `None`.
+pub fn fused_rmsnorm_rotate_for_mq<'a>(
+    gpu: &mut Gpu,
+    sample_weight: &WeightTensor,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    tmp: &GpuTensor,
+    x_rot_scratch: &'a GpuTensor,
+    eps: f32,
+) -> HipResult<Option<&'a GpuTensor>> {
+    match sample_weight.gpu_dtype {
+        DType::MQ4G256 => {
+            gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
+            Ok(Some(x_rot_scratch))
+        }
+        DType::MQ8G256 => {
+            // MQ8 rotate+quantize produces INT8 scratch; can't fuse with rmsnorm the
+            // same way. Keep the split path for now.
+            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+            gpu.rotate_quantize_x_mq8(tmp, sample_weight.k)?;
+            Ok(None)
+        }
+        _ => {
+            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+            Ok(None)
+        }
+    }
+}
+
 /// Pre-rotate x once for a batch of MagnumQuant weight GEMVs that share the same input.
 ///
 /// - MQ4: writes FWHT(x) into `x_rot_scratch`, returns `Some(x_rot_scratch)`.

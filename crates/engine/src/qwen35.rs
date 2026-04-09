@@ -3,7 +3,7 @@
 
 use crate::hfq::HfqFile;
 use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
-                    weight_gemv_prerotated, rotate_x_for_mq};
+                    weight_gemv_prerotated, rotate_x_for_mq, fused_rmsnorm_rotate_for_mq};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1185,10 +1185,13 @@ fn forward_scratch_layers(
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
-                // Batch FWHT for MQ weights: wqkv/wz/w_beta/w_alpha all consume s.tmp,
-                // so one rotation replaces four.
-                let x_rot = rotate_x_for_mq(gpu, &layer.wqkv, &s.tmp, &s.x_rot)?;
+                // Fused RMSNorm + FWHT rotation (Phase 3.6). For MQ4 weights this
+                // writes rmsnorm(x) followed by FWHT into s.x_rot in a single
+                // kernel launch. For non-MQ weights it falls back to plain rmsnorm
+                // into s.tmp. Either way, wqkv/wz/w_beta/w_alpha share this input.
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
                 weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                 weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                 weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
@@ -1249,9 +1252,10 @@ fn forward_scratch_layers(
                 weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
                 gpu.add_inplace_f32(&s.x, &s.o)?;
 
-                // FFN: w_gate/w_up share s.tmp, batch rotation (2 → 1).
-                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &s.tmp, &s.x_rot)?;
+                // FFN: fused rmsnorm + rotate for w_gate/w_up.
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
@@ -1268,9 +1272,10 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
-                // Batch FWHT for MQ weights: wq/wk/wv all consume s.tmp, one rotation for three.
-                let x_rot = rotate_x_for_mq(gpu, &layer.wq, &s.tmp, &s.x_rot)?;
+                // Fused rmsnorm + FWHT rotation for wq/wk/wv (all share input).
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
                 weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
 
                 // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
@@ -1365,9 +1370,10 @@ fn forward_scratch_layers(
                 weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
                 gpu.add_inplace_f32(&s.x, &s.o)?;
 
-                // FFN: w_gate/w_up share s.tmp, batch rotation (2 → 1).
-                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &s.tmp, &s.x_rot)?;
+                // FFN: fused rmsnorm + rotate for w_gate/w_up.
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
