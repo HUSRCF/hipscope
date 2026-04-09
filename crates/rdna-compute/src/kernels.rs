@@ -386,6 +386,11 @@ pub const L2_NORM_SRC: &str = include_str!("../../../kernels/src/l2_norm.hip");
 #[cfg(feature = "deltanet")]
 pub const FUSED_QK_L2_NORM_SCALE_SRC: &str = include_str!("../../../kernels/src/fused_qk_l2_norm_scale.hip");
 
+/// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Two back-to-back
+/// scalar ops in the DeltaNet preamble merged into one launch.
+#[cfg(feature = "deltanet")]
+pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str = include_str!("../../../kernels/src/fused_sigmoid_alpha_gate.hip");
+
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
 /// Dims >= n_rot pass through unchanged.

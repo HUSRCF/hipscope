@@ -744,16 +744,15 @@ fn forward_from_x_gpu(
                 let z = gpu.alloc_tensor(&[d_inner], DType::F32)?;
                 weight_gemv(gpu, &layer.wz, &tmp, &z)?;
 
-                // Beta projection + sigmoid
+                // Beta + alpha projections, then fused sigmoid/alpha_gate.
                 let n_v_heads = config.linear_num_value_heads;
                 let beta_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_beta, &tmp, &beta_out)?;
-                gpu.sigmoid_f32(&beta_out)?;
-
-                // Alpha projection + gate compute (all on GPU, no CPU roundtrip)
                 let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
-                gpu.alpha_gate_f32(&alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads)?;
+                gpu.fused_sigmoid_alpha_gate_f32(
+                    &beta_out, &alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads,
+                )?;
 
                 // Fused conv1d + SiLU (one kernel instead of two)
                 let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
@@ -1196,9 +1195,13 @@ fn forward_scratch_layers(
                 weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                 weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                 weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                gpu.sigmoid_f32(&s.dn_beta)?;
                 weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
-                gpu.alpha_gate_f32(&s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads)?;
+                // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
+                // elementwise scalar transforms on independent buffers of size
+                // n_v_heads — merging into one launch shaves one dispatch per LA.
+                gpu.fused_sigmoid_alpha_gate_f32(
+                    &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
+                )?;
 
                 gpu.conv1d_silu_f32(&s.dn_conv_out, &s.dn_qkv, &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx], qkv_dim)?;
