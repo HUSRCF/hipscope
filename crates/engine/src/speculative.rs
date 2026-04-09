@@ -17,7 +17,7 @@ use crate::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::tokenizer::Tokenizer;
 use hip_bridge::{DeviceBuffer, HipResult};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 
 /// Which KV cache layout to use when allocating a slot.
@@ -350,6 +350,116 @@ impl DeltaNetSnapshot {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
         Ok(())
+    }
+}
+
+/// Compute the DFlash target-layer extraction indices for a model of
+/// `num_target_layers` layers. Matches the `build_target_layer_ids` function in
+/// the DFlash reference implementation:
+///
+/// ```text
+/// start = 1
+/// end   = num_target_layers - 3        # 29 for num_target_layers=32
+/// step  = (end - start) / (num_extract - 1)
+/// layers[i] = round(start + i * step)  # for i in 0..num_extract
+/// ```
+///
+/// For Qwen3.5-9B (32 layers) and 5 extraction layers this returns
+/// `[1, 8, 15, 22, 29]`, matching the hard-coded indices in the HuggingFace
+/// `z-lab/Qwen3.5-9B-DFlash` config.
+pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) -> Vec<usize> {
+    if num_extract == 0 { return Vec::new(); }
+    if num_extract == 1 { return vec![1]; }
+    let start: f32 = 1.0;
+    let end: f32 = (num_target_layers as i32 - 3).max(1) as f32;
+    let step = (end - start) / (num_extract as f32 - 1.0);
+    (0..num_extract)
+        .map(|i| (start + i as f32 * step).round() as usize)
+        .collect()
+}
+
+/// Ring buffer holding the most recent `max_positions` of hidden state
+/// extractions from the target model's forward pass. Each of the `extract_layers`
+/// entries is a `[max_positions, hidden_dim]` f32 GPU tensor. `head` is the
+/// position that the NEXT write will land at (0..max_positions). `written` is
+/// the total cumulative number of writes, used to tell full vs partial buffer.
+///
+/// For DFlash, the draft model pulls a contiguous slice ending at the most
+/// recent position to use as context KV input.
+pub struct HiddenStateRingBuffer {
+    pub layer_bufs: Vec<GpuTensor>,
+    pub extract_layers: Vec<usize>,
+    pub max_positions: usize,
+    pub hidden_dim: usize,
+    pub head: usize,
+    pub written: usize,
+}
+
+impl HiddenStateRingBuffer {
+    /// Allocate GPU ring buffer for `num_extract` target layers.
+    pub fn new(
+        gpu: &mut Gpu,
+        num_target_layers: usize,
+        num_extract: usize,
+        hidden_dim: usize,
+        max_positions: usize,
+    ) -> HipResult<Self> {
+        let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
+        let mut layer_bufs = Vec::with_capacity(num_extract);
+        for _ in 0..num_extract {
+            layer_bufs.push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
+        }
+        let _ = layer_bufs.len(); // silence unused in case of Vec field confusion
+        Ok(Self {
+            layer_bufs,
+            extract_layers,
+            max_positions,
+            hidden_dim,
+            head: 0,
+            written: 0,
+        })
+    }
+
+    /// If `target_layer_idx` matches one of the extraction layers, return the
+    /// index into `layer_bufs`/`extract_layers` for that layer. Otherwise None.
+    #[inline]
+    pub fn extract_slot(&self, target_layer_idx: usize) -> Option<usize> {
+        self.extract_layers.iter().position(|&l| l == target_layer_idx)
+    }
+
+    /// Copy `x` (shape `[hidden_dim]`) into the ring buffer slot for the given
+    /// extraction layer at the CURRENT head position. Call once per extracted
+    /// layer per forward pass, then `advance_head()` at the end of the forward
+    /// to move to the next slot.
+    pub fn write_at_head(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        x: &GpuTensor,
+    ) -> HipResult<()> {
+        let offset = self.head * self.hidden_dim * 4;
+        gpu.hip.memcpy_dtod_at(
+            &self.layer_bufs[extract_idx].buf,
+            offset,
+            &x.buf,
+            0,
+            self.hidden_dim * 4,
+        )
+    }
+
+    /// Advance the write head. Call once per forward pass, AFTER all layer
+    /// extractions for this position have been written.
+    #[inline]
+    pub fn advance_head(&mut self) {
+        self.head = (self.head + 1) % self.max_positions;
+        self.written += 1;
+    }
+
+    /// Reset to empty (head=0, written=0). GPU buffers are not zeroed; stale
+    /// data is simply unreadable because `written < max_positions`.
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.written = 0;
     }
 }
 

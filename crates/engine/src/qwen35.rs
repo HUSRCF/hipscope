@@ -4,6 +4,7 @@
 use crate::hfq::HfqFile;
 use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                     weight_gemv_prerotated, rotate_x_for_mq};
+use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1100,7 +1101,39 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch)
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
+}
+
+/// Same as `forward_scratch` but also extracts hidden states from the
+/// configured target layers into `hidden_rb`. Used by the DFlash draft path
+/// during target verification. `hidden_rb.advance_head()` is called once
+/// automatically at the end of the forward pass.
+pub fn forward_scratch_with_hidden(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
+        _ => panic!("unsupported embedding format"),
+    }
+
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, Some(hidden_rb))?;
+    hidden_rb.advance_head();
+    Ok(())
 }
 
 /// Zero-alloc forward from pre-computed embedding in scratch.x.
@@ -1121,10 +1154,14 @@ pub fn forward_scratch_embed(
         std::slice::from_raw_parts(embedding_data.as_ptr() as *const u8, embedding_data.len() * 4)
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch)
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
 /// Layer loop using scratch buffers. Zero alloc/free per token.
+///
+/// `hidden_rb`: if Some, the layer loop extracts post-residual hidden states
+/// from the configured target layers into the ring buffer. When None (default
+/// for normal inference) this is branch-free and has zero overhead.
 fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1133,6 +1170,7 @@ fn forward_scratch_layers(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -1219,6 +1257,12 @@ fn forward_scratch_layers(
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
                 weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
                 gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
 
                 delta_layer_idx += 1;
             }
@@ -1329,12 +1373,20 @@ fn forward_scratch_layers(
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
                 weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
                 gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
+
                 kv_layer_idx += 1;
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
     }
+    let _ = &mut hidden_rb; // silence unused mut warning on paths where the branch never writes
 
     // Final norm + logits into scratch.logits
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
