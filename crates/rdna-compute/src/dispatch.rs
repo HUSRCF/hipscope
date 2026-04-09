@@ -734,6 +734,51 @@ impl Gpu {
         result
     }
 
+    /// Fused SwiGLU + FWHT rotation. Reads gate/up, computes
+    /// silu(gate[k])*up[k] on the fly, applies FWHT rotation, writes x_rot.
+    /// Used as the w_down input stage for MQ4 — replaces the pair
+    /// silu_mul_f32 + mq_rotate_x with one launch.
+    pub fn fused_silu_mul_rotate_mq(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC,
+            "fused_silu_mul_mq_rotate",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let func = &self.functions["fused_silu_mul_mq_rotate"];
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        // Bandwidth: read gate + up, 2x256 signs, write x_rot.
+        let bytes = k * 4 * 3 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     /// Exposed so callers can batch one rotation across multiple GEMVs that share x
     /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).

@@ -708,6 +708,43 @@ pub fn weight_gemv_residual(
     }
 }
 
+/// SwiGLU FFN epilogue fused into the w_down input stage for MQ4 weights.
+///
+/// Replaces:
+///   silu_mul_f32(gate, up, ffn_hidden)  // eliminated for MQ4
+///   weight_gemv_residual(w_down, ffn_hidden, x)
+/// with (for MQ4):
+///   fused_silu_mul_rotate_mq(gate, up, mq_x_rot)   // one kernel
+///   gemv_hfq4g256_residual(w_down, mq_x_rot, x)    // fused residual add
+/// so the entire w_down epilogue is two launches instead of four
+/// (silu_mul + rotate + gemv + add_inplace → fused_silu_rotate + gemv_residual).
+///
+/// Non-MQ path falls back to the pre-Phase-3.8 sequence (silu_mul_f32 +
+/// weight_gemv_residual). Byte-equivalent modulo FP reordering on the
+/// FWHT butterfly, which is the same butterfly as the standalone path.
+pub fn weight_gemv_swiglu_residual(
+    gpu: &mut Gpu,
+    w_down: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    ffn_hidden_scratch: &GpuTensor,
+    x: &GpuTensor,
+) -> HipResult<()> {
+    if w_down.gpu_dtype == DType::MQ4G256 {
+        gpu.ensure_mq_signs()?;
+        let x_rot_alias = GpuTensor {
+            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            dtype: DType::F32,
+        };
+        gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+        return gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k);
+    }
+    // Non-MQ fallback: plain two-step.
+    gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+    weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
+}
+
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
 /// x: [batch_size × K], y: [batch_size × M]. Falls back to repeated GEMV for unsupported formats.
 pub fn weight_gemm(

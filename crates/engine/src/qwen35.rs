@@ -4,7 +4,7 @@
 use crate::hfq::HfqFile;
 use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                     weight_gemv_prerotated, rotate_x_for_mq, fused_rmsnorm_rotate_for_mq,
-                    weight_gemv_residual};
+                    weight_gemv_residual, weight_gemv_swiglu_residual};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1259,9 +1259,12 @@ fn forward_scratch_layers(
                 )?;
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-                // Fused w_down GEMV + residual add: s.x += layer.w_down * s.ffn_hidden
-                weight_gemv_residual(gpu, &layer.w_down, &s.ffn_hidden, &s.x)?;
+                // Fused SwiGLU + w_down residual GEMV:
+                //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
+                //   HF4: silu_mul + weight_gemv_residual (unchanged)
+                weight_gemv_swiglu_residual(
+                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                )?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -1377,9 +1380,12 @@ fn forward_scratch_layers(
                 )?;
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-                // Fused w_down GEMV + residual add: s.x += layer.w_down * s.ffn_hidden
-                weight_gemv_residual(gpu, &layer.w_down, &s.ffn_hidden, &s.x)?;
+                // Fused SwiGLU + w_down residual GEMV:
+                //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
+                //   HF4: silu_mul + weight_gemv_residual (unchanged)
+                weight_gemv_swiglu_residual(
+                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                )?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
