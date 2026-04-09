@@ -30,8 +30,52 @@ set -u
 cd "$(dirname "$0")/.."
 
 REPO_ROOT="$(pwd)"
-BASELINE_DIR="tests/quality-baselines"
-MODELS_DIR="/home/kaden/ClaudeCode/autorocm/hipfire/models"
+
+# Detect GPU arch → pick per-arch baseline directory. Quality baselines
+# are byte-exact only within a single GPU architecture family because
+# the default GEMV kernels produce compiler-dependent FP rounding across
+# gfx1010/gfx1013/gfx1100/etc. Cross-arch reproducibility is infeasible
+# without forcing deterministic FMA in every hot kernel.
+#
+# Override with HIPFIRE_BASELINE_ARCH=gfxNNNN for special cases (dev,
+# CI using a different GPU, etc.).
+BASELINE_ARCH=""
+if [ -n "${HIPFIRE_BASELINE_ARCH:-}" ]; then
+    BASELINE_ARCH="$HIPFIRE_BASELINE_ARCH"
+else
+    # Probe common tool locations. `amdgpu-arch` sometimes lives under
+    # /opt/rocm/llvm/bin and isn't in PATH; `offload-arch` is usually in
+    # /opt/rocm/bin and returns the same value.
+    for probe in amdgpu-arch offload-arch \
+                 /opt/rocm/bin/amdgpu-arch /opt/rocm/bin/offload-arch \
+                 /opt/rocm/llvm/bin/amdgpu-arch; do
+        if command -v "$probe" >/dev/null 2>&1 || [ -x "$probe" ]; then
+            BASELINE_ARCH="$("$probe" 2>/dev/null | head -1)"
+            if [ -n "$BASELINE_ARCH" ]; then break; fi
+        fi
+    done
+fi
+# HSA_OVERRIDE_GFX_VERSION transparently remaps gfx1013 → gfx1010 at
+# runtime; honor it in the baseline lookup so BC-250 (native gfx1013,
+# runs as gfx1010) picks the gfx1010 baselines.
+case "${HSA_OVERRIDE_GFX_VERSION:-}" in
+    10.1.0|10.1) BASELINE_ARCH="gfx1010" ;;
+    10.3.0|10.3) BASELINE_ARCH="gfx1030" ;;
+    11.0.0|11.0) BASELINE_ARCH="gfx1100" ;;
+esac
+if [ -z "$BASELINE_ARCH" ]; then
+    echo "quality-gate: cannot detect GPU arch — set HIPFIRE_BASELINE_ARCH=gfxNNNN" >&2
+    exit 2
+fi
+
+BASELINE_DIR="tests/quality-baselines/${BASELINE_ARCH}"
+if [ ! -d "$BASELINE_DIR" ]; then
+    echo "quality-gate: no baselines for $BASELINE_ARCH at $BASELINE_DIR" >&2
+    echo "  generate with HIPFIRE_BASELINE_ARCH=$BASELINE_ARCH ./scripts/quality-gate.sh --update-baselines" >&2
+    exit 2
+fi
+
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
 EXE="./target/release/examples/greedy_dump"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
@@ -114,11 +158,17 @@ verify_one() {
     label=$(printf "%s MQ4 %s" "$model" "$prompt_name")
     printf "  %-30s " "$label"
 
+    local model_path="$MODELS_DIR/qwen3.5-${model}.mq4"
+    if [ ! -f "$model_path" ]; then
+        color yellow "SKIP (missing $model_path)"; echo
+        return 2
+    fi
+
     local baseline_tokens="$BASELINE_DIR/${model}_mq4_${prompt_name}.tokens"
     local baseline_md5_file="$BASELINE_DIR/${model}_mq4_${prompt_name}.md5"
     if [ ! -f "$baseline_md5_file" ]; then
-        color red "NO BASELINE"; echo
-        return 1
+        color yellow "NO BASELINE (generate with --update-baselines)"; echo
+        return 2
     fi
     local baseline_md5
     baseline_md5=$(cat "$baseline_md5_file")
@@ -227,21 +277,31 @@ echo
 
 pass=0
 fail=0
+skip=0
 for test_case in "${tests[@]}"; do
     read -r model prompt_name <<< "$test_case"
-    if verify_one "$model" "$prompt_name"; then
-        pass=$((pass+1))
-    else
-        fail=$((fail+1))
-    fi
+    verify_one "$model" "$prompt_name"
+    case $? in
+        0) pass=$((pass+1)) ;;
+        2) skip=$((skip+1)) ;;
+        *) fail=$((fail+1)) ;;
+    esac
 done
 echo
-if [ "$fail" -eq 0 ]; then
-    color green "=== ALL ${pass} TESTS PASSED ==="; echo
+if [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]; then
+    if [ "$skip" -gt 0 ]; then
+        color green "=== ${pass} PASSED, ${skip} SKIPPED ==="; echo
+    else
+        color green "=== ALL ${pass} TESTS PASSED ==="; echo
+    fi
+    exit 0
+fi
+if [ "$fail" -eq 0 ] && [ "$pass" -eq 0 ]; then
+    color yellow "=== NO TESTS RUN (all ${skip} skipped — missing models/baselines for $BASELINE_ARCH) ==="; echo
     exit 0
 fi
 
-color red "=== ${fail} FAILED, ${pass} PASSED ==="; echo
+color red "=== ${fail} FAILED, ${pass} PASSED, ${skip} SKIPPED ==="; echo
 echo
 echo "This is a NUMERICAL CORRECTNESS BUG. Do not dismiss as sampling variance or"
 echo "model quality — the tests are fully deterministic (greedy argmax, no sampling,"
