@@ -3,7 +3,8 @@
 
 use crate::hfq::HfqFile;
 use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
-                    weight_gemv_prerotated, rotate_x_for_mq, fused_rmsnorm_rotate_for_mq};
+                    weight_gemv_prerotated, rotate_x_for_mq, fused_rmsnorm_rotate_for_mq,
+                    weight_gemv_residual};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1249,8 +1250,8 @@ fn forward_scratch_layers(
 
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-                weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
-                gpu.add_inplace_f32(&s.x, &s.o)?;
+                // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
+                weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -1259,8 +1260,8 @@ fn forward_scratch_layers(
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-                weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
-                gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+                // Fused w_down GEMV + residual add: s.x += layer.w_down * s.ffn_hidden
+                weight_gemv_residual(gpu, &layer.w_down, &s.ffn_hidden, &s.x)?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -1367,8 +1368,8 @@ fn forward_scratch_layers(
 
                 gpu.sigmoid_f32(&s.fa_gate)?;
                 gpu.mul_f32(&s.fa_attn_out, &s.fa_gate, &s.fa_attn_out)?;
-                weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
-                gpu.add_inplace_f32(&s.x, &s.o)?;
+                // Fused wo GEMV + residual add: s.x += layer.wo * s.fa_attn_out
+                weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -1377,8 +1378,8 @@ fn forward_scratch_layers(
                 weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                 weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-                weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
-                gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+                // Fused w_down GEMV + residual add: s.x += layer.w_down * s.ffn_hidden
+                weight_gemv_residual(gpu, &layer.w_down, &s.ffn_hidden, &s.x)?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

@@ -664,6 +664,50 @@ pub fn weight_gemv_prerotated(
     }
 }
 
+/// Weight GEMV with fused residual add: `y += W * x`.
+///
+/// For HFQ4-G256 weights, routes through `gemv_hfq4g256_residual`, which
+/// saves one `add_inplace_f32` launch per residual stream update.
+///
+/// For MQ4 weights, performs `rotate_x_mq` into the internal scratch and
+/// then calls the residual GEMV against the rotated x. Equivalent to the
+/// standard prerotated path plus a fused residual epilogue.
+///
+/// For any other dtype, falls back to plain `weight_gemv` followed by an
+/// explicit `add_inplace_f32` — same observable behavior as before.
+pub fn weight_gemv_residual(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::MQ4G256 => {
+            // MQ4 weights were FWHT-rotated at quant time; rotate x first,
+            // then use the arch-tuned HFQ4 residual GEMV. We alias mq_x_rot
+            // (same trick as weight_gemv MQ4G256 branch).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
+        _ => {
+            // Fallback: plain weight_gemv into a scratch, then add_inplace.
+            // Allocates a scratch each call — only used for niche dtypes.
+            let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
+            weight_gemv(gpu, w, x, &tmp)?;
+            gpu.add_inplace_f32(y, &tmp)?;
+            gpu.free_tensor(tmp)?;
+            Ok(())
+        }
+    }
+}
+
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
 /// x: [batch_size × K], y: [batch_size × M]. Falls back to repeated GEMV for unsupported formats.
 pub fn weight_gemm(

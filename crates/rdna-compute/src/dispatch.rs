@@ -987,6 +987,47 @@ impl Gpu {
 
     // HFQ2 GEMV dispatch already exists at line ~521 from the HFQ family
 
+    /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
+    /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
+    /// instead of overwriting. Used for wo / w_down projections where the
+    /// following step would have been `x += gemv_out` via add_inplace_f32.
+    pub fn gemv_hfq4g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
+        let func = &self.functions["gemv_hfq4g256_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        // Bandwidth: weight + x + y_read (for residual) + y_write.
+        // Extra y read vs plain gemv_hfq4g256 adds m*4 bytes but that's negligible.
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
     /// x: [batch_size × K], y: [batch_size × M], both row-major.
     pub fn gemm_hfq4g256(
