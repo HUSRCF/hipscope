@@ -1381,8 +1381,8 @@ fn forward_scratch_layers(
                     )?;
                 }
 
-                gpu.sigmoid_f32(&s.fa_gate)?;
-                gpu.mul_f32(&s.fa_attn_out, &s.fa_gate, &s.fa_attn_out)?;
+                // Fused: fa_attn_out *= sigmoid(fa_gate). Two launches → one.
+                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.fa_attn_out
                 weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
 

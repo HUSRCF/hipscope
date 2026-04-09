@@ -2860,6 +2860,34 @@ impl Gpu {
         result
     }
 
+    /// Fused `out *= sigmoid(gate)`. Replaces the sigmoid_f32+mul_f32 pair
+    /// in the FA attention epilogue (one launch per full-attention layer).
+    pub fn sigmoid_mul_f32(
+        &mut self,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+    ) -> HipResult<()> {
+        self.ensure_kernel("sigmoid_mul", kernels::SIGMOID_MUL_SRC, "sigmoid_mul_f32")?;
+        let func = &self.functions["sigmoid_mul_f32"];
+        let mut op = out.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut n = out.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut op as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(n as usize) * 3;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "sigmoid_mul_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are element-wise
     /// scalar transforms applied to independent buffers of size n_v_heads in the
     /// DeltaNet preamble. Saves one launch per linear-attention layer.
@@ -3890,6 +3918,7 @@ impl Gpu {
             ("fused_qk_l2_norm_scale",   kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string()),
             ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
+            ("sigmoid_mul",              kernels::SIGMOID_MUL_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
             ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
             ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
@@ -3985,6 +4014,7 @@ impl Gpu {
                 "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
+                "sigmoid_mul" => vec!["sigmoid_mul_f32"],
                 "scale_f32" => vec!["scale_f32"],
                 "gated_norm" => vec!["gated_norm_f32"],
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],

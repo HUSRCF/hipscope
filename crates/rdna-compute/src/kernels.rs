@@ -391,6 +391,10 @@ pub const FUSED_QK_L2_NORM_SCALE_SRC: &str = include_str!("../../../kernels/src/
 #[cfg(feature = "deltanet")]
 pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str = include_str!("../../../kernels/src/fused_sigmoid_alpha_gate.hip");
 
+/// Fused sigmoid(gate) * x — the FA attention epilogue that used to be
+/// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
+pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
+
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
 /// Dims >= n_rot pass through unchanged.
