@@ -3171,6 +3171,58 @@ impl Gpu {
         result
     }
 
+    /// Fused conv1d+SiLU that writes directly to Q/K/V buffers, replacing
+    /// the conv1d_silu_f32 + three DtoD split copies in the DeltaNet path.
+    /// Channel layout: [Q (k_dim) | K (k_dim) | V (v_dim)] — matches the
+    /// wqkv projection output layout.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "conv1d_silu_split",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_silu_split_f32",
+        )?;
+        let func = &self.functions["conv1d_silu_split_f32"];
+        let mut qp = q_out.buf.as_ptr();
+        let mut kp = k_out.buf.as_ptr();
+        let mut vp = v_out.buf.as_ptr();
+        let mut ip = input.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut kd = k_dim as i32;
+        let mut vd = v_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void,
+            &mut vd as *mut _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels);
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // TurboQuant KV cache kernels
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3837,6 +3889,7 @@ impl Gpu {
             ("l2_norm",                  kernels::L2_NORM_SRC.to_string()),
             ("fused_qk_l2_norm_scale",   kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string()),
             ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
+            ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
             ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
             ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
@@ -3931,6 +3984,7 @@ impl Gpu {
                 "l2_norm" => vec!["l2_norm_f32"],
                 "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
+                "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "scale_f32" => vec!["scale_f32"],
                 "gated_norm" => vec!["gated_norm_f32"],
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],

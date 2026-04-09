@@ -452,6 +452,13 @@ pub const SCALE_F32_SRC: &str = include_str!("../../../kernels/src/scale_f32.hip
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu.hip");
 
+/// Conv1d + SiLU + Q/K/V split fused into one kernel. Writes directly to
+/// three separate destination buffers instead of producing a packed output
+/// that needs three memcpys to split. Eliminates 3 DtoD copies per
+/// linear-attention layer.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
+
 
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.

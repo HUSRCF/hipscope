@@ -1203,13 +1203,15 @@ fn forward_scratch_layers(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
 
-                gpu.conv1d_silu_f32(&s.dn_conv_out, &s.dn_qkv, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx], qkv_dim)?;
-
-                // Split conv output into Q, K, V
-                gpu.hip.memcpy_dtod_at(&s.dn_q_raw.buf, 0, &s.dn_conv_out.buf, 0, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&s.dn_k_raw.buf, 0, &s.dn_conv_out.buf, k_dim * 4, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&s.dn_v.buf, 0, &s.dn_conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+                // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
+                // eliminating the 3 DtoD copies that used to follow a
+                // contiguous conv1d_silu into dn_conv_out.
+                gpu.conv1d_silu_split_f32(
+                    &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
+                    &s.dn_qkv, &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    k_dim, v_dim,
+                )?;
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
