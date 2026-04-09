@@ -63,22 +63,51 @@ extern "C" __global__ void gemv_hfq4g256(
         #undef DOG
     }
 
-    for (int gi = 0; gi < tail; gi++) {
-        const int g = (quads << 2) + gi;
+    // Tail handling: groups_per_row may not be a multiple of 4. Each tail
+    // group must accumulate into its OWN accumulator (acc[g % 4]) to
+    // preserve the 4-way interleaving that the combine step assumes.
+    // Dumping every tail group into acc0 is a bug — it makes acc0 carry
+    // N+tail groups while acc1..acc3 only carry N, producing asymmetric
+    // FP accumulation that drifts noticeably over many GEMV calls.
+    // Measured: breaks MQ4 4B and 0.8B coherence on long generations.
+    #define TAIL_DOG(pk, sc, zp, b, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+    if (tail >= 1) {
+        const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
-        acc0 += (sc * (float)(pk & 0xFu)        + zp) * x[base]
-              + (sc * (float)((pk >> 4) & 0xFu)  + zp) * x[base + 1]
-              + (sc * (float)((pk >> 8) & 0xFu)  + zp) * x[base + 2]
-              + (sc * (float)((pk >> 12) & 0xFu) + zp) * x[base + 3]
-              + (sc * (float)((pk >> 16) & 0xFu) + zp) * x[base + 4]
-              + (sc * (float)((pk >> 20) & 0xFu) + zp) * x[base + 5]
-              + (sc * (float)((pk >> 24) & 0xFu) + zp) * x[base + 6]
-              + (sc * (float)((pk >> 28) & 0xFu) + zp) * x[base + 7];
+        TAIL_DOG(pk, sc, zp, base, acc0);
     }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + tid * 8;
+        TAIL_DOG(pk, sc, zp, base, acc1);
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + tid * 8;
+        TAIL_DOG(pk, sc, zp, base, acc2);
+    }
+    #undef TAIL_DOG
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
