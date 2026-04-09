@@ -400,6 +400,125 @@ fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
 /// Quantize F32 weights to HFQ4-G256: flat 4-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights (0.531 B/w).
 /// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
+/// CPU-side FWHT (Walsh-Hadamard Transform) on a 256-element group.
+/// Matches the GPU-side fwht_forward_256 in turbo_common: signs1 → butterfly → scale → signs2.
+fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 256);
+    for i in 0..256 { x[i] *= signs1[i]; }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale = 0.0625; // 1/sqrt(256) = 1/16
+    for i in 0..256 { x[i] *= scale * signs2[i]; }
+}
+
+/// Generate FWHT sign table (matches engine's gen_fwht_signs).
+fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+    let mut state = seed;
+    (0..n).map(|_| {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+    }).collect()
+}
+
+/// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
+/// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
+/// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
+fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        // Copy group and pad to 256
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        // Apply FWHT rotation — this equalizes outliers across the group
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        for i in 0..128 {
+            let lo_q = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
+            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
+/// MagnumQuant MQ8-G256: FWHT-rotated symmetric INT8 quantization.
+/// Format: [f16 scale][int8 × 256] = 258 bytes per 256 weights (1.008 B/w).
+/// Symmetric: scale = max(abs(group)) / 127, q = round(val / scale), no zero-point.
+/// Target: dp4a (v_dot4_i32_iu8) on gfx1100 for 4x VALU throughput.
+fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 258; // 2 (f16 scale) + 256 (int8 values)
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        // Copy and pad to 256
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        // FWHT rotation
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        // Symmetric quantization: scale = max(|val|) / 127
+        let amax = group.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        // Store scale as f16 (2 bytes)
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+
+        // Quantize to signed INT8
+        for i in 0..256 {
+            let q = (group[i] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+
+    output
+}
+
 fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 136;
@@ -436,6 +555,117 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
 
             output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
+/// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
+/// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
+/// Little-endian bitstream within each 3-byte chunk.
+fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 104; // 8 metadata + 96 packed 3-bit
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 7.0 } else { 1.0 }; // 3-bit: 8 levels (0-7)
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        // Pack 256 weights as 32 chunks of 8 weights × 3 bits = 3 bytes each = 96 bytes
+        // Matches the GEMV kernel's unpack: tid * 3 byte offset, 8 weights per thread.
+        for chunk in 0..32 {
+            let ci = chunk * 8; // index into group
+            let mut q = [0u8; 8];
+            for j in 0..8 {
+                let idx = ci + j;
+                let val = if idx < actual_len { group[idx] } else { min_val };
+                q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
+            }
+            // Pack 8 × 3-bit into 3 bytes (little-endian bitstream)
+            // Matches kernel unpack:
+            //   q0 = b0 & 7
+            //   q1 = (b0 >> 3) & 7
+            //   q2 = ((b0 >> 6) | (b1 << 2)) & 7
+            //   q3 = (b1 >> 1) & 7
+            //   q4 = (b1 >> 4) & 7
+            //   q5 = ((b1 >> 7) | (b2 << 1)) & 7
+            //   q6 = (b2 >> 2) & 7
+            //   q7 = (b2 >> 5) & 7
+            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+
+    output
+}
+
+/// Quantize F32 weights to HFQ3-G128: 3-bit with 128-weight groups (finer granularity).
+/// Block: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights (0.4375 B/w).
+fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 128;
+    let block_bytes = 56; // 8 metadata + 48 packed 3-bit
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 7.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        // 16 chunks of 8 weights × 3 bits = 3 bytes each = 48 bytes
+        for chunk in 0..16 {
+            let ci = chunk * 8;
+            let mut q = [0u8; 8];
+            for j in 0..8 {
+                let idx = ci + j;
+                let val = if idx < actual_len { group[idx] } else { min_val };
+                q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
+            }
+            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
         }
     }
 
@@ -632,6 +862,10 @@ enum QuantType {
     HFQ6G256 = 8,
     HFQ2G256 = 9,
     HFQ2G128 = 10,
+    HFQ3G256 = 11,
+    HFQ3G128 = 12,
+    MQ4G256 = 13,  // MagnumQuant: FWHT-rotated HFQ4-G256
+    MQ8G256 = 14,  // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
 }
 
 struct HfqTensor {
@@ -842,9 +1076,13 @@ fn main() {
     let use_q8hfq = format == "q8hfq";
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
-    let use_hfq4g256 = format == "hfq4g256" || format == "hfq4";
+    let use_mq8g256 = format == "mq8" || format == "mq8g256";
+    let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
+    let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
+    let use_hfq3g256 = format == "hfq3g256";
+    let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
     let use_hfq2g256 = format == "hfq2g256";
-    let use_hfq2g128 = format == "hfq2g128" || format == "hfq2";  // default HFQ2 = G128 (better quality)
+    let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_hfq6 = format == "hfq6" || format == "hfq6g256";
 
@@ -1050,6 +1288,57 @@ fn main() {
                     // Fallback to HFQ4 for non-256-aligned
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_mq8g256 && is_embed {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mq8g256 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq8g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ8G256, 256u32, "MQ8G256")
+                } else {
+                    // Fallback to Q8 for non-256-aligned
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                }
+            } else if use_mq4g256 && is_embed {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mq4g256 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                } else {
+                    // Fallback to standard HFQ4-G128 for non-256-aligned
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_hfq3g128 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 128 == 0 {
+                    let q = quantize_hfq3g128(&f32_data);
+                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                } else {
+                    let q = quantize_hfq3g128(&f32_data);
+                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                }
+            } else if use_hfq3g256 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let q = quantize_hfq3g256(&f32_data);
+                    (q, QuantType::HFQ3G256, 256u32, "HFQ3G256")
+                } else {
+                    let q = quantize_hfq3g128(&f32_data);
+                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
                 }
             } else if use_hfq4g256 && is_embed {
                 // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel

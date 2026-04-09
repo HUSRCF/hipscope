@@ -299,6 +299,22 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ2G128, m, k, row_stride: 0 })
         }
+        11 => { // HFQ3-G256 — flat 3-bit, 104 bytes per 256 elements
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+        }
+        12 => { // HFQ3-G128 — flat 3-bit, 56 bytes per 128 elements
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+        }
+        13 => { // MQ4-G256 — MagnumQuant FWHT-rotated 4-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+        }
+        14 => { // MQ8-G256 — MagnumQuant FWHT-rotated symmetric INT8, dp4a
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))

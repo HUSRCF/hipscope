@@ -539,6 +539,25 @@ pub fn weight_gemv(
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            // Extract raw pointer to avoid immutable borrow conflict
+            let x_rot_ptr = gpu.mq_x_rot.as_ref().unwrap().buf.as_ptr();
+            let x_rot_size = gpu.mq_x_rot.as_ref().unwrap().buf.size();
+            // Create a temporary non-owning GpuTensor alias for x_rot
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![x_rot_size / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq4g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
+        DType::MQ8G256 => {
+            gpu.ensure_mq_signs()?;
+            gpu.gemv_mq8g256_with_rotate(&w.buf, x, y, w.m, w.k)
+        }
+        DType::HFQ3G256 => gpu.gemv_hfq3g256(&w.buf, x, y, w.m, w.k),
+        DType::HFQ3G128 => gpu.gemv_hfq3g128(&w.buf, x, y, w.m, w.k),
         DType::HFQ2G256 => gpu.gemv_hfq2g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ2G128 => gpu.gemv_hfq2g128(&w.buf, x, y, w.m, w.k),
         DType::HFQ6G256 => gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k),
@@ -2162,7 +2181,7 @@ impl KvCache {
     }
 
     /// Generate deterministic ±1 sign array for FWHT.
-    fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+    pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
         let mut state = seed;
         (0..n).map(|_| {
             state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
@@ -2272,10 +2291,12 @@ pub fn apply_repeat_penalty(logits: &mut [f32], history: &[u32], window: usize, 
 
     for (&t, &(count, recency)) in &counts {
         if (t as usize) < logits.len() {
-            // Effective penalty: base^count scaled by recency
-            // A token seen once at the start of the window: penalty^(1 * 0.3) ≈ 1.015
-            // A token seen 3 times recently: penalty^(3 * 1.0) = penalty^3 ≈ 1.16
-            let effective = penalty.powf(count as f32 * recency);
+            // Effective penalty: base^(count * recency), capped at 1.5x.
+            // Without the cap, "the" appearing 8x recently gets 1.15^8 = 3x suppression,
+            // which collectively flattens the distribution after ~400 tokens.
+            // The cap ensures no single token is suppressed more than 50%, keeping
+            // the natural vocabulary accessible even in long generation.
+            let effective = penalty.powf(count as f32 * recency).min(1.5);
             if logits[t as usize] > 0.0 {
                 logits[t as usize] /= effective;
             } else {

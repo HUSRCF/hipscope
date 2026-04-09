@@ -245,6 +245,22 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
         }
+        11 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+        }
+        12 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+        }
+        13 => { // MQ4-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+        }
+        14 => { // MQ8-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -282,6 +298,22 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
         }
+        11 => { // HFQ3-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+        }
+        12 => { // HFQ3-G128
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+        }
+        13 => { // MQ4-G256 — MagnumQuant
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+        }
+        14 => { // MQ8-G256 — MagnumQuant dp4a
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+        }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -311,21 +343,93 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         3 => crate::llama::dequantize_q8_0(data, n),
-        6 | 7 => {
-            // HFQ4-G256 or G128 — CPU dequant
-            let group_size: usize = if info.quant_type == 6 { 256 } else { 128 };
+        14 => {
+            // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 258;
+            let n_groups = data.len() / bytes_per_group;
+            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale_bits = data[off] as u16 | ((data[off + 1] as u16) << 8);
+                let scale = crate::llama::f16_to_f32(scale_bits);
+                let start = out.len();
+                for i in 0..256 {
+                    let q = data[off + 2 + i] as i8;
+                    out.push(scale * q as f32);
+                }
+                // Inverse FWHT to recover original values
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let inv_s = 0.0625;
+                for i in 0..256 { group[i] *= inv_s * signs1[i]; }
+            }
+            out
+        }
+        6 | 7 | 13 => {
+            // HFQ4-G256 or G128 or MQ4-G256 — CPU dequant
+            // MQ4 stores FWHT-rotated weights. For small tensors loaded here,
+            // we dequant then inverse-FWHT to recover the original values.
+            let group_size: usize = if info.quant_type == 6 || info.quant_type == 13 { 256 } else { 128 };
             let bytes_per_group = 8 + group_size / 2;
             let n_groups = data.len() / bytes_per_group;
+            let is_mq4 = info.quant_type == 13;
             let mut out = Vec::with_capacity(n_groups * group_size);
+            // Generate inverse FWHT signs (same seeds as quantizer)
+            let (signs1, signs2) = if is_mq4 {
+                (Some(crate::llama::KvCache::gen_fwht_signs(42, 256)),
+                 Some(crate::llama::KvCache::gen_fwht_signs(1042, 256)))
+            } else { (None, None) };
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
                 let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let start = out.len();
                 for i in 0..group_size {
                     let byte_idx = i / 2;
                     let byte_val = data[off + 8 + byte_idx];
                     let nibble = if i % 2 == 0 { byte_val & 0xF } else { byte_val >> 4 };
                     out.push(scale * nibble as f32 + zero);
+                }
+                // Inverse FWHT for MQ4: recover original weight values
+                if is_mq4 && group_size == 256 {
+                    let s1 = signs1.as_ref().unwrap();
+                    let s2 = signs2.as_ref().unwrap();
+                    let group = &mut out[start..start + 256];
+                    // Inverse FWHT: signs2 → butterfly → scale → signs1
+                    for i in 0..256 { group[i] *= s2[i]; }
+                    let mut stride = 1;
+                    while stride < 256 {
+                        let mut j = 0;
+                        while j < 256 {
+                            for k in 0..stride {
+                                let a = group[j + k];
+                                let b = group[j + k + stride];
+                                group[j + k] = a + b;
+                                group[j + k + stride] = a - b;
+                            }
+                            j += stride * 2;
+                        }
+                        stride <<= 1;
+                    }
+                    let scale_inv = 0.0625; // 1/sqrt(256)
+                    for i in 0..256 { group[i] *= scale_inv * s1[i]; }
                 }
             }
             out
@@ -354,6 +458,77 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     out.push(scale * q1 + zero);
                     out.push(scale * q2 + zero);
                     out.push(scale * q3 + zero);
+                }
+            }
+            out
+        }
+        11 => {
+            // HFQ3-G256: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 104;
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                // 8 values per 3 bytes (matching kernel unpack)
+                for chunk in 0..32 {
+                    let bo = off + 8 + chunk * 3;
+                    let b0 = data[bo] as u32;
+                    let b1 = data[bo + 1] as u32;
+                    let b2 = data[bo + 2] as u32;
+                    let q0 = (b0 & 7) as f32;
+                    let q1 = ((b0 >> 3) & 7) as f32;
+                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
+                    let q3 = ((b1 >> 1) & 7) as f32;
+                    let q4 = ((b1 >> 4) & 7) as f32;
+                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
+                    let q6 = ((b2 >> 2) & 7) as f32;
+                    let q7 = ((b2 >> 5) & 7) as f32;
+                    out.push(scale * q0 + zero);
+                    out.push(scale * q1 + zero);
+                    out.push(scale * q2 + zero);
+                    out.push(scale * q3 + zero);
+                    out.push(scale * q4 + zero);
+                    out.push(scale * q5 + zero);
+                    out.push(scale * q6 + zero);
+                    out.push(scale * q7 + zero);
+                }
+            }
+            out
+        }
+        12 => {
+            // HFQ3-G128: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights
+            let group_size: usize = 128;
+            let bytes_per_group: usize = 56;
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                for chunk in 0..16 {
+                    let bo = off + 8 + chunk * 3;
+                    let b0 = data[bo] as u32;
+                    let b1 = data[bo + 1] as u32;
+                    let b2 = data[bo + 2] as u32;
+                    let q0 = (b0 & 7) as f32;
+                    let q1 = ((b0 >> 3) & 7) as f32;
+                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
+                    let q3 = ((b1 >> 1) & 7) as f32;
+                    let q4 = ((b1 >> 4) & 7) as f32;
+                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
+                    let q6 = ((b2 >> 2) & 7) as f32;
+                    let q7 = ((b2 >> 5) & 7) as f32;
+                    out.push(scale * q0 + zero);
+                    out.push(scale * q1 + zero);
+                    out.push(scale * q2 + zero);
+                    out.push(scale * q3 + zero);
+                    out.push(scale * q4 + zero);
+                    out.push(scale * q5 + zero);
+                    out.push(scale * q6 + zero);
+                    out.push(scale * q7 + zero);
                 }
             }
             out

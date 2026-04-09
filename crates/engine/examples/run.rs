@@ -28,6 +28,7 @@ fn main() {
     let mut boundary: u8 = 0;
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
+    let mut q4_state = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -35,6 +36,7 @@ fn main() {
             "--turbo" => { i += 1; turbo_bits = args[i].parse().unwrap_or(4); }
             "--asym" => { asym_kv = true; }
             "--hf4" => { hf4_kv = true; }
+            "--q4-state" => { q4_state = true; }
             "--boundary" => { i += 1; boundary = args[i].parse().unwrap_or(2); }
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
@@ -63,7 +65,9 @@ fn main() {
     } else {
         llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap()
     };
-    let dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+    let state_quant = if q4_state { qwen35::StateQuant::Q4 } else { qwen35::StateQuant::Q8 };
+    if q4_state { eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"); }
+    let dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("failed to load tokenizer");

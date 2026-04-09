@@ -36,6 +36,10 @@ pub enum DType {
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    HFQ3G256,  // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
+    HFQ3G128,  // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
+    MQ4G256,   // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    MQ8G256,   // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -47,7 +51,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ8G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -62,6 +66,12 @@ pub struct Gpu {
     pool: crate::pool::GpuPool,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
+    pub mq_signs1: Option<GpuTensor>,
+    pub mq_signs2: Option<GpuTensor>,
+    pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
+    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
+    pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
 }
 
 impl Gpu {
@@ -104,6 +114,11 @@ impl Gpu {
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
             active_stream: None,
+            mq_signs1: None,
+            mq_signs2: None,
+            mq_x_rot: None,
+            mq_x_q8: None,
+            mq_x_scales: None,
         })
     }
 
@@ -591,10 +606,159 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
+    pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
+        if self.mq_signs1.is_some() { return Ok(()); }
+        fn gen_signs(seed: u32) -> Vec<f32> {
+            let mut state = seed;
+            (0..256).map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+            }).collect()
+        }
+        let s1 = gen_signs(42);
+        let s2 = gen_signs(1042);
+        let s1b: Vec<u8> = s1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1t = self.alloc_tensor(&[256], DType::F32)?;
+        let s2t = self.alloc_tensor(&[256], DType::F32)?;
+        self.hip.memcpy_htod(&s1t.buf, &s1b)?;
+        self.hip.memcpy_htod(&s2t.buf, &s2b)?;
+        // Allocate scratch buffers — 32K elements covers K up to 32768
+        let x_rot = self.alloc_tensor(&[32768], DType::F32)?;
+        let x_q8 = self.hip.malloc(32768)?;  // INT8 buffer for dp4a
+        let x_scales = self.hip.malloc(128 * 4)?; // up to 128 groups × f32
+        self.mq_signs1 = Some(s1t);
+        self.mq_signs2 = Some(s2t);
+        self.mq_x_rot = Some(x_rot);
+        self.mq_x_q8 = Some(x_q8);
+        self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
+    /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
+    pub fn gemv_mq4g256(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "gemv_mq4g256")?;
+        let func = &self.functions["gemv_mq4g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut s1_ptr = signs1.buf.as_ptr(); let mut s2_ptr = signs2.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void, &mut s2_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void, &mut k_val as *mut _ as *mut c_void,
+        ];
+        // LDS for rotated x: 256 floats = 1024 bytes
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 1024, self.stream_ref(), &mut params) }
+    }
+
+    /// MagnumQuant: rotate x via FWHT (one launch for all groups), then GEMV against pre-rotated x.
+    /// x_rot is a scratch buffer same size as x.
+    pub fn gemv_mq4g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        // Step 1: rotate x → x_rot (one wavefront per 256-element group)
+        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let rot_func = &self.functions["mq_rotate_x"];
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        {
+            let mut xp = x.buf.as_ptr(); let mut xrp = x_rot.buf.as_ptr();
+            let mut s1 = s1_ptr; let mut s2 = s2_ptr;
+            let mut kv = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void, &mut xrp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+            ];
+            unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
+        }
+
+        // Step 2: standard GEMV against x_rot (identical to HFQ4-G256)
+        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "gemv_mq4g256")?;
+        let func = &self.functions["gemv_mq4g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x_rot.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MagnumQuant MQ8: FWHT rotate + INT8 quantize x, then dp4a GEMV.
+    pub fn gemv_mq8g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        let n_groups = (k / 256) as u32;
+
+        // Extract raw pointers before any mutable borrows
+        let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
+        let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        // Ensure both kernels compiled before borrowing function refs
+        self.ensure_kernel("mq8_rotate_quantize_x", kernels::GEMV_MQ8G256_SRC, "mq8_rotate_quantize_x")?;
+        self.ensure_kernel("gemv_mq8g256", kernels::GEMV_MQ8G256_SRC, "gemv_mq8g256")?;
+
+        // Step 1: rotate + quantize x → INT8
+        {
+            let rot_func = &self.functions["mq8_rotate_quantize_x"];
+            let mut xp = x.buf.as_ptr();
+            let mut xq = xq_ptr; let mut xs = xs_ptr;
+            let mut s1 = s1_ptr; let mut s2 = s2_ptr;
+            let mut kv = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void, &mut xq as *mut _ as *mut c_void,
+                &mut xs as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+            ];
+            unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
+        }
+
+        // Step 2: dp4a GEMV
+        let func = &self.functions["gemv_mq8g256"];
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xq = xq_ptr; let mut xs = xs_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32; let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut xq as *mut _ as *mut c_void,
+            &mut xs as *mut _ as *mut c_void, &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// HFQ3-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.ensure_kernel("gemv_hfq3g256", kernels::GEMV_HFQ3G256_SRC, "gemv_hfq3g256")?;
         let func = &self.functions["gemv_hfq3g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ3-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
+    pub fn gemv_hfq3g128(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq3g128", kernels::GEMV_HFQ3G128_SRC, "gemv_hfq3g128")?;
+        let func = &self.functions["gemv_hfq3g128"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32; let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
