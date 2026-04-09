@@ -1,0 +1,24 @@
+[package]
+name = "magnum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "magnum-test"
+path = "src/main.rs"
+
+[[bin]]
+name = "turbo-diag"
+path = "src/turbo_diag.rs"
+
+[[bin]]
+name = "bw-bench"
+path = "src/bw_bench.rs"
+
+[[bin]]
+name = "dp4a-bench"
+path = "src/dp4a_bench.rs"
+
+[dependencies]
+hip-bridge = { path = "../crates/hip-bridge" }
