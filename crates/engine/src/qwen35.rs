@@ -780,20 +780,17 @@ fn forward_from_x_gpu(
                 gpu.scale_f32(&q_part, 1.0 / (config.linear_key_head_dim as f32).sqrt())?;
 
                 // Repeat Q/K heads if num_k_heads < num_v_heads (GQA-style)
+                // Phase 3a-A fix: same fused kernel as forward_scratch_layers.
                 let (q_gdn, k_gdn) = if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     let expanded_dim = n_v_heads * config.linear_key_head_dim;
                     let q_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
                     let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
                     let hd = config.linear_key_head_dim;
-                    for kh in 0..config.linear_num_key_heads {
-                        for r in 0..ratio {
-                            let dst = (kh * ratio + r) * hd * 4;
-                            let src = kh * hd * 4;
-                            gpu.hip.memcpy_dtod_at(&q_exp.buf, dst, &q_part.buf, src, hd * 4)?;
-                            gpu.hip.memcpy_dtod_at(&k_exp.buf, dst, &k_part.buf, src, hd * 4)?;
-                        }
-                    }
+                    gpu.repeat_interleave_qk_f32(
+                        &q_part, &k_part, &q_exp, &k_exp,
+                        config.linear_num_key_heads, ratio, hd,
+                    )?;
                     (q_exp, k_exp)
                 } else {
                     // Same number of heads — no repeat needed, reuse buffers directly

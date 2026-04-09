@@ -85,11 +85,17 @@ fn main() {
         DeltaNetState::new(&mut gpu, &config).unwrap()
     };
 
+    // Phase 3a-A: use forward_scratch path (avoids per-call alloc/free + uses
+    // the fused repeat_interleave kernel). Allocate scratch once, reuse forever.
+    let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
+
     // Sequential prefill
     let t1 = Instant::now();
     let mut logits = vec![0.0f32; config.vocab_size];
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        logits = qwen35::forward(&mut gpu, &weights, &config, token, pos, &mut kv_cache, &mut dn_state).expect("forward failed");
+        qwen35::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv_cache, &mut dn_state, &scratch)
+            .expect("forward failed");
+        logits = gpu.download_f32(&scratch.logits).unwrap();
     }
     let prefill_ms = t1.elapsed().as_millis();
     eprintln!("Prefill: {}ms ({} tokens, {:.0} tok/s)", prefill_ms, prompt_tokens.len(),
@@ -134,8 +140,9 @@ fn main() {
         if !RUNNING.load(Ordering::Relaxed) { break; }
 
         let pos = prompt_tokens.len() + generated.len() - 1;
-        logits = qwen35::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state)
+        qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch)
             .expect("forward failed");
+        logits = gpu.download_f32(&scratch.logits).unwrap();
 
         llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
 
