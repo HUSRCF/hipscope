@@ -658,76 +658,84 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 1024, self.stream_ref(), &mut params) }
     }
 
-    /// MagnumQuant: rotate x via FWHT (one launch for all groups), then GEMV against pre-rotated x.
-    /// x_rot is a scratch buffer same size as x.
+    /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
+    /// Exposed so callers can batch one rotation across multiple GEMVs that share x
+    /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).
+    pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let rot_func = &self.functions["mq_rotate_x"];
+        let mut xp = x.buf.as_ptr(); let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr; let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
+    /// MQ4 weights are stored in HFQ4-G256 format with FWHT pre-applied, so the GEMV
+    /// inner loop is identical to standard HFQ4 — we reuse the arch-tuned HFQ4 kernel.
     pub fn gemv_mq4g256_with_rotate(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
-        // Step 1: rotate x → x_rot (one wavefront per 256-element group)
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
-        let rot_func = &self.functions["mq_rotate_x"];
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-        {
-            let mut xp = x.buf.as_ptr(); let mut xrp = x_rot.buf.as_ptr();
-            let mut s1 = s1_ptr; let mut s2 = s2_ptr;
-            let mut kv = k as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void, &mut xrp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
-        }
-
-        // Step 2: standard GEMV against x_rot (identical to HFQ4-G256)
-        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "gemv_mq4g256")?;
-        let func = &self.functions["gemv_mq4g256"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x_rot.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-        ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.rotate_x_mq(x, x_rot, k)?;
+        // MQ4 = FWHT-rotated HFQ4-G256. dot(rot(W), rot(x)) = dot(W, x).
+        // Route through the arch-specific HFQ4 kernel (4x unroll on gfx1100, etc).
+        self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
     }
 
-    /// MagnumQuant MQ8: FWHT rotate + INT8 quantize x, then dp4a GEMV.
-    pub fn gemv_mq8g256_with_rotate(
-        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    /// MagnumQuant MQ4 with pre-rotated x. Skips the rotation step entirely —
+    /// caller must have called `rotate_x_mq` into `x_rot` first.
+    pub fn gemv_mq4g256_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
-        let n_groups = (k / 256) as u32;
+        self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
+    }
 
-        // Extract raw pointers before any mutable borrows
+    /// Standalone MQ8 rotate + INT8 quantize of x into internal `mq_x_q8`/`mq_x_scales`.
+    /// After this, `gemv_mq8g256_prerotated` can be called multiple times with the same x.
+    pub fn rotate_quantize_x_mq8(&mut self, x: &GpuTensor, k: usize) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel("mq8_rotate_quantize_x", kernels::GEMV_MQ8G256_SRC, "mq8_rotate_quantize_x")?;
+
         let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
         let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
 
-        // Ensure both kernels compiled before borrowing function refs
-        self.ensure_kernel("mq8_rotate_quantize_x", kernels::GEMV_MQ8G256_SRC, "mq8_rotate_quantize_x")?;
+        let rot_func = &self.functions["mq8_rotate_quantize_x"];
+        let mut xp = x.buf.as_ptr();
+        let mut xq = xq_ptr; let mut xs = xs_ptr;
+        let mut s1 = s1_ptr; let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut xq as *mut _ as *mut c_void,
+            &mut xs as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MQ8 dp4a GEMV using pre-rotated+quantized x. Caller must have called
+    /// `rotate_quantize_x_mq8(x, k)` first — results use the internal `mq_x_q8`/`mq_x_scales`.
+    pub fn gemv_mq8g256_prerotated(
+        &mut self, a_raw: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
         self.ensure_kernel("gemv_mq8g256", kernels::GEMV_MQ8G256_SRC, "gemv_mq8g256")?;
 
-        // Step 1: rotate + quantize x → INT8
-        {
-            let rot_func = &self.functions["mq8_rotate_quantize_x"];
-            let mut xp = x.buf.as_ptr();
-            let mut xq = xq_ptr; let mut xs = xs_ptr;
-            let mut s1 = s1_ptr; let mut s2 = s2_ptr;
-            let mut kv = k as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void, &mut xq as *mut _ as *mut c_void,
-                &mut xs as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
-        }
+        let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
+        let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
 
-        // Step 2: dp4a GEMV
         let func = &self.functions["gemv_mq8g256"];
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr; let mut xs = xs_ptr;
@@ -739,6 +747,14 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MagnumQuant MQ8: FWHT rotate + INT8 quantize x, then dp4a GEMV.
+    pub fn gemv_mq8g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_quantize_x_mq8(x, k)?;
+        self.gemv_mq8g256_prerotated(a_raw, y, m, k)
     }
 
     /// HFQ3-G256 GEMV. K must be multiple of 256.
@@ -870,7 +886,7 @@ impl Gpu {
         // The RDNA2 variants have 2x+ unroll which compensates for 1-row-per-block,
         // and Infinity Cache makes launch overhead negligible vs compute.
         // Other archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = m >= 64 && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031");
+        let use_wide = m >= 64 && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
         if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
             let wfunc = &self.functions["gemv_hfq4g256_wide"];

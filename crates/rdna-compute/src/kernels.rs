@@ -81,6 +81,7 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 // v3: wide-unroll    — launch_bounds(32,12), 4x unroll, ~85 VGPRs
 // v4: dp4a-packed    — launch_bounds(32,16), dp4a intrinsics, factored scale/zero
 // v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
+pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
 pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");
 pub const GEMV_HFQ4G256_GFX1030_V3_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v3.hip");
@@ -108,6 +109,9 @@ pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
                 5 => (GEMV_HFQ4G256_GFX1030_V5_SRC, "gemv_hfq4g256_rdna2v5"),
                 _ => (GEMV_HFQ4G256_GFX1030_V1_SRC, "gemv_hfq4g256_rdna2v1"),
             }
+        }
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ4G256_GFX1100_SRC, "gemv_hfq4g256_rdna3")
         }
         // RDNA4 variants (existing)
         // "gfx1200" | "gfx1201" => ...,

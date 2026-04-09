@@ -541,13 +541,9 @@ pub fn weight_gemv(
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
-            // Extract raw pointer to avoid immutable borrow conflict
-            let x_rot_ptr = gpu.mq_x_rot.as_ref().unwrap().buf.as_ptr();
-            let x_rot_size = gpu.mq_x_rot.as_ref().unwrap().buf.size();
-            // Create a temporary non-owning GpuTensor alias for x_rot
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![x_rot_size / 4],
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_mq4g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
@@ -567,6 +563,63 @@ pub fn weight_gemv(
             eprintln!("WARNING: no GPU kernel for {:?}", other);
             Err(hip_bridge::HipError::new(0, &format!("unsupported dtype {:?}", other)))
         }
+    }
+}
+
+/// Pre-rotate x once for a batch of MagnumQuant weight GEMVs that share the same input.
+///
+/// - MQ4: writes FWHT(x) into `x_rot_scratch`, returns `Some(x_rot_scratch)`.
+///   Pass the returned buffer to `weight_gemv_prerotated` for each MQ4 call.
+/// - MQ8: rotates+quantizes x into the GPU's internal INT8 scratch, returns `None`.
+///   Subsequent `weight_gemv_prerotated` calls pick up the internal buffers automatically.
+/// - Any other dtype: no-op, returns `None` (caller should use plain `x`).
+///
+/// `sample_weight` is any weight from the batch — only its `gpu_dtype` and `k` are read.
+pub fn rotate_x_for_mq<'a>(
+    gpu: &mut Gpu,
+    sample_weight: &WeightTensor,
+    x: &GpuTensor,
+    x_rot_scratch: &'a GpuTensor,
+) -> HipResult<Option<&'a GpuTensor>> {
+    match sample_weight.gpu_dtype {
+        DType::MQ4G256 => {
+            gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
+            Ok(Some(x_rot_scratch))
+        }
+        DType::MQ8G256 => {
+            gpu.rotate_quantize_x_mq8(x, sample_weight.k)?;
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// GEMV with optional pre-rotated x for MagnumQuant weights.
+///
+/// - MQ4 + `x_rot = Some(..)`: calls the arch-tuned HFQ4 GEMV on the pre-rotated buffer,
+///   skipping the per-call FWHT pass. Use with `rotate_x_for_mq` to batch rotations across
+///   multiple projections that share the same input (Q/K/V, gate/up).
+/// - MQ4 + `x_rot = None`: falls back to the auto-rotate path in `weight_gemv`.
+/// - MQ8: uses the internal x_q8/x_scales set by `rotate_quantize_x_mq8`; caller must have
+///   called `rotate_x_for_mq` (which invokes that helper) before this.
+/// - Any other dtype: `x_rot` is ignored; equivalent to `weight_gemv`.
+pub fn weight_gemv_prerotated(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: Option<&GpuTensor>,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::MQ4G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq4g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
+        _ => weight_gemv(gpu, w, x, y),
     }
 }
 
@@ -904,6 +957,8 @@ pub struct ForwardScratch {
     pub repeat_buf: GpuTensor,
     pub attn_partials: GpuTensor,  // flash-decoding partial results
     pub pos_buf: hip_bridge::DeviceBuffer,
+    /// FWHT-rotated x scratch for MagnumQuant batching. Sized to max(dim, hidden_dim).
+    pub x_rot: GpuTensor,
 }
 
 impl ForwardScratch {
@@ -933,6 +988,7 @@ impl ForwardScratch {
             repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
             attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,  // single i32
+            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
         })
     }
 }
@@ -1012,9 +1068,11 @@ pub fn forward_scratch_layers(
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
-            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
-            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+            // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
         if config.has_qk_norm {
@@ -1129,8 +1187,10 @@ pub fn forward_scratch_layers(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
-            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+            // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
@@ -1191,9 +1251,11 @@ pub fn forward_early_exit(
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
-            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
-            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+            // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
         if config.has_qk_norm {
@@ -1243,8 +1305,10 @@ pub fn forward_early_exit(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
-            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+            // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
@@ -1312,9 +1376,11 @@ pub fn forward_scratch_compute(
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
-            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
-            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+            // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
         if config.has_qk_norm {
@@ -1429,8 +1495,10 @@ pub fn forward_scratch_compute(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
-            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+            // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
+            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;

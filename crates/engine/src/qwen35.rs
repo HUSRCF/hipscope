@@ -2,7 +2,8 @@
 //! Feature-gated behind `deltanet`.
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv};
+use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
+                    weight_gemv_prerotated, rotate_x_for_mq};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1005,6 +1006,10 @@ pub struct Qwen35Scratch {
     pub logits: GpuTensor,      // [vocab_size]
     pub sample_buf: GpuTensor,  // [2] — token_id + rng
     pub repeat_buf: GpuTensor,  // [repeat_window]
+
+    // MagnumQuant rotation scratch: FWHT(x) shared across Q/K/V (or gate/up, etc).
+    // Sized to max(dim, hidden_dim) — one rotation per batch replaces one per GEMV.
+    pub x_rot: GpuTensor,       // [max(dim, hidden_dim)]
 }
 
 impl Qwen35Scratch {
@@ -1050,6 +1055,7 @@ impl Qwen35Scratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
         })
     }
 
@@ -1063,7 +1069,7 @@ impl Qwen35Scratch {
                    self.dn_attn_out, self.dn_normed,
                    self.fa_q_full, self.fa_q, self.fa_gate, self.fa_k, self.fa_v, self.fa_attn_out,
                    self.o, self.gate_ffn, self.up, self.ffn_hidden, self.ffn_out,
-                   self.logits, self.sample_buf, self.repeat_buf] {
+                   self.logits, self.sample_buf, self.repeat_buf, self.x_rot] {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -1142,11 +1148,14 @@ fn forward_scratch_layers(
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
-                weight_gemv(gpu, &layer.wqkv, &s.tmp, &s.dn_qkv)?;
-                weight_gemv(gpu, &layer.wz, &s.tmp, &s.dn_z)?;
-                weight_gemv(gpu, &layer.w_beta, &s.tmp, &s.dn_beta)?;
+                // Batch FWHT for MQ weights: wqkv/wz/w_beta/w_alpha all consume s.tmp,
+                // so one rotation replaces four.
+                let x_rot = rotate_x_for_mq(gpu, &layer.wqkv, &s.tmp, &s.x_rot)?;
+                weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
+                weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                 gpu.sigmoid_f32(&s.dn_beta)?;
-                weight_gemv(gpu, &layer.w_alpha, &s.tmp, &s.dn_alpha)?;
+                weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 gpu.alpha_gate_f32(&s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads)?;
 
                 gpu.conv1d_silu_f32(&s.dn_conv_out, &s.dn_qkv, &layer.conv_weight,
@@ -1202,10 +1211,11 @@ fn forward_scratch_layers(
                 weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
                 gpu.add_inplace_f32(&s.x, &s.o)?;
 
-                // FFN
+                // FFN: w_gate/w_up share s.tmp, batch rotation (2 → 1).
                 gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                weight_gemv(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
-                weight_gemv(gpu, &layer.w_up, &s.tmp, &s.up)?;
+                let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &s.tmp, &s.x_rot)?;
+                weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
                 weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
                 gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
@@ -1215,7 +1225,9 @@ fn forward_scratch_layers(
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
                 gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
-                weight_gemv(gpu, &layer.wq, &s.tmp, &s.fa_q_full)?;
+                // Batch FWHT for MQ weights: wq/wk/wv all consume s.tmp, one rotation for three.
+                let x_rot = rotate_x_for_mq(gpu, &layer.wq, &s.tmp, &s.x_rot)?;
+                weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
 
                 // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
@@ -1223,8 +1235,8 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                weight_gemv(gpu, &layer.wk, &s.tmp, &s.fa_k)?;
-                weight_gemv(gpu, &layer.wv, &s.tmp, &s.fa_v)?;
+                weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+                weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
@@ -1309,10 +1321,11 @@ fn forward_scratch_layers(
                 weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
                 gpu.add_inplace_f32(&s.x, &s.o)?;
 
-                // FFN
+                // FFN: w_gate/w_up share s.tmp, batch rotation (2 → 1).
                 gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                weight_gemv(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
-                weight_gemv(gpu, &layer.w_up, &s.tmp, &s.up)?;
+                let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &s.tmp, &s.x_rot)?;
+                weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
                 weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
                 gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
