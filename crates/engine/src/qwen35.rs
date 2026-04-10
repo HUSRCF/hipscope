@@ -1192,23 +1192,30 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                // gfx1100 MQ4 fast path: one fused 4-way projection kernel
-                // (wqkv + wz + w_beta + w_alpha) in a single launch. The
-                // shared x_rot input lets the kernel schedule the tiny
-                // w_beta/w_alpha output tails alongside the big wqkv body,
-                // avoiding the 0.5%-utilisation launches the separate
-                // kernels produced.
-                let fused_la4_ok = x_rot.is_some()
-                    && layer.wqkv.gpu_dtype == DType::MQ4G256
-                    && layer.wz.gpu_dtype == DType::MQ4G256
-                    && layer.w_beta.gpu_dtype == DType::MQ4G256
-                    && layer.w_alpha.gpu_dtype == DType::MQ4G256
+                // gfx1100 fast path: one fused 4-way projection kernel
+                // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
+                // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
+                // and HF4 (weights not rotated, input is plain rmsnormed x).
+                // The kernel math is the same — it's a gemv_hfq4g256 inner
+                // loop; MQ4 and HF4 just live in different "rotated spaces"
+                // and the caller hands the matching x.
+                let dt = layer.wqkv.gpu_dtype;
+                let all_same_hfq4_family = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
+                    && layer.wz.gpu_dtype == dt
+                    && layer.w_beta.gpu_dtype == dt
+                    && layer.w_alpha.gpu_dtype == dt;
+                let fused_la4_ok = all_same_hfq4_family
                     && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
                 if fused_la4_ok {
-                    let xr = x_rot.unwrap();
+                    // MQ4: x_rot is Some(rotated x); HF4: x_rot is None and
+                    // s.tmp holds the plain rmsnormed x from the fallback path.
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
                     gpu.fused_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
-                        xr,
+                        eff_x,
                         &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
                         layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                         layer.wqkv.k,
@@ -1292,16 +1299,20 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                // gfx1100 MQ4 fast path: fused gate+up in one launch.
-                let fused_gu_ok = x_rot.is_some()
-                    && layer.w_gate.gpu_dtype == DType::MQ4G256
-                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                // gfx1100 fast path: fused gate+up in one launch. Works for
+                // both MQ4 (x_rot Some) and HF4 (x_rot None, use s.tmp).
+                let dt_g = layer.w_gate.gpu_dtype;
+                let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
+                    && layer.w_up.gpu_dtype == dt_g
                     && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
                 if fused_gu_ok {
-                    let xr = x_rot.unwrap();
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
                     gpu.fused_gate_up_hfq4g256_rdna3(
                         &layer.w_gate.buf, &layer.w_up.buf,
-                        xr,
+                        eff_x,
                         &s.gate_ffn, &s.up,
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k,
@@ -1331,20 +1342,22 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                // gfx1100 MQ4 fast path: fused 3-way projection for wq+wk+wv.
-                // Saves 2 launches per FA layer. Note: wq outputs into fa_q_full
-                // (Q+gate interleaved, M = n_heads*head_dim*2), so the fused
-                // kernel has to run BEFORE the deinterleave split.
-                let fused_fa3_ok = x_rot.is_some()
-                    && layer.wq.gpu_dtype == DType::MQ4G256
-                    && layer.wk.gpu_dtype == DType::MQ4G256
-                    && layer.wv.gpu_dtype == DType::MQ4G256
+                // gfx1100 fast path: fused 3-way projection for wq+wk+wv.
+                // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
+                let dt = layer.wq.gpu_dtype;
+                let all_same_hfq4_family = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
+                    && layer.wk.gpu_dtype == dt
+                    && layer.wv.gpu_dtype == dt;
+                let fused_fa3_ok = all_same_hfq4_family
                     && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
                 if fused_fa3_ok {
-                    let xr = x_rot.unwrap();
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
                     gpu.fused_qkv_hfq4g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                        xr,
+                        eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k,
@@ -1449,16 +1462,20 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                // gfx1100 MQ4 fast path: fused gate+up in one launch.
-                let fused_gu_ok = x_rot.is_some()
-                    && layer.w_gate.gpu_dtype == DType::MQ4G256
-                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                // gfx1100 fast path: fused gate+up in one launch. Works for
+                // both MQ4 (x_rot Some) and HF4 (x_rot None, use s.tmp).
+                let dt_g = layer.w_gate.gpu_dtype;
+                let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
+                    && layer.w_up.gpu_dtype == dt_g
                     && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
                 if fused_gu_ok {
-                    let xr = x_rot.unwrap();
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
                     gpu.fused_gate_up_hfq4g256_rdna3(
                         &layer.w_gate.buf, &layer.w_up.buf,
-                        xr,
+                        eff_x,
                         &s.gate_ffn, &s.up,
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k,
