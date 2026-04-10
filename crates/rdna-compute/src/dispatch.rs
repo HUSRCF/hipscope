@@ -1137,6 +1137,77 @@ impl Gpu {
 
     // HFQ2 GEMV dispatch already exists at line ~521 from the HFQ family
 
+    /// 4-way fused HFQ4-G256 projection — gfx1100 only.
+    ///
+    /// Performs y_qkv=A_qkv·x, y_z=A_z·x, y_beta=A_beta·x, y_alpha=A_alpha·x
+    /// in a single kernel launch, where all four matrices share the same
+    /// input `x` and the same K. Used by Qwen3.5 DeltaNet LA layer preamble
+    /// to collapse four launches (one per projection) into one. Bit-exact
+    /// with four sequential `gemv_hfq4g256` calls.
+    ///
+    /// Falls back to the caller's responsibility to issue four separate
+    /// `gemv_hfq4g256` calls on non-gfx1100 archs — this helper only exists
+    /// for the gfx1100 4x-unroll path.
+    pub fn fused_qkvza_hfq4g256(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "fused_qkvza_hfq4g256_rdna3",
+            kernels::FUSED_QKVZA_HFQ4G256_GFX1100_SRC,
+            "fused_qkvza_hfq4g256",
+        )?;
+        let func = &self.functions["fused_qkvza_hfq4g256"];
+
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_hfq4g256", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [total_m, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -4008,6 +4079,13 @@ impl Gpu {
                 let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
+                // gfx1100 4-way fused LA projection kernel (wqkv+wz+wbeta+walpha
+                // in one launch). RDNA3 only — inner loop is the 4x-unroll
+                // gfx1100 variant. Saves ~3 launches per LA layer.
+                if matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102") {
+                    specs.push(("fused_qkvza_hfq4g256_rdna3",
+                                kernels::FUSED_QKVZA_HFQ4G256_GFX1100_SRC.to_string()));
+                }
                 // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
                 // Empirically slower than the single-row kernel on gfx1100 at all
                 // tested matrix sizes (see commit log / multi-row kernel header),
@@ -4083,6 +4161,7 @@ impl Gpu {
                 "conv1d_silu" => vec!["conv1d_silu_f32"],
                 "l2_norm" => vec!["l2_norm_f32"],
                 "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
+                "fused_qkvza_hfq4g256_rdna3" => vec!["fused_qkvza_hfq4g256"],
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],

@@ -1192,10 +1192,33 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                // gfx1100 MQ4 fast path: one fused 4-way projection kernel
+                // (wqkv + wz + w_beta + w_alpha) in a single launch. The
+                // shared x_rot input lets the kernel schedule the tiny
+                // w_beta/w_alpha output tails alongside the big wqkv body,
+                // avoiding the 0.5%-utilisation launches the separate
+                // kernels produced.
+                let fused_la4_ok = x_rot.is_some()
+                    && layer.wqkv.gpu_dtype == DType::MQ4G256
+                    && layer.wz.gpu_dtype == DType::MQ4G256
+                    && layer.w_beta.gpu_dtype == DType::MQ4G256
+                    && layer.w_alpha.gpu_dtype == DType::MQ4G256
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+                if fused_la4_ok {
+                    let xr = x_rot.unwrap();
+                    gpu.fused_qkvza_hfq4g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        xr,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
+                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
