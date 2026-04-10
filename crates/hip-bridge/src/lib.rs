@@ -3,10 +3,12 @@
 
 mod ffi;
 mod error;
+mod kernarg;
 
 pub use error::{HipError, HipResult};
 pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
 pub use ffi::launch_counters;
+pub use kernarg::KernargBlob;
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

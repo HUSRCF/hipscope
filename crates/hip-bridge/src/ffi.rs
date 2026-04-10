@@ -526,6 +526,74 @@ impl HipRuntime {
         self.check(code, "hipModuleLaunchKernel")
     }
 
+    /// Launch a kernel using the `extra` path, passing a contiguous kernarg
+    /// byte buffer instead of the traditional `void**` pointer-per-arg array.
+    ///
+    /// This path is REQUIRED for graph capture on gfx1100 / ROCm 6.3: when a
+    /// launch is captured into a stream graph via `hipStreamBeginCapture`, the
+    /// kernelParams path (`*mut *mut c_void`) only captures pointers, not the
+    /// pointed-to values. By the time the graph is replayed, the stack frame
+    /// that held those values is gone and the kernel reads garbage. The
+    /// `extra` path, on the other hand, hands HIP a single blob pointer +
+    /// size, and HIP copies the blob contents into the kernel node at capture
+    /// time.
+    ///
+    /// The caller owns the `kernarg_blob` slice and is responsible for keeping
+    /// it alive for the lifetime of any graph that captured this launch. For
+    /// one-shot launches (no capture) the blob may be stack-local.
+    ///
+    /// Layout contract: `kernarg_blob` must be the kernel's full kernarg
+    /// struct, laid out with natural alignment per field (matching the way
+    /// hipcc emits the kernel's argument ABI). Total blob size is passed
+    /// alongside the pointer via HIP_LAUNCH_PARAM_BUFFER_SIZE.
+    ///
+    /// # Safety
+    /// `kernarg_blob` must have layout + size matching the kernel signature,
+    /// and all contained pointers must be valid GPU addresses.
+    pub unsafe fn launch_kernel_blob(
+        &self,
+        func: &Function,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: Option<&Stream>,
+        kernarg_blob: &mut [u8],
+    ) -> HipResult<()> {
+        // HIP `extra` mode sentinel constants (from hip_runtime.h):
+        //   HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
+        //   HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
+        //   HIP_LAUNCH_PARAM_END            = 0x03
+        // The `extra` array alternates sentinel, value pointer, ..., END.
+        let mut blob_size: usize = kernarg_blob.len();
+        let blob_ptr: *mut c_void = kernarg_blob.as_mut_ptr() as *mut c_void;
+        let size_ptr: *mut c_void = (&mut blob_size as *mut usize) as *mut c_void;
+        let mut extra: [*mut c_void; 5] = [
+            0x01 as *mut c_void,       // HIP_LAUNCH_PARAM_BUFFER_POINTER
+            blob_ptr,                  // → persistent kernarg blob
+            0x02 as *mut c_void,       // HIP_LAUNCH_PARAM_BUFFER_SIZE
+            size_ptr,                  // → &blob_size (must live across the call)
+            0x03 as *mut c_void,       // HIP_LAUNCH_PARAM_END
+        ];
+
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        let code = (self.fn_module_launch_kernel)(
+            func.0,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_mem,
+            stream_raw,
+            ptr::null_mut(),           // kernelParams = null (we use extra)
+            extra.as_mut_ptr(),
+        );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipModuleLaunchKernel(extra blob)")
+    }
+
     // ── Events ──────────────────────────────────────────────────
 
     pub fn event_create(&self) -> HipResult<Event> {

@@ -157,6 +157,45 @@ impl Gpu {
         })
     }
 
+    /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
+    /// for callers that need to JIT a kernel by name from outside the crate
+    /// (primarily the hipGraph capture/replay path).
+    pub fn ensure_kernel_public(
+        &mut self,
+        module_name: &str,
+        source: &str,
+        func_name: &str,
+    ) -> HipResult<()> {
+        self.ensure_kernel(module_name, source, func_name)
+    }
+
+    /// Launch a pre-loaded kernel by name using the `extra`-mode kernarg
+    /// blob path. This is the only launch path that survives hipGraph
+    /// capture on gfx1100 / ROCm 6.x — the traditional `kernelParams`
+    /// (`void**`) path records stack pointers that dangle by the time the
+    /// captured graph is replayed.
+    ///
+    /// Caller is responsible for:
+    ///  - keeping `kernargs` alive across the life of any graph that
+    ///    captured this launch (HIP records the blob pointer, not the data);
+    ///  - building `kernargs` with the layout matching the kernel signature
+    ///    (use `hip_bridge::KernargBlob` for correct alignment).
+    pub fn launch_kernel_blob(
+        &self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernargs: &mut [u8],
+    ) -> HipResult<()> {
+        let func = self.functions.get(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("launch_kernel_blob: function '{func_name}' not loaded"))
+        })?;
+        unsafe {
+            self.hip.launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
+        }
+    }
+
     /// Compile and load a kernel, caching the result.
     fn ensure_kernel(&mut self, module_name: &str, source: &str, func_name: &str) -> HipResult<()> {
         if self.functions.contains_key(func_name) {

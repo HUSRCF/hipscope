@@ -1,30 +1,36 @@
 //! hipGraph POC for the redline-dispatch branch.
 //!
-//! Validates that hipfire kernels capture cleanly into a hipGraph and that
-//! replay produces byte-exact output. Measures per-kernel walk inside the
-//! graph vs sequential null-stream launches.
+//! Demonstrates the bit-exact graph capture/replay path for hipfire kernels.
 //!
-//! Sequence under test (10 kernels, mix of small element-wise + rmsnorm +
-//! a synthetic GEMV through the hipfire dispatch path):
+//! ## History: why the first version of this POC failed
 //!
-//!   1. rmsnorm_f32           — block-reduction → divide
-//!   2. scale_f32             — element-wise × const
-//!   3. sigmoid_f32           — element-wise sigmoid (in-place)
-//!   4. mul_f32               — element-wise multiply (3 buffers)
-//!   5. add_inplace_f32       — c += d
-//!   6. silu_mul_f32          — fused SwiGLU
-//!   7. rmsnorm_f32           — second rmsnorm
-//!   8. scale_f32             — second scale
-//!   9. sigmoid_f32           — second sigmoid
-//!  10. mul_f32               — second mul
+//! The original POC tried to capture `gpu.mul_f32(&a, &b, &scratch)` directly.
+//! That dispatch helper packs kernargs via `Vec<*mut c_void>` where each
+//! entry points at a stack-local variable. Under `hipStreamBeginCapture` on
+//! gfx1100 / ROCm 6.3, `hipModuleLaunchKernel` captured those stack pointers
+//! *by reference* into the graph node — by the time the graph was replayed,
+//! the enclosing stack frame was gone and the kernel read garbage. The POC
+//! showed `graph vs reference: 1/4096 match` (only index 0, which happened
+//! to be zero in both) and the kernel effectively did nothing on replay.
 //!
-//! All operate on a 4096-float vector — same shape the 9B forward uses for
-//! its hidden state. This is the worst case for dispatch latency: each kernel
-//! does ~µs of compute and the rest is launch overhead.
+//! ## The fix
+//!
+//! `HipRuntime::launch_kernel_blob` uses the `extra` path of
+//! `hipModuleLaunchKernel`, passing a contiguous kernarg byte buffer. HIP
+//! copies the blob contents into the kernel node at capture time (the blob
+//! pointer itself still has to stay alive, but the caller owns the buffer
+//! and can hold it for the graph's full lifetime). Combined with the
+//! `hip_bridge::KernargBlob` helper, dispatch paths can build correctly
+//! aligned kernarg buffers without resorting to stack-local addresses.
+//!
+//! This POC proves the fix: it captures a `mul_f32` launch via the blob
+//! path, replays it, and confirms every element of the output matches the
+//! sequential reference.
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example hip_graph_poc
 
+use hip_bridge::KernargBlob;
 use rdna_compute::Gpu;
 use std::time::Instant;
 
@@ -33,143 +39,122 @@ fn main() {
     eprintln!("[hip_graph_poc] arch={}", gpu.arch);
 
     let dim = 4096usize;
-    let nbytes = dim * 4;
 
-    // Allocate two distinct buffers for the test sequence.
+    // Distinct buffers so the result has a unique signature.
     let init_a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001).collect();
     let init_b: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.0007 + 0.5).collect();
-    let init_w: Vec<f32> = (0..dim).map(|i| 1.0 + ((i % 16) as f32) * 0.01).collect();
+    let zero: Vec<f32> = vec![0.0; dim];
 
     let a = gpu.upload_f32(&init_a, &[dim]).unwrap();
     let b = gpu.upload_f32(&init_b, &[dim]).unwrap();
-    let c = gpu.upload_f32(&init_a, &[dim]).unwrap();
-    let d = gpu.upload_f32(&init_b, &[dim]).unwrap();
-    let weight = gpu.upload_f32(&init_w, &[dim]).unwrap();
-    let scratch = gpu.upload_f32(&vec![0.0; dim], &[dim]).unwrap();
+    let scratch = gpu.upload_f32(&zero, &[dim]).unwrap();
 
-    // ─── Helper that runs ONE kernel (mul_f32: c = scratch * b) ─
-    // Reduced to a single kernel to isolate whether rdna-compute's kernarg
-    // packing pattern (stack-local pointer to by-value args) is compatible
-    // with HIP graph capture. mul_f32 takes 3 buffer pointers + n (i32 by
-    // value via stack pointer).
-    let run_sequence = |gpu: &mut Gpu| -> hip_bridge::HipResult<()> {
-        gpu.mul_f32(&a, &b, &scratch)?;
-        Ok(())
-    };
-
-    // ─── Reset helper: re-uploads inputs so each run starts identically ──
-    let reset_inputs = |gpu: &mut Gpu| {
-        gpu.hip
-            .memcpy_htod(&a.buf, as_bytes(&init_a))
-            .unwrap();
-        gpu.hip
-            .memcpy_htod(&b.buf, as_bytes(&init_b))
-            .unwrap();
-        gpu.hip
-            .memcpy_htod(&c.buf, as_bytes(&init_a))
-            .unwrap();
-        gpu.hip
-            .memcpy_htod(&d.buf, as_bytes(&init_b))
-            .unwrap();
-        gpu.hip
-            .memcpy_htod(&scratch.buf, &vec![0u8; nbytes])
-            .unwrap();
-    };
-
-    // ─── 1. Reference run on the null stream, capture output ─────────────
-    eprintln!("\n--- Reference (null stream, sequential launches) ---");
-    reset_inputs(&mut gpu);
-    run_sequence(&mut gpu).unwrap();
+    // ─── Reference: run one mul_f32 on the null stream ──────────────────
+    //
+    // This ALSO serves as the kernel-warmup path — after this call,
+    // `mul_f32` is compiled, the module is loaded, and the function is
+    // cached in `gpu.functions`, so the subsequent `launch_kernel_blob`
+    // lookup by name will succeed.
+    eprintln!("\n--- Reference (null stream via dispatch.rs) ---");
+    gpu.mul_f32(&a, &b, &scratch).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let reference = gpu.download_f32(&scratch).unwrap();
-    eprintln!(
-        "  output[0..4] = {:?}",
-        &reference[..4]
-    );
+    eprintln!("  reference[0..4] = {:?}", &reference[..4]);
 
-    // ─── 2. Time sequential launches (no graph) on a custom stream ──────
-    eprintln!("\n--- Sequential launches on custom stream ---");
+    // ─── Zero the scratch so we can see the kernel writing to it ────────
+    gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
+    let zeroed = gpu.download_f32(&scratch).unwrap();
+    assert_eq!(zeroed[1], 0.0, "reset failed");
+
+    // ─── Build a kernarg blob for mul_f32 ───────────────────────────────
+    //
+    // Kernel signature:
+    //   extern "C" __global__ void mul_f32(
+    //       const float* a, const float* b, float* c, int n);
+    //
+    // ABI layout: 3 × 8-byte pointers + 1 × 4-byte i32 = 28 bytes.
+    let n = dim as i32;
+    let mut blob = KernargBlob::new();
+    blob.push_ptr(a.buf.as_ptr());
+    blob.push_ptr(b.buf.as_ptr());
+    blob.push_ptr(scratch.buf.as_ptr());
+    blob.push_i32(n);
+    eprintln!("\n--- Kernarg blob ---");
+    eprintln!("  size = {} bytes (expected 28)", blob.len());
+    assert_eq!(blob.len(), 28);
+
+    // ─── Blob-path launch on a dedicated stream ─────────────────────────
+    //
+    // Sanity check: the blob path works OUTSIDE of graph capture too,
+    // which confirms the kernarg layout is correct before we trust it
+    // inside a captured graph.
+    eprintln!("\n--- Blob-path launch (no capture) ---");
+    gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
     let stream = gpu.hip.stream_create().unwrap();
     gpu.active_stream = Some(stream);
 
-    // Warm-up
-    for _ in 0..10 {
-        reset_inputs(&mut gpu);
-        run_sequence(&mut gpu).unwrap();
-    }
+    let block = [256u32, 1, 1];
+    let grid = [((dim as u32) + 255) / 256, 1, 1];
+    gpu.launch_kernel_blob("mul_f32", grid, block, 0, blob.as_mut_slice())
+        .unwrap();
     gpu.hip
         .stream_synchronize(gpu.active_stream.as_ref().unwrap())
         .unwrap();
 
-    let iters = 200u32;
-    let mut seq_lat = Vec::with_capacity(iters as usize);
-    for _ in 0..iters {
-        reset_inputs(&mut gpu);
-        let t = Instant::now();
-        run_sequence(&mut gpu).unwrap();
-        gpu.hip
-            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
-            .unwrap();
-        seq_lat.push(t.elapsed());
-    }
-    let stream = gpu.active_stream.take().unwrap();
-    print_stats("Sequential (10 kernels, custom stream + sync)", &mut seq_lat);
-    let seq_total_us = median_us(&seq_lat);
-    let seq_per_kernel = seq_total_us / 10.0;
-    eprintln!("  per-kernel walk: {:.2} µs", seq_per_kernel);
+    let blob_direct = gpu.download_f32(&scratch).unwrap();
+    let bad = (0..dim)
+        .filter(|&i| (blob_direct[i] - reference[i]).abs() > 1e-6)
+        .count();
+    eprintln!("  blob-direct vs reference: {}/{} match", dim - bad, dim);
+    assert_eq!(bad, 0, "blob-path launch outside capture already differs");
 
-    // Verify sequential output still matches reference
-    let seq_out = gpu.download_f32(&scratch).unwrap();
-    let bad = (0..dim).filter(|&i| (seq_out[i] - reference[i]).abs() > 1e-4).count();
-    eprintln!("  sequential vs reference: {}/{} match", dim - bad, dim);
+    // ─── Graph capture via the blob path ────────────────────────────────
+    eprintln!("\n--- hipGraph capture + replay (blob path) ---");
+    gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
 
-    // ─── 3. Graph capture and replay ────────────────────────────────────
-    eprintln!("\n--- hipGraph capture + replay ---");
-    gpu.active_stream = Some(stream);
-    reset_inputs(&mut gpu);
-
-    // Begin capture, run sequence, end capture.
     gpu.hip
         .stream_begin_capture(gpu.active_stream.as_ref().unwrap(), 0)
         .expect("stream_begin_capture");
-    let capture_result = run_sequence(&mut gpu);
-    let graph_result = gpu
-        .hip
-        .stream_end_capture(gpu.active_stream.as_ref().unwrap());
 
-    let graph = match (capture_result, graph_result) {
-        (Ok(()), Ok(g)) => {
-            eprintln!("  capture succeeded");
-            g
-        }
-        (Err(e), _) => {
-            eprintln!("  ❌ capture FAILED during sequence: {e}");
-            std::process::exit(1);
-        }
-        (Ok(()), Err(e)) => {
-            eprintln!("  ❌ stream_end_capture FAILED: {e}");
-            std::process::exit(1);
-        }
-    };
+    // Rebuild the blob — we'll hand this one to the graph and keep it
+    // alive until graph destruction so the captured node's kernarg
+    // pointer stays valid.
+    let mut graph_blob = KernargBlob::new();
+    graph_blob.push_ptr(a.buf.as_ptr());
+    graph_blob.push_ptr(b.buf.as_ptr());
+    graph_blob.push_ptr(scratch.buf.as_ptr());
+    graph_blob.push_i32(n);
+
+    gpu.launch_kernel_blob("mul_f32", grid, block, 0, graph_blob.as_mut_slice())
+        .expect("launch during capture");
+
+    let graph = gpu
+        .hip
+        .stream_end_capture(gpu.active_stream.as_ref().unwrap())
+        .expect("stream_end_capture");
+    eprintln!("  capture succeeded");
 
     let exec = gpu.hip.graph_instantiate(&graph).expect("graph_instantiate");
     eprintln!("  instantiated");
 
-    // First replay (warmup)
-    reset_inputs(&mut gpu);
+    // First replay
+    gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
     gpu.hip
         .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
-        .expect("graph_launch (warmup)");
+        .unwrap();
     gpu.hip
         .stream_synchronize(gpu.active_stream.as_ref().unwrap())
         .unwrap();
 
-    // Verify graph output matches reference
     let graph_out = gpu.download_f32(&scratch).unwrap();
-    let bad = (0..dim).filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-4).count();
-    eprintln!("  graph vs reference: {}/{} match", dim - bad, dim);
+    let bad = (0..dim)
+        .filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6)
+        .count();
+    eprintln!("  graph replay vs reference: {}/{} match", dim - bad, dim);
+
     if bad > 0 {
-        for i in 0..8 {
+        eprintln!("  FIRST 8 MISMATCHES:");
+        for i in (0..dim).filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6).take(8) {
             eprintln!(
                 "    [{i}] graph={} ref={} delta={}",
                 graph_out[i],
@@ -177,46 +162,27 @@ fn main() {
                 graph_out[i] - reference[i]
             );
         }
+        eprintln!("\n=== POC FAILED — kernarg blob fix does not survive graph replay ===");
         std::process::exit(1);
     }
 
-    // ─── 4. Time graph replay ───────────────────────────────────────────
-    let mut warmup_count = 0;
-    while warmup_count < 20 {
-        reset_inputs(&mut gpu);
-        gpu.hip
-            .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
-            .unwrap();
-        gpu.hip
-            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
-            .unwrap();
-        warmup_count += 1;
-    }
+    // ─── Second replay to prove it's repeatable ─────────────────────────
+    gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
+    gpu.hip
+        .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
+        .unwrap();
+    gpu.hip
+        .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+        .unwrap();
+    let graph_out2 = gpu.download_f32(&scratch).unwrap();
+    let bad2 = (0..dim)
+        .filter(|&i| (graph_out2[i] - reference[i]).abs() > 1e-6)
+        .count();
+    eprintln!("  second replay: {}/{} match", dim - bad2, dim);
+    assert_eq!(bad2, 0);
 
-    let mut graph_lat = Vec::with_capacity(iters as usize);
-    for _ in 0..iters {
-        reset_inputs(&mut gpu);
-        let t = Instant::now();
-        gpu.hip
-            .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
-            .unwrap();
-        gpu.hip
-            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
-            .unwrap();
-        graph_lat.push(t.elapsed());
-    }
-    print_stats("hipGraph replay (10 kernels, 1 launch + sync)", &mut graph_lat);
-    let graph_total_us = median_us(&graph_lat);
-    let graph_per_kernel = graph_total_us / 10.0;
-    eprintln!("  per-kernel walk: {:.2} µs", graph_per_kernel);
-
-    // ─── 5. Measure replay WITHOUT the per-launch reset+sync overhead ───
-    // The reset + per-launch sync above adds host bookkeeping time. To
-    // isolate the actual GPU graph walk cost, run a tight burst of N
-    // graph_launches and sync once at the end.
-    eprintln!("\n--- hipGraph burst (no per-launch reset, 1 sync at end) ---");
-    let burst = 100u32;
-    reset_inputs(&mut gpu);
+    // ─── Timing: sequential vs graph replay ─────────────────────────────
+    let burst = 200u32;
     let mut burst_lat = Vec::with_capacity(50);
     for _ in 0..50 {
         let t = Instant::now();
@@ -233,66 +199,123 @@ fn main() {
     burst_lat.sort();
     let burst_total_us = burst_lat[burst_lat.len() / 2].as_secs_f64() * 1_000_000.0;
     let burst_per_replay = burst_total_us / burst as f64;
-    let burst_per_kernel = burst_per_replay / 10.0;
     eprintln!(
-        "  median {} replays = {:.1} µs total → {:.2} µs/replay → {:.2} µs/kernel-walk",
-        burst, burst_total_us, burst_per_replay, burst_per_kernel
+        "\n  graph burst: {:.1} µs total / {burst} replays → {:.2} µs/replay",
+        burst_total_us, burst_per_replay
     );
 
-    // ─── 6. Final summary ───────────────────────────────────────────────
-    eprintln!("\n=== Summary ===");
+    // Sequential reference: blob-path launch, no graph.
+    let mut seq_lat = Vec::with_capacity(50);
+    for _ in 0..50 {
+        let t = Instant::now();
+        for _ in 0..burst {
+            gpu.launch_kernel_blob("mul_f32", grid, block, 0, blob.as_mut_slice())
+                .unwrap();
+        }
+        gpu.hip
+            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+            .unwrap();
+        seq_lat.push(t.elapsed());
+    }
+    seq_lat.sort();
+    let seq_total_us = seq_lat[seq_lat.len() / 2].as_secs_f64() * 1_000_000.0;
+    let seq_per_launch = seq_total_us / burst as f64;
     eprintln!(
-        "  Sequential per-kernel walk:    {:.2} µs   (10 launches per replay, sync per replay)",
-        seq_per_kernel
+        "  sequential (blob-direct) burst: {:.1} µs total / {burst} launches → {:.2} µs/launch",
+        seq_total_us, seq_per_launch
     );
-    eprintln!(
-        "  Graph per-kernel walk (sync):  {:.2} µs   (1 graph launch per replay, sync per replay)",
-        graph_per_kernel
-    );
-    eprintln!(
-        "  Graph per-kernel walk (burst): {:.2} µs   ({burst} replays, sync at end)",
-        burst_per_kernel
-    );
-    let speedup_sync = seq_per_kernel / graph_per_kernel;
-    let speedup_burst = seq_per_kernel / burst_per_kernel;
-    eprintln!(
-        "  Speedup (graph sync vs seq):   {:.2}x",
-        speedup_sync
-    );
-    eprintln!(
-        "  Speedup (graph burst vs seq):  {:.2}x",
-        speedup_burst
-    );
+    let speedup = seq_per_launch / burst_per_replay;
+    eprintln!("  graph-replay speedup: {:.2}x", speedup);
 
-    // Cleanup
+    // Cleanup the single-node graph
     gpu.hip.graph_exec_destroy(exec).unwrap();
     gpu.hip.graph_destroy(graph).unwrap();
+
+    // ─── Multi-node graph test ───────────────────────────────────────────
+    //
+    // The single-node result above showed graph replay ≫ sequential launch
+    // on wall time, which is suspicious. The theory is that graph_launch
+    // has a fixed per-invocation overhead (issuing the command to the GPU's
+    // command processor) that gets amortized across all nodes inside the
+    // graph. A forward pass has ~400 kernels in one graph — we need to
+    // measure the per-NODE cost, not the per-graph_launch cost.
+    //
+    // This block captures N copies of mul_f32 into one graph, launches the
+    // graph once per iter, and computes per-node walk cost by subtracting
+    // the single-node number.
+    eprintln!("\n--- Multi-node graph (N kernels per graph_launch) ---");
+    for n_nodes in [1usize, 10, 50, 200] {
+        // Keep all kernargs alive for the life of the graph.
+        let mut blobs: Vec<KernargBlob> = (0..n_nodes)
+            .map(|_| {
+                let mut k = KernargBlob::new();
+                k.push_ptr(a.buf.as_ptr());
+                k.push_ptr(b.buf.as_ptr());
+                k.push_ptr(scratch.buf.as_ptr());
+                k.push_i32(n);
+                k
+            })
+            .collect();
+
+        gpu.hip
+            .stream_begin_capture(gpu.active_stream.as_ref().unwrap(), 0)
+            .unwrap();
+        for blob in blobs.iter_mut() {
+            gpu.launch_kernel_blob("mul_f32", grid, block, 0, blob.as_mut_slice())
+                .unwrap();
+        }
+        let multi_graph = gpu
+            .hip
+            .stream_end_capture(gpu.active_stream.as_ref().unwrap())
+            .unwrap();
+        let multi_exec = gpu.hip.graph_instantiate(&multi_graph).unwrap();
+
+        // Warm up
+        for _ in 0..5 {
+            gpu.hip
+                .graph_launch(&multi_exec, gpu.active_stream.as_ref().unwrap())
+                .unwrap();
+        }
+        gpu.hip
+            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+            .unwrap();
+
+        let iters = 100u32;
+        let mut lat = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                gpu.hip
+                    .graph_launch(&multi_exec, gpu.active_stream.as_ref().unwrap())
+                    .unwrap();
+            }
+            gpu.hip
+                .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+                .unwrap();
+            lat.push(t.elapsed());
+        }
+        lat.sort();
+        let total_us = lat[lat.len() / 2].as_secs_f64() * 1_000_000.0;
+        let per_launch = total_us / iters as f64;
+        let per_node = per_launch / n_nodes as f64;
+        eprintln!(
+            "  N={n_nodes:4} nodes: {per_launch:7.2} µs/graph_launch, {per_node:6.2} µs/node"
+        );
+
+        gpu.hip.graph_exec_destroy(multi_exec).unwrap();
+        gpu.hip.graph_destroy(multi_graph).unwrap();
+        drop(blobs);
+    }
+
+    // Cleanup
     let stream = gpu.active_stream.take().unwrap();
     gpu.hip.stream_destroy(stream).unwrap();
 
-    eprintln!("\n=== POC PASSED ===");
-}
+    // Keep blob alive until the graph that captured it is destroyed.
+    drop(blob);
+    drop(graph_blob);
 
-fn print_stats(label: &str, lat: &mut Vec<std::time::Duration>) {
-    lat.sort();
-    let to_us = |d: std::time::Duration| d.as_secs_f64() * 1_000_000.0;
-    let median = to_us(lat[lat.len() / 2]);
-    let mean = to_us(lat.iter().sum::<std::time::Duration>()) / lat.len() as f64;
-    let p99 = to_us(lat[(lat.len() as f64 * 0.99) as usize]);
-    let min = to_us(lat[0]);
-    let max = to_us(*lat.last().unwrap());
-    eprintln!("[{label}]");
-    eprintln!("  median: {median:7.2} µs");
-    eprintln!("  mean:   {mean:7.2} µs");
-    eprintln!("  p99:    {p99:7.2} µs");
-    eprintln!("  min:    {min:7.2} µs");
-    eprintln!("  max:    {max:7.2} µs");
-}
-
-fn median_us(lat: &[std::time::Duration]) -> f64 {
-    let mut sorted = lat.to_vec();
-    sorted.sort();
-    sorted[sorted.len() / 2].as_secs_f64() * 1_000_000.0
+    eprintln!("\n=== POC PASSED — hipGraph capture + blob-path kernargs work bit-exact ===");
 }
 
 fn as_bytes(v: &[f32]) -> &[u8] {
