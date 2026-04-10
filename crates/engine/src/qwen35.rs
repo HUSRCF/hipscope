@@ -1292,8 +1292,24 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-                weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                // gfx1100 MQ4 fast path: fused gate+up in one launch.
+                let fused_gu_ok = x_rot.is_some()
+                    && layer.w_gate.gpu_dtype == DType::MQ4G256
+                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+                if fused_gu_ok {
+                    let xr = x_rot.unwrap();
+                    gpu.fused_gate_up_hfq4g256_rdna3(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        xr,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
@@ -1433,8 +1449,24 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-                weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                // gfx1100 MQ4 fast path: fused gate+up in one launch.
+                let fused_gu_ok = x_rot.is_some()
+                    && layer.w_gate.gpu_dtype == DType::MQ4G256
+                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+                if fused_gu_ok {
+                    let xr = x_rot.unwrap();
+                    gpu.fused_gate_up_hfq4g256_rdna3(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        xr,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)

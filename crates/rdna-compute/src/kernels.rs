@@ -104,6 +104,12 @@ pub const FUSED_QKVZA_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernel
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m.
 pub const FUSED_QKV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256.gfx1100.hip");
+
+// 2-way fused HFQ4-G256 projection for the SwiGLU FFN preamble (w_gate +
+// w_up). gfx1100 4x-unroll variant — the original fused_gate_up_hfq4g256
+// uses the slow 1x baseline loop and was never wired up; this replaces
+// it in the Qwen3.5 MQ4 fast path.
+pub const FUSED_GATE_UP_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
 pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");
 pub const GEMV_HFQ4G256_GFX1030_V3_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v3.hip");
