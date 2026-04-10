@@ -413,6 +413,11 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str = include_str!("../../../kernels/sr
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
 
+/// Top-K=128 extraction over a logits vector. Lets the host sampler work
+/// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
+/// logits array. See kernel header for bit-exactness reasoning.
+pub const TOPK_LOGITS_SRC: &str = include_str!("../../../kernels/src/topk_logits.hip");
+
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
 /// Dims >= n_rot pass through unchanged.

@@ -2607,13 +2607,189 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     topk_idx[order[0]]
 }
 
+/// Apply the repeat penalty in-place to a specific subset of (token_id, value)
+/// candidates, rather than the full 151k-entry logits vector. Used by the
+/// GPU-assisted sampler path: the GPU produces a top-K=128 candidate set
+/// from the raw logits, and the CPU then runs the existing repeat-penalty
+/// math on just those 128 entries.
+///
+/// Math is identical to `apply_repeat_penalty` — same frequency count, same
+/// recency decay, same 1.5× cap, same ">0 ? divide : multiply" branch.
+/// The only difference is iteration scope.
+pub fn apply_repeat_penalty_candidates(
+    cand_ids: &[u32],
+    cand_vals: &mut [f32],
+    history: &[u32],
+    window: usize,
+    penalty: f32,
+) {
+    debug_assert_eq!(cand_ids.len(), cand_vals.len());
+
+    let start = history.len().saturating_sub(window);
+    let recent = &history[start..];
+    let window_len = recent.len() as f32;
+    if window_len == 0.0 { return; }
+
+    let mut counts = std::collections::HashMap::<u32, (u32, f32)>::new();
+    for (i, &t) in recent.iter().enumerate() {
+        let recency = (i as f32 + 1.0) / window_len;
+        let entry = counts.entry(t).or_insert((0, 0.0));
+        entry.0 += 1;
+        if recency > entry.1 { entry.1 = recency; }
+    }
+
+    for (i, &tok) in cand_ids.iter().enumerate() {
+        if let Some(&(count, recency)) = counts.get(&tok) {
+            let effective = penalty.powf(count as f32 * recency).min(1.5);
+            if cand_vals[i] > 0.0 {
+                cand_vals[i] /= effective;
+            } else {
+                cand_vals[i] *= effective;
+            }
+        }
+    }
+}
+
+/// Sample from a pre-selected candidate set instead of the full logits.
+///
+/// Accepts (cand_ids, cand_vals): 128 raw (pre-penalty) candidate tokens
+/// from the GPU `topk_logits_f32` kernel. Applies repeat penalty to just
+/// those candidates, then runs the same top-K=20 → softmax → top-p
+/// sampling pipeline as `sample_top_p` on the full logits array.
+///
+/// This is bit-exact with the full-CPU path PROVIDED that the pre-penalty
+/// top-128 ⊇ the post-penalty top-20 from the full vocabulary. Since
+/// `apply_repeat_penalty` monotonically decreases logits (divide-if-positive
+/// or multiply-more-negative), a token outside the pre-penalty top-128 can
+/// never climb into the top-20 after penalty, so the set relation holds.
+pub fn sample_top_p_from_candidates(
+    cand_ids: &[u32],
+    cand_vals: &mut [f32],
+    history: &[u32],
+    repeat_window: usize,
+    repeat_penalty: f32,
+    temperature: f32,
+    top_p: f32,
+) -> u32 {
+    debug_assert_eq!(cand_ids.len(), cand_vals.len());
+
+    // Step 1: apply repeat penalty to the candidate subset.
+    apply_repeat_penalty_candidates(cand_ids, cand_vals, history, repeat_window, repeat_penalty);
+
+    // Step 2: if greedy, just return the argmax of the penalized candidates.
+    if temperature <= 0.0 {
+        let mut best_idx = 0usize;
+        let mut best_val = cand_vals[0];
+        for i in 1..cand_vals.len() {
+            if cand_vals[i] > best_val {
+                best_val = cand_vals[i];
+                best_idx = i;
+            }
+        }
+        return cand_ids[best_idx];
+    }
+
+    // Step 3: top-K=20 selection from the candidate set, matching the
+    // full-CPU path's selection logic exactly. The candidate set is already
+    // ≤ 128, but we still pick the top 20 via the same min-tracking loop
+    // the full path uses, so the resulting set ordering is identical.
+    const TOP_K: usize = 20;
+    let top_p = top_p.clamp(0.0, 1.0);
+    let inv_temp = 1.0 / temperature;
+
+    let mut topk_val = [f32::NEG_INFINITY; TOP_K];
+    let mut topk_idx = [0u32; TOP_K];
+    let mut min_pos = 0usize;
+    let mut min_val = f32::NEG_INFINITY;
+    let mut max_logit = f32::NEG_INFINITY;
+
+    for (i, &l) in cand_vals.iter().enumerate() {
+        let tok = cand_ids[i];
+        if l > max_logit { max_logit = l; }
+        if l > min_val {
+            topk_val[min_pos] = l;
+            topk_idx[min_pos] = tok;
+            min_val = f32::INFINITY;
+            for j in 0..TOP_K {
+                if topk_val[j] < min_val {
+                    min_val = topk_val[j];
+                    min_pos = j;
+                }
+            }
+        }
+    }
+
+    // Step 4: softmax over the K=20 winners (temperature-scaled).
+    let mut probs = [0.0f32; TOP_K];
+    let mut sum = 0.0f32;
+    for i in 0..TOP_K {
+        let p = ((topk_val[i] - max_logit) * inv_temp).exp();
+        probs[i] = p;
+        sum += p;
+    }
+
+    // Step 5: sort descending by probability (insertion sort on 20).
+    let mut order: [usize; TOP_K] = core::array::from_fn(|i| i);
+    for i in 1..TOP_K {
+        let mut j = i;
+        while j > 0 && probs[order[j]] > probs[order[j - 1]] {
+            order.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+
+    // Step 6: top-p filtering + sample. Uses the shared `simple_rand` RNG
+    // state, so the RNG stream is identical across the full-CPU and
+    // GPU-assisted paths.
+    let r = simple_rand() * sum;
+    let mut cumulative = 0.0f32;
+    let mut sample_acc = 0.0f32;
+    let threshold = top_p * sum;
+    for &k in &order {
+        cumulative += probs[k];
+        sample_acc += probs[k];
+        if sample_acc >= r {
+            return topk_idx[k];
+        }
+        if cumulative >= threshold {
+            let r2 = simple_rand() * cumulative;
+            let mut acc2 = 0.0f32;
+            for &k2 in &order {
+                acc2 += probs[k2];
+                if acc2 >= r2 {
+                    return topk_idx[k2];
+                }
+                if acc2 >= cumulative { break; }
+            }
+            return topk_idx[order[0]];
+        }
+    }
+    topk_idx[order[0]]
+}
+
+/// Snapshot + restore the sampler RNG state. Used by HIPFIRE_SAMPLE_COMPARE
+/// to run two samplers against the same seed so token differences reflect
+/// real divergence and not just RNG stream drift.
+pub fn sampler_rng_snapshot() -> u32 {
+    use std::sync::atomic::Ordering;
+    SAMPLER_STATE.load(Ordering::Relaxed)
+}
+
+pub fn sampler_rng_restore(state: u32) {
+    use std::sync::atomic::Ordering;
+    SAMPLER_STATE.store(state, Ordering::Relaxed);
+}
+
+use std::sync::atomic::AtomicU32;
+static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
+
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
+/// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
 fn simple_rand() -> f32 {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static STATE: AtomicU32 = AtomicU32::new(0);
+    use std::sync::atomic::Ordering;
 
     // Seed from time on first call
-    let mut s = STATE.load(Ordering::Relaxed);
+    let mut s = SAMPLER_STATE.load(Ordering::Relaxed);
     if s == 0 {
         s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2625,6 +2801,6 @@ fn simple_rand() -> f32 {
     s ^= s << 13;
     s ^= s >> 17;
     s ^= s << 5;
-    STATE.store(s, Ordering::Relaxed);
+    SAMPLER_STATE.store(s, Ordering::Relaxed);
     (s as f32) / (u32::MAX as f32)
 }

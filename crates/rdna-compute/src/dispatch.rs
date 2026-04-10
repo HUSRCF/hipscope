@@ -3139,6 +3139,40 @@ impl Gpu {
         result
     }
 
+    /// Top-K=1024 extraction over a logits vector. Populates an 8 KB
+    /// buffer with [1024 × u32 indices | 1024 × f32 values]. One
+    /// device→host copy pulls the whole thing. The host then runs its
+    /// existing top-20 min-tracking loop over the 1024 candidates.
+    ///
+    /// Previous version used 1 wave of 32 threads and measured at ~1.4 ms
+    /// because the compiler couldn't pipeline loads through the branchy
+    /// min-tracking path. Current version uses 256 threads (8 waves) on
+    /// a single workgroup — roughly 10× faster.
+    pub fn topk_logits_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_buf: &GpuTensor,   // DType::F32 shape [2048] = 8192 bytes
+        vocab_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("topk_logits", kernels::TOPK_LOGITS_SRC, "topk_logits_f32")?;
+        let func = &self.functions["topk_logits_f32"];
+        let mut lp = logits.buf.as_ptr();
+        let mut bp = topk_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+        ];
+        let bytes = vocab_size * 4 + 8192;
+        let timer = crate::profile::begin_timer(&self.hip, "sampling", "topk_logits_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are element-wise
     /// scalar transforms applied to independent buffers of size n_v_heads in the
     /// DeltaNet preamble. Saves one launch per linear-attention layer.
@@ -4170,6 +4204,7 @@ impl Gpu {
             ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
             ("sigmoid_mul",              kernels::SIGMOID_MUL_SRC.to_string()),
+            ("topk_logits",              kernels::TOPK_LOGITS_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
             ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
             ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
@@ -4280,6 +4315,7 @@ impl Gpu {
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
+                "topk_logits"  => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],
                 "gated_norm" => vec!["gated_norm_f32"],
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],

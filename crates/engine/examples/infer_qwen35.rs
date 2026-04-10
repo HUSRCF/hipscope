@@ -89,6 +89,28 @@ fn main() {
     // the fused repeat_interleave kernel). Allocate scratch once, reuse forever.
     let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
+    // ── GPU-assisted top-K sampler (opt-in, experimental) ──
+    //
+    // HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU
+    // sample_top_p_from_candidates path, which avoids the 600 KB logits
+    // DtoH per token. It is BIT-EXACT with the full-CPU path for
+    // sampling-from-full-logits because apply_repeat_penalty can only
+    // decrease logits, so the pre-penalty top-128 ⊇ post-penalty top-20.
+    //
+    // HIPFIRE_SAMPLE_COMPARE=1 additionally runs the old full-CPU path
+    // every step and panics on token divergence — long-generation safety
+    // check for the opt-in flag before enabling it by default.
+    let use_gpu_topk = std::env::var("HIPFIRE_GPU_TOPK").ok().as_deref() == Some("1");
+    let sample_compare = std::env::var("HIPFIRE_SAMPLE_COMPARE").ok().as_deref() == Some("1");
+    if use_gpu_topk || sample_compare {
+        eprintln!("sampler: gpu_topk={} compare={}", use_gpu_topk, sample_compare);
+    }
+    const TOPK: usize = 1024;  // 256 threads × top-4 each
+    // Single 8 KB device buffer laid out as [1024 × u32 indices | 1024 × f32 values]
+    // so the whole top-K candidate set downloads in one memcpy_dtoh call.
+    let topk_buf = gpu.alloc_tensor(&[2 * TOPK], rdna_compute::DType::F32).unwrap();
+    let mut topk_host = vec![0u8; 2 * TOPK * 4];  // reused across steps
+
     // Sequential prefill
     let t1 = Instant::now();
     let mut logits = vec![0.0f32; config.vocab_size];
@@ -142,12 +164,74 @@ fn main() {
         let pos = prompt_tokens.len() + generated.len() - 1;
         qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch)
             .expect("forward failed");
-        logits = gpu.download_f32(&scratch.logits).unwrap();
-
-        llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
 
         let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
-        next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+
+        next_token = if use_gpu_topk || sample_compare {
+            // GPU-assisted path: run topk_logits_f32 kernel, ONE DtoH,
+            // run the same CPU sampler on the top-1024 subset.
+            gpu.topk_logits_f32(&scratch.logits, &topk_buf, config.vocab_size)
+                .expect("topk_logits");
+            gpu.hip.memcpy_dtoh(&mut topk_host, &topk_buf.buf).unwrap();
+
+            // (memcpy_dtoh already done above for timing)
+            let mut cand_ids = vec![0u32; TOPK];
+            let mut cand_vals = vec![0.0f32; TOPK];
+            for i in 0..TOPK {
+                cand_ids[i] = u32::from_ne_bytes([
+                    topk_host[i*4], topk_host[i*4+1], topk_host[i*4+2], topk_host[i*4+3],
+                ]);
+                let v_off = TOPK * 4 + i * 4;
+                cand_vals[i] = f32::from_ne_bytes([
+                    topk_host[v_off], topk_host[v_off+1], topk_host[v_off+2], topk_host[v_off+3],
+                ]);
+            }
+
+            if sample_compare {
+                // Snapshot RNG so both samplers see the same state.
+                let rng_before = llama::sampler_rng_snapshot();
+
+                // GPU-assisted path (advances RNG)
+                let mut cand_vals_gpu = cand_vals.clone();
+                let gpu_tok = llama::sample_top_p_from_candidates(
+                    &cand_ids, &mut cand_vals_gpu, &token_history,
+                    sc.repeat_window, sc.repeat_penalty, temp, sc.top_p,
+                );
+                let rng_after_gpu = llama::sampler_rng_snapshot();
+
+                // Restore and run full-CPU path
+                llama::sampler_rng_restore(rng_before);
+                logits = gpu.download_f32(&scratch.logits).unwrap();
+                llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
+                let cpu_tok = llama::sample_top_p(&logits, temp, sc.top_p);
+                let rng_after_cpu = llama::sampler_rng_snapshot();
+
+                if cpu_tok != gpu_tok || rng_after_cpu != rng_after_gpu {
+                    eprintln!("\n!! SAMPLE_COMPARE divergence at step {}: cpu={} gpu={} (pos={})",
+                        generated.len(), cpu_tok, gpu_tok, pos);
+                    eprintln!("   rng state: before={rng_before:#x} after_gpu={rng_after_gpu:#x} after_cpu={rng_after_cpu:#x}");
+                    // Show the top-128 candidate set + which of them the CPU's top-20 came from
+                    let mut sorted: Vec<(u32, f32)> = cand_ids.iter().copied().zip(cand_vals.iter().copied()).collect();
+                    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    eprintln!("   gpu top-8 candidates (by raw logit):");
+                    for (i, (tok, val)) in sorted.iter().take(8).enumerate() {
+                        eprintln!("     [{i}] tok={tok} raw_logit={val}");
+                    }
+                    panic!("sample comparison failed");
+                }
+                // Both matched and advanced RNG to the same state. Leave it at rng_after_gpu.
+                gpu_tok
+            } else {
+                llama::sample_top_p_from_candidates(
+                    &cand_ids, &mut cand_vals, &token_history,
+                    sc.repeat_window, sc.repeat_penalty, temp, sc.top_p,
+                )
+            }
+        } else {
+            logits = gpu.download_f32(&scratch.logits).unwrap();
+            llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
+            llama::sample_top_p(&logits, temp, sc.top_p)
+        };
     }
 
     let gen_ms = t2.elapsed().as_millis();
