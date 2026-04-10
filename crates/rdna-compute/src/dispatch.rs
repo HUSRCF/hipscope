@@ -11,15 +11,35 @@ use std::sync::OnceLock;
 /// gfx1100 multi-row GEMV tile selector.
 /// HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}. Default 1 = single-row kernel (legacy).
 /// Cached in a OnceLock — the env var is read exactly once per process.
-fn gemv_rows_override() -> u32 {
-    static CACHE: OnceLock<u32> = OnceLock::new();
+/// Returns the runtime HIPFIRE_GEMV_ROWS override if set, otherwise None.
+/// Valid values: 1, 2, 4, 8. Anything else is clamped to 1.
+fn gemv_rows_override() -> Option<u32> {
+    static CACHE: OnceLock<Option<u32>> = OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("HIPFIRE_GEMV_ROWS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .map(|r| match r { 1 | 2 | 4 | 8 => r, _ => 1 })
-            .unwrap_or(1)
     })
+}
+
+/// Per-arch default R for the multi-row HFQ4 GEMV kernel family.
+///
+/// - RDNA3 (gfx1100/1101/1102): R=1. Measured negative on 7900 XTX —
+///   single-row is already near-BW-saturated (577 GiB/s on 9B ≈ 60% of
+///   the 960 GiB/s peak) and multi-row under-subscribes the wave scheduler.
+/// - RDNA2 (gfx1030/1031): R=1. These have their own arch-optimized narrow
+///   kernels via gemv_hfq4g256_for_arch; the multi-row path is bypassed.
+/// - Default (gfx1010 baseline, gfx1013 Cyan Skillfish / BC-250, others):
+///   R=2. Measured +2.75% on BC-250 Qwen3.5 0.8B MQ4 in the session 1
+///   perf work — the x-hoist amortization across 2 rows pays for the
+///   minor occupancy drop from 20 → 18 waves/SIMD.
+fn gemv_rows_default(arch: &str) -> u32 {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => 1,
+        "gfx1030" | "gfx1031" => 1,
+        _ => 2,
+    }
 }
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -1022,19 +1042,15 @@ impl Gpu {
         ];
 
         // Multi-row GEMV: one warp computes R output rows, sharing x register
-        // state across rows. Controlled by HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}
-        // (default 1 = legacy single-row path).
+        // state across rows. Per-arch default picks R=1 on RDNA3 (negative)
+        // and RDNA2 (has its own arch-specific narrow path), R=2 on the
+        // default gfx1010-baseline path (gfx1010, gfx1013 Cyan Skillfish,
+        // etc.). Override any arch with HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}.
         //
-        // The RDNA3 (gfx1100) variant was introduced first as a negative-result
-        // experiment: on a 960 GiB/s bandwidth ceiling the single-row kernel is
-        // already near-peak BW-bound and multi-row under-subscribes the wave
-        // scheduler. On the lower-bandwidth RDNA1 targets (gfx1010 baseline /
-        // gfx1013 Cyan Skillfish / BC-250), R=2 is actually a small win
-        // (+2.7% on 0.8B MQ4 — the x-hoist amortization pays for the minor
-        // occupancy drop from 20 → 18 waves/SIMD). R=4/R=8 hurt on RDNA1 too
-        // (drop too far in occupancy).
+        // See gemv_rows_default() for the measurement data that motivates
+        // the per-arch defaults.
         let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
-        let rows = gemv_rows_override();
+        let rows = gemv_rows_override().unwrap_or_else(|| gemv_rows_default(self.arch.as_str()));
         let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
@@ -1111,9 +1127,14 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        // RDNA3 multi-row override path (same selector as the non-residual variant).
+        // RDNA3 multi-row override path. Same selector as the non-residual
+        // variant but there's currently no gfx1010-default multi-row residual
+        // kernel, so non-RDNA3 archs still take the single-row residual path
+        // regardless of HIPFIRE_GEMV_ROWS. (TODO: port the multi-row residual
+        // kernel to the default path if/when the non-residual multi-row wins
+        // scale to justify residual too.)
         let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
-        let rows = if rdna3 { gemv_rows_override() } else { 1 };
+        let rows = if rdna3 { gemv_rows_override().unwrap_or(1) } else { 1 };
         let use_multirow = rdna3 && rows > 1;
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
@@ -3953,7 +3974,7 @@ impl Gpu {
                 // tested matrix sizes (see commit log / multi-row kernel header),
                 // so we only precompile when the env var explicitly requests it.
                 if matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102")
-                    && gemv_rows_override() > 1
+                    && gemv_rows_override().unwrap_or(1) > 1
                 {
                     specs.push(("gemv_hfq4g256_multirow_rdna3",
                                 kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string()));
