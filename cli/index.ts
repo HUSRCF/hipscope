@@ -109,6 +109,14 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:9b-hf6":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf6",       size_gb: 6.8,  min_vram_gb: 8,  desc: "34 tok/s, near-FP16" },
   "qwen3.5:27b-hf6":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf6",      size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
 
+  // Qwen3.5 MagnumQuant MQ4 — FWHT-rotated 4-bit. Q8-grade quality at Q4 bandwidth,
+  // backed by a mandatory 9-test byte-exact greedy quality gate (tests/quality-baselines/).
+  // Perf numbers are RX 7900 XTX forward-only (200-iter bench_qwen35_forward).
+  "qwen3.5:0.8b-mq4":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq4",     size_gb: 0.55, min_vram_gb: 1,  desc: "447 tok/s, quality-gated" },
+  "qwen3.5:4b-mq4":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq4",       size_gb: 2.6,  min_vram_gb: 4,  desc: "187 tok/s, quality-gated" },
+  "qwen3.5:9b-mq4":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",       size_gb: 5.3,  min_vram_gb: 6,  desc: "135 tok/s, quality-gated" },
+  "qwen3.5:27b-mq4":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",      size_gb: 15.0, min_vram_gb: 16, desc: "46 tok/s, quality-gated 16GB+" },
+
   // Qwen3 (standard attention)
   "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",          size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
   "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
@@ -716,31 +724,35 @@ function findModel(name: string): string | null {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
     // Backward compat: try old .hfq naming for the SAME quant level only
-    const base = entry.file.replace(/\.(hf4|hf6)$/, "");
-    const isHf6 = entry.file.endsWith(".hf6");
-    const oldNames = isHf6
-      ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
-      : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
-    for (const old of oldNames) {
-      const op = join(MODELS_DIR, old);
-      if (existsSync(op)) return op;
+    // (only applies to .hf4 / .hf6 — .mq4 has no legacy alias)
+    if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
+      const base = entry.file.replace(/\.(hf4|hf6)$/, "");
+      const isHf6 = entry.file.endsWith(".hf6");
+      const oldNames = isHf6
+        ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
+        : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
+      for (const old of oldNames) {
+        const op = join(MODELS_DIR, old);
+        if (existsSync(op)) return op;
+      }
     }
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
-  // If the name includes a quant hint (hf4/hf6), match exactly. Otherwise prefer .hf4 (default quant).
+  // If the name includes a quant hint (hf4/hf6/mq4), match exactly. Otherwise prefer .hf4 (default quant).
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /\.hf[46]$|-hf[46]$/.test(name);
+  const hasQuantHint = /\.(hf[46]|mq4)$|-(hf[46]|mq4)$/.test(name);
   const isModel = (f: string) => {
-    if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq"))) return false;
+    if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4"))) return false;
     if (!(f.includes(name) || f.includes(searchName))) return false;
     // Exact filename match — user typed the specific file they want
     if (f === name || f === searchName) return true;
-    // If user didn't specify a quant, only match the default (4-bit) variant.
-    // For .hf4: always OK. For .hf6: reject. For legacy .hfq: only accept
-    // canonical defaults ({base}.q4.hfq, {base}-hfq4.hfq, {base}.hfq).
+    // If user didn't specify a quant, only match the default (4-bit HF) variant.
+    // HF4 is still the default because it's the fastest; MQ4 is explicit opt-in
+    // for quality-gated workloads. .hf6 and .mq4 both require an explicit tag.
     if (!hasQuantHint) {
       if (f.endsWith(".hf6")) return false;
+      if (f.endsWith(".mq4")) return false;
       if (f.endsWith(".hfq")) {
         const stem = f.slice(0, -4); // strip .hfq
         const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
@@ -774,16 +786,24 @@ function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
   const seen = new Set<string>();
   for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
-    try { for (const f of readdirSync(dir)) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && !seen.has(f)) {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const f of entries) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4")) && !seen.has(f)) {
         seen.add(f);
-        const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-        // Find matching registry tag (check new and old naming)
-        const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
-        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
-        models.push({ name: f, tag, size: `${sz}GB` });
+        // statSync may throw on dangling symlinks or files removed mid-scan;
+        // skip those individually instead of aborting the rest of the loop
+        // (a previous try/catch wrapping the entire iteration ate everything
+        // after the first stale symlink — see commit log for the bug story).
+        try {
+          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
+          // Find matching registry tag (check new and old naming)
+          const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
+          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
+          models.push({ name: f, tag, size: `${sz}GB` });
+        } catch {}
       }
-    }} catch {}
+    }
   }
   return models;
 }
