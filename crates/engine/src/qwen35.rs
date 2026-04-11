@@ -1104,6 +1104,42 @@ pub fn forward_scratch(
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
+/// Batched prefill entry point: processes N prompt tokens in one call,
+/// writing the last token's logits into `scratch.logits` and leaving
+/// the KV cache + DeltaNet state advanced by N positions.
+///
+/// This is the sole public API the daemon uses for the prompt-processing
+/// phase of a turn. The implementation starts as a trivial loop over
+/// `forward_scratch` (byte-identical to the daemon's old per-token loop)
+/// so the API shape, quality gate, and speed-gate baseline can be locked
+/// in. Subsequent commits replace the body with actually-batched kernel
+/// paths (using the batched GEMMs + element-wise kernels + batched
+/// `gated_delta_net_q8` / `conv1d_silu_split_f32_n` that landed in
+/// 0b7be7f / bd3da2c / 8bb8b6f / 5c5e3c6) to produce the prefill
+/// throughput win.
+///
+/// `tokens`: slice of prompt tokens to prefill in order.
+/// `start_pos`: first KV cache / DeltaNet position to write. Positions
+/// `start_pos .. start_pos + tokens.len()` get populated.
+/// On return, `scratch.logits` holds the logits for the *last* token
+/// (position `start_pos + tokens.len() - 1`).
+pub fn forward_prefill_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    for (i, &tok) in tokens.iter().enumerate() {
+        let pos = start_pos + i;
+        forward_scratch(gpu, weights, config, tok, pos, kv_cache, dn_state, scratch)?;
+    }
+    Ok(())
+}
+
 /// Same as `forward_scratch` but also extracts hidden states from the
 /// configured target layers into `hidden_rb`. Used by the DFlash draft path
 /// during target verification. `hidden_rb.advance_head()` is called once

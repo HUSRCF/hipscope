@@ -72,12 +72,13 @@ fn main() {
     let max_gen = kv_seq.saturating_sub(prompt_tokens.len() + 8);
     let mut out = std::fs::File::create(out_path).expect("create out");
 
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(
-            &mut gpu, &weights, &config, token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("prefill forward failed");
-    }
+    // Route prefill through forward_prefill_batch so the quality gate
+    // exercises the batched prefill path directly — any future batching
+    // regression in that function will be caught here.
+    qwen35::forward_prefill_batch(
+        &mut gpu, &weights, &config, &prompt_tokens, 0,
+        &mut kv_cache, &mut dn_state, &scratch,
+    ).expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);

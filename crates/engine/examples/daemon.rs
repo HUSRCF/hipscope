@@ -383,11 +383,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let kv = m.kv_cache.as_mut().unwrap();
         let dn = m.dn_state.as_mut().unwrap();
 
-        // Prefill this turn's tokens at the correct position
-        for (i, &tok) in new_tokens.iter().enumerate() {
-            let pos = m.seq_pos + i;
-            qwen35::forward_scratch(gpu, weights, config, tok, pos, kv, dn, scratch).unwrap();
-        }
+        // Prefill this turn's tokens via the batched prefill entry point.
+        // Currently delegates to per-token forward_scratch internally; future
+        // commits replace the body with actually-batched kernel paths without
+        // needing any more daemon changes.
+        qwen35::forward_prefill_batch(
+            gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
+        ).unwrap();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
