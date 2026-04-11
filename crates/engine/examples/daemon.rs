@@ -415,14 +415,29 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 emitted_bytes += vl;
             }
 
+            // Write this token's K/V to the cache FIRST so the next turn
+            // always starts from a fully-written context. Breaking before
+            // forward_scratch used to leave a hole at the im_end/eos
+            // position — the next turn then attended over zero-init K/V
+            // at that slot.
+            let pos = m.seq_pos + generated - 1;
+            qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
+
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            let pos = m.seq_pos + generated - 1;
-            qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
-            llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
+            // Scope anti-repeat to the CURRENT turn only. Passing the full
+            // conversation_tokens caused n-gram block to catch legitimate
+            // turn-2 continuations whose 3-6 token suffix happened to
+            // match a structural sequence from an earlier turn (e.g. the
+            // "<think></think>\n\n" header that every assistant turn emits).
+            // That was making follow-up turns silently terminate after
+            // 1-2 tokens on long multi-turn conversations.
+            let turn_start = m.conversation_tokens.len() - generated;
+            let turn_slice = &m.conversation_tokens[turn_start..];
+            llama::apply_ngram_block(&mut logits, turn_slice);
+            llama::apply_repeat_penalty(&mut logits, turn_slice, repeat_window, repeat_penalty);
             next_token = llama::sample_top_p(&logits, temp, top_p);
         }
         m.seq_pos += generated;
@@ -479,18 +494,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 emitted_bytes += vl;
             }
 
-            if next_token == config.eos_token { break; }
-            if im_end_token == Some(next_token) { break; }
-
-            // Qwen3/LLaMA scratch repeat_buf is 64 slots — clamp window to fit
+            // Scope repeat_buf to the current turn only (same reason as the
+            // Qwen3.5 path above — cross-turn n-gram blocking silently kills
+            // follow-up responses when structural tokens repeat). The old
+            // scope was the last 64 tokens of the *full* conversation.
             let rw = repeat_window.min(64);
-            let hist_start = m.conversation_tokens.len().saturating_sub(rw);
-            let hist_slice = &m.conversation_tokens[hist_start..];
+            let turn_start = m.conversation_tokens.len() - generated;
+            let turn_hist_start = turn_start.max(m.conversation_tokens.len().saturating_sub(rw));
+            let hist_slice = &m.conversation_tokens[turn_hist_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 
+            // Write K/V for this token FIRST so the next turn's context is
+            // always fully populated. The sampled next_token from this call
+            // is discarded when we break on im_end/eos — wasteful by one
+            // launch but avoids a KV cache gap at the terminator.
             let pos = m.seq_pos + generated - 1;
             let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, top_p, rng_state, hist_slice.len(), repeat_penalty).unwrap();
+
+            if next_token == config.eos_token { break; }
+            if im_end_token == Some(next_token) { break; }
+
             next_token = tok;
             rng_state = rng;
         }
