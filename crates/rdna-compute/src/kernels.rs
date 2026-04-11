@@ -87,6 +87,28 @@ pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/g
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 
+// Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
+// per launch with the same 4-accumulator interleave as the single-row GEMV, so
+// output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
+// for batched prefill (FFN down + wo projection) where N prompt tokens share
+// the same weight matrix.
+pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
+
+// Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
+// Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
+// N times on the same x[b]. Used for batched prefill of the LA layer projection.
+pub const GEMM_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.hip");
+
+// Batched 3-way fused HFQ4-G256 GEMM (FA preamble: wq + wk + wv).
+// Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
+// N times on the same x[b]. Used for batched prefill of the FA layer projection.
+pub const GEMM_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.hip");
+
+// Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
+// Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
+// N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
+pub const GEMM_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256.hip");
+
 // Multi-row GEMV variants: one warp computes R output rows at a time, sharing
 // x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points
 // from one source file. See kernel header for VGPR budget details.
