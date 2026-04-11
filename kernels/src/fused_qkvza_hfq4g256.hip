@@ -1,44 +1,70 @@
 #include <hip/hip_runtime.h>
 
-// gfx1100 (RDNA3) 3-way fused HFQ4-G256 GEMV for the Qwen3.5 FullAttention
-// layer preamble. One kernel launch performs all three projections from a
+// 4-way fused HFQ4-G256 GEMV for the Qwen3.5 DeltaNet linear-attention
+// layer preamble. One kernel launch performs all four projections from a
 // single shared x_rot input:
 //
-//   y_q = W_q · x_rot   (M=q_m, n_heads × head_dim × 2 — Q+gate interleaved)
-//   y_k = W_k · x_rot   (M=k_m, n_kv_heads × head_dim)
-//   y_v = W_v · x_rot   (M=v_m, n_kv_heads × head_dim)
+//   y_qkv   = W_qkv   · x_rot      (M=qkv_m,   e.g. 6144 on 0.8B)
+//   y_z     = W_z     · x_rot      (M=z_m,     e.g. 2048)
+//   y_beta  = W_beta  · x_rot      (M=beta_m,  e.g. 16)
+//   y_alpha = W_alpha · x_rot      (M=alpha_m, e.g. 16)
 //
-// Same 4x-unroll inner loop as gemv_hfq4g256.gfx1100.hip, same tail
-// handling (5302926 accumulator-interleave fix). Grid = q_m + k_m + v_m.
+// Grid = qkv_m + z_m + beta_m + alpha_m workgroups × 32 threads. Each
+// workgroup picks its target matrix/row via blockIdx.x range check, then
+// runs the SAME 4x-unroll inner loop as gemv_hfq4g256.hip — including
+// the 5302926 tail-group accumulator fix (acc[g%4], not all-into-acc0).
 //
-// Bit-exact with three sequential gemv_hfq4g256 calls.
+// Arch coverage: works on every RDNA generation (gfx1010 / gfx1013 /
+// gfx1030 / gfx1100+) because gemv_hfq4g256.hip and its arch variants
+// were unified onto the same 4-accumulator inner loop after the 5302926
+// fix. The launch_bounds(32, 16) target matches the gfx1100 register
+// budget; on gfx1010 this is the same single-wave-per-SIMD-half
+// occupancy used by the standalone gemv_hfq4g256.hip — both kernels
+// share the same VGPR pressure profile.
+//
+// Why fuse:
+//   1. Four launches → one → saves ~3 × (host submit + dispatch floor)
+//      per LA layer. On gfx1100 that's ~36 µs/layer ≈ ~640 µs per
+//      forward. On gfx1010 the per-launch dispatch floor is even higher,
+//      so the relative win is at least as large.
+//   2. The 16-wave w_beta and w_alpha launches are catastrophically
+//      under-subscribed on their own (16 / N_max_waves slots ≪ 1%).
+//      Co-scheduling them with the 6144-wave wqkv body lets the wave
+//      scheduler keep real work in flight during the tails.
+//
+// Bit-exact with four sequential gemv_hfq4g256 calls — the inner loop
+// is a verbatim copy.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_qkv_hfq4g256(
-    const char*  __restrict__ A_q,
-    const char*  __restrict__ A_k,
-    const char*  __restrict__ A_v,
+extern "C" __global__ void fused_qkvza_hfq4g256(
+    const char*  __restrict__ A_qkv,
+    const char*  __restrict__ A_z,
+    const char*  __restrict__ A_beta,
+    const char*  __restrict__ A_alpha,
     const float* __restrict__ x,
-    float*       __restrict__ y_q,
-    float*       __restrict__ y_k,
-    float*       __restrict__ y_v,
-    int q_m, int k_m, int v_m,
+    float*       __restrict__ y_qkv,
+    float*       __restrict__ y_z,
+    float*       __restrict__ y_beta,
+    float*       __restrict__ y_alpha,
+    int qkv_m, int z_m, int beta_m, int alpha_m,
     int K
 ) {
     const int gid = blockIdx.x;
-    const int total_m = q_m + k_m + v_m;
+    const int total_m = qkv_m + z_m + beta_m + alpha_m;
     if (gid >= total_m) return;
 
-    // Route to one of the three projections.
+    // Route this workgroup to its matrix + output row.
     const char* A;
     float* y;
     int row;
-    if (gid < q_m) {
-        A = A_q; y = y_q; row = gid;
-    } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; row = gid - q_m;
+    if (gid < qkv_m) {
+        A = A_qkv;   y = y_qkv;   row = gid;
+    } else if (gid < qkv_m + z_m) {
+        A = A_z;     y = y_z;     row = gid - qkv_m;
+    } else if (gid < qkv_m + z_m + beta_m) {
+        A = A_beta;  y = y_beta;  row = gid - (qkv_m + z_m);
     } else {
-        A = A_v; y = y_v; row = gid - q_m - k_m;
+        A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
     }
 
     const int tid = threadIdx.x;
@@ -46,6 +72,9 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
 
+    // Four accumulators for the 4x group unroll. Tail groups go back into
+    // acc[gi] to preserve the 4-way interleaving the combine step assumes
+    // (this is the 5302926 bug fix — DO NOT collapse into acc0).
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail  = groups_per_row & 3;
