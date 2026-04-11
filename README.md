@@ -14,6 +14,10 @@ irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/instal
 # Pull a model and chat
 hipfire pull qwen3.5:9b
 hipfire run qwen3.5:9b
+
+# Or pull the quality-gated MQ4 variant (Q8 quality at Q4 bandwidth)
+hipfire pull qwen3.5:9b-mq4
+hipfire run qwen3.5:9b-mq4
 ```
 
 ## Interactive Chat
@@ -50,13 +54,24 @@ Commands: `/reset`, `/stats`, `/quit`, `/help`
 | Qwen3-8B | HF4 | **60** | Standard attention |
 | ollama Qwen3.5-9B | — | 4.93 | llama.cpp + ROCm (same GPU) |
 
-**RX 7900 XTX (24GB, gfx1100):**
+**RX 7900 XTX (24GB, gfx1100):** — forward-only MQ4
 
-| Model | Quant | tok/s |
-|-------|-------|-------|
-| Qwen3.5-9B | HF4 | **62** |
-| Qwen3.5-27B | HF4 | **25-27** |
-| Qwen3.5-27B | HF6 | **16-20** |
+| Model | Quant | tok/s | Notes |
+|-------|-------|-------|-------|
+| Qwen3.5-0.8B | MQ4 | **447** | Quality-gated |
+| Qwen3.5-4B | MQ4 | **187** | Quality-gated |
+| Qwen3.5-9B | MQ4 | **135** | Quality-gated |
+| Qwen3.5-27B | MQ4 | **46** | Quality-gated |
+| Qwen3.5-9B | HF4 | **62** | HFQ4-G256 baseline |
+
+**Radeon Pro V620 (32GB, gfx1030):** — pre-consolidation baseline
+
+| Model | Quant | tok/s | Notes |
+|-------|-------|-------|-------|
+| Qwen3.5-9B | MQ4 | **62.4** | +118% vs master |
+| Qwen3.5-9B | HF4 | **61.8** | |
+| Qwen3.5-27B | MQ4 | **20.9** | matches HF4 throughput |
+| Qwen3.5-27B | HF4 | **21.0** | |
 
 ## Supported Hardware
 
@@ -77,6 +92,7 @@ Any AMD GPU with HIP SDK support. Kernels JIT-compile for the detected arch:
 - **Multi-turn conversation**: Cumulative KV cache + DeltaNet state across turns
 - **System prompts**: ChatML format, persists across turns
 - **HF4/HF6 weight formats**: Hipfire-native quantization optimized for RDNA GEMV
+- **MagnumQuant (MQ4)**: FWHT-rotated 4-bit — Q8-grade quality at Q4 bandwidth, protected by mandatory byte-exact quality gate
 - **TurboQuant KV**: FWHT + polynomial centroid dequant, boundary layer protection (LA-V7)
 - **Asymmetric KV**: Q8 keys + turbo4 values — 9B at 8K+ context on 8GB VRAM
 - **Vision-Language**: GPU vision encoder for Qwen3.5-VL models
@@ -89,7 +105,7 @@ Any AMD GPU with HIP SDK support. Kernels JIT-compile for the detected arch:
 
 | Family | Sizes | Arch | Quants |
 |--------|-------|------|--------|
-| Qwen3.5 | 0.8B, 2B, 4B, 9B, 27B | DeltaNet hybrid | HF4, HF6 |
+| Qwen3.5 | 0.8B, 2B, 4B, 9B, 27B | DeltaNet hybrid | HF4, HF6, **MQ4** |
 | Qwen3.5-VL | 0.8B, 4B, 9B | DeltaNet + ViT | HF4 + F16 vision |
 | Qwen3 | 0.6B, 8B | LLaMA attention | HF4 |
 
