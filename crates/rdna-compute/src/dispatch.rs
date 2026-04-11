@@ -808,6 +808,63 @@ impl Gpu {
         result
     }
 
+    /// Batched `fused_rmsnorm_rotate_mq`. Grid.x is the batch dim — processes
+    /// N tokens' [N × K] x into [N × K] x_rot in a single launch. Byte-exact
+    /// against calling `fused_rmsnorm_rotate_mq` N times on separate x/x_rot
+    /// buffers. Weight/signs are shared across the batch.
+    pub fn fused_rmsnorm_rotate_mq_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
+            "fused_rmsnorm_mq_rotate",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let func = &self.functions["fused_rmsnorm_mq_rotate"];
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused SwiGLU + FWHT rotation. Reads gate/up, computes
     /// silu(gate[k])*up[k] on the fly, applies FWHT rotation, writes x_rot.
     /// Used as the w_down input stage for MQ4 — replaces the pair
@@ -853,6 +910,56 @@ impl Gpu {
         result
     }
 
+    /// Batched `fused_silu_mul_rotate_mq`. Grid.y is the batch dim — processes
+    /// N tokens' [N × K] gate/up/x_rot in a single launch.
+    pub fn fused_silu_mul_rotate_mq_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC,
+            "fused_silu_mul_mq_rotate",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let func = &self.functions["fused_silu_mul_mq_rotate"];
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_groups, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     /// Exposed so callers can batch one rotation across multiple GEMVs that share x
     /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).
@@ -874,6 +981,48 @@ impl Gpu {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x", bytes);
         let result = unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched `rotate_x_mq`. Grid.y is the batch dim.
+    pub fn rotate_x_mq_batched(
+        &mut self,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let rot_func = &self.functions["mq_rotate_x"];
+        let mut xp = x.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                rot_func,
+                [n_groups, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -3450,6 +3599,53 @@ impl Gpu {
         result
     }
 
+    /// Batched `fused_sigmoid_alpha_gate_f32`. Grid.y is the batch dim.
+    #[cfg(feature = "deltanet")]
+    pub fn fused_sigmoid_alpha_gate_f32_batched(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "fused_sigmoid_alpha_gate",
+            kernels::FUSED_SIGMOID_ALPHA_GATE_SRC,
+            "fused_sigmoid_alpha_gate_f32",
+        )?;
+        let func = &self.functions["fused_sigmoid_alpha_gate_f32"];
+        let mut bp = beta.buf.as_ptr();
+        let mut ap = alpha.buf.as_ptr();
+        let mut dp = dt_bias.buf.as_ptr();
+        let mut lp = a_log.buf.as_ptr();
+        let mut nn = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = n * 4 * 4 * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_sigmoid_alpha_gate_f32_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, batch_size as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused L2-norm(Q) + L2-norm(K) + scale(Q). Replaces three back-to-back
     /// launches in DeltaNet's attention path with one — ~2 launches saved per
     /// linear-attention layer, so on Qwen3.5 (18-32 LA layers) we shave ~36-64
@@ -3489,6 +3685,54 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32", bytes);
         let result = unsafe {
             self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched `fused_qk_l2_norm_scale_f32`. Grid.y is the batch dim.
+    #[cfg(feature = "deltanet")]
+    pub fn fused_qk_l2_norm_scale_f32_batched(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "fused_qk_l2_norm_scale",
+            kernels::FUSED_QK_L2_NORM_SCALE_SRC,
+            "fused_qk_l2_norm_scale_f32",
+        )?;
+        let func = &self.functions["fused_qk_l2_norm_scale_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut qs = q_scale;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2 * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
@@ -3541,6 +3785,45 @@ impl Gpu {
         let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32", bytes);
         let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched `gated_norm_f32`. Grid.y is the batch dim.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_norm_f32_batched(
+        &mut self,
+        x: &GpuTensor, z: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,
+        n_heads: usize, head_dim: usize, eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
+        let func = &self.functions["gated_norm_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut zp = z.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut zp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
