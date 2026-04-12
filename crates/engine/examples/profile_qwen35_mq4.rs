@@ -12,7 +12,12 @@
 //! because async pipelining is disabled. Use bench_qwen35_mq4 for the
 //! real tok/s number. Use this to see where the time goes.
 //!
-//! Usage: profile_qwen35_mq4 <model.hfq> [--warmup N] [--profile-steps N]
+//! Usage: profile_qwen35_mq4 <model.hfq> [--prefill N] [--warmup N] [--profile-steps N]
+//!
+//! Prefill uses forward_prefill_batch (batched, fast) so you can prime to
+//! ctx=4096 in a few hundred ms. The profiled phase uses forward_scratch
+//! (single-token decode path) so the per-kernel breakdown reflects the
+//! actual decode hot path at that context length.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() { eprintln!("build with --features deltanet"); }
@@ -29,16 +34,18 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_qwen35_mq4 <model.hfq> [--warmup N] [--profile-steps N]");
+        eprintln!("Usage: profile_qwen35_mq4 <model.hfq> [--prefill N] [--warmup N] [--profile-steps N]");
         std::process::exit(1);
     }
     let model_path = &args[1];
 
-    let mut warmup_len: usize = 10;
+    let mut prefill_len: usize = 32;
+    let mut warmup_len: usize = 5;
     let mut profile_steps: usize = 10;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--prefill"       => { prefill_len    = args[i + 1].parse().unwrap(); i += 2; }
             "--warmup"        => { warmup_len     = args[i + 1].parse().unwrap(); i += 2; }
             "--profile-steps" => { profile_steps  = args[i + 1].parse().unwrap(); i += 2; }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
@@ -47,7 +54,7 @@ fn main() {
 
     eprintln!("=== profile_qwen35_mq4 ===");
     eprintln!("Model: {model_path}");
-    eprintln!("Warmup: {warmup_len}  Profile: {profile_steps}");
+    eprintln!("Prefill: {prefill_len}  Warmup: {warmup_len}  Profile: {profile_steps}");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
@@ -61,22 +68,22 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    let kv_seq = 512usize;
+    let kv_seq = (prefill_len + warmup_len + profile_steps + 16).max(512);
     let mut kv_cache = KvCache::new_gpu_q8(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
     ).unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
-    // Fake prompt: tokens 0..31 for a 32-token prefill.
-    let prompt_tokens: Vec<u32> = (0..32u32).collect();
-    eprintln!("\nPrefill {} tokens (untimed)...", prompt_tokens.len());
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(
-            &mut gpu, &weights, &config, token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("prefill forward failed");
-    }
+    // Deterministic fake prompt: tokens 0..prefill_len-1 (matches bench_qwen35_mq4).
+    let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
+    eprintln!("\nPrefill {prefill_len} tokens (batched, untimed)...");
+    let t_prefill = Instant::now();
+    qwen35::forward_prefill_batch(
+        &mut gpu, &weights, &config, &prompt_tokens, 0,
+        &mut kv_cache, &mut dn_state, &scratch,
+    ).expect("prefill forward failed");
+    eprintln!("  prefill: {:.1}ms", t_prefill.elapsed().as_secs_f64() * 1000.0);
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
 
@@ -92,7 +99,8 @@ fn main() {
     }
 
     // === PROFILED PHASE ===
-    eprintln!("\n=== profiled run: {profile_steps} gen steps ===");
+    eprintln!("\n=== profiled run: {profile_steps} gen steps at ctx ~{} ===",
+        prompt_tokens.len() + warmup_len);
     profile::start();
     let t_profile = Instant::now();
     for step in 0..profile_steps {

@@ -356,6 +356,14 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
 
+/// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
+/// to the baseline kernel but instrumented with wall_clock64() around each
+/// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head
+/// cycle counts into an extra output buffer of length [n_heads * 3]. For
+/// profiling/diagnostic use only.
+pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv_timed.hip");
+
+
 
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.

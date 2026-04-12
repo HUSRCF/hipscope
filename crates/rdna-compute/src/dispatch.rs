@@ -3160,6 +3160,56 @@ impl Gpu {
         result
     }
 
+    /// Phase-instrumented variant of attention_q8_0_kv. Identical to the
+    /// baseline kernel but additionally writes per-head cycle counts for
+    /// each internal phase into `cycle_counts` (layout: [n_heads * 3],
+    /// per-head order = phase1(QK^T), phase2(softmax), phase3(V-weighted)).
+    ///
+    /// Uses __builtin_amdgcn_s_memrealtime() which returns a wall-clock
+    /// counter. On gfx1100 the tick rate is approximately 1e8 Hz (10 ns
+    /// per tick); confirm empirically by comparing against the kernel's
+    /// total elapsed time from event timing.
+    ///
+    /// Use only for diagnostic profiling — the memrealtime reads serialize
+    /// execution and inflate total time slightly.
+    pub fn attention_q8_0_kv_timed(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        cycle_counts: &GpuTensor,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8_0_kv_timed", kernels::ATTENTION_Q8_0_KV_TIMED_SRC, "attention_q8_0_kv_timed")?;
+        let func = &self.functions["attention_q8_0_kv_timed"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut cc_ptr = cycle_counts.buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut cc_ptr as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
     pub fn kv_cache_write_q8(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
