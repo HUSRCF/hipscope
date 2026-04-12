@@ -126,6 +126,7 @@ fn main() {
         &mut gpu, &weights, &config, &prompt_tokens, 0,
         &mut kv_cache, &mut dn_state, &scratch,
     ).expect("prefill forward failed");
+    gpu.hip.device_synchronize().expect("sync after prefill");
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     if do_profile {
         if let Some(entries) = rdna_compute::profile::stop() {

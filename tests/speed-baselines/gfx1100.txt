@@ -1,5 +1,5 @@
 # hipfire speed-gate baseline — gfx1100
-# Captured 2026-04-12 from redline-dispatch (batched deinterleave + repeat_interleave + fused GDN)
+# Captured 2026-04-12 with hipDeviceSynchronize (accurate prefill timing)
 # Tolerance: 0.05 (fail if any metric drops below baseline * (1 - tolerance))
-0.8b_mq4_prefill_tok_s=5200.0
+0.8b_mq4_prefill_tok_s=3350.0
 0.8b_mq4_gen_tok_s=378.0
