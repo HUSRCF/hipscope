@@ -3312,23 +3312,23 @@ impl Gpu {
     /// Batched flash attention for givens4 KV cache during prefill.
     /// Processes batch_size positions with sub-batching to limit partials VRAM.
     /// Q and out are [batch_size × n_heads × head_dim] row-major.
-    /// Allocates its own partials buffer internally (sized for sub-batch).
+    /// `partials` must be pre-allocated by caller; sized for sub_batch × n_heads × max_tiles × stride.
     pub fn attention_flash_givens4_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, positions: &GpuTensor,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
-        // Sub-batch: limit partials to ~32 MB
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
-        let sub_batch = if per_pos_bytes > 0 { (32 * 1024 * 1024 / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
-        // Allocate partials for the sub-batch
-        let partials_elems = sub_batch * n_heads * max_tiles * stride;
-        let partials = self.alloc_tensor(&[partials_elems], crate::DType::F32)?;
+        // sub_batch derived from partials buffer capacity
+        // Derive sub_batch from partials buffer capacity (caller pre-allocates)
+        let partials_capacity = partials.numel() * 4; // bytes
+        let sub_batch = if per_pos_bytes > 0 { (partials_capacity / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
 
         self.ensure_givens4_kernel(
             "attention_flash_givens4_tile_batched",
@@ -3531,14 +3531,15 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
-        let sub_batch = if per_pos_bytes > 0 { (32 * 1024 * 1024 / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
-        let partials_elems = sub_batch * n_heads * max_tiles * stride;
-        let partials = self.alloc_tensor(&[partials_elems], crate::DType::F32)?;
+        // Derive sub_batch from partials buffer capacity (caller pre-allocates)
+        let partials_capacity = partials.numel() * 4; // bytes
+        let sub_batch = if per_pos_bytes > 0 { (partials_capacity / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
 
         self.ensure_givens4_kernel("attention_flash_givens2_tile_batched", kernels::ATTENTION_FLASH_GIVENS2_TILE_BATCHED_SRC, "attention_flash_givens2_tile_batched")?;
         self.ensure_givens4_kernel("attention_flash_givens4_reduce_batched", kernels::ATTENTION_FLASH_GIVENS4_REDUCE_BATCHED_SRC, "attention_flash_givens4_reduce_batched")?;

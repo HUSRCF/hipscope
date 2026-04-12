@@ -1073,7 +1073,10 @@ impl Qwen35Scratch {
             flash_partials: {
                 let tile_size = 128usize;
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                gpu.alloc_tensor(&[config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
+                // Sized for batched flash prefill: 64 positions × per-position partials.
+                // Reused across layers (not per-call allocated). ~33MB for 9B at 32K.
+                let batch_mult = 64usize;
+                gpu.alloc_tensor(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
             },
             use_flash_attn: std::env::var("HIPFIRE_ATTN_FLASH").map(|v| v == "1").unwrap_or(false),
         })
@@ -1704,14 +1707,14 @@ fn forward_prefill_chunk(
                             &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, max_ctx_len, n,
+                            kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_flash_givens4_batched(
                             &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, max_ctx_len, n,
+                            kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
                         )?;
                     }
                 } else if max_ctx_len > LDS_CTX_LIMIT {
