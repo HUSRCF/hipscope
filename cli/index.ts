@@ -21,7 +21,7 @@ mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
 interface HipfireConfig {
-  kv_cache: string;       // "q8" (default), "givens4", or "givens2"
+  kv_cache: string;       // "auto" (per-arch default), "q8", "givens4", or "givens2"
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
   top_p: number;
@@ -30,8 +30,12 @@ interface HipfireConfig {
   port: number;           // default serve port
 }
 
+// Detect GPU at import time for smart defaults
+const DETECTED_ARCH = detectGpuArch();
+const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
+
 const CONFIG_DEFAULTS: HipfireConfig = {
-  kv_cache: "q8",
+  kv_cache: ARCH_DEFAULTS.kv_cache,
   default_model: "qwen3.5:9b",
   temperature: 0.3,
   top_p: 0.8,
@@ -42,7 +46,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["q8", "givens4", "givens2", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "givens4", "givens2", "turbo4", "turbo3", "turbo2"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
     case "repeat_penalty": return typeof value === "number" && value >= 1 && value <= 3;
@@ -95,50 +99,42 @@ interface ModelEntry {
 }
 
 const REGISTRY: Record<string, ModelEntry> = {
-  // Qwen3.5 HFQ4 (default)
-  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf4",     size_gb: 0.5,  min_vram_gb: 1,  desc: "190 tok/s, tiny & fast" },
-  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf4",       size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
-  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf4",       size_gb: 2.1,  min_vram_gb: 4,  desc: "61 tok/s, best balance" },
-  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf4",       size_gb: 4.5,  min_vram_gb: 6,  desc: "43 tok/s, best quality 8GB" },
-  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf4",      size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, use -hf6 for coding" },
+  // Qwen3.5 MagnumQuant MQ4 — rotated 4-bit with quality gate.
+  // Default format: best quality-per-bit, WMMA-accelerated prefill on RDNA3.
+  // Perf: RX 7900 XTX (gfx1100), decode tok/s / prefill tok/s with WMMA.
+  "qwen3.5:0.8b":     { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq4",   size_gb: 0.55, min_vram_gb: 1,  desc: "386 / 5100 tok/s" },
+  "qwen3.5:4b":       { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq4",     size_gb: 2.6,  min_vram_gb: 4,  desc: "169 / 1900 tok/s" },
+  "qwen3.5:9b":       { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",     size_gb: 5.3,  min_vram_gb: 6,  desc: "125 / 1720 tok/s" },
+  "qwen3.5:27b":      { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "45 / 489 tok/s, 16GB+" },
 
-  // Qwen3.5 HFQ6
-  "qwen3.5:0.8b-hf6":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf6",     size_gb: 0.6,  min_vram_gb: 1,  desc: "180 tok/s, higher quality" },
-  "qwen3.5:2b-hf6":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf6",       size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
-  "qwen3.5:4b-hf6":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf6",       size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
-  "qwen3.5:9b-hf6":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf6",       size_gb: 6.8,  min_vram_gb: 8,  desc: "34 tok/s, near-FP16" },
-  "qwen3.5:27b-hf6":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf6",      size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+  // Qwen3 (standard attention, not DeltaNet)
+  "qwen3:0.6b":       { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",     size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
+  "qwen3:8b":         { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",       size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
 
-  // Qwen3.5 MagnumQuant MQ4 — FWHT-rotated 4-bit. Q8-grade quality at Q4 bandwidth,
-  // backed by a mandatory 9-test byte-exact greedy quality gate (tests/quality-baselines/).
-  // Perf numbers are RX 7900 XTX forward-only (200-iter bench_qwen35_forward).
-  "qwen3.5:0.8b-mq4":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq4",     size_gb: 0.55, min_vram_gb: 1,  desc: "447 tok/s, quality-gated" },
-  "qwen3.5:4b-mq4":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq4",       size_gb: 2.6,  min_vram_gb: 4,  desc: "187 tok/s, quality-gated" },
-  "qwen3.5:9b-mq4":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",       size_gb: 5.3,  min_vram_gb: 6,  desc: "135 tok/s, quality-gated" },
-  "qwen3.5:27b-mq4":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",      size_gb: 15.0, min_vram_gb: 16, desc: "46 tok/s, quality-gated 16GB+" },
-
-  // Qwen3 (standard attention)
-  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",          size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
-  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
-
-  // Community finetunes (Qwen3.5 architecture, same engine)
-  "carnice:9b":      { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.mq4",     size_gb: 5.0, min_vram_gb: 6, desc: "Hermes tool-use, quality-gated MQ4" },
-  "carnice:9b-hf4":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf4",     size_gb: 4.5, min_vram_gb: 6, desc: "Hermes tool-use finetune" },
-  "carnice:9b-hf6":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf6",     size_gb: 6.8, min_vram_gb: 8, desc: "Hermes tool-use, higher quality" },
-  "qwopus:9b":       { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf4",      size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3 finetune" },
-  "qwopus:9b-hf6":   { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf6",      size_gb: 6.8, min_vram_gb: 8, desc: "Qwopus3.5 v3, higher quality" },
-  "qwopus:4b":       { repo: "schuttdev/hipfire-qwopus-4b",    file: "qwopus-4b.hf4",      size_gb: 2.1, min_vram_gb: 4, desc: "Qwopus3.5 v3, 4B" },
-  "qwopus:27b":      { repo: "schuttdev/hipfire-qwopus-27b",   file: "qwopus-27b.hf4",     size_gb: 14.3, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B" },
+  // Community finetunes (Qwen3.5 architecture)
+  "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b", file: "carnice-9b.mq4", size_gb: 5.0, min_vram_gb: 6, desc: "Hermes tool-use, MQ4" },
+  "qwopus:9b":         { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.hf4",  size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3" },
+  "qwopus:4b":         { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.hf4",  size_gb: 2.1, min_vram_gb: 4, desc: "Qwopus3.5 v3, 4B" },
+  "qwopus:27b":        { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.hf4", size_gb: 14.3, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B" },
 };
 
-// Aliases
+// Aliases (also map retired hf4/hf6/mq4 tags to current names)
 const ALIASES: Record<string, string> = {
   "qwen3.5": "qwen3.5:4b",
   "qwen3.5:latest": "qwen3.5:9b",
   "qwen3.5:small": "qwen3.5:0.8b",
-  "qwen3": "qwen3:8b",
   "qwen3.5:large": "qwen3.5:27b",
+  "qwen3": "qwen3:8b",
   "carnice": "carnice:9b",
+  // Retired format tags → current MQ4
+  "qwen3.5:0.8b-mq4": "qwen3.5:0.8b", "qwen3.5:4b-mq4": "qwen3.5:4b",
+  "qwen3.5:9b-mq4": "qwen3.5:9b", "qwen3.5:27b-mq4": "qwen3.5:27b",
+  "qwen3.5:0.8b-hf4": "qwen3.5:0.8b", "qwen3.5:2b-hf4": "qwen3.5:4b",
+  "qwen3.5:4b-hf4": "qwen3.5:4b", "qwen3.5:9b-hf4": "qwen3.5:9b",
+  "qwen3.5:27b-hf4": "qwen3.5:27b",
+  "qwen3.5:0.8b-hf6": "qwen3.5:0.8b", "qwen3.5:2b-hf6": "qwen3.5:4b",
+  "qwen3.5:4b-hf6": "qwen3.5:4b", "qwen3.5:9b-hf6": "qwen3.5:9b",
+  "qwen3.5:27b-hf6": "qwen3.5:27b",
 };
 
 function resolveModelTag(input: string): string {
@@ -157,13 +153,60 @@ function downloadUrl(entry: ModelEntry): string {
   return `${HF_BASE}/${entry.repo}/resolve/main/${entry.file}`;
 }
 
-// ─── KV cache mode (turbo aliases → givens) ─────────────
+// ─── GPU arch detection + per-arch defaults ──────────────
+function detectGpuArch(): string {
+  // Read KFD sysfs for GPU arch (same as install command)
+  for (const node of ["1", "0"]) {
+    try {
+      const props = require("fs").readFileSync(`/sys/class/kfd/kfd/topology/nodes/${node}/properties`, "utf8");
+      const m = props.match(/gfx_target_version\s+(\d+)/);
+      if (m) {
+        const ver = parseInt(m[1]);
+        const major = Math.floor(ver / 10000);
+        const minor = Math.floor((ver % 10000) / 100);
+        const step = ver % 100;
+        let arch = `gfx${major}${minor.toString().padStart(2, '0')}${step || '0'}`;
+        return arch.replace(/^(gfx\d{4})0$/, '$1');
+      }
+    } catch {}
+  }
+  return "unknown";
+}
+
+interface ArchDefaults {
+  kv_cache: string;        // best KV mode for this hardware
+  vram_gb: number;         // approximate VRAM
+}
+
+function archDefaults(arch: string): ArchDefaults {
+  switch (arch) {
+    // RDNA3 — givens4: always-flash, 2× KV headroom, WMMA prefill
+    case "gfx1100": return { kv_cache: "givens4", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "givens4", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "givens4", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "givens2", vram_gb: 16 };  // Strix Halo APU (shared mem)
+    // RDNA4
+    case "gfx1200": case "gfx1201":
+      return { kv_cache: "givens4", vram_gb: 16 };  // 9070 XT
+    // RDNA2
+    case "gfx1030": return { kv_cache: "givens2", vram_gb: 32 };  // V620
+    case "gfx1031": return { kv_cache: "givens4", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "givens2", vram_gb: 8 };   // 6600 XT
+    // RDNA1
+    case "gfx1010": return { kv_cache: "givens2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "givens2", vram_gb: 14 };  // BC-250
+    // Fallback
+    default: return { kv_cache: "givens4", vram_gb: 8 };
+  }
+}
+
+// ─── KV cache mode (turbo aliases → givens) ──────────────
 function resolveKvMode(cfg: HipfireConfig): string {
   const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
-  // turbo2/3 → givens2, turbo4 → givens4 (backward compat)
+  if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
   if (raw === "turbo4") return "givens4";
   if (raw === "turbo3" || raw === "turbo2") return "givens2";
-  return raw;  // "q8", "givens4", "givens2"
+  return raw;
 }
 
 // ─── Daemon IPC ─────────────────────────────────────────
@@ -1532,9 +1575,14 @@ switch (cmd) {
           console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
           console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 
+          const ad = archDefaults(diag.arch || "unknown");
+          console.log(`  kv default:  ${ad.kv_cache} (${ad.vram_gb}GB VRAM)`);
+          const hasWmma = (diag.arch || "").startsWith("gfx11") || (diag.arch || "").startsWith("gfx12");
+          console.log(`  WMMA:        ${hasWmma ? "yes (4.1x prefill)" : "no (FP16 packed, +15% prefill)"}`);
+
           const vram = diag.vram_total_mb;
           if (models.length === 0 && vram > 0) {
-            const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hf6";
+            const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : "qwen3.5:9b";
             console.log(`\nTIP: No models downloaded. Run: hipfire pull ${rec}`);
           }
         } else {
