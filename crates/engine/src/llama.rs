@@ -548,6 +548,15 @@ pub fn weight_gemv(
             };
             gpu.gemv_mq4g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
+        DType::MQ6G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq6g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::MQ8G256 => {
             gpu.ensure_mq_signs()?;
             gpu.gemv_mq8g256_with_rotate(&w.buf, x, y, w.m, w.k)
@@ -589,7 +598,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 => {
+        DType::MQ4G256 | DType::MQ6G256 => {
             gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
             Ok(Some(x_rot_scratch))
         }
@@ -623,7 +632,7 @@ pub fn rotate_x_for_mq<'a>(
     x_rot_scratch: &'a GpuTensor,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 => {
+        DType::MQ4G256 | DType::MQ6G256 => {
             gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
             Ok(Some(x_rot_scratch))
         }
@@ -659,6 +668,13 @@ pub fn weight_gemv_prerotated(
                 weight_gemv(gpu, w, x, y)
             }
         }
+        DType::MQ6G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq6g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
         DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
         _ => weight_gemv(gpu, w, x, y),
     }
@@ -683,10 +699,15 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::HFQ6G256 | DType::MQ6G256 => {
+            // No dedicated residual GEMV for HFQ6 yet — fall through to generic path.
+            let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
+            weight_gemv(gpu, w, x, &tmp)?;
+            gpu.add_inplace_f32(y, &tmp)?;
+            gpu.free_tensor(tmp)?;
+            Ok(())
+        }
         DType::MQ4G256 => {
-            // MQ4 weights were FWHT-rotated at quant time; rotate x first,
-            // then use the arch-tuned HFQ4 residual GEMV. We alias mq_x_rot
-            // (same trick as weight_gemv MQ4G256 branch).
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },

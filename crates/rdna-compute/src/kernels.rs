@@ -55,6 +55,8 @@ pub const GEMV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
+/// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
+pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 
@@ -116,16 +118,46 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
 pub const GEMM_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.hip");
+// FP16 packed variant — RDNA1/2 fast path (no WMMA available).
+pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_fp16.hip");
+// v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
+pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_dot2.hip");
 
 // Batched 3-way fused HFQ4-G256 GEMM (FA preamble: wq + wk + wv).
 // Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FA layer projection.
 pub const GEMM_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.hip");
+// FP16 packed variant — RDNA1/2 fast path (no WMMA available).
+pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_fp16.hip");
+// v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
+pub const GEMM_QKV_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_dot2.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
 pub const GEMM_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256.hip");
+// FP16 packed variant — RDNA1/2 fast path (no WMMA available).
+pub const GEMM_GATE_UP_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_fp16.hip");
+// v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
+// Does NOT work on gfx1010 (5700 XT) or gfx1013 (BC-250 APU) — lack dot instructions.
+pub const GEMM_GATE_UP_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_dot2.hip");
+
+// ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
+pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");
+pub const GEMM_HFQ6G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_fp16.hip");
+pub const GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma_k2.hip");
+pub const GEMM_QKVZA_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256.hip");
+pub const GEMM_QKVZA_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_fp16.hip");
+pub const GEMM_QKVZA_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_dot2.hip");
+pub const GEMM_QKVZA_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wmma.hip");
+pub const GEMM_QKV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256.hip");
+pub const GEMM_QKV_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_fp16.hip");
+pub const GEMM_QKV_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_dot2.hip");
+pub const GEMM_QKV_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.hip");
+pub const GEMM_GATE_UP_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256.hip");
+pub const GEMM_GATE_UP_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_fp16.hip");
+pub const GEMM_GATE_UP_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_dot2.hip");
+pub const GEMM_GATE_UP_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wmma.hip");
 
 // Multi-row GEMV variants: one warp computes R output rows at a time, sharing
 // x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points

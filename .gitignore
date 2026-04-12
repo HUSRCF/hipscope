@@ -40,3 +40,8 @@ __pycache__/
 # Logs / temp
 *.log
 /tmp/
+
+# Local Claude agent state
+.claude/
+# Personal CLI instructions
+cli/CLAUDE.md

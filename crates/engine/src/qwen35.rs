@@ -264,6 +264,10 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
         }
+        15 => { // MQ6-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -316,6 +320,10 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         14 => { // MQ8-G256 — MagnumQuant dp4a
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+        }
+        15 => { // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
         }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -385,17 +393,17 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             }
             out
         }
-        6 | 7 | 13 => {
-            // HFQ4-G256 or G128 or MQ4-G256 — CPU dequant
-            // MQ4 stores rotated weights. For small tensors loaded here,
+        6 | 7 | 13 | 15 => {
+            // HFQ4-G256 or G128 or MQ4-G256 or MQ6-G256 — CPU dequant
+            // MQ4/MQ6 store rotated weights. For small tensors loaded here,
             // we dequant then inverse-rotate to recover the original values.
-            let group_size: usize = if info.quant_type == 6 || info.quant_type == 13 { 256 } else { 128 };
-            let bytes_per_group = 8 + group_size / 2;
+            let is_6bit = info.quant_type == 15;
+            let group_size: usize = if info.quant_type == 6 || info.quant_type == 13 || info.quant_type == 15 { 256 } else { 128 };
+            let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
             let n_groups = data.len() / bytes_per_group;
-            let is_mq4 = info.quant_type == 13;
+            let is_mq = info.quant_type == 13 || info.quant_type == 15;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            // Generate inverse rotation tables (same seeds as quantizer)
-            let (signs1, signs2) = if is_mq4 {
+            let (signs1, signs2) = if is_mq {
                 (Some(crate::llama::KvCache::gen_fwht_signs(42, 256)),
                  Some(crate::llama::KvCache::gen_fwht_signs(1042, 256)))
             } else { (None, None) };
@@ -404,14 +412,27 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
                 let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
                 let start = out.len();
-                for i in 0..group_size {
-                    let byte_idx = i / 2;
-                    let byte_val = data[off + 8 + byte_idx];
-                    let nibble = if i % 2 == 0 { byte_val & 0xF } else { byte_val >> 4 };
-                    out.push(scale * nibble as f32 + zero);
+                if is_6bit {
+                    for i in (0..group_size).step_by(4) {
+                        let bo = off + 8 + (i / 4) * 3;
+                        let b0 = data[bo] as u32;
+                        let b1 = data[bo + 1] as u32;
+                        let b2 = data[bo + 2] as u32;
+                        out.push(scale * ((b0 & 0x3F) as f32) + zero);
+                        out.push(scale * ((((b0 >> 6) | (b1 << 2)) & 0x3F) as f32) + zero);
+                        out.push(scale * ((((b1 >> 4) | (b2 << 4)) & 0x3F) as f32) + zero);
+                        out.push(scale * (((b2 >> 2) & 0x3F) as f32) + zero);
+                    }
+                } else {
+                    for i in 0..group_size {
+                        let byte_idx = i / 2;
+                        let byte_val = data[off + 8 + byte_idx];
+                        let nibble = if i % 2 == 0 { byte_val & 0xF } else { byte_val >> 4 };
+                        out.push(scale * nibble as f32 + zero);
+                    }
                 }
-                // Inverse FWHT for MQ4: recover original weight values
-                if is_mq4 && group_size == 256 {
+                // Inverse FWHT for MQ4/MQ6: recover original weight values
+                if is_mq && group_size == 256 {
                     let s1 = signs1.as_ref().unwrap();
                     let s2 = signs2.as_ref().unwrap();
                     let group = &mut out[start..start + 256];
@@ -1370,7 +1391,7 @@ pub fn forward_prefill_batch(
 /// branches in `forward_prefill_chunk`).
 #[inline]
 fn is_batchable_la(dt: DType) -> bool {
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256)
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -1452,13 +1473,14 @@ fn forward_prefill_chunk(
                 // plain rmsnormed activations. The GEMM kernels themselves
                 // are dtype-agnostic — they just consume whatever [N × K]
                 // activation buffer we point them at.
-                let is_mq4 = layer.wqkv.gpu_dtype == DType::MQ4G256 ;
+                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
-                // Batched rmsnorm (+ FWHT for MQ4) for the LA preamble.
-                // x_batch / x_rot_batch are [N × dim] contiguous. For HF4
+                // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
+                // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
                 // we reuse x_rot_batch as the "normed, unrotated" output
                 // so the subsequent GEMM can read it the same way.
-                if is_mq4 {
+                if is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
@@ -1470,13 +1492,23 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-                gpu.gemm_qkvza_hfq4g256(
-                    &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                    layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                    layer.wqkv.k, n,
-                )?;
+                if is_6bit {
+                    gpu.gemm_qkvza_hfq6g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_qkvza_hfq4g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k, n,
+                    )?;
+                }
 
                 // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -1538,14 +1570,15 @@ fn forward_prefill_chunk(
 
                 // Batched wo + residual.
                 //
-                // For MQ4 weights, the decode path's weight_gemv_residual
+                // For MQ weights, the decode path's weight_gemv_residual
                 // internally FWHT-rotates dn_normed into mq_x_rot before
-                // calling gemv_hfq4g256_residual (MQ4 weights are pre-rotated
+                // calling gemv_hfq{4,6}g256_residual (MQ weights are pre-rotated
                 // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
-                // For HFQ4 weights no rotation is needed — the activation
-                // feeds gemm_hfq4g256_residual directly.
-                let wo_is_mq4 = layer.wo.gpu_dtype == DType::MQ4G256;
-                let wo_input = if wo_is_mq4 {
+                // For HFQ weights no rotation is needed — the activation
+                // feeds gemm_hfq{4,6}g256_residual directly.
+                let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let wo_input = if wo_is_mq {
                     gpu.rotate_x_mq_batched(
                         &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
                     )?;
@@ -1553,14 +1586,22 @@ fn forward_prefill_chunk(
                 } else {
                     &pbs.dn_normed_batch
                 };
-                gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, wo_input, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
-                )?;
+                if wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf, wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                }
 
-                // FFN: rmsnorm (+ rotate for MQ4).
-                let ffn_is_mq4 = layer.w_gate.gpu_dtype == DType::MQ4G256;
-                if ffn_is_mq4 {
+                // FFN: rmsnorm (+ rotate for MQ).
+                let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                if ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
@@ -1572,22 +1613,33 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched gate+up projection.
-                gpu.gemm_gate_up_hfq4g256(
-                    &layer.w_gate.buf, &layer.w_up.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.gate_ffn_batch, &pbs.up_batch,
-                    layer.w_gate.m, layer.w_up.m,
-                    layer.w_gate.k, n,
-                )?;
+                if ffn_is_6bit {
+                    gpu.gemm_gate_up_hfq6g256(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_gate_up_hfq4g256(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
+                }
 
-                // SwiGLU activation feeding w_down. For MQ4, we need the
+                // SwiGLU activation feeding w_down. For MQ, we need the
                 // output FWHT-rotated so it matches the pre-rotated w_down
-                // weights. For HF4, plain silu_mul is enough. silu_mul_f32
+                // weights. For HFQ, plain silu_mul is enough. silu_mul_f32
                 // is purely element-wise and uses numel() as its length,
                 // so a [N × hidden_dim] tensor processes all rows in one
                 // launch with no batch offset needed.
-                let w_down_is_mq4 = layer.w_down.gpu_dtype == DType::MQ4G256;
-                if w_down_is_mq4 {
+                let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                if w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                         hidden_dim, n,
@@ -1599,12 +1651,19 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched w_down + residual.
-                gpu.gemm_hfq4g256_residual(
-                    &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                    layer.w_down.m, layer.w_down.k, n,
-                )?;
+                if w_down_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                }
 
-                let _ = is_mq4; // retained above for potential future use
+                let _ = is_mq; // retained above for potential future use
                 delta_layer_idx += 1;
             }
 
@@ -1614,10 +1673,11 @@ fn forward_prefill_chunk(
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
-                let qkv_is_mq4 = layer.wq.gpu_dtype == DType::MQ4G256;
+                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
-                // 1. rmsnorm (+ rotate for MQ4) for the attn preamble.
-                if qkv_is_mq4 {
+                // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
+                if qkv_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
@@ -1629,13 +1689,23 @@ fn forward_prefill_chunk(
                 }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
-                gpu.gemm_qkv_hfq4g256(
-                    &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                    layer.wq.m, layer.wk.m, layer.wv.m,
-                    layer.wq.k, n,
-                )?;
+                if qkv_is_6bit {
+                    gpu.gemm_qkv_hfq6g256(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_qkv_hfq4g256(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k, n,
+                    )?;
+                }
 
                 // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
                 gpu.deinterleave_f32_batched(
@@ -1741,9 +1811,10 @@ fn forward_prefill_chunk(
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
 
                 // 9. wo residual: x_batch += wo · (optional rotate)(fa_attn_out_batch).
-                // Same MQ4 rotation requirement as the LA wo path.
-                let fa_wo_is_mq4 = layer.wo.gpu_dtype == DType::MQ4G256;
-                let fa_wo_input = if fa_wo_is_mq4 {
+                // Same MQ rotation requirement as the LA wo path.
+                let fa_wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_wo_input = if fa_wo_is_mq {
                     gpu.rotate_x_mq_batched(
                         &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
                     )?;
@@ -1751,15 +1822,23 @@ fn forward_prefill_chunk(
                 } else {
                     &pbs.fa_attn_out_batch
                 };
-                gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, fa_wo_input, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
-                )?;
+                if fa_wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                }
 
-                // 10. FFN: rmsnorm (+ rotate for MQ4), gate+up, silu_mul
-                // (+ rotate for MQ4), w_down residual.
-                let fa_ffn_is_mq4 = layer.w_gate.gpu_dtype == DType::MQ4G256;
-                if fa_ffn_is_mq4 {
+                // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
+                // (+ rotate for MQ), w_down residual.
+                let fa_ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                if fa_ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
@@ -1769,15 +1848,26 @@ fn forward_prefill_chunk(
                         n, dim, config.norm_eps,
                     )?;
                 }
-                gpu.gemm_gate_up_hfq4g256(
-                    &layer.w_gate.buf, &layer.w_up.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.gate_ffn_batch, &pbs.up_batch,
-                    layer.w_gate.m, layer.w_up.m,
-                    layer.w_gate.k, n,
-                )?;
-                let fa_w_down_is_mq4 = layer.w_down.gpu_dtype == DType::MQ4G256;
-                if fa_w_down_is_mq4 {
+                if fa_ffn_is_6bit {
+                    gpu.gemm_gate_up_hfq6g256(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_gate_up_hfq4g256(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
+                }
+                let fa_w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                if fa_w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                         hidden_dim, n,
@@ -1787,10 +1877,17 @@ fn forward_prefill_chunk(
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                     )?;
                 }
-                gpu.gemm_hfq4g256_residual(
-                    &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                    layer.w_down.m, layer.w_down.k, n,
-                )?;
+                if fa_w_down_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                }
 
                 // Silence unused warning if kv_dim ends up shadowed.
                 let _ = kv_dim;

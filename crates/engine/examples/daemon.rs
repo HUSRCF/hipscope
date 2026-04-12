@@ -400,9 +400,34 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // INCLUDES this turn's prompt tokens as an anti-loop anchor).
         let ngram_scope_start = m.conversation_tokens.len() - this_turn_prompt_len;
 
-        // Generate
-        let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+        // Generate. GPU-side sampling eliminates per-token logits download +
+        // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
+        // bench throughput and daemon throughput.
+        //
+        // Kernel signature reads `repeat_tokens[0..repeat_window]`, so we
+        // only need to upload the tokens that will actually be read — no
+        // need to clear the buffer between calls. The upload is on the same
+        // stream as the sample kernel launch, so the copy and compute pipeline
+        // naturally.
+        let vocab_size = config.vocab_size;
+        let mut rng_state: u32 = 0x13579BDFu32;
+        let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
+
+        // First sample: use conversation so far as scope.
+        let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+        let scope_start0 = ngram_scope.len().saturating_sub(repeat_buf_cap);
+        let scope0 = &ngram_scope[scope_start0..];
+        let bytes0: Vec<u8> = scope0.iter().flat_map(|t| t.to_ne_bytes()).collect();
+        if !bytes0.is_empty() {
+            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
+        }
+        let (tok0, rng0) = gpu.sample_top_p(
+            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+            vocab_size, temp, top_p, rng_state, scope0.len(), repeat_penalty,
+        ).unwrap();
+        let mut next_token = tok0;
+        rng_state = rng0;
+
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
         let mut emitted_bytes = 0usize;
@@ -433,16 +458,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            logits = gpu.download_f32(&scratch.logits).unwrap();
-            // Scope anti-repeat to this turn's prompt + generated tokens.
-            // Includes the prompt as an anti-loop anchor (topic n-grams
-            // break thinking-process repetition). Excludes previous turns'
-            // generated tokens to avoid cross-turn structural blocking
-            // (e.g. "<think></think>\n\n" appearing in every turn).
+            // Upload fresh repeat window (scope = this turn's prompt + gen so far).
             let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-            llama::apply_ngram_block(&mut logits, ngram_scope);
-            llama::apply_repeat_penalty(&mut logits, ngram_scope, repeat_window, repeat_penalty);
-            next_token = llama::sample_top_p(&logits, temp, top_p);
+            let scope_start = ngram_scope.len().saturating_sub(repeat_buf_cap);
+            let scope = &ngram_scope[scope_start..];
+            let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
+            if !bytes.is_empty() {
+                gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+            }
+            // GPU sample: reads scratch.logits (already on GPU), writes token+rng
+            // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.
+            let (tok, rng) = gpu.sample_top_p(
+                &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+                vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
+            ).unwrap();
+            next_token = tok;
+            rng_state = rng;
         }
         m.seq_pos += generated;
 

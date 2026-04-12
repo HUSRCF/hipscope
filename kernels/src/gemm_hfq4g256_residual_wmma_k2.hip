@@ -82,14 +82,16 @@ extern "C" __global__ void gemm_hfq4g256_residual_wmma_k2(
         }
     }
 
-    const int out_row = row_start + (tid & 15);
-    const int out_batch_base = batch_start + (tid >> 4) * 8;
-    if (out_row < M) {
+    // RDNA3 wave32 WMMA output: acc[j] = C[2*j + (tid>>4)][tid & 15].
+    // A operand = weight rows (m-dim), B operand = batch X cols (n-dim).
+    // So row = 2*j + (tid>>4), col (batch) = tid & 15.
+    const int out_col = batch_start + (tid & 15);  // batch index
+    if (out_col < batch_size) {
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            int bidx = out_batch_base + j;
-            if (bidx < batch_size)
-                Y[(long long)bidx * M + out_row] += acc[j];
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < M)
+                Y[(long long)out_col * M + out_row] += acc[j];
         }
     }
 }

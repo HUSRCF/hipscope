@@ -112,26 +112,25 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma(
     }
 
     // --- Output ---
-    // Thread t writes C[t%16, (t/16)*8 .. (t/16)*8+7].
-    const int out_row = row_start + (tid & 15);
-    const int out_batch_base = batch_start + (tid >> 4) * 8;
-
-    if (out_row < total_m) {
-        // Route this thread's row to the correct output matrix.
-        float* Y;
-        int proj_row;
-        int out_stride;
-        if (out_row < gate_m) {
-            Y = Y_gate;  proj_row = out_row;              out_stride = gate_m;
-        } else {
-            Y = Y_up;    proj_row = out_row - gate_m;     out_stride = up_m;
-        }
-
+    // RDNA3 wave32 WMMA output: acc[j] = C[2*j + (tid>>4)][tid & 15].
+    // A operand = weight rows (m-dim), B operand = batch X cols (n-dim).
+    // So row = 2*j + (tid>>4), col (batch) = tid & 15.
+    const int out_col = batch_start + (tid & 15);  // batch index
+    if (out_col < N) {
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            int bidx = out_batch_base + j;
-            if (bidx < N) {
-                Y[(long long)bidx * out_stride + proj_row] = acc[j];
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < total_m) {
+                // Route this row to the correct output matrix.
+                float* Y;
+                int proj_row;
+                int out_stride;
+                if (out_row < gate_m) {
+                    Y = Y_gate;  proj_row = out_row;              out_stride = gate_m;
+                } else {
+                    Y = Y_up;    proj_row = out_row - gate_m;     out_stride = up_m;
+                }
+                Y[(long long)out_col * out_stride + proj_row] = acc[j];
             }
         }
     }
