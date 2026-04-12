@@ -390,8 +390,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
         ).unwrap();
+        let this_turn_prompt_len = new_tokens.len();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
+
+        // ngram scope: this turn's prompt + generated tokens (excludes previous
+        // turns' generations to avoid cross-turn structural token blocking, but
+        // INCLUDES this turn's prompt tokens as an anti-loop anchor).
+        let ngram_scope_start = m.conversation_tokens.len() - this_turn_prompt_len;
 
         // Generate
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
@@ -427,17 +433,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if im_end_token == Some(next_token) { break; }
 
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            // Scope anti-repeat to the CURRENT turn only. Passing the full
-            // conversation_tokens caused n-gram block to catch legitimate
-            // turn-2 continuations whose 3-6 token suffix happened to
-            // match a structural sequence from an earlier turn (e.g. the
-            // "<think></think>\n\n" header that every assistant turn emits).
-            // That was making follow-up turns silently terminate after
-            // 1-2 tokens on long multi-turn conversations.
-            let turn_start = m.conversation_tokens.len() - generated;
-            let turn_slice = &m.conversation_tokens[turn_start..];
-            llama::apply_ngram_block(&mut logits, turn_slice);
-            llama::apply_repeat_penalty(&mut logits, turn_slice, repeat_window, repeat_penalty);
+            // Scope anti-repeat to this turn's prompt + generated tokens.
+            // Includes the prompt as an anti-loop anchor (topic n-grams
+            // break thinking-process repetition). Excludes previous turns'
+            // generated tokens to avoid cross-turn structural blocking
+            // (e.g. "<think></think>\n\n" appearing in every turn).
+            let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+            llama::apply_ngram_block(&mut logits, ngram_scope);
+            llama::apply_repeat_penalty(&mut logits, ngram_scope, repeat_window, repeat_penalty);
             next_token = llama::sample_top_p(&logits, temp, top_p);
         }
         m.seq_pos += generated;
@@ -468,8 +471,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
             rng_state = rng;
         }
+        let this_turn_prompt_len_llama = new_tokens.len();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
+        let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
 
         let mut out_bytes = [0u8; 8];
         gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
@@ -494,14 +499,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 emitted_bytes += vl;
             }
 
-            // Scope repeat_buf to the current turn only (same reason as the
-            // Qwen3.5 path above — cross-turn n-gram blocking silently kills
-            // follow-up responses when structural tokens repeat). The old
-            // scope was the last 64 tokens of the *full* conversation.
+            // Scope repeat_buf to this turn's prompt + generated tokens
+            // (same logic as the Qwen3.5 path: prompt anchor + current turn).
             let rw = repeat_window.min(64);
-            let turn_start = m.conversation_tokens.len() - generated;
-            let turn_hist_start = turn_start.max(m.conversation_tokens.len().saturating_sub(rw));
-            let hist_slice = &m.conversation_tokens[turn_hist_start..];
+            let scope_start = ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
+            let hist_slice = &m.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 

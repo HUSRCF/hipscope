@@ -113,6 +113,7 @@ fn main() {
     //   - attn_out: f32 [n_heads × head_dim]
     //   - pos_buf: raw int32 DeviceBuffer [1]
     //   - cycle_counts: raw [n_heads * 3 * 8] bytes (u64 per entry)
+    // Restore real Q for production testing
     let q_values: Vec<f32> = (0..config.n_heads * config.head_dim)
         .map(|i| (i as f32 * 0.013).sin() * 0.5)
         .collect();
@@ -254,11 +255,75 @@ fn main() {
     println!();
     println!("=== baseline attention_q8_0_kv timing at seq_len={seq_len} ===");
     println!("  wall clock (50 reps avg): {v1_us:7.1} us/call");
+
+    // ═══ Flash attention comparison ═══
+    eprintln!("\n=== Flash attention (tile+reduce) ===");
+    const TILE_SIZE: usize = 128;
+    let max_tiles = (kv_seq + TILE_SIZE - 1) / TILE_SIZE;
+    let partials = gpu.zeros(
+        &[config.n_heads * max_tiles * (2 + config.head_dim)],
+        DType::F32,
+    ).unwrap();
+
+    // Warmup flash (forces JIT compile of both kernels)
+    for _ in 0..3 {
+        gpu.attention_flash_q8_0(
+            &q_tensor, k_cache, v_cache, &attn_out,
+            &pos_buf, seq_len,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_seq,
+            &partials,
+        ).unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+
+    // Time flash
+    let t_flash = Instant::now();
+    for _ in 0..repeats_cmp {
+        gpu.attention_flash_q8_0(
+            &q_tensor, k_cache, v_cache, &attn_out,
+            &pos_buf, seq_len,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_seq,
+            &partials,
+        ).unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let flash_us = t_flash.elapsed().as_secs_f64() * 1e6 / repeats_cmp as f64;
+
+    // Correctness check
+    gpu.attention_q8_0_kv(
+        &q_tensor, k_cache, v_cache, &attn_out,
+        &pos_buf, seq_len,
+        config.n_heads, config.n_kv_heads, config.head_dim, kv_seq,
+    ).unwrap();
+    let out_baseline = gpu.download_f32(&attn_out).unwrap();
+
+    gpu.attention_flash_q8_0(
+        &q_tensor, k_cache, v_cache, &attn_out,
+        &pos_buf, seq_len,
+        config.n_heads, config.n_kv_heads, config.head_dim, kv_seq,
+        &partials,
+    ).unwrap();
+    let out_flash = gpu.download_f32(&attn_out).unwrap();
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut max_val = 0.0f32;
+    for (a, b) in out_baseline.iter().zip(out_flash.iter()) {
+        let e = (a - b).abs();
+        max_abs = max_abs.max(e);
+        max_val = max_val.max(a.abs()).max(b.abs());
+        if a.abs() > 1e-6 { max_rel = max_rel.max(e / a.abs()); }
+    }
+
     println!();
-    println!("  NOTE: memrealtime-instrumented total ({total_avg:.0} ticks × {ns_per_tick:.2} ns/tick");
-    println!("  = {:.1} us) is inflated over event timing because each phase timer",
-        total_avg * ns_per_tick / 1000.0);
-    println!("  call adds ~{:.0} ns of serialization. Use event timing for absolutes",
-        (wall_us_avg - v1_us) * 1000.0 / 4.0);
-    println!("  and %-total phase breakdown for which phase dominates.");
+    println!("=== baseline vs flash at seq_len={seq_len} ===");
+    println!("  baseline:    {v1_us:7.1} us/call  (1.00x)");
+    println!("  flash:       {flash_us:7.1} us/call  ({:.2}x)", v1_us / flash_us);
+    println!();
+    println!("  max_abs={max_abs:.2e}  max_rel={max_rel:.2e}  (out_max={max_val:.2e})");
+    if max_abs / max_val.max(1e-30) > 1e-3 {
+        println!("  WARNING: relative error > 1e-3");
+        println!("  First 8 baseline: {:?}", &out_baseline[..8]);
+        println!("  First 8 flash:    {:?}", &out_flash[..8]);
+    }
 }

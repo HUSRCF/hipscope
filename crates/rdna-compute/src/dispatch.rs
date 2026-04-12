@@ -3129,6 +3129,96 @@ impl Gpu {
         result
     }
 
+    /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
+    /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
+    /// blocks for the tile kernel, then [n_heads] blocks for the reduce.
+    /// Requires a pre-allocated `partials` buffer of size
+    /// n_heads * max_tiles * (2 + head_dim) floats.
+    pub fn attention_flash_q8_0(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let n_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+
+        // ── Tile kernel ──
+        self.ensure_kernel(
+            "attention_flash_q8_0_tile",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+            "attention_flash_q8_0_tile",
+        )?;
+        {
+            let func = &self.functions["attention_flash_q8_0_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, n_tiles as u32, 1],
+                    [32, 1, 1],
+                    ((TILE_SIZE + head_dim) * 4) as u32, // scores[tile_size] + q_lds[head_dim]
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // ── Reduce kernel ──
+        self.ensure_kernel(
+            "attention_flash_q8_0_reduce",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+            "attention_flash_q8_0_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nt = n_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Attention with Q8_0 quantized KV cache.
     pub fn attention_q8_0_kv(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,

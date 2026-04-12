@@ -363,7 +363,15 @@ pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str = include_str!("../../../kernels/s
 /// profiling/diagnostic use only.
 pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv_timed.hip");
 
+/// Flash attention tile kernel — zero LDS, online softmax, 32-thread WAVE32.
+/// Grid: [n_heads, n_tiles]. Each block fuses QK-dot + softmax + V-accumulate
+/// for its tile of positions, writing partials to global memory.
+pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
 
+/// Flash attention reduce kernel — combines tile partials via online softmax
+/// correction. Grid: [n_heads]. Reads per-tile {max, sum, out[head_dim]},
+/// combines across tiles, normalizes, writes final output.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
 
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.

@@ -79,7 +79,7 @@ fn main() {
         other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|turbo4|turbo4_adaptive|asym)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
+    let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
     // Deterministic fake-prompt: token 0, 1, 2, ... prefill_len-1. Keeps the
     // benchmark independent of tokenizer / chat template behaviour.

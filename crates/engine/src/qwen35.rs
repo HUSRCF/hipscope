@@ -1011,10 +1011,20 @@ pub struct Qwen35Scratch {
     // MagnumQuant rotation scratch: FWHT(x) shared across Q/K/V (or gate/up, etc).
     // Sized to max(dim, hidden_dim) — one rotation per batch replaces one per GEMV.
     pub x_rot: GpuTensor,       // [max(dim, hidden_dim)]
+
+    // Flash attention partials buffer for tile+reduce 2-kernel path.
+    // Size: n_heads * max_tiles * (2 + head_dim) floats.
+    pub flash_partials: GpuTensor,
+    pub use_flash_attn: bool,
 }
 
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
+        // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
+        Self::new_with_kv_max(gpu, config, repeat_window, 8192)
+    }
+
+    pub fn new_with_kv_max(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize, kv_max_seq: usize) -> HipResult<Self> {
         let dim = config.dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -1057,6 +1067,15 @@ impl Qwen35Scratch {
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
             x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
+
+            // Flash attention partials: enough for max_seq with tile_size=128.
+            // n_heads * max_tiles * (2 + head_dim) floats.
+            flash_partials: {
+                let tile_size = 128usize;
+                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
+                gpu.alloc_tensor(&[config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
+            },
+            use_flash_attn: std::env::var("HIPFIRE_ATTN_FLASH").map(|v| v == "1").unwrap_or(false),
         })
     }
 
@@ -1070,7 +1089,8 @@ impl Qwen35Scratch {
                    self.dn_attn_out, self.dn_normed,
                    self.fa_q_full, self.fa_q, self.fa_gate, self.fa_k, self.fa_v, self.fa_attn_out,
                    self.o, self.gate_ffn, self.up, self.ffn_hidden, self.ffn_out,
-                   self.logits, self.sample_buf, self.repeat_buf, self.x_rot] {
+                   self.logits, self.sample_buf, self.repeat_buf, self.x_rot,
+                   self.flash_partials] {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -2242,11 +2262,20 @@ fn forward_scratch_layers(
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_q8_0_kv(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
-                    )?;
+                    if s.use_flash_attn && pos + 1 >= 2048 {
+                        gpu.attention_flash_q8_0(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.attention_q8_0_kv(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        )?;
+                    }
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
