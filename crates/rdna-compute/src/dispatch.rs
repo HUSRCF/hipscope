@@ -120,6 +120,20 @@ pub struct Gpu {
     pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
+
+    // ── hipGraph capture state ────────────────────────────────────────────
+    /// When true, dispatch methods use the blob launch path (graph-capture-safe).
+    /// Kernarg blobs are stored in `capture_blobs` and must stay alive until the
+    /// captured graph is destroyed.
+    pub capture_mode: bool,
+    /// Heap-stored kernarg blobs for the current capture session. The blob
+    /// pointers are baked into the graph at capture time — do NOT clear this
+    /// vec until after `graph_exec_destroy`.
+    capture_blobs: Vec<Vec<u8>>,
+    /// The captured graph exec, ready for replay.
+    pub graph_exec: Option<hip_bridge::GraphExec>,
+    /// The raw captured graph (kept alive for potential update operations).
+    captured_graph: Option<hip_bridge::Graph>,
 }
 
 impl Gpu {
@@ -167,7 +181,84 @@ impl Gpu {
             mq_x_rot: None,
             mq_x_q8: None,
             mq_x_scales: None,
+            capture_mode: false,
+            capture_blobs: Vec::new(),
+            graph_exec: None,
+            captured_graph: None,
         })
+    }
+
+    // ── hipGraph capture/replay ───────────────────────────────────────────
+
+    /// Begin capturing all kernel launches on the active stream into a graph.
+    /// While capturing, dispatch methods that support it will use the blob
+    /// launch path so that kernarg pointers survive until graph replay.
+    pub fn begin_graph_capture(&mut self) -> HipResult<()> {
+        self.capture_blobs.clear();
+        self.capture_mode = true;
+        let stream = self.active_stream.as_ref()
+            .expect("graph capture requires an explicit stream (not null stream)");
+        self.hip.stream_begin_capture(stream, 0) // 0 = hipStreamCaptureModeGlobal
+    }
+
+    /// End capture, instantiate the graph for replay.
+    pub fn end_graph_capture(&mut self) -> HipResult<()> {
+        self.capture_mode = false;
+        let stream = self.active_stream.as_ref().unwrap();
+        let graph = self.hip.stream_end_capture(stream)?;
+        let exec = self.hip.graph_instantiate(&graph)?;
+        self.captured_graph = Some(graph);
+        self.graph_exec = Some(exec);
+        Ok(())
+    }
+
+    /// Replay the captured graph.
+    pub fn graph_launch(&self) -> HipResult<()> {
+        let exec = self.graph_exec.as_ref().expect("no captured graph to replay");
+        let stream = self.active_stream.as_ref().unwrap();
+        self.hip.graph_launch(exec, stream)
+    }
+
+    /// Destroy the captured graph and free all retained kernarg blobs.
+    pub fn graph_destroy(&mut self) {
+        if let Some(exec) = self.graph_exec.take() {
+            let _ = self.hip.graph_exec_destroy(exec);
+        }
+        if let Some(graph) = self.captured_graph.take() {
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.capture_blobs.clear();
+    }
+
+    /// Helper: launch a kernel using the blob path during graph capture,
+    /// or the normal kernelParams path otherwise. The `blob_builder` closure
+    /// constructs the KernargBlob; it's only called when capturing.
+    fn launch_maybe_blob(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut Vec<*mut std::ffi::c_void>,
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        if self.capture_mode {
+            let blob = blob_builder();
+            self.capture_blobs.push(blob.into_vec());
+            // Re-borrow fields separately to avoid conflicting borrows on self
+            let buf = self.capture_blobs.last_mut().unwrap();
+            let func = &self.functions[func_name];
+            let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
+            unsafe {
+                self.hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
+            }
+        } else {
+            let func = &self.functions[func_name];
+            let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
+            unsafe {
+                self.hip.launch_kernel(func, grid, block, shared_mem, stream, params)
+            }
+        }
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
@@ -775,22 +866,21 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
-        let func = &self.functions["fused_rmsnorm_mq_rotate"];
-        let mut xp = x.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
-        let mut eps_v = eps;
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
+        let eps_v = eps;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut xrp as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut eps_v as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
         ];
 
         let block_size = 256u32;
@@ -805,16 +895,16 @@ impl Gpu {
             "fused_rmsnorm_mq_rotate",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate", [1, 1, 1], [block_size, 1, 1], shared_mem, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -898,27 +988,33 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
-        let func = &self.functions["fused_silu_mul_mq_rotate"];
-        let mut gp = gate.buf.as_ptr();
-        let mut up_p = up.buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut gp as *mut _ as *mut c_void,
-            &mut up_p as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut xrp as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
         ];
         // Bandwidth: read gate + up, 2x256 signs, write x_rot.
         let bytes = k * 4 * 3 + 2 * 256 * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "fused_silu_mul_mq_rotate", [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -1317,32 +1413,31 @@ impl Gpu {
             kernels::FUSED_QKV_HFQ4G256_SRC,
             "fused_qkv_hfq4g256",
         )?;
-        let func = &self.functions["fused_qkv_hfq4g256"];
 
-        let mut aq = a_q.buf.as_ptr();
-        let mut ak = a_k.buf.as_ptr();
-        let mut av = a_v.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yq = y_q.buf.as_ptr();
-        let mut yk = y_k.buf.as_ptr();
-        let mut yv = y_v.buf.as_ptr();
-        let mut q_m_val = q_m as i32;
-        let mut k_m_val = k_m as i32;
-        let mut v_m_val = v_m as i32;
-        let mut k_val = k as i32;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_val = q_m as i32;
+        let k_m_val = k_m as i32;
+        let v_m_val = v_m as i32;
+        let k_val = k as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut aq as *mut _ as *mut c_void,
-            &mut ak as *mut _ as *mut c_void,
-            &mut av as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yq as *mut _ as *mut c_void,
-            &mut yk as *mut _ as *mut c_void,
-            &mut yv as *mut _ as *mut c_void,
-            &mut q_m_val as *mut _ as *mut c_void,
-            &mut k_m_val as *mut _ as *mut c_void,
-            &mut v_m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_val as *const _ as *mut c_void,
+            &k_m_val as *const _ as *mut c_void,
+            &v_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
 
         let total_m = (q_m + k_m + v_m) as u32;
@@ -1350,9 +1445,17 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [total_m, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "fused_qkv_hfq4g256", [total_m, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val);
+                b.push_i32(v_m_val); b.push_i32(k_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -1382,49 +1485,51 @@ impl Gpu {
             kernels::FUSED_QKVZA_HFQ4G256_SRC,
             "fused_qkvza_hfq4g256",
         )?;
-        let func = &self.functions["fused_qkvza_hfq4g256"];
-
-        let mut aq = a_qkv.buf.as_ptr();
-        let mut az = a_z.buf.as_ptr();
-        let mut ab = a_beta.buf.as_ptr();
-        let mut aa = a_alpha.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yq = y_qkv.buf.as_ptr();
-        let mut yz = y_z.buf.as_ptr();
-        let mut yb = y_beta.buf.as_ptr();
-        let mut ya = y_alpha.buf.as_ptr();
-        let mut q_m = qkv_m as i32;
-        let mut z_m_val = z_m as i32;
-        let mut b_m = beta_m as i32;
-        let mut a_m = alpha_m as i32;
-        let mut k_val = k as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut aq as *mut _ as *mut c_void,
-            &mut az as *mut _ as *mut c_void,
-            &mut ab as *mut _ as *mut c_void,
-            &mut aa as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yq as *mut _ as *mut c_void,
-            &mut yz as *mut _ as *mut c_void,
-            &mut yb as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut q_m as *mut _ as *mut c_void,
-            &mut z_m_val as *mut _ as *mut c_void,
-            &mut b_m as *mut _ as *mut c_void,
-            &mut a_m as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-        ];
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
 
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let grid = [total_m, 1, 1];
+
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(z_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [total_m, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void, &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void, &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void, &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_qkvza_hfq4g256", grid, [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp); b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -1648,18 +1753,18 @@ impl Gpu {
         let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
 
         // RDNA3 multi-row override path. Same selector as the non-residual
@@ -1693,10 +1798,15 @@ impl Gpu {
                 self.hip.launch_kernel(mrfunc, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
             }
         } else {
-            let func = &self.functions["gemv_hfq4g256_residual"];
-            unsafe {
-                self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-            }
+            self.launch_maybe_blob(
+                "gemv_hfq4g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                    b.push_i32(m_val); b.push_i32(k_val);
+                    b
+                },
+            )
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
@@ -2209,23 +2319,22 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
-        let func = &self.functions["rmsnorm_f32"];
 
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
 
-        let mut x_ptr = x.buf.as_ptr();
-        let mut w_ptr = weight.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut n_val = n;
-        let mut eps_val = eps;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n;
+        let eps_val = eps;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut eps_val as *mut _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
         ];
 
         let block_size = 256u32.min(n as u32);
@@ -2233,16 +2342,15 @@ impl Gpu {
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [batch as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "rmsnorm_f32", [batch as u32, 1, 1], [block_size, 1, 1], shared_mem, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr); b.push_ptr(w_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(eps_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -2686,23 +2794,31 @@ impl Gpu {
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("fused_gate_up_hfq4g256", kernels::FUSED_GATE_UP_HFQ4G256_SRC, "fused_gate_up_hfq4g256")?;
-        let func = &self.functions["fused_gate_up_hfq4g256"];
-        let mut ag = a_gate.buf.as_ptr();
-        let mut au = a_up.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yg = y_gate.buf.as_ptr();
-        let mut yu = y_up.buf.as_ptr();
-        let mut gm = gate_m as i32;
-        let mut um = up_m as i32;
-        let mut kv = k as i32;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut ag as *mut _ as *mut c_void, &mut au as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void, &mut yg as *mut _ as *mut c_void,
-            &mut yu as *mut _ as *mut c_void, &mut gm as *mut _ as *mut c_void,
-            &mut um as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+            &ag as *const _ as *mut c_void, &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
         ];
         let total_rows = (gate_m + up_m) as u32;
-        unsafe { self.hip.launch_kernel(func, [total_rows, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "fused_gate_up_hfq4g256", [total_rows, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// Write KV to HFQ4 co-located block (72 bytes per head: scale+zero+nibbles).
@@ -4137,27 +4253,38 @@ impl Gpu {
 
     /// Partial interleaved RoPE for Qwen3.5 full attention layers.
     #[cfg(feature = "deltanet")]
+    /// Single-token RoPE. `pos_buf` is a device buffer holding one i32 position
+    /// value (graph-capture-safe: the pointer is stable, content updated before replay).
     pub fn rope_partial_interleaved_f32(
-        &mut self, q: &GpuTensor, k: &GpuTensor, pos: i32,
+        &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
     ) -> HipResult<()> {
         self.ensure_kernel("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")?;
-        let func = &self.functions["rope_partial_interleaved_f32"];
-        let mut qp = q.buf.as_ptr(); let mut kp = k.buf.as_ptr();
-        let mut p = pos; let mut nhq = n_heads_q as i32; let mut nhk = n_heads_k as i32;
-        let mut hd = head_dim as i32; let mut nr = n_rot as i32; let mut fb = freq_base;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
-            &mut p as *mut _ as *mut c_void, &mut nhq as *mut _ as *mut c_void,
-            &mut nhk as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void, &mut fb as *mut _ as *mut c_void,
-        ];
+        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
+        let hd = head_dim as i32; let nr = n_rot as i32; let fb = freq_base;
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
-        let grid = (n_pairs + block - 1) / block;
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_interleaved_f32", grid, [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nr);
+                b.push_f32(fb);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4234,22 +4361,21 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("repeat_interleave_qk", kernels::REPEAT_INTERLEAVE_QK_SRC, "repeat_interleave_qk_f32")?;
-        let func = &self.functions["repeat_interleave_qk_f32"];
-        let mut qsp = q_src.buf.as_ptr();
-        let mut ksp = k_src.buf.as_ptr();
-        let mut qdp = q_dst.buf.as_ptr();
-        let mut kdp = k_dst.buf.as_ptr();
-        let mut nkh = n_key_heads as i32;
-        let mut r = ratio as i32;
-        let mut hd = head_dim as i32;
+        let qsp = q_src.buf.as_ptr();
+        let ksp = k_src.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nkh = n_key_heads as i32;
+        let r = ratio as i32;
+        let hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut qsp as *mut _ as *mut c_void,
-            &mut ksp as *mut _ as *mut c_void,
-            &mut qdp as *mut _ as *mut c_void,
-            &mut kdp as *mut _ as *mut c_void,
-            &mut nkh as *mut _ as *mut c_void,
-            &mut r as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &qsp as *const _ as *mut c_void,
+            &ksp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &r as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
         let total = (n_key_heads * ratio * head_dim) as u32;
         let block = 256u32;
@@ -4257,9 +4383,16 @@ impl Gpu {
         let bytes = (n_key_heads * head_dim * 4) * 2 // Q/K reads
                   + (n_key_heads * ratio * head_dim * 4) * 2; // Q/K writes
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "repeat_interleave_qk_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "repeat_interleave_qk_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qsp); b.push_ptr(ksp);
+                b.push_ptr(qdp); b.push_ptr(kdp);
+                b.push_i32(nkh); b.push_i32(r); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4497,26 +4630,31 @@ impl Gpu {
             kernels::FUSED_SIGMOID_ALPHA_GATE_SRC,
             "fused_sigmoid_alpha_gate_f32",
         )?;
-        let func = &self.functions["fused_sigmoid_alpha_gate_f32"];
-        let mut bp = beta.buf.as_ptr();
-        let mut ap = alpha.buf.as_ptr();
-        let mut dp = dt_bias.buf.as_ptr();
-        let mut lp = a_log.buf.as_ptr();
-        let mut nn = n as i32;
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dp = dt_bias.buf.as_ptr();
+        let lp = a_log.buf.as_ptr();
+        let nn = n as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut bp as *mut _ as *mut c_void,
-            &mut ap as *mut _ as *mut c_void,
-            &mut dp as *mut _ as *mut c_void,
-            &mut lp as *mut _ as *mut c_void,
-            &mut nn as *mut _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &nn as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = n * 4 * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_sigmoid_alpha_gate_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "fused_sigmoid_alpha_gate_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp); b.push_ptr(ap); b.push_ptr(dp); b.push_ptr(lp);
+                b.push_i32(nn);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4587,27 +4725,33 @@ impl Gpu {
             kernels::FUSED_QK_L2_NORM_SCALE_SRC,
             "fused_qk_l2_norm_scale_f32",
         )?;
-        let func = &self.functions["fused_qk_l2_norm_scale_f32"];
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut qs = q_scale;
-        let mut ep = eps;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let qs = q_scale;
+        let ep = eps;
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut qs as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
         ];
         // Covers both Q and K reads/writes.
         let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2;
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "fused_qk_l2_norm_scale_f32", [n_heads as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp);
+                b.push_i32(nh); b.push_i32(hd);
+                b.push_f32(qs); b.push_f32(ep);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4690,23 +4834,31 @@ impl Gpu {
         out: &GpuTensor, n_heads: usize, head_dim: usize, eps: f32,
     ) -> HipResult<()> {
         self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
-        let func = &self.functions["gated_norm_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut zp = z.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ep = eps;
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ep = eps;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void, &mut zp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
         ];
         let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "gated_norm_f32", [n_heads as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(zp);
+                b.push_ptr(wp); b.push_ptr(op);
+                b.push_i32(nh); b.push_i32(hd); b.push_f32(ep);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4791,30 +4943,39 @@ impl Gpu {
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
-        let func = &self.functions["gated_delta_net_q8"];
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut vp = v.buf.as_ptr();
-        let mut gp = gate.buf.as_ptr();
-        let mut bp = beta.buf.as_ptr();
-        let mut sp = s_q8.buf.as_ptr();
-        let mut scp = s_scales.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let sp = s_q8.buf.as_ptr();
+        let scp = s_scales.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
-            &mut scp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8", [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
+                b.push_ptr(scp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -5050,35 +5211,41 @@ impl Gpu {
             kernels::CONV1D_SILU_SPLIT_SRC,
             "conv1d_silu_split_f32",
         )?;
-        let func = &self.functions["conv1d_silu_split_f32"];
-        let mut qp = q_out.buf.as_ptr();
-        let mut kp = k_out.buf.as_ptr();
-        let mut vp = v_out.buf.as_ptr();
-        let mut ip = input.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut kd = k_dim as i32;
-        let mut vd = v_dim as i32;
-        let mut nt = n_tokens as i32;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut kd as *mut _ as *mut c_void,
-            &mut vd as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
         ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
+                b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }

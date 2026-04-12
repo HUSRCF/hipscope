@@ -2,7 +2,7 @@
 extern "C" __global__ void rope_partial_interleaved_f32(
     float* __restrict__ q,
     float* __restrict__ k,
-    int pos,
+    const int* __restrict__ pos_buf,  // device buffer, single i32 — graph-safe
     int n_heads_q,
     int n_heads_k,
     int head_dim,
@@ -17,6 +17,7 @@ extern "C" __global__ void rope_partial_interleaved_f32(
     int d0 = pair * 2;
     int d1 = pair * 2 + 1;
 
+    int pos = *pos_buf;
     // Frequency for this pair (same formula as standard RoPE but indexed by pair)
     float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
     float angle = (float)pos * freq;

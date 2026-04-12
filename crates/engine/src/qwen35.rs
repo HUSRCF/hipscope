@@ -894,7 +894,7 @@ fn forward_from_x_gpu(
 
                 // Partial interleaved RoPE: rotate first n_rot dims, pairs (d0,d1),(d2,d3),...
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize; // 64
-                gpu.rope_partial_interleaved_f32(&q, &k, pos as i32,
+                gpu.rope_partial_interleaved_f32(&q, &k, &pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
                 // KV cache write + attention (Q8 if available, FP32 fallback)
@@ -1854,7 +1854,7 @@ fn run_fa_layer_body(
     gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
+    gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
         config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
     if kv_cache.quant_hf4v {
@@ -2260,7 +2260,7 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
+                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
                 if kv_cache.quant_hf4v {
