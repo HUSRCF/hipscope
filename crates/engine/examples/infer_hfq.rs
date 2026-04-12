@@ -1,6 +1,6 @@
 //! Run inference on a .hfq (hipfire-quantized) model.
 //! Usage: cargo run --release --example infer_hfq <model.hfq> [flags] [prompt text...]
-//! Flags: --q8kv, --fp32kv, --turbo2, --turbo3, --turbo4, --temp T
+//! Flags: --q8kv, --fp32kv, --givens4, --givens2, --hfq4kv, --temp T
 
 use engine::hfq::{self, HfqFile};
 use engine::llama::{self, KvCache, ForwardScratch};
@@ -16,28 +16,24 @@ fn main() {
     unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1)
-        .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [--q8kv|--fp32kv|--turbo2|--turbo3|--turbo4] [--temp T] [prompt...]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [--q8kv|--fp32kv|--givens4|--givens2|--hfq4kv] [--temp T] [prompt...]"); std::process::exit(1); });
 
     // Parse flags
-    let turbo_bits: u8 = args.iter().find(|a| a.starts_with("--turbo"))
-        .map(|a| a.trim_start_matches("--turbo").parse().unwrap_or(3))
-        .unwrap_or(0);
+    let use_givens4 = args.iter().any(|a| a == "--givens4");
+    let use_givens2 = args.iter().any(|a| a == "--givens2");
     let use_q8kv = args.iter().any(|a| a == "--q8kv");
     let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
     let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
-    let use_adaptive = args.iter().any(|a| a == "--adaptive");
-    let use_hfq4skv = args.iter().any(|a| a == "--hfq4skv");
     let temp: f32 = args.iter().position(|a| a == "--temp")
         .map(|i| args[i + 1].parse().unwrap_or(0.6))
         .unwrap_or(0.0);
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
 
     let prompt_text = {
-        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--hfq4skv", "--adaptive", "--temp", "--maxgen"];
+        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--givens4", "--givens2", "--temp", "--maxgen"];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..].iter().filter(|a| {
             if skip_next { skip_next = false; return false; }
-            if a.starts_with("--turbo") { return false; }
             if skip_flags.contains(&a.as_str()) { skip_next = a.as_str() == "--temp" || a.as_str() == "--maxgen"; return false; }
             true
         }).map(|s| s.as_str()).collect();
@@ -108,10 +104,10 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = if turbo_bits > 0 {
-        KvCache::new_gpu_turbo_adaptive(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len, turbo_bits, use_adaptive).unwrap()
-    } else if use_hfq4skv {
-        KvCache::new_gpu_hfq4s_kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    let mut kv_cache = if use_givens4 {
+        KvCache::new_gpu_givens4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else if use_givens2 {
+        KvCache::new_gpu_givens2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_hfq4kv {
         KvCache::new_gpu_hfq4kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_q8kv {
@@ -133,9 +129,9 @@ fn main() {
     let repeat_penalty: f32 = 1.1;
     let repeat_window: usize = 64;
 
-    // Prefill: try batched (skip for turbo KV — format mismatch), fallback to sequential
+    // Prefill: try batched (skip for non-standard KV formats), fallback to sequential
     let t1 = Instant::now();
-    let prefill_logits = if turbo_bits > 0 || use_hfq4kv || use_hfq4skv {
+    let prefill_logits = if use_givens4 || use_givens2 || use_hfq4kv {
         Err(hip_bridge::HipError::new(0, "quantized KV requires sequential prefill"))
     } else {
         llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache)

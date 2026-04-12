@@ -1,5 +1,5 @@
 //! Interactive REPL for hipfire — like `ollama run`.
-//! Usage: hipfire-run <model.hfq> [--system "prompt"] [--turbo N]
+//! Usage: hipfire-run <model.hfq> [--system "prompt"] [--kv givens4|givens2]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() { eprintln!("Build with --features deltanet"); }
@@ -15,17 +15,14 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--turbo N] [--temp F] [--max-seq N]");
+        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N]");
         std::process::exit(1);
     }
     let model_path = &args[1];
 
     // Parse flags
     let mut system_prompt: Option<String> = None;
-    let mut turbo_bits: u8 = 0;
-    let mut asym_kv = false;
-    let mut hf4_kv = false;
-    let mut boundary: u8 = 0;
+    let mut kv_mode_str: String = "q8".to_string();
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
     let mut q4_state = false;
@@ -37,11 +34,8 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--system" | "-s" => { i += 1; system_prompt = Some(args[i].clone()); }
-            "--turbo" => { i += 1; turbo_bits = args[i].parse().unwrap_or(4); }
-            "--asym" => { asym_kv = true; }
-            "--hf4" => { hf4_kv = true; }
+            "--kv" => { i += 1; kv_mode_str = args[i].clone(); }
             "--q4-state" => { q4_state = true; }
-            "--boundary" => { i += 1; boundary = args[i].parse().unwrap_or(2); }
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
             "--draft-model" => { i += 1; draft_model = Some(args[i].clone()); }
@@ -60,10 +54,8 @@ fn main() {
     use engine::speculative::{KvMode, ModelSlot, ModelSlotConfig};
     let state_quant = if q4_state { qwen35::StateQuant::Q4 } else { qwen35::StateQuant::Q8 };
     if q4_state { eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"); }
-    let target_kv_mode = if hf4_kv { KvMode::Q8kHf4v }
-        else if asym_kv { eprintln!("KV cache: asymmetric q8-K + turbo4-V (boundary={})", boundary); KvMode::AsymQ8Turbo4 { boundary } }
-        else if turbo_bits >= 2 && turbo_bits <= 4 { eprintln!("KV cache: turbo{}", turbo_bits); KvMode::Turbo(turbo_bits) }
-        else { KvMode::Q8 };
+    eprintln!("KV cache: {kv_mode_str}");
+    let target_kv_mode = KvMode::Q8;
     let target_cfg = ModelSlotConfig {
         max_seq, kv_mode: target_kv_mode, repeat_window: 128, state_quant,
     };
@@ -81,10 +73,7 @@ fn main() {
 
         let draft_cfg = ModelSlotConfig {
             max_seq,
-            kv_mode: if hf4_kv { KvMode::Q8kHf4v }
-                else if asym_kv { KvMode::AsymQ8Turbo4 { boundary } }
-                else if turbo_bits >= 2 && turbo_bits <= 4 { KvMode::Turbo(turbo_bits) }
-                else { KvMode::Q8 },
+            kv_mode: KvMode::Q8,
             repeat_window: 128,
             state_quant,
         };

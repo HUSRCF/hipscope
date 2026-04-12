@@ -1,8 +1,0 @@
-# Hipcc standalone build artifacts produced by running
-# `hipcc --genco` or bpf-bundling on the butterfly kernel from the
-# magnum crate root. They're derivative and would bloat the repo.
-/magnum_butterfly-hip-*
-
-# Compiled kernel blobs in results/ (compiled at runtime by magnum-test,
-# turbo-diag, bw-bench, dp4a-bench via hipcc --genco). Rebuildable.
-/results/*.hsaco

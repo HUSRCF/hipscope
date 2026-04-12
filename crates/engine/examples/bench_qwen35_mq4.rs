@@ -60,20 +60,11 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via HIPFIRE_KV_MODE env var:
-    //   q8 (default) | turbo4 | turbo4_adaptive | asym (Q8 K + turbo4 V)
+    //   q8 (default) | givens4 | givens2 | givens4d (deferred conversion)
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
-        ).unwrap(),
-        "turbo4" => KvCache::new_gpu_turbo_adaptive(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, 4, false
-        ).unwrap(),
-        "turbo4_adaptive" => KvCache::new_gpu_turbo_adaptive(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, 4, true
-        ).unwrap(),
-        "asym" => KvCache::new_gpu_asym_q8k_turbo4v(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).unwrap(),
         "givens4" => KvCache::new_gpu_givens4(
@@ -86,7 +77,7 @@ fn main() {
         "givens4d" => KvCache::new_gpu_q8(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|turbo4|turbo4_adaptive|asym|givens4|givens4d)"),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|givens4|givens2|givens4d)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -159,8 +150,8 @@ fn main() {
         let mut g4_kv = KvCache::new_gpu_givens4(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).unwrap();
-        let ct = g4_kv.turbo_signs1.as_ref().unwrap();
-        let st = g4_kv.turbo_signs2.as_ref().unwrap();
+        let ct = g4_kv.givens_cos.as_ref().unwrap();
+        let st = g4_kv.givens_sin.as_ref().unwrap();
         let t_conv = std::time::Instant::now();
         for layer in 0..config.n_layers {
             gpu.convert_q8_to_givens4(

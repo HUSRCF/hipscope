@@ -121,24 +121,22 @@ fn main() {
         Ok(format!("im_start={} im_end={}", im_start[0], im_end[0]))
     });
 
-    // Test 6: Asymmetric KV cache allocates correctly
-    test!("asymmetric q8-K + turbo4-V cache allocates", 5000, {
+    // Test 6: Givens4 KV cache allocates correctly
+    test!("givens4 KV cache allocates", 5000, {
         let kv_seq = 128;
-        let kv = llama::KvCache::new_gpu_asym_q8k_turbo4v(
+        let kv = llama::KvCache::new_gpu_givens4(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).map_err(|e| format!("{e}"))?;
-        assert!(kv.quant_asym, "quant_asym should be true");
-        assert!(kv.quant_q8, "quant_q8 should be true for K");
-        assert_eq!(kv.quant_turbo, 4, "quant_turbo should be 4 for V");
-        assert!(kv.turbo_signs1.is_some(), "signs1 missing");
-        assert!(kv.turbo_signs2.is_some(), "signs2 missing");
-        Ok(format!("K+V allocated for {} layers, hd={}", config.n_layers, config.head_dim))
+        assert!(kv.quant_givens4, "quant_givens4 should be true");
+        assert!(kv.givens_cos.is_some(), "givens_cos missing");
+        assert!(kv.givens_sin.is_some(), "givens_sin missing");
+        Ok(format!("givens4 allocated for {} layers, hd={}", config.n_layers, config.head_dim))
     });
 
-    // Test 7: Asymmetric forward doesn't hang
-    test!("asymmetric forward completes (no hang)", 15000, {
+    // Test 7: Givens4 forward doesn't hang
+    test!("givens4 forward completes (no hang)", 15000, {
         let kv_seq = 128;
-        let mut kv = llama::KvCache::new_gpu_asym_q8k_turbo4v(
+        let mut kv = llama::KvCache::new_gpu_givens4(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).map_err(|e| format!("{e}"))?;
         let mut dn = DeltaNetState::new(&mut gpu, &config).map_err(|e| format!("{e}"))?;

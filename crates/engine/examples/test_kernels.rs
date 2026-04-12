@@ -146,59 +146,6 @@ fn main() {
         });
     }
 
-    eprintln!("\n--- Asymmetric turbo (q8-K + turbo4-V, hd=256) ---");
-    for (label, n_heads, n_kv, hd) in [
-        ("asym hd=256 h=16 kv=4 (9B config)", 16, 4, 256),
-        ("asym hd=256 h=10 kv=2 (4B config)", 10, 2, 256),
-    ] {
-        test!(label, {
-            let seq = 8;
-            // K cache: Q8 format
-            let q8_blocks = hd / 32;
-            let q8_bytes_per_pos = n_kv * q8_blocks * 34;
-            let k_bytes = seq * q8_bytes_per_pos;
-            let k_cache = gpu.zeros(&[(k_bytes + 3) / 4], DType::F32).map_err(|e| format!("{e}"))?;
-
-            // V cache: turbo4 format
-            let t4_bytes_per_head = 4 + hd / 2;
-            let v_bytes = seq * n_kv * t4_bytes_per_head;
-            let v_cache = gpu.zeros(&[(v_bytes + 3) / 4], DType::F32).map_err(|e| format!("{e}"))?;
-
-            // Sign tables
-            let signs1 = gpu.upload_f32(&vec![1.0f32; hd], &[hd]).map_err(|e| format!("{e}"))?;
-            let signs2 = gpu.upload_f32(&vec![1.0f32; hd], &[hd]).map_err(|e| format!("{e}"))?;
-            let pos_buf = gpu.hip.malloc(4).map_err(|e| format!("{e}"))?;
-
-            // Write a few positions
-            for p in 0..4 {
-                let k_data = gpu.upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd]).map_err(|e| format!("{e}"))?;
-                let v_data = gpu.upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd]).map_err(|e| format!("{e}"))?;
-                let pv = p as i32;
-                gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| format!("{e}"))?;
-                gpu.kv_cache_write_q8_0(&k_cache, &k_data, &pos_buf, n_kv, hd).map_err(|e| format!("{e}"))?;
-                gpu.kv_cache_write_turbo4_v256(&v_cache, &v_data, &pos_buf, &signs1, &signs2, n_kv, hd).map_err(|e| format!("{e}"))?;
-                gpu.free_tensor(k_data).map_err(|e| format!("{e}"))?; gpu.free_tensor(v_data).map_err(|e| format!("{e}"))?;
-            }
-
-            // Asymmetric attention at pos 3
-            let q = gpu.upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd]).map_err(|e| format!("{e}"))?;
-            let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| format!("{e}"))?;
-            let pv = 3i32;
-            gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| format!("{e}"))?;
-            gpu.attention_q8k_turbo4v_256(
-                &q, &k_cache, &v_cache, &o, &pos_buf, &signs1, &signs2,
-                4, n_heads, n_kv, hd, seq,
-            ).map_err(|e| format!("{e}"))?;
-            let r = gpu.download_f32(&o).map_err(|e| format!("{e}"))?;
-            assert!(r[0].is_finite(), "asym attention produced NaN at r[0]={}", r[0]);
-            gpu.free_tensor(q).map_err(|e| format!("{e}"))?; gpu.free_tensor(o).map_err(|e| format!("{e}"))?;
-            gpu.free_tensor(k_cache).map_err(|e| format!("{e}"))?; gpu.free_tensor(v_cache).map_err(|e| format!("{e}"))?;
-            gpu.free_tensor(signs1).map_err(|e| format!("{e}"))?; gpu.free_tensor(signs2).map_err(|e| format!("{e}"))?;
-            gpu.hip.free(pos_buf).map_err(|e| format!("{e}"))?;
-            Ok::<(), String>(())
-        });
-    }
-
     eprintln!("\n--- GDN (tiled LDS) ---");
     for (label, n_heads, hd) in [
         ("gdn_q8 h=32 hd=128 (9B DeltaNet)", 32, 128),

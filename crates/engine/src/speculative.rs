@@ -25,12 +25,6 @@ use std::path::Path;
 pub enum KvMode {
     /// INT8 co-located K and V (default).
     Q8,
-    /// Asymmetric: Q8 K + turbo4 V with boundary layers at Q8.
-    AsymQ8Turbo4 { boundary: u8 },
-    /// Q8 K + HF4-V.
-    Q8kHf4v,
-    /// TurboN (2/3/4) on both K and V.
-    Turbo(u8),
 }
 
 impl Default for KvMode {
@@ -97,39 +91,13 @@ impl ModelSlot {
             .filter(|t| **t == qwen35::LayerType::FullAttention)
             .count();
 
-        let kv_cache = match slot_config.kv_mode {
-            KvMode::Q8 => KvCache::new_gpu_q8(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Q8kHf4v => KvCache::new_gpu_q8k_hf4v(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::AsymQ8Turbo4 { boundary } => KvCache::new_gpu_asym_q8k_turbo4v_boundary(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-                boundary,
-                n_kv_layers,
-            )?,
-            KvMode::Turbo(bits) => KvCache::new_gpu_turbo(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-                bits,
-            )?,
-        };
+        let kv_cache = KvCache::new_gpu_q8(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            slot_config.max_seq,
+        )?;
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
         let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;

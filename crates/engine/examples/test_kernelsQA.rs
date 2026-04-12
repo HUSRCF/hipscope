@@ -27,8 +27,6 @@ const CASES: &[CaseDef] = &[
     CaseDef { name: "q8_write_attn_hd128_kv8", timeout: Duration::from_secs(30) },
     CaseDef { name: "q8_write_attn_hd256_kv4", timeout: Duration::from_secs(30) },
     CaseDef { name: "q8_write_attn_hd256_kv2", timeout: Duration::from_secs(30) },
-    CaseDef { name: "asym_hd256_h16_kv4", timeout: Duration::from_secs(30) },
-    CaseDef { name: "asym_hd256_h10_kv2", timeout: Duration::from_secs(30) },
     CaseDef { name: "gdn_q8_h32_hd128", timeout: Duration::from_secs(30) },
     CaseDef { name: "gdn_q8_h16_hd128", timeout: Duration::from_secs(30) },
     CaseDef { name: "vision_gemm_f16", timeout: Duration::from_secs(30) },
@@ -169,8 +167,6 @@ fn run_case(case_name: &str, expected_arch: Option<&str>) -> ExitCode {
         "q8_write_attn_hd128_kv8" => q8_kv_case(expected_arch, 8, 128),
         "q8_write_attn_hd256_kv4" => q8_kv_case(expected_arch, 4, 256),
         "q8_write_attn_hd256_kv2" => q8_kv_case(expected_arch, 2, 256),
-        "asym_hd256_h16_kv4" => asym_case(expected_arch, 16, 4, 256),
-        "asym_hd256_h10_kv2" => asym_case(expected_arch, 10, 2, 256),
         "gdn_q8_h32_hd128" => gdn_case(expected_arch, 32, 128),
         "gdn_q8_h16_hd128" => gdn_case(expected_arch, 16, 128),
         "vision_gemm_f16" => vision_gemm_f16(expected_arch),
@@ -397,60 +393,6 @@ fn q8_kv_case(expected_arch: Option<&str>, n_kv: usize, hd: usize) -> CaseOutcom
         gpu.free_tensor(o).map_err(|e| e.to_string())?;
         gpu.free_tensor(k_cache).map_err(|e| e.to_string())?;
         gpu.free_tensor(v_cache).map_err(|e| e.to_string())?;
-        Ok(format!("output[0]={:.4}", r[0]))
-    })() {
-        Ok(msg) => CaseOutcome::Pass(msg),
-        Err(err) => CaseOutcome::Fail(err),
-    }
-}
-
-fn asym_case(expected_arch: Option<&str>, n_heads: usize, n_kv: usize, hd: usize) -> CaseOutcome {
-    let mut gpu = match init_gpu(expected_arch) {
-        Ok(gpu) => gpu,
-        Err(outcome) => return outcome,
-    };
-
-    match (|| -> Result<String, String> {
-        let seq = 8usize;
-        let q8_blocks = hd / 32;
-        let q8_bytes_per_pos = n_kv * q8_blocks * 34;
-        let k_bytes = seq * q8_bytes_per_pos;
-        let t4_bytes_per_head = 4 + hd / 2;
-        let v_bytes = seq * n_kv * t4_bytes_per_head;
-
-        let k_cache = gpu.zeros(&[(k_bytes + 3) / 4], DType::F32).map_err(|e| e.to_string())?;
-        let v_cache = gpu.zeros(&[(v_bytes + 3) / 4], DType::F32).map_err(|e| e.to_string())?;
-        let signs1 = gpu.upload_f32(&vec![1.0f32; hd], &[hd]).map_err(|e| e.to_string())?;
-        let signs2 = gpu.upload_f32(&vec![1.0f32; hd], &[hd]).map_err(|e| e.to_string())?;
-        let pos_buf = gpu.hip.malloc(4).map_err(|e| e.to_string())?;
-
-        for p in 0..4 {
-            let k_data = gpu.upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd]).map_err(|e| e.to_string())?;
-            let v_data = gpu.upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd]).map_err(|e| e.to_string())?;
-            let pv = p as i32;
-            gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| e.to_string())?;
-            gpu.kv_cache_write_q8_0(&k_cache, &k_data, &pos_buf, n_kv, hd).map_err(|e| e.to_string())?;
-            gpu.kv_cache_write_turbo4_v256(&v_cache, &v_data, &pos_buf, &signs1, &signs2, n_kv, hd)
-                .map_err(|e| e.to_string())?;
-            gpu.free_tensor(k_data).map_err(|e| e.to_string())?;
-            gpu.free_tensor(v_data).map_err(|e| e.to_string())?;
-        }
-
-        let q = gpu.upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
-        let pv = 3i32;
-        gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| e.to_string())?;
-        gpu.attention_q8k_turbo4v_256(&q, &k_cache, &v_cache, &o, &pos_buf, &signs1, &signs2, 4, n_heads, n_kv, hd, seq)
-            .map_err(|e| e.to_string())?;
-        let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("asymmetric attention produced non-finite value {}", r[0]))?;
-        gpu.hip.free(pos_buf).map_err(|e| e.to_string())?;
-        gpu.free_tensor(q).map_err(|e| e.to_string())?;
-        gpu.free_tensor(o).map_err(|e| e.to_string())?;
-        gpu.free_tensor(k_cache).map_err(|e| e.to_string())?;
-        gpu.free_tensor(v_cache).map_err(|e| e.to_string())?;
-        gpu.free_tensor(signs1).map_err(|e| e.to_string())?;
-        gpu.free_tensor(signs2).map_err(|e| e.to_string())?;
         Ok(format!("output[0]={:.4}", r[0]))
     })() {
         Ok(msg) => CaseOutcome::Pass(msg),

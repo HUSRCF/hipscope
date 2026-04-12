@@ -33,14 +33,12 @@ fn main() {
     // Parse flags
     let no_think = args.iter().any(|a| a == "--no-think");
     let debug_cmp = args.iter().any(|a| a == "--debug-compare");
-    let use_asym = args.iter().any(|a| a == "--asym");
     let max_tokens: usize = args.iter().position(|a| a == "--max-tokens")
         .and_then(|i| args.get(i + 1).and_then(|v| v.parse().ok()))
         .unwrap_or(2048);
-    let turbo_bits: u8 = if args.iter().any(|a| a == "--turbo2") { 2 }
-        else if args.iter().any(|a| a == "--turbo3") { 3 }
-        else if args.iter().any(|a| a == "--turbo4") { 4 }
-        else { 0 };
+    let kv_mode: &str = if args.iter().any(|a| a == "--givens4") { "givens4" }
+        else if args.iter().any(|a| a == "--givens2") { "givens2" }
+        else { "q8" };
     let image_path = args.iter().position(|a| a == "--image")
         .and_then(|i| args.get(i + 1).cloned());
     let vl_mode = image_path.is_some();
@@ -49,7 +47,7 @@ fn main() {
     let mut skip_next = false;
     for a in args.iter().skip(1) {
         if skip_next { skip_next = false; continue; }
-        if a == "--no-think" || a == "--debug-compare" || a == "--turbo2" || a == "--turbo3" || a == "--turbo4" || a == "--asym" { continue; }
+        if a == "--no-think" || a == "--debug-compare" || a == "--givens4" || a == "--givens2" { continue; }
         if a == "--image" || a == "--max-tokens" { skip_next = true; continue; }
         positional.push(a.as_str());
     }
@@ -121,14 +119,11 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &text_config, &mut gpu).expect("failed to load text weights");
 
     let kv_seq = 4096usize;
-    let mut kv_cache = if use_asym {
-        llama::KvCache::new_gpu_asym_q8k_turbo4v(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap()
-    } else if turbo_bits > 0 {
-        eprintln!("KV cache: turbo{turbo_bits}");
-        llama::KvCache::new_gpu_turbo(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq, turbo_bits).unwrap()
-    } else {
-        eprintln!("KV cache: Q8");
-        llama::KvCache::new_gpu_q8(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap()
+    eprintln!("KV cache: {kv_mode}");
+    let mut kv_cache = match kv_mode {
+        "givens4" => llama::KvCache::new_gpu_givens4(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
+        "givens2" => llama::KvCache::new_gpu_givens2(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
+        _ => llama::KvCache::new_gpu_q8(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 

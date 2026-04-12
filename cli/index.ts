@@ -21,7 +21,7 @@ mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
 interface HipfireConfig {
-  kv_cache: string;       // "q8" (default) or "turbo4", "turbo3", "turbo2"
+  kv_cache: string;       // "q8" (default), "givens4", or "givens2"
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
   top_p: number;
@@ -42,7 +42,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["q8", "turbo2", "turbo3", "turbo4"].includes(value);
+    case "kv_cache": return ["q8", "givens4", "givens2", "turbo4", "turbo3", "turbo2"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
     case "repeat_penalty": return typeof value === "number" && value >= 1 && value <= 3;
@@ -122,7 +122,8 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
 
   // Community finetunes (Qwen3.5 architecture, same engine)
-  "carnice:9b":      { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf4",     size_gb: 4.5, min_vram_gb: 6, desc: "Hermes tool-use finetune" },
+  "carnice:9b":      { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.mq4",     size_gb: 5.0, min_vram_gb: 6, desc: "Hermes tool-use, quality-gated MQ4" },
+  "carnice:9b-hf4":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf4",     size_gb: 4.5, min_vram_gb: 6, desc: "Hermes tool-use finetune" },
   "carnice:9b-hf6":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf6",     size_gb: 6.8, min_vram_gb: 8, desc: "Hermes tool-use, higher quality" },
   "qwopus:9b":       { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf4",      size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3 finetune" },
   "qwopus:9b-hf6":   { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf6",      size_gb: 6.8, min_vram_gb: 8, desc: "Qwopus3.5 v3, higher quality" },
@@ -137,6 +138,7 @@ const ALIASES: Record<string, string> = {
   "qwen3.5:small": "qwen3.5:0.8b",
   "qwen3": "qwen3:8b",
   "qwen3.5:large": "qwen3.5:27b",
+  "carnice": "carnice:9b",
 };
 
 function resolveModelTag(input: string): string {
@@ -153,6 +155,15 @@ function resolveModelTag(input: string): string {
 
 function downloadUrl(entry: ModelEntry): string {
   return `${HF_BASE}/${entry.repo}/resolve/main/${entry.file}`;
+}
+
+// ─── KV cache mode (turbo aliases → givens) ─────────────
+function resolveKvMode(cfg: HipfireConfig): string {
+  const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
+  // turbo2/3 → givens2, turbo4 → givens4 (backward compat)
+  if (raw === "turbo4") return "givens4";
+  if (raw === "turbo3" || raw === "turbo2") return "givens2";
+  return raw;  // "q8", "givens4", "givens2"
 }
 
 // ─── Daemon IPC ─────────────────────────────────────────
@@ -172,7 +183,7 @@ class Engine {
     const bin = bins.find(p => existsSync(p));
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
 
-    this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+    this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
     this.reader = this.proc.stdout!.getReader();
     this.buffer = "";
     this.lines = [];
@@ -334,11 +345,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 
   if (image && !existsSync(image)) { console.error(`Image not found: ${image}`); process.exit(1); }
 
-  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: path, turbo: turboMode });
+  await e.send({ type: "load", model: path });
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -383,7 +394,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 }
 
 async function serve(port: number) {
-  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
@@ -396,7 +407,7 @@ async function serve(port: number) {
   if (warmPath) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
-      await e.send({ type: "load", model: warmPath, turbo: turboMode });
+      await e.send({ type: "load", model: warmPath });
       const loadResult = await e.recv();
       if (loadResult.type === "error") {
         console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
@@ -528,7 +539,7 @@ async function serve(port: number) {
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path, turbo: turboMode });
+          await e.send({ type: "load", model: path });
           const loadResult = await e.recv();
           if (loadResult.type === "error") {
             current = null;
@@ -883,13 +894,13 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     }
   }
 
-  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
 
   // Start daemon
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: modelPath, turbo: turboMode });
+  await e.send({ type: "load", model: modelPath});
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
 
@@ -942,7 +953,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       try {
         await ve.start();
         await withTimeout(ve.send({ type: "ping" }).then(() => ve.recv()), 10_000, "ping");
-        await ve.send({ type: "load", model: modelPath, turbo: turboMode });
+        await ve.send({ type: "load", model: modelPath});
         const vloaded = await withTimeout(ve.recv(), LOAD_TIMEOUT, `v${v.n} load`);
         if (vloaded.type === "error") {
           console.error(`  v${v.n} ${v.name}: LOAD FAIL — ${vloaded.message}`);
@@ -1097,8 +1108,8 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
       }
     }
     if (modelPath) {
-      const turboMode = process.env.TURBO ? Number(process.env.TURBO) : (cfg.kv_cache === "q8" ? 0 : Number(cfg.kv_cache.replace("turbo", "")));
-      await e.send({ type: "load", model: modelPath, turbo: turboMode });
+      process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+      await e.send({ type: "load", model: modelPath});
       const loaded = await e.recv();
       if (loaded.type === "error") {
         console.error(`Load failed: ${loaded.message}`);
@@ -1648,7 +1659,7 @@ Examples:
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: q8, turbo2, turbo3, turbo4",
+          kv_cache: "one of: q8, givens4, givens2 (turbo2/3/4 also accepted)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
           repeat_penalty: "number between 1.0 and 3.0",

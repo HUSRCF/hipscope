@@ -72,12 +72,11 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let turbo_bits: u8 = std::env::var("TURBO").and_then(|v| v.parse().map_err(|_| std::env::VarError::NotPresent)).unwrap_or(0);
-    let mut kv_cache = if turbo_bits >= 2 && turbo_bits <= 4 {
-        eprintln!("KV cache: turbo{turbo_bits}");
-        llama::KvCache::new_gpu_turbo(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, turbo_bits).unwrap()
-    } else {
-        llama::KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap()
+    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let mut kv_cache = match kv_mode.as_str() {
+        "givens4" => { eprintln!("KV cache: givens4"); llama::KvCache::new_gpu_givens4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
+        "givens2" => { eprintln!("KV cache: givens2"); llama::KvCache::new_gpu_givens2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
+        _ => llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
     };
     let mut dn_state = if std::env::var("FP32_STATE").is_ok() {
         DeltaNetState::new_with_quant(&mut gpu, &config, engine::qwen35::StateQuant::FP32).unwrap()

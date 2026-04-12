@@ -51,8 +51,8 @@ const CASES: &[CaseDef] = &[
     CaseDef { name: "sequence_no_hang", timeout: Duration::from_secs(20) },
     CaseDef { name: "think_token_detectable", timeout: Duration::from_secs(10) },
     CaseDef { name: "chatml_single_tokens", timeout: Duration::from_secs(10) },
-    CaseDef { name: "asym_cache_allocates", timeout: Duration::from_secs(20) },
-    CaseDef { name: "asym_forward_no_hang", timeout: Duration::from_secs(20) },
+    CaseDef { name: "givens4_cache_allocates", timeout: Duration::from_secs(20) },
+    CaseDef { name: "givens4_forward_no_hang", timeout: Duration::from_secs(20) },
     CaseDef { name: "decode_speed_sanity", timeout: Duration::from_secs(35) },
     CaseDef { name: "vram_leak_signal", timeout: Duration::from_secs(20) },
 ];
@@ -234,8 +234,8 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
             "sequence_no_hang" => sequence_no_hang(&mut ctx),
             "think_token_detectable" => think_token_detectable(&mut ctx),
             "chatml_single_tokens" => chatml_single_tokens(&mut ctx),
-            "asym_cache_allocates" => asym_cache_allocates(&mut ctx),
-            "asym_forward_no_hang" => asym_forward_no_hang(&mut ctx),
+            "givens4_cache_allocates" => givens4_cache_allocates(&mut ctx),
+            "givens4_forward_no_hang" => givens4_forward_no_hang(&mut ctx),
             "decode_speed_sanity" => decode_speed_sanity(&mut ctx),
             "vram_leak_signal" => vram_leak_signal(&mut ctx),
             other => CaseOutcome::Fail(format!("unknown case: {other}")),
@@ -463,8 +463,8 @@ fn chatml_single_tokens(ctx: &mut Context) -> CaseOutcome {
 }
 
 #[cfg(feature = "deltanet")]
-fn asym_cache_allocates(ctx: &mut Context) -> CaseOutcome {
-    match llama::KvCache::new_gpu_asym_q8k_turbo4v(
+fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
+    match llama::KvCache::new_gpu_givens4(
         &mut ctx.gpu,
         ctx.config.n_layers,
         ctx.config.n_kv_heads,
@@ -472,20 +472,20 @@ fn asym_cache_allocates(ctx: &mut Context) -> CaseOutcome {
         128,
     ) {
         Ok(kv) => {
-            if kv.quant_asym && kv.quant_q8 && kv.quant_turbo == 4 && kv.turbo_signs1.is_some() && kv.turbo_signs2.is_some() {
-                CaseOutcome::Pass(format!("allocated asymmetric KV for {} layers", ctx.config.n_layers))
+            if kv.quant_givens4 && kv.givens_cos.is_some() && kv.givens_sin.is_some() {
+                CaseOutcome::Pass(format!("allocated givens4 KV for {} layers", ctx.config.n_layers))
             } else {
-                CaseOutcome::Fail("asymmetric KV cache flags were inconsistent".to_string())
+                CaseOutcome::Fail("givens4 KV cache flags were inconsistent".to_string())
             }
         }
-        Err(err) => CaseOutcome::Fail(format!("failed to allocate asymmetric KV cache: {err}")),
+        Err(err) => CaseOutcome::Fail(format!("failed to allocate givens4 KV cache: {err}")),
     }
 }
 
 #[cfg(feature = "deltanet")]
-fn asym_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
+fn givens4_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
-        let mut kv = llama::KvCache::new_gpu_asym_q8k_turbo4v(
+        let mut kv = llama::KvCache::new_gpu_givens4(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,

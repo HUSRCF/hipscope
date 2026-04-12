@@ -151,13 +151,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "magnum"
-version = "0.1.5-alpha"
-dependencies = [
- "hip-bridge",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

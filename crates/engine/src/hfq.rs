@@ -142,41 +142,6 @@ impl HfqFile {
     }
 }
 
-// ─── Name Mapping ────────────────────────────────────────────────────────────
-
-/// Map safetensors tensor name to GGUF-style name used by the engine.
-fn st_to_gguf_name(st_name: &str) -> Option<String> {
-    // model.embed_tokens.weight → token_embd.weight
-    if st_name == "model.embed_tokens.weight" { return Some("token_embd.weight".into()); }
-    if st_name == "model.norm.weight" { return Some("output_norm.weight".into()); }
-    if st_name == "lm_head.weight" { return Some("output.weight".into()); }
-
-    // model.layers.N.xxx → blk.N.xxx
-    if let Some(rest) = st_name.strip_prefix("model.layers.") {
-        let dot = rest.find('.')?;
-        let layer_num = &rest[..dot];
-        let suffix = &rest[dot + 1..];
-
-        let mapped = match suffix {
-            "input_layernorm.weight" => format!("blk.{layer_num}.attn_norm.weight"),
-            "self_attn.q_proj.weight" => format!("blk.{layer_num}.attn_q.weight"),
-            "self_attn.k_proj.weight" => format!("blk.{layer_num}.attn_k.weight"),
-            "self_attn.v_proj.weight" => format!("blk.{layer_num}.attn_v.weight"),
-            "self_attn.o_proj.weight" => format!("blk.{layer_num}.attn_output.weight"),
-            "self_attn.q_norm.weight" => format!("blk.{layer_num}.attn_q_norm.weight"),
-            "self_attn.k_norm.weight" => format!("blk.{layer_num}.attn_k_norm.weight"),
-            "post_attention_layernorm.weight" => format!("blk.{layer_num}.ffn_norm.weight"),
-            "mlp.gate_proj.weight" => format!("blk.{layer_num}.ffn_gate.weight"),
-            "mlp.up_proj.weight" => format!("blk.{layer_num}.ffn_up.weight"),
-            "mlp.down_proj.weight" => format!("blk.{layer_num}.ffn_down.weight"),
-            _ => return None,
-        };
-        return Some(mapped);
-    }
-
-    None
-}
-
 // ─── Config from HFQ metadata ───────────────────────────────────────────────
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<LlamaConfig> {

@@ -432,6 +432,7 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     }).collect()
 }
 
+
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.

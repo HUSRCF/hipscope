@@ -1208,14 +1208,7 @@ pub fn forward_scratch_layers(
 
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        if kv_cache.quant_hfq4s {
-            gpu.kv_cache_write_hfq4s(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_hfq4s(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_hfq4s_kv(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        } else if kv_cache.quant_hfq4 {
+        if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_hfq4_kv(
@@ -1239,42 +1232,6 @@ pub fn forward_scratch_layers(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
-        } else if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
-                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
-            // Layer-adaptive: first/last layers use FP32 KV for max quality
-            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        } else if kv_cache.quant_turbo > 0 {
-            let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
-            let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
-            match kv_cache.quant_turbo {
-                4 => {
-                    gpu.kv_cache_write_turbo4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo4_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                3 => {
-                    gpu.kv_cache_write_turbo3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo3_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                2 => {
-                    gpu.kv_cache_write_turbo2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo2_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                _ => panic!("unsupported turbo bits"),
-            }
         } else if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
@@ -1392,15 +1349,7 @@ pub fn forward_early_exit(
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
         // KV write + attention (use same dispatch as forward_scratch_layers)
-        if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
-                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
-            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        } else if kv_cache.quantized && kv_cache.quant_q8 {
+        if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_q8_0_kv(
@@ -1516,14 +1465,7 @@ pub fn forward_scratch_compute(
 
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        if kv_cache.quant_hfq4s {
-            gpu.kv_cache_write_hfq4s(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_hfq4s(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_hfq4s_kv(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        } else if kv_cache.quant_hfq4 {
+        if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_hfq4_kv(
@@ -1547,42 +1489,6 @@ pub fn forward_scratch_compute(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
-        } else if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
-                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
-            // Layer-adaptive: first/last layers use FP32 KV for max quality
-            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        } else if kv_cache.quant_turbo > 0 {
-            let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
-            let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
-            match kv_cache.quant_turbo {
-                4 => {
-                    gpu.kv_cache_write_turbo4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo4_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                3 => {
-                    gpu.kv_cache_write_turbo3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo3_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                2 => {
-                    gpu.kv_cache_write_turbo2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo2_kv(&scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &scratch.attn_out, &scratch.pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                _ => panic!("unsupported turbo bits"),
-            }
         } else if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
@@ -1716,41 +1622,12 @@ pub fn forward(
         gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
         // Store K, V in GPU cache + attention
-        if kv_cache.quant_turbo > 0 {
-            let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
-            let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
-            match kv_cache.quant_turbo {
-                4 => {
-                    gpu.kv_cache_write_turbo4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &k, &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo4_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                3 => {
-                    gpu.kv_cache_write_turbo3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &k, &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo3_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                2 => {
-                    gpu.kv_cache_write_turbo2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &k, &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
-                    gpu.attention_turbo2_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
-                }
-                _ => panic!("unsupported turbo bits"),
-            }
-        } else {
-            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
-        }
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+        gpu.attention_f32(
+            &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+        )?;
         // Output projection: o = Wo * attn_out
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
 
@@ -1969,19 +1846,6 @@ fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
     }
 }
 
-/// Apply per-head RMSNorm (for Qwen3 QK normalization).
-fn per_head_rmsnorm_cpu(data: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
-    for h in 0..n_heads {
-        let base = h * head_dim;
-        let head = &data[base..base + head_dim];
-        let ss: f32 = head.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
-        let rms = 1.0 / (ss + eps).sqrt();
-        for d in 0..head_dim {
-            data[base + d] = data[base + d] * rms * weight[d];
-        }
-    }
-}
-
 /// GPU-resident KV cache for autoregressive generation.
 /// Pre-allocates [max_seq * n_kv_heads * head_dim] per layer on GPU.
 pub struct KvCache {
@@ -1997,17 +1861,12 @@ pub struct KvCache {
     pub quant_q8: bool,
     pub quant_int8: bool,        // true = INT8 with separate scales
     pub quant_hfq4: bool,        // true = HFQ4 co-located blocks (72 bytes/head)
-    pub quant_hfq4s: bool,       // true = HFQ4 + sign-flip decorrelation
-    pub quant_turbo: u8,         // 0=off, 2=turbo_hfq2, 3=turbo_hfq3, 4=turbo_hfq4
-    pub quant_asym: bool,        // true = asymmetric: K=Q8, V=turbo4 (FWHT + centroid LUT)
-    pub quant_hf4v: bool,        // true = asymmetric: K=Q8, V=HF4 (affine 4-bit, no FWHT)
     pub quant_givens4: bool,     // true = block-diagonal Givens rotation + 4-bit centroids (flash-compatible)
     pub quant_givens2: bool,     // true = block-diagonal Givens rotation + 2-bit centroids (3.8× vs Q8)
-    pub turbo_adaptive: bool,    // true = boundary layers use Q8 KV (TurboQuant+ LA-V7)
     pub boundary_layers: u8,     // number of boundary layers at each end (default 2)
-    pub turbo_signs1: Option<GpuTensor>,  // FWHT sign table (head_dim × f32, ±1.0)
-    pub turbo_signs2: Option<GpuTensor>,
-    /// Per-layer flag: true = this layer uses Q8 (boundary), false = turbo
+    pub givens_cos: Option<GpuTensor>,  // Givens rotation cos table (n_blocks × f32)
+    pub givens_sin: Option<GpuTensor>,  // Givens rotation sin table (n_blocks × f32)
+    /// Per-layer flag: true = this layer uses Q8 (boundary layer)
     pub layer_is_boundary: Vec<bool>,
 }
 
@@ -2034,7 +1893,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -2058,7 +1917,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
@@ -2078,7 +1937,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
@@ -2096,7 +1955,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
@@ -2114,26 +1973,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
-    }
-
-    /// Create HFQ4 KV cache with sign-flip decorrelation. Same format, better quality.
-    pub fn new_gpu_hfq4s_kv(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-    ) -> HipResult<Self> {
-        let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_block = 8 + head_dim / 2;
-        let bytes_per_pos = n_kv_heads * bytes_per_block;
-        let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-        }
-        eprintln!("KV cache: HFQ4+sign (72B/head, 7.1x vs fp32)");
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: true, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
@@ -2153,7 +1993,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
@@ -2175,72 +2015,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: false, boundary_layers: 0, turbo_signs1: None, turbo_signs2: None, layer_is_boundary: vec![] })
-    }
-
-    /// Create TurboQuant KV cache. `bits` = 2, 3, or 4.
-    /// turbo_hfq2: 36B/head (14.2x vs fp32), turbo_hfq3: 52B/head (9.85x), turbo_hfq4: 68B/head (7.5x).
-    pub fn new_gpu_turbo(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-        bits: u8,
-    ) -> HipResult<Self> {
-        Self::new_gpu_turbo_adaptive(gpu, n_layers, n_kv_heads, head_dim, max_seq_len, bits, false)
-    }
-
-    /// Create TurboQuant KV cache with optional layer-adaptive mode.
-    /// When adaptive=true, first and last layers use FP32 KV for max quality.
-    pub fn new_gpu_turbo_adaptive(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-        bits: u8, adaptive: bool,
-    ) -> HipResult<Self> {
-        let real_bits = if bits == 12 { 2u8 } else { bits };
-        assert!(real_bits == 2 || real_bits == 3 || real_bits == 4, "turbo bits must be 2, 3, 4, or 12");
-        assert!(head_dim == 128 || head_dim == 256, "turbo KV cache requires head_dim=128 or 256 (got {head_dim})");
-
-        let kv_dim = n_kv_heads * head_dim;
-        let turbo_bytes_per_head = match real_bits {
-            2 => 4 + head_dim / 4,
-            3 => 4 + head_dim / 4 + head_dim / 8,
-            4 => 4 + head_dim / 2,
-            _ => unreachable!(),
-        };
-        let fp32_bytes_per_pos = max_seq_len * kv_dim * 4;
-        let fp32_elems = kv_dim * max_seq_len;
-        let turbo_bytes_per_pos = n_kv_heads * turbo_bytes_per_head;
-        let turbo_cache_bytes = max_seq_len * turbo_bytes_per_pos;
-        let turbo_elems = (turbo_cache_bytes + 3) / 4;
-
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for layer in 0..n_layers {
-            let is_edge = adaptive && (layer == 0 || layer == n_layers - 1);
-            let elems = if is_edge { fp32_elems } else { turbo_elems };
-            k_gpu.push(gpu.zeros(&[elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[elems], DType::F32)?);
-        }
-
-        let signs1 = Self::gen_fwht_signs(42, head_dim);
-        let signs2 = Self::gen_fwht_signs(1042, head_dim);
-        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let mut s1t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        let mut s2t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1t.buf, &s1b)?;
-        gpu.hip.memcpy_htod(&s2t.buf, &s2b)?;
-
-        let label = if adaptive { format!("turbo_hfq{bits}+adaptive") } else { format!("turbo_hfq{bits}") };
-        eprintln!("KV cache: {label} ({turbo_bytes_per_head}B/head turbo, {:.1}x vs fp32{})",
-            (head_dim * 4) as f64 / turbo_bytes_per_head as f64,
-            if adaptive { ", layers 0+last=FP32" } else { "" });
-
-        Ok(Self {
-            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
-            max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: bits, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: adaptive,
-            boundary_layers: 0, turbo_signs1: Some(s1t), turbo_signs2: Some(s2t),
-            layer_is_boundary: vec![],
-        })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Generate deterministic Givens rotation angles from a seed.
@@ -2293,9 +2068,9 @@ impl KvCache {
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: true, quant_givens2: false, turbo_adaptive: false,
-            boundary_layers: 0, turbo_signs1: Some(ct), turbo_signs2: Some(st),
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_givens4: true, quant_givens2: false,
+            boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })
     }
@@ -2334,9 +2109,9 @@ impl KvCache {
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: false, quant_givens2: true, turbo_adaptive: false,
-            boundary_layers: 0, turbo_signs1: Some(ct), turbo_signs2: Some(st),
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_givens4: false, quant_givens2: true,
+            boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })
     }
@@ -2391,138 +2166,9 @@ impl KvCache {
         Ok(Self {
             k_gpu, v_gpu, k_scales, v_scales, kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: 0, quant_asym: false, quant_hf4v: false, quant_givens4: true, quant_givens2: false, turbo_adaptive: false,
-            boundary_layers: 0, turbo_signs1: Some(ct), turbo_signs2: Some(st),
-            layer_is_boundary: vec![],
-        })
-    }
-
-    /// Asymmetric KV cache: Q8 for K (preserves quality), turbo4 for V (free compression).
-    /// Works with head_dim=128 or 256. V gets FWHT + turbo4, K stays Q8_0.
-    /// `boundary`: number of layers at each end to keep at Q8 V (TurboQuant+ LA-V7).
-    /// `n_kv_layers`: actual number of KV-cache-using layers (may be < n_layers for hybrid models).
-    pub fn new_gpu_asym_q8k_turbo4v(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym_q8k_turbo4v_boundary(gpu, n_layers, n_kv_heads, head_dim, max_seq_len, 0, n_layers)
-    }
-
-    pub fn new_gpu_asym_q8k_turbo4v_boundary(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-        boundary: u8, n_kv_layers: usize,
-    ) -> HipResult<Self> {
-        assert!(head_dim == 128 || head_dim == 256, "asymmetric KV needs head_dim 128 or 256 (got {head_dim})");
-        let kv_dim = n_kv_heads * head_dim;
-
-        // K: Q8_0 format (34 bytes per 32 elements)
-        let q8_blocks_per_head = head_dim / 32;
-        let q8_bytes_per_pos = n_kv_heads * q8_blocks_per_head * 34;
-        let k_cache_bytes = max_seq_len * q8_bytes_per_pos;
-        let k_elems = (k_cache_bytes + 3) / 4;
-
-        // V: turbo4 format (4 bytes norm + head_dim/2 nibbles)
-        let turbo_bytes_per_head = 4 + head_dim / 2;
-        let v_bytes_per_pos = n_kv_heads * turbo_bytes_per_head;
-        let v_cache_bytes = max_seq_len * v_bytes_per_pos;
-        let v_elems = (v_cache_bytes + 3) / 4;
-
-        // Boundary layer map indexed by KV ordinal (0..n_kv_layers)
-        // First `boundary` + last `boundary` KV layers at Q8 V (TurboQuant+ LA-V7)
-        let mut layer_is_boundary = vec![false; n_kv_layers];
-        if boundary > 0 && n_kv_layers > 0 {
-            let b = boundary as usize;
-            for i in 0..n_kv_layers {
-                if i < b || i >= n_kv_layers.saturating_sub(b) {
-                    layer_is_boundary[i] = true;
-                }
-            }
-        }
-        let boundary_count = layer_is_boundary.iter().filter(|&&b| b).count();
-
-        // Q8 V for boundary layers (same format/size as K)
-        let q8_v_elems = k_elems;
-
-        // Allocate: all layers get K (Q8). V gets the larger of Q8/turbo4 size
-        // so boundary layers can use Q8 V without a separate allocation path.
-        let v_alloc_elems = if boundary > 0 { std::cmp::max(v_elems, q8_v_elems) } else { v_elems };
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_alloc_elems], DType::F32)?);
-        }
-
-        // FWHT sign tables for V rotation (sized to head_dim)
-        let signs1 = Self::gen_fwht_signs(42, head_dim);
-        let signs2 = Self::gen_fwht_signs(1042, head_dim);
-        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        let s2t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1t.buf, &s1b)?;
-        gpu.hip.memcpy_htod(&s2t.buf, &s2b)?;
-
-        let fp32_bytes = kv_dim * max_seq_len * 4 * 2;
-        let asym_bytes = k_cache_bytes + v_cache_bytes;
-        if boundary > 0 {
-            eprintln!("KV cache: asymmetric q8-K + turbo4-V (hd={head_dim}, {:.1}x vs fp32, boundary={boundary}: {boundary_count} layers at Q8-V)",
-                fp32_bytes as f64 / asym_bytes as f64);
-        } else {
-            eprintln!("KV cache: asymmetric q8-K + turbo4-V (hd={head_dim}, {:.1}x vs fp32, K={:.1}MB V={:.1}MB)",
-                fp32_bytes as f64 / asym_bytes as f64,
-                k_cache_bytes as f64 / 1e6, v_cache_bytes as f64 / 1e6);
-        }
-
-        Ok(Self {
-            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
-            max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: 4, quant_asym: true, quant_hf4v: false, quant_givens4: false, quant_givens2: false, turbo_adaptive: boundary > 0,
-            boundary_layers: boundary, turbo_signs1: Some(s1t), turbo_signs2: Some(s2t),
-            layer_is_boundary,
-        })
-    }
-
-    /// HF4-V: hipfire-native 4-bit V cache. K=Q8, V=affine 4-bit (no FWHT).
-    /// Designed for RDNA: same cache access pattern as Q8, 2x compression.
-    pub fn new_gpu_q8k_hf4v(
-        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-    ) -> HipResult<Self> {
-        assert!(head_dim == 256, "HF4-V requires head_dim=256 (got {head_dim})");
-        let kv_dim = n_kv_heads * head_dim;
-
-        // K: Q8_0 format
-        let q8_bph = (head_dim / 32) * 34;
-        let k_bpp = n_kv_heads * q8_bph;
-        let k_cache_bytes = max_seq_len * k_bpp;
-        let k_elems = (k_cache_bytes + 3) / 4;
-
-        // V: HF4 format (8B header + head_dim/2 nibbles)
-        let hf4_bph = 8 + head_dim / 2;  // 136
-        let v_bpp = n_kv_heads * hf4_bph;
-        let v_cache_bytes = max_seq_len * v_bpp;
-        let v_elems = (v_cache_bytes + 3) / 4;
-
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
-
-        let fp32_bytes = kv_dim * max_seq_len * 4 * 2;
-        let total = k_cache_bytes + v_cache_bytes;
-        eprintln!("KV cache: HF4 (Q8-K + HF4-V, hd={head_dim}, {:.1}x vs fp32, K={:.1}MB V={:.1}MB)",
-            fp32_bytes as f64 / total as f64,
-            k_cache_bytes as f64 / 1e6, v_cache_bytes as f64 / 1e6);
-
-        Ok(Self {
-            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
-            max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: 0, quant_asym: false, quant_hf4v: true, quant_givens4: false, quant_givens2: false, turbo_adaptive: false,
-            boundary_layers: 0, turbo_signs1: None, turbo_signs2: None,
+            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false,
+            quant_givens4: true, quant_givens2: false,
+            boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })
     }
@@ -2543,8 +2189,8 @@ impl KvCache {
         for t in self.v_gpu { let _ = gpu.free_tensor(t); }
         for t in self.k_scales { let _ = gpu.free_tensor(t); }
         for t in self.v_scales { let _ = gpu.free_tensor(t); }
-        if let Some(t) = self.turbo_signs1 { let _ = gpu.free_tensor(t); }
-        if let Some(t) = self.turbo_signs2 { let _ = gpu.free_tensor(t); }
+        if let Some(t) = self.givens_cos { let _ = gpu.free_tensor(t); }
+        if let Some(t) = self.givens_sin { let _ = gpu.free_tensor(t); }
     }
 
     /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).

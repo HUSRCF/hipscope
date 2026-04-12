@@ -59,6 +59,8 @@ pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 
 
+
+
 /// HFQ4-G512: flat 4-bit with 512-weight groups.
 /// Block: [f32 scale][f32 zero][256B nibbles] = 264 bytes per 512 weights (0.516 B/w).
 /// 264B ≈ 1 PCIe TLP, 2 L2 cache lines.
@@ -93,6 +95,22 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kern
 // for batched prefill (FFN down + wo projection) where N prompt tokens share
 // the same weight matrix.
 pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
+
+// FP16-packed variant: dequant to __half, v_pk_fma_f16 inner loop, FP32 accumulation.
+// 2× throughput over FP32 on all RDNA. Same grid/block layout.
+pub const GEMM_HFQ4G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp16.hip");
+
+// WMMA variant: gfx1100+ only. Uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
+// for 16×16 tiled matrix multiply. Same FP16 X input, FP32 Y output.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma2.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k4.hip");
+pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
+pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
+pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
+pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
@@ -373,6 +391,9 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str = include_str!("../../../kernels/s
 /// combines across tiles, normalizes, writes final output.
 pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
 
+/// Turbo common header: shared definitions for turbo/givens kernels.
+pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
+
 /// Givens rotation common header: 2x2 block-diagonal rotation primitives.
 pub const GIVENS_COMMON_SRC: &str = include_str!("../../../kernels/src/givens_common.h");
 
@@ -405,17 +426,6 @@ pub const ATTENTION_FLASH_GIVENS2_TILE_SRC: &str = include_str!("../../../kernel
 pub const KV_CACHE_WRITE_GIVENS2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens2_batched.hip");
 pub const ATTENTION_FLASH_GIVENS2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens2_tile_batched.hip");
 
-/// Flash attention tile kernel for symmetric turbo4 KV (turbo4 K + turbo4 V).
-/// FWHT-forward rotates Q in registers, reads turbo4 K for dot products,
-/// accumulates turbo4 V in FWHT-rotated space. Reduce kernel applies inverse.
-/// Grid: [n_heads, n_tiles]. LDS: tile_size * 4 bytes (scores only).
-pub const ATTENTION_FLASH_TURBO4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_turbo4_tile.hip");
-
-/// Flash attention reduce for turbo4 KV — combines tile partials, normalizes,
-/// then applies fwht_shfl_inverse to convert FWHT-rotated space back to real space.
-/// Grid: [n_heads]. Zero LDS — FWHT inverse uses ds_swizzle_b32 (native RDNA).
-pub const ATTENTION_FLASH_TURBO4_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_turbo4_reduce.hip");
-
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
@@ -429,17 +439,6 @@ pub const ATTENTION_Q8KV_SRC: &str = include_str!("../../../kernels/src/attentio
 /// HFQ4 KV block: co-located FP32 scale+zero + packed nibbles. 72 bytes per head.
 /// Layout per position: [n_kv_heads × 72] bytes. One cache line per head.
 pub const KV_CACHE_WRITE_HFQ4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_hfq4.hip");
-
-
-/// HFQ4 KV with sign-flip decorrelation. Same format as HFQ4 (72B/head),
-/// but values are multiplied by TURBO_SIGNS1 before quantization.
-/// On read: Q is sign-flipped, V output is sign-flipped.
-pub const KV_CACHE_WRITE_HFQ4S_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_hfq4s.hip");
-
-
-/// Attention with HFQ4+sign-flip KV: Q sign-flipped before dot, V output sign-flipped.
-/// Same HFQ4 block format (72B/head). Uses TURBO_SIGNS1 from constant memory.
-pub const ATTENTION_HFQ4S_KV_SRC: &str = include_str!("../../../kernels/src/attention_hfq4s_kv.hip");
 
 
 /// Attention with HFQ4 KV blocks v2. Tight single-block pattern.
@@ -675,49 +674,6 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// TurboQuant KV cache: FWHT rotation + norm-corrected quantization
-// Supports turbo_hfq2 (2-bit), turbo_hfq3 (3-bit), turbo_hfq4 (4-bit)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Shared FWHT + centroid tables used by all turbo kernels.
-/// Included as a preamble in each kernel source string.
-pub const TURBO_COMMON_SRC: &str = include_str!("../../../kernels/src/turbo_common.hip");
-
-
-/// KV cache write kernel for turbo_hfq4 (4-bit).
-/// Layout per head: [f32 norm (4B)][nibbles × head_dim/2 (64B)] = 68 bytes for head_dim=128.
-/// One block per kv_head, thread 0 does all work (head_dim=128 is serial per head).
-pub const KV_CACHE_WRITE_TURBO4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo4.hip");
-
-
-/// KV cache write kernel for turbo_hfq3 (3-bit, split 2+1).
-/// Layout per head: [f32 norm (4B)][2-bit low × hd/4 (32B)][1-bit high × hd/8 (16B)] = 52 bytes.
-/// Fused KV write for turbo_hfq3 (3-bit). K+V in one kernel, 32-thread parallel FWHT.
-/// Grid: n_kv_heads blocks, 32 threads each. Two passes: K then V.
-pub const KV_CACHE_WRITE_TURBO3_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo3.hip");
-
-
-/// KV cache write kernel for turbo_hfq2 (2-bit).
-/// Layout per head: [f32 norm (4B)][2-bit × hd/4 (32B)] = 36 bytes for head_dim=128.
-pub const KV_CACHE_WRITE_TURBO2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo2.hip");
-
-
-/// Attention kernel with turbo_hfq4 KV cache (4-bit, nibble-packed).
-/// One wavefront (32 threads) per attention head.
-/// Q is pre-rotated in shared memory, V output is inverse-rotated.
-pub const ATTENTION_TURBO4_KV_SRC: &str = include_str!("../../../kernels/src/attention_turbo4_kv.hip");
-
-
-/// Optimized attention with turbo_hfq3 KV cache.
-/// Threads own dimensions (4 each × 32 = 128): zero V reduction, warp-shuffle K dots.
-pub const ATTENTION_TURBO3_KV_SRC: &str = include_str!("../../../kernels/src/attention_turbo3_kv.hip");
-
-
-/// Attention kernel with turbo_hfq2 KV cache (2-bit).
-pub const ATTENTION_TURBO2_KV_SRC: &str = include_str!("../../../kernels/src/attention_turbo2_kv.hip");
-
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -756,29 +712,15 @@ pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip")
 
 
 
-// Symmetric turbo for head_dim=256 (both K and V quantized)
-pub const KV_CACHE_WRITE_TURBO4_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo4_256.hip");
-pub const ATTENTION_TURBO4_KV_256_SRC: &str = include_str!("../../../kernels/src/attention_turbo4_kv_256.hip");
-pub const KV_CACHE_WRITE_TURBO2_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo2_256.hip");
-pub const ATTENTION_TURBO2_KV_256_SRC: &str = include_str!("../../../kernels/src/attention_turbo2_kv_256.hip");
-
-// Asymmetric turbo: Q8 K + turbo4 V for head_dim=256
-pub const KV_CACHE_WRITE_TURBO4_V256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo4_v256.hip");
-pub const ATTENTION_Q8K_TURBO4V_256_SRC: &str = include_str!("../../../kernels/src/attention_q8k_turbo4v_256.hip");
-
 /// Deinterleave: split [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] into separate Q and Gate tensors.
 pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterleave.hip");
 
 /// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
 pub const DEINTERLEAVE_BATCHED_SRC: &str = include_str!("../../../kernels/src/deinterleave_batched.hip");
 
-/// Repeat-interleave Q and K key heads up to value heads count.
-/// Replaces the per-head memcpy loop in DeltaNet for asymmetric MQA configs.
+/// Single-token repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk.hip");
 
-/// Batched repeat-interleave: same as above but processes N tokens in one launch.
+/// Batched repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk_batched.hip");
 
-/// HF4-V: hipfire-native 4-bit V cache (no FWHT, 1 FMA dequant, RDNA-optimized layout)
-pub const KV_CACHE_WRITE_HF4V_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_hf4v_256.hip");
-pub const ATTENTION_Q8K_HF4V_256_SRC: &str = include_str!("../../../kernels/src/attention_q8k_hf4v_256.hip");

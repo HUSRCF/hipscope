@@ -1,5 +1,0 @@
-arch=gfx1100
-model=models/qwen3.5-9b.q4.hfq
-prompt=The quick brown fox jumps over the lazy dog. Explain step by step how a combustion engine works, covering the four stroke cycle, fuel injection, and exhaust.
-prompt_tokens=32
-kv=q8, state=default, temp=greedy
