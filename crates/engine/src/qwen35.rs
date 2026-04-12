@@ -1484,19 +1484,12 @@ fn forward_prefill_chunk(
                 // 0.8B has n_key=n_value=16 so the memcpy path runs.
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
-                    // repeat_interleave_qk_f32 takes single-token tensors, so
-                    // loop per row using scratch.dn_q_raw/dn_k_raw as staging.
-                    // Cheap vs. the GEMM + GDN work.
-                    for i in 0..n {
-                        gpu.hip.memcpy_dtod_at(&s.dn_q_raw.buf, 0, &pbs.dn_q_raw_batch.buf, i * k_dim * 4, k_dim * 4)?;
-                        gpu.hip.memcpy_dtod_at(&s.dn_k_raw.buf, 0, &pbs.dn_k_raw_batch.buf, i * k_dim * 4, k_dim * 4)?;
-                        gpu.repeat_interleave_qk_f32(
-                            &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
-                            config.linear_num_key_heads, ratio, hd,
-                        )?;
-                        gpu.hip.memcpy_dtod_at(&pbs.dn_q_batch.buf, i * v_dim * 4, &s.dn_q.buf, 0, v_dim * 4)?;
-                        gpu.hip.memcpy_dtod_at(&pbs.dn_k_batch.buf, i * v_dim * 4, &s.dn_k.buf, 0, v_dim * 4)?;
-                    }
+                    // Batched repeat-interleave: one kernel launch for all N tokens.
+                    gpu.repeat_interleave_qk_f32_batched(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
+                        &pbs.dn_q_batch, &pbs.dn_k_batch,
+                        config.linear_num_key_heads, ratio, hd, n,
+                    )?;
                 } else {
                     // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
                     gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
@@ -1623,35 +1616,11 @@ fn forward_prefill_chunk(
                     layer.wq.k, n,
                 )?;
 
-                // 3. Deinterleave Q + gate per row. The existing kernel
-                // operates on one row at a time; loop N times. Each call
-                // is cheap (8 heads × 256 dims = 2048 elements).
-                for i in 0..n {
-                    let q_full_view = GpuTensor {
-                        buf: unsafe { pbs.fa_q_full_batch.buf.alias() },
-                        shape: vec![q_dim * 2],
-                        dtype: DType::F32,
-                    };
-                    let q_view = GpuTensor {
-                        buf: unsafe { pbs.fa_q_batch.buf.alias() },
-                        shape: vec![q_dim],
-                        dtype: DType::F32,
-                    };
-                    let gate_view = GpuTensor {
-                        buf: unsafe { pbs.fa_gate_batch.buf.alias() },
-                        shape: vec![q_dim],
-                        dtype: DType::F32,
-                    };
-                    // Hack: we can't cheaply "offset" a GpuTensor, so gather
-                    // the row into scratch, deinterleave into per-row scratch,
-                    // then scatter back. 3 cheap memcpys per row.
-                    gpu.hip.memcpy_dtod_at(&s.fa_q_full.buf, 0, &pbs.fa_q_full_batch.buf, i * q_dim * 2 * 4, q_dim * 2 * 4)?;
-                    gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
-                    gpu.hip.memcpy_dtod_at(&pbs.fa_q_batch.buf, i * q_dim * 4, &s.fa_q.buf, 0, q_dim * 4)?;
-                    gpu.hip.memcpy_dtod_at(&pbs.fa_gate_batch.buf, i * q_dim * 4, &s.fa_gate.buf, 0, q_dim * 4)?;
-                    // Keep the view names alive for clarity; no-op.
-                    drop(q_full_view); drop(q_view); drop(gate_view);
-                }
+                // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
+                gpu.deinterleave_f32_batched(
+                    &pbs.fa_q_full_batch, &pbs.fa_q_batch, &pbs.fa_gate_batch,
+                    config.n_heads, config.head_dim, n,
+                )?;
 
                 // 4. Per-head Q/K rmsnorm. rmsnorm_batched uses batch =
                 // number of "rows" of head_dim. For [N × n_heads × head_dim]

@@ -100,6 +100,26 @@ fn main() {
     // prefill path (daemon + greedy_dump both go through it). Inside, this
     // takes the batched LA kernel path for MQ4 models and the FA gather/scatter
     // fallback for FA layers.
+    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    // When profiling, do an unprofile warm-up prefill first to JIT all kernels,
+    // then reset state and profile the second pass.
+    if do_profile {
+        eprintln!("\n=== warm-up prefill (JIT kernels) ===");
+        qwen35::forward_prefill_batch(
+            &mut gpu, &weights, &config, &prompt_tokens, 0,
+            &mut kv_cache, &mut dn_state, &scratch,
+        ).expect("warmup prefill failed");
+        // Reset DeltaNet state for the profiled run
+        dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+        kv_cache = match kv_mode.as_str() {
+            "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+            "givens2" => KvCache::new_gpu_givens2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+            "givens4" => KvCache::new_gpu_givens4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+            _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        };
+        eprintln!("  JIT complete, profiling next pass...");
+        rdna_compute::profile::start();
+    }
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
     let t_prefill = Instant::now();
     qwen35::forward_prefill_batch(
@@ -107,6 +127,25 @@ fn main() {
         &mut kv_cache, &mut dn_state, &scratch,
     ).expect("prefill forward failed");
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    if do_profile {
+        if let Some(entries) = rdna_compute::profile::stop() {
+            let mut by_kernel: std::collections::HashMap<&str, (f64, usize)> = Default::default();
+            for e in &entries {
+                let (time, count) = by_kernel.entry(e.kernel).or_default();
+                *time += e.time_us;
+                *count += 1;
+            }
+            eprintln!("\n=== PROFILE ({} launches, {:.1}ms wall) ===", entries.len(), prefill_ms);
+            let mut kerns: Vec<_> = by_kernel.iter().collect();
+            kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            let total_us: f64 = kerns.iter().map(|(_, (t, _))| t).sum();
+            for (kern, (us, n)) in &kerns {
+                eprintln!("  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%",
+                    us / 1000.0, us / *n as f64, us / total_us * 100.0);
+            }
+            eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
+        }
+    }
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
     eprintln!("  total: {prefill_ms:.1}ms");
     eprintln!("  tok/s: {prefill_tok_s:.1}");

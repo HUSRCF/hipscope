@@ -1447,11 +1447,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemm_qkvza_hfq4g256",
-            kernels::GEMM_QKVZA_HFQ4G256_SRC,
-            "gemm_qkvza_hfq4g256",
-        )?;
+        self.ensure_kernel("gemm_qkvza_hfq4g256", kernels::GEMM_QKVZA_HFQ4G256_SRC, "gemm_qkvza_hfq4g256")?;
         let func = &self.functions["gemm_qkvza_hfq4g256"];
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -1488,8 +1484,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
-        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
@@ -1526,11 +1521,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemm_qkv_hfq4g256",
-            kernels::GEMM_QKV_HFQ4G256_SRC,
-            "gemm_qkv_hfq4g256",
-        )?;
+        self.ensure_kernel("gemm_qkv_hfq4g256", kernels::GEMM_QKV_HFQ4G256_SRC, "gemm_qkv_hfq4g256")?;
         let func = &self.functions["gemm_qkv_hfq4g256"];
 
         let mut aq = a_q.buf.as_ptr();
@@ -1561,8 +1552,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
-        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (q_m + k_m + v_m) as u32;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
@@ -1598,11 +1588,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemm_gate_up_hfq4g256",
-            kernels::GEMM_GATE_UP_HFQ4G256_SRC,
-            "gemm_gate_up_hfq4g256",
-        )?;
+        self.ensure_kernel("gemm_gate_up_hfq4g256", kernels::GEMM_GATE_UP_HFQ4G256_SRC, "gemm_gate_up_hfq4g256")?;
         let func = &self.functions["gemm_gate_up_hfq4g256"];
 
         let mut ag = a_gate.buf.as_ptr();
@@ -1627,8 +1613,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
-        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (gate_m + up_m) as u32;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
@@ -1723,7 +1708,7 @@ impl Gpu {
     /// Bitwise-identical output to calling `gemv_hfq4g256_residual` N times
     /// (preserves the 4-accumulator interleave and pairwise final combine),
     /// so safe to use in the quality-gated forward path. Each block handles
-    /// one row × up to BATCH_TILE (=8) batch elements, amortizing the weight
+    /// one row × up to BATCH_TILE batch elements, amortizing the weight
     /// fetch across the batch loop.
     ///
     /// `x`: [batch_size × K] row-major, `y`: [batch_size × M] row-major.
@@ -1737,11 +1722,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual",
-            kernels::GEMM_HFQ4G256_RESIDUAL_SRC,
-            "gemm_hfq4g256_residual",
-        )?;
+        self.ensure_kernel("gemm_hfq4g256_residual", kernels::GEMM_HFQ4G256_RESIDUAL_SRC, "gemm_hfq4g256_residual")?;
         let func = &self.functions["gemm_hfq4g256_residual"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -1760,9 +1741,7 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        // BATCH_TILE in the kernel — keep in sync.
-        const BATCH_TILE: usize = 8;
-        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
 
         // Bandwidth: weight (read once, amortized across the batch loop on-chip
         // via L1/L2), per-batch x read, per-batch y read-modify-write.
@@ -1814,7 +1793,7 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        let batch_tiles = ((batch_size + 7) / 8) as u32; // ceil(batch_size / BATCH_TILE=8)
+        let batch_tiles = { const BATCH_TILE: usize = 8; ((batch_size + BATCH_TILE - 1) / BATCH_TILE) as u32 };
         let bytes = crate::profile::gemm_hfq4g256_bytes(m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemm_hfq4g256", bytes);
         let result = unsafe {
@@ -4285,6 +4264,47 @@ impl Gpu {
         result
     }
 
+    /// Batched repeat-interleave: repeat key heads across N batch elements in one launch.
+    /// q_src/k_src: [N × n_key_heads × head_dim], q_dst/k_dst: [N × n_key_heads × ratio × head_dim].
+    pub fn repeat_interleave_qk_f32_batched(
+        &mut self,
+        q_src: &GpuTensor, k_src: &GpuTensor,
+        q_dst: &GpuTensor, k_dst: &GpuTensor,
+        n_key_heads: usize, ratio: usize, head_dim: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, "repeat_interleave_qk_f32_batched")?;
+        let func = &self.functions["repeat_interleave_qk_f32_batched"];
+        let mut qsp = q_src.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr();
+        let mut qdp = q_dst.buf.as_ptr();
+        let mut kdp = k_dst.buf.as_ptr();
+        let mut nkh = n_key_heads as i32;
+        let mut r = ratio as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qsp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut qdp as *mut _ as *mut c_void,
+            &mut kdp as *mut _ as *mut c_void,
+            &mut nkh as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let total = (n_key_heads * ratio * head_dim) as u32;
+        let block = 256u32;
+        let grid_x = (total + block - 1) / block;
+        let bytes = n * ((n_key_heads * head_dim * 4) * 2
+                       + (n_key_heads * ratio * head_dim * 4) * 2);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "repeat_interleave_qk_f32_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid_x, n as u32, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Deinterleave: split [A_h0(hd), B_h0(hd), A_h1(hd), B_h1(hd), ...] into A and B.
     /// Replaces per-head memcpy loop (n_heads × 2 ioctls → 1 dispatch).
     pub fn deinterleave_f32(&mut self, interleaved: &GpuTensor, out_a: &GpuTensor, out_b: &GpuTensor,
@@ -4309,6 +4329,38 @@ impl Gpu {
         let bytes = n_heads * head_dim * 4 * 3; // read interleaved, write both outputs
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "deinterleave_f32", bytes);
         let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched deinterleave: split [N × n_heads × head_dim × 2] interleaved
+    /// Q+Gate into separate [N × n_heads × head_dim] Q and Gate tensors.
+    /// Replaces the per-token gather/deinterleave/scatter loop in the FA
+    /// batched prefill path.
+    pub fn deinterleave_f32_batched(&mut self, interleaved: &GpuTensor, out_q: &GpuTensor, out_gate: &GpuTensor,
+                                    n_heads: usize, head_dim: usize, n: usize) -> HipResult<()> {
+        self.ensure_kernel("deinterleave_batched", kernels::DEINTERLEAVE_BATCHED_SRC, "deinterleave_f32_batched")?;
+        let func = &self.functions["deinterleave_f32_batched"];
+        let mut inp = interleaved.buf.as_ptr();
+        let mut qp = out_q.buf.as_ptr();
+        let mut gp = out_gate.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let total = (n_heads * head_dim) as u32;
+        let block = 256u32;
+        let grid_x = (total + block - 1) / block;
+        let bytes = n * n_heads * head_dim * 4 * 3;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "deinterleave_f32_batched", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid_x, n as u32, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -4802,62 +4854,52 @@ impl Gpu {
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
         let func = &self.functions["gated_delta_net_q8"];
 
-        let stride_qkv_bytes = n_heads * head_dim * 4;
-        let stride_ab_bytes = n_heads * 4;
         let n_tiles = (128 / 4) as u32;
 
-        let q_base = q_batch.buf.as_ptr() as *mut u8;
-        let k_base = k_batch.buf.as_ptr() as *mut u8;
-        let v_base = v_batch.buf.as_ptr() as *mut u8;
-        let g_base = gate_batch.buf.as_ptr() as *mut u8;
-        let b_base = beta_batch.buf.as_ptr() as *mut u8;
-        let o_base = output_batch.buf.as_ptr() as *mut u8;
-        let s_ptr_raw = s_q8.buf.as_ptr();
-        let sc_ptr_raw = s_scales.buf.as_ptr();
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
 
-        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * n_tokens;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
-
-        for i in 0..n_tokens {
-            let off_qkv = i * stride_qkv_bytes;
-            let off_ab = i * stride_ab_bytes;
-            let mut qp: *mut c_void = unsafe { q_base.add(off_qkv) as *mut c_void };
-            let mut kp: *mut c_void = unsafe { k_base.add(off_qkv) as *mut c_void };
-            let mut vp: *mut c_void = unsafe { v_base.add(off_qkv) as *mut c_void };
-            let mut gp: *mut c_void = unsafe { g_base.add(off_ab) as *mut c_void };
-            let mut bp: *mut c_void = unsafe { b_base.add(off_ab) as *mut c_void };
-            let mut op: *mut c_void = unsafe { o_base.add(off_qkv) as *mut c_void };
-            let mut sp = s_ptr_raw;
-            let mut scp = sc_ptr_raw;
-            let mut nt = 1i32;
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut qp as *mut _ as *mut c_void,
-                &mut kp as *mut _ as *mut c_void,
-                &mut vp as *mut _ as *mut c_void,
-                &mut gp as *mut _ as *mut c_void,
-                &mut bp as *mut _ as *mut c_void,
-                &mut sp as *mut _ as *mut c_void,
-                &mut scp as *mut _ as *mut c_void,
-                &mut op as *mut _ as *mut c_void,
-                &mut nt as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-            ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, n_tiles, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
-        }
+        // Single launch — the kernel loops over n_tokens internally,
+        // keeping state in F32 LDS across all tokens. Q8 quantization
+        // happens once at the end instead of per-token, reducing noise
+        // accumulation. Not byte-exact with N×1 decode calls but
+        // strictly higher quality.
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, n_tiles, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// GDN recurrence with Q4-quantized S state.

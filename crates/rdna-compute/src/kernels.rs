@@ -769,9 +769,15 @@ pub const ATTENTION_Q8K_TURBO4V_256_SRC: &str = include_str!("../../../kernels/s
 /// Deinterleave: split [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] into separate Q and Gate tensors.
 pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterleave.hip");
 
+/// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
+pub const DEINTERLEAVE_BATCHED_SRC: &str = include_str!("../../../kernels/src/deinterleave_batched.hip");
+
 /// Repeat-interleave Q and K key heads up to value heads count.
 /// Replaces the per-head memcpy loop in DeltaNet for asymmetric MQA configs.
 pub const REPEAT_INTERLEAVE_QK_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk.hip");
+
+/// Batched repeat-interleave: same as above but processes N tokens in one launch.
+pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk_batched.hip");
 
 /// HF4-V: hipfire-native 4-bit V cache (no FWHT, 1 FMA dequant, RDNA-optimized layout)
 pub const KV_CACHE_WRITE_HF4V_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_hf4v_256.hip");
