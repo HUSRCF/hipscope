@@ -1,5 +1,145 @@
 # Changelog
 
+## v0.1.5 "redline" (2026-04-13)
+
+First full (non-alpha) release. Focus: **RotorQuant asymmetric KV cache** for
+multi-turn recall, plus a full UX overhaul that makes hipfire feel like
+Ollama — background daemon, idle eviction, interactive TUI config, per-model
+overrides, and `hipfire run` auto-connecting to a running serve.
+
+### Asymmetric KV cache (asym{4,3,2}) — replaces givens
+
+K is rotated-quantized at 2/3/4-bit with Lloyd-Max centroids; V stays Q8_0
+in normal space. Value-side reuses the existing Q8_0 flash reduce path so
+only K needs the rotation machinery. Always flash, always batched prefill.
+
+- **asym3 is the new default** on every RDNA3/RDNA4 card (5.5× compression
+  vs fp32, verbatim rare-token recall on Qwen 3.5 9B multi-turn).
+- **asym4** — 5.1× compression for headroom-to-spare workflows.
+- **asym2** — 6.0× compression for 8 GB cards (still recall-safe for
+  common tokens).
+- **Legacy aliases:** `turbo`/`turbo3` → asym3, `turbo4` → asym4,
+  `turbo2` → asym2.
+
+The givens2/givens4 rotation family has been fully removed from kernels,
+dispatch, and the daemon. `KvCache::new_gpu_givens{4,2}` /
+`new_gpu_givens4_deferred` are gone. 11 kernel files deleted.
+
+### Multi-turn recall — fixed
+
+Multi-turn prompts like "My name is Kaden. … What is my name?" were
+returning "Kendall" / "Kade" on 9B MQ4 + givens4 KV. Root-caused to
+**two bugs** landing together:
+
+1. **K kernel head_dim=256 half-coverage.** All rotated-K kernels had
+   `tid×4 × 32threads = 128` only — second half of Qwen 3.5's 256-dim head
+   was silently uninitialized. Fixed via explicit 2-pass loop
+   (`half=0,1`). Invisible to md5, perf benchmarks, or single-turn tests.
+2. **KV precision for rare tokens.** 4-bit K collapses the outlier
+   components that carry rare-token identity ("aden" subtoken). asym3's
+   3-bit quantization is precise enough — asymmetric because V reuses Q8_0.
+
+Verified: MQ4 + asym3 KV recalls "Kaden" correctly on 0.8B/4B/9B/27B.
+
+### Flash attention — configurable per codepath
+
+- `flash_mode` config key, tri-state `auto|always|never`.
+- Only affects the Q8 path (asym modes are flash-only — no non-flash
+  kernel exists). TUI surfaces `(ignored — asym is flash-only)` when a
+  user has asym KV selected.
+- `HIPFIRE_ATTN_FLASH` env var accepts any of `auto|always|never|0|1|2|off|on|force`.
+- Dispatch: `use_flash = capture_mode || mode==2 || (mode==1 && ctx≥2048) || ctx>15000`.
+
+### Daemon UX — Ollama-style
+
+- **`hipfire serve -d`** / `--detach` — forks via setsid+nohup, writes PID
+  to `~/.hipfire/serve.pid`, logs to `~/.hipfire/serve.log`. Polls
+  `/health` up to 30s to confirm up.
+- **`hipfire stop`** — SIGTERM + 5s grace + SIGKILL fallback.
+- **`hipfire ps`** — lists daemons, quantize jobs, HF uploads with ETIME
+  + RSS + serve-port status.
+- **`hipfire run` HTTP fallback** — if a serve is running on `cfg.port`,
+  run streams through its `/v1/chat/completions` instead of spawning its
+  own cold-start daemon. Skips the 2-5s load cost per invocation.
+- **Idle eviction** — `idle_timeout` config (default 300s). Serve unloads
+  the model when no request has arrived within the window; next request
+  reloads. 0 = never unload.
+
+### Interactive config TUI
+
+`hipfire config` launches a keyboard-driven settings editor. No more
+hunt-and-peck `config set X Y`.
+
+- ↑↓ nav, ←→/space cycle enum values, -/+ tweak numbers, Enter edits
+  free-text, `r` resets/removes-override, `s` saves, `q` save+quit,
+  Ctrl+C aborts.
+- Long enum lists collapse to `←→ cycle (N/M)` to avoid line-wrap.
+- Values color-coded by source: green if user-set, dim if default.
+- Scripting still works: `hipfire config set <key> <value>`,
+  `hipfire config get <key>`, `hipfire config reset [key]`.
+
+### Per-model config overlays
+
+- `hipfire config <model:tag>` launches the same TUI scoped to that model.
+  Rows show `(inherited)` vs `(overridden)` with cyan highlighting; `r`
+  removes the override instead of resetting.
+- Stored as sparse JSON at `~/.hipfire/per_model_config.json` — only
+  overridden keys are persisted.
+- Resolution order: `--flag > per-model > global > registry default > engine fallback`.
+- Overridable keys: kv_cache, flash_mode, temperature, top_p,
+  repeat_penalty, max_tokens, max_seq, thinking, max_think_tokens.
+  Global-only: port, idle_timeout, default_model.
+- Global TUI has a "[per-model configs]" nav row at the bottom; Enter
+  opens a model picker sub-TUI that lists all registered tags with
+  override count + drill-down.
+
+### New config keys
+
+- **`max_seq`** (default 32768) — KV cache capacity allocated at model
+  load. Wired through to daemon via `params.max_seq` — fixes the pre-
+  existing panic when `max_tokens > 4096` with the old hardcoded default.
+- **`flash_mode`** (default auto) — see above.
+- **`thinking`** (default on) — `on` = model uses `<think>...</think>`
+  (stripped from display); `off` = prepends a no-think directive to the
+  system prompt. Advisory (instruction-tuned models comply).
+- **`max_think_tokens`** (default 0 = unlimited) — reasoning budget per
+  turn. Stored + passed to daemon today; hard enforcement (forced
+  `</think>` emission) is a follow-up.
+- **`idle_timeout`** (default 300s) — serve auto-eviction window.
+
+### Quantize CLI — one-shot download→quantize→upload
+
+`hipfire quantize <hf-id|local-dir>` now supports:
+- `--both` (shorthand for `--format mq4 --format mq6`)
+- `--stem <name>` overrides the output basename
+- `--output-dir <dir>` for multi-format outputs
+- `--upload <owner/repo>` — pushes to HuggingFace after quantize
+- `--create-repo` — invokes `hf repos create --exist-ok` first
+- `--install` — copies to `~/.hipfire/models/` so `hipfire run` finds it
+- `--register <tag>` — writes a user alias to `~/.hipfire/models.json`
+  so the custom tag resolves alongside the built-in registry
+
+Example: `hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both --upload schuttdev/hipfire-qwopus-4b --create-repo --install --register qwopus:4b`
+
+### HuggingFace uploads this cycle
+
+- `schuttdev/hipfire-qwen3.5-{0.8b,4b,9b,27b}` — MQ6 added alongside MQ4
+- `schuttdev/hipfire-qwopus-{4b,9b,27b}` — MQ4 + MQ6 (Jackrong Qwopus 3.5 v3)
+- `schuttdev/hipfire-carnice-{9b,27b}` — MQ4 + MQ6 (kai-os Carnice)
+
+### Misc
+
+- **First-run banner** on bare `hipfire` when `~/.hipfire/config.json`
+  and `~/.hipfire/models/` are both absent — walks new users through
+  `diag → pull → run → config`.
+- **User aliases** — `findModel` consults `~/.hipfire/models.json` before
+  the built-in REGISTRY, so custom fine-tunes addressed by their
+  registered tag always resolve.
+- **Sampler greedy fast-path** for `temperature ≤ 1e-6` — avoids the
+  `1/0 → NaN` path that surfaced at temp=0.
+- **`speed-gate.sh`** switched from the retired `HIPFIRE_KV_MODE=givens4`
+  to `asym3`.
+
 ## v0.1.5-alpha "ichigo" (2026-04-11)
 
 The ichigo release focuses on one thing: **MagnumQuant**, a new 4-bit weight
