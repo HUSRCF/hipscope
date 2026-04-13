@@ -486,13 +486,24 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
 ///
 /// Precondition: `block_size ≤ scratch.max_block_size`,
 /// `ctx_len ≤ scratch.max_ctx_len`.
+/// Run one draft forward over `block_size` positions with `ctx_len` cached
+/// context rows.
+///
+/// `noise_embedding`: if `Some`, uploaded into `scratch.x` before the forward.
+///     If `None`, the caller must have already filled `scratch.x` with B × hidden
+///     F32 embeddings — this avoids the target→host→draft round-trip in the
+///     spec-decode hot loop (both target and draft share the same GPU, so
+///     D2D copies into `scratch.x` suffice).
+/// `target_hidden`: if `Some`, uploaded into `scratch.target_hidden`.
+///     If `None`, the caller must have already filled `scratch.target_hidden`
+///     with `ctx_len × num_extract × hidden` F32 rows.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_forward(
     gpu: &mut Gpu,
     weights: &DflashWeights,
     cfg: &DflashConfig,
-    noise_embedding: &[f32],
-    target_hidden: &[f32],
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
     positions_q: &[i32],
     positions_k: &[i32],
     block_size: usize,
@@ -512,14 +523,22 @@ pub fn draft_forward(
 
     assert!(b <= scratch.max_block_size, "block_size > scratch max");
     assert!(l <= scratch.max_ctx_len, "ctx_len > scratch max");
-    assert_eq!(noise_embedding.len(), b * h, "noise_embedding size");
-    assert_eq!(target_hidden.len(), l * ne * h, "target_hidden size");
+    if let Some(ne_slice) = noise_embedding {
+        assert_eq!(ne_slice.len(), b * h, "noise_embedding size");
+    }
+    if let Some(th_slice) = target_hidden {
+        assert_eq!(th_slice.len(), l * ne * h, "target_hidden size");
+    }
     assert_eq!(positions_q.len(), b, "positions_q size");
     assert_eq!(positions_k.len(), tot, "positions_k size");
 
     // ── 0. Uploads ────────────────────────────────────────────────────────
-    upload_slice_f32(gpu, &scratch.x, noise_embedding)?;
-    upload_slice_f32(gpu, &scratch.target_hidden, target_hidden)?;
+    if let Some(ne_slice) = noise_embedding {
+        upload_slice_f32(gpu, &scratch.x, ne_slice)?;
+    }
+    if let Some(th_slice) = target_hidden {
+        upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
+    }
     upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
 

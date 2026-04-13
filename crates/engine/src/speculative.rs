@@ -1237,28 +1237,27 @@ pub fn spec_step_dflash(
     let mut block: Vec<u32> = vec![mask_token; b];
     block[0] = seed_token;
 
-    // ── 2. noise_embedding = target.embed_tokens(block) on host ──────────
-    // B separate embedding_lookups into target.scratch.x, download each row.
-    let mut noise_embedding: Vec<f32> = Vec::with_capacity(b * h);
-    for &tok in &block {
+    // ── 2. noise_embedding = target.embed_tokens(block) written directly
+    // into draft_scratch.x on GPU (no host round-trip). Target and draft
+    // share the same Gpu, so the embedding lookup can target the draft's
+    // scratch buffer. Avoids 16 × D2H + one H2D per iter (~1 ms saved).
+    for (i, &tok) in block.iter().enumerate() {
+        let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
             crate::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &target.scratch.x, tok, h)?
+                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
             crate::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &target.scratch.x, tok, h)?
+                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
             crate::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &target.scratch.x, tok, h)?
+                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
             crate::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &target.scratch.x, tok, h)?
+                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("dflash: unsupported target embedding format for noise lookup"),
         }
-        let row = gpu.download_f32(&target.scratch.x)?;
-        debug_assert_eq!(row.len(), h);
-        noise_embedding.extend_from_slice(&row);
     }
 
     // ── 3. Position arrays + optional context slice ─────────────────────
@@ -1285,12 +1284,14 @@ pub fn spec_step_dflash(
     let th_slice: &[f32] = &target_hidden_host[th_offset..];
 
     // ── 4. draft_forward ────────────────────────────────────────────────
+    // noise_embedding = None: we wrote embeddings directly into
+    // draft_scratch.x above via D2D (no host round-trip).
     dflash::draft_forward(
         gpu,
         draft_weights,
         draft_cfg,
-        &noise_embedding,
-        th_slice,
+        None,
+        Some(th_slice),
         &positions_q,
         &positions_k,
         b,
