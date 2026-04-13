@@ -2259,6 +2259,22 @@ impl PrefillBatchScratch {
 /// `start_pos .. start_pos + tokens.len()` get populated.
 /// On return, `scratch.logits` holds the logits for the *last* token
 /// (position `start_pos + tokens.len() - 1`).
+///
+/// `hidden_rb`: if `Some`, post-layer residual hidden states are captured
+/// into the ring buffer for the configured extract layers. Used by the
+/// DFlash target-side verify path to batch `verify_dflash_block` into a
+/// single forward launch (MVP does B per-token forwards — 88 ms on 4B;
+/// this path drops it to ~40 ms with batched forward, further improvement
+/// possible with batched lm_head). The per-token fallback also honors it,
+/// so the fast-path eligibility doesn't change behavior.
+///
+/// `per_token_hidden_out`: if `Some`, writes post-output-norm hidden state
+/// for each of the N tokens into the provided [N × dim] buffer. The caller
+/// then loops `weight_gemv(weights.output, hidden_row, logits)` to recover
+/// per-token logits. Required for DFlash verify (needs all B positions'
+/// logits, not just the last). `None` preserves the existing "last token
+/// only" semantics where logits land in `scratch.logits`.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2268,6 +2284,8 @@ pub fn forward_prefill_batch(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -2319,9 +2337,31 @@ pub fn forward_prefill_batch(
         });
 
     if !eligible {
-        // Fallback: per-token loop, byte-identical to decode.
+        // Fallback: per-token loop, byte-identical to decode. If hidden
+        // extraction is requested, use the with_hidden variant so the ring
+        // buffer still gets populated correctly (each call advances head by 1).
+        // When per-token hidden output is also requested, extract post-norm
+        // hidden row-by-row into the caller's buffer.
+        let dim = config.dim;
         for (i, &tok) in tokens.iter().enumerate() {
-            forward_scratch(gpu, weights, config, tok, start_pos + i, kv_cache, dn_state, scratch)?;
+            if let Some(rb) = hidden_rb.as_mut() {
+                forward_scratch_with_hidden(
+                    gpu, weights, config, tok, start_pos + i,
+                    kv_cache, dn_state, scratch, rb,
+                )?;
+            } else {
+                forward_scratch(gpu, weights, config, tok, start_pos + i, kv_cache, dn_state, scratch)?;
+            }
+            if let Some(dst) = per_token_hidden_out {
+                // scratch.tmp holds post-output-norm hidden after
+                // forward_scratch_{with_hidden,layers} — it's the same buffer
+                // lm_head reads from. Copy into the caller's output.
+                gpu.hip.memcpy_dtod_at(
+                    &dst.buf, i * dim * 4,
+                    &scratch.tmp.buf, 0,
+                    dim * 4,
+                )?;
+            }
         }
         return Ok(());
     }
@@ -2334,10 +2374,19 @@ pub fn forward_prefill_batch(
         while chunk_start < n {
             let chunk_end = (chunk_start + MAX_BATCH).min(n);
             let chunk = &tokens[chunk_start..chunk_end];
+            let chunk_n = chunk.len();
+            // The chunk only reads the ring buffer's head/dims to place its
+            // writes. We advance the head AFTER the chunk returns, here in
+            // the caller, to keep the mutable borrow scope tight.
+            let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start));
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
-                kv_cache, dn_state, scratch, &pbs,
+                kv_cache, dn_state, scratch, &pbs, hidden_rb.as_deref(),
+                pth_slot,
             )?;
+            if let Some(rb) = hidden_rb.as_mut() {
+                rb.advance_head_by(chunk_n);
+            }
             chunk_start = chunk_end;
         }
         Ok(())
@@ -2357,6 +2406,16 @@ fn is_batchable_la(dt: DType) -> bool {
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
 /// prefill path. All LA layers go through batched kernels; all FA layers
 /// go through a per-token gather/scatter loop with the inline FA body.
+///
+/// `hidden_rb`: if `Some`, post-layer residual hidden states for configured
+/// extract layers get written into the ring buffer at its current head. The
+/// caller (forward_prefill_batch) advances the head by N after this chunk
+/// completes so writes from the next chunk don't overwrite.
+///
+/// `per_token_hidden_out`: if `Some((dst, offset_rows))`, writes post-output
+/// RMSNorm hidden for each of the N tokens into `dst[offset_rows..offset_rows+N]`
+/// in row-major order. Required for DFlash verify to compute per-position
+/// logits via B sequential `weight_gemv` calls on the caller side.
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -2368,6 +2427,8 @@ fn forward_prefill_chunk(
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<(&GpuTensor, usize)>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -2623,6 +2684,13 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                // Post-layer hidden extract for the DFlash draft path.
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+
                 let _ = is_mq; // retained above for potential future use
                 delta_layer_idx += 1;
             }
@@ -2872,6 +2940,13 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                // Post-layer hidden extract for the DFlash draft path.
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+
                 // Silence unused warning if kv_dim ends up shadowed.
                 let _ = kv_dim;
                 kv_layer_idx += 1;
@@ -2888,6 +2963,16 @@ fn forward_prefill_chunk(
                     run_fa_layer_body(gpu, weights, config, layer_idx, kv_layer_idx, pos, kv_cache, s)?;
                     gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
                 }
+
+                // Post-layer hidden extract for the DFlash draft path. After
+                // the per-token loop, pbs.x_batch has the full layer output
+                // for all N tokens (last copy-back finishes each row).
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+
                 kv_layer_idx += 1;
             }
 
@@ -2895,12 +2980,28 @@ fn forward_prefill_chunk(
         }
     }
 
-    // ── 3. Final logits from the last token only ─────────────────────────
-    // Copy last row of x_batch into s.x, run output rmsnorm + lm_head.
-    let last = n - 1;
-    gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
-    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+    // ── 3. Final output norm + logits ───────────────────────────────────
+    // If the caller requested per-token hidden output (DFlash verify path),
+    // run rmsnorm over all N rows into their buffer. Otherwise use the
+    // legacy last-token-only path.
+    if let Some((dst, offset_rows)) = per_token_hidden_out {
+        let dst_view = dst.sub_offset(offset_rows * dim, n * dim);
+        gpu.rmsnorm_batched(
+            &pbs.x_batch, &weights.output_norm, &dst_view,
+            n, dim, config.norm_eps,
+        )?;
+        // Still populate s.logits with the last-token logits for callers
+        // that rely on it (the legacy prefill path's post-condition).
+        let last = n - 1;
+        let last_view = dst.sub_offset((offset_rows + last) * dim, dim);
+        weight_gemv(gpu, &weights.output, &last_view, &s.logits)?;
+    } else {
+        // Legacy path: only last-token logits.
+        let last = n - 1;
+        gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
+        gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+        weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+    }
 
     Ok(())
 }

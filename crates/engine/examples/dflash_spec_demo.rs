@@ -7,7 +7,12 @@
 //!
 //! Usage:
 //!   dflash_spec_demo --target <target.hfq> --draft <draft.hfq> \
-//!                    --prompt "Hello" [--max 64] [--ctx 512]
+//!                    --prompt "Hello" [--max 64] [--ctx 512] [--ctx-slice N]
+//!
+//! --ctx-slice N: for accept-rate bisect only. Restricts the draft's
+//! context view to the last N positions (instead of the full accumulated
+//! history). Useful if the draft was trained on shorter contexts than the
+//! prompt+decode length we're handing it at inference.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -38,6 +43,8 @@ fn main() {
     let mut prompt: Option<String> = None;
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
+    let mut ctx_slice: Option<usize> = None;
+    let mut kv_mode_str = String::from("q8");
 
     let mut i = 1;
     while i < args.len() {
@@ -62,6 +69,14 @@ fn main() {
                 ctx_capacity = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--ctx-slice" => {
+                ctx_slice = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
+            "--kv-mode" => {
+                kv_mode_str = args[i + 1].clone();
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -75,6 +90,9 @@ fn main() {
     eprintln!("=== dflash_spec_demo ===");
     eprintln!("target: {target_path}");
     eprintln!("draft:  {draft_path}");
+    if let Some(n) = ctx_slice {
+        eprintln!("ctx_slice: last {n} positions only (bisect mode)");
+    }
 
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -102,6 +120,17 @@ fn main() {
     // ── Load target ───────────────────────────────────────────────────
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + draft_cfg.block_size + 16;
+    slot_cfg.kv_mode = match kv_mode_str.as_str() {
+        "q8" => engine::speculative::KvMode::Q8,
+        "asym4" | "turbo4" => engine::speculative::KvMode::Asym4,
+        "asym3" | "turbo3" | "turbo" => engine::speculative::KvMode::Asym3,
+        "asym2" | "turbo2" => engine::speculative::KvMode::Asym2,
+        other => {
+            eprintln!("unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("kv_mode: {:?}", slot_cfg.kv_mode);
     let t1 = Instant::now();
     let mut target =
         ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg).expect("load target");
@@ -189,6 +218,7 @@ fn main() {
             &mut target_snap,
             position,
             seed_token,
+            ctx_slice,
         )
         .expect("spec step");
         stats.record(&step);

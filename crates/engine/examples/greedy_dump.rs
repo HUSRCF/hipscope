@@ -78,6 +78,7 @@ fn main() {
     qwen35::forward_prefill_batch(
         &mut gpu, &weights, &config, &prompt_tokens, 0,
         &mut kv_cache, &mut dn_state, &scratch,
+        None, None,
     ).expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();

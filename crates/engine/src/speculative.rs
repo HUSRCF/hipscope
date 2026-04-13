@@ -26,6 +26,13 @@ use std::path::Path;
 pub enum KvMode {
     /// INT8 co-located K and V (default).
     Q8,
+    /// Asym4: rotated 4-bit K + Q8 V (smaller than Q8, higher-fidelity than asym3).
+    Asym4,
+    /// Asym3: rotated 3-bit K + Q8 V. ~2.7× less KV BW than Q8, tightly-tuned
+    /// kernel for the hot FA attention path. Good choice for long-context verify.
+    Asym3,
+    /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
+    Asym2,
 }
 
 impl Default for KvMode {
@@ -92,13 +99,39 @@ impl ModelSlot {
             .filter(|t| **t == qwen35::LayerType::FullAttention)
             .count();
 
-        let kv_cache = KvCache::new_gpu_q8(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            slot_config.max_seq,
-        )?;
+        // Honor the caller's requested KV cache mode. Default is Q8 for
+        // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
+        // longer contexts — asym3/asym4 cut the verify attention cost.
+        let kv_cache = match slot_config.kv_mode {
+            KvMode::Q8 => KvCache::new_gpu_q8(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Asym4 => KvCache::new_gpu_asym4(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Asym3 => KvCache::new_gpu_asym3(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Asym2 => KvCache::new_gpu_asym2(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+        };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
         let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
@@ -424,6 +457,58 @@ impl HiddenStateRingBuffer {
         self.written += 1;
     }
 
+    /// Advance the write head by `n`. Used by the batched prefill path after
+    /// writing N rows per extract layer in a single dispatch.
+    #[inline]
+    pub fn advance_head_by(&mut self, n: usize) {
+        self.head = (self.head + n) % self.max_positions;
+        self.written += n;
+    }
+
+    /// Copy `n` contiguous rows from `src` (shape `[n × hidden_dim]` row-major)
+    /// into the ring buffer slot for the given extraction layer, starting at
+    /// the CURRENT head position. Handles the ring-buffer wrap: if head + n
+    /// exceeds max_positions, the write splits into a head→end + 0→tail pair.
+    /// Call this once per extracted layer per batched forward, then advance
+    /// the head by `n` via `advance_head_by(n)` at the end.
+    pub fn write_rows_at_head(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        src: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let head = self.head;
+        let max_pos = self.max_positions;
+        if head + n <= max_pos {
+            gpu.hip.memcpy_dtod_at(
+                &self.layer_bufs[extract_idx].buf,
+                head * row_bytes,
+                &src.buf,
+                0,
+                n * row_bytes,
+            )?;
+        } else {
+            let first = max_pos - head;
+            gpu.hip.memcpy_dtod_at(
+                &self.layer_bufs[extract_idx].buf,
+                head * row_bytes,
+                &src.buf,
+                0,
+                first * row_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &self.layer_bufs[extract_idx].buf,
+                0,
+                &src.buf,
+                first * row_bytes,
+                (n - first) * row_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reset to empty (head=0, written=0). GPU buffers are not zeroed; stale
     /// data is simply unreadable because `written < max_positions`.
     pub fn reset(&mut self) {
@@ -632,13 +717,17 @@ pub struct DflashVerifyOutput {
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
 /// advances B times). Returns downloaded logits + argmax per position.
 ///
-/// MVP path: B sequential `forward_scratch_with_hidden` calls. Each
-/// call quantizes K/V into the KV cache at the relevant position and
-/// extracts hidden states at the configured dflash layers.
+/// Fast path (0.1.7 batched verify): one `forward_prefill_batch` call
+/// over all B tokens with hidden extraction + per-token post-output-norm
+/// hidden capture. Then B sequential `weight_gemv`s against the target's
+/// lm_head to get per-position logits. The batched layer-level kernels
+/// amortize launch overhead across all B tokens; the lm_head still loops
+/// because a batched Q8/MQ4 lm_head GEMM isn't wired yet (task #13).
 ///
-/// Phase 7 optimization target: a single batched forward over the B
-/// positions (a `forward_prefill_batch_with_hidden` variant) so the
-/// GEMM is one launch instead of B, and only one logits download.
+/// Fallback: when the batched path is ineligible (non-MQ weights,
+/// non-Q8/asym KV cache, N < MIN_BATCH), `forward_prefill_batch` routes
+/// to the per-token loop using `forward_scratch_with_hidden`, so hidden
+/// extraction still works.
 pub fn verify_dflash_block(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -648,26 +737,56 @@ pub fn verify_dflash_block(
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
+    let dim = target.config.dim;
+
+    // Scratch buffer for per-token post-output-norm hidden, [B × dim].
+    // Allocated fresh each verify; ~160 KB at dim=2560, B=16 — negligible
+    // alloc overhead compared to the verify forward.
+    let final_hidden =
+        gpu.alloc_tensor(&[b * dim], rdna_compute::DType::F32)?;
+
+    let batch_result = qwen35::forward_prefill_batch(
+        gpu,
+        &target.weights,
+        &target.config,
+        draft_tokens,
+        start_pos,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        Some(hidden_rb),
+        Some(&final_hidden),
+    );
+    if let Err(e) = batch_result {
+        let _ = gpu.free_tensor(final_hidden);
+        return Err(e);
+    }
+
+    // Per-position lm_head: B sequential GEMVs into target.scratch.logits.
     let mut logits_per_pos: Vec<f32> = Vec::with_capacity(b * vocab);
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
-
-    for (i, &tok) in draft_tokens.iter().enumerate() {
-        qwen35::forward_scratch_with_hidden(
-            gpu,
-            &target.weights,
-            &target.config,
-            tok,
-            start_pos + i,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            hidden_rb,
-        )?;
-        let row = gpu.download_f32(&target.scratch.logits)?;
+    for i in 0..b {
+        let hidden_row = final_hidden.sub_offset(i * dim, dim);
+        let r = llama::weight_gemv(
+            gpu, &target.weights.output, &hidden_row, &target.scratch.logits,
+        );
+        if let Err(e) = r {
+            let _ = gpu.free_tensor(final_hidden);
+            return Err(e);
+        }
+        let row = match gpu.download_f32(&target.scratch.logits) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = gpu.free_tensor(final_hidden);
+                return Err(e);
+            }
+        };
         debug_assert_eq!(row.len(), vocab);
         argmax_per_pos.push(argmax_u32(&row));
         logits_per_pos.extend_from_slice(&row);
     }
+
+    let _ = gpu.free_tensor(final_hidden);
 
     Ok(DflashVerifyOutput {
         argmax_per_pos,
@@ -755,6 +874,12 @@ pub fn download_hidden_block(
 ///   by `seed_target_hidden_from_prompt`).
 /// - `position ≤ draft_scratch.max_ctx_len`.
 /// - `draft_cfg.block_size ≤ draft_scratch.max_block_size`.
+///
+/// `ctx_slice`: if `Some(N)`, the draft only sees the most recent `N` rows
+/// of `target_hidden_host` (with RoPE positions `[position-N..position+B)`).
+/// Use this for accept-rate bisect experiments — if training-time context
+/// was shorter than inference-time, truncation may help. `None` uses the
+/// full cumulative context (the default, distribution-preserving path).
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
@@ -767,6 +892,7 @@ pub fn spec_step_dflash(
     target_snap: &mut DeltaNetSnapshot,
     position: usize,
     seed_token: u32,
+    ctx_slice: Option<usize>,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let h = draft_cfg.hidden;
@@ -809,11 +935,28 @@ pub fn spec_step_dflash(
         noise_embedding.extend_from_slice(&row);
     }
 
-    // ── 3. Position arrays ──────────────────────────────────────────────
+    // ── 3. Position arrays + optional context slice ─────────────────────
     // Q positions: the absolute positions of the block slots, [position..position+B).
-    // K positions: all accepted context positions [0..position), then block [position..position+B).
+    // K positions by default: all accepted context [0..position), then block [position..position+B).
+    //
+    // If `ctx_slice = Some(N)` is set, restrict the draft's context view to
+    // the last `N` rows of target_hidden_host, with RoPE positions
+    // [position-N..position+B). This tests whether distant context hurts
+    // accept rate (e.g., if the draft was trained on shorter contexts).
+    let effective_ctx_len = match ctx_slice {
+        Some(n) => n.min(position),
+        None => position,
+    };
+    let ctx_start = position - effective_ctx_len;
     let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
-    let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
+    let positions_k: Vec<i32> =
+        (ctx_start as i32..(position + b) as i32).collect();
+
+    // Slice target_hidden_host to the last effective_ctx_len rows. When
+    // ctx_slice is None, this is a no-op (ctx_start = 0). Row stride is
+    // num_extract × hidden = ne * h.
+    let th_offset = ctx_start * ne * h;
+    let th_slice: &[f32] = &target_hidden_host[th_offset..];
 
     // ── 4. draft_forward ────────────────────────────────────────────────
     dflash::draft_forward(
@@ -821,24 +964,122 @@ pub fn spec_step_dflash(
         draft_weights,
         draft_cfg,
         &noise_embedding,
-        target_hidden_host,
+        th_slice,
         &positions_q,
         &positions_k,
         b,
-        position,
+        effective_ctx_len,
         draft_scratch,
     )?;
 
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
-    // Each GEMV reads draft_scratch.x[i*h..(i+1)*h] and writes vocab logits
-    // into target.scratch.logits. Download and argmax.
+    // Fast path: a single batched GEMM against target.weights.output over
+    // (B-1) hidden rows at once. Drops lm_head from ~40 ms (B-1 serial
+    // weight_gemv + downloads) to ~8 ms (one batched GEMM + one download)
+    // for MQ4/HFQ4 lm_heads. Falls back to the per-row loop when the
+    // output weight dtype isn't covered by the batched gemm dispatch.
     let mut drafted: Vec<u32> = vec![seed_token]; // drafted[0] = seed (by convention; not used)
-    for i in 1..b {
-        let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-        llama::weight_gemv(gpu, &target.weights.output, &hidden_row, &target.scratch.logits)?;
-        let logits = gpu.download_f32(&target.scratch.logits)?;
-        debug_assert_eq!(logits.len(), vocab);
-        drafted.push(argmax_u32(&logits));
+    let w_out = &target.weights.output;
+    // Fast-paths on the lm_head:
+    //   HFQ4G256 / MQ4G256 → single batched GEMM kernel (best: all math fused).
+    //   Q8_0               → B-1 serial GEMVs with STAGED outputs + single D2H.
+    //                         Saves the per-row PCIe sync that dominated the
+    //                         MVP path (~15 × ~150 µs = 2.3 ms stall budget).
+    //   Anything else      → per-row weight_gemv + download loop (fallback).
+    let use_batched_gemm = matches!(
+        w_out.gpu_dtype,
+        rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256,
+    );
+    // Q8 lm_head is common on typed-up Qwen3.5 exports; we stage the output
+    // writes into a contiguous buffer so the B-1 GEMVs don't serialize on
+    // per-row D2H round-trips (even though the kernels themselves remain
+    // serial — a true batched Q8 GEMM is queued for follow-up).
+    let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
+    if use_batched_gemm {
+        let batch = b - 1;
+        // Draft's hidden rows 1..B live contiguously at offset [h, b*h).
+        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+        let logits_batch =
+            gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+        if matches!(w_out.gpu_dtype, rdna_compute::DType::MQ4G256) {
+            let rotated =
+                gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let rot_result = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = rot_result {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let gr = gpu.gemm_hfq4g256(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            if let Err(e) = gr {
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+        } else {
+            // HFQ4G256: direct batched GEMM, no rotation.
+            let gr = gpu.gemm_hfq4g256(
+                &w_out.buf, &hidden_rows, &logits_batch,
+                w_out.m, w_out.k, batch,
+            );
+            if let Err(e) = gr {
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+        }
+        let logits_host = match gpu.download_f32(&logits_batch) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+        };
+        let _ = gpu.free_tensor(logits_batch);
+        debug_assert_eq!(logits_host.len(), batch * vocab);
+        for i in 0..batch {
+            let row = &logits_host[i * vocab..(i + 1) * vocab];
+            drafted.push(argmax_u32(row));
+        }
+    } else if use_q8_staged {
+        // Staged Q8 path: B-1 GEMVs writing into offset slots of a single
+        // [B-1 × vocab] buffer, then ONE D2H download. Keeps kernels
+        // async-enqueued on the stream without per-row PCIe sync points.
+        let batch = b - 1;
+        let logits_batch =
+            gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+        for i in 0..batch {
+            let hidden_row = draft_scratch.x.sub_offset((i + 1) * h, h);
+            let row_out = logits_batch.sub_offset(i * vocab, vocab);
+            let gr = gpu.gemv_q8_0(&w_out.buf, &hidden_row, &row_out, w_out.m, w_out.k);
+            if let Err(e) = gr {
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+        }
+        let logits_host = match gpu.download_f32(&logits_batch) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+        };
+        let _ = gpu.free_tensor(logits_batch);
+        debug_assert_eq!(logits_host.len(), batch * vocab);
+        for i in 0..batch {
+            let row = &logits_host[i * vocab..(i + 1) * vocab];
+            drafted.push(argmax_u32(row));
+        }
+    } else {
+        // Fallback: per-row weight_gemv loop (unchanged from MVP).
+        for i in 1..b {
+            let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+            llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+            let logits = gpu.download_f32(&target.scratch.logits)?;
+            debug_assert_eq!(logits.len(), vocab);
+            drafted.push(argmax_u32(&logits));
+        }
     }
     for i in 1..b {
         block[i] = drafted[i];

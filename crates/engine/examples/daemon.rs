@@ -642,6 +642,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // prefill by a large factor (prefill_tok_s ~5–10× too optimistic).
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
+            None, None,
         ).unwrap();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
