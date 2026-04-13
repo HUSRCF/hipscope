@@ -4616,6 +4616,47 @@ impl Gpu {
         }
     }
 
+    /// GPU-side batched argmax: writes one i32 index per row into `result`
+    /// (shape `[batch_size]`). Avoids downloading `batch_size × n` floats
+    /// to the host — only `batch_size × 4` bytes land on PCIe.
+    pub fn argmax_f32_batched(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "argmax_f32_batched",
+            kernels::ARGMAX_BATCHED_SRC,
+            "argmax_f32_batched",
+        )?;
+        let func = &self.functions["argmax_f32_batched"];
+
+        let mut dp = data.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut nn = n as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8; // f32 + i32 per thread
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [block_size, 1, 1],
+                shared,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;

@@ -857,21 +857,37 @@ pub fn verify_dflash_block(
             let _ = gpu.free_tensor(final_hidden);
             return Err(e);
         }
-        let logits_host = match gpu.download_f32(&logits_batch) {
-            Ok(v) => v,
-            Err(e) => {
+        // GPU-side batched argmax. Writes B i32 indices; we download just
+        // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
+        // PCIe D2H per verify on the 4B Q8 lm_head (~3-5 ms/iter).
+        let argmax_buf = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+        let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b);
+        if let Err(e) = ar {
+            let _ = gpu.free_tensor(argmax_buf);
+            let _ = gpu.free_tensor(logits_batch);
+            let _ = gpu.free_tensor(final_hidden);
+            return Err(e);
+        }
+        let mut host_idx = vec![0i32; b];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4)
+            };
+            if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+                let _ = gpu.free_tensor(argmax_buf);
                 let _ = gpu.free_tensor(logits_batch);
                 let _ = gpu.free_tensor(final_hidden);
                 return Err(e);
             }
-        };
-        let _ = gpu.free_tensor(logits_batch);
-        debug_assert_eq!(logits_host.len(), b * vocab);
-        for i in 0..b {
-            let row = &logits_host[i * vocab..(i + 1) * vocab];
-            argmax_per_pos.push(argmax_u32(row));
         }
-        logits_per_pos = logits_host;
+        let _ = gpu.free_tensor(argmax_buf);
+        let _ = gpu.free_tensor(logits_batch);
+        for &idx in &host_idx {
+            argmax_per_pos.push(idx as u32);
+        }
+        // Greedy path doesn't need `logits_per_pos`; leave empty to avoid
+        // the 15 MB D2H. If temp>0 sampling is added later, reinstate the
+        // download or sample on-GPU.
     } else {
         // Fallback: B sequential GEMVs.
         for i in 0..b {
@@ -1105,81 +1121,63 @@ pub fn spec_step_dflash(
     // per-row D2H round-trips (even though the kernels themselves remain
     // serial — a true batched Q8 GEMM is queued for follow-up).
     let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
-    if use_batched_gemm {
+    if use_batched_gemm || use_q8_staged {
+        // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
+        // download just (B-1) × 4 bytes of indices.
         let batch = b - 1;
-        // Draft's hidden rows 1..B live contiguously at offset [h, b*h).
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch =
             gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-        if matches!(w_out.gpu_dtype, rdna_compute::DType::MQ4G256) {
-            let rotated =
-                gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let rot_result = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
-            if let Err(e) = rot_result {
+
+        let gemm_result = match w_out.gpu_dtype {
+            rdna_compute::DType::Q8_0 => {
+                gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+            }
+            rdna_compute::DType::HFQ4G256 => {
+                gpu.gemm_hfq4g256(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+            }
+            rdna_compute::DType::MQ4G256 => {
+                let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+                let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+                if let Err(e) = r1 {
+                    let _ = gpu.free_tensor(rotated);
+                    let _ = gpu.free_tensor(logits_batch);
+                    return Err(e);
+                }
+                let r2 = gpu.gemm_hfq4g256(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
+                r2
             }
-            let gr = gpu.gemm_hfq4g256(
-                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
-            );
-            let _ = gpu.free_tensor(rotated);
-            if let Err(e) = gr {
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-        } else {
-            // HFQ4G256: direct batched GEMM, no rotation.
-            let gr = gpu.gemm_hfq4g256(
-                &w_out.buf, &hidden_rows, &logits_batch,
-                w_out.m, w_out.k, batch,
-            );
-            if let Err(e) = gr {
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-        }
-        let logits_host = match gpu.download_f32(&logits_batch) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
+            _ => unreachable!(),
         };
-        let _ = gpu.free_tensor(logits_batch);
-        debug_assert_eq!(logits_host.len(), batch * vocab);
-        for i in 0..batch {
-            let row = &logits_host[i * vocab..(i + 1) * vocab];
-            drafted.push(argmax_u32(row));
-        }
-    } else if use_q8_staged {
-        // Batched Q8 GEMM (gemm_q8_0_batched): one launch + one D2H. Each
-        // weight block is loaded once and broadcast across all batch lanes
-        // in registers, eliminating the (batch − 1)× weight re-reads of the
-        // serial GEMV loop.
-        let batch = b - 1;
-        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-        let logits_batch =
-            gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-        let gr = gpu.gemm_q8_0_batched(
-            &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
-        );
-        if let Err(e) = gr {
+        if let Err(e) = gemm_result {
             let _ = gpu.free_tensor(logits_batch);
             return Err(e);
         }
-        let logits_host = match gpu.download_f32(&logits_batch) {
-            Ok(v) => v,
-            Err(e) => {
+
+        // GPU argmax over (B-1) rows — one kernel, small D2H.
+        let argmax_buf = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+        let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch);
+        if let Err(e) = ar {
+            let _ = gpu.free_tensor(argmax_buf);
+            let _ = gpu.free_tensor(logits_batch);
+            return Err(e);
+        }
+        let mut host_idx = vec![0i32; batch];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+            };
+            if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+                let _ = gpu.free_tensor(argmax_buf);
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-        };
+        }
+        let _ = gpu.free_tensor(argmax_buf);
         let _ = gpu.free_tensor(logits_batch);
-        debug_assert_eq!(logits_host.len(), batch * vocab);
-        for i in 0..batch {
-            let row = &logits_host[i * vocab..(i + 1) * vocab];
-            drafted.push(argmax_u32(row));
+        for &idx in &host_idx {
+            drafted.push(idx as u32);
         }
     } else {
         // Fallback: per-row weight_gemv loop (unchanged from MVP).

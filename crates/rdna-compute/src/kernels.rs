@@ -749,6 +749,10 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
+/// Batched argmax: one block per row, writes B indices with one kernel launch.
+/// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
+pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
