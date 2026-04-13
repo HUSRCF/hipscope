@@ -608,3 +608,118 @@ pub fn spec_step_greedy(
         committed,
     })
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DFlash-specific target-side verify
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Output of a DFlash target verify step.
+pub struct DflashVerifyOutput {
+    /// Target argmax token at each of the B positions. argmax_per_pos[i]
+    /// is what the target would greedy-decode at absolute position
+    /// `start_pos + i` given the preceding context plus `draft_tokens[0..i]`.
+    pub argmax_per_pos: Vec<u32>,
+    /// Full logits downloaded for every position, concatenated row-major
+    /// as `[B * vocab_size]`. The spec step currently only needs argmax,
+    /// but the full logits are kept so temp>0 rejection sampling (Phase
+    /// 7+) can plug in without re-running the target.
+    pub logits_per_pos: Vec<f32>,
+}
+
+/// Run the target on `draft_tokens` (length B) positions starting at
+/// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
+/// positions. Writes B hidden-state rows into `hidden_rb` (ring head
+/// advances B times). Returns downloaded logits + argmax per position.
+///
+/// MVP path: B sequential `forward_scratch_with_hidden` calls. Each
+/// call quantizes K/V into the KV cache at the relevant position and
+/// extracts hidden states at the configured dflash layers.
+///
+/// Phase 7 optimization target: a single batched forward over the B
+/// positions (a `forward_prefill_batch_with_hidden` variant) so the
+/// GEMM is one launch instead of B, and only one logits download.
+pub fn verify_dflash_block(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+) -> HipResult<DflashVerifyOutput> {
+    let b = draft_tokens.len();
+    let vocab = target.config.vocab_size;
+    let mut logits_per_pos: Vec<f32> = Vec::with_capacity(b * vocab);
+    let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
+
+    for (i, &tok) in draft_tokens.iter().enumerate() {
+        qwen35::forward_scratch_with_hidden(
+            gpu,
+            &target.weights,
+            &target.config,
+            tok,
+            start_pos + i,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            hidden_rb,
+        )?;
+        let row = gpu.download_f32(&target.scratch.logits)?;
+        debug_assert_eq!(row.len(), vocab);
+        argmax_per_pos.push(argmax_u32(&row));
+        logits_per_pos.extend_from_slice(&row);
+    }
+
+    Ok(DflashVerifyOutput {
+        argmax_per_pos,
+        logits_per_pos,
+    })
+}
+
+/// Download extracted target hidden states for the most recent B positions
+/// from `hidden_rb` and concat them into a flat `[B × num_extract × hidden]`
+/// host vector in the order expected by `dflash::draft_forward` (per-position,
+/// then per-extract-layer).
+///
+/// Caller typically slices this by `[0..accept_len+1]` of the position
+/// dimension when appending to the cumulative target_hidden buffer used
+/// by subsequent draft forwards.
+///
+/// MVP path: downloads all `num_extract × hidden × B` floats via
+/// `gpu.download_f32` per layer (fine at block size 16 + 5 layers: ~2.6 MB
+/// per verify). Optimizable in 0.1.7 with a GPU-side scatter kernel.
+pub fn download_hidden_block(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    b: usize,
+) -> HipResult<Vec<f32>> {
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let max_pos = hidden_rb.max_positions;
+    let written = hidden_rb.written;
+
+    // Figure out which ring positions hold the most recent B writes.
+    // `head` points to where the NEXT write will land. After B advances,
+    // the most recent B sit at ring slots (head - B) mod max_pos ..
+    // (head - 1) mod max_pos.
+    assert!(b <= written, "verify must have written at least B rows to ring buffer");
+    let head = hidden_rb.head;
+    let start_slot = (head + max_pos - b) % max_pos;
+
+    // Download every extract-layer buffer once (small — ≤ max_pos rows).
+    let mut layer_data: Vec<Vec<f32>> = Vec::with_capacity(num_extract);
+    for buf in &hidden_rb.layer_bufs {
+        layer_data.push(gpu.download_f32(buf)?);
+    }
+
+    // Rearrange into per-position-then-per-extract-layer order.
+    let mut out: Vec<f32> = Vec::with_capacity(b * num_extract * hidden);
+    for pi in 0..b {
+        let slot = (start_slot + pi) % max_pos;
+        for ext in 0..num_extract {
+            let src_off = slot * hidden;
+            out.extend_from_slice(&layer_data[ext][src_off..src_off + hidden]);
+        }
+    }
+
+    debug_assert_eq!(out.len(), b * num_extract * hidden);
+    Ok(out)
+}

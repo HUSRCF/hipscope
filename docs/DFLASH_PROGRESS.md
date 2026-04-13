@@ -132,4 +132,34 @@ in the commit body. Baseline refresh is deferred to 0.1.6 finalization.
   this exists as per-token `forward_scratch_with_hidden`; MVP path
   wires that into a per-block loop (correctness first, batched fast
   path can come in 0.1.7).
+- Deliverables:
+  - `speculative::verify_dflash_block(target, draft_tokens, pos,
+    hidden_rb) -> DflashVerifyOutput`: sequential B-position forward
+    using the existing `forward_scratch_with_hidden`, downloading
+    logits per position. Returns `argmax_per_pos` + raw
+    `logits_per_pos` so temp>0 sampling can plug in later.
+  - `speculative::download_hidden_block(hidden_rb, B) -> Vec<f32>`:
+    gathers extracted hidden states for the most recent B ring-buffer
+    writes into a flat `[B × num_extract × hidden]` row-major host
+    vector — the exact layout `dflash::draft_forward` expects as its
+    `target_hidden` input.
+- Design choices:
+  - Logits stay downloaded to host. B=16 × 248K-vocab × 4B = ~15 MB
+    per verify. Acceptable at PCIe bandwidth.
+  - Argmax is CPU-side (`argmax_u32` already exists in speculative.rs).
+    Fast enough; GPU topk can drop in later.
+  - Hidden download is per-layer (5 buffers × ≤max_positions × 4096
+    × 4 = up to 10 MB per layer; typical ring buffer sizes much smaller).
+    Rearrangement is host-side memcpy — microseconds.
+- Deferred to 0.1.7:
+  - A true `forward_prefill_batch_with_hidden` that writes all B
+    hidden rows in a single launch (current path is B launches).
+  - GPU-side argmax (can save 1 D2H per verify).
+- Status: complete.
+- Completed: 2026-04-13
+
+## Phase 5 — speculative daemon loop
+
+- Goal: the orchestrator that stitches draft_forward + verify_dflash_block
+  + acceptance math into an end-to-end spec decode of N tokens.
 - Status: starting.
