@@ -45,6 +45,7 @@ fn main() {
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
+    let mut block_size_override: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -77,6 +78,10 @@ fn main() {
                 kv_mode_str = args[i + 1].clone();
                 i += 2;
             }
+            "--block-size" => {
+                block_size_override = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -100,7 +105,12 @@ fn main() {
 
     // ── Load draft ────────────────────────────────────────────────────
     let draft_hfq = HfqFile::open(Path::new(&draft_path)).expect("open draft");
-    let draft_cfg = DflashConfig::from_hfq(&draft_hfq).expect("parse DflashConfig");
+    let mut draft_cfg = DflashConfig::from_hfq(&draft_hfq).expect("parse DflashConfig");
+    if let Some(b) = block_size_override {
+        let orig = draft_cfg.block_size;
+        draft_cfg.block_size = b;
+        eprintln!("block_size override: {orig} -> {b} (draft was trained at {orig}; smaller B lowers per-iter cost but may reduce τ)");
+    }
     eprintln!(
         "draft: layers={} hidden={} heads={} kv_heads={} block={} target_layers={:?}",
         draft_cfg.n_layers,
