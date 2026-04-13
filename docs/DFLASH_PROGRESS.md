@@ -244,4 +244,46 @@ accept_rate (accepted / (cycles × (B-1))): 0.105
 
 ## Phase 7 — quantization + HF shipping
 
-- Status: starting.
+- Goal: MQ4-quantize the draft, verify accept rate doesn't tank,
+  upload to `schuttdev/hipfire-qwen3.5-*-dflash` tags, register pulls.
+- Decision (per autonomy contract's scope-cut rule at phase boundary):
+  **defer the full Phase 7 to 0.1.7.** Reasons:
+  1. 0.1.6 already ships a working loop (MVP floor achieved in Phase 6).
+  2. MQ4 quantization needs a matching MQ4 path in the draft forward
+     (new kernels for MQ4 GEMM at block_size=16). That's >1 hour of
+     HIP work and risks a broken kernel blocking the ship.
+  3. The draft at F16 fits in 0.6 GB → 2 GB VRAM per size class, which
+     the 7900 XTX handles fine. MQ4 is a memory optimization for
+     smaller cards, not a speed win on gfx1100.
+  4. HF uploads are on hold until the speedup actually materializes
+     (no point distributing a slow draft).
+- Shipped as part of 0.1.6:
+  - F16 draft in `.hfq` format via `dflash_convert`.
+  - Quality gate stance: dflash path preserves byte-exact greedy
+    on the target's committed tokens by construction (spec decode
+    is distribution-preserving). Gate refresh is the overnight
+    [stale-baseline] deferred task.
+- Status: shipped as-is (F16, local conversion only). Full MQ4
+  quant + HF upload is 0.1.7.
+- Completed: 2026-04-13 (scope cut)
+
+## Phase 8 — benchmarks + docs
+
+- Goal: `docs/SPECULATIVE_DECODING.md` + `docs/BENCHMARKS.md`
+  additions.
+- Deliverables:
+  - `docs/SPECULATIVE_DECODING.md` (new): full user-facing doc of
+    what dflash does, when it helps, how to enable in 0.1.6 (demo
+    binary path), the algorithm, and the known 0.1.6 limitations
+    (no temp>0, no batched verify, F32 draft on GPU, no daemon
+    wiring yet).
+  - `docs/BENCHMARKS.md`: new section "DFlash speculative decoding
+    (preview, 0.1.6)" with the warm-cache numbers from Phase 6
+    alongside the non-dflash baseline. Sets expectations for the
+    0.1.7 speedup targets.
+- Status: complete.
+- Completed: 2026-04-13
+
+## Session wrap-up
+
+See `docs/DFLASH_MORNING_REPORT.md` for the synthesized status.
