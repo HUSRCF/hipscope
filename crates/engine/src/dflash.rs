@@ -23,6 +23,7 @@
 //!   one whole layer of persistence bookkeeping.
 
 use crate::hfq::HfqFile;
+use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -115,27 +116,31 @@ impl DflashConfig {
 // ─── Weights ───────────────────────────────────────────────────────────────
 
 pub struct DflashLayerWeights {
-    pub attn_norm: GpuTensor,      // [hidden]
-    pub wq: GpuTensor,             // [q_dim, hidden]
-    pub wk: GpuTensor,             // [kv_dim, hidden]
-    pub wv: GpuTensor,             // [kv_dim, hidden]
-    pub wo: GpuTensor,             // [hidden, q_dim]
-    pub q_norm: GpuTensor,         // [head_dim]
-    pub k_norm: GpuTensor,         // [head_dim]
-    pub ffn_norm: GpuTensor,       // [hidden]
-    pub w_gate: GpuTensor,         // [intermediate, hidden]
-    pub w_up: GpuTensor,           // [intermediate, hidden]
-    pub w_down: GpuTensor,         // [hidden, intermediate]
+    pub attn_norm: GpuTensor,        // [hidden] — F32, RMSNorm weight
+    pub wq: WeightTensor,            // [q_dim, hidden]
+    pub wk: WeightTensor,            // [kv_dim, hidden]
+    pub wv: WeightTensor,            // [kv_dim, hidden]
+    pub wo: WeightTensor,            // [hidden, q_dim]
+    pub q_norm: GpuTensor,           // [head_dim] — F32
+    pub k_norm: GpuTensor,           // [head_dim] — F32
+    pub ffn_norm: GpuTensor,         // [hidden] — F32
+    pub w_gate: WeightTensor,        // [intermediate, hidden]
+    pub w_up: WeightTensor,          // [intermediate, hidden]
+    pub w_down: WeightTensor,        // [hidden, intermediate]
 }
 
 pub struct DflashWeights {
     /// `fc`: Linear(num_extract × hidden → hidden). Shape: [hidden, num_extract × hidden].
-    pub fc: GpuTensor,
-    pub hidden_norm: GpuTensor,    // [hidden]
-    pub norm: GpuTensor,           // [hidden] — final output norm
+    pub fc: WeightTensor,
+    pub hidden_norm: GpuTensor,    // [hidden] — F32
+    pub norm: GpuTensor,           // [hidden] — F32, final output norm
     pub layers: Vec<DflashLayerWeights>,
+    /// True when at least one matrix weight is MQ4G256 — drives whether
+    /// the draft_forward path needs to allocate FWHT rotation scratches.
+    pub has_mq: bool,
 }
 
+/// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
 fn hfq_tensor_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: Vec<usize>) -> HipResult<GpuTensor> {
     let (info, data) = hfq
         .tensor_data(name)
@@ -162,10 +167,53 @@ fn hfq_tensor_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: Vec<usize>) -
     gpu.upload_f32(&f32_data, &shape)
 }
 
+/// Load a matrix tensor as a `WeightTensor` carrying its native dtype.
+/// Supported quant_types:
+///   1  (F16)      → lifted to F32 on GPU (legacy path).
+///   2  (F32)      → uploaded as F32.
+///   13 (MQ4-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
+///
+/// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
+/// the unaligned byte length; for MQ4 we skip shape verification (the
+/// quantized bytes are not a function of m*k alone — group padding can add
+/// up to 255 trailing bytes per row group).
+fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+    let (info, data) = hfq
+        .tensor_data(name)
+        .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
+    match info.quant_type {
+        1 => {
+            // F16 on disk → F32 on GPU (legacy upload path).
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
+            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+        }
+        2 => {
+            let f32_data: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
+            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+        }
+        13 => {
+            // MQ4-G256: 136 bytes per 256 weights. The buffer is opaque to
+            // the engine; the gemm_hfq4g256 kernel reads it directly.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+        }
+        q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
+    }
+}
+
 impl DflashWeights {
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        let fc_shape = vec![cfg.hidden, cfg.num_extract() * cfg.hidden];
-        let fc = hfq_tensor_f32(hfq, gpu, "fc.weight", fc_shape)?;
+        let fc = hfq_weight(hfq, gpu, "fc.weight", cfg.hidden, cfg.num_extract() * cfg.hidden)?;
         let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
         let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
 
@@ -173,99 +221,57 @@ impl DflashWeights {
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
             let layer = DflashLayerWeights {
-                attn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.input_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                wq: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    vec![cfg.q_dim(), cfg.hidden],
-                )?,
-                wk: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    vec![cfg.kv_dim(), cfg.hidden],
-                )?,
-                wv: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    vec![cfg.kv_dim(), cfg.hidden],
-                )?,
-                wo: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    vec![cfg.hidden, cfg.q_dim()],
-                )?,
-                q_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                k_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                ffn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                w_gate: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    vec![cfg.intermediate, cfg.hidden],
-                )?,
-                w_up: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    vec![cfg.intermediate, cfg.hidden],
-                )?,
-                w_down: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    vec![cfg.hidden, cfg.intermediate],
-                )?,
+                attn_norm: hfq_tensor_f32(hfq, gpu, &format!("{p}.input_layernorm.weight"), vec![cfg.hidden])?,
+                wq: hfq_weight(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), cfg.q_dim(), cfg.hidden)?,
+                wk: hfq_weight(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), cfg.kv_dim(), cfg.hidden)?,
+                wv: hfq_weight(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), cfg.kv_dim(), cfg.hidden)?,
+                wo: hfq_weight(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), cfg.hidden, cfg.q_dim())?,
+                q_norm: hfq_tensor_f32(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), vec![cfg.head_dim])?,
+                k_norm: hfq_tensor_f32(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), vec![cfg.head_dim])?,
+                ffn_norm: hfq_tensor_f32(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), vec![cfg.hidden])?,
+                w_gate: hfq_weight(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), cfg.intermediate, cfg.hidden)?,
+                w_up: hfq_weight(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), cfg.intermediate, cfg.hidden)?,
+                w_down: hfq_weight(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), cfg.hidden, cfg.intermediate)?,
             };
             layers.push(layer);
         }
+
+        let has_mq = std::iter::once(&fc)
+            .chain(layers.iter().flat_map(|l| {
+                [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down].into_iter()
+            }))
+            .any(|w| matches!(w.gpu_dtype, DType::MQ4G256));
+        if has_mq {
+            // The MQ4 dispatch needs the engine's FWHT sign tables uploaded
+            // (matches `gemv_mq4g256_with_rotate`'s setup).
+            gpu.ensure_mq_signs()?;
+        }
+
         Ok(DflashWeights {
             fc,
             hidden_norm,
             norm,
             layers,
+            has_mq,
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.fc);
+        let _ = gpu.free_tensor(self.fc.buf);
         let _ = gpu.free_tensor(self.hidden_norm);
         let _ = gpu.free_tensor(self.norm);
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq);
-            let _ = gpu.free_tensor(l.wk);
-            let _ = gpu.free_tensor(l.wv);
-            let _ = gpu.free_tensor(l.wo);
+            let _ = gpu.free_tensor(l.wq.buf);
+            let _ = gpu.free_tensor(l.wk.buf);
+            let _ = gpu.free_tensor(l.wv.buf);
+            let _ = gpu.free_tensor(l.wo.buf);
             let _ = gpu.free_tensor(l.q_norm);
             let _ = gpu.free_tensor(l.k_norm);
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate);
-            let _ = gpu.free_tensor(l.w_up);
-            let _ = gpu.free_tensor(l.w_down);
+            let _ = gpu.free_tensor(l.w_gate.buf);
+            let _ = gpu.free_tensor(l.w_up.buf);
+            let _ = gpu.free_tensor(l.w_down.buf);
         }
     }
 }
@@ -306,6 +312,11 @@ pub struct DflashScratch {
     // Positions (i32).
     pub positions_q: GpuTensor,          // [B]       i32
     pub positions_k: GpuTensor,          // [L + B]   i32
+
+    // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
+    // single-call requirement: max(max_ctx × num_extract*hidden,
+    // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
+    pub mq_x_rot: Option<GpuTensor>,
 }
 
 impl DflashScratch {
@@ -315,6 +326,19 @@ impl DflashScratch {
         max_block_size: usize,
         max_ctx_len: usize,
     ) -> HipResult<Self> {
+        Self::new_with_mq(gpu, cfg, max_block_size, max_ctx_len, false)
+    }
+
+    /// `with_mq` allocates the FWHT rotation scratch needed when at least
+    /// one matrix weight is MQ4-G256. Sized to handle every per-call
+    /// rotation in the draft forward.
+    pub fn new_with_mq(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+    ) -> HipResult<Self> {
         let b = max_block_size;
         let l = max_ctx_len;
         let tot = l + b;
@@ -323,6 +347,17 @@ impl DflashScratch {
         let inter = cfg.intermediate;
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
+
+        let mq_x_rot = if with_mq {
+            // The widest single rotation: max(max_ctx × ne*h, max_block × max(intermediate, q_dim)).
+            // ne*h on ctx is the `fc` rotation (target_hidden). intermediate is the `w_down`
+            // rotation. q_dim is the `wo` rotation. Take the max so a single
+            // buffer covers them all.
+            let widest = std::cmp::max(l * ne * h, b * std::cmp::max(inter, qd));
+            Some(gpu.alloc_tensor(&[widest], DType::F32)?)
+        } else {
+            None
+        };
 
         Ok(DflashScratch {
             max_block_size: b,
@@ -349,8 +384,10 @@ impl DflashScratch {
             k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
             v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
 
-            positions_q: gpu.alloc_tensor(&[b],   DType::F32)?,   // stored as 4-byte slots; interpreted as i32 by kernels
+            positions_q: gpu.alloc_tensor(&[b],   DType::F32)?,
             positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
+
+            mq_x_rot,
         })
     }
 
@@ -375,10 +412,45 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.v_cat);
         let _ = gpu.free_tensor(self.positions_q);
         let _ = gpu.free_tensor(self.positions_k);
+        if let Some(t) = self.mq_x_rot {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 
 // ─── Forward ───────────────────────────────────────────────────────────────
+
+/// Dispatch a batched GEMM by weight dtype.
+///
+/// Layout (row-major):
+///   x [batch × k]  F32 input activations
+///   w.buf [m × k]  weight, format depends on w.gpu_dtype
+///   y [batch × m]  F32 output
+///
+/// For MQ4-G256, the kernel needs the input FWHT-rotated. We do that into
+/// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
+/// HFQ4-G256 GEMM kernel against the pre-rotated weights.
+fn gemm_dispatch(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &WeightTensor,
+    y: &GpuTensor,
+    batch: usize,
+    mq_x_rot: Option<&GpuTensor>,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch),
+        DType::MQ4G256 => {
+            let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
+            // Use the prefix [0, batch * k) of the rotation scratch.
+            let rot_view = scratch.sub_offset(0, batch * w.k);
+            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
+            gpu.gemm_hfq4g256(&w.buf, &rot_view, y, w.m, w.k, batch)
+        }
+        other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
+    }
+}
 
 /// Upload f32 slice into a GPU tensor (bytes via memcpy_htod).
 fn upload_slice_f32(gpu: &Gpu, dst: &GpuTensor, data: &[f32]) -> HipResult<()> {
@@ -452,20 +524,15 @@ pub fn draft_forward(
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
-    // Treat `target_hidden` as a [L, num_extract*hidden] batch with inner
-    // dim = num_extract*hidden. fc is [hidden, num_extract*hidden].
-    //
-    // gemm_f32_batched(A, B, Y, M, K, N) → Y[M,N] = A[M,K] @ B[N,K]^T.
-    // Pick M=L (batch rows), K=num_extract*hidden (inner), N=hidden
-    // (output). Pass A = target_hidden (the batch) and B = fc (the
-    // weights) so Y[L,hidden] is row-major batch × output.
-    gpu.gemm_f32_batched(
-        &scratch.target_hidden,     // A[L, ne*h]
-        &weights.fc,                // B[hidden, ne*h]
-        &scratch.target_hidden_proj, // Y[L, hidden]
+    // Dispatch on fc weight dtype: F32 → gemm_f32_batched (legacy),
+    // MQ4 → FWHT-rotate target_hidden then gemm_hfq4g256.
+    gemm_dispatch(
+        gpu,
+        &scratch.target_hidden,         // x [L, ne*h]
+        &weights.fc,                    // w [hidden, ne*h]
+        &scratch.target_hidden_proj,    // y [L, hidden]
         l,
-        ne * h,
-        h,
+        scratch.mq_x_rot.as_ref(),
     )?;
     // RMSNorm across each L-row of size hidden with hidden_norm weight.
     gpu.rmsnorm_batched(
@@ -494,17 +561,15 @@ pub fn draft_forward(
             eps,
         )?;
 
-        // Q = x_norm @ wq^T  → [B, q_dim]
-        gpu.gemm_f32_batched(&scratch.x_norm, &layer.wq, &scratch.q,   b, h, qd)?;
-        // K_noise = x_norm @ wk^T → [B, kv_dim]
-        gpu.gemm_f32_batched(&scratch.x_norm, &layer.wk, &scratch.k_noise, b, h, kvd)?;
-        // V_noise = x_norm @ wv^T → [B, kv_dim]
-        gpu.gemm_f32_batched(&scratch.x_norm, &layer.wv, &scratch.v_noise, b, h, kvd)?;
+        // Q/K/V projections — dispatched on each weight's dtype.
+        gemm_dispatch(gpu, &scratch.x_norm, &layer.wq, &scratch.q,       b, scratch.mq_x_rot.as_ref())?;
+        gemm_dispatch(gpu, &scratch.x_norm, &layer.wk, &scratch.k_noise, b, scratch.mq_x_rot.as_ref())?;
+        gemm_dispatch(gpu, &scratch.x_norm, &layer.wv, &scratch.v_noise, b, scratch.mq_x_rot.as_ref())?;
 
-        // K_ctx = target_hidden_proj @ wk^T → [L, kv_dim]
-        gpu.gemm_f32_batched(&scratch.target_hidden_proj, &layer.wk, &scratch.k_ctx, l, h, kvd)?;
-        // V_ctx = target_hidden_proj @ wv^T → [L, kv_dim]
-        gpu.gemm_f32_batched(&scratch.target_hidden_proj, &layer.wv, &scratch.v_ctx, l, h, kvd)?;
+        // K_ctx / V_ctx — same wk/wv weights but projected over the L
+        // accepted-context rows of target_hidden_proj.
+        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wk, &scratch.k_ctx, l, scratch.mq_x_rot.as_ref())?;
+        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wv, &scratch.v_ctx, l, scratch.mq_x_rot.as_ref())?;
 
         // Concat K = [K_ctx | K_noise] → [L + B, kv_dim]
         //         V = [V_ctx | V_noise] → [L + B, kv_dim]
@@ -563,7 +628,7 @@ pub fn draft_forward(
         )?;
 
         // attn_proj = attn_out @ wo^T → [B, hidden]
-        gpu.gemm_f32_batched(&scratch.attn_out, &layer.wo, &scratch.attn_proj, b, qd, h)?;
+        gemm_dispatch(gpu, &scratch.attn_out, &layer.wo, &scratch.attn_proj, b, scratch.mq_x_rot.as_ref())?;
 
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
@@ -575,14 +640,14 @@ pub fn draft_forward(
         gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
 
         // gate = x_norm @ w_gate^T; up = x_norm @ w_up^T
-        gpu.gemm_f32_batched(&scratch.x_norm, &layer.w_gate, &scratch.gate, b, h, cfg.intermediate)?;
-        gpu.gemm_f32_batched(&scratch.x_norm, &layer.w_up,   &scratch.up,   b, h, cfg.intermediate)?;
+        gemm_dispatch(gpu, &scratch.x_norm, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
+        gemm_dispatch(gpu, &scratch.x_norm, &layer.w_up,   &scratch.up,   b, scratch.mq_x_rot.as_ref())?;
 
         // SiLU(gate) * up → gate_up
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
 
         // x = w_down @ gate_up^T  (output [B, hidden])
-        gpu.gemm_f32_batched(&scratch.gate_up, &layer.w_down, &scratch.x, b, cfg.intermediate, h)?;
+        gemm_dispatch(gpu, &scratch.gate_up, &layer.w_down, &scratch.x, b, scratch.mq_x_rot.as_ref())?;
 
         // x = residual_ffn + x
         gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)?;

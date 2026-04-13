@@ -114,8 +114,12 @@ fn main() {
     let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft");
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
 
-    let mut draft_scratch = DflashScratch::new(&mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity)
-        .expect("alloc draft scratch");
+    let mut draft_scratch = DflashScratch::new_with_mq(
+        &mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity, draft_weights.has_mq,
+    ).expect("alloc draft scratch");
+    if draft_weights.has_mq {
+        eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
+    }
 
     // ── Load target ───────────────────────────────────────────────────
     let mut slot_cfg = ModelSlotConfig::default();
