@@ -207,4 +207,41 @@ in the commit body. Baseline refresh is deferred to 0.1.6 finalization.
   loads a target + draft, runs N tokens of speculative decode, prints
   tokens + accept rate + tok/s. Full daemon protocol + `hipfire run
   --dflash` wiring is a nice-to-have.
+- Deliverables (MVP bar):
+  - `crates/engine/examples/dflash_spec_demo.rs` — loads target
+    `.hfq` + draft `.hfq`, tokenizes a prompt, seeds target_hidden,
+    runs `spec_step_dflash` in a loop, emits tokens, reports
+    accept rate + tok/s + acceptance histogram.
+  - Verified on 7900 XTX against z-lab/Qwen3.5-4B-DFlash
+    (converted in-place) + local `~/.hipfire/models/qwen3.5-4b.mq4`:
+
+```
+$ dflash_spec_demo --target ~/.hipfire/models/qwen3.5-4b.mq4 \
+                   --draft /tmp/dflash-test/qwen35-4b-dflash.hfq \
+                   --prompt "The quick brown fox" --max 16 --ctx 128
+prompt tokens (4): [760, 3841, 13477, 37550]
+decoding (max 16 tokens, block_size 16)...
+--- OUTPUT ---
+ jumps over the lazy dog.
+The quick brown fox jumps over the lazy dog.
+The
+--------------
+emitted: 19 tokens in 1.46s  (13.04 tok/s)
+cycles: 7  committed: 25  accepted: 11  τ=1.571  mean_committed=3.571
+accept_rate (accepted / (cycles × (B-1))): 0.105
+```
+
+- **MVP floor hit.** The loop runs, produces coherent output, and
+  measures accept rate. 13 tok/s in debug with first-run JIT is a
+  baseline; release + warm-cache improvements are Phase 7/8 work.
+- Deferred to 0.1.7 (or later 0.1.6 follow-up):
+  - Daemon protocol additions (`spec_load`, `spec_generate`) —
+    requires serve crate edits that aren't needed to prove MVP.
+  - `hipfire run qwen3.5:9b --dflash` CLI flag.
+  - Accept-rate telemetry in `/v1/chat/completions usage`.
+- Status: complete (test-binary level; daemon protocol deferred).
+- Completed: 2026-04-13
+
+## Phase 7 — quantization + HF shipping
+
 - Status: starting.

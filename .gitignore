@@ -33,6 +33,7 @@ docs/superpowers/
 .worktrees/
 .dflash-reference/
 .dflash-ref-hf/
+.dflash-ref-hf-4b/
 
 # Python
 __pycache__/
