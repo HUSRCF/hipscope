@@ -154,6 +154,20 @@ impl KernelCompiler {
             format!("--offload-arch={arch}"),
             "-O3".into(),
         ];
+        // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
+        // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
+        // fails with "file not found". Add well-known candidates as -I flags —
+        // existence-checked so wrong paths on other distros don't leak in.
+        let hip_path = std::env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+        for candidate in [
+            format!("{hip_path}/include"),
+            "/opt/rocm/include".to_string(),
+        ] {
+            if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
+                args.push(format!("-I{candidate}"));
+                break;
+            }
+        }
         for flag in extra.split_whitespace() {
             args.push(flag.to_string());
         }
