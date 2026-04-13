@@ -523,6 +523,28 @@ pub struct LayerWeights {
     pub w_down: WeightTensor,
 }
 
+impl LlamaWeights {
+    /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.token_embd);
+        let _ = gpu.free_tensor(self.output_norm);
+        let _ = gpu.free_tensor(self.output.buf);
+        for l in self.layers {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wq.buf);
+            let _ = gpu.free_tensor(l.wk.buf);
+            let _ = gpu.free_tensor(l.wv.buf);
+            let _ = gpu.free_tensor(l.wo.buf);
+            if let Some(t) = l.q_norm { let _ = gpu.free_tensor(t); }
+            if let Some(t) = l.k_norm { let _ = gpu.free_tensor(t); }
+            let _ = gpu.free_tensor(l.ffn_norm);
+            let _ = gpu.free_tensor(l.w_gate.buf);
+            let _ = gpu.free_tensor(l.w_up.buf);
+            let _ = gpu.free_tensor(l.w_down.buf);
+        }
+    }
+}
+
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 pub fn weight_gemv(
@@ -1133,6 +1155,17 @@ impl ForwardScratch {
             pos_buf: gpu.hip.malloc(4)?,  // single i32
             x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
         })
+    }
+
+    /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [self.x, self.tmp, self.q, self.k, self.v, self.attn_out,
+                  self.o, self.gate, self.up, self.ffn_hidden, self.ffn_out,
+                  self.logits, self.sample_buf, self.repeat_buf,
+                  self.attn_partials, self.x_rot] {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }
 

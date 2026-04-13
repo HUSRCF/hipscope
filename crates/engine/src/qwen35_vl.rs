@@ -65,6 +65,27 @@ pub struct VisionWeights {
     pub merger_fc2_w: GpuTensor, pub merger_fc2_b: GpuTensor,
 }
 
+impl VisionWeights {
+    /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.patch_embed_w);
+        let _ = gpu.free_tensor(self.patch_embed_b);
+        let _ = gpu.free_tensor(self.pos_embed);
+        for l in self.layers {
+            for t in [l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b,
+                      l.norm2_w, l.norm2_b, l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b] {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        let _ = gpu.free_tensor(self.merger_norm_w);
+        let _ = gpu.free_tensor(self.merger_norm_b);
+        let _ = gpu.free_tensor(self.merger_fc1_w);
+        let _ = gpu.free_tensor(self.merger_fc1_b);
+        let _ = gpu.free_tensor(self.merger_fc2_w);
+        let _ = gpu.free_tensor(self.merger_fc2_b);
+    }
+}
+
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
 fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {

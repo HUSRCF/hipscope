@@ -144,11 +144,14 @@ function savePerModelConfigs(all: PerModelConfigs) {
 
 // Return the effective config for a given model tag. Per-model overrides
 // win over global. If tag is null/undefined, returns the global config.
+// Reads the global config fresh each call so edits via `hipfire config set`
+// take effect without restarting a running `hipfire serve`.
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
-  if (!tag) return { ...cfg };
+  const base = loadConfig();
+  if (!tag) return base;
   const resolved = resolveModelTag(tag);
   const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
-  return { ...cfg, ...overrides };
+  return { ...base, ...overrides };
 }
 
 // thinking: "off" prepends a directive to the system prompt asking the model
@@ -907,12 +910,16 @@ async function serve(port: number) {
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
+        // Fall back to the user's configured defaults (global or per-model) when
+        // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
+        // that ignored `hipfire config set max_tokens …`.
+        const effective = resolveModelConfig(body.model);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
-          max_tokens: body.max_tokens ?? 512,
-          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : 1.05),
-          top_p: body.top_p ?? 0.8,
+          temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
+          max_tokens: body.max_tokens ?? effective.max_tokens,
+          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
+          top_p: body.top_p ?? effective.top_p,
         };
         // Per-model thinking mode: prepend the "no-think" directive when
         // this model's override (or the global config) sets thinking=off.

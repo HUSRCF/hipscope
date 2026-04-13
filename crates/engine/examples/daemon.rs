@@ -326,12 +326,17 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
 }
 
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
     if let Some(kv) = m.kv_cache { kv.free_gpu(gpu); }
     if let Some(dn) = m.dn_state { dn.free_gpu(gpu); }
     if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
     if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
-    // Weights and ForwardScratch also hold GPU tensors but we don't have free_gpu for them yet
-    // TODO: add free_gpu for Qwen35Weights, LlamaWeights, ForwardScratch
+    if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
+    // actually returns VRAM to the system, not just the cache.
+    if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
     gpu.drain_pool();
 }
 

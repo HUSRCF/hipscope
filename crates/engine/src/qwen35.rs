@@ -140,6 +140,48 @@ pub struct Qwen35Weights {
     pub layers: Vec<LayerWeights>,
 }
 
+impl Qwen35Weights {
+    /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.token_embd);
+        let _ = gpu.free_tensor(self.output_norm);
+        let _ = gpu.free_tensor(self.output.buf);
+        for layer in self.layers {
+            match layer {
+                LayerWeights::DeltaNet(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wqkv.buf);
+                    let _ = gpu.free_tensor(l.wz.buf);
+                    let _ = gpu.free_tensor(l.w_alpha.buf);
+                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    let _ = gpu.free_tensor(l.w_gate.buf);
+                    let _ = gpu.free_tensor(l.w_up.buf);
+                    let _ = gpu.free_tensor(l.w_down.buf);
+                }
+                LayerWeights::FullAttn(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wq.buf);
+                    let _ = gpu.free_tensor(l.wk.buf);
+                    let _ = gpu.free_tensor(l.wv.buf);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    let _ = gpu.free_tensor(l.w_gate.buf);
+                    let _ = gpu.free_tensor(l.w_up.buf);
+                    let _ = gpu.free_tensor(l.w_down.buf);
+                }
+            }
+        }
+    }
+}
+
 // ─── State ──────────────────────────────────────────────────────────────
 
 /// Persistent state for DeltaNet layers across tokens.
