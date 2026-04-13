@@ -790,7 +790,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
-        eprintln!("  loading output (tied embeddings)...");
+        eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
         let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
         if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
@@ -798,6 +798,15 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256, _ => unreachable!()
             };
             WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 13 {
+            // MQ4-G256 tied embedding — produced by hipfire-quantize
+            // `--format mq4-all`. DFlash uses this to make the target's
+            // lm_head (tied to embed_tokens) hit the batched MQ4 GEMM path.
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 14 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
         } else if embd_info.0.quant_type == 3 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
             WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
