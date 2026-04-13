@@ -46,6 +46,8 @@ fn main() {
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
     let mut block_size_override: Option<usize> = None;
+    let mut temp: f32 = 0.0;
+    let mut seed: u64 = 42;
 
     let mut i = 1;
     while i < args.len() {
@@ -80,6 +82,14 @@ fn main() {
             }
             "--block-size" => {
                 block_size_override = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
+            "--temp" => {
+                temp = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--seed" => {
+                seed = args[i + 1].parse().unwrap();
                 i += 2;
             }
             other => {
@@ -229,6 +239,11 @@ fn main() {
         std::collections::VecDeque::with_capacity(TAU_WINDOW);
     let live_tau = std::env::var("DFLASH_LIVE_TAU").is_ok();
 
+    let mut rng_state: u64 = seed | 1; // xorshift state must be non-zero
+    if temp > 0.0 {
+        eprintln!("temp sampling: T={temp}, seed={seed}");
+    }
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
@@ -248,6 +263,8 @@ fn main() {
             seed_token,
             ctx_slice,
             Some(&mut gdn_tape),
+            temp,
+            &mut rng_state,
         )
         .expect("spec step");
         stats.record(&step);

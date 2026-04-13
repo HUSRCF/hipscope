@@ -779,6 +779,80 @@ fn argmax_u32(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// Temperature-scaled softmax. Writes into `out` (reused across calls to
+/// avoid per-position allocation in the rejection-sampling hot loop).
+#[inline]
+fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(logits.len());
+    let inv_t = 1.0 / temp;
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        let s = v * inv_t;
+        if s > max { max = s; }
+    }
+    let mut sum = 0.0f32;
+    for &v in logits {
+        let e = (v * inv_t - max).exp();
+        out.push(e);
+        sum += e;
+    }
+    let inv_sum = 1.0 / sum;
+    for p in out.iter_mut() { *p *= inv_sum; }
+}
+
+/// Draw a categorical sample from `probs` given uniform u ∈ [0, 1).
+#[inline]
+fn sample_categorical(probs: &[f32], u: f32) -> u32 {
+    let mut acc = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if u < acc { return i as u32; }
+    }
+    (probs.len() - 1) as u32
+}
+
+/// Draw from (p_target − p_draft)₊, renormalized. Used on rejection to
+/// sample the "corrective" bonus token in speculative rejection sampling
+/// (Chen & Leviathan 2023, algorithm 1).
+#[inline]
+fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
+    let mut sum = 0.0f32;
+    for i in 0..p_target.len() {
+        let d = p_target[i] - p_draft[i];
+        if d > 0.0 { sum += d; }
+    }
+    if sum <= 0.0 {
+        // Degenerate case (p_draft >= p_target everywhere). Should not
+        // happen in practice if a rejection was just drawn. Fall back to
+        // argmax of p_target.
+        return argmax_u32(p_target);
+    }
+    let u_scaled = u * sum;
+    let mut acc = 0.0f32;
+    for i in 0..p_target.len() {
+        let d = p_target[i] - p_draft[i];
+        if d > 0.0 {
+            acc += d;
+            if u_scaled < acc { return i as u32; }
+        }
+    }
+    (p_target.len() - 1) as u32
+}
+
+/// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
+/// given the seed, cheap enough to inline into the B-rejection loop.
+#[inline]
+fn xorshift_next_unit(state: &mut u64) -> f32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    *state = s;
+    // Top 24 bits for a reasonable float mantissa; divide by 2^24.
+    ((s >> 40) as f32) * (1.0 / 16_777_216.0)
+}
+
 /// Aggregated metrics for a sequence of speculative decode steps.
 #[derive(Debug, Default, Clone)]
 pub struct SpecStats {
@@ -981,6 +1055,7 @@ pub fn verify_dflash_block(
     start_pos: usize,
     hidden_rb: &mut HiddenStateRingBuffer,
     gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -1056,33 +1131,52 @@ pub fn verify_dflash_block(
             let _ = gpu.free_tensor(final_hidden);
             return Err(e);
         }
-        // GPU-side batched argmax. Writes B i32 indices; we download just
-        // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
-        // PCIe D2H per verify on the 4B Q8 lm_head (~3-5 ms/iter).
-        let argmax_buf = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-        let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b);
-        if let Err(e) = ar {
-            let _ = gpu.free_tensor(argmax_buf);
-            let _ = gpu.free_tensor(logits_batch);
-            let _ = gpu.free_tensor(final_hidden);
-            return Err(e);
-        }
-        let mut host_idx = vec![0i32; b];
-        {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4)
+        if want_full_logits {
+            // Rejection-sampling path needs full target distribution.
+            // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
+            let host_logits = match gpu.download_f32(&logits_batch) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = gpu.free_tensor(logits_batch);
+                    let _ = gpu.free_tensor(final_hidden);
+                    return Err(e);
+                }
             };
-            if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+            let _ = gpu.free_tensor(logits_batch);
+            for i in 0..b {
+                let row = &host_logits[i * vocab..(i + 1) * vocab];
+                argmax_per_pos.push(argmax_u32(row));
+            }
+            logits_per_pos = host_logits;
+        } else {
+            // GPU-side batched argmax. Writes B i32 indices; we download just
+            // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
+            // PCIe D2H per verify on the 4B Q8 lm_head (~3-5 ms/iter).
+            let argmax_buf = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b);
+            if let Err(e) = ar {
                 let _ = gpu.free_tensor(argmax_buf);
                 let _ = gpu.free_tensor(logits_batch);
                 let _ = gpu.free_tensor(final_hidden);
                 return Err(e);
             }
-        }
-        let _ = gpu.free_tensor(argmax_buf);
-        let _ = gpu.free_tensor(logits_batch);
-        for &idx in &host_idx {
-            argmax_per_pos.push(idx as u32);
+            let mut host_idx = vec![0i32; b];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4)
+                };
+                if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+                    let _ = gpu.free_tensor(argmax_buf);
+                    let _ = gpu.free_tensor(logits_batch);
+                    let _ = gpu.free_tensor(final_hidden);
+                    return Err(e);
+                }
+            }
+            let _ = gpu.free_tensor(argmax_buf);
+            let _ = gpu.free_tensor(logits_batch);
+            for &idx in &host_idx {
+                argmax_per_pos.push(idx as u32);
+            }
         }
         // Greedy path doesn't need `logits_per_pos`; leave empty to avoid
         // the 15 MB D2H. If temp>0 sampling is added later, reinstate the
@@ -1219,6 +1313,8 @@ pub fn spec_step_dflash(
     seed_token: u32,
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
+    temp: f32,
+    rng_state: &mut u64,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let h = draft_cfg.hidden;
@@ -1305,22 +1401,24 @@ pub fn spec_step_dflash(
     // weight_gemv + downloads) to ~8 ms (one batched GEMM + one download)
     // for MQ4/HFQ4 lm_heads. Falls back to the per-row loop when the
     // output weight dtype isn't covered by the batched gemm dispatch.
+    //
+    // Temperature-sampling mode (temp > 0): we must DOWNLOAD the full
+    // (B-1, vocab) draft logits, softmax + sample + record p_draft[token]
+    // for later rejection acceptance. The greedy GPU-argmax path is kept
+    // intact for temp == 0 so we don't regress that case.
     let mut drafted: Vec<u32> = vec![seed_token]; // drafted[0] = seed (by convention; not used)
+    // Per-position draft probability at the sampled token; only populated
+    // when temp > 0. Length B-1 to match drafted[1..B].
+    let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
+    // Full draft softmax distributions at each drafted position; only
+    // populated when temp > 0 for residual sampling on rejection.
+    let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
+    let use_temp_sampling = temp > 0.0;
     let w_out = &target.weights.output;
-    // Fast-paths on the lm_head:
-    //   HFQ4G256 / MQ4G256 → single batched GEMM kernel (best: all math fused).
-    //   Q8_0               → B-1 serial GEMVs with STAGED outputs + single D2H.
-    //                         Saves the per-row PCIe sync that dominated the
-    //                         MVP path (~15 × ~150 µs = 2.3 ms stall budget).
-    //   Anything else      → per-row weight_gemv + download loop (fallback).
     let use_batched_gemm = matches!(
         w_out.gpu_dtype,
         rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256,
     );
-    // Q8 lm_head is common on typed-up Qwen3.5 exports; we stage the output
-    // writes into a contiguous buffer so the B-1 GEMVs don't serialize on
-    // per-row D2H round-trips (even though the kernels themselves remain
-    // serial — a true batched Q8 GEMM is queued for follow-up).
     let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
     if use_batched_gemm || use_q8_staged {
         // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
@@ -1356,38 +1454,72 @@ pub fn spec_step_dflash(
             return Err(e);
         }
 
-        // GPU argmax over (B-1) rows — one kernel, small D2H.
-        let argmax_buf = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-        let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch);
-        if let Err(e) = ar {
-            let _ = gpu.free_tensor(argmax_buf);
-            let _ = gpu.free_tensor(logits_batch);
-            return Err(e);
-        }
-        let mut host_idx = vec![0i32; batch];
-        {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+        if use_temp_sampling {
+            // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
+            let host_logits = match gpu.download_f32(&logits_batch) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = gpu.free_tensor(logits_batch);
+                    return Err(e);
+                }
             };
-            if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+            let _ = gpu.free_tensor(logits_batch);
+            debug_assert_eq!(host_logits.len(), batch * vocab);
+            draft_softmaxes.reserve(batch);
+            for i in 0..batch {
+                let row = &host_logits[i * vocab..(i + 1) * vocab];
+                let mut probs = Vec::with_capacity(vocab);
+                softmax_temp_into(row, temp, &mut probs);
+                let u = xorshift_next_unit(rng_state);
+                let t = sample_categorical(&probs, u);
+                draft_probs_at_drafted.push(probs[t as usize]);
+                drafted.push(t);
+                draft_softmaxes.push(probs);
+            }
+        } else {
+            // GPU argmax over (B-1) rows — one kernel, small D2H.
+            let argmax_buf = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+            let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch);
+            if let Err(e) = ar {
                 let _ = gpu.free_tensor(argmax_buf);
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-        }
-        let _ = gpu.free_tensor(argmax_buf);
-        let _ = gpu.free_tensor(logits_batch);
-        for &idx in &host_idx {
-            drafted.push(idx as u32);
+            let mut host_idx = vec![0i32; batch];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+                };
+                if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
+                    let _ = gpu.free_tensor(argmax_buf);
+                    let _ = gpu.free_tensor(logits_batch);
+                    return Err(e);
+                }
+            }
+            let _ = gpu.free_tensor(argmax_buf);
+            let _ = gpu.free_tensor(logits_batch);
+            for &idx in &host_idx {
+                drafted.push(idx as u32);
+            }
         }
     } else {
-        // Fallback: per-row weight_gemv loop (unchanged from MVP).
+        // Fallback: per-row weight_gemv loop.
         for i in 1..b {
             let hidden_row = draft_scratch.x.sub_offset(i * h, h);
             llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
             let logits = gpu.download_f32(&target.scratch.logits)?;
             debug_assert_eq!(logits.len(), vocab);
-            drafted.push(argmax_u32(&logits));
+            if use_temp_sampling {
+                let mut probs = Vec::with_capacity(vocab);
+                softmax_temp_into(&logits, temp, &mut probs);
+                let u = xorshift_next_unit(rng_state);
+                let t = sample_categorical(&probs, u);
+                draft_probs_at_drafted.push(probs[t as usize]);
+                drafted.push(t);
+                draft_softmaxes.push(probs);
+            } else {
+                drafted.push(argmax_u32(&logits));
+            }
         }
     }
     for i in 1..b {
@@ -1406,18 +1538,67 @@ pub fn spec_step_dflash(
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
+        use_temp_sampling,  // need full target logits for rejection sampling
     )?;
 
-    // ── 7. Acceptance: longest prefix where block[1..i+1] == posterior[0..i] ─
+    // ── 7. Acceptance ──────────────────────────────────────────────────
+    //
+    // Greedy path: longest prefix where block[i+1] == argmax_per_pos[i].
+    //   bonus = argmax_per_pos[accept_len].
+    //
+    // Rejection-sampling path (temp > 0):
+    //   For each i in 0..B-1:
+    //     t = block[i+1] (draft sampled this at position start+i+1)
+    //     p_d = draft_softmax[i][t]
+    //     p_t = target_softmax[i][t]  (softmax of verify logits row i, same temp)
+    //     u = rng
+    //     accept if u * p_d < p_t
+    //     else: rejected → bonus = sample from (p_target - p_draft)+
+    //   If all accepted → bonus = sample from target_softmax[B-1].
     let mut accept_len = 0usize;
-    for i in 0..b - 1 {
-        if verify_out.argmax_per_pos[i] == block[i + 1] {
-            accept_len += 1;
-        } else {
-            break;
+    let bonus_token;
+    if use_temp_sampling {
+        let tgt_logits = &verify_out.logits_per_pos;
+        debug_assert_eq!(tgt_logits.len(), b * vocab);
+        debug_assert_eq!(draft_softmaxes.len(), b - 1);
+        let mut target_probs = Vec::with_capacity(vocab);
+        let mut rejected_bonus: Option<u32> = None;
+        for i in 0..b - 1 {
+            softmax_temp_into(&tgt_logits[i * vocab..(i + 1) * vocab], temp, &mut target_probs);
+            let t = block[i + 1] as usize;
+            let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
+            let p_t = target_probs[t];
+            let u = xorshift_next_unit(rng_state);
+            if u * p_d <= p_t {
+                accept_len += 1;
+            } else {
+                // Rejected — sample bonus from (p_target − p_draft)₊.
+                let u2 = xorshift_next_unit(rng_state);
+                rejected_bonus = Some(sample_residual(
+                    &target_probs, &draft_softmaxes[i], u2,
+                ));
+                break;
+            }
         }
+        bonus_token = if let Some(b) = rejected_bonus {
+            b
+        } else {
+            // All accepted: sample from target_softmax at position B-1.
+            let i = b - 1;
+            softmax_temp_into(&tgt_logits[i * vocab..(i + 1) * vocab], temp, &mut target_probs);
+            let u = xorshift_next_unit(rng_state);
+            sample_categorical(&target_probs, u)
+        };
+    } else {
+        for i in 0..b - 1 {
+            if verify_out.argmax_per_pos[i] == block[i + 1] {
+                accept_len += 1;
+            } else {
+                break;
+            }
+        }
+        bonus_token = verify_out.argmax_per_pos[accept_len];
     }
-    let bonus_token = verify_out.argmax_per_pos[accept_len];
 
     // ── 8. Committed sequence ───────────────────────────────────────────
     // committed[0] is the seed_token (already emitted by prev iter). The
