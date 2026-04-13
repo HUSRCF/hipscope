@@ -811,28 +811,89 @@ pub fn verify_dflash_block(
         return Err(e);
     }
 
-    // Per-position lm_head: B sequential GEMVs into target.scratch.logits.
+    // Per-position lm_head. Fast paths in priority order:
+    //   Q8_0      → batched gemm_q8_0_batched (one launch + one D2H).
+    //   MQ4G256   → batched rotate + gemm_hfq4g256 (one launch + one D2H).
+    //   HFQ4G256  → batched gemm_hfq4g256 directly.
+    //   else      → B sequential weight_gemv calls + B downloads (legacy).
+    let w_out = &target.weights.output;
     let mut logits_per_pos: Vec<f32> = Vec::with_capacity(b * vocab);
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
-    for i in 0..b {
-        let hidden_row = final_hidden.sub_offset(i * dim, dim);
-        let r = llama::weight_gemv(
-            gpu, &target.weights.output, &hidden_row, &target.scratch.logits,
-        );
-        if let Err(e) = r {
+
+    let try_batched = match w_out.gpu_dtype {
+        rdna_compute::DType::Q8_0
+        | rdna_compute::DType::HFQ4G256
+        | rdna_compute::DType::MQ4G256 => true,
+        _ => false,
+    };
+
+    if try_batched {
+        let logits_batch =
+            gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+        let gemm_result = match w_out.gpu_dtype {
+            rdna_compute::DType::Q8_0 => {
+                gpu.gemm_q8_0_batched(&w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b)
+            }
+            rdna_compute::DType::HFQ4G256 => {
+                gpu.gemm_hfq4g256(&w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b)
+            }
+            rdna_compute::DType::MQ4G256 => {
+                let rot = gpu.alloc_tensor(&[b * w_out.k], rdna_compute::DType::F32)?;
+                let r1 = gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b);
+                if let Err(e) = r1 {
+                    let _ = gpu.free_tensor(rot);
+                    let _ = gpu.free_tensor(logits_batch);
+                    let _ = gpu.free_tensor(final_hidden);
+                    return Err(e);
+                }
+                let r2 = gpu.gemm_hfq4g256(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b);
+                let _ = gpu.free_tensor(rot);
+                r2
+            }
+            _ => unreachable!(),
+        };
+        if let Err(e) = gemm_result {
+            let _ = gpu.free_tensor(logits_batch);
             let _ = gpu.free_tensor(final_hidden);
             return Err(e);
         }
-        let row = match gpu.download_f32(&target.scratch.logits) {
-            Ok(r) => r,
+        let logits_host = match gpu.download_f32(&logits_batch) {
+            Ok(v) => v,
             Err(e) => {
+                let _ = gpu.free_tensor(logits_batch);
                 let _ = gpu.free_tensor(final_hidden);
                 return Err(e);
             }
         };
-        debug_assert_eq!(row.len(), vocab);
-        argmax_per_pos.push(argmax_u32(&row));
-        logits_per_pos.extend_from_slice(&row);
+        let _ = gpu.free_tensor(logits_batch);
+        debug_assert_eq!(logits_host.len(), b * vocab);
+        for i in 0..b {
+            let row = &logits_host[i * vocab..(i + 1) * vocab];
+            argmax_per_pos.push(argmax_u32(row));
+        }
+        logits_per_pos = logits_host;
+    } else {
+        // Fallback: B sequential GEMVs.
+        for i in 0..b {
+            let hidden_row = final_hidden.sub_offset(i * dim, dim);
+            let r = llama::weight_gemv(
+                gpu, &target.weights.output, &hidden_row, &target.scratch.logits,
+            );
+            if let Err(e) = r {
+                let _ = gpu.free_tensor(final_hidden);
+                return Err(e);
+            }
+            let row = match gpu.download_f32(&target.scratch.logits) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = gpu.free_tensor(final_hidden);
+                    return Err(e);
+                }
+            };
+            debug_assert_eq!(row.len(), vocab);
+            argmax_per_pos.push(argmax_u32(&row));
+            logits_per_pos.extend_from_slice(&row);
+        }
     }
 
     let _ = gpu.free_tensor(final_hidden);
@@ -1092,20 +1153,20 @@ pub fn spec_step_dflash(
             drafted.push(argmax_u32(row));
         }
     } else if use_q8_staged {
-        // Staged Q8 path: B-1 GEMVs writing into offset slots of a single
-        // [B-1 × vocab] buffer, then ONE D2H download. Keeps kernels
-        // async-enqueued on the stream without per-row PCIe sync points.
+        // Batched Q8 GEMM (gemm_q8_0_batched): one launch + one D2H. Each
+        // weight block is loaded once and broadcast across all batch lanes
+        // in registers, eliminating the (batch − 1)× weight re-reads of the
+        // serial GEMV loop.
         let batch = b - 1;
+        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch =
             gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-        for i in 0..batch {
-            let hidden_row = draft_scratch.x.sub_offset((i + 1) * h, h);
-            let row_out = logits_batch.sub_offset(i * vocab, vocab);
-            let gr = gpu.gemv_q8_0(&w_out.buf, &hidden_row, &row_out, w_out.m, w_out.k);
-            if let Err(e) = gr {
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
+        let gr = gpu.gemm_q8_0_batched(
+            &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+        );
+        if let Err(e) = gr {
+            let _ = gpu.free_tensor(logits_batch);
+            return Err(e);
         }
         let logits_host = match gpu.download_f32(&logits_batch) {
             Ok(v) => v,

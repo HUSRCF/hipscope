@@ -309,6 +309,12 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
+/// per-row accumulators in registers, broadcasting each weight load across
+/// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
+/// serial-GEMV loop for DFlash lm_heads.
+pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_batched.hip");
+
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
 /// Q6_K block: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes per 256 elements.

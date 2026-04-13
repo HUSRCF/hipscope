@@ -4357,6 +4357,59 @@ impl Gpu {
         }
     }
 
+    /// Y[batch, M] = X[batch, K] @ A_q8[M, K]^T — batched Q8_0 GEMM.
+    /// One block per output row (32 threads, one wave). Each thread holds
+    /// MAX_BATCH=16 per-batch accumulators and broadcasts each weight load.
+    /// Drops the (batch_size − 1)× weight re-reads of the GEMV-loop path
+    /// without splitting launches.
+    pub fn gemm_q8_0_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(
+            batch_size <= 16,
+            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=16"
+        );
+        self.ensure_kernel(
+            "gemm_q8_0_batched",
+            kernels::GEMM_Q8_0_BATCHED_SRC,
+            "gemm_q8_0_batched",
+        )?;
+        let func = &self.functions["gemm_q8_0_batched"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,
