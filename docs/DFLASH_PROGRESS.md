@@ -162,4 +162,49 @@ in the commit body. Baseline refresh is deferred to 0.1.6 finalization.
 
 - Goal: the orchestrator that stitches draft_forward + verify_dflash_block
   + acceptance math into an end-to-end spec decode of N tokens.
+- Deliverables:
+  - `speculative::spec_step_dflash(target, draft_weights, draft_cfg,
+    draft_scratch, hidden_rb, target_hidden_host, target_snap,
+    position, seed_token) -> SpecStepResult`:
+    builds the block (seed + B-1 MASKs), builds the noise_embedding
+    by downloading `target.scratch.x` after B `embedding_lookup_*`
+    calls, runs `dflash::draft_forward`, applies `target.weights.output`
+    per draft position to sample the B-1 mask slots, verifies via
+    `verify_dflash_block`, computes accept_len, appends accepted
+    target_hidden rows, snapshots + rewinds + replays DeltaNet state
+    so target ends at `position + accept_len + 1`.
+  - `speculative::seed_target_hidden_from_prompt(target, hidden_rb,
+    target_hidden_host, prompt_tokens)`: one-shot prompt prefill with
+    per-token `forward_scratch_with_hidden` to populate the ring
+    buffer + host vec. MVP path — skips the fast `forward_prefill_batch`
+    because that path doesn't extract hidden states yet.
+- Design choices:
+  - Draft predictions go through `llama::weight_gemv(&target.output)`
+    per-row (B-1 GEMVs). ~15 × (vocab × hidden) floats per iter ≈
+    15 GB bandwidth on 9B target; comfortably sub-ms per GEMV on
+    7900 XTX. Could batch in 0.1.7 via a B-wide GEMM against
+    target.weights.output.
+  - State rewind follows the existing spec_step_greedy pattern:
+    `DeltaNetSnapshot::save_from` pre-verify, `restore_to` post-
+    accept, then replay `accept_len+1` `forward_scratch` calls
+    (without hidden extraction — already captured during verify,
+    don't double-write).
+  - Committed slice includes the seed_token at position 0 because
+    target state must advance through the seed's position on the
+    current iter (in the reference, the seed was last iter's bonus
+    and its target forward happens on THIS iter's verify). Callers
+    emit only `committed[1..]`.
+  - bonus token's target_hidden is NOT appended (matches reference's
+    `extract_feat[:, :accept_len+1, :]` pattern). Its row will
+    materialize on the next iter when the bonus becomes block[0].
+- Status: module-level deliverables complete, end-to-end demo binary
+  is a Phase 6 task.
+- Completed: 2026-04-13
+
+## Phase 6 — CLI / serve integration
+
+- Goal: end-to-end runnable path. MVP target is a test binary that
+  loads a target + draft, runs N tokens of speculative decode, prints
+  tokens + accept rate + tok/s. Full daemon protocol + `hipfire run
+  --dflash` wiring is a nice-to-have.
 - Status: starting.

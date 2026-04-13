@@ -12,6 +12,7 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
+use crate::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
@@ -722,4 +723,264 @@ pub fn download_hidden_block(
 
     debug_assert_eq!(out.len(), b * num_extract * hidden);
     Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DFlash spec step — one speculative decode iteration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One DFlash speculative iteration. Given a previously-accepted token at
+/// `position - 1` (the "seed" for block_output_ids[0]) and a cumulative
+/// `target_hidden_host` buffer of shape `[position × num_extract × hidden]`,
+/// runs the draft to fill B-1 mask slots, verifies against the target,
+/// commits the accepted prefix plus a bonus target token, and rewinds the
+/// target's DeltaNet state so only `accept_len + 1` forwards are reflected.
+///
+/// Returns `SpecStepResult` describing accepted draft count, bonus token,
+/// drafted proposals, and the full committed sequence (length accept+2:
+/// `[seed_token, draft[..accept_len], posterior[accept_len]]` — note the
+/// seed_token is ALSO committed here because it was the bonus token from
+/// the PREVIOUS iteration and still needs the target forward at its
+/// position). Callers append `committed[1..]` to the output token stream
+/// (the seed was already emitted).
+///
+/// Side effects:
+/// - Appends `accept_len + 1` positions × `num_extract × hidden` floats to
+///   `target_hidden_host`.
+/// - Advances target's KV cache and DeltaNet state by `accept_len + 1`
+///   positions. Draft has no persistent state.
+///
+/// Preconditions:
+/// - `target_hidden_host.len() == position × num_extract × hidden` (set up
+///   by `seed_target_hidden_from_prompt`).
+/// - `position ≤ draft_scratch.max_ctx_len`.
+/// - `draft_cfg.block_size ≤ draft_scratch.max_block_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_dflash(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    position: usize,
+    seed_token: u32,
+) -> HipResult<SpecStepResult> {
+    let b = draft_cfg.block_size;
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    let vocab = target.config.vocab_size;
+    let mask_token = draft_cfg.mask_token_id;
+
+    assert!(b >= 2, "dflash block size must be ≥ 2");
+    assert_eq!(
+        target_hidden_host.len(),
+        position * ne * h,
+        "target_hidden_host size mismatches position"
+    );
+
+    // ── 1. block_output_ids seeded with prev bonus at [0], masks at [1..B] ──
+    let mut block: Vec<u32> = vec![mask_token; b];
+    block[0] = seed_token;
+
+    // ── 2. noise_embedding = target.embed_tokens(block) on host ──────────
+    // B separate embedding_lookups into target.scratch.x, download each row.
+    let mut noise_embedding: Vec<f32> = Vec::with_capacity(b * h);
+    for &tok in &block {
+        match target.weights.embd_format {
+            crate::llama::EmbeddingFormat::HFQ4G256 => {
+                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &target.scratch.x, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::HFQ4G128 => {
+                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &target.scratch.x, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::Q8_0 => {
+                gpu.embedding_lookup_q8(&target.weights.token_embd, &target.scratch.x, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::F32 => {
+                gpu.embedding_lookup(&target.weights.token_embd, &target.scratch.x, tok, h)?
+            }
+            _ => panic!("dflash: unsupported target embedding format for noise lookup"),
+        }
+        let row = gpu.download_f32(&target.scratch.x)?;
+        debug_assert_eq!(row.len(), h);
+        noise_embedding.extend_from_slice(&row);
+    }
+
+    // ── 3. Position arrays ──────────────────────────────────────────────
+    // Q positions: the absolute positions of the block slots, [position..position+B).
+    // K positions: all accepted context positions [0..position), then block [position..position+B).
+    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+    let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
+
+    // ── 4. draft_forward ────────────────────────────────────────────────
+    dflash::draft_forward(
+        gpu,
+        draft_weights,
+        draft_cfg,
+        &noise_embedding,
+        target_hidden_host,
+        &positions_q,
+        &positions_k,
+        b,
+        position,
+        draft_scratch,
+    )?;
+
+    // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
+    // Each GEMV reads draft_scratch.x[i*h..(i+1)*h] and writes vocab logits
+    // into target.scratch.logits. Download and argmax.
+    let mut drafted: Vec<u32> = vec![seed_token]; // drafted[0] = seed (by convention; not used)
+    for i in 1..b {
+        let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+        llama::weight_gemv(gpu, &target.weights.output, &hidden_row, &target.scratch.logits)?;
+        let logits = gpu.download_f32(&target.scratch.logits)?;
+        debug_assert_eq!(logits.len(), vocab);
+        drafted.push(argmax_u32(&logits));
+    }
+    for i in 1..b {
+        block[i] = drafted[i];
+    }
+
+    // ── 6. Snapshot DeltaNet pre-verify, run verify (advances state by B) ─
+    target_snap.save_from(&target.dn_state, gpu)?;
+    let verify_out = verify_dflash_block(gpu, target, &block, position, hidden_rb)?;
+
+    // ── 7. Acceptance: longest prefix where block[1..i+1] == posterior[0..i] ─
+    let mut accept_len = 0usize;
+    for i in 0..b - 1 {
+        if verify_out.argmax_per_pos[i] == block[i + 1] {
+            accept_len += 1;
+        } else {
+            break;
+        }
+    }
+    let bonus_token = verify_out.argmax_per_pos[accept_len];
+
+    // ── 8. Committed sequence ───────────────────────────────────────────
+    // committed[0] is the seed_token (already emitted by prev iter). The
+    // caller's output stream appends committed[1..]. We include seed in
+    // committed because target KV/state must be at position seed+accept_len+1
+    // after this step.
+    let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
+    committed.push(seed_token);
+    for i in 0..accept_len {
+        committed.push(drafted[i + 1]);
+    }
+    committed.push(bonus_token);
+    let committed_count = committed.len();
+    debug_assert_eq!(committed_count, accept_len + 2);
+
+    // ── 9. Append accepted target hidden rows to target_hidden_host ─────
+    // Verify wrote B rows into hidden_rb. We keep the first accept_len+1
+    // (= committed_count - 1) because the last committed token (bonus) is
+    // ALREADY reflected in target state + will get its hidden captured on
+    // the NEXT verify when it's forwarded as block[0].
+    //
+    // Wait: bonus_token is placed at position `position + accept_len + 1`.
+    // Its hidden was captured at ring slot (verify start + accept_len),
+    // which corresponds to the B-th verify forward position = position +
+    // accept_len. That's the bonus position if we identify it correctly.
+    //
+    // Actually every verify position writes one hidden row. Position i of
+    // the B-verify corresponds to absolute position `position + i`, so:
+    //   block[0] hidden captured at ring slot (head - B + 0) → pos=position
+    //   block[1] hidden captured at ring slot (head - B + 1) → pos=position+1
+    //   ...
+    //   block[accept_len] hidden captured → pos=position+accept_len (THIS is the last committed before bonus)
+    //   block[accept_len+1] hidden captured → pos=position+accept_len+1 (this would be bonus; but target's prediction at that slot is what drove the bonus choice)
+    //
+    // The bonus token is what target WOULD predict at position+accept_len+1
+    // given the B-verify input. Its hidden was NOT captured at that
+    // position — the hidden at that slot is for `block[accept_len+1]`, a
+    // REJECTED draft token's target forward. We can't use that hidden for
+    // the committed bonus token.
+    //
+    // Resolution: DON'T append bonus-token hidden here. Next iter's
+    // verify will forward the bonus token at its position (position +
+    // committed_count - 1) as its new block[0], capturing proper hidden
+    // and target state there. Committed_count - 1 rows appended here
+    // covers positions [position..position + committed_count - 2] =
+    // [position..position + accept_len]. Bonus at position+accept_len+1
+    // sits in no-man's land — its hidden will materialize on next iter.
+    //
+    // This matches the reference's `target_hidden = ...[:, :accept_len+1, :]`
+    // pattern which slices the verify's hidden output to accept_len+1
+    // rows — NOT accept_len+2.
+    let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
+    let rows_to_keep = accept_len + 1;
+    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+
+    // ── 10. Rewind DeltaNet + replay committed tokens ────────────────────
+    // After verify, target state reflects B forwards. We need it to reflect
+    // `committed_count - 1 = accept_len + 1` forwards (the seed + accepted
+    // draft tokens). The bonus token is NOT replayed — it will be
+    // block[0] of the next iter. This keeps the invariant that before each
+    // verify, target state is at position `start` (= pre-verify position).
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    // Replay committed[0..accept_len+1] with forward_scratch (no hidden —
+    // already captured on the verify side; replaying would double-write).
+    for i in 0..accept_len + 1 {
+        qwen35::forward_scratch(
+            gpu,
+            &target.weights,
+            &target.config,
+            committed[i],
+            position + i,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+        )?;
+    }
+    // Target state is now at position + accept_len + 1. KV cache has
+    // written K/V at positions [position..position+accept_len]. The bonus
+    // token's K/V will be written on the next iter's verify (at position
+    // `position + accept_len + 1`) as part of that iter's block[0] forward.
+
+    Ok(SpecStepResult {
+        accepted: accept_len,
+        bonus_token,
+        drafted,
+        committed,
+    })
+}
+
+/// Seed `target_hidden_host` from the prompt by running the target over
+/// each prompt token one at a time with hidden-state extraction enabled.
+/// This is a slow but correct MVP path — the target already ran a fast
+/// prefill earlier; this exists only to populate `hidden_rb` + host vec
+/// with the prompt's layer-selected hidden states.
+///
+/// Callers with a fast-path prefill that already populates `hidden_rb`
+/// should skip this and just call `download_hidden_block(hidden_rb, len)`
+/// instead. For MVP we eat the redundant work because it's a one-shot
+/// cost at session start.
+pub fn seed_target_hidden_from_prompt(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    prompt_tokens: &[u32],
+) -> HipResult<()> {
+    // Reset target state to avoid double-prefill of the same context.
+    target.reset_state(gpu);
+    for (i, &tok) in prompt_tokens.iter().enumerate() {
+        qwen35::forward_scratch_with_hidden(
+            gpu,
+            &target.weights,
+            &target.config,
+            tok,
+            i,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            hidden_rb,
+        )?;
+    }
+    // Gather the just-written rows from the ring buffer.
+    let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
+    target_hidden_host.extend_from_slice(&block);
+    Ok(())
 }
