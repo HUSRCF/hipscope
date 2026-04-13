@@ -840,6 +840,70 @@ fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
     (p_target.len() - 1) as u32
 }
 
+/// Rolling bigram n-gram cache. Keyed by the last two committed tokens
+/// `(a, b)`; value is a small map from possible next-token to count.
+///
+/// Populated incrementally from the committed output stream. Used as a
+/// "free" second opinion on top of the DFlash draft: if the cache has
+/// seen a (a, b) → c transition with high enough count, and the DFlash
+/// draft proposed something else at that position, the n-gram's `c`
+/// often turns out to match the target's argmax.
+///
+/// Scales: the cache size is bounded by the number of distinct bigrams
+/// in the committed output — typically a few hundred per session, so
+/// no eviction policy needed.
+pub struct NgramCache {
+    /// `(a, b) → { next: count, ... }` with the next-token histogram.
+    pub bigram: std::collections::HashMap<(u32, u32), std::collections::HashMap<u32, u32>>,
+    /// Minimum count before we trust the prediction. Smaller = more
+    /// aggressive (more overrides), larger = more conservative. 3 is a
+    /// reasonable default on hot-loop code / repetitive text.
+    pub min_count: u32,
+}
+
+impl NgramCache {
+    pub fn new(min_count: u32) -> Self {
+        Self {
+            bigram: std::collections::HashMap::new(),
+            min_count,
+        }
+    }
+
+    /// Record the triple `(a, b) → c` in the cache.
+    #[inline]
+    pub fn observe(&mut self, a: u32, b: u32, c: u32) {
+        *self
+            .bigram
+            .entry((a, b))
+            .or_default()
+            .entry(c)
+            .or_insert(0) += 1;
+    }
+
+    /// Predict `c` from last-two `(a, b)` if the max-count next-token
+    /// reaches `min_count`. Returns (token, count).
+    #[inline]
+    pub fn predict(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let map = self.bigram.get(&(a, b))?;
+        let (&tok, &cnt) = map.iter().max_by_key(|(_, &c)| c)?;
+        if cnt >= self.min_count {
+            Some((tok, cnt))
+        } else {
+            None
+        }
+    }
+
+    /// Record every consecutive triple in a slice of committed tokens.
+    /// Caller supplies the full token stream; this walks it in-place.
+    pub fn observe_many(&mut self, tokens: &[u32]) {
+        if tokens.len() >= 3 {
+            for w in tokens.windows(3) {
+                self.observe(w[0], w[1], w[2]);
+            }
+        }
+    }
+}
+
 /// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
 /// given the seed, cheap enough to inline into the B-rejection loop.
 #[inline]
@@ -1316,6 +1380,8 @@ pub fn spec_step_dflash(
     temp: f32,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
+    ngram_cache: Option<&NgramCache>,
+    prev_committed: &[u32],
 ) -> HipResult<SpecStepResult> {
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
@@ -1528,6 +1594,41 @@ pub fn spec_step_dflash(
     }
     for i in 1..b {
         block[i] = drafted[i];
+    }
+
+    // ── 5b. N-gram override ─────────────────────────────────────────────
+    // When an n-gram cache is supplied, walk the block left-to-right. For
+    // each position i, look up the bigram (block[i-2], block[i-1]) → t. If
+    // the cache has a high-enough count for t, override block[i] with t.
+    // Chained: subsequent lookups use the (possibly-overridden) prior
+    // tokens. Chained overrides only "compound" when the cache captures
+    // multi-step patterns (e.g. boilerplate phrases, code indentation).
+    //
+    // Cost: two HashMap lookups per block position = microseconds.
+    //
+    // Limitation: dflash's draft_forward already ran against the ORIGINAL
+    // draft argmax block; overrides don't feed back into the draft. So
+    // downstream positions' target-hidden cross-attention was computed
+    // against the un-overridden block. In practice this doesn't matter
+    // because the per-position target attention at verify time reruns
+    // anyway — what matters is target's argmax at position i versus
+    // block[i+1] (the override).
+    if let Some(ng) = ngram_cache {
+        if prev_committed.len() >= 2 {
+            let mut a = prev_committed[prev_committed.len() - 2];
+            let mut bb = seed_token;
+            for i in 1..b {
+                if let Some((tok, _cnt)) = ng.predict(a, bb) {
+                    block[i] = tok;
+                    // Also reflect the override in `drafted` so the committed
+                    // sequence reported back to the caller matches what was
+                    // actually verified against the target.
+                    drafted[i] = tok;
+                }
+                a = bb;
+                bb = block[i];
+            }
+        }
     }
 
     // ── 6. Snapshot DeltaNet pre-verify, run verify (advances state by B) ─

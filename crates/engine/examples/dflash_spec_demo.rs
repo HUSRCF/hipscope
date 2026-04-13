@@ -49,6 +49,8 @@ fn main() {
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
     let mut adaptive_b: bool = false;
+    let mut ngram: bool = false;
+    let mut ngram_min_count: u32 = 3;
 
     let mut i = 1;
     while i < args.len() {
@@ -96,6 +98,14 @@ fn main() {
             "--adaptive-b" => {
                 adaptive_b = true;
                 i += 1;
+            }
+            "--ngram" => {
+                ngram = true;
+                i += 1;
+            }
+            "--ngram-min" => {
+                ngram_min_count = args[i + 1].parse().unwrap();
+                i += 2;
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -248,6 +258,19 @@ fn main() {
     if temp > 0.0 {
         eprintln!("temp sampling: T={temp}, seed={seed}");
     }
+    // N-gram cache: built incrementally from committed output each iter.
+    // Seeded from the prompt so multi-turn repetitions in the prompt get
+    // cached. min_count gates how aggressive overrides are.
+    let mut ngram_cache = if ngram {
+        let mut c = engine::speculative::NgramCache::new(ngram_min_count);
+        c.observe_many(&prompt_tokens);
+        eprintln!(
+            "ngram cache: bigrams seeded from prompt, min_count={ngram_min_count}"
+        );
+        Some(c)
+    } else {
+        None
+    };
 
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
@@ -285,8 +308,24 @@ fn main() {
             temp,
             &mut rng_state,
             block_override,
+            ngram_cache.as_ref(),
+            &emitted,
         )
         .expect("spec step");
+
+        // Populate n-gram cache from newly committed tokens. `step.committed`
+        // is [seed, accepted draft tokens, bonus]; we record all consecutive
+        // triples within the committed span plus the join with prior context.
+        if let Some(ref mut ng) = ngram_cache {
+            // The 2 tokens right before step.committed[0] are the last 2 of
+            // `emitted` (since seed_token == prev iter's bonus = last emitted).
+            // Walk windows across (tail-2 of emitted ++ step.committed).
+            let tail_len = emitted.len().min(2);
+            let mut window: Vec<u32> = Vec::with_capacity(tail_len + step.committed.len());
+            window.extend_from_slice(&emitted[emitted.len() - tail_len..]);
+            window.extend_from_slice(&step.committed);
+            ng.observe_many(&window);
+        }
         stats.record(&step);
 
         // Rolling τ.
