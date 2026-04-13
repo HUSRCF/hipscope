@@ -211,6 +211,14 @@ fn main() {
 
     eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
 
+    // Rolling τ window for live emit + future adaptive routing decisions.
+    // τ_window[i] = accepted draft tokens in cycle i. Running mean over the
+    // last N cycles is a good proxy for whether the draft is keeping up.
+    const TAU_WINDOW: usize = 8;
+    let mut accepts_window: std::collections::VecDeque<usize> =
+        std::collections::VecDeque::with_capacity(TAU_WINDOW);
+    let live_tau = std::env::var("DFLASH_LIVE_TAU").is_ok();
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
@@ -233,6 +241,21 @@ fn main() {
         )
         .expect("spec step");
         stats.record(&step);
+
+        // Rolling τ.
+        if accepts_window.len() == TAU_WINDOW {
+            accepts_window.pop_front();
+        }
+        accepts_window.push_back(step.accepted);
+        if live_tau {
+            let win_tau: f64 = accepts_window.iter().copied().sum::<usize>() as f64
+                / accepts_window.len() as f64;
+            let cum_tau: f64 = stats.accepted_tokens as f64 / stats.cycles as f64;
+            eprintln!(
+                "[cycle {:3}] accepted={:2} seed={:5} τ_win={:.2} τ_cum={:.2} position={}",
+                stats.cycles, step.accepted, seed_token, win_tau, cum_tau, position,
+            );
+        }
 
         // `step.committed[0]` is the seed_token (already emitted). Emit [1..].
         for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
