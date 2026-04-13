@@ -2274,6 +2274,12 @@ impl PrefillBatchScratch {
 /// per-token logits. Required for DFlash verify (needs all B positions'
 /// logits, not just the last). `None` preserves the existing "last token
 /// only" semantics where logits land in `scratch.logits`.
+///
+/// `gdn_tape`: if `Some`, captures the post-processed `(q, k, v, α, β)` for
+/// every DN (LinearAttention) layer and block position BEFORE the batched
+/// `gated_delta_net_q8_batch_seq` call. Enables the DFlash rollback path
+/// to replay GDN recurrence from a pre-verify S-state snapshot for
+/// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
@@ -2286,6 +2292,7 @@ pub fn forward_prefill_batch(
     scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
+    mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -2379,10 +2386,14 @@ pub fn forward_prefill_batch(
             // writes. We advance the head AFTER the chunk returns, here in
             // the caller, to keep the mutable borrow scope tight.
             let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start));
+            // Reborrow the tape for this chunk so we keep the outer mut
+            // after the chunk returns.
+            let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
+                gdn_tape.as_mut().map(|t| &mut **t);
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, &pbs, hidden_rb.as_deref(),
-                pth_slot,
+                pth_slot, tape_for_chunk, chunk_start,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 rb.advance_head_by(chunk_n);
@@ -2416,6 +2427,11 @@ fn is_batchable_la(dt: DType) -> bool {
 /// RMSNorm hidden for each of the N tokens into `dst[offset_rows..offset_rows+N]`
 /// in row-major order. Required for DFlash verify to compute per-position
 /// logits via B sequential `weight_gemv` calls on the caller side.
+///
+/// `gdn_tape` + `tape_offset`: if `Some`, captures the post-processed
+/// `(q, k, v, α, β)` tensors per DN layer at rows
+/// `[tape_offset .. tape_offset+N]` right before the batched GDN kernel
+/// runs. Used by the DFlash rollback path.
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -2429,6 +2445,8 @@ fn forward_prefill_chunk(
     pbs: &PrefillBatchScratch,
     hidden_rb: Option<&HiddenStateRingBuffer>,
     per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tape_offset: usize,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -2537,6 +2555,32 @@ fn forward_prefill_chunk(
                     &layer.dt_bias, &layer.a_log,
                     n_v_heads, n,
                 )?;
+
+                // DFlash tape capture: snap pre-conv1d qkv + post-sigmoid α/β
+                // for this layer into the per-layer tape slots. The next LA
+                // layer's fused_qkvza / fused_sigmoid_alpha_gate will overwrite
+                // dn_qkv_batch / dn_{alpha,beta}_batch, so capture must happen
+                // now (after sigmoid_alpha_gate, before conv1d consumes qkv).
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let qkv_row_bytes = tape.qkv_dim * 4;
+                    let alpha_row_bytes = n_v_heads * 4;
+                    let off_qkv = tape_offset * qkv_row_bytes;
+                    let off_a = tape_offset * alpha_row_bytes;
+                    let copy_qkv = n * qkv_row_bytes;
+                    let copy_a = n * alpha_row_bytes;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
+                        &pbs.dn_qkv_batch.buf, 0, copy_qkv,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.alpha_bufs[delta_layer_idx].buf, off_a,
+                        &pbs.dn_alpha_batch.buf, 0, copy_a,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.beta_bufs[delta_layer_idx].buf, off_a,
+                        &pbs.dn_beta_batch.buf, 0, copy_a,
+                    )?;
+                }
 
                 // Conv1d + SiLU + Q/K/V split, advancing state N steps.
                 // State advance is byte-identical to N single-token calls.

@@ -368,6 +368,203 @@ pub struct DeltaNetTape {
     pub slots: Vec<DeltaNetSnapshot>,
 }
 
+/// Innovation tape for the GatedDeltaNet recurrence. During a batched verify
+/// forward we capture the per-LA-layer pre-conv1d `qkv` projection and the
+/// post-sigmoid `(α, β)` for every block position. On rollback we replay
+/// conv1d + QK-norm + repeat-interleave + GDN for `accept_len + 1` steps
+/// against the pre-verify DN snapshot — advancing both S-state AND
+/// conv_state correctly, no full target re-run needed.
+///
+/// Why pre-conv1d qkv instead of post-conv1d (q, k, v): conv_state is a
+/// recurrent buffer advanced by conv1d_silu_split. If we skipped conv1d on
+/// replay the next verify would see a stale conv_state reflecting the
+/// previous full-B aborted trajectory rather than the accepted prefix —
+/// small numerical drift that empirically halves τ on our 4B hybrid target.
+/// Running conv1d from the captured qkv advances conv_state to the right
+/// place.
+pub struct GdnTape {
+    pub max_n: usize,
+    pub qkv_dim: usize,
+    pub v_dim: usize,
+    pub k_dim: usize,
+    pub n_v_heads: usize,
+    pub n_key_heads: usize,
+    pub value_head_dim: usize,
+    pub key_head_dim: usize,
+    /// Per-LA-layer [max_n × qkv_dim] F32 — raw qkvza projection output.
+    pub qkv_bufs: Vec<GpuTensor>,
+    /// Per-LA-layer [max_n × n_v_heads] F32 — post-sigmoid_alpha_gate.
+    pub alpha_bufs: Vec<GpuTensor>,
+    pub beta_bufs: Vec<GpuTensor>,
+    /// Replay scratch (shared across layers — serial replay is fine).
+    pub q_raw_scratch: GpuTensor,   // [max_n × k_dim]
+    pub k_raw_scratch: GpuTensor,   // [max_n × k_dim]
+    pub v_scratch: GpuTensor,       // [max_n × v_dim]
+    pub q_scratch: GpuTensor,       // [max_n × v_dim] (post repeat-interleave)
+    pub k_scratch: GpuTensor,       // [max_n × v_dim]
+    pub attn_scratch: GpuTensor,    // [max_n × v_dim]
+}
+
+impl GdnTape {
+    pub fn new_for_config(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let n_v_heads = config.linear_num_value_heads;
+        let n_key_heads = config.linear_num_key_heads;
+        let n_la_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == qwen35::LayerType::LinearAttention)
+            .count();
+
+        let mut qkv_bufs = Vec::with_capacity(n_la_layers);
+        let mut alpha_bufs = Vec::with_capacity(n_la_layers);
+        let mut beta_bufs = Vec::with_capacity(n_la_layers);
+        for _ in 0..n_la_layers {
+            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
+            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+        }
+
+        Ok(Self {
+            max_n,
+            qkv_dim,
+            v_dim,
+            k_dim,
+            n_v_heads,
+            n_key_heads,
+            value_head_dim: config.linear_value_head_dim,
+            key_head_dim: config.linear_key_head_dim,
+            qkv_bufs,
+            alpha_bufs,
+            beta_bufs,
+            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
+            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
+            v_scratch:     gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            q_scratch:     gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            k_scratch:     gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            attn_scratch:  gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self
+            .qkv_bufs
+            .into_iter()
+            .chain(self.alpha_bufs.into_iter())
+            .chain(self.beta_bufs.into_iter())
+        {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.q_raw_scratch);
+        let _ = gpu.free_tensor(self.k_raw_scratch);
+        let _ = gpu.free_tensor(self.v_scratch);
+        let _ = gpu.free_tensor(self.q_scratch);
+        let _ = gpu.free_tensor(self.k_scratch);
+        let _ = gpu.free_tensor(self.attn_scratch);
+    }
+
+    /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
+    /// GDN recurrence) for `n_steps` across all LinearAttention layers. Advances
+    /// both `dn_state.s_matrices`/`s_scales` AND `dn_state.conv_states` by
+    /// exactly `n_steps` single-token updates. Caller must have restored the
+    /// DN snapshot to the pre-verify point before calling this.
+    pub fn replay_gdn(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        assert!(n_steps <= self.max_n, "replay_gdn: n_steps {n_steps} > max_n");
+        let n_v_heads = self.n_v_heads;
+        let n_key_heads = self.n_key_heads;
+        let hd = self.key_head_dim;
+        let v_dim = self.v_dim;
+        let k_dim = self.k_dim;
+        let value_head_dim = self.value_head_dim;
+        let mut la_idx = 0usize;
+
+        for (layer_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != qwen35::LayerType::LinearAttention {
+                continue;
+            }
+            let layer = match &weights.layers[layer_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => l,
+                _ => unreachable!("LA layer type mismatch in replay_gdn"),
+            };
+
+            // 1. conv1d + SiLU + split — advances conv_state, writes
+            //    (q_raw, k_raw, v) into scratch.
+            gpu.conv1d_silu_split_f32_n(
+                &self.q_raw_scratch,
+                &self.k_raw_scratch,
+                &self.v_scratch,
+                &self.qkv_bufs[la_idx],
+                &layer.conv_weight,
+                &dn_state.conv_states[la_idx],
+                k_dim,
+                v_dim,
+                n_steps,
+            )?;
+
+            // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
+            gpu.fused_qk_l2_norm_scale_f32_batched(
+                &self.q_raw_scratch,
+                &self.k_raw_scratch,
+                n_key_heads,
+                hd,
+                1.0 / (hd as f32).sqrt(),
+                config.norm_eps,
+                n_steps,
+            )?;
+
+            // 3. Repeat-interleave if GQA.
+            if n_key_heads < n_v_heads {
+                let ratio = n_v_heads / n_key_heads;
+                gpu.repeat_interleave_qk_f32_batched(
+                    &self.q_raw_scratch,
+                    &self.k_raw_scratch,
+                    &self.q_scratch,
+                    &self.k_scratch,
+                    n_key_heads,
+                    ratio,
+                    hd,
+                    n_steps,
+                )?;
+            } else {
+                let bytes = n_steps * k_dim * 4;
+                gpu.hip.memcpy_dtod_at(&self.q_scratch.buf, 0, &self.q_raw_scratch.buf, 0, bytes)?;
+                gpu.hip.memcpy_dtod_at(&self.k_scratch.buf, 0, &self.k_raw_scratch.buf, 0, bytes)?;
+            }
+
+            // 4. GDN recurrence — advances S_state.
+            gpu.gated_delta_net_q8_batch_seq(
+                &self.q_scratch,
+                &self.k_scratch,
+                &self.v_scratch,
+                &self.alpha_bufs[la_idx],
+                &self.beta_bufs[la_idx],
+                &dn_state.s_matrices[la_idx],
+                &dn_state.s_scales[la_idx],
+                &self.attn_scratch,
+                n_steps,
+                n_v_heads,
+                value_head_dim,
+            )?;
+
+            la_idx += 1;
+        }
+        Ok(())
+    }
+}
+
 impl DeltaNetTape {
     pub fn new_for(
         gpu: &mut Gpu,
@@ -783,6 +980,7 @@ pub fn verify_dflash_block(
     draft_tokens: &[u32],
     start_pos: usize,
     hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -805,6 +1003,7 @@ pub fn verify_dflash_block(
         &target.scratch,
         Some(hidden_rb),
         Some(&final_hidden),
+        gdn_tape,
     );
     if let Err(e) = batch_result {
         let _ = gpu.free_tensor(final_hidden);
@@ -1019,6 +1218,7 @@ pub fn spec_step_dflash(
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
+    gdn_tape: Option<&mut GdnTape>,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let h = draft_cfg.hidden;
@@ -1194,8 +1394,18 @@ pub fn spec_step_dflash(
     }
 
     // ── 6. Snapshot DeltaNet pre-verify, run verify (advances state by B) ─
+    //
+    // If a GdnTape is supplied, the verify forward also records the
+    // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
+    // replay just the GDN recurrence for `accept+1` steps without
+    // re-running the target.
     target_snap.save_from(&target.dn_state, gpu)?;
-    let verify_out = verify_dflash_block(gpu, target, &block, position, hidden_rb)?;
+    // Mutable variable to allow both verify capture + rollback replay usage.
+    let mut gdn_tape_opt = gdn_tape;
+    let verify_out = verify_dflash_block(
+        gpu, target, &block, position, hidden_rb,
+        gdn_tape_opt.as_deref_mut(),
+    )?;
 
     // ── 7. Acceptance: longest prefix where block[1..i+1] == posterior[0..i] ─
     let mut accept_len = 0usize;
@@ -1269,23 +1479,35 @@ pub fn spec_step_dflash(
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
     target_snap.restore_to(&mut target.dn_state, gpu)?;
-    // Batched replay (0.1.7 perf): forward_prefill_batch over (accept+1)
-    // tokens in one call, instead of (accept+1) sequential forward_scratch
-    // calls. Same byte-exact effect on KV cache + DN state, but the per-layer
-    // launches collapse to a single batched dispatch. Drops the replay cost
-    // from ~10 ms (4 sequential decodes) to ~2-3 ms.
-    let replay_tokens = &committed[..accept_len + 1];
-    qwen35::forward_prefill_batch(
-        gpu,
-        &target.weights,
-        &target.config,
-        replay_tokens,
-        position,
-        &mut target.kv_cache,
-        &mut target.dn_state,
-        &target.scratch,
-        None, None,
-    )?;
+    // Tape-replay path (0.1.7 perf): if a GdnTape was captured during verify,
+    // replay the GatedDeltaNet recurrence for (accept+1) steps using the
+    // recorded (q, k, v, α, β) tuples — no full-target re-run needed. The
+    // FullAttention layers don't need explicit rewind because the next
+    // verify (starting at position + accept + 1) will overwrite their KV
+    // cache slots [position + accept + 1 .. position + accept + 1 + B),
+    // which subsumes the previously-written [position..position + B) range.
+    //
+    // Fallback (no tape): batched forward_prefill_batch over (accept+1)
+    // tokens, same as the prior version — re-runs the full target but one
+    // batched call instead of (accept+1) sequential decodes.
+    if let Some(tape) = gdn_tape_opt.as_deref() {
+        tape.replay_gdn(
+            gpu, &target.weights, &target.config, &mut target.dn_state, accept_len + 1,
+        )?;
+    } else {
+        let replay_tokens = &committed[..accept_len + 1];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            replay_tokens,
+            position,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            None, None, None,
+        )?;
+    }
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus
     // token's K/V will be written on the next iter's verify (at position

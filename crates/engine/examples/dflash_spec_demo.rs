@@ -163,6 +163,12 @@ fn main() {
     .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");
+    // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
+    // positions, allocated once and reused every spec step. Enables the
+    // rollback path to replay GDN recurrence without re-running the target.
+    let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
+        &mut gpu, &target.config, draft_cfg.block_size,
+    ).expect("alloc gdn tape");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
@@ -223,6 +229,7 @@ fn main() {
             position,
             seed_token,
             ctx_slice,
+            Some(&mut gdn_tape),
         )
         .expect("spec step");
         stats.record(&step);
