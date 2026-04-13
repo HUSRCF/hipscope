@@ -114,7 +114,9 @@ bench_run() {
     local size="$1"
     local prefill="$2"
     local model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
-    local env_prefix="HIPFIRE_KV_MODE=givens4"
+    # givens4 was removed in the asym migration; asym3 is the current default
+    # (5.5× compression, same speed regime as the old givens4 baseline).
+    local env_prefix="HIPFIRE_KV_MODE=asym3"
     # 0.8B has a known hipGraph panic; use plain path.
     if [ "$size" != "0.8b" ]; then
         env_prefix="$env_prefix HIPFIRE_GRAPH=1"
@@ -335,7 +337,7 @@ echo "  2. If the change intentionally trades speed for something else (e.g.,"
 echo "     correctness on a new codepath), justify the tradeoff AND re-baseline."
 echo
 echo "Re-bench with:"
-echo "  HIPFIRE_KV_MODE=givens4 HIPFIRE_GRAPH=1 \\"
+echo "  HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \\"
 echo "    ./target/release/examples/bench_qwen35_mq4 <model>"
 echo
 exit 1

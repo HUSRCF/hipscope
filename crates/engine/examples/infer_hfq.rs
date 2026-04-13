@@ -105,9 +105,9 @@ fn main() {
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
     let mut kv_cache = if use_givens4 {
-        KvCache::new_gpu_givens4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+        KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_givens2 {
-        KvCache::new_gpu_givens2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+        KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_hfq4kv {
         KvCache::new_gpu_hfq4kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_q8kv {

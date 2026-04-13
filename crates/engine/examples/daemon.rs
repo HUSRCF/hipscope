@@ -268,18 +268,31 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+        // KV cache modes (RotorQuant-style asymmetric: K rotated + V Q8):
+        //   asym3 (default) — K at 3-bit rotated, V at Q8_0. 5.5× vs fp32.
+        //                     Best quality/compression tradeoff — RotorQuant "planar3".
+        //   asym4 — K at 4-bit rotated, V at Q8_0. 5.1× (slightly safer).
+        //   asym2 — K at 2-bit rotated, V at Q8_0. 6.0× (loses rare-token tail).
+        //   q8    — K+V both Q8_0. 3.76× (reference quality).
+        //
+        // Legacy "turbo{2,3,4}" aliases map to asym{2,3,4} for backward compat.
         let kv = match kv_mode.as_str() {
-            "givens4" => {
-                eprintln!("  KV cache: givens4");
-                llama::KvCache::new_gpu_givens4(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
-            }
-            "givens2" => {
-                eprintln!("  KV cache: givens2");
-                llama::KvCache::new_gpu_givens2(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
-            }
-            _ => {
+            "q8" => {
                 eprintln!("  KV cache: Q8");
                 llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+            }
+            "asym4" | "turbo4" => {
+                llama::KvCache::new_gpu_asym4(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+            }
+            "asym2" | "turbo2" => {
+                llama::KvCache::new_gpu_asym2(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+            }
+            "asym3" | "turbo3" | "turbo" | "auto" | "" => {
+                llama::KvCache::new_gpu_asym3(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+            }
+            other => {
+                eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
+                llama::KvCache::new_gpu_asym3(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
         };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
@@ -391,14 +404,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
         ).unwrap();
-        let this_turn_prompt_len = new_tokens.len();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
-        // ngram scope: this turn's prompt + generated tokens (excludes previous
-        // turns' generations to avoid cross-turn structural token blocking, but
-        // INCLUDES this turn's prompt tokens as an anti-loop anchor).
-        let ngram_scope_start = m.conversation_tokens.len() - this_turn_prompt_len;
+        // ngram scope for the repeat penalty: ONLY generated tokens (never the
+        // prompt). Prior design included the user's prompt as an anti-loop
+        // anchor, but that penalizes the very tokens we're asked to recall
+        // (names, numbers, facts) under MQ4/MQ6 quantizations that are more
+        // RP-sensitive than llama.cpp's Q4_K. First sample: empty scope (no
+        // generated tokens yet); subsequent samples: generated-so-far only.
+        let ngram_scope_start = m.conversation_tokens.len();
 
         // Generate. GPU-side sampling eliminates per-token logits download +
         // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
@@ -458,7 +473,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            // Upload fresh repeat window (scope = this turn's prompt + gen so far).
+            // Upload fresh repeat window (scope = generated tokens so far).
             let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
             let scope_start = ngram_scope.len().saturating_sub(repeat_buf_cap);
             let scope = &ngram_scope[scope_start..];

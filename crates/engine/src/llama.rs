@@ -1882,8 +1882,9 @@ pub struct KvCache {
     pub quant_q8: bool,
     pub quant_int8: bool,        // true = INT8 with separate scales
     pub quant_hfq4: bool,        // true = HFQ4 co-located blocks (72 bytes/head)
-    pub quant_givens4: bool,     // true = block-diagonal Givens rotation + 4-bit centroids (flash-compatible)
-    pub quant_givens2: bool,     // true = block-diagonal Givens rotation + 2-bit centroids (3.8× vs Q8)
+    pub quant_asym4: bool,       // true = K at 4-bit rotated, V at Q8_0 — RotorQuant planar4 asymmetric
+    pub quant_asym3: bool,       // true = K at givens3 (rotated 3-bit Lloyd-Max), V at Q8_0 — best-quality rotated K per RotorQuant
+    pub quant_asym2: bool,       // true = K at givens2 (rotated 2-bit), V at Q8_0 (normal space)
     pub boundary_layers: u8,     // number of boundary layers at each end (default 2)
     pub givens_cos: Option<GpuTensor>,  // Givens rotation cos table (n_blocks × f32)
     pub givens_sin: Option<GpuTensor>,  // Givens rotation sin table (n_blocks × f32)
@@ -1914,7 +1915,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -1938,7 +1939,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
@@ -1958,7 +1959,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
@@ -1976,7 +1977,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
@@ -1994,7 +1995,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
@@ -2014,7 +2015,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
@@ -2036,7 +2037,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_givens4: false, quant_givens2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![] })
     }
 
     /// Generate deterministic Givens rotation angles from a seed.
@@ -2054,141 +2055,124 @@ impl KvCache {
         (cos_vals, sin_vals)
     }
 
-    /// Create givens4 KV cache: block-diagonal Givens rotation + 4-bit centroids.
-    /// Flash-compatible by design. Same byte layout as turbo4 (68 bytes/head, hd=128).
-    pub fn new_gpu_givens4(
+    /// Create asym4 KV cache: K at 4-bit rotated (Givens + Lloyd-Max), V at Q8_0.
+    /// head_dim=256 → K=132 B/head, V=272 B/head → 404 B/head total (5.1× vs fp32).
+    pub fn new_gpu_asym4(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 128 || head_dim == 256, "givens4 requires head_dim=128 or 256");
+        assert!(head_dim == 128 || head_dim == 256, "asym4 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
         let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_head = 4 + head_dim / 2; // 68 for hd=128
-        let bytes_per_pos = n_kv_heads * bytes_per_head;
-        let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (max_seq_len * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (max_seq_len * v_bpp + 3) / 4;
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
         }
-
-        // Generate deterministic Givens angles
-        let n_blocks = head_dim / 2; // 64 for hd=128
+        let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let mut ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let mut st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
-
-        eprintln!("KV cache: givens4 ({bytes_per_head}B/head, {:.1}x vs fp32)",
-            (head_dim * 4) as f64 / bytes_per_head as f64);
-
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!("KV cache: asym4 (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_givens4: true, quant_givens2: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })
     }
 
-    /// Create givens2 KV cache: block-diagonal Givens + 2-bit centroids.
-    /// 3.8× compression vs Q8. 36 bytes/head for hd=128.
-    pub fn new_gpu_givens2(
+    /// Create asym3 KV cache: K at 3-bit rotated (Lloyd-Max N(0, 1/256)), V at Q8_0.
+    /// head_dim=256 → K=100 B/head, V=272 B/head → 372 B/head (5.5× vs fp32).
+    pub fn new_gpu_asym3(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 128 || head_dim == 256);
+        assert!(head_dim == 256, "asym3 currently requires head_dim=256 (Qwen 3.5)");
+        assert!(head_dim % 32 == 0);
         let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_head = 4 + head_dim / 4; // 36 for hd=128
-        let bytes_per_pos = n_kv_heads * bytes_per_head;
-        let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (max_seq_len * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (max_seq_len * v_bpp + 3) / 4;
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
         }
-
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let mut ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let mut st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
-
-        eprintln!("KV cache: givens2 ({bytes_per_head}B/head, {:.1}x vs fp32)",
-            (head_dim * 4) as f64 / bytes_per_head as f64);
-
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_givens4: false, quant_givens2: true,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })
     }
 
-    /// Create deferred givens4 KV cache: starts as Q8, converts to givens4 at threshold.
-    /// Allocates Q8 staging buffers (up to `threshold` positions) + givens4 main buffers.
-    /// Use `convert_q8_to_givens4` to convert staging→main at the switch point.
-    pub fn new_gpu_givens4_deferred(
+    /// Create asym2 KV cache: K at 2-bit rotated, V at Q8_0.
+    /// head_dim=256 → K=68 B/head, V=272 B/head → 340 B/head (6.0× vs fp32).
+    pub fn new_gpu_asym2(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
-        threshold: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 128 || head_dim == 256);
+        assert!(head_dim == 128 || head_dim == 256, "asym2 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
         let kv_dim = n_kv_heads * head_dim;
-
-        // givens4 main buffers (sized for full context)
-        let g4_bph = 4 + head_dim / 2;
-        let g4_bpp = n_kv_heads * g4_bph;
-        let g4_bytes = max_seq_len * g4_bpp;
-        let g4_elems = (g4_bytes + 3) / 4;
-
-        // Q8_0 staging buffers (sized for threshold positions only)
-        let q8_blocks_per_head = head_dim / 32;
-        let q8_blocks_per_pos = n_kv_heads * q8_blocks_per_head;
-        let q8_bpp = q8_blocks_per_pos * 34;
-        let q8_bytes = threshold * q8_bpp;
-        let q8_elems = (q8_bytes + 3) / 4;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (max_seq_len * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (max_seq_len * v_bpp + 3) / 4;
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        let mut k_scales = Vec::with_capacity(n_layers); // reuse for Q8 staging
-        let mut v_scales = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[g4_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[g4_elems], DType::F32)?);
-            k_scales.push(gpu.zeros(&[q8_elems], DType::F32)?);
-            v_scales.push(gpu.zeros(&[q8_elems], DType::F32)?);
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
         }
-
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let mut ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let mut st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
-
-        let q8_mb = (q8_bytes * n_layers * 2) as f64 / 1e6;
-        eprintln!("KV cache: givens4-deferred (Q8 staging ≤{threshold} pos = {q8_mb:.1}MB, givens4 {g4_bph}B/head, {:.1}x vs fp32)",
-            (head_dim * 4) as f64 / g4_bph as f64);
-
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!("KV cache: asym2 (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
-            k_gpu, v_gpu, k_scales, v_scales, kv_dim,
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
-            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false,
-            quant_givens4: true, quant_givens2: false,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
         })

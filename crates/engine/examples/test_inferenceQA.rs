@@ -464,7 +464,7 @@ fn chatml_single_tokens(ctx: &mut Context) -> CaseOutcome {
 
 #[cfg(feature = "deltanet")]
 fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
-    match llama::KvCache::new_gpu_givens4(
+    match llama::KvCache::new_gpu_asym3(
         &mut ctx.gpu,
         ctx.config.n_layers,
         ctx.config.n_kv_heads,
@@ -472,7 +472,7 @@ fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
         128,
     ) {
         Ok(kv) => {
-            if kv.quant_givens4 && kv.givens_cos.is_some() && kv.givens_sin.is_some() {
+            if kv.quant_asym3 && kv.givens_cos.is_some() && kv.givens_sin.is_some() {
                 CaseOutcome::Pass(format!("allocated givens4 KV for {} layers", ctx.config.n_layers))
             } else {
                 CaseOutcome::Fail("givens4 KV cache flags were inconsistent".to_string())
@@ -485,7 +485,7 @@ fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
 #[cfg(feature = "deltanet")]
 fn givens4_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
-        let mut kv = llama::KvCache::new_gpu_givens4(
+        let mut kv = llama::KvCache::new_gpu_asym3(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,

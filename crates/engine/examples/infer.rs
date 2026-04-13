@@ -121,8 +121,8 @@ fn main() {
     let kv_seq = 4096usize;
     eprintln!("KV cache: {kv_mode}");
     let mut kv_cache = match kv_mode {
-        "givens4" => llama::KvCache::new_gpu_givens4(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
-        "givens2" => llama::KvCache::new_gpu_givens2(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
+        "givens4" => llama::KvCache::new_gpu_asym3(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
+        "givens2" => llama::KvCache::new_gpu_asym2(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
         _ => llama::KvCache::new_gpu_q8(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap(),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();

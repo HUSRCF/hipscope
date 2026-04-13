@@ -429,34 +429,27 @@ pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common
 /// Givens rotation common header: 2x2 block-diagonal rotation primitives.
 pub const GIVENS_COMMON_SRC: &str = include_str!("../../../kernels/src/givens_common.h");
 
-/// KV cache write for givens4 (Givens rotation + 4-bit centroid quantize).
-pub const KV_CACHE_WRITE_GIVENS4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens4.hip");
+// ── asym4 / asym3 / asym2: K at rotated-quantized + V at Q8_0 (RotorQuant planar/Q8 style) ──
+//
+// K is rotated and stored 4-bit (asym4) or 2-bit (asym2) — same byte layout
+// as givens4 / givens2 K. V is stored at Q8_0 in NORMAL (un-rotated) space.
+// Attention reads K in rotated space, V in normal space; accumulation thus
+// ends in normal space — the plain Q8_0 flash reduce works as-is.
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2.hip");
+pub const ATTENTION_FLASH_ASYM4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_tile.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile.hip");
+pub const ATTENTION_FLASH_ASYM2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile.hip");
 
-/// Flash attention tile kernel for givens4 KV cache (block-diagonal Givens rotation).
-pub const ATTENTION_FLASH_GIVENS4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_tile.hip");
-
-/// Flash attention reduce for givens4 — 2-pass combine + Givens inverse (register-local).
-pub const ATTENTION_FLASH_GIVENS4_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_reduce.hip");
-
-/// Bulk convert Q8_0 KV cache → givens4 format (deferred quantization switch point).
-pub const CONVERT_Q8_TO_GIVENS4_SRC: &str = include_str!("../../../kernels/src/convert_q8_to_givens4.hip");
-
-/// Batched givens4 KV write — processes N positions in one launch for prefill.
-pub const KV_CACHE_WRITE_GIVENS4_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens4_batched.hip");
-
-/// Batched flash attention tile for givens4 — processes sub-batch of positions via blockIdx.z.
-pub const ATTENTION_FLASH_GIVENS4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_tile_batched.hip");
-
-/// Batched flash attention reduce for givens4 — processes sub-batch via blockIdx.y.
-/// Also used by givens2 (reduce is bit-width independent).
-pub const ATTENTION_FLASH_GIVENS4_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_reduce_batched.hip");
-
-// ── givens2: 2-bit Givens rotation, 3.8× compression vs Q8 ──
-
-pub const KV_CACHE_WRITE_GIVENS2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens2.hip");
-pub const ATTENTION_FLASH_GIVENS2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens2_tile.hip");
-pub const KV_CACHE_WRITE_GIVENS2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens2_batched.hip");
-pub const ATTENTION_FLASH_GIVENS2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens2_tile_batched.hip");
+// asym batched prefill variants: K rotated + V Q8 in one launch for N positions.
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2_batched.hip");
+pub const ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_tile_batched.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
+pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
+pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.

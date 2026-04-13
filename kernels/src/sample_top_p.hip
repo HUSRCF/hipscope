@@ -137,8 +137,18 @@ extern "C" __global__ void sample_top_p(
 
         // Find max (for numerical stability) and clamp against degenerate cases.
         float max_val = vals[0];
-        for (int k = 1; k < TOP_K; k++) { if (vals[k] > max_val) max_val = vals[k]; }
+        int   max_pos = 0;
+        for (int k = 1; k < TOP_K; k++) { if (vals[k] > max_val) { max_val = vals[k]; max_pos = k; } }
         if (max_val <= -1e29f) { result[0] = 0; result[1] = rand_seed; return; }
+
+        // Greedy fast path: at temperature == 0 (or effectively zero), just
+        // return the argmax. Skipping the softmax avoids a 1/temp division
+        // that would produce +inf → NaN probabilities and a garbage pick.
+        if (temperature <= 1e-6f) {
+            result[0] = (unsigned int)idx[max_pos];
+            result[1] = rand_seed;
+            return;
+        }
 
         // Softmax over top-K only (matches CPU `sample_top_p`).
         float inv_temp = 1.0f / temperature;
