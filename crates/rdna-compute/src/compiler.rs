@@ -269,12 +269,17 @@ impl KernelCompiler {
         let arch = self.arch.clone();
         let precompiled_dir = self.precompiled_dir.clone();
 
+        // Shared counter so parallel threads can report "[i/N] name" as each one
+        // completes. Ordering follows completion (not launch) — matches the pace
+        // of hipcc finishing.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         // Spawn hipcc in parallel threads
         let results: Vec<_> = to_compile.into_iter().map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
             let arch = arch.clone();
             let precompiled_dir = precompiled_dir.clone();
+            let done = std::sync::Arc::clone(&done);
             let handle = thread::spawn(move || {
-                eprint!("    {name}...");
                 let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source);
                 if result.is_ok() {
                     let _ = std::fs::write(&hash_path, &src_hash);
@@ -286,6 +291,9 @@ impl KernelCompiler {
                         let _ = std::fs::write(&pre_hash, &src_hash);
                     }
                 }
+                let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let marker = if result.is_ok() { "✓" } else { "✗" };
+                eprintln!("  [{i:>3}/{n}] {marker} {name}");
                 (name, obj_path, result)
             });
             handle
@@ -301,7 +309,7 @@ impl KernelCompiler {
                 Err(e) => errors.push(e),
             }
         }
-        eprintln!(" done.");
+        eprintln!("  done ({n} kernels).");
 
         if let Some(e) = errors.into_iter().next() {
             return Err(e);

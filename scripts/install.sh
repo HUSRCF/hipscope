@@ -375,13 +375,26 @@ if [ "$GPU_ARCH" != "unknown" ]; then
         count=$(ls "$KERNEL_DEST"/*.hsaco 2>/dev/null | wc -l)
         echo "  Copied $count kernels + hashes to $KERNEL_DEST/ ✓"
     else
-        echo "  WARNING: No pre-compiled kernels for $GPU_ARCH in repo."
-        echo "  Compile them: cd $REPO_DIR && scripts/compile-kernels.sh $GPU_ARCH"
-        echo "  Then copy: cp kernels/compiled/$GPU_ARCH/*.hsaco $KERNEL_DEST/"
+        echo "  No pre-compiled kernels for $GPU_ARCH in repo — will JIT from source below."
     fi
 else
-    echo "Skipping kernel setup (GPU arch unknown)."
-    echo "  Re-run installer after fixing GPU detection, or copy kernels manually."
+    echo "Skipping pre-built kernel copy (GPU arch unknown) — daemon will still"
+    echo "  auto-detect at runtime. Missing kernels compile on first use."
+fi
+
+# Fill in any kernels missing from the pre-compiled set, including MQ4/asym3
+# defaults that aren't always shipped for newer arches. Uses hipcc in parallel
+# and writes back to ~/.hipfire/bin/kernels/compiled/<arch>/ so first
+# `hipfire run` isn't a 2-minute compile wall. Runs regardless of install-time
+# arch detection — the daemon's own Gpu::init resolves the active arch.
+if [ -x "$BIN_DIR/daemon" ]; then
+    echo ""
+    echo "Pre-compiling GPU kernels (first run will be instant afterward)..."
+    if "$BIN_DIR/daemon" --precompile; then
+        echo "  Pre-compile complete ✓"
+    else
+        echo "  Pre-compile finished with warnings — any missing kernels will compile on first use."
+    fi
 fi
 
 # ─── Config ──────────────────────────────────────────────

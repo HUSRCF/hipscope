@@ -54,19 +54,41 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // --precompile: compile all kernels for this GPU, write hash files, exit.
-    // Used by `hipfire update` so `hipfire serve` starts instantly.
+    // Used by scripts/install.sh and `hipfire update` so first `hipfire run`
+    // isn't a 2-minute hipcc wait.
+    //
+    // Covers the current default path (mq4 weights + asym3 KV) plus the legacy
+    // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
+    // era of the registry start instantly.
     if args.iter().any(|a| a == "--precompile") {
+        // Pre-create the expected precompiled-dir next to this binary so the
+        // compiler's writeback path fires. Without this, Gpu::init probes for
+        // an existing dir and silently disables writeback if it's missing —
+        // meaning fresh installs would compile but never cache cross-invocation.
+        if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
+            // we support so the probe picks one up. The real arch check after init
+            // will log the active dir.
+            for arch in ["gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1200", "gfx1201"] {
+                let _ = std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
+            }
+        }
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
-        // Cover Q8 KV cache × weight formats
-        for kv in &["q8"] {
-            for wq in &["hfq6", "hfq4", "q8"] {
+        let mut errors = 0usize;
+        for kv in &["asym3", "q8"] {
+            for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
                     eprintln!("  {wq}/{kv}: {e}");
+                    errors += 1;
                 }
             }
         }
-        eprintln!("Kernel precompilation done.");
+        if errors > 0 {
+            eprintln!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
+        } else {
+            eprintln!("Kernel precompilation done.");
+        }
         return;
     }
 

@@ -7536,6 +7536,17 @@ impl Gpu {
     /// weight quantization and KV cache type. Runs hipcc in parallel.
     #[cfg(feature = "deltanet")]
     pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+        // asym kernels #include "turbo_common.h" + "givens_common.h"; the
+        // runtime dispatch path (see ensure_givens4_kernel) prepends the
+        // header bodies and strips the #includes. We mirror that exactly so
+        // the hash matches and the runtime re-uses our cached .hsaco.
+        let assemble_asym = |body: &str| -> String {
+            let stripped = body
+                .replace("#include \"turbo_common.h\"", "")
+                .replace("#include \"givens_common.h\"", "");
+            format!("{}\n{}\n{}", kernels::TURBO_COMMON_H, kernels::GIVENS_COMMON_SRC, stripped)
+        };
+
         // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
         let mut specs: Vec<(&str, String)> = vec![
             ("rmsnorm",                  kernels::RMSNORM_SRC.to_string()),
@@ -7565,6 +7576,12 @@ impl Gpu {
             "hfq6" => {
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
             }
+            "mq6" => {
+                // MQ6 = FWHT-rotated HFQ6-G256. Needs both the MQ6 GEMV and the
+                // raw HFQ6 GEMV (used by a few residual paths).
+                specs.push(("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC.to_string()));
+                specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
+            }
             "hfq4" => {
                 let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
                 specs.push((module, src.to_string()));
@@ -7592,6 +7609,24 @@ impl Gpu {
                                 kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string()));
                 }
             }
+            "mq4" => {
+                // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
+                // Shares the HFQ4 fused kernels (same blob, different dispatch key)
+                // plus MQ-specific rotation kernels.
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+                specs.push((module, src.to_string()));
+                specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
+                specs.push(("fused_qkvza_hfq4g256",
+                            kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string()));
+                specs.push(("fused_qkv_hfq4g256",
+                            kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
+                specs.push(("fused_gate_up_hfq4g256",
+                            kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
+                specs.push(("fused_rmsnorm_mq_rotate",
+                            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
+                specs.push(("fused_silu_mul_mq_rotate",
+                            kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
+            }
             "q8" => {
                 specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
             }
@@ -7606,11 +7641,56 @@ impl Gpu {
         // DeltaNet kernels
         specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
 
-        // KV cache kernels
+        // KV cache kernels. asym3 is the current default — always ships flash.
+        // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
+            "asym4" => {
+                specs.push(("kv_cache_write_asym_k_givens4",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC)));
+                specs.push(("kv_cache_write_asym_k_givens4_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC)));
+                specs.push(("attention_flash_asym4_tile",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_SRC)));
+                specs.push(("attention_flash_asym4_tile_batched",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC)));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+            }
+            "asym3" => {
+                specs.push(("kv_cache_write_asym_k_givens3",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC)));
+                specs.push(("kv_cache_write_asym_k_givens3_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC)));
+                specs.push(("attention_flash_asym3_tile",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC)));
+                specs.push(("attention_flash_asym3_tile_batched",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC)));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+            }
+            "asym2" => {
+                specs.push(("kv_cache_write_asym_k_givens2",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC)));
+                specs.push(("kv_cache_write_asym_k_givens2_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC)));
+                specs.push(("attention_flash_asym2_tile",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_SRC)));
+                specs.push(("attention_flash_asym2_tile_batched",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC)));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+            }
             "q8" | _ => {
                 specs.push(("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string()));
                 specs.push(("attention_q8_0_kv",   kernels::ATTENTION_Q8_0_KV_SRC.to_string()));
+                specs.push(("attention_q8_0_kv_batched",
+                            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string()));
+                specs.push(("kv_cache_write_q8_0_batched",
+                            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string()));
+                specs.push(("attention_flash_q8_0_tile",
+                            kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string()));
+                specs.push(("attention_flash_q8_0_reduce",
+                            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string()));
             }
         }
 
@@ -7644,8 +7724,12 @@ impl Gpu {
                 "deinterleave" => vec!["deinterleave_f32"],
                 "repeat_interleave_qk" => vec!["repeat_interleave_qk_f32"],
                 "gated_delta_net_q8" => vec!["gated_delta_net_q8"],
-                // RDNA2 variant module names → common function symbol
-                n if n.starts_with("gemv_hfq4g256_rdna2") => vec!["gemv_hfq4g256"],
+                // MQ4 GEMV module exports both the main GEMV and the standalone
+                // x rotation kernel used by the prerotated dispatch path.
+                "gemv_mq4g256" => vec!["gemv_mq4g256", "mq_rotate_x"],
+                // Arch-variant HFQ4 GEMV modules all expose the same symbol.
+                n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
+                n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],
                 // Multi-row RDNA3 modules expose three entry points per .hsaco
                 "gemv_hfq4g256_multirow_rdna3" => vec![
                     "gemv_hfq4g256_multirow_r2",
