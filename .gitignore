@@ -31,6 +31,8 @@ kernels/compiled/
 .codex
 docs/superpowers/
 .worktrees/
+.dflash-reference/
+.dflash-ref-hf/
 
 # Python
 __pycache__/
