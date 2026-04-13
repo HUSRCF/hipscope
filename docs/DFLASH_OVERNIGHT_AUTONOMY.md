@@ -231,6 +231,54 @@ Do NOT:
 - Blow away `~/.hipfire/models/` or the repo `models/` directory
 - Merge dflash into master — that's the user's review step in the morning
 
+## Monitor injections — check at every phase boundary
+
+There is a live monitor watching your progress on `origin/dflash`. It
+communicates via `docs/DFLASH_INJECTIONS.md`. Treat this file as a
+real-time command channel from the user.
+
+**Required checks:**
+
+1. `git pull origin dflash` at the start of every phase.
+2. `cat docs/DFLASH_INJECTIONS.md` — read the "Active injections" section.
+3. If there's an entry dated after your last applied injection:
+   - Read it in full.
+   - Apply it according to its priority level:
+     - `INFO` — add to your mental context, no action
+     - `GUIDANCE` — suggested adjustment; apply if it helps your MVP
+     - `OVERRIDE` — supersedes the autonomy contract for the stated
+       scope (e.g., "quality-gate parity relaxed for Phase 3")
+     - `ABORT` — stop current phase, follow the injection's next-step
+   - Acknowledge by appending to `docs/DFLASH_PROGRESS.md`:
+     `[injection applied <timestamp>] <one-line summary>`
+4. Commit any file changes the injection produced. Push.
+
+**Why the mailbox exists:** the monitor sees things you can't (rate of
+progress, stall patterns, whether a quality-gate failure is a real
+regression vs. an ambient cost of new code). Trust its overrides unless
+they'd clearly break the spec-decoding correctness contract.
+
+**If the mailbox file doesn't exist or is empty:** proceed with the
+autonomy contract as originally written. No injections is the default.
+
+## Emergency escalation — worker → monitor
+
+If you hit a fundamental block and need human context before morning,
+append a priority block to the END of `docs/DFLASH_INJECTIONS.md`
+yourself, titled:
+
+```
+## WORKER → MONITOR <timestamp>
+priority: HELP
+context: <1-2 sentences>
+blocked on: <specific technical question>
+```
+
+Commit + push. The monitor checks the file on its next 30-min cycle and
+will either inject an OVERRIDE/GUIDANCE or (via codex-rescue fallback)
+kick a debugging agent at the problem. While waiting, continue on
+anything parallelizable — never sit idle.
+
 ## Final rule
 
 If in doubt at a decision point, prefer **correct + committed + documented**
