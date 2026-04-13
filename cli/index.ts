@@ -2370,18 +2370,28 @@ switch (cmd) {
         env: { ...process.env, HIPFIRE_DETACHED: "1" },
       });
       child.unref();
-      // Poll until /health is reachable (up to ~30s for model pre-warm).
-      const deadline = Date.now() + 30_000;
+      // Poll until /health is reachable. First-run kernel JIT on slower
+      // hardware (APUs, gfx1013) can take well over a minute for a 9B model,
+      // so give it a generous window. Subsequent starts hit the kernel cache
+      // and return in seconds.
+      const READINESS_TIMEOUT_MS = 300_000;   // 5 minutes
+      const deadline = Date.now() + READINESS_TIMEOUT_MS;
+      console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
       while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 250));
+        await new Promise(r => setTimeout(r, 500));
         if (await isServeUp(port)) break;
+        // Show progress every 30s
+        const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
+        if (elapsed > 0 && elapsed % 30 === 0) {
+          process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
+        }
       }
       if (await isServeUp(port)) {
         console.log(`hipfire serve started in background (PID ${child.pid}, port ${port})`);
         console.log(`  log:  ${SERVE_LOG_FILE}`);
         console.log(`  stop: hipfire stop`);
       } else {
-        console.error(`Serve started (PID ${child.pid}) but /health did not respond within 30s.`);
+        console.error(`Serve started (PID ${child.pid}) but /health did not respond within ${READINESS_TIMEOUT_MS / 1000}s.`);
         console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
       }
       break;
