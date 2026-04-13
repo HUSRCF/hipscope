@@ -48,6 +48,7 @@ fn main() {
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
+    let mut adaptive_b: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -91,6 +92,10 @@ fn main() {
             "--seed" => {
                 seed = args[i + 1].parse().unwrap();
                 i += 2;
+            }
+            "--adaptive-b" => {
+                adaptive_b = true;
+                i += 1;
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -250,6 +255,20 @@ fn main() {
             eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
             break;
         }
+        // Adaptive B: when rolling τ falls below threshold, shrink block_size
+        // to 8 to cut per-iter cost. Raise back to 16 when τ recovers. Only
+        // active when --adaptive-b is set.
+        let block_override = if adaptive_b {
+            if accepts_window.len() >= 4 {
+                let win_tau: f64 =
+                    accepts_window.iter().copied().sum::<usize>() as f64 / accepts_window.len() as f64;
+                if win_tau < 4.0 { Some(8usize) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let step = speculative::spec_step_dflash(
             &mut gpu,
             &mut target,
@@ -265,6 +284,7 @@ fn main() {
             Some(&mut gdn_tape),
             temp,
             &mut rng_state,
+            block_override,
         )
         .expect("spec step");
         stats.record(&step);

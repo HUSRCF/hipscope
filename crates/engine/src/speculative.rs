@@ -1315,8 +1315,12 @@ pub fn spec_step_dflash(
     gdn_tape: Option<&mut GdnTape>,
     temp: f32,
     rng_state: &mut u64,
+    block_size_override: Option<usize>,
 ) -> HipResult<SpecStepResult> {
-    let b = draft_cfg.block_size;
+    // Effective block size for THIS step. Usually `draft_cfg.block_size`
+    // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
+    // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
+    let b = block_size_override.unwrap_or(draft_cfg.block_size);
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
