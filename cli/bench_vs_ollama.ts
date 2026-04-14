@@ -96,13 +96,16 @@ for (const p of PAIRS) {
   const h = await benchHipfire(p.hipfire);
   if (h) console.log(`  pp128=${h.pp128.toFixed(0)} pp512=${h.pp512.toFixed(0)} decode=${h.decode_tok_s.toFixed(1)} ttft=${h.ttft_ms.toFixed(1)}ms`);
 
-  console.log(`→ ollama Q4_K_M (pp128)...`);
-  const o128 = await benchOllama(p.ollama, prompt128, 32);
-  if (o128) console.log(`  prefill=${o128.prefill_tok_s.toFixed(0)} tok/s (${o128.prefill_tok} tok) decode=${o128.decode_tok_s.toFixed(1)} tok/s`);
+  // num_predict=128 matches hipfire's default decode-run length. Short
+  // generations under-report decode tok/s because launch-overhead
+  // dominates; 128 is long enough to hit steady state.
+  console.log(`→ ollama Q4_K_M (pp128 + tg128)...`);
+  const o128 = await benchOllama(p.ollama, prompt128, 128);
+  if (o128) console.log(`  prefill=${o128.prefill_tok_s.toFixed(0)} tok/s (${o128.prefill_tok} tok) decode=${o128.decode_tok_s.toFixed(1)} tok/s (${o128.decode_tok} tok)`);
 
-  console.log(`→ ollama Q4_K_M (pp512)...`);
-  const o512 = await benchOllama(p.ollama, prompt512, 32);
-  if (o512) console.log(`  prefill=${o512.prefill_tok_s.toFixed(0)} tok/s (${o512.prefill_tok} tok) decode=${o512.decode_tok_s.toFixed(1)} tok/s`);
+  console.log(`→ ollama Q4_K_M (pp512 + tg128)...`);
+  const o512 = await benchOllama(p.ollama, prompt512, 128);
+  if (o512) console.log(`  prefill=${o512.prefill_tok_s.toFixed(0)} tok/s (${o512.prefill_tok} tok) decode=${o512.decode_tok_s.toFixed(1)} tok/s (${o512.decode_tok} tok)`);
 
   // Decode baseline from the larger prefill measurement (steady state).
   rows.push({ model: p.name, hipfire: h, ollama128: o128, ollama512: o512 });

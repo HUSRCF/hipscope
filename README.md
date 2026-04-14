@@ -35,23 +35,24 @@ on the MQ4 fused projections.
 ### vs ollama (Q4_K_M GGUF via llama.cpp/ROCm) — 7900 XTX
 
 Same machine, same models. hipfire asym3 MQ4 vs ollama default Q4_K_M
-(llama.cpp ROCm backend). Matched ~128-token and ~530-token prompts fed
-to both (ollama via `/api/generate`, numbers from its own reported
+(llama.cpp ROCm backend). Matched ~140-token and ~530-token prompts and
+matched 128-token generation lengths fed to both (ollama via
+`/api/generate` with `num_predict=128`, numbers from its own reported
 `prompt_eval_duration` / `eval_duration`).
 
 | Model | hf pp128 | oll pp128 | hf pp512 | oll pp512 | hf decode | oll decode | decode× |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen 3.5 0.8B | **11,310** | 3,392 | **13,163** | 6,359 | **353** | 170 | **2.08×** |
-| Qwen 3.5 4B   | **3,350**  | 2,024 | **3,348**  | 2,737 | **166** | 96  | **1.73×** |
-| Qwen 3.5 9B   | **1,932**  | 617   | 1,649      | **1,974** | **122** | 48  | **2.55×** |
+| Qwen 3.5 0.8B | **10,861** | 4,622 | **12,962** | 7,117 | **353** | 168 | **2.10×** |
+| Qwen 3.5 4B   | **3,304**  | 1,972 | **3,321**  | 2,670 | **165** | 93  | **1.78×** |
+| Qwen 3.5 9B   | **1,920**  | 1,428 | 1,919      | **1,970** | **122** | 71  | **1.71×** |
 
 Decode is the user-visible number for interactive chat and hipfire wins
-~1.7–2.6× across the board. Prefill is a more mixed picture: hipfire
-wins decisively on 0.8B and at pp128 for all sizes (batched MQ4 fused
-projections saturate WMMA on small matmuls where ollama's per-token
-GGUF dequant can't), but ollama catches up at pp512 on 9B (1,974 vs
-1,649 tok/s) — the GEMMs are large enough there to saturate even
-without WMMA. Harness: [`cli/bench_vs_ollama.ts`](cli/bench_vs_ollama.ts).
+1.7–2.1× across the board. Prefill is more nuanced: hipfire wins
+decisively on 0.8B/4B and at pp128 for 9B (batched MQ4 fused projections
+saturate WMMA on small matmuls where ollama's per-token GGUF dequant
+can't), but ollama edges past hipfire at pp512 on 9B (1,970 vs 1,919
+tok/s) — the GEMMs are large enough there to saturate even without WMMA.
+Harness: [`cli/bench_vs_ollama.ts`](cli/bench_vs_ollama.ts).
 
 Other arches:
 
