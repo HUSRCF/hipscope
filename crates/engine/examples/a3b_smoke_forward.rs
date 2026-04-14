@@ -43,9 +43,25 @@ fn main() {
     eprintln!("Loaded {} layers.", weights.layers.len());
 
     let kv_seq = 256usize;
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-    ).expect("kv cache alloc");
+    // Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
+    // production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit
+    // KV path and always-on flash; f32 falls back to plain attention_f32.
+    let kv_mode = std::env::var("HIPFIRE_SMOKE_KV").unwrap_or_else(|_| "q8".to_string());
+    eprintln!("KV cache mode: {kv_mode}");
+    let mut kv_cache = match kv_mode.as_str() {
+        "asym4" => KvCache::new_gpu_asym4(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+        ).expect("kv cache alloc"),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+        ).expect("kv cache alloc"),
+        "asym2" => KvCache::new_gpu_asym2(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+        ).expect("kv cache alloc"),
+        _ => KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+        ).expect("kv cache alloc"),
+    };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state alloc");
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");
 
