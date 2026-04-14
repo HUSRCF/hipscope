@@ -2633,7 +2633,10 @@ impl Gpu {
     /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in a
     /// single launch. Caller passes the 8 selected experts' weight
     /// tensors (in top-K order); the kernel's grid.y picks which expert
-    /// each block uses. Output layout is [K_TOP × M] row-major.
+    /// each block uses. Outputs are SPLIT into `y_gate` (first mi rows of
+    /// each expert) and `y_up` (second mi rows), both `[k_top × mi]`
+    /// row-major, so the next-stage batched silu_mul_rotate can consume
+    /// them as plain [batch × K] buffers without extra strided reads.
     ///
     /// Bit-exact with running `gemv_hfq4g256` 8 times (same accumulator
     /// layout and pairwise final combine). `k_top` is currently hardcoded
@@ -2644,7 +2647,8 @@ impl Gpu {
         w0: &GpuTensor, w1: &GpuTensor, w2: &GpuTensor, w3: &GpuTensor,
         w4: &GpuTensor, w5: &GpuTensor, w6: &GpuTensor, w7: &GpuTensor,
         x: &GpuTensor,
-        y: &GpuTensor,   // [k_top × m] row-major
+        y_gate: &GpuTensor,   // [k_top × mi] — first half
+        y_up:   &GpuTensor,   // [k_top × mi] — second half
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.ensure_kernel(
@@ -2657,7 +2661,8 @@ impl Gpu {
         let w4p = w4.buf.as_ptr(); let w5p = w5.buf.as_ptr();
         let w6p = w6.buf.as_ptr(); let w7p = w7.buf.as_ptr();
         let xp = x.buf.as_ptr();
-        let yp = y.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -2666,7 +2671,8 @@ impl Gpu {
             &w4p as *const _ as *mut c_void, &w5p as *const _ as *mut c_void,
             &w6p as *const _ as *mut c_void, &w7p as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
@@ -2681,7 +2687,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(w0p); b.push_ptr(w1p); b.push_ptr(w2p); b.push_ptr(w3p);
                 b.push_ptr(w4p); b.push_ptr(w5p); b.push_ptr(w6p); b.push_ptr(w7p);
-                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_ptr(xp); b.push_ptr(ygp); b.push_ptr(yup);
                 b.push_i32(m_val); b.push_i32(k_val);
                 b
             },

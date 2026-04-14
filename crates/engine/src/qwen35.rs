@@ -1120,15 +1120,23 @@ fn moe_ffn_decode(
         gpu.ensure_mq_signs()?;
     }
 
-    // Scratch batch output for all k experts' gate_up results: [k × 2*mi].
+    // Scratch batch outputs for all k experts: gate[k × mi], up[k × mi],
+    // rot_silumul[k × mi] (rotated silu_mul output).
     let use_fused_gate_up = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
-    let gate_up_batch = if use_fused_gate_up {
-        Some(gpu.alloc_tensor(&[k * 2 * mi], DType::F32)?)
+    let (gate_batch, up_batch, rot_batch) = if use_fused_gate_up {
+        (
+            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
+            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
+            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
+        )
     } else {
-        None
+        (None, None, None)
     };
-    if let (Some(batch_out), Some(xr)) = (gate_up_batch.as_ref(), x_rot_local.as_ref()) {
-        // Single fused launch: 8 experts' gate_up GEMV in parallel.
+    if let (Some(gb), Some(ub), Some(rb), Some(xr)) =
+        (gate_batch.as_ref(), up_batch.as_ref(), rot_batch.as_ref(), x_rot_local.as_ref())
+    {
+        // Single fused launch: 8 experts' gate_up GEMV in parallel, split
+        // into gate_batch + up_batch (each [k × mi]).
         let e0 = &ffn.experts[topk_indices[0]].gate_up;
         let e1 = &ffn.experts[topk_indices[1]].gate_up;
         let e2 = &ffn.experts[topk_indices[2]].gate_up;
@@ -1140,44 +1148,53 @@ fn moe_ffn_decode(
         gpu.gemv_hfq4g256_moe_gate_up_k8(
             &e0.buf, &e1.buf, &e2.buf, &e3.buf,
             &e4.buf, &e5.buf, &e6.buf, &e7.buf,
-            xr, batch_out,
+            xr, gb, ub,
             2 * mi, e0.k,
         )?;
+        // Single batched silu_mul+rotate for all 8 experts:
+        //   rot_batch[k × mi] = FWHT(silu(gate_batch[k, :]) * up_batch[k, :])
+        gpu.fused_silu_mul_rotate_mq_batched(gb, ub, rb, mi, k)?;
     }
 
     for (krank, (&expert_idx, &weight)) in topk_indices.iter().zip(topk_weights.iter()).enumerate() {
         let expert = &ffn.experts[expert_idx];
-        // Source buffer for silu_mul: either the fused batch output slice
-        // or a fresh per-expert scratch from an unfused gate_up GEMV.
-        let (gate_view, up_view) = if let Some(ref batch) = gate_up_batch {
-            let base = krank * 2 * mi;
-            (slice_f32_view(batch, base, mi), slice_f32_view(batch, base + mi, mi))
+        if let Some(ref rb) = rot_batch {
+            // Fast path: all upstream stages fused. Just do the down-GEMV
+            // with scaled residual against this expert's slice of rot_batch.
+            let rot_slice = slice_f32_view(rb, krank * mi, mi);
+            gpu.gemv_hfq4g256_residual_scaled_cpu(
+                &expert.down.buf, &rot_slice, x_residual, weight,
+                expert.down.m, expert.down.k,
+            )?;
         } else {
+            // Non-fused fallback: per-expert gate_up → silu_mul_rotate →
+            // scaled_residual. Preserves the Phase 2a-iii path for any
+            // layer that isn't all-MQ4 or has k != 8.
             if let Some(ref xr) = x_rot_local {
                 gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
                     expert.gate_up.m, expert.gate_up.k)?;
             } else {
                 weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
             }
-            (slice_f32_view(&gate_up_buf, 0, mi), slice_f32_view(&gate_up_buf, mi, mi))
-        };
-        if routed_mq4 {
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
-            gpu.gemv_hfq4g256_residual_scaled_cpu(
-                &expert.down.buf, &x_rot_alias, x_residual, weight,
-                expert.down.m, expert.down.k,
-            )?;
-        } else {
-            // Non-MQ fallback: pre-2a-ii path.
-            let hid_view = slice_f32_view(&ffn_hidden, 0, mi);
-            gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
-            weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
-            gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
+            let gate_view = slice_f32_view(&gate_up_buf, 0,  mi);
+            let up_view   = slice_f32_view(&gate_up_buf, mi, mi);
+            if routed_mq4 {
+                let x_rot_alias = GpuTensor {
+                    buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                    shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                    dtype: DType::F32,
+                };
+                gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
+                gpu.gemv_hfq4g256_residual_scaled_cpu(
+                    &expert.down.buf, &x_rot_alias, x_residual, weight,
+                    expert.down.m, expert.down.k,
+                )?;
+            } else {
+                let hid_view = slice_f32_view(&ffn_hidden, 0, mi);
+                gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
+                weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
+                gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
+            }
         }
     }
 
@@ -1188,9 +1205,9 @@ fn moe_ffn_decode(
     if let Some(buf) = x_rot_local {
         gpu.free_tensor(buf)?;
     }
-    if let Some(buf) = gate_up_batch {
-        gpu.free_tensor(buf)?;
-    }
+    if let Some(buf) = gate_batch { gpu.free_tensor(buf)?; }
+    if let Some(buf) = up_batch   { gpu.free_tensor(buf)?; }
+    if let Some(buf) = rot_batch  { gpu.free_tensor(buf)?; }
     Ok(())
 }
 

@@ -8,8 +8,12 @@
 // global memory load per block) and runs the standard HFQ4G256 GEMV body
 // against the shared `x_rot` input.
 //
-// Output layout is [K_TOP × M] row-major (expert-major):
-//   y[krank * M + row] = W_expert[topk[krank]] [row, :] · x_rot
+// Output layout: SPLIT into two contiguous [K_TOP × MI] buffers. The
+// weight's first MI rows (the `gate` half) land in `y_gate[krank * MI + r]`
+// and the next MI rows (the `up` half) land in `y_up[krank * MI + r]`.
+// This matches the [batch × K] layout that `fused_silu_mul_mq_rotate` (in
+// batched mode, grid.y = krank) expects, so the next stage can run as a
+// single launch across all 8 experts.
 //
 // Byte-exact with gemv_hfq4g256 called 8 times — same 4-accumulator
 // interleave, same pairwise final combine. Caller is responsible for
@@ -26,7 +30,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8(
     const char* __restrict__ W4, const char* __restrict__ W5,
     const char* __restrict__ W6, const char* __restrict__ W7,
     const float* __restrict__ x,
-    float* __restrict__ y,
+    float* __restrict__ y_gate,   // [K_TOP × MI] — first half of each expert
+    float* __restrict__ y_up,     // [K_TOP × MI] — second half of each expert
     int M, int K
 ) {
     const int row = blockIdx.x;
@@ -141,5 +146,12 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-    if (tid == 0) y[krank * M + row] = acc;
+    if (tid == 0) {
+        const int mi = M >> 1;   // M = 2*mi; first mi rows are gate, next mi are up
+        if (row < mi) {
+            y_gate[krank * mi + row] = acc;
+        } else {
+            y_up[krank * mi + (row - mi)] = acc;
+        }
+    }
 }
