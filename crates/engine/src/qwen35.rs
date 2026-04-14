@@ -48,6 +48,10 @@ pub struct Qwen35Config {
     pub moe_intermediate_size: usize,            // 512 for A3B (per-routed-expert FFN)
     pub shared_expert_intermediate_size: usize,  // 512 for A3B
     pub has_shared_expert: bool,                 // true for A3B (always-on shared expert)
+    /// If true, top-K routing weights are re-normalized to sum to 1 after
+    /// softmax + top-K selection. Qwen convention (matches HF
+    /// `modeling_qwen3_5_moe.py`). DeepSeek-v1 uses false.
+    pub norm_topk_prob: bool,
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
@@ -101,6 +105,10 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let moe_intermediate_size = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let shared_expert_intermediate_size = tc.get("shared_expert_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let has_shared_expert = shared_expert_intermediate_size > 0;
+    // Qwen convention: re-normalize top-K routing weights to sum to 1.
+    // Absent from some configs (including the shipped A3B HFQ); default on
+    // for Qwen3.5-MoE / A3B to match the HF reference.
+    let norm_topk_prob = tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
 
     Some(Qwen35Config {
         dim, n_layers, vocab_size, norm_eps, eos_token,
@@ -108,6 +116,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
+        norm_topk_prob,
     })
 }
 
@@ -156,27 +165,39 @@ pub struct FullAttnLayerWeights {
 //   shared_expert_intermediate = 512 (same as routed)
 //
 // Per-layer storage:
-//   router:               [num_experts, hidden]  Q8  — small but precision-sensitive
-//   shared_expert_gate:   [hidden]               F16 — scales the shared-expert add
+//   router:               [num_experts, hidden]  MQ4G256 / Q8
+//   shared_expert_gate:   [1, hidden]            MQ4G256 / Q8 — projects to scalar
 //   experts[X].gate_up:   [2*moe_intermediate, hidden]  MQ4G256
 //   experts[X].down:      [hidden, moe_intermediate]    MQ4G256
-//   shared_expert.{...}:  same shape as routed                 MQ4G256
+//   shared_expert.gate:   [shared_expert_intermediate, hidden]   MQ4G256
+//   shared_expert.up:     [shared_expert_intermediate, hidden]   MQ4G256
+//   shared_expert.down:   [hidden, shared_expert_intermediate]   MQ4G256
 //
 // The quantizer (hipfire-quantize) splits the safetensors 3D
 // `mlp.experts.gate_up_proj` / `down_proj` tensors per-expert into
 // `mlp.experts.{X}.gate_up_proj.weight` / `down_proj.weight` so the loader
-// can fish them out by index.
+// can fish them out by index. The shared expert is stored with separate
+// gate_proj + up_proj + down_proj (it is not fused in safetensors either).
 
 pub struct ExpertWeights {
-    pub gate_up: WeightTensor,  // [2 * moe_intermediate, hidden]
+    pub gate_up: WeightTensor,  // [2 * moe_intermediate, hidden] — fused (gate || up)
     pub down: WeightTensor,     // [hidden, moe_intermediate]
 }
 
+/// Shared expert storage — unlike routed experts, gate_proj and up_proj are
+/// NOT fused in the safetensors, so we keep them separate here too. The
+/// forward path does two GEMVs + silu_mul + down GEMV.
+pub struct SharedExpertWeights {
+    pub gate: WeightTensor,  // [shared_expert_intermediate, hidden]
+    pub up: WeightTensor,    // [shared_expert_intermediate, hidden]
+    pub down: WeightTensor,  // [hidden, shared_expert_intermediate]
+}
+
 pub struct MoeFfnWeights {
-    pub router: WeightTensor,               // [num_experts, hidden] — Q8
-    pub experts: Vec<ExpertWeights>,        // num_experts (= 256 for A3B)
-    pub shared_expert: ExpertWeights,
-    pub shared_expert_gate: WeightTensor,   // [hidden] — F16, scalar-style gate
+    pub router: WeightTensor,                 // [num_experts, hidden]
+    pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B)
+    pub shared_expert: SharedExpertWeights,
+    pub shared_expert_gate: WeightTensor,     // [1, hidden] — row-vector projecting to scalar
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -295,7 +316,8 @@ impl Qwen35Weights {
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     let _ = gpu.free_tensor(ffn.router.buf);
     let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.gate_up.buf);
+    let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
+    let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
     for e in ffn.experts {
         let _ = gpu.free_tensor(e.gate_up.buf);
@@ -890,21 +912,19 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &Gpu, p: &str, config: &Qwen35Config) -> Hip
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
 
-    // Router: hidden_size → num_experts. Q8 in our quantization (precision-sensitive).
+    // Router: hidden_size → num_experts. Precision-sensitive but small.
     let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
 
-    // Shared expert (always-on, contributes to every token).
-    let shared_expert = ExpertWeights {
-        gate_up: {
-            // The safetensors store gate and up as separate tensors for the shared expert
-            // (unlike the routed experts which are stored as a fused `gate_up_proj`).
-            // For consistency in our struct, we currently load them separately and stash
-            // gate in `gate_up` slot — the forward path will refactor this once the
-            // forward implementation lands. TODO(phase1-forward): unify storage.
-            load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?
-        },
+    // Shared expert (always-on, contributes to every token). Unlike routed
+    // experts, gate_proj + up_proj are stored separately in the safetensors
+    // (routed experts store them fused as `gate_up_proj`).
+    let shared_expert = SharedExpertWeights {
+        gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?,
+        up:   load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.up_proj.weight"),   smi, config.dim)?,
         down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.down_proj.weight"), config.dim, smi)?,
     };
+    // Scalar gate on the shared-expert add: sigmoid(shared_expert_gate · x).
+    // Stored as a 1×hidden row-vector.
     let shared_expert_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
 
     // Routed experts — quantizer wrote per-expert tensors named
@@ -922,6 +942,129 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &Gpu, p: &str, config: &Qwen35Config) -> Hip
     }
 
     Ok(MoeFfnWeights { router, experts, shared_expert, shared_expert_gate })
+}
+
+// ─── MoE FFN (decode, batch=1) ──────────────────────────────────────────
+
+/// Construct a non-owning `GpuTensor` view over `[offset_elems,
+/// offset_elems + len_elems)` of `src`. Valid only for F32 (4 bytes/elem).
+/// The view MUST NOT outlive `src` — it shares the same GPU pointer.
+#[inline]
+fn slice_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
+    unsafe {
+        let base = src.buf.as_ptr() as *mut u8;
+        let ptr = base.add(offset_elems * 4);
+        GpuTensor {
+            buf: hip_bridge::DeviceBuffer::from_raw(ptr as *mut _, len_elems * 4),
+            shape: vec![len_elems],
+            dtype: DType::F32,
+        }
+    }
+}
+
+/// One-token MoE FFN: router → top-K → shared expert + top-K routed, added
+/// into `x_residual` in place. `x_norm` is the already-RMSNormed FFN input.
+///
+/// Dense-compute decode reference implementation (Phase 1). Top-K selection
+/// runs on CPU via a single D2H sync per layer on the router logits; the
+/// shared-expert scalar gate is another D2H sync. Sparse-routing + batched
+/// grouped-GEMM variants come in later phases — this version prioritizes
+/// correctness and minimal surface area.
+///
+/// Matches HF `modeling_qwen3_5_moe.py`:
+///   router_probs  = softmax(W_router · x_norm)            // [n_exp]
+///   (idx, w)      = topk(router_probs, k)                  // [k]
+///   if norm_topk:  w /= w.sum()
+///   scalar        = sigmoid(W_shared_gate · x_norm)        // [1]
+///   y_shared      = scalar * shared_expert(x_norm)         // [hidden]
+///   y_moe         = sum_{k} w[k] * expert[idx[k]](x_norm)  // [hidden]
+///   x_residual   += y_shared + y_moe
+fn moe_ffn_decode(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+) -> HipResult<()> {
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+    let max_inter = mi.max(smi);
+
+    // Scratch buffers — allocated once per layer, reused across experts.
+    let router_logits = gpu.alloc_tensor(&[n_exp], DType::F32)?;
+    let gate_up_buf   = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
+    let gate_buf      = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let up_buf        = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let ffn_hidden    = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let ffn_out       = gpu.alloc_tensor(&[hidden], DType::F32)?;
+    let scalar_buf    = gpu.alloc_tensor(&[1], DType::F32)?;
+
+    // ── 1. Router logits → softmax → CPU top-K + (optional) renormalize ──
+    weight_gemv(gpu, &ffn.router, x_norm, &router_logits)?;
+    gpu.softmax_f32(&router_logits)?;
+    let probs = gpu.download_f32(&router_logits)?;
+
+    // Partial sort: select top-K indices by probability. `select_nth_unstable_by`
+    // places the k-1-th element in its sorted position with O(n) average work.
+    let mut indices: Vec<usize> = (0..n_exp).collect();
+    indices.select_nth_unstable_by(k - 1, |&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+    // Sort top-K by probability (descending) for deterministic accumulation order.
+    topk_indices.sort_by(|&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+    if config.norm_topk_prob {
+        let sum: f32 = topk_weights.iter().sum();
+        if sum > 0.0 {
+            for w in topk_weights.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+
+    // ── 2. Shared-expert scalar gate: sigmoid(W · x_norm) → CPU f32 ──
+    weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, &scalar_buf)?;
+    let scalar_vec = gpu.download_f32(&scalar_buf)?;
+    let shared_gate_scalar = 1.0 / (1.0 + (-scalar_vec[0]).exp());
+
+    // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
+    let shared_gate = slice_f32_view(&gate_buf, 0, smi);
+    let shared_up   = slice_f32_view(&up_buf,   0, smi);
+    let shared_hid  = slice_f32_view(&ffn_hidden, 0, smi);
+    weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+    weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+    gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
+    weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, &ffn_out)?;
+    gpu.scale_f32(&ffn_out, shared_gate_scalar)?;
+    gpu.add_inplace_f32(x_residual, &ffn_out)?;
+
+    // ── 4. Top-K routed experts: fused gate_up → split → silu_mul → down ──
+    // The routed expert's `gate_up` is [2*mi, hidden] fused; layout is
+    // [gate(mi); up(mi)] along the first dim (matches HF's
+    // torch.cat([gate_proj, up_proj], dim=0)).
+    let gate_view = slice_f32_view(&gate_up_buf, 0,  mi);
+    let up_view   = slice_f32_view(&gate_up_buf, mi, mi);
+    let hid_view  = slice_f32_view(&ffn_hidden,  0,  mi);
+    for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
+        let expert = &ffn.experts[expert_idx];
+        weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
+        gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
+        weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
+        gpu.scale_f32(&ffn_out, weight)?;
+        gpu.add_inplace_f32(x_residual, &ffn_out)?;
+    }
+
+    // Free scratch
+    for t in [router_logits, gate_up_buf, gate_buf, up_buf, ffn_hidden, ffn_out, scalar_buf] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
 }
 
 // ─── Forward pass (decode, one token at a time) ─────────────────────────
@@ -1209,6 +1352,173 @@ fn forward_from_x_gpu(
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
                 for t in [q_full, q, gate_vec, k, v, attn_out, o, gate_ffn, up, ffn_hidden, ffn_out] {
+                    gpu.free_tensor(t)?;
+                }
+            }
+
+            // ── MoE variants (Qwen3.5-MoE / A3B) ──
+            // Attention is byte-identical to the dense variant above; only
+            // the FFN differs (router + top-K + shared + routed experts).
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                // ── DeltaNet attention (same as dense) ──
+                gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
+
+                let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                             + config.linear_num_value_heads * config.linear_value_head_dim;
+                let qkv = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
+                weight_gemv(gpu, &layer.wqkv, &tmp, &qkv)?;
+
+                let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                let z = gpu.alloc_tensor(&[d_inner], DType::F32)?;
+                weight_gemv(gpu, &layer.wz, &tmp, &z)?;
+
+                let n_v_heads = config.linear_num_value_heads;
+                let beta_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
+                weight_gemv(gpu, &layer.w_beta, &tmp, &beta_out)?;
+                let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
+                weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
+                gpu.fused_sigmoid_alpha_gate_f32(
+                    &beta_out, &alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads,
+                )?;
+
+                let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
+                gpu.conv1d_silu_f32(
+                    &conv_out, &qkv, &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx], qkv_dim,
+                )?;
+
+                let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+                let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+                let q_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                let k_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                let v_part = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                gpu.hip.memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &q_part, &k_part,
+                    config.linear_num_key_heads, config.linear_key_head_dim,
+                    1.0 / (config.linear_key_head_dim as f32).sqrt(),
+                    config.norm_eps,
+                )?;
+
+                let (q_gdn, k_gdn) = if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    let expanded_dim = n_v_heads * config.linear_key_head_dim;
+                    let q_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                    let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                    let hd = config.linear_key_head_dim;
+                    gpu.repeat_interleave_qk_f32(
+                        &q_part, &k_part, &q_exp, &k_exp,
+                        config.linear_num_key_heads, ratio, hd,
+                    )?;
+                    (q_exp, k_exp)
+                } else {
+                    let q_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    let k_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    gpu.hip.memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
+                    (q_ref, k_ref)
+                };
+
+                let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                match dn_state.quant {
+                    StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q4 => gpu.gated_delta_net_q4(
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                }
+
+                let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                gpu.gated_norm_f32(&attn_out, &z, &layer.norm_weight, &normed_out,
+                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+
+                let o = gpu.alloc_tensor(&[dim], DType::F32)?;
+                weight_gemv(gpu, &layer.wo, &normed_out, &o)?;
+
+                gpu.add_inplace_f32(&x, &o)?;
+
+                // ── MoE FFN (only difference from dense) ──
+                gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+
+                for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o] {
+                    gpu.free_tensor(t)?;
+                }
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                // ── Full attention (same as dense FullAttn) ──
+                gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
+
+                let q_full_dim = config.n_heads * config.head_dim * 2;
+                let q_full = gpu.alloc_tensor(&[q_full_dim], DType::F32)?;
+                weight_gemv(gpu, &layer.wq, &tmp, &q_full)?;
+
+                let q_dim = config.n_heads * config.head_dim;
+                let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+                let gate_vec = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+                gpu.deinterleave_f32(&q_full, &q, &gate_vec, config.n_heads, config.head_dim)?;
+
+                gpu.rmsnorm_batched(&q, &layer.q_norm, &q, config.n_heads, config.head_dim, config.norm_eps)?;
+
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+                let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+                weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+                weight_gemv(gpu, &layer.wv, &tmp, &v)?;
+
+                gpu.rmsnorm_batched(&k, &layer.k_norm, &k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32(&q, &k, &pos_buf,
+                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+
+                let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+                if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_q8_0_kv(
+                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                } else {
+                    gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+                    gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+                    gpu.attention_f32(
+                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                }
+
+                gpu.sigmoid_f32(&gate_vec)?;
+                gpu.mul_f32(&attn_out, &gate_vec, &attn_out)?;
+
+                let o = gpu.alloc_tensor(&[dim], DType::F32)?;
+                weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
+
+                gpu.add_inplace_f32(&x, &o)?;
+
+                // ── MoE FFN (only difference from dense) ──
+                gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+
+                for t in [q_full, q, gate_vec, k, v, attn_out, o] {
                     gpu.free_tensor(t)?;
                 }
             }
@@ -2743,6 +3053,218 @@ fn forward_scratch_layers(
                     }
                 }
 
+                kv_layer_idx += 1;
+            }
+
+            // ── MoE variants (Qwen3.5-MoE / A3B) ──
+            // Attention path mirrors the dense counterpart above; FFN is
+            // replaced by moe_ffn_decode (router + top-K + shared + routed).
+            // The MQ-rotate pre-FFN fusion used by the dense FFN doesn't
+            // apply here — moe_ffn_decode uses plain weight_gemv, which
+            // does its own internal MQ rotation once per call. Re-rotation
+            // overhead is one of the items targeted by Phase 2/3 speedups.
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
+                let dt = layer.wqkv.gpu_dtype;
+                let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
+                    && layer.wz.gpu_dtype == dt
+                    && layer.w_beta.gpu_dtype == dt
+                    && layer.w_alpha.gpu_dtype == dt;
+                if fused_la4_ok {
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
+                    gpu.fused_qkvza_hfq4g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        eff_x,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
+                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                }
+                gpu.fused_sigmoid_alpha_gate_f32(
+                    &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
+                )?;
+                gpu.conv1d_silu_split_f32(
+                    &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
+                    &s.dn_qkv, &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    k_dim, v_dim,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &s.dn_q_raw, &s.dn_k_raw,
+                    config.linear_num_key_heads, hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?;
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    gpu.repeat_interleave_qk_f32(
+                        &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
+                        config.linear_num_key_heads, ratio, hd,
+                    )?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+                match dn_state.quant {
+                    StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q4 => gpu.gated_delta_net_q4(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                }
+                gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
+                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+
+                // ── MoE FFN ──
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config)?;
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                let x_rot = fused_rmsnorm_rotate_for_mq(
+                    gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                )?;
+                let dt = layer.wq.gpu_dtype;
+                let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
+                    && layer.wk.gpu_dtype == dt
+                    && layer.wv.gpu_dtype == dt;
+                if fused_fa3_ok {
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
+                    gpu.fused_qkv_hfq4g256(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        eff_x,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+                    weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
+                }
+
+                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+                gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
+                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+
+                if kv_cache.quant_asym4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    gpu.kv_cache_write_asym4_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_flash_asym4(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_asym3 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    gpu.kv_cache_write_asym3_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_flash_asym3(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_asym2 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    gpu.kv_cache_write_asym2_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_flash_asym2(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    let use_flash = gpu.capture_mode
+                        || s.flash_mode == 2
+                        || (s.flash_mode == 1 && pos + 1 >= 2048)
+                        || pos + 1 > 15000;
+                    if use_flash {
+                        gpu.attention_flash_q8_0(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.attention_q8_0_kv(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        )?;
+                    }
+                } else {
+                    gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
+                    gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
+                    gpu.attention_f32(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                }
+
+                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+
+                // ── MoE FFN ──
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config)?;
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
                 kv_layer_idx += 1;
             }
 
