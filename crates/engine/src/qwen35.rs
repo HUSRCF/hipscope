@@ -1002,8 +1002,33 @@ fn moe_ffn_decode(
     let ffn_out       = gpu.alloc_tensor(&[hidden], DType::F32)?;
     let scalar_buf    = gpu.alloc_tensor(&[1], DType::F32)?;
 
+    // Phase 2a-iii: rotate x_norm once per layer and share the rotated
+    // buffer across every gate-side GEMV (router, shared_expert_gate,
+    // shared.gate, shared.up, and all top-K experts' gate_up). Each
+    // weight_gemv on MQ4G256 otherwise does its own rotate_x_mq launch
+    // — 12+ redundant rotations per layer. Only MQ4 GEMVs benefit, so
+    // we detect the all-MQ4 fast path and fall back to weight_gemv
+    // (which rotates internally) for any mixed-dtype layer.
+    let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+        && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
+    let x_rot_local = if gate_side_mq4 {
+        let buf = gpu.alloc_tensor(&[hidden], DType::F32)?;
+        gpu.ensure_mq_signs()?;
+        gpu.rotate_x_mq(x_norm, &buf, hidden)?;
+        Some(buf)
+    } else {
+        None
+    };
+
     // ── 1. Router logits → softmax → CPU top-K + (optional) renormalize ──
-    weight_gemv(gpu, &ffn.router, x_norm, &router_logits)?;
+    if let Some(ref xr) = x_rot_local {
+        gpu.gemv_mq4g256_prerotated(&ffn.router.buf, xr, &router_logits, ffn.router.m, ffn.router.k)?;
+    } else {
+        weight_gemv(gpu, &ffn.router, x_norm, &router_logits)?;
+    }
     gpu.softmax_f32(&router_logits)?;
     let probs = gpu.download_f32(&router_logits)?;
 
@@ -1032,7 +1057,12 @@ fn moe_ffn_decode(
     // Phase 2a: compute the sigmoid on-device and pass the result by
     // device pointer into the fused scaled-add below. Eliminates one
     // D2H sync per layer (was 80 syncs per token across 40 layers).
-    weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, &scalar_buf)?;
+    if let Some(ref xr) = x_rot_local {
+        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert_gate.buf, xr, &scalar_buf,
+            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k)?;
+    } else {
+        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, &scalar_buf)?;
+    }
     gpu.sigmoid_f32(&scalar_buf)?;
 
     // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
@@ -1043,8 +1073,15 @@ fn moe_ffn_decode(
     // the full `y += sigmoid(gate_scalar) * W_down · silu_mul(gate, up)`.
     let shared_gate = slice_f32_view(&gate_buf, 0, smi);
     let shared_up   = slice_f32_view(&up_buf,   0, smi);
-    weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-    weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+    if let Some(ref xr) = x_rot_local {
+        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.gate.buf, xr, &shared_gate,
+            ffn.shared_expert.gate.m, ffn.shared_expert.gate.k)?;
+        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.up.buf, xr, &shared_up,
+            ffn.shared_expert.up.m, ffn.shared_expert.up.k)?;
+    } else {
+        weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+        weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+    }
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
@@ -1079,7 +1116,12 @@ fn moe_ffn_decode(
     }
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let expert = &ffn.experts[expert_idx];
-        weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
+        if let Some(ref xr) = x_rot_local {
+            gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
+                expert.gate_up.m, expert.gate_up.k)?;
+        } else {
+            weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
+        }
         if routed_mq4 {
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1103,6 +1145,9 @@ fn moe_ffn_decode(
     // Free scratch
     for t in [router_logits, gate_up_buf, gate_buf, up_buf, ffn_hidden, ffn_out, scalar_buf] {
         gpu.free_tensor(t)?;
+    }
+    if let Some(buf) = x_rot_local {
+        gpu.free_tensor(buf)?;
     }
     Ok(())
 }
