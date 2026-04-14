@@ -1117,6 +1117,20 @@ fn resolve_model_path(input: &str) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Bound rayon's pool to 80% of cores (default cap; override with --threads N
+    // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
+    // memory bandwidth, so leaving headroom for the rest of the system avoids
+    // making the whole box unresponsive during a multi-hour quantize run.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let default_threads = ((cores * 8) / 10).max(1);
+    let threads = args.iter().position(|a| a == "--threads")
+        .and_then(|i| args.get(i + 1).and_then(|s| s.parse::<usize>().ok()))
+        .or_else(|| std::env::var("HIPFIRE_QUANT_THREADS").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(default_threads);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+    eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
+
+
     let input_dir = args.iter().position(|a| a == "--input")
         .map(|i| &args[i + 1])
         .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>"); std::process::exit(1); });
@@ -1289,37 +1303,40 @@ fn main() {
             let inner_k = inner_shape[1] as usize;
             let supports_mq4 = inner_k % 256 == 0;
 
-            for x in 0..n_experts {
+            // Parallelize across the 256 expert slices via rayon. Each slice
+            // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
+            // The outer Rayon pool size is set in main() before this runs.
+            use rayon::prelude::*;
+            let dtype = meta.dtype.clone();
+            let parent_owned = parent.to_string();
+            let inner_shape_clone = inner_shape.clone();
+            let base_owned = base_name.to_string();
+            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
-                let f32_slice = to_f32(slice, &meta.dtype);
-
-                let slice_name = format!("{parent}{x}.{base_name}.weight");
-                quantized_params += inner_n as u64;
-
-                let (quantized, qt, gs, label) = if supports_mq4 {
+                let f32_slice = to_f32(slice, &dtype);
+                let (quantized, qt, gs) = if supports_mq4 {
                     let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    (q, QuantType::MQ4G256, 256u32)
                 } else {
-                    // Fallback: HFQ4G128 if K isn't 256-aligned (shouldn't happen for A3B which is 2048/512)
                     let q = quantize_hfq4g128(&f32_slice);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    (q, QuantType::HFQ4G128, 128u32)
                 };
-
-                if x == 0 {
-                    eprintln!("  {label:>8}: {} {:?} (×{} experts, {:.1} KB/expert)",
-                        slice_name, inner_shape, n_experts,
-                        quantized.len() as f64 / 1024.0);
-                }
-
-                hfq_tensors.push(HfqTensor {
-                    name: slice_name,
+                HfqTensor {
+                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
                     quant_type: qt,
-                    shape: inner_shape.clone(),
+                    shape: inner_shape_clone.clone(),
                     group_size: gs,
                     data: quantized,
-                });
-            }
+                }
+            }).collect();
+            quantized_params += inner_n as u64 * n_experts as u64;
+            // Single eprintln to summarize the whole expert sweep.
+            let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
+            let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
+            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
+                inner_shape, bytes_per as f64 / 1024.0);
+            hfq_tensors.append(&mut new_tensors);
             continue;
         }
 
