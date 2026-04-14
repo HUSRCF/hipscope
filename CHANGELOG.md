@@ -12,6 +12,131 @@
   Measured gains on AMD are 1.3-2× KV memory at +0.3-1.8% PPL — not the paper's
   10.7× headline. Requires relaxing byte-exact contract behind an opt-in flag.
 
+## v0.1.6 "deltacut" (2026-04-14)
+
+Focus: **Qwen3.5-35B-A3B (MoE) support** end-to-end — quantizer, loader,
+forward path, daemon wiring, and a stack of fused MoE kernels that take the
+first-working-dense-compute path from 28 tok/s to 115 tok/s of production
+decode throughput on gfx1100. Plus serve/install/bench polish.
+
+### Qwen3.5-35B-A3B — first MoE model
+
+35B total params / 3B activated per token. 256 experts, top-8 routing, plus
+one always-on shared expert. Hybrid attention (30 DeltaNet + 10 FullAttn)
+like the dense 9B, with A3B-specific shape differences: head_dim=256, 16 Q
+heads / 2 KV heads, `partial_rotary_factor=0.25`, `attn_output_gate=true`.
+
+- **Quantizer** (`hipfire-quantize`): recognizes `qwen3_5_moe` (arch id 6),
+  splits the 3D-stacked `mlp.experts.{gate_up,down}_proj` tensors per-expert
+  into 256 MQ4G256 blobs apiece. Rayon-parallelized across experts (80% of
+  cores by default; override with `--threads N` or `HIPFIRE_QUANT_THREADS`).
+  67 GB safetensors → 18.7 GB MQ4 in ~30 s.
+- **Engine**: new `DeltaNetMoe` / `FullAttnMoe` `LayerWeights` variants,
+  separate `SharedExpertWeights { gate, up, down }` struct (the loader was
+  previously stashing `gate_proj` into the routed-expert fused slot and
+  silently skipping `up_proj`), and a `moe_ffn_decode` hot path that routes
+  through four new kernels (below).
+- **Daemon / CLI**: `arch_id=6` dispatches through the same `qwen35` path
+  as dense 5, with the loaded response reporting `arch: "qwen3_5_moe"`.
+  Registry entry `qwen3.5:35b-a3b` is marked local-only (`repo: ""`) until
+  the HF upload lands; `hipfire pull` short-circuits with a clear message
+  instead of 404'ing.
+
+### MoE fused-kernel stack (four new kernels)
+
+Built up across nine incremental optimizations (each commit verified byte-
+identical or byte-equivalent against the previous stage through the A3B
+smoke test). Final routed-expert compute is **3 kernel launches per layer**,
+down from 24 in the dense-compute reference.
+
+- **`moe_softmax_topk_renorm_k8`** — single-workgroup GPU softmax + top-8
+  selection + (optional) renormalization. Writes `[k]` indices and `[k]`
+  weights to device buffers, eliminating the per-layer D2H sync the
+  CPU-side top-K path needed.
+- **`gemv_hfq4g256_moe_gate_up_k8_indexed`** — eight top-K experts' fused
+  `gate_up` HFQ4-G256 GEMV in one launch. Reads expert IDs from a
+  device-side `topk_indices` buffer; weight bases come from a per-layer
+  `expert_gate_up_ptrs` pointer table built once at load. Output is split
+  `[k × mi]` gate + `[k × mi]` up so the existing batched
+  `fused_silu_mul_rotate_mq` consumes it unchanged.
+- **`gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`** — same pattern
+  for the down projection. Reads scales from `topk_weights`, atomicAdds
+  the weighted contribution into `x_residual`.
+- **`scaled_add_inplace`** (CPU-scalar + GPU-scalar variants) — fuses the
+  old (`scale_f32` + `add_inplace_f32`) pair used by the per-expert
+  accumulator. The GPU-scalar variant reads the scale from a 1-element
+  device buffer, keeping the shared-expert sigmoid gate on-device.
+- **`gemv_hfq4g256_residual_scaled`** (CPU + GPU scalar) — one-kernel
+  replacement for the `weight_gemv_residual` + explicit scale pair on the
+  MQ4 SwiGLU down tail.
+
+### MoE decode speed progression (gfx1100, A3B MQ4, greedy chat)
+
+Each stage is a separate commit and a separate incremental win:
+
+| Stage | tok/s | vs P1 |
+|-------|-------|-------|
+| Phase 1 dense-compute reference | 28 | 1.00× |
+| Phase 2a (GPU sigmoid + fused scaled-add) | 77 | 2.75× |
+| Phase 2a-ii (fused MQ4 `gemv_residual_scaled`) | 88 | 3.15× |
+| Phase 2a-iii (pre-rotate x\_norm once per layer) | 102 | 3.65× |
+| Phase 2c step 1 (fused 8-expert gate\_up) | 111 | 3.98× |
+| Phase 2c step 2 (batched silu\_mul\_rotate) | 125 | 4.48× |
+| Phase 2c step 3 (fused 8-expert down + atomicAdd) | 140 | 5.01× |
+| Phase 2b+2c (GPU top-K + indexed kernels) | 153 | 5.46× |
+| + hipGraph (single-turn smoke test only — see Known Issues) | 162 | 5.80× |
+
+Production daemon path: **~115 tok/s** at `HIPFIRE_KV_MODE=asym3` (default).
+Prefill is still per-token-fallback for MoE (`forward_prefill_batch`
+eligibility check requires a dense DeltaNet layer), so pp ≈ decode at
+~143 tok/s on 641 tokens — batched MoE prefill is v0.1.7 material.
+
+### Daemon / serve / install polish
+
+- **Daemon flock mutex** (`~/.hipfire/daemon.pid`). A second daemon process
+  exits with `FATAL: hipfire daemon already running (PID N)` before
+  touching the GPU instead of silently double-consuming VRAM. Fd released
+  automatically on kill, so stale PID content is harmless.
+- **Install precompiles MQ4 + asym3 defaults** for the detected arch at
+  install time, so the first `hipfire run` doesn't eat a multi-minute JIT
+  stall. `hipfire update` syncs the CLI before the cargo rebuild so the
+  registry change propagates in the same invocation.
+- **Serve**: frees weights on idle eviction (was leaking across eviction
+  cycles), respects the per-model `max_tokens` config (default was a
+  hardcoded 512 even after you set one), bumps the detach readiness
+  timeout from 30 s to 5 min for cold kernel JIT, and enforces the KV
+  budget end-to-end so oversized requests return a clean error rather
+  than writing past the cache.
+- **`hipfire run`** surfaces KV-budget errors instead of exiting 0 with no
+  output. Spawns cargo/git via absolute paths detected via `autodetect`
+  so `HIPFIRE_UPDATE` behaves the same whether invoked via a shell shim
+  or directly.
+- **`hipfire bench`** gained pp128/pp512/pp1024 prefill-scaling numbers,
+  explicit prefill + decode split, and TTFT. Fixed a GPU-sync bug that
+  was reporting prefill tok/s 5–10× too optimistic.
+
+### Experimental
+
+- **Gated `think-budget` alert injection.** When the model has burned
+  more than `experimental_budget_alert_tokens` inside an open `<think>`
+  block, the daemon splices a configurable nudge string into the stream
+  — tokens are emitted to stdout AND forward-fed through the KV cache so
+  the next sample sees the model having "said" them. Hard-gated behind
+  config; off by default. See `experimental_budget_alert_tokens` /
+  `experimental_budget_alert_text`.
+
+### Known issues
+
+- **hipGraph + MoE multi-turn corruption** ([#19](https://github.com/Kaden-Schutt/hipfire/issues/19)).
+  Single-shot short decodes with `HIPFIRE_GRAPH=1` on A3B look healthy
+  (162 tok/s, byte-coherent at 30 tokens), but state diverges from the
+  direct path after ~40 decoded tokens — the model starts skipping a
+  number in a count, loops on a single token, etc. Root cause unclear
+  after a full kernel audit (all individually graph-safe). `forward_scratch`
+  gates `use_graph` on `config.num_experts == 0`; dense Qwen3.5 still
+  takes the graph fast path. Cost: ~30% of the potential A3B decode
+  ceiling. Tracking for v0.1.7.
+
 ## v0.1.5 "redline" (2026-04-13)
 
 First full (non-alpha) release. Focus: **RotorQuant asymmetric KV cache** for
