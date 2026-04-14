@@ -334,6 +334,11 @@ fn main() {
                     for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                 }
 
+                // Flush any residual GPU work so it doesn't bleed into the
+                // measured interval, then time forward_prefill_batch + a
+                // trailing device_synchronize so we capture actual GPU
+                // completion (kernel launches are async by default).
+                let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = if m.arch_id == 5 {
                     let config = m.q35_config.as_ref().unwrap();
@@ -356,6 +361,7 @@ fn main() {
                     }
                     ok
                 };
+                let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
 
                 // Reset state AFTER measurement — we've written N KV slots and a
@@ -596,10 +602,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // Currently delegates to per-token forward_scratch internally; future
         // commits replace the body with actually-batched kernel paths without
         // needing any more daemon changes.
+        //
+        // Note: forward_prefill_batch launches HIP kernels asynchronously.
+        // The t_prefill mark below lives AFTER the first sample_top_p, whose
+        // D2H readback of tok0 forces a device sync — that's the point at
+        // which the first token is actually ready to stream. Placing the
+        // mark earlier captures CPU-dispatch time, which under-reports
+        // prefill by a large factor (prefill_tok_s ~5–10× too optimistic).
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
         ).unwrap();
-        let t_prefill = Instant::now();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
@@ -636,6 +648,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
             vocab_size, temp, top_p, rng_state, scope0.len(), repeat_penalty,
         ).unwrap();
+        // First token is ready (sample_top_p's D2H forces GPU sync). This is
+        // the user-observable "time to first token" boundary — prefill above,
+        // decode loop below.
+        let t_prefill = Instant::now();
         let mut next_token = tok0;
         rng_state = rng0;
 
