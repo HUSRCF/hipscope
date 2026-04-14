@@ -127,9 +127,75 @@ pub struct FullAttnLayerWeights {
     pub w_down: WeightTensor,
 }
 
+// ─── MoE FFN weights (Qwen3.5-MoE / A3B) ────────────────────────────────
+//
+// Replaces the dense (w_gate, w_up, w_down) triple with N+1 expert FFNs
+// gated by a router, plus a shared always-on expert.
+//
+// A3B specifics:
+//   num_experts = 256, top_k = 8, moe_intermediate = 512, hidden = 2048
+//   shared_expert_intermediate = 512 (same as routed)
+//
+// Per-layer storage:
+//   router:               [num_experts, hidden]  Q8  — small but precision-sensitive
+//   shared_expert_gate:   [hidden]               F16 — scales the shared-expert add
+//   experts[X].gate_up:   [2*moe_intermediate, hidden]  MQ4G256
+//   experts[X].down:      [hidden, moe_intermediate]    MQ4G256
+//   shared_expert.{...}:  same shape as routed                 MQ4G256
+//
+// The quantizer (hipfire-quantize) splits the safetensors 3D
+// `mlp.experts.gate_up_proj` / `down_proj` tensors per-expert into
+// `mlp.experts.{X}.gate_up_proj.weight` / `down_proj.weight` so the loader
+// can fish them out by index.
+
+pub struct ExpertWeights {
+    pub gate_up: WeightTensor,  // [2 * moe_intermediate, hidden]
+    pub down: WeightTensor,     // [hidden, moe_intermediate]
+}
+
+pub struct MoeFfnWeights {
+    pub router: WeightTensor,               // [num_experts, hidden] — Q8
+    pub experts: Vec<ExpertWeights>,        // num_experts (= 256 for A3B)
+    pub shared_expert: ExpertWeights,
+    pub shared_expert_gate: WeightTensor,   // [hidden] — F16, scalar-style gate
+}
+
+pub struct DeltaNetMoeLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub wqkv: WeightTensor,
+    pub wz: WeightTensor,
+    pub w_alpha: WeightTensor,
+    pub w_beta: WeightTensor,
+    pub a_log: GpuTensor,
+    pub dt_bias: GpuTensor,
+    pub conv_weight: GpuTensor,
+    pub norm_weight: GpuTensor,
+    pub wo: WeightTensor,
+    pub ffn_norm: GpuTensor,
+    pub ffn: MoeFfnWeights,
+}
+
+pub struct FullAttnMoeLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub wq: WeightTensor,
+    pub wk: WeightTensor,
+    pub wv: WeightTensor,
+    pub wo: WeightTensor,
+    pub q_norm: GpuTensor,
+    pub k_norm: GpuTensor,
+    pub ffn_norm: GpuTensor,
+    pub ffn: MoeFfnWeights,
+}
+
 pub enum LayerWeights {
     DeltaNet(DeltaNetLayerWeights),
     FullAttn(FullAttnLayerWeights),
+    // A3B / qwen3_5_moe: same attention as above, MoE FFN instead of dense.
+    // Loader + forward path TODO — adding the variants now so the enum is
+    // forward-compatible and downstream code that pattern-matches gets a
+    // compile-time hint to handle the new case.
+    DeltaNetMoe(DeltaNetMoeLayerWeights),
+    FullAttnMoe(FullAttnMoeLayerWeights),
 }
 
 pub struct Qwen35Weights {
@@ -177,8 +243,44 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.w_up.buf);
                     let _ = gpu.free_tensor(l.w_down.buf);
                 }
+                LayerWeights::DeltaNetMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wqkv.buf);
+                    let _ = gpu.free_tensor(l.wz.buf);
+                    let _ = gpu.free_tensor(l.w_alpha.buf);
+                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_moe_ffn(gpu, l.ffn);
+                }
+                LayerWeights::FullAttnMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wq.buf);
+                    let _ = gpu.free_tensor(l.wk.buf);
+                    let _ = gpu.free_tensor(l.wv.buf);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_moe_ffn(gpu, l.ffn);
+                }
             }
         }
+    }
+}
+
+fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    let _ = gpu.free_tensor(ffn.router.buf);
+    let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
+    let _ = gpu.free_tensor(ffn.shared_expert.gate_up.buf);
+    let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
+    for e in ffn.experts {
+        let _ = gpu.free_tensor(e.gate_up.buf);
+        let _ = gpu.free_tensor(e.down.buf);
     }
 }
 
@@ -1419,6 +1521,9 @@ pub fn forward_prefill_batch(
                     && is_batchable_la(l.w_up.gpu_dtype)
                     && is_batchable_la(l.w_down.gpu_dtype),
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
+            // MoE variants — batched prefill not yet implemented; force the
+            // per-token fallback path until the MoE plumbing lands.
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         });
 
     if !eligible {
