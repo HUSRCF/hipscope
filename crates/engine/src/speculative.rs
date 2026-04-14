@@ -904,6 +904,117 @@ impl NgramCache {
     }
 }
 
+/// Prompt Lookup Decoding (Saxena 2023): training-free deterministic draft
+/// built from context suffix self-match. If the last N tokens of context
+/// appeared earlier in context, the tokens that followed that earlier
+/// occurrence are a high-quality continuation guess.
+///
+/// Used as the draft source in Goose bypass mode (Jin et al. 2026,
+/// arXiv:2604.02047 §4.3): PLD-matched tokens have 2–18× higher acceptance
+/// than bigram (TR) tokens (median 6× across 5 models × 5 benchmarks).
+/// When PLD confidence is high, the spine — a deep linear chain of
+/// PLD-matched tokens — is verified in one target forward pass without
+/// tree construction. That's exactly what we need on Qwen3.5 hybrid
+/// (24 DeltaNet + 8 FullAttention): linear verify sidesteps the
+/// state-forking problem that tree verify imposes on recurrent LA layers.
+pub struct PldMatcher {
+    /// n-gram suffix lengths to try, longest first. Paper uses {5,4,3}.
+    /// Longer matches are more selective; if the longest fails we fall
+    /// back to shorter. Order matters: we return the first (longest) hit.
+    pub ngram_lens: Vec<usize>,
+    /// Hard cap on spine length. Paper uses 8 — sufficient for typical
+    /// block sizes and avoids running off the end of a match into drift.
+    pub max_extract: usize,
+    /// Minimum extracted length to count as a usable spine. Very short
+    /// spines aren't worth the PLD path (bigram covers 1-token lookahead
+    /// at lower risk); require at least this many continuation tokens.
+    pub min_extract: usize,
+}
+
+impl Default for PldMatcher {
+    fn default() -> Self {
+        Self { ngram_lens: vec![5, 4, 3], max_extract: 8, min_extract: 3 }
+    }
+}
+
+/// Result of a successful PLD lookup.
+#[derive(Debug, Clone)]
+pub struct PldMatch {
+    /// The extracted spine (continuation tokens after the matched suffix).
+    pub tokens: Vec<u32>,
+    /// The suffix length that produced this match (the longest that hit).
+    pub n: usize,
+    /// Number of tried n-gram lengths that agreed on `tokens[0]`. Paper
+    /// §4.3 uses this as part of the bypass-mode confidence signal;
+    /// higher consensus = more reliable spine. Ranges 1..=ngram_lens.len().
+    pub consensus: usize,
+}
+
+impl PldMatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Find a spine continuation for `context`. Returns `None` if no tried
+    /// n-gram length produces a match of length ≥ `self.min_extract`.
+    ///
+    /// For each n in `self.ngram_lens`: take the last-n tokens as the
+    /// suffix, search for its last occurrence earlier in context, and
+    /// extract the `max_extract` tokens that followed it (stopping before
+    /// the suffix itself so we don't include tokens that would be about
+    /// to be re-predicted). Returns the longest-n match with a usable
+    /// spine; consensus counts how many alternate n's produced the same
+    /// first continuation token.
+    pub fn lookup(&self, context: &[u32]) -> Option<PldMatch> {
+        if self.ngram_lens.is_empty() {
+            return None;
+        }
+        // Per-n continuation, collected to compute consensus across lengths.
+        let mut firsts: Vec<u32> = Vec::with_capacity(self.ngram_lens.len());
+        let mut best: Option<(usize, Vec<u32>)> = None; // (n, spine)
+        for &n in &self.ngram_lens {
+            if context.len() <= n {
+                continue;
+            }
+            let suffix_start = context.len() - n;
+            let suffix = &context[suffix_start..];
+            let haystack = &context[..suffix_start];
+            if haystack.len() < n {
+                continue;
+            }
+            // Last occurrence (freshest) of `suffix` in `haystack`.
+            let mut found: Option<usize> = None;
+            for i in (0..=haystack.len() - n).rev() {
+                if &haystack[i..i + n] == suffix {
+                    found = Some(i);
+                    break;
+                }
+            }
+            let start = match found {
+                Some(s) => s,
+                None => continue,
+            };
+            let cont_start = start + n;
+            let cont_end = (cont_start + self.max_extract).min(suffix_start);
+            if cont_end <= cont_start {
+                continue;
+            }
+            let spine: Vec<u32> = context[cont_start..cont_end].to_vec();
+            if spine.len() < self.min_extract {
+                continue;
+            }
+            firsts.push(spine[0]);
+            if best.is_none() {
+                best = Some((n, spine));
+            }
+        }
+
+        let (n, tokens) = best?;
+        let consensus = firsts.iter().filter(|&&t| t == tokens[0]).count();
+        Some(PldMatch { tokens, n, consensus })
+    }
+}
+
 /// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
 /// given the seed, cheap enough to inline into the B-rejection loop.
 #[inline]
@@ -1383,11 +1494,20 @@ pub fn spec_step_dflash(
     ngram_cache: Option<&NgramCache>,
     prev_committed: &[u32],
     cactus_delta: f32,
+    pld_spine: Option<&[u32]>,
 ) -> HipResult<SpecStepResult> {
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
-    let b = block_size_override.unwrap_or(draft_cfg.block_size);
+    //
+    // When `pld_spine` is Some, shrink b to 1+pld.len() (capped at requested)
+    // so we don't run off the end of the PLD continuation. PLD-supplied
+    // spines are often shorter than the trained B; the paper caps at 8.
+    let requested_b = block_size_override.unwrap_or(draft_cfg.block_size);
+    let b = match pld_spine {
+        Some(pld) => (1 + pld.len()).min(requested_b).max(2),
+        None => requested_b,
+    };
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
@@ -1404,6 +1524,38 @@ pub fn spec_step_dflash(
     let mut block: Vec<u32> = vec![mask_token; b];
     block[0] = seed_token;
 
+    // Draft state: either synthesized from a PLD spine (Goose §4.3 bypass
+    // mode — deterministic, skips the DFlash forward) or produced by the
+    // DFlash draft forward pass below. Declared out here so the post-draft
+    // common code (ngram gating, target verify, rejection) sees the same
+    // `drafted` / `draft_softmaxes` / `draft_probs_at_drafted` regardless
+    // of draft source.
+    let mut drafted: Vec<u32> = vec![seed_token];
+    let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
+    let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
+    let use_temp_sampling = temp > 0.0;
+
+    if let Some(pld) = pld_spine {
+        // PLD spine path: drafted tokens come from context-suffix match.
+        // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
+        // context-deterministic, not a softmax. The rejection math below
+        // computes residual from (target_probs − draft_probs)+ normalized,
+        // and with draft one-hot at tok, the residual pulls correctly from
+        // target minus just that single-position overclaim.
+        for i in 0..b - 1 {
+            drafted.push(pld[i]);
+        }
+        if use_temp_sampling {
+            draft_probs_at_drafted.reserve(b - 1);
+            draft_softmaxes.reserve(b - 1);
+            for i in 0..b - 1 {
+                let mut probs = vec![0f32; vocab];
+                probs[pld[i] as usize] = 1.0;
+                draft_softmaxes.push(probs);
+                draft_probs_at_drafted.push(1.0);
+            }
+        }
+    } else {
     // ── 2. noise_embedding = target.embed_tokens(block) written directly
     // into draft_scratch.x on GPU (no host round-trip). Target and draft
     // share the same Gpu, so the embedding lookup can target the draft's
@@ -1477,14 +1629,6 @@ pub fn spec_step_dflash(
     // (B-1, vocab) draft logits, softmax + sample + record p_draft[token]
     // for later rejection acceptance. The greedy GPU-argmax path is kept
     // intact for temp == 0 so we don't regress that case.
-    let mut drafted: Vec<u32> = vec![seed_token]; // drafted[0] = seed (by convention; not used)
-    // Per-position draft probability at the sampled token; only populated
-    // when temp > 0. Length B-1 to match drafted[1..B].
-    let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
-    // Full draft softmax distributions at each drafted position; only
-    // populated when temp > 0 for residual sampling on rejection.
-    let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
-    let use_temp_sampling = temp > 0.0;
     let w_out = &target.weights.output;
     let use_batched_gemm = matches!(
         w_out.gpu_dtype,
@@ -1593,11 +1737,13 @@ pub fn spec_step_dflash(
             }
         }
     }
+    } // close else (DFlash draft path)
+
     for i in 1..b {
         block[i] = drafted[i];
     }
 
-    // ── 5b. N-gram override ─────────────────────────────────────────────
+    // ── 5b. N-gram override (DFlash path only) ───────────────────────────
     // When an n-gram cache is supplied, walk the block left-to-right. For
     // each position i, look up the bigram (block[i-2], block[i-1]) → t. If
     // the cache has a high-enough count for t, override block[i] with t.
@@ -1614,20 +1760,25 @@ pub fn spec_step_dflash(
     // because the per-position target attention at verify time reruns
     // anyway — what matters is target's argmax at position i versus
     // block[i+1] (the override).
-    if let Some(ng) = ngram_cache {
-        if prev_committed.len() >= 2 {
-            let mut a = prev_committed[prev_committed.len() - 2];
-            let mut bb = seed_token;
-            for i in 1..b {
-                if let Some((tok, _cnt)) = ng.predict(a, bb) {
-                    block[i] = tok;
-                    // Also reflect the override in `drafted` so the committed
-                    // sequence reported back to the caller matches what was
-                    // actually verified against the target.
-                    drafted[i] = tok;
+    // Skip bigram override when PLD is the draft source: per Goose §3,
+    // PLD tokens have 2–18× higher acceptance than bigram (TR) tokens
+    // (median 6×). Overriding PLD with a bigram guess strictly lowers τ.
+    if pld_spine.is_none() {
+        if let Some(ng) = ngram_cache {
+            if prev_committed.len() >= 2 {
+                let mut a = prev_committed[prev_committed.len() - 2];
+                let mut bb = seed_token;
+                for i in 1..b {
+                    if let Some((tok, _cnt)) = ng.predict(a, bb) {
+                        block[i] = tok;
+                        // Also reflect the override in `drafted` so the committed
+                        // sequence reported back to the caller matches what was
+                        // actually verified against the target.
+                        drafted[i] = tok;
+                    }
+                    a = bb;
+                    bb = block[i];
                 }
-                a = bb;
-                bb = block[i];
             }
         }
     }

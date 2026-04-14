@@ -54,6 +54,23 @@ fn main() {
     // CACTUS bumped acceptance (Hao & Mou 2026). 0.0 = vanilla SpS;
     // paper's strongest setting is 1.0. Only affects temp > 0 runs.
     let mut cactus_delta: f32 = 0.0;
+    // Goose bypass-mode PLD spine (Jin et al. 2026, arXiv:2604.02047).
+    // When enabled, each cycle checks the last-N-of-context for an earlier
+    // occurrence in context; on match, its continuation is used as the
+    // draft spine instead of the DFlash forward pass (cheaper + higher
+    // acceptance on repetition-heavy content). No kernel work; hybrid-arch
+    // safe (pure linear verify, no tree state forking).
+    let mut pld_enabled: bool = false;
+    let mut pld_min_extract: usize = 3;  // matcher floor; ≥3 tokens to record a match
+    let mut pld_max_extract: usize = 8;  // paper cap
+    let mut pld_ngrams: Vec<usize> = vec![5, 4, 3];  // paper defaults
+    // Goose §4.3 bypass-mode confidence gate: only USE a PLD match when
+    // it's confident enough to beat DFlash. Paper uses consensus ≥ 2
+    // (at least two n-gram lengths agree on first token) and chain length
+    // ≥ 8. 0 disables the gate (use every matcher hit — useful for
+    // diagnostics; usually a net loss on content where DFlash is strong).
+    let mut pld_min_consensus: usize = 2;
+    let mut pld_min_chain: usize = 5;  // conservative: below paper's 8 but still filters noise
 
     let mut i = 1;
     while i < args.len() {
@@ -112,6 +129,35 @@ fn main() {
             }
             "--cactus-delta" => {
                 cactus_delta = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--pld" => {
+                pld_enabled = true;
+                i += 1;
+            }
+            "--pld-min" => {
+                pld_min_extract = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--pld-max" => {
+                pld_max_extract = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--pld-ngrams" => {
+                pld_ngrams = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>().expect("--pld-ngrams: comma-separated positive ints"))
+                    .collect();
+                // Sort descending — longest-first is required by the matcher.
+                pld_ngrams.sort_by(|a, b| b.cmp(a));
+                i += 2;
+            }
+            "--pld-min-consensus" => {
+                pld_min_consensus = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--pld-min-chain" => {
+                pld_min_chain = args[i + 1].parse().unwrap();
                 i += 2;
             }
             other => {
@@ -285,6 +331,25 @@ fn main() {
     } else {
         None
     };
+    // PLD matcher: stateless, scans (prompt ++ emitted) suffix each cycle.
+    let pld_matcher = if pld_enabled {
+        let m = engine::speculative::PldMatcher {
+            ngram_lens: pld_ngrams.clone(),
+            max_extract: pld_max_extract,
+            min_extract: pld_min_extract,
+        };
+        eprintln!(
+            "pld: enabled (ngrams={:?}, min_extract={}, max_extract={})",
+            m.ngram_lens, m.min_extract, m.max_extract
+        );
+        Some(m)
+    } else {
+        None
+    };
+    // PLD stats: hits = cycles where a spine was substituted for DFlash;
+    // accepted_from_pld = accepted count on those cycles (for τ_pld).
+    let mut pld_hits: usize = 0;
+    let mut pld_accepted: usize = 0;
 
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
@@ -306,6 +371,41 @@ fn main() {
         } else {
             None
         };
+        // PLD lookup: context = prompt ++ emitted (everything committed so
+        // far). The matcher finds a suffix self-match and extracts up to
+        // pld_max_extract continuation tokens. `pld_spine` is passed as a
+        // borrowed slice — when Some, spec_step_dflash bypasses the
+        // DFlash forward entirely for this cycle.
+        let pld_match = pld_matcher.as_ref().and_then(|m| {
+            // Build context = prompt ++ emitted ++ seed_token, making sure
+            // the context suffix ENDS at seed_token — the matcher predicts
+            // what follows the suffix, and block[1..] lives right after
+            // seed_token. At cycle K≥1, emitted[-1] is already seed_token
+            // (pushed as the prior cycle's bonus) so we skip the extra push;
+            // at cycle 0 (emitted empty) we need to append it explicitly.
+            let mut ctx = Vec::with_capacity(prompt_tokens.len() + emitted.len() + 1);
+            ctx.extend_from_slice(&prompt_tokens);
+            ctx.extend_from_slice(&emitted);
+            if ctx.last() != Some(&seed_token) {
+                ctx.push(seed_token);
+            }
+            m.lookup(&ctx)
+        });
+        // Goose §4.3 bypass-mode gate: only use PLD if both consensus AND
+        // chain length clear their thresholds. Weaker matches are a net loss
+        // when DFlash is strong (repetition-heavy content where literal
+        // 3-gram matches predict the wrong number/variable in a list).
+        let pld_spine: Option<&[u32]> = pld_match.as_ref().and_then(|m| {
+            if m.consensus >= pld_min_consensus && m.tokens.len() >= pld_min_chain {
+                Some(m.tokens.as_slice())
+            } else {
+                None
+            }
+        });
+        let used_pld = pld_spine.is_some();
+        if used_pld {
+            pld_hits += 1;
+        }
         let step = speculative::spec_step_dflash(
             &mut gpu,
             &mut target,
@@ -325,8 +425,12 @@ fn main() {
             ngram_cache.as_ref(),
             &emitted,
             cactus_delta,
+            pld_spine,
         )
         .expect("spec step");
+        if used_pld {
+            pld_accepted += step.accepted;
+        }
 
         // Populate n-gram cache from newly committed tokens. `step.committed`
         // is [seed, accepted draft tokens, bonus]; we record all consecutive
@@ -405,4 +509,30 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    if pld_matcher.is_some() {
+        let hit_rate = if stats.cycles > 0 {
+            pld_hits as f32 / stats.cycles as f32
+        } else {
+            0.0
+        };
+        let tau_pld = if pld_hits > 0 {
+            pld_accepted as f32 / pld_hits as f32
+        } else {
+            0.0
+        };
+        let tau_dflash = if stats.cycles > pld_hits {
+            (stats.accepted_tokens - pld_accepted) as f32
+                / (stats.cycles - pld_hits) as f32
+        } else {
+            0.0
+        };
+        eprintln!(
+            "pld: hits={}/{} ({:.1}%)  τ_pld={:.3}  τ_dflash={:.3}",
+            pld_hits,
+            stats.cycles,
+            hit_rate * 100.0,
+            tau_pld,
+            tau_dflash,
+        );
+    }
 }
