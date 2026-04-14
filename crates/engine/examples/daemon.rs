@@ -375,7 +375,7 @@ fn main() {
                     let scratch = m.q35_scratch.as_ref().unwrap();
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
-                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch).is_ok()
+                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None).is_ok()
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
