@@ -5863,6 +5863,12 @@ impl Gpu {
     }
 
     /// Shared helper: launch a batched asym flash tile + the shared asym reduce.
+    ///
+    /// `tree_bias` / `block_start` / `block_cols` activate DDTree tree-attention
+    /// mode (bias added to in-block qk scores; seq_len extends to full cache
+    /// including the tree block). When `tree_bias` is None and `block_cols` is
+    /// 0, behavior is byte-identical to the legacy causal path.
+    #[allow(clippy::too_many_arguments)]
     fn launch_asym_flash_batched(
         &mut self,
         tile_key: &'static str, tile_src: &'static str, tile_func_name: &'static str,
@@ -5872,6 +5878,9 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -5907,10 +5916,15 @@ impl Gpu {
                 let mut pos_ptr = positions.buf.as_ptr();
                 let mut ct_ptr = cos_theta.buf.as_ptr();
                 let mut st_ptr = sin_theta.buf.as_ptr();
+                let mut bias_ptr: *mut std::ffi::c_void = match tree_bias {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
                 let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
                 let mut hd = head_dim as i32; let mut ms = max_seq as i32;
                 let mut sc = scale; let mut ts = TILE_SIZE as i32;
                 let mut mt = max_tiles as i32; let mut bo = offset as i32;
+                let mut bs = block_start as i32; let mut bc = block_cols as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &mut q_ptr as *mut _ as *mut c_void,
                     &mut k_ptr as *mut _ as *mut c_void,
@@ -5919,6 +5933,7 @@ impl Gpu {
                     &mut pos_ptr as *mut _ as *mut c_void,
                     &mut ct_ptr as *mut _ as *mut c_void,
                     &mut st_ptr as *mut _ as *mut c_void,
+                    &mut bias_ptr as *mut _ as *mut c_void,
                     &mut nh as *mut _ as *mut c_void,
                     &mut nkv as *mut _ as *mut c_void,
                     &mut hd as *mut _ as *mut c_void,
@@ -5927,6 +5942,8 @@ impl Gpu {
                     &mut ts as *mut _ as *mut c_void,
                     &mut mt as *mut _ as *mut c_void,
                     &mut bo as *mut _ as *mut c_void,
+                    &mut bs as *mut _ as *mut c_void,
+                    &mut bc as *mut _ as *mut c_void,
                 ];
                 unsafe {
                     self.hip.launch_kernel(
@@ -5949,6 +5966,7 @@ impl Gpu {
                 let mut nh = n_heads as i32; let mut hd = head_dim as i32;
                 let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
                 let mut bo = offset as i32;
+                let mut bs = block_start as i32; let mut bc = block_cols as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &mut p_ptr as *mut _ as *mut c_void,
                     &mut o_ptr as *mut _ as *mut c_void,
@@ -5958,6 +5976,8 @@ impl Gpu {
                     &mut ts as *mut _ as *mut c_void,
                     &mut mt as *mut _ as *mut c_void,
                     &mut bo as *mut _ as *mut c_void,
+                    &mut bs as *mut _ as *mut c_void,
+                    &mut bc as *mut _ as *mut c_void,
                 ];
                 unsafe {
                     self.hip.launch_kernel(
@@ -6012,6 +6032,7 @@ impl Gpu {
     }
 
     /// Batched flash attention for asym4 (K 4-bit rotated + V Q8_0).
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, positions: &GpuTensor,
@@ -6020,16 +6041,41 @@ impl Gpu {
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.attention_flash_asym4_batched_masked(
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
+        )
+    }
+
+    /// Tree-mask variant of `attention_flash_asym4_batched`. See
+    /// `attention_q8_0_kv_batched_masked` and `ddtree::linearize_tree` for the
+    /// bias layout. Passes `tree_bias` / `block_start` / `block_cols` into the
+    /// tile + reduce kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_batched_masked(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
         self.launch_asym_flash_batched(
             "attention_flash_asym4_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
             "attention_flash_asym4_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols,
         )
     }
 
     /// Batched flash attention for asym2 (K 2-bit rotated + V Q8_0).
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym2_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, positions: &GpuTensor,
@@ -6044,6 +6090,7 @@ impl Gpu {
             "attention_flash_asym2_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
         )
     }
 
@@ -6101,6 +6148,7 @@ impl Gpu {
     /// Batched flash attention for asym3 KV.
     /// Grid: [n_heads, max_tiles, sub_batch] tile + [n_heads, sub_batch] reduce,
     /// chunked by partials buffer capacity.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym3_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, positions: &GpuTensor,
@@ -6109,114 +6157,36 @@ impl Gpu {
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
-        const TILE_SIZE: usize = 128;
-        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
-        let stride = 2 + head_dim;
-        let per_pos_bytes = n_heads * max_tiles * stride * 4;
-        let partials_capacity = partials.numel() * 4;
-        let sub_batch = if per_pos_bytes > 0 {
-            (partials_capacity / per_pos_bytes).max(1).min(batch_size)
-        } else {
-            batch_size
-        };
+        self.attention_flash_asym3_batched_masked(
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
+        )
+    }
 
-        self.ensure_givens4_kernel(
+    /// Tree-mask variant of `attention_flash_asym3_batched`. asym3 is the
+    /// default live KV path on 9B MQ4 — this is the primary target for
+    /// DDTree batched verify on the hybrid arch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym3_batched_masked(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
             kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
             "attention_flash_asym3_tile_batched",
-        )?;
-        self.ensure_kernel(
-            "attention_flash_asym_reduce_batched",
-            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
-            "attention_flash_asym_reduce_batched",
-        )?;
-
-        let q_dim = n_heads * head_dim;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut offset = 0usize;
-        while offset < batch_size {
-            let chunk = (batch_size - offset).min(sub_batch);
-
-            // Tile kernel
-            {
-                let func = &self.functions["attention_flash_asym3_tile_batched"];
-                let mut q_ptr = unsafe {
-                    (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void
-                };
-                let mut k_ptr = k_cache.buf.as_ptr();
-                let mut v_ptr = v_cache.buf.as_ptr();
-                let mut p_ptr = partials.buf.as_ptr();
-                let mut pos_ptr = positions.buf.as_ptr();
-                let mut ct_ptr = cos_theta.buf.as_ptr();
-                let mut st_ptr = sin_theta.buf.as_ptr();
-                let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
-                let mut hd = head_dim as i32; let mut ms = max_seq as i32;
-                let mut sc = scale; let mut ts = TILE_SIZE as i32;
-                let mut mt = max_tiles as i32; let mut bo = offset as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &mut q_ptr as *mut _ as *mut c_void,
-                    &mut k_ptr as *mut _ as *mut c_void,
-                    &mut v_ptr as *mut _ as *mut c_void,
-                    &mut p_ptr as *mut _ as *mut c_void,
-                    &mut pos_ptr as *mut _ as *mut c_void,
-                    &mut ct_ptr as *mut _ as *mut c_void,
-                    &mut st_ptr as *mut _ as *mut c_void,
-                    &mut nh as *mut _ as *mut c_void,
-                    &mut nkv as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut ms as *mut _ as *mut c_void,
-                    &mut sc as *mut _ as *mut c_void,
-                    &mut ts as *mut _ as *mut c_void,
-                    &mut mt as *mut _ as *mut c_void,
-                    &mut bo as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    self.hip.launch_kernel(
-                        func,
-                        [n_heads as u32, max_tiles as u32, chunk as u32],
-                        [32, 1, 1],
-                        (TILE_SIZE * 4) as u32,
-                        self.stream_ref(),
-                        &mut params,
-                    )?;
-                }
-            }
-
-            // Reduce kernel (no inverse rotation — V in normal space)
-            {
-                let func = &self.functions["attention_flash_asym_reduce_batched"];
-                let mut p_ptr = partials.buf.as_ptr();
-                let mut o_ptr = unsafe {
-                    (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void
-                };
-                let mut pos_ptr = positions.buf.as_ptr();
-                let mut nh = n_heads as i32; let mut hd = head_dim as i32;
-                let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
-                let mut bo = offset as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &mut p_ptr as *mut _ as *mut c_void,
-                    &mut o_ptr as *mut _ as *mut c_void,
-                    &mut pos_ptr as *mut _ as *mut c_void,
-                    &mut nh as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut ts as *mut _ as *mut c_void,
-                    &mut mt as *mut _ as *mut c_void,
-                    &mut bo as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    self.hip.launch_kernel(
-                        func,
-                        [n_heads as u32, chunk as u32, 1],
-                        [32, 1, 1],
-                        0,
-                        self.stream_ref(),
-                        &mut params,
-                    )?;
-                }
-            }
-            offset += chunk;
-        }
-        Ok(())
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols,
+        )
     }
 
     /// Flash attention for asym3 KV (K at 3-bit rotated, V at Q8_0).
