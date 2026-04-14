@@ -64,7 +64,11 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let n_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
     let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dim / n_heads);
     let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
-    let hidden_dim = tc.get("intermediate_size")?.as_u64()? as usize;
+    // Dense FFN intermediate dim. MoE configs (qwen3_5_moe / A3B) replace this
+    // with `moe_intermediate_size` and don't ship `intermediate_size`, so don't
+    // hard-fail here — we still need to load the rest of the config to detect
+    // is_moe and route accordingly.
+    let hidden_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let norm_eps = tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
 
     let rope_params = tc.get("rope_parameters");
