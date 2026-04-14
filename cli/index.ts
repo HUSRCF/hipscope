@@ -434,6 +434,14 @@ async function runViaHttp(
       if (data === "[DONE]") { buffer = ""; break; }
       try {
         const chunk = JSON.parse(data);
+        // Top-level {"error":{...}} is how the serve surfaces daemon-side
+        // rejections (e.g. KV-budget overrun). Print it and set a non-zero
+        // exit code so `hipfire run` doesn't silently look successful.
+        if (chunk.error) {
+          process.stderr.write(`\n[hipfire] ${chunk.error.message || "server error"}\n`);
+          process.exitCode = 1;
+          continue;
+        }
         const delta = chunk.choices?.[0]?.delta ?? {};
         let text: string = delta.content ?? "";
         if (!text) continue;
@@ -695,6 +703,14 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
       process.stdout.write(text);
     }
     else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    else if (msg.type === "error") {
+      // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
+      // exiting 0 with no visible output. Sets exitCode so downstream shell
+      // pipelines can detect the failure.
+      process.stderr.write(`\n[hipfire] ${msg.message || "generation failed"}\n`);
+      process.exitCode = 1;
+      break;
+    }
   }
   await e.stop();
 }
