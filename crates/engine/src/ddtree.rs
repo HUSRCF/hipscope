@@ -305,6 +305,65 @@ pub fn follow_verified_tree(tree: &DdTree, posterior: &[u32]) -> (Vec<usize>, u3
     (accepted, next_token)
 }
 
+/// Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)`
+/// triple suitable for a single batched target forward.
+///
+/// - `seed_token`: the anchor at tree root (= `block_output_ids[0]` in the
+///   DFlash / DDTree papers). Occupies slot 0 in the returned arrays.
+/// - `base_pos`: the absolute decode position of the seed (matches the
+///   `position` argument of `spec_step_dflash`). Tree nodes live at
+///   `base_pos + depth` where `depth` is 1-indexed from `DdNode::depth`.
+///
+/// Returns:
+/// - `tokens: Vec<u32>` of length `1 + tree.num_nodes()`. `tokens[0] =
+///   seed_token`; `tokens[i+1] = tree.nodes[i].token`.
+/// - `positions: Vec<i32>` matching `tokens`, carrying each slot's logical
+///   RoPE position (seed at `base_pos`, node i at `base_pos + depth_i`).
+///   Two nodes at the same tree depth get the same logical position — they
+///   represent alternative futures at the same time step, not successive
+///   tokens in a chain.
+/// - `mask_block: Vec<f32>` of shape `[(1+N) × (1+N)]` row-major. Value is
+///   `0.0` when `visibility[i][j]` (j is an ancestor-or-self of i), else
+///   `f32::NEG_INFINITY`. Attention kernels add this as a bias to qk scores
+///   for keys in the tree block; the prompt region (positions
+///   `[0, base_pos - 1]`) is always visible and needs no mask.
+///
+/// Ordering: matches `tree.nodes` exactly, which is heap-pop order. That
+/// order is guaranteed topological (every parent appears before its children)
+/// but NOT strictly BFS — siblings of different root-children may interleave
+/// with their descendants. The kernel doesn't care; what matters is
+/// (a) topological order so children see their parents' K/V, and
+/// (b) the mask encodes the actual tree, not the linearization index.
+pub fn linearize_tree(
+    tree: &DdTree,
+    seed_token: u32,
+    base_pos: u32,
+) -> (Vec<u32>, Vec<i32>, Vec<f32>) {
+    let len = 1 + tree.num_nodes();
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(len);
+    tokens.push(seed_token);
+    tokens.extend(tree.nodes.iter().map(|n| n.token));
+
+    let mut positions: Vec<i32> = Vec::with_capacity(len);
+    positions.push(base_pos as i32);
+    positions.extend(tree.nodes.iter().map(|n| base_pos as i32 + n.depth as i32));
+
+    // Row-major flatten of the visibility bool matrix → f32 additive bias.
+    // -inf on masked keeps the running-max / logsumexp math exact (exp(-inf)
+    // = 0 contributes nothing) and needs no epsilon tuning across dtypes.
+    let mut mask_block: Vec<f32> = Vec::with_capacity(len * len);
+    for row in &tree.visibility {
+        debug_assert_eq!(row.len(), len);
+        for &v in row {
+            mask_block.push(if v { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    debug_assert_eq!(mask_block.len(), len * len);
+
+    (tokens, positions, mask_block)
+}
+
 /// CPU top-K per row on a log-softmax-normalized logits matrix. Produces the
 /// `(top_tokens, top_log_probs)` arrays expected by `build_ddtree_tree`.
 ///
@@ -453,6 +512,70 @@ mod tests {
         let (accepted, bonus) = follow_verified_tree(&t, &posterior);
         assert_eq!(accepted.len(), 0);
         assert_eq!(bonus, 55);
+    }
+
+    #[test]
+    fn linearize_empty_tree_is_seed_only() {
+        let t = build_ddtree_tree(&[], &[], 0, 0, 0);
+        let (toks, pos, mask) = linearize_tree(&t, /*seed=*/ 42, /*base_pos=*/ 100);
+        assert_eq!(toks, vec![42]);
+        assert_eq!(pos, vec![100]);
+        // Single slot; root is visible to itself.
+        assert_eq!(mask, vec![0.0]);
+    }
+
+    #[test]
+    fn linearize_spine_has_causal_mask() {
+        // Spine (topk=1): depth 3, top-1. Tree nodes = [t1, t2, t3] all on a
+        // single chain. Linearized: [seed, t1, t2, t3]. Each node should see
+        // root + every ancestor. Mask should be lower-triangular zeros.
+        let tokens = vec![11, 22, 33];
+        let logps = vec![-0.1, -0.2, -0.3];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
+        assert_eq!(t.nodes.len(), 3);
+        let (toks, pos, mask) = linearize_tree(&t, 5, 50);
+        assert_eq!(toks, vec![5, 11, 22, 33]);
+        // Depths: 1, 2, 3 → positions: 50, 51, 52, 53.
+        assert_eq!(pos, vec![50, 51, 52, 53]);
+        // 4×4 lower-triangular: visible = 0.0, invisible = -inf.
+        let expected: Vec<f32> = vec![
+            0.0,               f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY,
+            0.0,               0.0,               f32::NEG_INFINITY, f32::NEG_INFINITY,
+            0.0,               0.0,               0.0,               f32::NEG_INFINITY,
+            0.0,               0.0,               0.0,               0.0,
+        ];
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn linearize_bushy_tree_masks_siblings() {
+        // Reuse the 4-node test tree: [10, 30 under 10, 20 (sibling of 10),
+        // 30 under 20]. Seed = 1, base_pos = 0.
+        let tokens = vec![10, 20, 30, 40];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5];
+        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
+        assert_eq!(t.nodes.len(), 4);
+        let (toks, pos, mask) = linearize_tree(&t, 1, 0);
+        assert_eq!(toks, vec![1, 10, 30, 20, 30]);
+        // Depths from construction: 1 (node0=10), 2 (node1=30 under 10),
+        // 1 (node2=20), 2 (node3=30 under 20). Base 0 → positions 0,1,2,1,2.
+        assert_eq!(pos, vec![0, 1, 2, 1, 2]);
+        // 5×5 mask. Slot 0 = root. Slot i+1 = node i.
+        // Ancestors:
+        //   slot 0 (root): {0}
+        //   slot 1 (node 10, parent=root): {0, 1}
+        //   slot 2 (node 30 under 10, parent=node 10): {0, 1, 2}
+        //   slot 3 (node 20, parent=root): {0, 3}
+        //   slot 4 (node 30 under 20, parent=node 20): {0, 3, 4}
+        let ni = f32::NEG_INFINITY;
+        let expected: Vec<f32> = vec![
+            0.0, ni,  ni,  ni,  ni,
+            0.0, 0.0, ni,  ni,  ni,
+            0.0, 0.0, 0.0, ni,  ni,
+            0.0, ni,  ni,  0.0, ni,
+            0.0, ni,  ni,  0.0, 0.0,
+        ];
+        assert_eq!(mask, expected);
     }
 
     #[test]
