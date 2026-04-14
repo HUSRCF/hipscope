@@ -2696,6 +2696,77 @@ impl Gpu {
         result
     }
 
+    /// MoE fused down GEMV with scaled residual: accumulates 8 top-K
+    /// experts' weighted contributions into `x_residual` in a single
+    /// kernel launch. Grid.y selects the expert; each block atomicAdds
+    /// `s_rank * (W_rank[row] · rot_batch[rank, :])` into `x_residual[row]`.
+    /// Replaces 8 separate `gemv_hfq4g256_residual_scaled_cpu` calls.
+    ///
+    /// Atomic-add summation order is non-deterministic, so bit-exactness
+    /// across runs isn't guaranteed (vs the sequential per-expert path).
+    /// For A3B the MoE contribution is added on top of a non-trivial base,
+    /// so the ordering-dependent FP noise is tiny in practice and the
+    /// smoke-test decode still matches the Phase 2c step 2 output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_down_residual_scaled_k8(
+        &mut self,
+        w0: &GpuTensor, w1: &GpuTensor, w2: &GpuTensor, w3: &GpuTensor,
+        w4: &GpuTensor, w5: &GpuTensor, w6: &GpuTensor, w7: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        scales: [f32; 8],
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_down",
+            kernels::GEMV_HFQ4G256_MOE_DOWN_SRC,
+            "gemv_hfq4g256_moe_down_residual_scaled_k8",
+        )?;
+        let w0p = w0.buf.as_ptr(); let w1p = w1.buf.as_ptr();
+        let w2p = w2.buf.as_ptr(); let w3p = w3.buf.as_ptr();
+        let w4p = w4.buf.as_ptr(); let w5p = w5.buf.as_ptr();
+        let w6p = w6.buf.as_ptr(); let w7p = w7.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let [s0, s1, s2, s3, s4, s5, s6, s7] = scales;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w0p as *const _ as *mut c_void, &w1p as *const _ as *mut c_void,
+            &w2p as *const _ as *mut c_void, &w3p as *const _ as *mut c_void,
+            &w4p as *const _ as *mut c_void, &w5p as *const _ as *mut c_void,
+            &w6p as *const _ as *mut c_void, &w7p as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &s0 as *const _ as *mut c_void, &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void, &s3 as *const _ as *mut c_void,
+            &s4 as *const _ as *mut c_void, &s5 as *const _ as *mut c_void,
+            &s6 as *const _ as *mut c_void, &s7 as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g256_moe_down_residual_scaled_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_down_residual_scaled_k8",
+            [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w0p); b.push_ptr(w1p); b.push_ptr(w2p); b.push_ptr(w3p);
+                b.push_ptr(w4p); b.push_ptr(w5p); b.push_ptr(w6p); b.push_ptr(w7p);
+                b.push_ptr(rbp); b.push_ptr(xrp);
+                b.push_f32(s0); b.push_f32(s1); b.push_f32(s2); b.push_f32(s3);
+                b.push_f32(s4); b.push_f32(s5); b.push_f32(s6); b.push_f32(s7);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///

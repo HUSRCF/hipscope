@@ -1135,41 +1135,44 @@ fn moe_ffn_decode(
     if let (Some(gb), Some(ub), Some(rb), Some(xr)) =
         (gate_batch.as_ref(), up_batch.as_ref(), rot_batch.as_ref(), x_rot_local.as_ref())
     {
-        // Single fused launch: 8 experts' gate_up GEMV in parallel, split
-        // into gate_batch + up_batch (each [k × mi]).
-        let e0 = &ffn.experts[topk_indices[0]].gate_up;
-        let e1 = &ffn.experts[topk_indices[1]].gate_up;
-        let e2 = &ffn.experts[topk_indices[2]].gate_up;
-        let e3 = &ffn.experts[topk_indices[3]].gate_up;
-        let e4 = &ffn.experts[topk_indices[4]].gate_up;
-        let e5 = &ffn.experts[topk_indices[5]].gate_up;
-        let e6 = &ffn.experts[topk_indices[6]].gate_up;
-        let e7 = &ffn.experts[topk_indices[7]].gate_up;
+        // Phase 2c all-in-one fast path (k=8, all MQ4G256):
+        //   1. Fused gate_up GEMV across 8 experts → gate_batch + up_batch
+        //   2. Batched silu_mul+rotate across 8 experts → rot_batch
+        //   3. Fused down GEMV + scaled residual across 8 experts →
+        //      x_residual (atomicAdd accumulator)
+        // Total: 3 launches for the routed-expert compute — down from 24
+        // in Phase 2a-iii (3 per expert × 8 experts).
+        let e0 = &ffn.experts[topk_indices[0]];
+        let e1 = &ffn.experts[topk_indices[1]];
+        let e2 = &ffn.experts[topk_indices[2]];
+        let e3 = &ffn.experts[topk_indices[3]];
+        let e4 = &ffn.experts[topk_indices[4]];
+        let e5 = &ffn.experts[topk_indices[5]];
+        let e6 = &ffn.experts[topk_indices[6]];
+        let e7 = &ffn.experts[topk_indices[7]];
         gpu.gemv_hfq4g256_moe_gate_up_k8(
-            &e0.buf, &e1.buf, &e2.buf, &e3.buf,
-            &e4.buf, &e5.buf, &e6.buf, &e7.buf,
+            &e0.gate_up.buf, &e1.gate_up.buf, &e2.gate_up.buf, &e3.gate_up.buf,
+            &e4.gate_up.buf, &e5.gate_up.buf, &e6.gate_up.buf, &e7.gate_up.buf,
             xr, gb, ub,
-            2 * mi, e0.k,
+            2 * mi, e0.gate_up.k,
         )?;
-        // Single batched silu_mul+rotate for all 8 experts:
-        //   rot_batch[k × mi] = FWHT(silu(gate_batch[k, :]) * up_batch[k, :])
         gpu.fused_silu_mul_rotate_mq_batched(gb, ub, rb, mi, k)?;
-    }
-
-    for (krank, (&expert_idx, &weight)) in topk_indices.iter().zip(topk_weights.iter()).enumerate() {
-        let expert = &ffn.experts[expert_idx];
-        if let Some(ref rb) = rot_batch {
-            // Fast path: all upstream stages fused. Just do the down-GEMV
-            // with scaled residual against this expert's slice of rot_batch.
-            let rot_slice = slice_f32_view(rb, krank * mi, mi);
-            gpu.gemv_hfq4g256_residual_scaled_cpu(
-                &expert.down.buf, &rot_slice, x_residual, weight,
-                expert.down.m, expert.down.k,
-            )?;
-        } else {
-            // Non-fused fallback: per-expert gate_up → silu_mul_rotate →
-            // scaled_residual. Preserves the Phase 2a-iii path for any
-            // layer that isn't all-MQ4 or has k != 8.
+        let scales = [
+            topk_weights[0], topk_weights[1], topk_weights[2], topk_weights[3],
+            topk_weights[4], topk_weights[5], topk_weights[6], topk_weights[7],
+        ];
+        gpu.gemv_hfq4g256_moe_down_residual_scaled_k8(
+            &e0.down.buf, &e1.down.buf, &e2.down.buf, &e3.down.buf,
+            &e4.down.buf, &e5.down.buf, &e6.down.buf, &e7.down.buf,
+            rb, x_residual, scales,
+            e0.down.m, e0.down.k,
+        )?;
+    } else {
+        // Non-fused fallback — per-expert gate_up → silu_mul_rotate →
+        // scaled_residual. Preserves the Phase 2a-iii path for layers
+        // that aren't all-MQ4 or have k != 8.
+        for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
+            let expert = &ffn.experts[expert_idx];
             if let Some(ref xr) = x_rot_local {
                 gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
                     expert.gate_up.m, expert.gate_up.k)?;

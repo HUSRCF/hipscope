@@ -104,6 +104,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kerne
 /// standard HFQ4G256 body. Saves 7 launches per MoE layer.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up.hip");
 
+/// MoE fused down GEMV with scaled residual: 8 experts' weighted
+/// contributions accumulate into a single residual buffer via atomicAdd
+/// in one kernel launch. Grid.y selects the expert. Saves 7 launches
+/// per MoE layer.
+pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_moe_down.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
