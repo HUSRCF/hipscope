@@ -2068,7 +2068,17 @@ pub fn forward_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
-    let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1");
+    // hipGraph capture is currently DISABLED for MoE configs. The captured
+    // graph corrupts multi-turn state — single-token decode looks healthy
+    // (validated by a3b_smoke_forward at HIPFIRE_GRAPH=1: 162 tok/s,
+    // coherent single-shot output), but every additional `forward_scratch`
+    // call that follows a graph capture writes through the same per-layer
+    // moe_topk / gate_batch / rot_batch scratch, and replay produces
+    // increasingly garbage logits across turns (verified against the
+    // daemon multi-turn test). Until that's properly diagnosed, MoE
+    // configs always take the direct path.
+    let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1")
+        && config.num_experts == 0;
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
