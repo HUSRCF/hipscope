@@ -121,7 +121,7 @@ cd "$REPO"
 log "=== BISECT QA: $LABEL ($COMMIT) === $(date '+%Y-%m-%d %H:%M:%S')"
 
 git checkout "$COMMIT" --quiet
-rm -rf /tmp/hipfire_kernels/
+rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/
 log "checked out $COMMIT"
 
 log "building..."

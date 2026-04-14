@@ -1697,8 +1697,10 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     const RUN_TIMEOUT = 60_000;   // 1min per generation run
 
     for (const v of variants) {
-      // Clear kernel cache so variant recompiles
-      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/"); } catch {}
+      // Clear kernel cache so variant recompiles. Cache now defaults to
+      // $CWD/.hipfire_kernels (per-worktree isolation); /tmp is legacy and
+      // still cleaned in case HIPFIRE_KERNEL_CACHE pins the old location.
+      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/"); } catch {}
 
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
@@ -3025,11 +3027,16 @@ switch (cmd) {
       // because the OLD blob's hash still matches the OLD source we no
       // longer ship). `/tmp/hipfire_kernels` dies at reboot; this one
       // doesn't, so it's the one that actually needs the cleanup.
+      // As of the cwd-cache switch, also clean .hipfire_kernels (the new
+      // default hot-path location) in case the daemon was launched from
+      // the current cwd — leftover blobs would otherwise mask the cold
+      // update. /tmp clean is kept for the HIPFIRE_KERNEL_CACHE=/tmp pinning.
       const { rmSync } = await import("fs");
       if (existsSync(kernelDst)) {
         try { rmSync(kernelDst, { recursive: true, force: true }); } catch {}
       }
       try { rmSync("/tmp/hipfire_kernels", { recursive: true, force: true }); } catch {}
+      try { rmSync(".hipfire_kernels", { recursive: true, force: true }); } catch {}
       mkdirSync(kernelDst, { recursive: true });
       if (existsSync(kernelSrc)) {
         for (const f of readdirSync(kernelSrc)) {
