@@ -979,6 +979,47 @@ fn slice_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> Gpu
 ///   y_shared      = scalar * shared_expert(x_norm)         // [hidden]
 ///   y_moe         = sum_{k} w[k] * expert[idx[k]](x_norm)  // [hidden]
 ///   x_residual   += y_shared + y_moe
+/// Non-owning borrow of the 11 scratch buffers `moe_ffn_decode_impl` needs.
+/// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
+/// hipGraph-capturable) or from tensors they own locally (heap path).
+struct MoeScratchRef<'a> {
+    router_logits: &'a GpuTensor,
+    scalar_buf:    &'a GpuTensor,
+    x_rot_local:   &'a GpuTensor,
+    gate_up_buf:   &'a GpuTensor,
+    gate_buf:      &'a GpuTensor,
+    up_buf:        &'a GpuTensor,
+    ffn_hidden:    &'a GpuTensor,
+    ffn_out:       &'a GpuTensor,
+    gate_batch:    &'a GpuTensor,
+    up_batch:      &'a GpuTensor,
+    rot_batch:     &'a GpuTensor,
+}
+
+impl<'a> MoeScratchRef<'a> {
+    /// View into a Qwen35Scratch's MoE fields. Panics if the caller didn't
+    /// allocate MoE scratch (config.num_experts == 0).
+    fn from_scratch(s: &'a Qwen35Scratch) -> Self {
+        Self {
+            router_logits: s.moe_router_logits.as_ref().expect("MoE scratch not allocated"),
+            scalar_buf:    s.moe_scalar_buf.as_ref().expect("MoE scratch"),
+            x_rot_local:   s.moe_x_rot.as_ref().expect("MoE scratch"),
+            gate_up_buf:   s.moe_gate_up_buf.as_ref().expect("MoE scratch"),
+            gate_buf:      s.moe_gate_buf.as_ref().expect("MoE scratch"),
+            up_buf:        s.moe_up_buf.as_ref().expect("MoE scratch"),
+            ffn_hidden:    s.moe_ffn_hidden.as_ref().expect("MoE scratch"),
+            ffn_out:       s.moe_ffn_out.as_ref().expect("MoE scratch"),
+            gate_batch:    s.moe_gate_batch.as_ref().expect("MoE scratch"),
+            up_batch:      s.moe_up_batch.as_ref().expect("MoE scratch"),
+            rot_batch:     s.moe_rot_batch.as_ref().expect("MoE scratch"),
+        }
+    }
+}
+
+/// Heap-allocating wrapper for callers without pre-allocated scratch (the
+/// debug `forward()` path). Allocates 11 tensors, runs moe_ffn_decode_impl,
+/// frees. NOT hipGraph-compatible. For hot-path decode, callers should go
+/// through moe_ffn_decode_with_scratch which reuses pre-allocated buffers.
 fn moe_ffn_decode(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -993,14 +1034,79 @@ fn moe_ffn_decode(
     let n_exp = config.num_experts;
     let max_inter = mi.max(smi);
 
-    // Scratch buffers — allocated once per layer, reused across experts.
     let router_logits = gpu.alloc_tensor(&[n_exp], DType::F32)?;
+    let scalar_buf    = gpu.alloc_tensor(&[1], DType::F32)?;
+    let x_rot_local   = gpu.alloc_tensor(&[hidden], DType::F32)?;
     let gate_up_buf   = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
     let gate_buf      = gpu.alloc_tensor(&[max_inter], DType::F32)?;
     let up_buf        = gpu.alloc_tensor(&[max_inter], DType::F32)?;
     let ffn_hidden    = gpu.alloc_tensor(&[max_inter], DType::F32)?;
     let ffn_out       = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let scalar_buf    = gpu.alloc_tensor(&[1], DType::F32)?;
+    let gate_batch    = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let up_batch      = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let rot_batch     = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+
+    let refs = MoeScratchRef {
+        router_logits: &router_logits,
+        scalar_buf:    &scalar_buf,
+        x_rot_local:   &x_rot_local,
+        gate_up_buf:   &gate_up_buf,
+        gate_buf:      &gate_buf,
+        up_buf:        &up_buf,
+        ffn_hidden:    &ffn_hidden,
+        ffn_out:       &ffn_out,
+        gate_batch:    &gate_batch,
+        up_batch:      &up_batch,
+        rot_batch:     &rot_batch,
+    };
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs);
+
+    for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
+              up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch] {
+        gpu.free_tensor(t)?;
+    }
+    result
+}
+
+/// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
+/// be populated (done automatically by `Qwen35Scratch::new` when config
+/// indicates a MoE model). Safe to call under hipGraph stream capture.
+fn moe_ffn_decode_with_scratch(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(scratch);
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs)
+}
+
+/// The actual MoE FFN implementation. Uses the caller-provided scratch
+/// buffers, never allocates.
+fn moe_ffn_decode_impl(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+) -> HipResult<()> {
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let _ = hidden; // may be unused in fallback paths
+    let _ = k;
+
+    let router_logits = s.router_logits;
+    let scalar_buf    = s.scalar_buf;
+    let gate_up_buf   = s.gate_up_buf;
+    let gate_buf      = s.gate_buf;
+    let up_buf        = s.up_buf;
+    let ffn_hidden    = s.ffn_hidden;
+    let ffn_out       = s.ffn_out;
 
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
     // buffer across every gate-side GEMV (router, shared_expert_gate,
@@ -1015,22 +1121,23 @@ fn moe_ffn_decode(
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
     let x_rot_local = if gate_side_mq4 {
-        let buf = gpu.alloc_tensor(&[hidden], DType::F32)?;
         gpu.ensure_mq_signs()?;
-        gpu.rotate_x_mq(x_norm, &buf, hidden)?;
-        Some(buf)
+        gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
+        Some(s.x_rot_local)
     } else {
         None
     };
 
     // ── 1. Router logits → softmax → CPU top-K + (optional) renormalize ──
-    if let Some(ref xr) = x_rot_local {
-        gpu.gemv_mq4g256_prerotated(&ffn.router.buf, xr, &router_logits, ffn.router.m, ffn.router.k)?;
+    if let Some(xr) = x_rot_local {
+        gpu.gemv_mq4g256_prerotated(&ffn.router.buf, xr, router_logits, ffn.router.m, ffn.router.k)?;
     } else {
-        weight_gemv(gpu, &ffn.router, x_norm, &router_logits)?;
+        weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
     }
-    gpu.softmax_f32(&router_logits)?;
-    let probs = gpu.download_f32(&router_logits)?;
+    gpu.softmax_f32(router_logits)?;
+    let probs = gpu.download_f32(router_logits)?;
+    let n_exp = config.num_experts;
+    let k = config.num_experts_per_tok;
 
     // Partial sort: select top-K indices by probability. `select_nth_unstable_by`
     // places the k-1-th element in its sorted position with O(n) average work.
@@ -1057,13 +1164,13 @@ fn moe_ffn_decode(
     // Phase 2a: compute the sigmoid on-device and pass the result by
     // device pointer into the fused scaled-add below. Eliminates one
     // D2H sync per layer (was 80 syncs per token across 40 layers).
-    if let Some(ref xr) = x_rot_local {
-        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert_gate.buf, xr, &scalar_buf,
+    if let Some(xr) = x_rot_local {
+        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert_gate.buf, xr, scalar_buf,
             ffn.shared_expert_gate.m, ffn.shared_expert_gate.k)?;
     } else {
-        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, &scalar_buf)?;
+        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
     }
-    gpu.sigmoid_f32(&scalar_buf)?;
+    gpu.sigmoid_f32(scalar_buf)?;
 
     // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
     // Phase 2a-ii: fuse silu_mul + rotate + down-GEMV + scaled-residual-add
@@ -1071,9 +1178,9 @@ fn moe_ffn_decode(
     // when down weights are MQ4G256. Eliminates the separate silu_mul,
     // explicit scale_f32, and add_inplace_f32 launches — one kernel does
     // the full `y += sigmoid(gate_scalar) * W_down · silu_mul(gate, up)`.
-    let shared_gate = slice_f32_view(&gate_buf, 0, smi);
-    let shared_up   = slice_f32_view(&up_buf,   0, smi);
-    if let Some(ref xr) = x_rot_local {
+    let shared_gate = slice_f32_view(gate_buf, 0, smi);
+    let shared_up   = slice_f32_view(up_buf,   0, smi);
+    if let Some(xr) = x_rot_local {
         gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.gate.buf, xr, &shared_gate,
             ffn.shared_expert.gate.m, ffn.shared_expert.gate.k)?;
         gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.up.buf, xr, &shared_up,
@@ -1091,25 +1198,22 @@ fn moe_ffn_decode(
         };
         gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi)?;
         gpu.gemv_hfq4g256_residual_scaled_gpu(
-            &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, &scalar_buf,
+            &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
         )?;
     } else {
         // Non-MQ fallback: pre-2a-ii path.
-        let shared_hid = slice_f32_view(&ffn_hidden, 0, smi);
+        let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
         gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
-        weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, &ffn_out)?;
-        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, &ffn_out, &scalar_buf)?;
+        weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
+        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
     }
 
     // ── 4. Top-K routed experts ──
-    // Phase 2c step 1: when top_k==8 and all selected experts' gate_up are
-    // MQ4G256 (true for A3B), fuse the 8 gate_up GEMVs into a single
-    // kernel launch via gemv_hfq4g256_moe_gate_up_k8 — grid.y selects the
-    // expert via a kernarg pointer array. Output is a [k × 2*mi] batch.
-    //
-    // The silu_mul+rotate and down+scaled_residual stages are still
-    // per-expert launches for now (Phase 2c step 2 will batch them too).
+    // Phase 2c step 1-3: when top_k==8 and all selected experts' gate_up are
+    // MQ4G256 (true for A3B), the routed-expert compute collapses to 3
+    // kernel launches (fused MoE gate_up → batched silu_mul_rotate → fused
+    // MoE down with atomicAdd residual).
     let routed_mq4 = ffn.experts.first()
         .map(|e| e.down.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
@@ -1120,21 +1224,9 @@ fn moe_ffn_decode(
         gpu.ensure_mq_signs()?;
     }
 
-    // Scratch batch outputs for all k experts: gate[k × mi], up[k × mi],
-    // rot_silumul[k × mi] (rotated silu_mul output).
     let use_fused_gate_up = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
-    let (gate_batch, up_batch, rot_batch) = if use_fused_gate_up {
-        (
-            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
-            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
-            Some(gpu.alloc_tensor(&[k * mi], DType::F32)?),
-        )
-    } else {
-        (None, None, None)
-    };
-    if let (Some(gb), Some(ub), Some(rb), Some(xr)) =
-        (gate_batch.as_ref(), up_batch.as_ref(), rot_batch.as_ref(), x_rot_local.as_ref())
-    {
+    if use_fused_gate_up {
+        let (gb, ub, rb, xr) = (s.gate_batch, s.up_batch, s.rot_batch, x_rot_local.unwrap());
         // Phase 2c all-in-one fast path (k=8, all MQ4G256):
         //   1. Fused gate_up GEMV across 8 experts → gate_batch + up_batch
         //   2. Batched silu_mul+rotate across 8 experts → rot_batch
@@ -1173,14 +1265,14 @@ fn moe_ffn_decode(
         // that aren't all-MQ4 or have k != 8.
         for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
             let expert = &ffn.experts[expert_idx];
-            if let Some(ref xr) = x_rot_local {
-                gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
+            if let Some(xr) = x_rot_local {
+                gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, gate_up_buf,
                     expert.gate_up.m, expert.gate_up.k)?;
             } else {
-                weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
+                weight_gemv(gpu, &expert.gate_up, x_norm, gate_up_buf)?;
             }
-            let gate_view = slice_f32_view(&gate_up_buf, 0,  mi);
-            let up_view   = slice_f32_view(&gate_up_buf, mi, mi);
+            let gate_view = slice_f32_view(gate_up_buf, 0,  mi);
+            let up_view   = slice_f32_view(gate_up_buf, mi, mi);
             if routed_mq4 {
                 let x_rot_alias = GpuTensor {
                     buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1193,24 +1285,13 @@ fn moe_ffn_decode(
                     expert.down.m, expert.down.k,
                 )?;
             } else {
-                let hid_view = slice_f32_view(&ffn_hidden, 0, mi);
+                let hid_view = slice_f32_view(ffn_hidden, 0, mi);
                 gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
-                weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
-                gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
+                weight_gemv(gpu, &expert.down, &hid_view, ffn_out)?;
+                gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, ffn_out, weight)?;
             }
         }
     }
-
-    // Free scratch
-    for t in [router_logits, gate_up_buf, gate_buf, up_buf, ffn_hidden, ffn_out, scalar_buf] {
-        gpu.free_tensor(t)?;
-    }
-    if let Some(buf) = x_rot_local {
-        gpu.free_tensor(buf)?;
-    }
-    if let Some(buf) = gate_batch { gpu.free_tensor(buf)?; }
-    if let Some(buf) = up_batch   { gpu.free_tensor(buf)?; }
-    if let Some(buf) = rot_batch  { gpu.free_tensor(buf)?; }
     Ok(())
 }
 
@@ -1746,6 +1827,21 @@ pub struct Qwen35Scratch {
     //   1 = auto       (default) flash kicks in at ctx >= 2048
     //   2 = always     force flash at all contexts
     pub flash_mode: u8,
+
+    // MoE scratch (allocated only when config.num_experts > 0). Pre-allocated
+    // so moe_ffn_decode can be captured by hipGraph — the per-layer allocs
+    // it used to do violated the "no allocator ops while capturing" rule.
+    pub moe_router_logits: Option<GpuTensor>,   // [num_experts]
+    pub moe_scalar_buf:    Option<GpuTensor>,   // [1] shared-expert gate scalar
+    pub moe_x_rot:         Option<GpuTensor>,   // [dim]
+    pub moe_gate_up_buf:   Option<GpuTensor>,   // [2*max_inter]   fallback path
+    pub moe_gate_buf:      Option<GpuTensor>,   // [max_inter]     fallback path
+    pub moe_up_buf:        Option<GpuTensor>,   // [max_inter]     fallback path
+    pub moe_ffn_hidden:    Option<GpuTensor>,   // [max_inter]     fallback path
+    pub moe_ffn_out:       Option<GpuTensor>,   // [dim]           fallback path
+    pub moe_gate_batch:    Option<GpuTensor>,   // [k × mi]
+    pub moe_up_batch:      Option<GpuTensor>,   // [k × mi]
+    pub moe_rot_batch:     Option<GpuTensor>,   // [k × mi]
 }
 
 impl Qwen35Scratch {
@@ -1818,6 +1914,48 @@ impl Qwen35Scratch {
                 Ok("always") | Ok("2") | Ok("force") => 2,
                 _ => 1, // auto / unset / any other value
             },
+
+            moe_router_logits: None,
+            moe_scalar_buf:    None,
+            moe_x_rot:         None,
+            moe_gate_up_buf:   None,
+            moe_gate_buf:      None,
+            moe_up_buf:        None,
+            moe_ffn_hidden:    None,
+            moe_ffn_out:       None,
+            moe_gate_batch:    None,
+            moe_up_batch:      None,
+            moe_rot_batch:     None,
+        })
+        .and_then(|mut s| {
+            // Allocate MoE scratch only for MoE configs. Done after the
+            // main struct init so these Options start as None for dense
+            // models and never cost VRAM there.
+            if config.num_experts > 0 {
+                let hidden = config.dim;
+                let n_exp = config.num_experts;
+                let mi = config.moe_intermediate_size;
+                let smi = config.shared_expert_intermediate_size;
+                let max_inter = mi.max(smi);
+                let k = config.num_experts_per_tok;
+                s.moe_router_logits = Some(gpu.alloc_tensor(&[n_exp], DType::F32)?);
+                s.moe_scalar_buf    = Some(gpu.alloc_tensor(&[1], DType::F32)?);
+                s.moe_x_rot         = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_up_buf   = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
+                s.moe_gate_buf      = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_up_buf        = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_hidden    = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_out       = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_batch    = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_up_batch      = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_rot_batch     = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
+                // ensure_mq_signs fires during the first moe_ffn_decode and
+                // blows up hipGraph capture with a hipMalloc-in-capture
+                // error). Idempotent if already computed.
+                gpu.ensure_mq_signs()?;
+            }
+            Ok(s)
         })
     }
 
@@ -1834,6 +1972,13 @@ impl Qwen35Scratch {
                    self.logits, self.sample_buf, self.repeat_buf, self.x_rot,
                    self.flash_partials] {
             let _ = gpu.free_tensor(t);
+        }
+        // MoE scratch — only present for MoE configs.
+        for t in [self.moe_router_logits, self.moe_scalar_buf, self.moe_x_rot,
+                   self.moe_gate_up_buf, self.moe_gate_buf, self.moe_up_buf,
+                   self.moe_ffn_hidden, self.moe_ffn_out,
+                   self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch] {
+            if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
         }
     }
 }
@@ -3287,7 +3432,7 @@ fn forward_scratch_layers(
 
                 // ── MoE FFN ──
                 gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config)?;
+                moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -3405,7 +3550,7 @@ fn forward_scratch_layers(
 
                 // ── MoE FFN ──
                 gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config)?;
+                moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
