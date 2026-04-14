@@ -39,8 +39,15 @@ pub struct Qwen35Config {
     pub linear_value_head_dim: usize,  // 128
     pub conv_kernel_dim: usize,        // 4
 
-    // FFN
-    pub hidden_dim: usize,     // 3584
+    // FFN — dense; for MoE see num_experts below
+    pub hidden_dim: usize,     // 3584 (dense) or unused when num_experts > 0
+
+    // MoE (qwen3_5_moe / A3B). num_experts == 0 means plain dense (qwen3_5).
+    pub num_experts: usize,                      // 256 for A3B
+    pub num_experts_per_tok: usize,              // 8 for A3B
+    pub moe_intermediate_size: usize,            // 512 for A3B (per-routed-expert FFN)
+    pub shared_expert_intermediate_size: usize,  // 512 for A3B
+    pub has_shared_expert: bool,                 // true for A3B (always-on shared expert)
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
@@ -84,11 +91,19 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         }).collect())
         .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
 
+    // MoE config (zeros = dense fallback). Qwen3.5-MoE / A3B sets these.
+    let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let num_experts_per_tok = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let moe_intermediate_size = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let shared_expert_intermediate_size = tc.get("shared_expert_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let has_shared_expert = shared_expert_intermediate_size > 0;
+
     Some(Qwen35Config {
         dim, n_layers, vocab_size, norm_eps, eos_token,
         n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
         linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
         hidden_dim, layer_types,
+        num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
     })
 }
 
@@ -765,13 +780,16 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         }
     };
 
+    let is_moe = config.num_experts > 0;
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!("  loading layer {i}/{} ({:?})...", config.n_layers, config.layer_types[i]);
+        eprintln!("  loading layer {i}/{} ({:?}{})...",
+            config.n_layers, config.layer_types[i],
+            if is_moe { " + MoE" } else { "" });
         let p = format!("layers.{i}");
 
-        match config.layer_types[i] {
-            LayerType::LinearAttention => {
+        match (config.layer_types[i], is_moe) {
+            (LayerType::LinearAttention, false) => {
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
                             + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -796,7 +814,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
                 }));
             }
-            LayerType::FullAttention => {
+            (LayerType::FullAttention, false) => {
                 let q_out_dim = config.n_heads * config.head_dim * 2; // 2x for query + gate
                 let kv_dim = config.n_kv_heads * config.head_dim;
 
@@ -814,10 +832,92 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
                 }));
             }
+            (LayerType::LinearAttention, true) => {
+                let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                            + config.linear_num_value_heads * config.linear_value_head_dim;
+                let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+
+                layers.push(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
+                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                    wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                    w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                        config.linear_num_value_heads, config.dim)?,
+                    w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                        config.linear_num_value_heads, config.dim)?,
+                    a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
+                    dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
+                    conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
+                        qkv_dim * config.conv_kernel_dim)?,
+                    norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
+                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config)?,
+                }));
+            }
+            (LayerType::FullAttention, true) => {
+                let q_out_dim = config.n_heads * config.head_dim * 2;
+                let kv_dim = config.n_kv_heads * config.head_dim;
+
+                layers.push(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
+                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                    wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                    wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                    q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                    k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config)?,
+                }));
+            }
         }
     }
 
     Ok(Qwen35Weights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
+}
+
+/// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
+/// and the per-layer scalar shared-expert gate. Tensor naming follows what the
+/// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
+/// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
+fn load_moe_ffn(hfq: &HfqFile, gpu: &Gpu, p: &str, config: &Qwen35Config) -> HipResult<MoeFfnWeights> {
+    let n_exp = config.num_experts;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+
+    // Router: hidden_size → num_experts. Q8 in our quantization (precision-sensitive).
+    let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
+
+    // Shared expert (always-on, contributes to every token).
+    let shared_expert = ExpertWeights {
+        gate_up: {
+            // The safetensors store gate and up as separate tensors for the shared expert
+            // (unlike the routed experts which are stored as a fused `gate_up_proj`).
+            // For consistency in our struct, we currently load them separately and stash
+            // gate in `gate_up` slot — the forward path will refactor this once the
+            // forward implementation lands. TODO(phase1-forward): unify storage.
+            load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?
+        },
+        down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.down_proj.weight"), config.dim, smi)?,
+    };
+    let shared_expert_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
+
+    // Routed experts — quantizer wrote per-expert tensors named
+    // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
+    // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
+    let mut experts = Vec::with_capacity(n_exp);
+    for x in 0..n_exp {
+        let gate_up = load_weight_tensor(hfq, gpu,
+            &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+            2 * mi, config.dim)?;
+        let down = load_weight_tensor(hfq, gpu,
+            &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+            config.dim, mi)?;
+        experts.push(ExpertWeights { gate_up, down });
+    }
+
+    Ok(MoeFfnWeights { router, experts, shared_expert, shared_expert_gate })
 }
 
 // ─── Forward pass (decode, one token at a time) ─────────────────────────
