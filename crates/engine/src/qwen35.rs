@@ -1028,10 +1028,12 @@ fn moe_ffn_decode(
         }
     }
 
-    // ── 2. Shared-expert scalar gate: sigmoid(W · x_norm) → CPU f32 ──
+    // ── 2. Shared-expert scalar gate: sigmoid(W · x_norm) — stays on GPU ──
+    // Phase 2a: compute the sigmoid on-device and pass the result by
+    // device pointer into the fused scaled-add below. Eliminates one
+    // D2H sync per layer (was 80 syncs per token across 40 layers).
     weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, &scalar_buf)?;
-    let scalar_vec = gpu.download_f32(&scalar_buf)?;
-    let shared_gate_scalar = 1.0 / (1.0 + (-scalar_vec[0]).exp());
+    gpu.sigmoid_f32(&scalar_buf)?;
 
     // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
     let shared_gate = slice_f32_view(&gate_buf, 0, smi);
@@ -1041,8 +1043,10 @@ fn moe_ffn_decode(
     weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
     gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
     weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, &ffn_out)?;
-    gpu.scale_f32(&ffn_out, shared_gate_scalar)?;
-    gpu.add_inplace_f32(x_residual, &ffn_out)?;
+    // Fused: x_residual += sigmoid(gate_scalar) * ffn_out. Replaces the
+    // old (scale_f32 + add_inplace_f32) pair and uses the GPU-side
+    // scalar from scalar_buf directly.
+    gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, &ffn_out, &scalar_buf)?;
 
     // ── 4. Top-K routed experts: fused gate_up → split → silu_mul → down ──
     // The routed expert's `gate_up` is [2*mi, hidden] fused; layout is
@@ -1056,8 +1060,10 @@ fn moe_ffn_decode(
         weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
         gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
         weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
-        gpu.scale_f32(&ffn_out, weight)?;
-        gpu.add_inplace_f32(x_residual, &ffn_out)?;
+        // Fused: x_residual += weight * ffn_out. Replaces the old
+        // (scale_f32 + add_inplace_f32) pair — one launch per expert
+        // instead of two (saves 9 launches per MoE layer).
+        gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
     }
 
     // Free scratch

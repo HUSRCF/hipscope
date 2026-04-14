@@ -101,17 +101,32 @@ fn main() {
     if n_steps > 1 {
         eprintln!("\n=== decoding {} more tokens greedily ===", n_steps - 1);
         let mut next = argmax;
+        let mut timings = Vec::with_capacity(n_steps.saturating_sub(1));
         for step in 1..n_steps {
+            let t0 = std::time::Instant::now();
             qwen35::forward_scratch(
                 &mut gpu, &weights, &config, next, step,
                 &mut kv_cache, &mut dn_state, &scratch,
             ).expect("forward_scratch failed");
             let l = gpu.download_f32(&scratch.logits).expect("download");
+            timings.push(t0.elapsed());
             let has_nan = l.iter().any(|v| v.is_nan() || v.is_infinite());
             assert!(!has_nan, "NaN/Inf at step {step}");
             next = llama::argmax(&l);
             let decoded = tokenizer.decode(&[next]);
-            eprintln!("  step {step:2} -> {next:6} '{}'", decoded.replace('\n', "\\n"));
+            eprintln!("  step {step:2} -> {next:6} '{}'  ({} µs)",
+                decoded.replace('\n', "\\n"), timings.last().unwrap().as_micros());
+        }
+
+        // Steady-state summary — ignore the first 2 steps (graph capture
+        // and KV cache warm-up throw off early measurements).
+        let settled: Vec<_> = timings.iter().skip(2).collect();
+        if !settled.is_empty() {
+            let sum: u128 = settled.iter().map(|d| d.as_micros()).sum();
+            let avg_us = sum / settled.len() as u128;
+            let tok_per_s = 1_000_000.0 / avg_us as f64;
+            eprintln!("\nsteady-state decode (n={}): avg {} µs/tok = {:.1} tok/s",
+                settled.len(), avg_us, tok_per_s);
         }
     }
 

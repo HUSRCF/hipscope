@@ -7238,6 +7238,80 @@ impl Gpu {
         result
     }
 
+    /// Fused `y[i] += c * x[i]` with a CPU-supplied scalar. Merges the
+    /// (scale_f32 + add_inplace_f32) pair used by the MoE routed-expert
+    /// epilogue — one kernel launch instead of two.
+    pub fn scaled_add_inplace_cpu_scalar_f32(
+        &mut self, y: &GpuTensor, x: &GpuTensor, c: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "scaled_add_inplace",
+            kernels::SCALED_ADD_INPLACE_SRC,
+            "scaled_add_inplace_cpu_scalar_f32",
+        )?;
+        let func = &self.functions["scaled_add_inplace_cpu_scalar_f32"];
+        let n = y.numel();
+        let mut yp = y.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut cv = c;
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut yp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut cv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(n);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "scaled_add_inplace_cpu_scalar_f32", bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Fused `y[i] += c_buf[0] * x[i]` where `c_buf` is a 1-element GPU
+    /// tensor. Used by the MoE shared-expert epilogue: the scalar gate
+    /// is `sigmoid(W_shared_gate · x)` computed entirely on-device, so
+    /// passing the result by device pointer saves the D2H sync that a
+    /// plain `scale_f32(c_host)` would require.
+    pub fn scaled_add_inplace_gpu_scalar_f32(
+        &mut self, y: &GpuTensor, x: &GpuTensor, c_buf: &GpuTensor,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "scaled_add_inplace",
+            kernels::SCALED_ADD_INPLACE_SRC,
+            "scaled_add_inplace_gpu_scalar_f32",
+        )?;
+        let func = &self.functions["scaled_add_inplace_gpu_scalar_f32"];
+        let n = y.numel();
+        let mut yp = y.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut cp = c_buf.buf.as_ptr();
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut yp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(n);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "scaled_add_inplace_gpu_scalar_f32", bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused conv1d (kernel_size=4) + SiLU decode.
     #[cfg(feature = "deltanet")]
     pub fn conv1d_silu_f32(

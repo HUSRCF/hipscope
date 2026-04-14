@@ -289,6 +289,13 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
 
 
+/// Scaled in-place add: y[i] += c * x[i] — one kernel for both
+/// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
+/// variants. Used in the MoE FFN accumulator to fuse the old
+/// (scale_f32 + add_inplace_f32) pair.
+pub const SCALED_ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/scaled_add_inplace.hip");
+
+
 /// Element-wise multiply
 pub const MUL_SRC: &str = include_str!("../../../kernels/src/mul.hip");
 
