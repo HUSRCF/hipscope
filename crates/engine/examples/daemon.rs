@@ -363,9 +363,12 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 }
 
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
-    // Check KV capacity — auto-reset if conversation would overflow
+    // Auto-reset on multi-turn rollover. The estimate here is intentionally
+    // rough (ignores system prompt, which is only prepended on seq_pos==0);
+    // undercounting only means we reset slightly later, and the EXACT
+    // post-build guard below is the hard guarantee against KV overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20; // rough: tokens + ChatML overhead
+    let prompt_est = tokenizer.encode(prompt).len() + 20;
     if m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
@@ -411,6 +414,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     new_tokens.extend_from_slice(&im_start);
     new_tokens.extend_from_slice(&asst_tok);
     new_tokens.extend_from_slice(&nl);
+
+    // EXACT KV-budget guard. `new_tokens.len()` is the precise prefill cost
+    // (including system prompt on seq_pos==0 and all ChatML framing tokens);
+    // plus max_tokens for generation, plus nl.len() reserved for the ChatML
+    // trailer we run through forward AFTER an im_end termination (see the
+    // `for &t in &nl` loops below — they increment seq_pos and call
+    // forward_scratch at the new position). Without reserving those slots,
+    // a request that exactly fills max_seq and terminates naturally on
+    // im_end silently writes past the KV buffer.
+    let trailer = nl.len();
+    if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > max_seq={} — reload model with a larger max_seq"}}"#,
+            id, m.seq_pos, new_tokens.len(), max_tokens, trailer, m.max_seq
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let t0 = Instant::now();
@@ -692,6 +714,19 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     prompt_tokens.extend_from_slice(&im_start);
     prompt_tokens.extend_from_slice(&asst_tok);
     prompt_tokens.extend_from_slice(&nl);
+
+    // EXACT KV-budget guard — same contract as `generate` (reserves nl.len()
+    // for the ChatML trailer written post-generation on im_end termination).
+    let trailer = nl.len();
+    if m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.max_seq {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > max_seq={} — reload model with a larger max_seq"}}"#,
+            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer, m.max_seq
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let t0 = Instant::now();

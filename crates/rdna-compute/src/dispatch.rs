@@ -1136,7 +1136,10 @@ impl Gpu {
     /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         self.ensure_mq_signs()?;
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        // `mq_rotate_x` lives inside the `gemv_mq4g256` module — precompile
+        // writes the .hsaco/.hash sidecar under that module name, so the
+        // runtime cache key here MUST match or we silently JIT on first use.
+        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -1165,7 +1168,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.ensure_mq_signs()?;
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        // Same cache-key contract as `rotate_x_mq` — see comment there.
+        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;

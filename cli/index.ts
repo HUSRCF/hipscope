@@ -715,6 +715,11 @@ async function serve(port: number) {
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
+  // Track the `max_seq` the currently-loaded model was loaded with, so we can
+  // detect when a live `max_tokens` bump (via `hipfire config set max_tokens`
+  // or a client-sent body.max_tokens) needs more headroom than the KV cache
+  // was allocated for — and reload instead of letting the daemon overrun.
+  let currentMaxSeq: number | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -728,6 +733,7 @@ async function serve(port: number) {
       await e.send({ type: "unload" });
       await e.recv();
       current = null;
+      currentMaxSeq = null;
     } catch (err: any) {
       console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
     }
@@ -742,7 +748,8 @@ async function serve(port: number) {
   if (warmPath) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
-      await e.send(buildLoadMessage(warmPath, defaultModel));
+      const warmLoadMsg = buildLoadMessage(warmPath, defaultModel);
+      await e.send(warmLoadMsg);
       const loadResult = await e.recv();
       if (loadResult.type === "error") {
         console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
@@ -752,11 +759,13 @@ async function serve(port: number) {
         }
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
+        currentMaxSeq = warmLoadMsg.params.max_seq;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
       console.error(`[hipfire] pre-warm failed: ${err?.message} — restarting daemon`);
       current = null;
+      currentMaxSeq = null;
       try { await e.stop(); } catch {}
       await e.start();
       await e.send({ type: "ping" }); await e.recv();
@@ -809,6 +818,7 @@ async function serve(port: number) {
         await e.drain();
         e.generating = false;
         current = null; // daemon may have restarted — force model reload
+        currentMaxSeq = null;
       }
 
       try {
@@ -895,16 +905,35 @@ async function serve(port: number) {
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = resolve(rawPath);
 
-        if (current !== path) {
+        // Resolve effective config FIRST so we can size the KV cache against
+        // the actual per-request max_tokens (body.max_tokens or config). The
+        // daemon's KV buffers are sized at load time — if max_tokens grows
+        // beyond currentMaxSeq we MUST reload instead of sending a request
+        // the daemon would either reject or, worse, overrun the buffer with.
+        const effective = resolveModelConfig(body.model);
+        const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
+        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024);
+
+        const needReload = current !== path
+          || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
+
+        if (needReload) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send(buildLoadMessage(path, body.model));
+          const loadMsg = buildLoadMessage(path, body.model);
+          if (requiredMaxSeq > loadMsg.params.max_seq) {
+            console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
+            loadMsg.params.max_seq = requiredMaxSeq;
+          }
+          await e.send(loadMsg);
           const loadResult = await e.recv();
           if (loadResult.type === "error") {
             current = null;
+            currentMaxSeq = null;
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
           current = path;
+          currentMaxSeq = loadMsg.params.max_seq;
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
@@ -913,11 +942,10 @@ async function serve(port: number) {
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
-        const effective = resolveModelConfig(body.model);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
-          max_tokens: body.max_tokens ?? effective.max_tokens,
+          max_tokens: requestMaxTokens,
           repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
@@ -1030,9 +1058,13 @@ async function serve(port: number) {
                     ctrl.close();
                     return;
                   } else if (msg.type === "error") {
+                    // Propagate daemon-side errors (e.g. KV-budget rejection on a
+                    // giant prompt) to the client instead of masking them as a
+                    // normal zero-token "stop" — otherwise clients can't tell a
+                    // real failure from a model that just produced no output.
+                    const errMsg = msg.message || "generation failed";
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                      choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                      error: { message: errMsg, type: "invalid_request_error" }
                     })}\n\n`));
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
@@ -1052,11 +1084,25 @@ async function serve(port: number) {
 
         let content = "";
         let completionTokens = 0;
+        let daemonError: string | null = null;
         e.generating = true;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
+          else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
         }
         e.generating = false;
+
+        // If the daemon rejected the request mid-generate (e.g. KV-budget
+        // overrun on a huge system prompt), surface that as a 400 instead of
+        // returning a 200 with empty content — otherwise a client that sent a
+        // too-large request can't distinguish failure from a zero-token reply.
+        if (daemonError) {
+          safeRelease();
+          return Response.json(
+            { error: { message: daemonError, type: "invalid_request_error" } },
+            { status: 400 }
+          );
+        }
 
         // Strip think tags and special tokens.
         // Greedy match: strip everything from first <think> to last </think>.
