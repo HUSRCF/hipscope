@@ -2840,10 +2840,13 @@ switch (cmd) {
     ];
     const missing: { name: string; hint: string }[] = [];
     const augmentDirs = new Set<string>();
+    const depAbsPath: Record<string, string> = {};
     for (const d of depsNeeded) {
       const p = findDep(d.name, d.dirs);
       if (!p) { missing.push(d); continue; }
-      // Any found tool's directory goes onto PATH so spawned children see it.
+      depAbsPath[d.name] = p;
+      // Any found tool's directory goes onto PATH so spawned children (e.g.
+      // cargo invoking rustc) see the rest of the toolchain.
       const dir = p.substring(0, p.lastIndexOf("/"));
       if (dir) augmentDirs.add(dir);
     }
@@ -2853,14 +2856,9 @@ switch (cmd) {
       console.error("\nAborting update. Install the above and retry `hipfire update`.");
       process.exit(1);
     }
-    // bun is optional at update time (we're already running it), but if the
-    // update script spawns anything that needs bun as a subprocess we want
-    // its dir on PATH too. Finding via inPath probe also covers NVM-style
-    // layouts where bun lives under user home in a non-standard dir.
+    // bun dir too — its subtree helpers need to resolve bun during cargo builds.
     const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
     if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
-    // Prepend (not append) so our detected paths beat any stale system
-    // shadows that may exist in the bare PATH.
     if (augmentDirs.size) {
       const curr = (process.env.PATH || "").split(":").filter(Boolean);
       const fresh = [...augmentDirs].filter(d => !curr.includes(d));
@@ -2869,9 +2867,16 @@ switch (cmd) {
         console.error(`  PATH augmented with: ${fresh.join(", ")}`);
       }
     }
-    const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] });
+    // Bun.spawnSync's command lookup uses the child's env PATH, which inherits
+    // from process.env.PATH — but we've observed cases where a bare-name
+    // lookup fails even after a mid-process PATH mutation. Using the absolute
+    // path we resolved up-front sidesteps the issue entirely. Child processes
+    // (cargo → rustc, rustc → cc, etc.) still need PATH augmented above.
+    const GIT_BIN = depAbsPath["git"]!;
+    const CARGO_BIN = depAbsPath["cargo"]!;
+    const git = (args: string[]) => Bun.spawnSync([GIT_BIN, ...args], { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] });
     const gitOut = (args: string[]) => {
-      const r = Bun.spawnSync(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+      const r = Bun.spawnSync([GIT_BIN, ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
       return { code: r.exitCode ?? 1, out: (r.stdout?.toString() ?? "").trim() };
     };
     const must = (code: number | null | undefined, msg: string) => {
@@ -2937,7 +2942,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (build.exitCode !== 0) {
@@ -2952,7 +2957,7 @@ switch (cmd) {
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
     const buildQ = Bun.spawnSync(
-      ["cargo", "build", "--release", "-p", "hipfire-quantize"],
+      [CARGO_BIN, "build", "--release", "-p", "hipfire-quantize"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (buildQ.exitCode !== 0) {
