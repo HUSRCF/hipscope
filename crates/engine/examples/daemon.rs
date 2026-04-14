@@ -188,7 +188,11 @@ fn main() {
                 let max_seq = msg.get("params").and_then(|p| p.get("max_seq")).and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
                 match load_model(path, max_seq, &mut gpu) {
                     Ok(m) => {
-                        let arch = if m.arch_id == 5 { "qwen3_5" } else { "qwen3" };
+                        let arch = match m.arch_id {
+                            5 => "qwen3_5",
+                            6 => "qwen3_5_moe",
+                            _ => "qwen3",
+                        };
                         let vl = m.vision_config.is_some();
                         let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)
@@ -297,7 +301,11 @@ fn main() {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
                 let has_model = model.is_some();
-                let model_arch = model.as_ref().map(|m| if m.arch_id == 5 { "qwen3_5" } else { "qwen3" }).unwrap_or("none");
+                let model_arch = model.as_ref().map(|m| match m.arch_id {
+                    5 => "qwen3_5",
+                    6 => "qwen3_5_moe",
+                    _ => "qwen3",
+                }).unwrap_or("none");
                 // Count pre-compiled kernels
                 let kernel_dir = std::env::current_exe().ok()
                     .and_then(|e| e.parent().map(|p| p.join("kernels").join("compiled").join(&gpu.arch)))
@@ -361,7 +369,7 @@ fn main() {
                 // completion (kernel launches are async by default).
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = if m.arch_id == 5 {
+                let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
                     let config = m.q35_config.as_ref().unwrap();
                     let weights = m.q35_weights.as_ref().unwrap();
                     let scratch = m.q35_scratch.as_ref().unwrap();
@@ -441,8 +449,8 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
-    if hfq.arch_id == 5 {
-        // Qwen3.5 DeltaNet
+    if hfq.arch_id == 5 || hfq.arch_id == 6 {
+        // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B)
         let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
 
         // Detect VL model: check if vision config AND vision tensors are present
@@ -492,7 +500,7 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
         let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
-            arch_id: 5,
+            arch_id: hfq.arch_id,
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
@@ -610,8 +618,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
-    if m.arch_id == 5 {
-        // Qwen3.5 path — multi-turn: prefill only the NEW turn tokens,
+    if m.arch_id == 5 || m.arch_id == 6 {
+        // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();

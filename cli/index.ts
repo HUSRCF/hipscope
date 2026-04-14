@@ -216,6 +216,10 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:4b":       { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq4",     size_gb: 2.6,  min_vram_gb: 4,  desc: "169 / 1900 tok/s" },
   "qwen3.5:9b":       { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",     size_gb: 5.3,  min_vram_gb: 6,  desc: "125 / 1720 tok/s" },
   "qwen3.5:27b":      { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "45 / 489 tok/s, 16GB+" },
+  // Qwen3.5-MoE (A3B): 35B total / 3B activated (256 experts, top-8). The
+  // hipfire MoE decode path runs ~162 tok/s on RX 7900 XTX with hipGraph.
+  // No HF repo yet — the file is local-only until upload lands.
+  "qwen3.5:35b-a3b":  { repo: hfRepo("qwen3.5","35b-a3b"), file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 162 tok/s" },
 
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
