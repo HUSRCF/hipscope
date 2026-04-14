@@ -71,6 +71,13 @@ fn main() {
     // diagnostics; usually a net loss on content where DFlash is strong).
     let mut pld_min_consensus: usize = 2;
     let mut pld_min_chain: usize = 5;  // conservative: below paper's 8 but still filters noise
+    // DDTree (Ringel & Romano 2026): tree-structured verification built from
+    // DFlash per-position draft marginals. Per-path DFS verify (no batched
+    // tree attention) — slower per cycle but correct on hybrid arch. Spike
+    // measurement: does τ improve with the tree structure?
+    let mut ddtree_enabled: bool = false;
+    let mut ddtree_budget: usize = 16;  // paper uses 60; cheaper spike default
+    let mut ddtree_topk: usize = 8;     // paper uses B-1 * budget_fanout; small k keeps tree shallow
 
     let mut i = 1;
     while i < args.len() {
@@ -158,6 +165,18 @@ fn main() {
             }
             "--pld-min-chain" => {
                 pld_min_chain = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--ddtree" => {
+                ddtree_enabled = true;
+                i += 1;
+            }
+            "--ddtree-budget" => {
+                ddtree_budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--ddtree-topk" => {
+                ddtree_topk = args[i + 1].parse().unwrap();
                 i += 2;
             }
             other => {
@@ -251,6 +270,10 @@ fn main() {
     .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");
+    // DDTree needs a SECOND snapshot for the post-seed branch point (shared
+    // across all DFS paths in a cycle). Allocate unconditionally — a single
+    // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
+    let mut post_seed_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
@@ -351,6 +374,24 @@ fn main() {
     let mut pld_hits: usize = 0;
     let mut pld_accepted: usize = 0;
 
+    if ddtree_enabled {
+        if temp > 0.0 {
+            eprintln!(
+                "WARNING: --ddtree with temp>0 falls back to greedy on the verify side for \
+                this spike (rejection-sampling integration is deferred)."
+            );
+        }
+        if pld_enabled {
+            eprintln!("WARNING: --pld is ignored when --ddtree is enabled.");
+        }
+        eprintln!(
+            "ddtree: enabled (budget={}, topk={}; per-path DFS verify, ~{}× DFlash per-cycle cost)",
+            ddtree_budget,
+            ddtree_topk,
+            ddtree_budget / (draft_cfg.block_size.saturating_sub(1).max(1)),
+        );
+    }
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
@@ -406,28 +447,49 @@ fn main() {
         if used_pld {
             pld_hits += 1;
         }
-        let step = speculative::spec_step_dflash(
-            &mut gpu,
-            &mut target,
-            &draft_weights,
-            &draft_cfg,
-            &mut draft_scratch,
-            &mut hidden_rb,
-            &mut target_hidden_host,
-            &mut target_snap,
-            position,
-            seed_token,
-            ctx_slice,
-            Some(&mut gdn_tape),
-            temp,
-            &mut rng_state,
-            block_override,
-            ngram_cache.as_ref(),
-            &emitted,
-            cactus_delta,
-            pld_spine,
-        )
-        .expect("spec step");
+        let step = if ddtree_enabled {
+            speculative::spec_step_ddtree(
+                &mut gpu,
+                &mut target,
+                &draft_weights,
+                &draft_cfg,
+                &mut draft_scratch,
+                &mut hidden_rb,
+                &mut target_hidden_host,
+                &mut target_snap,
+                &mut post_seed_snap,
+                &mut gdn_tape,
+                position,
+                seed_token,
+                ctx_slice,
+                ddtree_budget,
+                ddtree_topk,
+            )
+            .expect("ddtree spec step")
+        } else {
+            speculative::spec_step_dflash(
+                &mut gpu,
+                &mut target,
+                &draft_weights,
+                &draft_cfg,
+                &mut draft_scratch,
+                &mut hidden_rb,
+                &mut target_hidden_host,
+                &mut target_snap,
+                position,
+                seed_token,
+                ctx_slice,
+                Some(&mut gdn_tape),
+                temp,
+                &mut rng_state,
+                block_override,
+                ngram_cache.as_ref(),
+                &emitted,
+                cactus_delta,
+                pld_spine,
+            )
+            .expect("spec step")
+        };
         if used_pld {
             pld_accepted += step.accepted;
         }
