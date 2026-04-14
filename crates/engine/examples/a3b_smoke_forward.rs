@@ -49,23 +49,52 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state alloc");
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");
 
-    // Pick a benign starting token — use the BOS-like `<|im_start|>` id if we
-    // can, otherwise fall back to token 0. The exact token doesn't matter for
-    // a finite-logits smoke test; we just need SOMETHING.
+    // Prompt mode selection:
+    //   raw (default for back-compat):  tokenize "Hello" and decode from pos=0.
+    //     Useful for finite-logits smoke tests, but the model has no chat
+    //     context, so the output will drift into random trained patterns
+    //     (e.g. Wikipedia prose). Don't read too much into coherence here.
+    //   chat:  wrap the prompt in the Qwen3.5 chat template
+    //     (<|im_start|>user ... <|im_end|> <|im_start|>assistant ...) and
+    //     prefill the full prompt before greedy decoding. Use this to
+    //     sanity-check assistant-style coherence.
+    let prompt_mode = std::env::var("HIPFIRE_SMOKE_MODE").unwrap_or_else(|_| "raw".to_string());
+    let user_prompt = std::env::var("HIPFIRE_SMOKE_PROMPT")
+        .unwrap_or_else(|_| "Hello".to_string());
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
-    let start_tok = {
-        let enc = tokenizer.encode("Hello");
-        enc.first().copied().unwrap_or(0)
-    };
-    eprintln!("Starting token: {start_tok}");
 
-    eprintln!("\n=== forward_scratch pos=0 (cold) ===");
+    let prompt_tokens: Vec<u32> = if prompt_mode == "chat" {
+        let im_start = tokenizer.encode("<|im_start|>");
+        let im_end = tokenizer.encode("<|im_end|>");
+        let user = tokenizer.encode("user");
+        let asst = tokenizer.encode("assistant");
+        let nl = tokenizer.encode("\n");
+        let body = tokenizer.encode(&user_prompt);
+        let mut chat = Vec::new();
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&user);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&body);
+        chat.extend_from_slice(&im_end);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&asst);
+        chat.extend_from_slice(&nl);
+        chat
+    } else {
+        tokenizer.encode(&user_prompt)
+    };
+    eprintln!("Prompt ({prompt_mode} mode): {} tokens", prompt_tokens.len());
+
+    eprintln!("\n=== forward_scratch prefill ===");
     let t0 = std::time::Instant::now();
-    qwen35::forward_scratch(
-        &mut gpu, &weights, &config, start_tok, 0,
-        &mut kv_cache, &mut dn_state, &scratch,
-    ).expect("forward_scratch failed");
+    for (pos, &tok) in prompt_tokens.iter().enumerate() {
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, tok, pos,
+            &mut kv_cache, &mut dn_state, &scratch,
+        ).expect("forward_scratch failed");
+    }
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
     let elapsed = t0.elapsed();
 
@@ -101,11 +130,12 @@ fn main() {
     if n_steps > 1 {
         eprintln!("\n=== decoding {} more tokens greedily ===", n_steps - 1);
         let mut next = argmax;
+        let base_pos = prompt_tokens.len();
         let mut timings = Vec::with_capacity(n_steps.saturating_sub(1));
         for step in 1..n_steps {
             let t0 = std::time::Instant::now();
             qwen35::forward_scratch(
-                &mut gpu, &weights, &config, next, step,
+                &mut gpu, &weights, &config, next, base_pos + step - 1,
                 &mut kv_cache, &mut dn_state, &scratch,
             ).expect("forward_scratch failed");
             let l = gpu.download_f32(&scratch.logits).expect("download");
