@@ -11,5 +11,7 @@ pub mod qwen35_vl;
 pub mod speculative;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+#[cfg(feature = "deltanet")]
+pub mod ddtree;
 pub mod image;
 pub mod tokenizer;
