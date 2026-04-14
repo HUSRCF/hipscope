@@ -91,6 +91,13 @@ pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/g
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 
+/// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
+/// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
+/// from a 1-element device buffer. Used by the MoE FFN accumulator — the
+/// routed-expert variant scales by a CPU top-K weight, and the shared-expert
+/// variant scales by an on-device sigmoid gate (no D2H sync).
+pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used

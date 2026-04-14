@@ -2527,6 +2527,109 @@ impl Gpu {
         result
     }
 
+    /// HFQ4-G256 GEMV with fused SCALED residual add, CPU-scalar variant:
+    ///   y[row] += scale * (A[row] · x)
+    /// where `scale` is host-supplied by kernarg. Replaces the three-kernel
+    /// tail of the MoE routed-expert epilogue (gemv → scale → add_inplace)
+    /// with a single launch. Bit-exact with gemv_hfq4g256_residual followed
+    /// by scaled_add_inplace_cpu_scalar when the inputs are identical —
+    /// same accumulator layout, same pairwise combine.
+    pub fn gemv_hfq4g256_residual_scaled_cpu(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        scale: f32,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_hfq4g256_residual_scaled",
+            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            "gemv_hfq4g256_residual_scaled_cpu",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let s_val = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &s_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g256_residual_scaled_cpu", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_residual_scaled_cpu", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_f32(s_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4-G256 GEMV with fused SCALED residual add, GPU-scalar variant:
+    ///   y[row] += c_buf[0] * (A[row] · x)
+    /// Reads the scale from a 1-element device buffer. Used by the MoE
+    /// shared-expert epilogue where `c_buf` holds sigmoid(gate · x) computed
+    /// entirely on-device, avoiding a D2H sync.
+    pub fn gemv_hfq4g256_residual_scaled_gpu(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        c_buf: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_hfq4g256_residual_scaled",
+            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            "gemv_hfq4g256_residual_scaled_gpu",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let c_ptr = c_buf.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g256_residual_scaled_gpu", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_residual_scaled_gpu", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_ptr(c_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///

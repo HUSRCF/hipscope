@@ -1036,17 +1036,34 @@ fn moe_ffn_decode(
     gpu.sigmoid_f32(&scalar_buf)?;
 
     // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
+    // Phase 2a-ii: fuse silu_mul + rotate + down-GEMV + scaled-residual-add
+    // into two launches (fused_silu_mul_rotate_mq + gemv_residual_scaled_gpu)
+    // when down weights are MQ4G256. Eliminates the separate silu_mul,
+    // explicit scale_f32, and add_inplace_f32 launches — one kernel does
+    // the full `y += sigmoid(gate_scalar) * W_down · silu_mul(gate, up)`.
     let shared_gate = slice_f32_view(&gate_buf, 0, smi);
     let shared_up   = slice_f32_view(&up_buf,   0, smi);
-    let shared_hid  = slice_f32_view(&ffn_hidden, 0, smi);
     weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
     weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
-    gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
-    weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, &ffn_out)?;
-    // Fused: x_residual += sigmoid(gate_scalar) * ffn_out. Replaces the
-    // old (scale_f32 + add_inplace_f32) pair and uses the GPU-side
-    // scalar from scalar_buf directly.
-    gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, &ffn_out, &scalar_buf)?;
+    if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
+        gpu.ensure_mq_signs()?;
+        let x_rot_alias = GpuTensor {
+            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            dtype: DType::F32,
+        };
+        gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi)?;
+        gpu.gemv_hfq4g256_residual_scaled_gpu(
+            &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, &scalar_buf,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k,
+        )?;
+    } else {
+        // Non-MQ fallback: pre-2a-ii path.
+        let shared_hid = slice_f32_view(&ffn_hidden, 0, smi);
+        gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
+        weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, &ffn_out)?;
+        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, &ffn_out, &scalar_buf)?;
+    }
 
     // ── 4. Top-K routed experts: fused gate_up → split → silu_mul → down ──
     // The routed expert's `gate_up` is [2*mi, hidden] fused; layout is
@@ -1054,16 +1071,33 @@ fn moe_ffn_decode(
     // torch.cat([gate_proj, up_proj], dim=0)).
     let gate_view = slice_f32_view(&gate_up_buf, 0,  mi);
     let up_view   = slice_f32_view(&gate_up_buf, mi, mi);
-    let hid_view  = slice_f32_view(&ffn_hidden,  0,  mi);
+    let routed_mq4 = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    if routed_mq4 {
+        gpu.ensure_mq_signs()?;
+    }
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let expert = &ffn.experts[expert_idx];
         weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
-        gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
-        weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
-        // Fused: x_residual += weight * ffn_out. Replaces the old
-        // (scale_f32 + add_inplace_f32) pair — one launch per expert
-        // instead of two (saves 9 launches per MoE layer).
-        gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
+        if routed_mq4 {
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
+            gpu.gemv_hfq4g256_residual_scaled_cpu(
+                &expert.down.buf, &x_rot_alias, x_residual, weight,
+                expert.down.m, expert.down.k,
+            )?;
+        } else {
+            // Non-MQ fallback: pre-2a-ii path.
+            let hid_view = slice_f32_view(&ffn_hidden, 0, mi);
+            gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
+            weight_gemv(gpu, &expert.down, &hid_view, &ffn_out)?;
+            gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, &ffn_out, weight)?;
+        }
     }
 
     // Free scratch
