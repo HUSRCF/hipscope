@@ -2638,23 +2638,43 @@ switch (cmd) {
       git(["reset", "--hard", "origin/master"]).exitCode,
       "git reset --hard origin/master failed — repo may be in an inconsistent state",
     );
+    // Sync the CLI FIRST, before the Rust build. The CLI is pure Bun/TS — it
+    // doesn't depend on the daemon compiling. If the build fails later (ROCm
+    // version mismatch, missing header, WSL quirks), the registry + bug fixes
+    // in the CLI are already live so `hipfire pull`, `hipfire list`, and
+    // config commands keep working. Previously the copy happened after the
+    // cargo build, so a build failure left the CLI frozen at its install-time
+    // version — users saw "unknown model" for entries added post-install.
+    const { copyFileSync } = await import("fs");
+    const exe = process.platform === "win32" ? ".exe" : "";
+    const binDir = join(HIPFIRE_DIR, "bin");
+    copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
+    console.error("  CLI updated ✓");
     // Rebuild
-    console.error("Rebuilding...");
+    console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
       ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
-    if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
+    if (build.exitCode !== 0) {
+      console.error("");
+      console.error("  Daemon build failed. CLI is updated (so `hipfire pull`,");
+      console.error("  `hipfire list`, `hipfire config` still work), but the");
+      console.error("  daemon binary was NOT rebuilt.");
+      console.error("");
+      console.error("  To diagnose:  hipfire diag");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p engine --example daemon");
+      process.exit(1);
+    }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
     const buildQ = Bun.spawnSync(
       ["cargo", "build", "--release", "-p", "hipfire-quantize"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
-    if (buildQ.exitCode !== 0) { console.error("Build (hipfire-quantize) failed."); process.exit(1); }
+    if (buildQ.exitCode !== 0) {
+      console.error("  hipfire-quantize build failed (quantize subcommand won't work). Continuing.");
+    }
     // Recopy binaries
-    const binDir = join(HIPFIRE_DIR, "bin");
-    const { copyFileSync } = await import("fs");
-    const exe = process.platform === "win32" ? ".exe" : "";
     // Example binaries live under target/release/examples/
     for (const bin of ["daemon", "infer", "run"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
@@ -2667,8 +2687,6 @@ switch (cmd) {
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
-    // Recopy CLI
-    copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
     // Detect GPU arch from sysfs (cross-platform, no external commands)
     let archOut = "";
     try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/1/properties").text(); } catch {}

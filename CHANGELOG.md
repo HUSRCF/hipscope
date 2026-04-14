@@ -1,5 +1,17 @@
 # Changelog
 
+## Roadmap
+
+### v0.1.7 (planned)
+
+- **TriAttention KV-cache pruning** — opt-in long-context memory reduction via
+  pre-RoPE Q/K concentration scoring. Composes with asym3 for ≤12 GB cards at
+  32K+ context. Tracking: [#17](https://github.com/Kaden-Schutt/hipfire/issues/17).
+  Based on Mao et al. 2026 ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921))
+  with reference HIP port by [@domvox](https://github.com/domvox/triattention-ggml).
+  Measured gains on AMD are 1.3-2× KV memory at +0.3-1.8% PPL — not the paper's
+  10.7× headline. Requires relaxing byte-exact contract behind an opt-in flag.
+
 ## v0.1.5 "redline" (2026-04-13)
 
 First full (non-alpha) release. Focus: **RotorQuant asymmetric KV cache** for
