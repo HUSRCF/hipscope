@@ -42,7 +42,8 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Loaded {} layers.", weights.layers.len());
 
-    let kv_seq = 256usize;
+    let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(256usize);
     // Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
     // production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit
     // KV path and always-on flash; f32 falls back to plain attention_f32.
@@ -113,6 +114,10 @@ fn main() {
     }
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
     let elapsed = t0.elapsed();
+    let n_prompt = prompt_tokens.len();
+    let pf_us = elapsed.as_micros() as f64;
+    eprintln!("prefill {} toks in {:.2} ms ({:.1} tok/s)",
+        n_prompt, pf_us / 1000.0, (n_prompt as f64) * 1_000_000.0 / pf_us);
 
     // ─── Correctness gates ──────────────────────────────────────────────
     let mut n_nan = 0usize;
