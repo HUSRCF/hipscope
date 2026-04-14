@@ -201,6 +201,10 @@ const HF_BASE = "https://huggingface.co";
 function hfRepo(family: string, size: string) { return `schuttdev/hipfire-${family}-${size}`; }
 
 interface ModelEntry {
+  /// Empty string = local-only. `pull()` short-circuits with a clear message
+  /// instead of attempting a 404'ing fetch against a HF repo that doesn't
+  /// exist yet (used while a model is in pre-release / quantize-locally
+  /// state and the upload hasn't shipped).
   repo: string;
   file: string;
   size_gb: number;
@@ -219,7 +223,11 @@ const REGISTRY: Record<string, ModelEntry> = {
   // Qwen3.5-MoE (A3B): 35B total / 3B activated (256 experts, top-8). The
   // hipfire MoE decode path runs ~162 tok/s on RX 7900 XTX with hipGraph.
   // No HF repo yet — the file is local-only until upload lands.
-  "qwen3.5:35b-a3b":  { repo: hfRepo("qwen3.5","35b-a3b"), file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 162 tok/s" },
+  // Local-only until upload lands — `repo: ""` makes `hipfire pull` exit
+  // with a clear message rather than 404'ing against a non-existent HF repo.
+  // `hipfire run` still works once the file is in MODELS_DIR (auto-pull
+  // sees the local copy and skips the download).
+  "qwen3.5:35b-a3b":  { repo: "", file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
 
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
@@ -601,6 +609,15 @@ async function pull(tag: string): Promise<string> {
     const sz = (statSync(dest).size / 1e9).toFixed(1);
     console.error(`Already downloaded: ${entry.file} (${sz}GB)`);
     return dest;
+  }
+
+  // Local-only entries have no HF repo to download from — fail with a
+  // clear message rather than fetching a 404.
+  if (!entry.repo) {
+    console.error(`Cannot pull ${resolved}: no remote repo registered yet.`);
+    console.error(`This model is local-only — quantize it from source and place at:`);
+    console.error(`  ${dest}`);
+    process.exit(1);
   }
 
   // Hint for 27B MQ4: suggest MQ6 for complex reasoning / coding when available
