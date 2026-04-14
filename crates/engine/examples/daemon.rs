@@ -599,9 +599,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let dn = m.dn_state.as_mut().unwrap();
 
         // Prefill this turn's tokens via the batched prefill entry point.
-        // Currently delegates to per-token forward_scratch internally; future
-        // commits replace the body with actually-batched kernel paths without
-        // needing any more daemon changes.
+        // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
+        // fast path; other archs fall back to dp2 / FP16-packed / scalar
+        // variants. The one sequential hotspot inside is the gated_delta_net
+        // Q8 state update (N sequential per-token calls per LA layer, byte-
+        // exact with decode to keep the quality gate green).
         //
         // Note: forward_prefill_batch launches HIP kernels asynchronously.
         // The t_prefill mark below lives AFTER the first sample_top_p, whose

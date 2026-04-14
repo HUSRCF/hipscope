@@ -1381,7 +1381,15 @@ pub fn forward_prefill_batch(
     const MIN_BATCH: usize = 2;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
-    const MAX_BATCH: usize = 64;
+    //
+    // Tuning note: each extra chunk pays full dispatch-overhead for the LA
+    // preamble (rmsnorm, rotate, 4-way fused GEMM) and FFN (gate_up + down).
+    // 256 costs ~80 MB of scratch on 9B vs 20 MB at 64 — trivial on modern
+    // cards — and drops chunk count for pp2048 from 32 → 8. The inner
+    // gated_delta_net_q8_batch_seq loop is still sequential per token, so
+    // the per-chunk DeltaNet cost is linear in N either way; raising the
+    // batch just amortizes the NON-DeltaNet kernels more.
+    const MAX_BATCH: usize = 256;
 
     let n = tokens.len();
     if n == 0 {

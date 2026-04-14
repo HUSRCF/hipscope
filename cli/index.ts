@@ -2910,12 +2910,26 @@ switch (cmd) {
     if (gpuArch !== "unknown") {
       const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
       const kernelDst = join(binDir, "kernels/compiled", gpuArch);
+      // Clear the persistent install cache — stale blobs here outlive a
+      // version bump because the .hash sidecars only detect source drift
+      // for the kernels that still exist, not orphans. Empirically, one
+      // renamed-or-cache-key-changed kernel can linger as a stale blob
+      // and get loaded by the new daemon at a fresh lookup key's
+      // location, producing subtly wrong math (non-failing hash check
+      // because the OLD blob's hash still matches the OLD source we no
+      // longer ship). `/tmp/hipfire_kernels` dies at reboot; this one
+      // doesn't, so it's the one that actually needs the cleanup.
+      const { rmSync } = await import("fs");
+      if (existsSync(kernelDst)) {
+        try { rmSync(kernelDst, { recursive: true, force: true }); } catch {}
+      }
+      try { rmSync("/tmp/hipfire_kernels", { recursive: true, force: true }); } catch {}
       mkdirSync(kernelDst, { recursive: true });
       if (existsSync(kernelSrc)) {
         for (const f of readdirSync(kernelSrc)) {
           if (f.endsWith(".hsaco")) copyFileSync(join(kernelSrc, f), join(kernelDst, f));
         }
-        console.error(`  Updated ${gpuArch} kernels ✓`);
+        console.error(`  Updated ${gpuArch} kernels ✓ (cache cleared)`);
       }
     }
     // Rename legacy .hfq model files to .hf4/.hf6
