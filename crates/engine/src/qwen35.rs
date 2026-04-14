@@ -198,6 +198,11 @@ pub struct MoeFfnWeights {
     pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B)
     pub shared_expert: SharedExpertWeights,
     pub shared_expert_gate: WeightTensor,     // [1, hidden] — row-vector projecting to scalar
+    /// Device-side array of `unsigned long long` pointers, one per
+    /// expert's `gate_up.buf`. Indexed at runtime by the GPU top-K
+    /// kernel's output so the indexed MoE GEMV can stay capture-safe.
+    pub expert_gate_up_ptrs: GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
+    pub expert_down_ptrs:    GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -319,6 +324,8 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
+    let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
+    let _ = gpu.free_tensor(ffn.expert_down_ptrs);
     for e in ffn.experts {
         let _ = gpu.free_tensor(e.gate_up.buf);
         let _ = gpu.free_tensor(e.down.buf);
@@ -907,7 +914,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
-fn load_moe_ffn(hfq: &HfqFile, gpu: &Gpu, p: &str, config: &Qwen35Config) -> HipResult<MoeFfnWeights> {
+fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) -> HipResult<MoeFfnWeights> {
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -941,7 +948,28 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &Gpu, p: &str, config: &Qwen35Config) -> Hip
         experts.push(ExpertWeights { gate_up, down });
     }
 
-    Ok(MoeFfnWeights { router, experts, shared_expert, shared_expert_gate })
+    // Build the device-side pointer tables consumed by the indexed MoE
+    // GEMV kernels. Each slot is an `unsigned long long` (the device
+    // address of an expert's `gate_up.buf` / `down.buf`). Stored as an
+    // F32 tensor of length 2 * num_experts because each pointer occupies
+    // 8 bytes = 2 F32 slots; the kernel reads them via a u64 cast.
+    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+    for e in &experts {
+        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
+        dn_ptrs.push(e.down.buf.buf.as_ptr()    as u64);
+    }
+    let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
+    gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &dn_bytes)?;
+
+    Ok(MoeFfnWeights {
+        router, experts, shared_expert, shared_expert_gate,
+        expert_gate_up_ptrs, expert_down_ptrs,
+    })
 }
 
 // ─── MoE FFN (decode, batch=1) ──────────────────────────────────────────
@@ -979,7 +1007,7 @@ fn slice_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> Gpu
 ///   y_shared      = scalar * shared_expert(x_norm)         // [hidden]
 ///   y_moe         = sum_{k} w[k] * expert[idx[k]](x_norm)  // [hidden]
 ///   x_residual   += y_shared + y_moe
-/// Non-owning borrow of the 11 scratch buffers `moe_ffn_decode_impl` needs.
+/// Non-owning borrow of the scratch buffers `moe_ffn_decode_impl` needs.
 /// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
 /// hipGraph-capturable) or from tensors they own locally (heap path).
 struct MoeScratchRef<'a> {
@@ -994,6 +1022,8 @@ struct MoeScratchRef<'a> {
     gate_batch:    &'a GpuTensor,
     up_batch:      &'a GpuTensor,
     rot_batch:     &'a GpuTensor,
+    topk_indices:  &'a GpuTensor,
+    topk_weights:  &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -1012,6 +1042,8 @@ impl<'a> MoeScratchRef<'a> {
             gate_batch:    s.moe_gate_batch.as_ref().expect("MoE scratch"),
             up_batch:      s.moe_up_batch.as_ref().expect("MoE scratch"),
             rot_batch:     s.moe_rot_batch.as_ref().expect("MoE scratch"),
+            topk_indices:  s.moe_topk_indices.as_ref().expect("MoE scratch"),
+            topk_weights:  s.moe_topk_weights.as_ref().expect("MoE scratch"),
         }
     }
 }
@@ -1045,6 +1077,8 @@ fn moe_ffn_decode(
     let gate_batch    = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let up_batch      = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let rot_batch     = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let topk_indices  = gpu.alloc_tensor(&[k], DType::F32)?;
+    let topk_weights  = gpu.alloc_tensor(&[k], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
@@ -1058,11 +1092,14 @@ fn moe_ffn_decode(
         gate_batch:    &gate_batch,
         up_batch:      &up_batch,
         rot_batch:     &rot_batch,
+        topk_indices:  &topk_indices,
+        topk_weights:  &topk_weights,
     };
     let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs);
 
     for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
-              up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch] {
+              up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
+              topk_indices, topk_weights] {
         gpu.free_tensor(t)?;
     }
     result
@@ -1097,8 +1134,8 @@ fn moe_ffn_decode_impl(
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
-    let _ = hidden; // may be unused in fallback paths
-    let _ = k;
+    let n_exp = config.num_experts;
+    let _ = hidden;
 
     let router_logits = s.router_logits;
     let scalar_buf    = s.scalar_buf;
@@ -1109,12 +1146,8 @@ fn moe_ffn_decode_impl(
     let ffn_out       = s.ffn_out;
 
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
-    // buffer across every gate-side GEMV (router, shared_expert_gate,
-    // shared.gate, shared.up, and all top-K experts' gate_up). Each
-    // weight_gemv on MQ4G256 otherwise does its own rotate_x_mq launch
-    // — 12+ redundant rotations per layer. Only MQ4 GEMVs benefit, so
-    // we detect the all-MQ4 fast path and fall back to weight_gemv
-    // (which rotates internally) for any mixed-dtype layer.
+    // buffer across every gate-side GEMV. Only MQ4 GEMVs benefit; mixed
+    // configs fall back to weight_gemv which rotates internally.
     let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
@@ -1128,42 +1161,60 @@ fn moe_ffn_decode_impl(
         None
     };
 
-    // ── 1. Router logits → softmax → CPU top-K + (optional) renormalize ──
+    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
+    // device and the indexed MoE kernels consume topk_indices /
+    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
+    let routed_mq4 = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    let routed_gate_up_mq4 = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+
+    // ── 1. Router GEMV ──
     if let Some(xr) = x_rot_local {
         gpu.gemv_mq4g256_prerotated(&ffn.router.buf, xr, router_logits, ffn.router.m, ffn.router.k)?;
     } else {
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
     }
-    gpu.softmax_f32(router_logits)?;
-    let probs = gpu.download_f32(router_logits)?;
-    let n_exp = config.num_experts;
-    let k = config.num_experts_per_tok;
 
-    // Partial sort: select top-K indices by probability. `select_nth_unstable_by`
-    // places the k-1-th element in its sorted position with O(n) average work.
-    let mut indices: Vec<usize> = (0..n_exp).collect();
-    indices.select_nth_unstable_by(k - 1, |&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-    // Sort top-K by probability (descending) for deterministic accumulation order.
-    topk_indices.sort_by(|&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-    if config.norm_topk_prob {
-        let sum: f32 = topk_weights.iter().sum();
-        if sum > 0.0 {
-            for w in topk_weights.iter_mut() {
-                *w /= sum;
+    // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
+    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) = if use_gpu_topk {
+        // GPU path: softmax + top-K + renorm in one launch, results land
+        // in s.topk_indices [k] (i32) and s.topk_weights [k] (f32) on
+        // device. Indexed MoE kernels consume them directly — no D2H.
+        gpu.moe_softmax_topk_renorm_k8(
+            router_logits, s.topk_indices, s.topk_weights,
+            n_exp, config.norm_topk_prob,
+        )?;
+        (None, None)
+    } else {
+        // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
+        gpu.softmax_f32(router_logits)?;
+        let probs = gpu.download_f32(router_logits)?;
+        let mut indices: Vec<usize> = (0..n_exp).collect();
+        indices.select_nth_unstable_by(k - 1, |&a, &b| {
+            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+        topk_indices.sort_by(|&a, &b| {
+            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+        if config.norm_topk_prob {
+            let sum: f32 = topk_weights.iter().sum();
+            if sum > 0.0 {
+                for w in topk_weights.iter_mut() { *w /= sum; }
             }
         }
-    }
+        (Some(topk_indices), Some(topk_weights))
+    };
 
-    // ── 2. Shared-expert scalar gate: sigmoid(W · x_norm) — stays on GPU ──
+    // ── 2b. Shared-expert scalar gate: sigmoid(W · x_norm) — stays on GPU ──
     // Phase 2a: compute the sigmoid on-device and pass the result by
     // device pointer into the fused scaled-add below. Eliminates one
-    // D2H sync per layer (was 80 syncs per token across 40 layers).
+    // D2H sync per layer.
     if let Some(xr) = x_rot_local {
         gpu.gemv_mq4g256_prerotated(&ffn.shared_expert_gate.buf, xr, scalar_buf,
             ffn.shared_expert_gate.m, ffn.shared_expert_gate.k)?;
@@ -1210,85 +1261,94 @@ fn moe_ffn_decode_impl(
     }
 
     // ── 4. Top-K routed experts ──
-    // Phase 2c step 1-3: when top_k==8 and all selected experts' gate_up are
-    // MQ4G256 (true for A3B), the routed-expert compute collapses to 3
-    // kernel launches (fused MoE gate_up → batched silu_mul_rotate → fused
-    // MoE down with atomicAdd residual).
-    let routed_mq4 = ffn.experts.first()
-        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    let routed_gate_up_mq4 = ffn.experts.first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
     if routed_mq4 {
         gpu.ensure_mq_signs()?;
     }
 
-    let use_fused_gate_up = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
-    if use_fused_gate_up {
-        let (gb, ub, rb, xr) = (s.gate_batch, s.up_batch, s.rot_batch, x_rot_local.unwrap());
-        // Phase 2c all-in-one fast path (k=8, all MQ4G256):
-        //   1. Fused gate_up GEMV across 8 experts → gate_batch + up_batch
-        //   2. Batched silu_mul+rotate across 8 experts → rot_batch
-        //   3. Fused down GEMV + scaled residual across 8 experts →
-        //      x_residual (atomicAdd accumulator)
-        // Total: 3 launches for the routed-expert compute — down from 24
-        // in Phase 2a-iii (3 per expert × 8 experts).
-        let e0 = &ffn.experts[topk_indices[0]];
-        let e1 = &ffn.experts[topk_indices[1]];
-        let e2 = &ffn.experts[topk_indices[2]];
-        let e3 = &ffn.experts[topk_indices[3]];
-        let e4 = &ffn.experts[topk_indices[4]];
-        let e5 = &ffn.experts[topk_indices[5]];
-        let e6 = &ffn.experts[topk_indices[6]];
-        let e7 = &ffn.experts[topk_indices[7]];
-        gpu.gemv_hfq4g256_moe_gate_up_k8(
-            &e0.gate_up.buf, &e1.gate_up.buf, &e2.gate_up.buf, &e3.gate_up.buf,
-            &e4.gate_up.buf, &e5.gate_up.buf, &e6.gate_up.buf, &e7.gate_up.buf,
-            xr, gb, ub,
-            2 * mi, e0.gate_up.k,
+    if use_gpu_topk {
+        // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
+        // IDs and weights from device buffers. 3 launches for routed
+        // compute, zero D2H sync — hipGraph-capturable.
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        let down_m = ffn.experts[0].down.m;
+        let down_k = ffn.experts[0].down.k;
+        let gate_up_k = ffn.experts[0].gate_up.k;
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs, s.topk_indices,
+            xr, s.gate_batch, s.up_batch,
+            2 * mi, gate_up_k,
         )?;
-        gpu.fused_silu_mul_rotate_mq_batched(gb, ub, rb, mi, k)?;
-        let scales = [
-            topk_weights[0], topk_weights[1], topk_weights[2], topk_weights[3],
-            topk_weights[4], topk_weights[5], topk_weights[6], topk_weights[7],
-        ];
-        gpu.gemv_hfq4g256_moe_down_residual_scaled_k8(
-            &e0.down.buf, &e1.down.buf, &e2.down.buf, &e3.down.buf,
-            &e4.down.buf, &e5.down.buf, &e6.down.buf, &e7.down.buf,
-            rb, x_residual, scales,
-            e0.down.m, e0.down.k,
+        gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+        gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
+            &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
+            s.rot_batch, x_residual,
+            down_m, down_k,
         )?;
     } else {
-        // Non-fused fallback — per-expert gate_up → silu_mul_rotate →
-        // scaled_residual. Preserves the Phase 2a-iii path for layers
-        // that aren't all-MQ4 or have k != 8.
-        for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
-            let expert = &ffn.experts[expert_idx];
-            if let Some(xr) = x_rot_local {
-                gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, gate_up_buf,
-                    expert.gate_up.m, expert.gate_up.k)?;
-            } else {
-                weight_gemv(gpu, &expert.gate_up, x_norm, gate_up_buf)?;
-            }
-            let gate_view = slice_f32_view(gate_up_buf, 0,  mi);
-            let up_view   = slice_f32_view(gate_up_buf, mi, mi);
-            if routed_mq4 {
-                let x_rot_alias = GpuTensor {
-                    buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                    shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                    dtype: DType::F32,
-                };
-                gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
-                gpu.gemv_hfq4g256_residual_scaled_cpu(
-                    &expert.down.buf, &x_rot_alias, x_residual, weight,
-                    expert.down.m, expert.down.k,
-                )?;
-            } else {
-                let hid_view = slice_f32_view(ffn_hidden, 0, mi);
-                gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
-                weight_gemv(gpu, &expert.down, &hid_view, ffn_out)?;
-                gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, ffn_out, weight)?;
+        // CPU-top-K fallback path. Two sub-paths from here:
+        //   (a) k==8 && all-MQ4 but gate_side wasn't all-MQ4 (e.g. router
+        //       not MQ4): use the kernarg-pointer fused kernels with the
+        //       CPU-selected indices.
+        //   (b) Mixed-dtype or k != 8: per-expert loop.
+        let topk_indices = topk_indices_cpu.expect("CPU-fallback path implies CPU top-K");
+        let topk_weights = topk_weights_cpu.expect("CPU-fallback path implies CPU top-K");
+        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
+        if use_kernarg_fused {
+            let xr = x_rot_local.unwrap();
+            let e0 = &ffn.experts[topk_indices[0]];
+            let e1 = &ffn.experts[topk_indices[1]];
+            let e2 = &ffn.experts[topk_indices[2]];
+            let e3 = &ffn.experts[topk_indices[3]];
+            let e4 = &ffn.experts[topk_indices[4]];
+            let e5 = &ffn.experts[topk_indices[5]];
+            let e6 = &ffn.experts[topk_indices[6]];
+            let e7 = &ffn.experts[topk_indices[7]];
+            gpu.gemv_hfq4g256_moe_gate_up_k8(
+                &e0.gate_up.buf, &e1.gate_up.buf, &e2.gate_up.buf, &e3.gate_up.buf,
+                &e4.gate_up.buf, &e5.gate_up.buf, &e6.gate_up.buf, &e7.gate_up.buf,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, e0.gate_up.k,
+            )?;
+            gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+            let scales = [
+                topk_weights[0], topk_weights[1], topk_weights[2], topk_weights[3],
+                topk_weights[4], topk_weights[5], topk_weights[6], topk_weights[7],
+            ];
+            gpu.gemv_hfq4g256_moe_down_residual_scaled_k8(
+                &e0.down.buf, &e1.down.buf, &e2.down.buf, &e3.down.buf,
+                &e4.down.buf, &e5.down.buf, &e6.down.buf, &e7.down.buf,
+                s.rot_batch, x_residual, scales,
+                e0.down.m, e0.down.k,
+            )?;
+        } else {
+            // Per-expert fallback for layers that aren't all-MQ4 or have k != 8.
+            for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
+                let expert = &ffn.experts[expert_idx];
+                if let Some(xr) = x_rot_local {
+                    gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, gate_up_buf,
+                        expert.gate_up.m, expert.gate_up.k)?;
+                } else {
+                    weight_gemv(gpu, &expert.gate_up, x_norm, gate_up_buf)?;
+                }
+                let gate_view = slice_f32_view(gate_up_buf, 0,  mi);
+                let up_view   = slice_f32_view(gate_up_buf, mi, mi);
+                if routed_mq4 {
+                    let x_rot_alias = GpuTensor {
+                        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                        dtype: DType::F32,
+                    };
+                    gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
+                    gpu.gemv_hfq4g256_residual_scaled_cpu(
+                        &expert.down.buf, &x_rot_alias, x_residual, weight,
+                        expert.down.m, expert.down.k,
+                    )?;
+                } else {
+                    let hid_view = slice_f32_view(ffn_hidden, 0, mi);
+                    gpu.silu_mul_f32(&gate_view, &up_view, &hid_view)?;
+                    weight_gemv(gpu, &expert.down, &hid_view, ffn_out)?;
+                    gpu.scaled_add_inplace_cpu_scalar_f32(x_residual, ffn_out, weight)?;
+                }
             }
         }
     }
@@ -1842,6 +1902,10 @@ pub struct Qwen35Scratch {
     pub moe_gate_batch:    Option<GpuTensor>,   // [k × mi]
     pub moe_up_batch:      Option<GpuTensor>,   // [k × mi]
     pub moe_rot_batch:     Option<GpuTensor>,   // [k × mi]
+    /// Phase 2b: GPU-side top-K outputs (kept on-device so moe_ffn_decode
+    /// can stay in a graph-capturable stream).
+    pub moe_topk_indices:  Option<GpuTensor>,   // [k] i32 stored as f32 alias
+    pub moe_topk_weights:  Option<GpuTensor>,   // [k] f32
 }
 
 impl Qwen35Scratch {
@@ -1926,6 +1990,8 @@ impl Qwen35Scratch {
             moe_gate_batch:    None,
             moe_up_batch:      None,
             moe_rot_batch:     None,
+            moe_topk_indices:  None,
+            moe_topk_weights:  None,
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1949,6 +2015,11 @@ impl Qwen35Scratch {
                 s.moe_gate_batch    = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 s.moe_up_batch      = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 s.moe_rot_batch     = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                // i32 topk_indices stored in an F32 tensor (same byte width).
+                // The kernel that writes it casts the buffer to int*, and the
+                // indexed MoE GEMV kernels read it as int*.
+                s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -1977,7 +2048,8 @@ impl Qwen35Scratch {
         for t in [self.moe_router_logits, self.moe_scalar_buf, self.moe_x_rot,
                    self.moe_gate_up_buf, self.moe_gate_buf, self.moe_up_buf,
                    self.moe_ffn_hidden, self.moe_ffn_out,
-                   self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch] {
+                   self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
+                   self.moe_topk_indices, self.moe_topk_weights] {
             if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
         }
     }

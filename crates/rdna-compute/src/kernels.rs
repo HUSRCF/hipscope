@@ -110,6 +110,25 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_SRC: &str = include_str!("../../../kernels/s
 /// per MoE layer.
 pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_moe_down.hip");
 
+/// GPU softmax + top-K + (optional) renormalize for the MoE router.
+/// Reads [n_exp] logits, writes [k] indices and [k] weights to device
+/// buffers. Eliminates the per-layer D2H sync the CPU-side top-K used
+/// to need — required for hipGraph capture of MoE decode.
+pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
+
+/// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
+/// topk_indices buffer and the per-expert weight base from an
+/// expert-pointers table. hipGraph-capture-safe replacement for the
+/// kernarg-pointer variant.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
+
+/// Index-aware MoE down GEMV — same pattern as the indexed gate_up,
+/// also reads scales from a device topk_weights buffer. Pairs with the
+/// GPU top-K kernel to make MoE decode hipGraph-capturable end-to-end.
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
