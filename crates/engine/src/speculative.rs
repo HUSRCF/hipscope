@@ -1090,9 +1090,9 @@ pub struct DflashVerifyOutput {
     /// `start_pos + i` given the preceding context plus `draft_tokens[0..i]`.
     pub argmax_per_pos: Vec<u32>,
     /// Full logits downloaded for every position, concatenated row-major
-    /// as `[B * vocab_size]`. The spec step currently only needs argmax,
-    /// but the full logits are kept so temp>0 rejection sampling (Phase
-    /// 7+) can plug in without re-running the target.
+    /// as `[B * vocab_size]`. Only populated when `want_full_logits=true`
+    /// (i.e. temperature sampling). Empty otherwise — greedy decode
+    /// uses GPU argmax and ships just B × 4 bytes to the host.
     pub logits_per_pos: Vec<f32>,
 }
 
