@@ -5524,6 +5524,44 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_masked(
+            q, k_cache, v_cache, out, positions,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size,
+            None, 0, 0,
+        )
+    }
+
+    /// Tree-mask variant of `attention_q8_0_kv_batched`. When `tree_bias` is
+    /// `Some`, the kernel ignores the causal cutoff and iterates over
+    /// `[0, block_start + block_cols)`, applying an additive bias from
+    /// `tree_bias[b × block_cols + (t - block_start)]` for in-block keys.
+    /// Caller passes `-inf` on non-ancestor slots and `0.0` on ancestors
+    /// (see `engine::ddtree::linearize_tree`).
+    ///
+    /// When `tree_bias` is `None`, `block_start` / `block_cols` are ignored
+    /// and behavior is byte-identical to the legacy causal path.
+    ///
+    /// Shared memory: the tree-mode `seq_len` is always `block_start +
+    /// block_cols`. Caller must pass `max_ctx_len` ≥ that value so the
+    /// scores[] LDS slice is sized correctly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
         self.ensure_kernel(
             "attention_q8_0_kv_batched",
             kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
@@ -5536,22 +5574,32 @@ impl Gpu {
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut out_ptr = out.buf.as_ptr();
         let mut pos_ptr = positions.buf.as_ptr();
+        // tree_bias = null when None; the kernel branches on bias != nullptr.
+        let mut bias_ptr: *mut std::ffi::c_void = match tree_bias {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut ms = max_seq as i32;
         let mut sc = scale;
+        let mut bs = block_start as i32;
+        let mut bc = block_cols as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
             &mut out_ptr as *mut _ as *mut c_void,
             &mut pos_ptr as *mut _ as *mut c_void,
+            &mut bias_ptr as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut bc as *mut _ as *mut c_void,
         ];
         let block_size = (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256);
         // Shared memory must accommodate the LARGEST batch row's seq_len for

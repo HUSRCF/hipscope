@@ -20,24 +20,46 @@
 // pointers are derived relative to seq_len so different batch rows with
 // different seq_len each have their own valid slice within the per-block
 // allocation).
-
+//
+// ─── Tree-attention mode (DDTree batched verify) ──────────────────────────
+// When `tree_bias != nullptr` the kernel runs in tree mode:
+//   - seq_len = block_start + block_cols (full cache up to and including
+//     the tree block, ignoring `positions[b]` for the causal cutoff).
+//   - For keys in [block_start, block_start + block_cols), the score is
+//     augmented by `tree_bias[b * block_cols + (t - block_start)]`. The
+//     caller uses `+0.0` on ancestor-or-self positions and `-inf` on
+//     non-ancestors; this gates within-block attention to the tree's
+//     visibility matrix without changing the prompt path.
+//   - Keys in [0, block_start) are unmasked (prompt is always visible).
+//   - Rope-encoded K entries in the block may have LOGICAL positions that
+//     differ from their cache slot (siblings share a depth). That's
+//     handled host-side at KV-write time — this kernel just does dot
+//     products on whatever is in the cache.
+// When `tree_bias == nullptr` the kernel falls back to standard causal
+// (byte-identical to the pre-tree path).
 extern "C" __global__ void attention_q8_0_kv_batched(
     const float* __restrict__ q,            // [batch_size × n_heads × head_dim]
     const unsigned char* __restrict__ k_cache,  // [max_seq × n_kv_heads × head_dim Q8_0 blocks]
     const unsigned char* __restrict__ v_cache,  // same layout
     float* __restrict__ out,                // [batch_size × n_heads × head_dim]
     const int* __restrict__ positions,      // [batch_size]
+    const float* __restrict__ tree_bias,    // optional [batch_size × block_cols] or nullptr
     int n_heads,
     int n_kv_heads,
     int head_dim,
     int max_seq,
-    float scale_attn
+    float scale_attn,
+    int block_start,                        // ignored when tree_bias == nullptr
+    int block_cols                          // ignored when tree_bias == nullptr
 ) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
     if (h >= n_heads) return;
 
-    const int seq_len = positions[b] + 1;  // causal: attend to 0..positions[b]
+    const bool tree_mode = (tree_bias != nullptr);
+    // Tree mode: iterate over the full cache including the block.
+    // Causal mode: attend to 0..positions[b] inclusive (unchanged).
+    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[b] + 1);
     extern __shared__ float sdata[];
 
     const int kv_group = n_heads / n_kv_heads;
@@ -75,6 +97,17 @@ extern "C" __global__ void attention_q8_0_kv_batched(
             }
         }
         float s = dot * scale_attn;
+        // Tree-attention bias: add per-row mask for keys inside the block.
+        // Prompt keys (t < block_start) stay unmasked. A -inf bias on a
+        // non-ancestor key makes expf(s - max) collapse to 0, so that key
+        // contributes nothing to the numerator or denominator. Correctness
+        // of the running-max reduction requires that we NOT mix -inf into
+        // the max when every non-ancestor gets -inf — but the ancestor set
+        // always includes the root (slot 0 in the block) so at least one
+        // in-block score is finite on every row.
+        if (tree_mode && t >= block_start) {
+            s += tree_bias[b * block_cols + (t - block_start)];
+        }
         scores[t] = s;
         local_max = fmaxf(local_max, s);
     }
