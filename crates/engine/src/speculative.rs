@@ -1335,14 +1335,16 @@ fn verify_dflash_block_inner(
         gdn_tape,
         tree_verify,
     );
-    // TODO(root-cause): tree-mode needs an explicit device sync here or
-    // subsequent kernels (lm_head, argmax) see partially-written memory and
-    // produce wrong argmaxes / illegal accesses. Suspected queue-ordering
-    // bug in the tree-masked FA kernels — same-stream dispatch SHOULD
-    // serialize but empirically doesn't on gfx1100. Cost: one pipeline
-    // stall per cycle (~µs) but without it τ degrades from 2.0 to 1.1 and
-    // destabilizes across runs. Fix the underlying race before shipping
-    // to master.
+    // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
+    // (e.g. budget=60 topk=8 drops 7.0 → 3.3; 9B asym3 2026-04-14). topk=1
+    // is fine without the sync (byte-exact with baseline DFlash either way).
+    // Root cause suspected: siblings at the same tree depth produce
+    // duplicate entries in `positions[]`, so `kv_cache_write` dispatches
+    // multiple batch rows targeting the same cache slot — the async write
+    // order lets a subsequent attention kernel read a partially-committed
+    // slot. Fix TODO: either serialize within-kernel per-slot, or ensure
+    // the "winning" sibling's write happens last. Cost ~3–5 ms per cycle
+    // until fixed.
     if batch_result.is_ok() && tree_verify.is_some() {
         if let Err(e) = gpu.hip.device_synchronize() {
             let _ = gpu.free_tensor(final_hidden);
