@@ -1232,6 +1232,49 @@ pub fn verify_dflash_block(
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
 ) -> HipResult<DflashVerifyOutput> {
+    verify_dflash_block_inner(
+        gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
+    )
+}
+
+/// Tree-verify variant of `verify_dflash_block`. Pass the linearized
+/// `(positions, attn_bias)` built from a `DdTree` and this runs the whole
+/// tree through a single batched forward — per-position argmax at slot i
+/// corresponds to target's prediction after tree node i (slot 0 = after
+/// seed / tree root).
+///
+/// Note: `gdn_tape` captured from a tree verify records innovations in
+/// linearization order, NOT commit order. Callers that need to advance
+/// GDN state to a specific committed path should either (a) re-verify
+/// the committed linear prefix with `verify_dflash_block` (no tree) and
+/// capture tape on that, matching `spec_step_ddtree`'s pattern, or (b)
+/// implement a slot-reordering replay (not currently available).
+pub fn verify_dflash_block_tree(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    tree_verify: qwen35::TreeVerifyCtx<'_>,
+) -> HipResult<DflashVerifyOutput> {
+    verify_dflash_block_inner(
+        gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits,
+        Some(tree_verify),
+    )
+}
+
+fn verify_dflash_block_inner(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
+) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
@@ -1254,8 +1297,14 @@ pub fn verify_dflash_block(
         Some(hidden_rb),
         Some(&final_hidden),
         gdn_tape,
-        None,
+        tree_verify,
     );
+    if batch_result.is_ok() && tree_verify.is_some() {
+        if let Err(e) = gpu.hip.device_synchronize() {
+            let _ = gpu.free_tensor(final_hidden);
+            return Err(e);
+        }
+    }
     if let Err(e) = batch_result {
         let _ = gpu.free_tensor(final_hidden);
         return Err(e);
@@ -1280,9 +1329,32 @@ pub fn verify_dflash_block(
     if try_batched {
         let logits_batch =
             gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
+        // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
+        // MQ4/HFQ4 kernels have no such cap — they take the single-shot path.
         let gemm_result = match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                gpu.gemm_q8_0_batched(&w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b)
+                const Q8_LM_MAX: usize = 16;
+                let mut chunk_start = 0usize;
+                let mut chunk_err: Option<hip_bridge::HipError> = None;
+                while chunk_start < b {
+                    let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
+                    let chunk_n = chunk_end - chunk_start;
+                    let x_chunk = final_hidden.sub_offset(chunk_start * dim, chunk_n * dim);
+                    let y_chunk = logits_batch.sub_offset(chunk_start * vocab, chunk_n * vocab);
+                    let r = gpu.gemm_q8_0_batched(
+                        &w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n,
+                    );
+                    if let Err(e) = r {
+                        chunk_err = Some(e);
+                        break;
+                    }
+                    chunk_start = chunk_end;
+                }
+                match chunk_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
             rdna_compute::DType::HFQ4G256 => {
                 gpu.gemm_hfq4g256(&w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b)
@@ -2429,6 +2501,242 @@ pub fn spec_step_ddtree(
     // accept_len] of the verified block. download_hidden_block returns the
     // most-recent N rows in order, so pulling tape_block.len() rows and
     // slicing to accept_len+1 grabs the right prefix.
+    let hidden_rows_written = tape_block.len();
+    let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
+    let rows_to_keep = accept_len + 1;
+    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+
+    Ok(SpecStepResult {
+        accepted: accept_len,
+        bonus_token,
+        drafted,
+        committed,
+    })
+}
+
+/// Batched tree-verify counterpart of `spec_step_ddtree`. Replaces the
+/// per-path DFS with a single `verify_dflash_block_tree` call using the
+/// FA tree-attention mask infrastructure (commits 835aa46 / f0ee980 /
+/// 704bf11). Same return value and side-effect semantics as the per-path
+/// version — callers swap the two transparently.
+///
+/// Correctness notes:
+///
+/// - **FA side (tree-exact):** each tree node's Q attends only to its
+///   ancestors + prompt. The mask is -inf on non-ancestor in-block keys
+///   so exp-sum collapses, matching per-path DFS argmaxes exactly at
+///   temp=0.
+/// - **GDN side (linear-replay approximation):** in the tree forward
+///   the recurrent GDN kernel advances state sequentially through the
+///   linearized token order `[seed, n0, n1, ...]`. For siblings at the
+///   same tree depth this cross-contaminates state — node b's S-state
+///   update sees node a's innovations even though they're alternatives,
+///   not sequential. At `topk=1` the tree is a pure chain so state
+///   advance is identical to DFlash (byte-exact). At `topk>1` the FA
+///   posteriors are still correct (ancestor attention), but the GDN
+///   contribution to each node's hidden has small drift vs per-path DFS.
+/// - **Tape/commit path (correct):** we do a SECOND verify on the
+///   committed prefix (no tree) for tape capture. That tape is byte-
+///   exact with per-path DFS's committed-prefix verify, so LA state
+///   advances correctly after the cycle completes.
+///
+/// Target: replaces 8–16 forwards per cycle (per-path DFS) with 2
+/// forwards per cycle (tree verify + linear tape capture). Converts the
+/// τ wins (+40–46% on creative/essay) into wall-clock wins.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_ddtree_batched(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    post_seed_snap: &mut DeltaNetSnapshot,
+    gdn_tape: &mut GdnTape,
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    tree_budget: usize,
+    tree_topk: usize,
+) -> HipResult<SpecStepResult> {
+    let b = draft_cfg.block_size;
+    let vocab = target.config.vocab_size;
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    assert!(b >= 2, "spec_step_ddtree_batched: block_size must be ≥ 2");
+    assert_eq!(
+        target_hidden_host.len(),
+        position * ne * h,
+        "target_hidden_host size mismatches position"
+    );
+    assert!(
+        tree_topk >= 1 && tree_topk <= vocab,
+        "tree_topk must be in [1, vocab]"
+    );
+    // Unused in the batched path (no per-path DFS), kept in signature for
+    // API compatibility with `spec_step_ddtree` so callers can switch by
+    // flipping a single fn pointer.
+    let _ = &post_seed_snap;
+
+    // ── 1. Run DFlash draft, download raw logits ─────────────────────────
+    let draft_logits = run_dflash_draft_for_logits(
+        gpu,
+        target,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        target_hidden_host,
+        position,
+        seed_token,
+        ctx_slice,
+        b,
+    )?;
+
+    // ── 2. Per-position top-K + log-normalize ────────────────────────────
+    let (top_tokens, top_log_probs) =
+        crate::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
+
+    // ── 3. Build the DDTree ───────────────────────────────────────────────
+    let tree = crate::ddtree::build_ddtree_tree(
+        &top_tokens,
+        &top_log_probs,
+        b - 1,
+        tree_topk,
+        tree_budget,
+    );
+
+    // Empty-tree shortcut (identical to spec_step_ddtree's path).
+    if tree.nodes.is_empty() {
+        target_snap.save_from(&target.dn_state, gpu)?;
+        qwen35::forward_scratch_with_hidden(
+            gpu, &target.weights, &target.config, seed_token, position,
+            &mut target.kv_cache, &mut target.dn_state, &target.scratch, hidden_rb,
+        )?;
+        let logits0 = gpu.download_f32(&target.scratch.logits)?;
+        let bonus = argmax_u32(&logits0);
+        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
+        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
+        return Ok(SpecStepResult {
+            accepted: 0,
+            bonus_token: bonus,
+            drafted: vec![seed_token],
+            committed: vec![seed_token, bonus],
+        });
+    }
+
+    // ── 4. Linearize the tree into (tokens, positions, mask_host) ────────
+    let (verify_tokens, verify_positions, mask_host) =
+        crate::ddtree::linearize_tree(&tree, seed_token, position as u32);
+    let big_n = verify_tokens.len();
+    debug_assert_eq!(big_n, 1 + tree.num_nodes());
+
+    // ── 5. Upload mask to GPU as [N × N] f32 ──────────────────────────────
+    let attn_bias_gpu = gpu.alloc_tensor(&[big_n * big_n], rdna_compute::DType::F32)?;
+    {
+        let mask_bytes = unsafe {
+            std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
+        };
+        if let Err(e) = gpu.hip.memcpy_htod(&attn_bias_gpu.buf, mask_bytes) {
+            let _ = gpu.free_tensor(attn_bias_gpu);
+            return Err(e);
+        }
+        // Force the htod to drain before any kernel launches see the buffer.
+        // Belt-and-suspenders: `memcpy_htod` should already be synchronous on
+        // the default stream, but the asym FA kernels are dispatched on a
+        // stream from `self.stream_ref()` and we've observed launches race
+        // with the bias read without this barrier. Cheap (<1 µs) and removes
+        // the race entirely.
+        if let Err(e) = gpu.hip.device_synchronize() {
+            let _ = gpu.free_tensor(attn_bias_gpu);
+            return Err(e);
+        }
+    }
+
+    // ── 6. Snapshot pre-seed target state ─────────────────────────────────
+    if let Err(e) = target_snap.save_from(&target.dn_state, gpu) {
+        let _ = gpu.free_tensor(attn_bias_gpu);
+        return Err(e);
+    }
+
+    // ── 7. Tree verify: single batched forward with tree-attention mask ──
+    //
+    // argmax_per_pos[i] = target's argmax prediction at slot i in the
+    // linearization, i.e. what comes AFTER the token at that slot.
+    // Matches exactly the DdTree `posterior` convention expected by
+    // `follow_verified_tree`: posterior[0] = pred after seed, posterior[i+1]
+    // = pred after tree.nodes[i].
+    let ctx = qwen35::TreeVerifyCtx {
+        positions: &verify_positions,
+        attn_bias: &attn_bias_gpu,
+    };
+    let verify_out = verify_dflash_block_tree(
+        gpu, target, &verify_tokens, position, hidden_rb, None, false, ctx,
+    );
+    let posterior = match verify_out {
+        Ok(v) => v.argmax_per_pos,
+        Err(e) => {
+            let _ = gpu.free_tensor(attn_bias_gpu);
+            return Err(e);
+        }
+    };
+    let _ = gpu.free_tensor(attn_bias_gpu);
+
+    // ── 8. Greedy walk: longest accepted path + bonus ─────────────────────
+    let (accepted_node_indices, bonus_token) =
+        crate::ddtree::follow_verified_tree(&tree, &posterior);
+    let accept_len = accepted_node_indices.len();
+
+    // ── 9. Build committed + drafted sequences ────────────────────────────
+    let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
+    committed.push(seed_token);
+    for &ni in &accepted_node_indices {
+        committed.push(tree.nodes[ni].token);
+    }
+    committed.push(bonus_token);
+
+    let mut drafted: Vec<u32> = Vec::with_capacity(accept_len + 1);
+    drafted.push(seed_token);
+    for &ni in &accepted_node_indices {
+        drafted.push(tree.nodes[ni].token);
+    }
+
+    // ── 10. Tape-capturing verify on the committed path ──────────────────
+    //
+    // Same tape_block decision as spec_step_ddtree: use the full-B top-1
+    // block when the accepted path coincides with the top-1 chain
+    // (byte-exact with DFlash's LA state advance), else use just the
+    // committed prefix (correct LA innovations for the accepted path).
+    let topk1_is_committed_prefix = accept_len > 0 && committed[1..=accept_len].iter().enumerate()
+        .all(|(d, &tok)| tok == top_tokens[d * tree_topk]);
+    let tape_block: Vec<u32> = if topk1_is_committed_prefix || accept_len == 0 {
+        let mut vb: Vec<u32> = Vec::with_capacity(b);
+        vb.push(seed_token);
+        for d in 0..(b - 1) {
+            vb.push(top_tokens[d * tree_topk]);
+        }
+        vb
+    } else {
+        committed[..accept_len + 1].to_vec()
+    };
+
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    let _tape_verify = verify_dflash_block(
+        gpu, target, &tape_block, position, hidden_rb, Some(gdn_tape), false,
+    )?;
+
+    // ── 11. Restore + tape replay for accept_len + 1 committed tokens ────
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    gdn_tape.replay_gdn(
+        gpu,
+        &target.weights,
+        &target.config,
+        &mut target.dn_state,
+        accept_len + 1,
+    )?;
+
+    // ── 12. Append (1 + accept_len) hidden rows to target_hidden_host ────
     let hidden_rows_written = tape_block.len();
     let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
     let rows_to_keep = accept_len + 1;

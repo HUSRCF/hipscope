@@ -78,6 +78,10 @@ fn main() {
     let mut ddtree_enabled: bool = false;
     let mut ddtree_budget: usize = 16;  // paper uses 60; cheaper spike default
     let mut ddtree_topk: usize = 8;     // paper uses B-1 * budget_fanout; small k keeps tree shallow
+    // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
+    // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
+    // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
+    let mut ddtree_batched: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -178,6 +182,11 @@ fn main() {
             "--ddtree-topk" => {
                 ddtree_topk = args[i + 1].parse().unwrap();
                 i += 2;
+            }
+            "--ddtree-batched" => {
+                ddtree_batched = true;
+                ddtree_enabled = true; // implies --ddtree
+                i += 1;
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -384,12 +393,19 @@ fn main() {
         if pld_enabled {
             eprintln!("WARNING: --pld is ignored when --ddtree is enabled.");
         }
-        eprintln!(
-            "ddtree: enabled (budget={}, topk={}; per-path DFS verify, ~{}× DFlash per-cycle cost)",
-            ddtree_budget,
-            ddtree_topk,
-            ddtree_budget / (draft_cfg.block_size.saturating_sub(1).max(1)),
-        );
+        if ddtree_batched {
+            eprintln!(
+                "ddtree: enabled (budget={}, topk={}; BATCHED tree verify via FA tree-attention mask + GDN linear replay)",
+                ddtree_budget, ddtree_topk,
+            );
+        } else {
+            eprintln!(
+                "ddtree: enabled (budget={}, topk={}; per-path DFS verify, ~{}× DFlash per-cycle cost)",
+                ddtree_budget,
+                ddtree_topk,
+                ddtree_budget / (draft_cfg.block_size.saturating_sub(1).max(1)),
+            );
+        }
     }
 
     let t_decode = Instant::now();
@@ -448,7 +464,12 @@ fn main() {
             pld_hits += 1;
         }
         let step = if ddtree_enabled {
-            speculative::spec_step_ddtree(
+            let step_fn = if ddtree_batched {
+                speculative::spec_step_ddtree_batched
+            } else {
+                speculative::spec_step_ddtree
+            };
+            step_fn(
                 &mut gpu,
                 &mut target,
                 &draft_weights,
