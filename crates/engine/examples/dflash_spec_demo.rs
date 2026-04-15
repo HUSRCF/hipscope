@@ -295,6 +295,13 @@ fn main() {
     let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
         &mut gpu, &target.config, tape_max_n,
     ).expect("alloc gdn tape");
+    // DdtreeScratch: persistent attention-bias buffer for batched tree verify.
+    // One allocation at startup (sized for max_budget), reused every cycle —
+    // avoids the per-cycle malloc+htod+free churn that dominated early wall-
+    // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
+    // callers can switch strategies at runtime without reinit.
+    let ddtree_scratch = engine::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
+        .expect("alloc ddtree scratch");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
@@ -470,29 +477,46 @@ fn main() {
             pld_hits += 1;
         }
         let step = if ddtree_enabled {
-            let step_fn = if ddtree_batched {
-                speculative::spec_step_ddtree_batched
+            if ddtree_batched {
+                speculative::spec_step_ddtree_batched(
+                    &mut gpu,
+                    &mut target,
+                    &draft_weights,
+                    &draft_cfg,
+                    &mut draft_scratch,
+                    &mut hidden_rb,
+                    &mut target_hidden_host,
+                    &mut target_snap,
+                    &mut post_seed_snap,
+                    &mut gdn_tape,
+                    &ddtree_scratch,
+                    position,
+                    seed_token,
+                    ctx_slice,
+                    ddtree_budget,
+                    ddtree_topk,
+                )
+                .expect("ddtree-batched spec step")
             } else {
-                speculative::spec_step_ddtree
-            };
-            step_fn(
-                &mut gpu,
-                &mut target,
-                &draft_weights,
-                &draft_cfg,
-                &mut draft_scratch,
-                &mut hidden_rb,
-                &mut target_hidden_host,
-                &mut target_snap,
-                &mut post_seed_snap,
-                &mut gdn_tape,
-                position,
-                seed_token,
-                ctx_slice,
-                ddtree_budget,
-                ddtree_topk,
-            )
-            .expect("ddtree spec step")
+                speculative::spec_step_ddtree(
+                    &mut gpu,
+                    &mut target,
+                    &draft_weights,
+                    &draft_cfg,
+                    &mut draft_scratch,
+                    &mut hidden_rb,
+                    &mut target_hidden_host,
+                    &mut target_snap,
+                    &mut post_seed_snap,
+                    &mut gdn_tape,
+                    position,
+                    seed_token,
+                    ctx_slice,
+                    ddtree_budget,
+                    ddtree_topk,
+                )
+                .expect("ddtree spec step")
+            }
         } else {
             speculative::spec_step_dflash(
                 &mut gpu,

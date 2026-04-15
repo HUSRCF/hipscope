@@ -634,6 +634,42 @@ pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) ->
 ///
 /// For DFlash, the draft model pulls a contiguous slice ending at the most
 /// recent position to use as context KV input.
+/// Persistent scratch for `spec_step_ddtree_batched` — eliminates the
+/// per-cycle alloc/free churn that dominated early-benchmark wall-clock
+/// time. Allocated once at session start, sized for the maximum tree we
+/// may see.
+///
+/// Contents:
+/// - `attn_bias`: `[max_n × max_n]` f32 additive bias buffer. `max_n =
+///   1 + tree_budget`. Per cycle the caller uploads `big_n × big_n`
+///   floats into its head — unused tail space is irrelevant because the
+///   FA kernel reads at `global_bid * block_cols + col` with `block_cols
+///   = big_n`.
+///
+/// Callers pass this by `&mut` to `spec_step_ddtree_batched`. It's OK
+/// to over-allocate (max_n larger than any cycle's actual tree) — the
+/// per-cycle cost is only the htod of the current cycle's mask bytes.
+pub struct DdtreeScratch {
+    pub max_n: usize,
+    pub attn_bias: GpuTensor,
+}
+
+impl DdtreeScratch {
+    /// Allocate for a worst-case tree of `max_budget` non-root nodes.
+    pub fn new(gpu: &mut Gpu, max_budget: usize) -> HipResult<Self> {
+        let max_n = 1 + max_budget;
+        let attn_bias = gpu.alloc_tensor(
+            &[max_n * max_n],
+            rdna_compute::DType::F32,
+        )?;
+        Ok(Self { max_n, attn_bias })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_bias);
+    }
+}
+
 pub struct HiddenStateRingBuffer {
     pub layer_bufs: Vec<GpuTensor>,
     pub extract_layers: Vec<usize>,
@@ -2563,6 +2599,7 @@ pub fn spec_step_ddtree_batched(
     target_snap: &mut DeltaNetSnapshot,
     post_seed_snap: &mut DeltaNetSnapshot,
     gdn_tape: &mut GdnTape,
+    scratch: &DdtreeScratch,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
@@ -2588,6 +2625,11 @@ pub fn spec_step_ddtree_batched(
     // flipping a single fn pointer.
     let _ = &post_seed_snap;
 
+    // `DDTREE_TIMING=1` prints per-cycle breakdown: draft / topk / build /
+    // pre_verify / verify. Used to diagnose where the wall-clock goes.
+    let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
+    let t_all = std::time::Instant::now();
+
     // ── 1. Run DFlash draft, download raw logits ─────────────────────────
     let draft_logits = run_dflash_draft_for_logits(
         gpu,
@@ -2602,9 +2644,13 @@ pub fn spec_step_ddtree_batched(
         b,
     )?;
 
+    let t_draft = t_all.elapsed();
+
     // ── 2. Per-position top-K + log-normalize ────────────────────────────
     let (top_tokens, top_log_probs) =
         crate::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
+
+    let t_topk = t_all.elapsed();
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
     let tree = crate::ddtree::build_ddtree_tree(
@@ -2614,6 +2660,8 @@ pub fn spec_step_ddtree_batched(
         tree_topk,
         tree_budget,
     );
+
+    let t_build = t_all.elapsed();
 
     // Empty-tree shortcut (identical to spec_step_ddtree's path).
     if tree.nodes.is_empty() {
@@ -2640,26 +2688,26 @@ pub fn spec_step_ddtree_batched(
     let big_n = verify_tokens.len();
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
 
-    // ── 5. Upload mask to GPU as [N × N] f32 ──────────────────────────────
-    // The bias buffer is read by the FA attention kernels inside step 7's
-    // forward. `memcpy_htod` is synchronous on the default stream so the
-    // data is in VRAM before forward kernels queue — no device sync needed.
-    let attn_bias_gpu = gpu.alloc_tensor(&[big_n * big_n], rdna_compute::DType::F32)?;
+    // ── 5. Upload mask to GPU into the persistent bias scratch ───────────
+    //
+    // Reuses `scratch.attn_bias` (sized for max_budget at init time), so
+    // per cycle we only pay for the htod of the current cycle's mask. The
+    // FA kernel reads at `row * block_cols + col` with block_cols = big_n;
+    // unused tail space in the buffer is never accessed.
+    assert!(
+        big_n <= scratch.max_n,
+        "tree big_n {} exceeds scratch.max_n {} (increase DdtreeScratch size)",
+        big_n, scratch.max_n,
+    );
     {
         let mask_bytes = unsafe {
             std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
         };
-        if let Err(e) = gpu.hip.memcpy_htod(&attn_bias_gpu.buf, mask_bytes) {
-            let _ = gpu.free_tensor(attn_bias_gpu);
-            return Err(e);
-        }
+        gpu.hip.memcpy_htod(&scratch.attn_bias.buf, mask_bytes)?;
     }
 
     // ── 6. Snapshot pre-seed target state ─────────────────────────────────
-    if let Err(e) = target_snap.save_from(&target.dn_state, gpu) {
-        let _ = gpu.free_tensor(attn_bias_gpu);
-        return Err(e);
-    }
+    target_snap.save_from(&target.dn_state, gpu)?;
 
     // ── 7. Tree verify: single batched forward with tree-attention mask ──
     //
@@ -2676,19 +2724,14 @@ pub fn spec_step_ddtree_batched(
     // linearization, i.e. what comes AFTER the token at that slot.
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
-        attn_bias: &attn_bias_gpu,
+        attn_bias: &scratch.attn_bias,
     };
+    let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(
         gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false, ctx,
-    );
-    let posterior = match verify_out {
-        Ok(v) => v.argmax_per_pos,
-        Err(e) => {
-            let _ = gpu.free_tensor(attn_bias_gpu);
-            return Err(e);
-        }
-    };
-    let _ = gpu.free_tensor(attn_bias_gpu);
+    )?;
+    let posterior = verify_out.argmax_per_pos;
+    let t_post_verify = t_all.elapsed();
 
     // ── 8. Greedy walk: longest accepted path + bonus ─────────────────────
     let (accepted_node_indices, bonus_token) =
@@ -2761,6 +2804,20 @@ pub fn spec_step_ddtree_batched(
     let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
     let rows_to_keep = accept_len + 1;
     target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+
+    if debug_tm {
+        let total = t_all.elapsed();
+        eprintln!(
+            "[ddtree-tm] draft={:.2}ms topk={:.2}ms build={:.2}ms pre_verify={:.2}ms verify={:.2}ms total={:.2}ms  (N={} accept={})",
+            t_draft.as_secs_f64() * 1000.0,
+            (t_topk - t_draft).as_secs_f64() * 1000.0,
+            (t_build - t_topk).as_secs_f64() * 1000.0,
+            (t_pre_verify - t_build).as_secs_f64() * 1000.0,
+            (t_post_verify - t_pre_verify).as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+            big_n, accept_len,
+        );
+    }
 
     Ok(SpecStepResult {
         accepted: accept_len,

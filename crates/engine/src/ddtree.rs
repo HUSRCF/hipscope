@@ -390,33 +390,92 @@ pub fn topk_from_logits(
     assert!(k <= vocab, "topk_from_logits: k > vocab");
     let mut top_tokens = Vec::with_capacity(rows * k);
     let mut top_log_probs = Vec::with_capacity(rows * k);
-    // Reused per-row index buffer; partial_sort would be ideal but std has
-    // no generic partial sort for f32 so we use full sort on indices.
-    // Cheap enough at rows × O(vocab log vocab), called once per cycle.
-    let mut idx: Vec<usize> = Vec::with_capacity(vocab);
+
+    // Fast path: k==1 is just argmax + the max value (no heap needed).
+    // Common case for spine-only trees — O(vocab) instead of O(vocab log k).
+    if k == 1 {
+        for r in 0..rows {
+            let row = &logits[r * vocab..(r + 1) * vocab];
+            let mut best_val = f32::NEG_INFINITY;
+            let mut best_idx: u32 = 0;
+            let mut max = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > best_val { best_val = v; best_idx = i as u32; }
+                if v > max { max = v; }
+            }
+            let mut sum_exp = 0.0f64;
+            for &v in row { sum_exp += ((v - max) as f64).exp(); }
+            let log_z = max + sum_exp.ln() as f32;
+            top_tokens.push(best_idx);
+            top_log_probs.push(best_val - log_z);
+        }
+        return (top_tokens, top_log_probs);
+    }
+
+    // General path: min-heap of size k, O(vocab × log k) per row instead of
+    // O(vocab × log vocab) for a full sort. At k=8 over 248K vocab that's
+    // ~10× faster than the prior sort-based impl — which on 9B MQ4 was
+    // eating 150 ms per cycle (measured via DDTREE_TIMING).
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    // (value, index). BinaryHeap is max-heap; to keep the top-k we want a
+    // MIN-heap of k items — wrap in Reverse. Custom Eq/Ord because f32
+    // isn't total-ordered; NaN is treated as NEG_INFINITY-equivalent which
+    // is safe for softmax-normalized logits (NaN never arises in practice).
+    #[derive(Copy, Clone, PartialEq)]
+    struct Item(f32, u32);
+    impl Eq for Item {}
+    impl Ord for Item {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+                .then(self.1.cmp(&other.1))
+        }
+    }
+    impl PartialOrd for Item {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: BinaryHeap<std::cmp::Reverse<Item>> = BinaryHeap::with_capacity(k + 1);
+    let mut top_k_items: Vec<Item> = Vec::with_capacity(k);
     for r in 0..rows {
         let row = &logits[r * vocab..(r + 1) * vocab];
-        // log-sum-exp for normalization.
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum_exp = 0.0f64;
-        for &v in row {
-            sum_exp += ((v - max) as f64).exp();
+        // Pass 1: top-k via min-heap + running max for log-sum-exp.
+        heap.clear();
+        let mut max = f32::NEG_INFINITY;
+        for (i, &v) in row.iter().enumerate() {
+            if v > max { max = v; }
+            let item = std::cmp::Reverse(Item(v, i as u32));
+            if heap.len() < k {
+                heap.push(item);
+            } else if heap.peek().unwrap() > &item {
+                // heap's min is GREATER than new item — wait, with Reverse
+                // the BinaryHeap max is actually the Reverse-smallest = the
+                // f32-SMALLEST. So we want to evict when new f32 > smallest.
+                // `peek() > item` via Reverse means "peek's inner < item's
+                // inner" which means "stored smallest < new" → push.
+                heap.pop();
+                heap.push(item);
+            }
         }
+        // Pass 2: log-sum-exp (needs running max from pass 1).
+        let mut sum_exp = 0.0f64;
+        for &v in row { sum_exp += ((v - max) as f64).exp(); }
         let log_z = max + sum_exp.ln() as f32;
 
-        idx.clear();
-        idx.extend(0..vocab);
-        // Partial sort would be O(vocab) but std_sort_by_cached_key is plenty
-        // fast and keeps the code simple.
-        idx.sort_unstable_by(|&a, &b| {
-            row[b]
-                .partial_cmp(&row[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for j in 0..k {
-            let tok = idx[j] as u32;
-            top_tokens.push(tok);
-            top_log_probs.push(row[idx[j]] - log_z);
+        // Extract heap contents sorted by value descending.
+        top_k_items.clear();
+        while let Some(std::cmp::Reverse(item)) = heap.pop() {
+            top_k_items.push(item);
+        }
+        // Heap popped in ascending f32 order (smallest first via Reverse);
+        // reverse for descending output.
+        top_k_items.reverse();
+        for item in &top_k_items {
+            top_tokens.push(item.1);
+            top_log_probs.push(item.0 - log_z);
         }
     }
     (top_tokens, top_log_probs)
