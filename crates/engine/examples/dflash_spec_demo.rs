@@ -421,11 +421,65 @@ fn main() {
         }
     }
 
+    // HIPFIRE_PROFILE=1: enable per-kernel profiling for `--profile-cycles N`
+    // worth of cycles (default 5) starting at cycle 1 (after a warm-up cycle
+    // 0 to settle the JIT). Prints kernel breakdown after the limit.
+    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    let profile_cycles_target: usize = std::env::var("HIPFIRE_PROFILE_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let mut profile_cycle_count: usize = 0;
+    let mut profile_armed = false;
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
             eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
             break;
+        }
+        if do_profile && stats.cycles == 1 && !profile_armed {
+            // First cycle was the JIT warm-up. Arm profiling now and drain
+            // after `profile_cycles_target` more cycles.
+            rdna_compute::profile::start();
+            profile_armed = true;
+        }
+        if do_profile && profile_armed
+            && stats.cycles >= 1 + profile_cycles_target
+            && profile_cycle_count == 0
+        {
+            profile_cycle_count = stats.cycles - 1;
+            if let Some(entries) = rdna_compute::profile::stop() {
+                use std::collections::HashMap;
+                let mut by_kernel: HashMap<&str, (f64, usize, usize)> = HashMap::new();
+                for e in &entries {
+                    let entry = by_kernel.entry(e.kernel).or_insert((0.0, 0, 0));
+                    entry.0 += e.time_us;
+                    entry.1 += 1;
+                    entry.2 += e.bytes;
+                }
+                let mut kerns: Vec<_> = by_kernel.into_iter().collect();
+                kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+                let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
+                eprintln!(
+                    "\n=== PROFILE ({} kernel calls over {} cycles, {:.1}ms total kernel time) ===",
+                    entries.len(), profile_cycle_count, total_us / 1000.0,
+                );
+                eprintln!(
+                    "  {:50} {:>6} {:>10} {:>10} {:>7} {:>10}",
+                    "kernel", "calls", "total_ms", "us/call", "%", "MB",
+                );
+                for (kern, (us, n, bytes)) in &kerns {
+                    if *us / total_us < 0.005 { continue; } // skip <0.5%
+                    eprintln!(
+                        "  {kern:50} {n:>6} {:>10.2} {:>10.0} {:>6.1}% {:>10.1}",
+                        us / 1000.0,
+                        us / *n as f64,
+                        us / total_us * 100.0,
+                        *bytes as f64 / 1.0e6,
+                    );
+                }
+            }
         }
         // Adaptive B: when rolling τ falls below threshold, shrink block_size
         // to 8 to cut per-iter cost. Raise back to 16 when τ recovers. Only
