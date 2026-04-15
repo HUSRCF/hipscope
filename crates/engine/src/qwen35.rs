@@ -17,6 +17,35 @@ pub enum LayerType {
     FullAttention,    // Standard MHA with gated output
 }
 
+/// Optional tree-attention context for `forward_prefill_batch` — activates
+/// DDTree batched verify when `Some`.
+///
+/// Fields:
+/// - `positions`: length matches `tokens.len()`. Each slot's logical RoPE
+///   position (seed at `start_pos`, node i at `start_pos + depth_i`).
+///   Two nodes at the same tree depth share a logical position — they're
+///   alternative futures at the same time step, not successive tokens.
+/// - `attn_bias`: `[N × N]` f32 additive bias on qk scores (with N = tokens.len()),
+///   produced by `crate::ddtree::linearize_tree`. `0.0` on ancestor-or-self
+///   entries, `-inf` on non-ancestors. Applied to in-block keys only;
+///   prompt keys (positions `[0, start_pos)`) remain unmasked.
+///
+/// Tree mode requires the batched FA path (`fa_batched_ok`); the per-token
+/// FA fallback always uses causal attention and cannot honor a tree mask.
+/// `forward_prefill_batch` returns an error if tree mode is requested but
+/// any FA layer would take the fallback path.
+///
+/// GDN (LinearAttention) layers use the existing linear-replay state
+/// advance in tree mode — correct at topk=1 (byte-exact with DFlash), an
+/// approximation at topk>1 (sibling subtrees cross-contaminate recurrent
+/// state). A per-branch state-forking kernel would eliminate the
+/// approximation but is a separate kernel project.
+#[derive(Clone, Copy)]
+pub struct TreeVerifyCtx<'a> {
+    pub positions: &'a [i32],
+    pub attn_bias: &'a GpuTensor,
+}
+
 #[derive(Debug)]
 pub struct Qwen35Config {
     pub dim: usize,
@@ -2302,6 +2331,7 @@ pub fn forward_prefill_batch(
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -2322,6 +2352,22 @@ pub fn forward_prefill_batch(
     let n = tokens.len();
     if n == 0 {
         return Ok(());
+    }
+
+    // Tree-verify mode sanity checks — the downstream path can't silently
+    // fall back to per-token FA (that's always causal and would ignore the
+    // tree mask), and the positions/bias shapes must match the token count.
+    if let Some(ctx) = tree_verify.as_ref() {
+        assert_eq!(
+            ctx.positions.len(), n,
+            "TreeVerifyCtx.positions length {} must equal tokens.len() {}",
+            ctx.positions.len(), n,
+        );
+        assert_eq!(
+            ctx.attn_bias.numel(), n * n,
+            "TreeVerifyCtx.attn_bias must be [{} × {}] f32 ({}), got numel {}",
+            n, n, n * n, ctx.attn_bias.numel(),
+        );
     }
 
     // Fast path requires (a) every LA layer's weights to be either MQ4G256
@@ -2353,6 +2399,11 @@ pub fn forward_prefill_batch(
         });
 
     if !eligible {
+        assert!(
+            tree_verify.is_none(),
+            "tree-verify mode requires the batched-FA-eligible prefill path; \
+             kv quant + FA weight dtypes do not match on this model",
+        );
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -2382,6 +2433,17 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
+    // Tree-verify mode runs as a single chunk (tree is small, O(16) nodes);
+    // chunk splitting would require slicing the mask by chunk rows which
+    // is extra work for a case we don't need.
+    if tree_verify.is_some() {
+        assert!(
+            n <= MAX_BATCH,
+            "tree-verify tokens {} exceeds MAX_BATCH {}; tree budget must fit",
+            n, MAX_BATCH,
+        );
+    }
+
     // Allocate the batch scratch once, reuse across chunks. Scope with an
     // inner closure so the explicit free runs even on error.
     let pbs = PrefillBatchScratch::new(gpu, config, MAX_BATCH)?;
@@ -2399,10 +2461,13 @@ pub fn forward_prefill_batch(
             // after the chunk returns.
             let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
                 gdn_tape.as_mut().map(|t| &mut **t);
+            // Tree-verify was asserted to fit in one chunk above, so passing
+            // the whole ctx through unconditionally is safe.
+            let tv_for_chunk = tree_verify.as_ref().copied();
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, &pbs, hidden_rb.as_deref(),
-                pth_slot, tape_for_chunk, chunk_start,
+                pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 rb.advance_head_by(chunk_n);
@@ -2456,6 +2521,7 @@ fn forward_prefill_chunk(
     per_token_hidden_out: Option<(&GpuTensor, usize)>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -2481,9 +2547,15 @@ fn forward_prefill_chunk(
         gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
     }
 
-    // ── 1b. Upload positions array (start_pos .. start_pos + n) ───────────
+    // ── 1b. Upload positions array ────────────────────────────────────────
     // Used by batched rope / kv_write / attention kernels in FA layers.
-    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    // Legacy mode: sequential `start_pos .. start_pos + n`.
+    // Tree-verify mode: depth-based positions from the DDTree linearization
+    //   (seed at `start_pos`; each tree node at `start_pos + depth_i`).
+    let positions_host: Vec<i32> = match tree_verify.as_ref() {
+        Some(ctx) => ctx.positions.to_vec(),
+        None => (0..n).map(|i| (start_pos + i) as i32).collect(),
+    };
     let positions_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
     };
@@ -2850,29 +2922,46 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                // 7. Batched causal attention.
+                // 7. Batched causal attention (or tree-attention if tree_verify is set).
                 // asym{4,3,2}: batched flash (K rotated-quantized + V Q8 in normal space).
                 // Q8: batched kernel unless ctx > 15K (LDS overflow), then per-position flash.
+                //
+                // Tree-verify mode: `block_start = start_pos`, `block_cols = n`.
+                // The bias buffer is `[n × n]`; each query row applies its
+                // corresponding bias row to in-block keys. Long-context Q8
+                // tiled fallback isn't supported in tree mode (we caught
+                // that as an assert above — tree blocks are small).
                 const LDS_CTX_LIMIT: usize = 15000;
+                let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                let (block_start, block_cols) = match tree_verify.as_ref() {
+                    Some(_) => (start_pos, n),
+                    None => (0, 0),
+                };
                 if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.attention_flash_asym4_batched(
+                    gpu.attention_flash_asym4_batched_masked(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.attention_flash_asym3_batched(
+                    gpu.attention_flash_asym3_batched_masked(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
+                    assert!(
+                        tree_verify.is_none(),
+                        "tree-verify mode not supported on asym2 KV (use asym3)",
+                    );
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym2_batched(
@@ -2882,6 +2971,12 @@ fn forward_prefill_chunk(
                         kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
+                    assert!(
+                        tree_verify.is_none(),
+                        "tree-verify mode hits the long-context Q8 fallback \
+                         at max_ctx_len={} > {}; tree blocks should stay small",
+                        max_ctx_len, LDS_CTX_LIMIT,
+                    );
                     // Per-position flash Q8 attention for long-context prefill.
                     let q_dim = config.n_heads * config.head_dim;
                     let pos_host = gpu.download_f32(&pbs.positions)?;
@@ -2901,12 +2996,13 @@ fn forward_prefill_chunk(
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
                 } else {
-                    gpu.attention_q8_0_kv_batched(
+                    gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.max_seq, max_ctx_len, n,
+                        tree_bias, block_start, block_cols,
                     )?;
                 }
 

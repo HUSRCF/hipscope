@@ -1254,6 +1254,7 @@ pub fn verify_dflash_block(
         Some(hidden_rb),
         Some(&final_hidden),
         gdn_tape,
+        None,
     );
     if let Err(e) = batch_result {
         let _ = gpu.free_tensor(final_hidden);
@@ -1975,7 +1976,7 @@ pub fn spec_step_dflash(
             &mut target.kv_cache,
             &mut target.dn_state,
             &target.scratch,
-            None, None, None,
+            None, None, None, None,
         )?;
     }
     // Target state is now at position + accept_len + 1. KV cache has
