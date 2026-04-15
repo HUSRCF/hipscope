@@ -2242,6 +2242,148 @@ fn run_dflash_draft_for_logits(
     Ok(host_logits)
 }
 
+/// Like `run_dflash_draft_for_logits` but does the top-K + log-sum-exp
+/// ON GPU via `topk_logsumexp_batched_f32`, returning only the top-K
+/// tokens and log-probs per row. Used by `spec_step_ddtree_batched` to
+/// skip the ~20 ms CPU sort and the 15 MB logits D2H.
+///
+/// Returns `(top_tokens, top_log_probs)` each of size `(b-1) * k` in
+/// row-major order (same convention as `ddtree::topk_from_logits`).
+#[allow(clippy::too_many_arguments)]
+fn run_dflash_draft_for_topk_gpu(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    target_hidden_host: &[f32],
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    b: usize,
+    k: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    let vocab = target.config.vocab_size;
+    let mask_token = draft_cfg.mask_token_id;
+    assert!(b >= 2, "dflash draft: b must be ≥ 2");
+    assert!(k >= 1 && k <= 8, "topk k={} must be in [1, 8]", k);
+
+    // Step 1-3: identical to run_dflash_draft_for_logits — embed, positions,
+    // draft forward. Duplicating the small glue to avoid a refactor risk;
+    // this path is shipped after. (Could factor out, but the savings is <50
+    // lines and the call site is stable.)
+    let mut block: Vec<u32> = vec![mask_token; b];
+    block[0] = seed_token;
+    for (i, &tok) in block.iter().enumerate() {
+        let dst = draft_scratch.x.sub_offset(i * h, h);
+        match target.weights.embd_format {
+            crate::llama::EmbeddingFormat::HFQ4G256 => {
+                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::HFQ4G128 => {
+                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::Q8_0 => {
+                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            crate::llama::EmbeddingFormat::F32 => {
+                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+            }
+            _ => panic!("ddtree draft: unsupported target embedding format"),
+        }
+    }
+    let effective_ctx_len = match ctx_slice {
+        Some(n) => n.min(position),
+        None => position,
+    };
+    let ctx_start = position - effective_ctx_len;
+    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+    let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
+    let th_offset = ctx_start * ne * h;
+    let th_slice: &[f32] = &target_hidden_host[th_offset..];
+
+    dflash::draft_forward(
+        gpu,
+        draft_weights,
+        draft_cfg,
+        None,
+        Some(th_slice),
+        &positions_q,
+        &positions_k,
+        b,
+        effective_ctx_len,
+        draft_scratch,
+    )?;
+
+    // Step 4: lm_head → [batch × vocab] logits (GPU-resident).
+    let batch = b - 1;
+    let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+    let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+    let w_out = &target.weights.output;
+    let gemm_result = match w_out.gpu_dtype {
+        rdna_compute::DType::Q8_0 => {
+            gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+        }
+        rdna_compute::DType::HFQ4G256 => {
+            gpu.gemm_hfq4g256(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+        }
+        rdna_compute::DType::MQ4G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq4g256(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        _ => Err(hip_bridge::HipError::new(
+            0,
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256)",
+        )),
+    };
+    if let Err(e) = gemm_result {
+        let _ = gpu.free_tensor(logits_batch);
+        return Err(e);
+    }
+
+    // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
+    let topk_idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+    let topk_val_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+    let topk_result = gpu.topk_logsumexp_batched_f32(
+        &logits_batch, &topk_idx_gpu, &topk_val_gpu, vocab, k, batch,
+    );
+    let _ = gpu.free_tensor(logits_batch);
+    if let Err(e) = topk_result {
+        let _ = gpu.free_tensor(topk_idx_gpu);
+        let _ = gpu.free_tensor(topk_val_gpu);
+        return Err(e);
+    }
+
+    // Step 6: D2H just the top-K outputs (tiny — 8 × 15 × 4 = 480 bytes for k=8).
+    let mut idx_host: Vec<i32> = vec![0i32; batch * k];
+    let mut val_host: Vec<f32> = vec![0f32; batch * k];
+    let idx_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, batch * k * 4)
+    };
+    let val_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(val_host.as_mut_ptr() as *mut u8, batch * k * 4)
+    };
+    gpu.hip.memcpy_dtoh(idx_bytes, &topk_idx_gpu.buf)?;
+    gpu.hip.memcpy_dtoh(val_bytes, &topk_val_gpu.buf)?;
+    let _ = gpu.free_tensor(topk_idx_gpu);
+    let _ = gpu.free_tensor(topk_val_gpu);
+
+    let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
+    Ok((top_tokens, val_host))
+}
+
 /// Enumerate all root-to-leaf paths in a DdTree. Returns paths as Vec<Vec<usize>>
 /// where each inner Vec is the sequence of node indices from the first
 /// child-of-root (depth 1) down to a leaf. Leaves are nodes with no children
@@ -2629,11 +2771,17 @@ pub fn spec_step_ddtree_batched(
 
     // `DDTREE_TIMING=1` prints per-cycle breakdown: draft / topk / build /
     // pre_verify / verify. Used to diagnose where the wall-clock goes.
+    // `DDTREE_TIMING=1` prints per-cycle breakdown: draft+topk / build /
+    // pre_verify / verify. The draft and top-K are fused into one GPU-
+    // resident path now — no separate timer.
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
-    // ── 1. Run DFlash draft, download raw logits ─────────────────────────
-    let draft_logits = run_dflash_draft_for_logits(
+    // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
+    // Keeps logits on device; returns only (b-1) × k indices + log-probs
+    // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
+    // with an on-device top-K (~µs) plus a ~480 byte D2H.
+    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,
@@ -2644,15 +2792,11 @@ pub fn spec_step_ddtree_batched(
         seed_token,
         ctx_slice,
         b,
+        tree_topk,
     )?;
 
     let t_draft = t_all.elapsed();
-
-    // ── 2. Per-position top-K + log-normalize ────────────────────────────
-    let (top_tokens, top_log_probs) =
-        crate::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
-
-    let t_topk = t_all.elapsed();
+    let t_topk = t_draft; // fused with draft now
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
     let tree = crate::ddtree::build_ddtree_tree(

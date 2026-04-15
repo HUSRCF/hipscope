@@ -573,6 +573,7 @@ pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
 pub const TOPK_LOGITS_SRC: &str = include_str!("../../../kernels/src/topk_logits.hip");
+pub const TOPK_LOGSUMEXP_BATCHED_SRC: &str = include_str!("../../../kernels/src/topk_logsumexp_batched.hip");
 
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...

@@ -7212,6 +7212,59 @@ impl Gpu {
         result
     }
 
+    /// Per-row top-K + log-sum-exp over `[B × vocab]` f32 logits.
+    /// Writes `top_idx[B × K]` and `top_logp[B × K]` where `top_logp[r,k] =
+    /// logit[r, top_idx[r,k]] - log_z[r]` with `log_z` = row-wise
+    /// log-sum-exp. Replaces 20 ms of CPU sort + log_z per DDTree cycle.
+    ///
+    /// Constraints: K ≤ 8 (kernel-enforced). For larger K, extend MAX_K in
+    /// the kernel source and the per-thread arrays.
+    pub fn topk_logsumexp_batched_f32(
+        &mut self,
+        logits: &GpuTensor,   // [B × vocab] f32
+        top_idx: &GpuTensor,  // [B × K] i32 (we use f32 tensor for storage — caller reinterprets)
+        top_logp: &GpuTensor, // [B × K] f32
+        vocab: usize,
+        k: usize,
+        b: usize,
+    ) -> HipResult<()> {
+        assert!(k >= 1 && k <= 8, "topk_logsumexp_batched: K={} must be in [1,8]", k);
+        self.ensure_kernel(
+            "topk_logsumexp_batched",
+            kernels::TOPK_LOGSUMEXP_BATCHED_SRC,
+            "topk_logsumexp_batched_f32",
+        )?;
+        let func = &self.functions["topk_logsumexp_batched_f32"];
+        let mut lp = logits.buf.as_ptr();
+        let mut ti = top_idx.buf.as_ptr();
+        let mut tl = top_logp.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut kk = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut ti as *mut _ as *mut c_void,
+            &mut tl as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        // LDS: (nth_warps=8 floats) + (nth × MAX_K × 2 floats). At nth=256,
+        // MAX_K=8: 32 + 4096 = 4128 floats = 16,512 bytes. Fits in 64 KB LDS.
+        const MAX_K: u32 = 8;
+        let nth: u32 = 256;
+        let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [b as u32, 1, 1],
+                [nth, 1, 1],
+                lds,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        result
+    }
+
     /// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are element-wise
     /// scalar transforms applied to independent buffers of size n_v_heads in the
     /// DeltaNet preamble. Saves one launch per linear-attention layer.
