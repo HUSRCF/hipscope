@@ -317,6 +317,19 @@ pub struct DflashScratch {
     // single-call requirement: max(max_ctx × num_extract*hidden,
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
+
+    // Incremental-upload tracker for `target_hidden`. On each draft_forward
+    // call, the caller passes `target_hidden_host` with `l` total rows. If
+    // `uploaded_target_hidden_rows` ≤ l and the caller indicates we can
+    // stream-append (ctx_slice == None in spec_step_dflash), we upload only
+    // the tail [uploaded..l) rows instead of re-sending the full cumulative
+    // context. Drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens ×
+    // 5 layers × 4096 × 4 B) to (accept+1) × 5 × 4096 × 4 B ≈ 700 KB —
+    // saves ~3–5 ms per cycle on mid-length math prompts.
+    //
+    // Set to 0 by `reset_upload_tracking` (called at new-prompt boundary).
+    // draft_forward updates it after each partial upload.
+    pub uploaded_target_hidden_rows: usize,
 }
 
 impl DflashScratch {
@@ -388,7 +401,16 @@ impl DflashScratch {
             positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
 
             mq_x_rot,
+            uploaded_target_hidden_rows: 0,
         })
+    }
+
+    /// Reset the incremental-upload tracker for target_hidden. Call this
+    /// at the start of a new prompt / session — otherwise stale tracker
+    /// state from a prior prompt would cause the next draft_forward to
+    /// skip required rows.
+    pub fn reset_upload_tracking(&mut self) {
+        self.uploaded_target_hidden_rows = 0;
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -537,7 +559,45 @@ pub fn draft_forward(
         upload_slice_f32(gpu, &scratch.x, ne_slice)?;
     }
     if let Some(th_slice) = target_hidden {
-        upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
+        // Incremental-upload fast path: the caller passes a rolling prefix
+        // (rows 0..l) of target_hidden. In DFlash's common steady-state
+        // (ctx_slice == None), the prefix grows by accept+1 rows per cycle
+        // and rows [0..prev_l) are unchanged since the previous call.
+        // Upload only the new tail when detected. This cuts the H2D from
+        // `l × ne × hidden × 4` (e.g. ~90 MB at l=1100 on 9B) to
+        // `(l - uploaded) × ne × hidden × 4` (~700 KB at accept=8).
+        //
+        // The optimization only fires when `th_slice.len() == l × ne × h`
+        // and it matches what the caller told us (matches a non-sliced
+        // cumulative buffer). ctx_slice callers pass a DIFFERENT slice
+        // every cycle (last N rows shift) — for them, force full upload.
+        let row_f32 = ne * h;
+        let expected_full_len = l * row_f32;
+        let prev = scratch.uploaded_target_hidden_rows;
+        // Full-upload conditions: first call, reset flagged, caller shrank
+        // the context, or the slice length suggests ctx_slice (unusual l).
+        if prev == 0
+            || prev > l
+            || th_slice.len() != expected_full_len
+        {
+            upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
+            scratch.uploaded_target_hidden_rows = l;
+        } else if prev < l {
+            // Delta-upload: rows [prev..l) need to land at byte offset
+            // prev * row_f32 * 4 of scratch.target_hidden.
+            let tail = &th_slice[prev * row_f32..];
+            let dst_byte_off = prev * row_f32 * 4;
+            let src_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    tail.as_ptr() as *const u8,
+                    tail.len() * 4,
+                )
+            };
+            gpu.hip.memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
+            scratch.uploaded_target_hidden_rows = l;
+        }
+        // prev == l: nothing new to upload (wouldn't happen in practice
+        // since caller always appends, but harmless).
     }
     upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;

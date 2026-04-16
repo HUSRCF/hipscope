@@ -670,6 +670,63 @@ impl DdtreeScratch {
     }
 }
 
+/// Persistent per-decode-cycle scratch for the target verify pass and the
+/// draft lm_head. Prior to 2026-04-16 these were allocated fresh every cycle
+/// inside `verify_dflash_block_inner` and `spec_step_dflash` — ~8 hipMalloc
+/// + hipFree pairs per cycle (biggest are 16 MB logits buffers). The HIP
+/// allocator is 50–200 µs per call, so per-cycle overhead was 0.5–1.5 ms
+/// just in allocator churn. Preallocating once at session start removes
+/// the churn with no correctness impact.
+///
+/// `max_n` must be ≥ max of (verify block size, tree-verify node count).
+/// The demo sizes it to `max(block_size, 1 + tree_budget)` to cover both
+/// the vanilla DFlash and DDTree paths.
+pub struct VerifyScratch {
+    pub max_n: usize,
+    pub dim: usize,
+    pub vocab: usize,
+    pub hidden_k: usize,
+    /// Post-output-norm hidden from the target forward, [max_n × dim] F32.
+    /// Drives the per-position lm_head GEMM.
+    pub final_hidden: GpuTensor,
+    /// Scratch logits from target + draft lm_head, [max_n × vocab] F32.
+    /// Reused across target verify (n=B) and draft lm_head (n=B-1).
+    pub logits: GpuTensor,
+    /// FWHT-rotated hidden for MQ4 lm_head path, [max_n × hidden_k] F32.
+    /// Allocated unconditionally; unused on non-MQ4 targets.
+    pub rot: GpuTensor,
+    /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
+    pub argmax: GpuTensor,
+}
+
+impl VerifyScratch {
+    pub fn new(
+        gpu: &mut Gpu,
+        max_n: usize,
+        dim: usize,
+        vocab: usize,
+        hidden_k: usize,
+    ) -> HipResult<Self> {
+        Ok(Self {
+            max_n,
+            dim,
+            vocab,
+            hidden_k,
+            final_hidden: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
+            logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
+            rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
+            argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.final_hidden);
+        let _ = gpu.free_tensor(self.logits);
+        let _ = gpu.free_tensor(self.rot);
+        let _ = gpu.free_tensor(self.argmax);
+    }
+}
+
 pub struct HiddenStateRingBuffer {
     pub layer_bufs: Vec<GpuTensor>,
     pub extract_layers: Vec<usize>,
@@ -1267,9 +1324,11 @@ pub fn verify_dflash_block(
     hidden_rb: &mut HiddenStateRingBuffer,
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
+    verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
+        verify_scratch,
     )
 }
 
@@ -1294,10 +1353,12 @@ pub fn verify_dflash_block_tree(
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     tree_verify: qwen35::TreeVerifyCtx<'_>,
+    verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits,
         Some(tree_verify),
+        verify_scratch,
     )
 }
 
@@ -1310,16 +1371,21 @@ fn verify_dflash_block_inner(
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
+    verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
 
-    // Scratch buffer for per-token post-output-norm hidden, [B × dim].
-    // Allocated fresh each verify; ~160 KB at dim=2560, B=16 — negligible
-    // alloc overhead compared to the verify forward.
-    let final_hidden =
-        gpu.alloc_tensor(&[b * dim], rdna_compute::DType::F32)?;
+    assert!(b <= verify_scratch.max_n,
+        "verify_scratch max_n {} < b {}", verify_scratch.max_n, b);
+    assert_eq!(verify_scratch.dim, dim, "verify_scratch dim mismatch");
+    assert_eq!(verify_scratch.vocab, vocab, "verify_scratch vocab mismatch");
+
+    // Views into the persistent scratch — no per-cycle allocation. Sized to
+    // the actual current `b` (≤ max_n) so downstream kernels see the right
+    // shapes. sub_offset returns a non-owning view; do NOT free these.
+    let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
 
     let batch_result = qwen35::forward_prefill_batch(
         gpu,
@@ -1346,15 +1412,9 @@ fn verify_dflash_block_inner(
     // the "winning" sibling's write happens last. Cost ~3–5 ms per cycle
     // until fixed.
     if batch_result.is_ok() && tree_verify.is_some() {
-        if let Err(e) = gpu.hip.device_synchronize() {
-            let _ = gpu.free_tensor(final_hidden);
-            return Err(e);
-        }
+        gpu.hip.device_synchronize()?;
     }
-    if let Err(e) = batch_result {
-        let _ = gpu.free_tensor(final_hidden);
-        return Err(e);
-    }
+    batch_result?;
 
     // Per-position lm_head. Fast paths in priority order:
     //   Q8_0      → batched gemm_q8_0_batched (one launch + one D2H).
@@ -1373,70 +1433,46 @@ fn verify_dflash_block_inner(
     };
 
     if try_batched {
-        let logits_batch =
-            gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+        let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
         // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
         // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
         // MQ4/HFQ4 kernels have no such cap — they take the single-shot path.
-        let gemm_result = match w_out.gpu_dtype {
+        match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
                 const Q8_LM_MAX: usize = 16;
                 let mut chunk_start = 0usize;
-                let mut chunk_err: Option<hip_bridge::HipError> = None;
                 while chunk_start < b {
                     let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
                     let chunk_n = chunk_end - chunk_start;
                     let x_chunk = final_hidden.sub_offset(chunk_start * dim, chunk_n * dim);
                     let y_chunk = logits_batch.sub_offset(chunk_start * vocab, chunk_n * vocab);
-                    let r = gpu.gemm_q8_0_batched(
+                    gpu.gemm_q8_0_batched(
                         &w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n,
-                    );
-                    if let Err(e) = r {
-                        chunk_err = Some(e);
-                        break;
-                    }
+                    )?;
                     chunk_start = chunk_end;
-                }
-                match chunk_err {
-                    Some(e) => Err(e),
-                    None => Ok(()),
                 }
             }
             rdna_compute::DType::HFQ4G256 => {
-                gpu.gemm_hfq4g256(&w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b)
+                gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b,
+                )?;
             }
             rdna_compute::DType::MQ4G256 => {
-                let rot = gpu.alloc_tensor(&[b * w_out.k], rdna_compute::DType::F32)?;
-                let r1 = gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b);
-                if let Err(e) = r1 {
-                    let _ = gpu.free_tensor(rot);
-                    let _ = gpu.free_tensor(logits_batch);
-                    let _ = gpu.free_tensor(final_hidden);
-                    return Err(e);
-                }
-                let r2 = gpu.gemm_hfq4g256(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b);
-                let _ = gpu.free_tensor(rot);
-                r2
+                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized: b*k={} > max_n*hidden_k={}",
+                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
+                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+                )?;
             }
             _ => unreachable!(),
-        };
-        if let Err(e) = gemm_result {
-            let _ = gpu.free_tensor(logits_batch);
-            let _ = gpu.free_tensor(final_hidden);
-            return Err(e);
         }
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
             // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
-            let host_logits = match gpu.download_f32(&logits_batch) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = gpu.free_tensor(logits_batch);
-                    let _ = gpu.free_tensor(final_hidden);
-                    return Err(e);
-                }
-            };
-            let _ = gpu.free_tensor(logits_batch);
+            let host_logits = gpu.download_f32(&logits_batch)?;
             for i in 0..b {
                 let row = &host_logits[i * vocab..(i + 1) * vocab];
                 argmax_per_pos.push(argmax_u32(row));
@@ -1446,28 +1482,15 @@ fn verify_dflash_block_inner(
             // GPU-side batched argmax. Writes B i32 indices; we download just
             // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
             // PCIe D2H per verify on the 4B Q8 lm_head (~3-5 ms/iter).
-            let argmax_buf = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-            let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b);
-            if let Err(e) = ar {
-                let _ = gpu.free_tensor(argmax_buf);
-                let _ = gpu.free_tensor(logits_batch);
-                let _ = gpu.free_tensor(final_hidden);
-                return Err(e);
-            }
+            let argmax_buf = verify_scratch.argmax.sub_offset(0, b);
+            gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b)?;
             let mut host_idx = vec![0i32; b];
             {
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4)
                 };
-                if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
-                    let _ = gpu.free_tensor(argmax_buf);
-                    let _ = gpu.free_tensor(logits_batch);
-                    let _ = gpu.free_tensor(final_hidden);
-                    return Err(e);
-                }
+                gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
             }
-            let _ = gpu.free_tensor(argmax_buf);
-            let _ = gpu.free_tensor(logits_batch);
             for &idx in &host_idx {
                 argmax_per_pos.push(idx as u32);
             }
@@ -1479,27 +1502,15 @@ fn verify_dflash_block_inner(
         // Fallback: B sequential GEMVs.
         for i in 0..b {
             let hidden_row = final_hidden.sub_offset(i * dim, dim);
-            let r = llama::weight_gemv(
+            llama::weight_gemv(
                 gpu, &target.weights.output, &hidden_row, &target.scratch.logits,
-            );
-            if let Err(e) = r {
-                let _ = gpu.free_tensor(final_hidden);
-                return Err(e);
-            }
-            let row = match gpu.download_f32(&target.scratch.logits) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = gpu.free_tensor(final_hidden);
-                    return Err(e);
-                }
-            };
+            )?;
+            let row = gpu.download_f32(&target.scratch.logits)?;
             debug_assert_eq!(row.len(), vocab);
             argmax_per_pos.push(argmax_u32(&row));
             logits_per_pos.extend_from_slice(&row);
         }
     }
-
-    let _ = gpu.free_tensor(final_hidden);
 
     Ok(DflashVerifyOutput {
         argmax_per_pos,
@@ -1516,9 +1527,13 @@ fn verify_dflash_block_inner(
 /// dimension when appending to the cumulative target_hidden buffer used
 /// by subsequent draft forwards.
 ///
-/// MVP path: downloads all `num_extract × hidden × B` floats via
-/// `gpu.download_f32` per layer (fine at block size 16 + 5 layers: ~2.6 MB
-/// per verify). Optimizable in 0.1.7 with a GPU-side scatter kernel.
+/// Partial-download path (2026-04-16): downloads only the B most recent
+/// rows per layer via `memcpy_dtoh` of the exact slice needed, handling
+/// the ring-buffer wrap as two segments when necessary. Prior version
+/// downloaded the full `max_pos × hidden` per layer (~170 MB at ctx=2048
+/// × hidden=4096 × 5 layers); this cuts per-cycle D2H to the useful
+/// `B × hidden × 5 × 4` bytes (~1.3 MB). For a math prompt at ctx=1024
+/// this saves ~7 ms/cycle of PCIe + sync overhead.
 pub fn download_hidden_block(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
@@ -1536,20 +1551,54 @@ pub fn download_hidden_block(
     assert!(b <= written, "verify must have written at least B rows to ring buffer");
     let head = hidden_rb.head;
     let start_slot = (head + max_pos - b) % max_pos;
+    let row_bytes = hidden * 4;
 
-    // Download every extract-layer buffer once (small — ≤ max_pos rows).
-    let mut layer_data: Vec<Vec<f32>> = Vec::with_capacity(num_extract);
-    for buf in &hidden_rb.layer_bufs {
-        layer_data.push(gpu.download_f32(buf)?);
+    // Per layer, download only the B needed rows (not the full ring).
+    // If start_slot + b <= max_pos: one contiguous segment.
+    // Otherwise: two segments (head→end + 0→tail).
+    //
+    // Each layer's B-row slice lands at [ext × b × hidden] in layer_data_flat.
+    let mut layer_data_flat = vec![0f32; num_extract * b * hidden];
+    for ext in 0..num_extract {
+        let src_buf = &hidden_rb.layer_bufs[ext].buf;
+        let dst_offset_floats = ext * b * hidden;
+        if start_slot + b <= max_pos {
+            // Single contiguous copy.
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    layer_data_flat.as_mut_ptr().add(dst_offset_floats) as *mut u8,
+                    b * row_bytes,
+                )
+            };
+            gpu.hip.memcpy_dtoh_at(dst_bytes, src_buf, start_slot * row_bytes)?;
+        } else {
+            // Two-segment ring wrap: tail of buffer, then head.
+            let first_rows = max_pos - start_slot;
+            let second_rows = b - first_rows;
+            let dst_first_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    layer_data_flat.as_mut_ptr().add(dst_offset_floats) as *mut u8,
+                    first_rows * row_bytes,
+                )
+            };
+            gpu.hip.memcpy_dtoh_at(dst_first_bytes, src_buf, start_slot * row_bytes)?;
+            let dst_second_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    layer_data_flat.as_mut_ptr().add(dst_offset_floats + first_rows * hidden) as *mut u8,
+                    second_rows * row_bytes,
+                )
+            };
+            gpu.hip.memcpy_dtoh_at(dst_second_bytes, src_buf, 0)?;
+        }
     }
 
     // Rearrange into per-position-then-per-extract-layer order.
+    // layer_data_flat is [ext × b × hidden]; we want [b × ext × hidden].
     let mut out: Vec<f32> = Vec::with_capacity(b * num_extract * hidden);
     for pi in 0..b {
-        let slot = (start_slot + pi) % max_pos;
         for ext in 0..num_extract {
-            let src_off = slot * hidden;
-            out.extend_from_slice(&layer_data[ext][src_off..src_off + hidden]);
+            let src_off = (ext * b + pi) * hidden;
+            out.extend_from_slice(&layer_data_flat[src_off..src_off + hidden]);
         }
     }
 
@@ -1603,6 +1652,7 @@ pub fn spec_step_dflash(
     hidden_rb: &mut HiddenStateRingBuffer,
     target_hidden_host: &mut Vec<f32>,
     target_snap: &mut DeltaNetSnapshot,
+    verify_scratch: &VerifyScratch,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
@@ -1757,47 +1807,41 @@ pub fn spec_step_dflash(
     if use_batched_gemm || use_q8_staged {
         // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
         // download just (B-1) × 4 bytes of indices.
+        //
+        // Reuses `verify_scratch.logits` and `.rot` — same buffers the target
+        // verify uses. Draft calls this BEFORE verify in the cycle, so
+        // there's no aliasing. The verify call overwrites these buffers
+        // afterward. Avoids 2-3 hipMalloc/Free pairs per cycle.
         let batch = b - 1;
+        assert!(batch <= verify_scratch.max_n,
+            "verify_scratch max_n {} < draft batch {}", verify_scratch.max_n, batch);
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-        let logits_batch =
-            gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+        let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
 
-        let gemm_result = match w_out.gpu_dtype {
+        match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+                gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             rdna_compute::DType::HFQ4G256 => {
-                gpu.gemm_hfq4g256(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+                gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+                )?;
             }
             rdna_compute::DType::MQ4G256 => {
-                let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-                let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
-                if let Err(e) = r1 {
-                    let _ = gpu.free_tensor(rotated);
-                    let _ = gpu.free_tensor(logits_batch);
-                    return Err(e);
-                }
-                let r2 = gpu.gemm_hfq4g256(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-                let _ = gpu.free_tensor(rotated);
-                r2
+                assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized for draft lm_head");
+                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                )?;
             }
             _ => unreachable!(),
-        };
-        if let Err(e) = gemm_result {
-            let _ = gpu.free_tensor(logits_batch);
-            return Err(e);
         }
 
         if use_temp_sampling {
             // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
-            let host_logits = match gpu.download_f32(&logits_batch) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = gpu.free_tensor(logits_batch);
-                    return Err(e);
-                }
-            };
-            let _ = gpu.free_tensor(logits_batch);
+            let host_logits = gpu.download_f32(&logits_batch)?;
             debug_assert_eq!(host_logits.len(), batch * vocab);
             draft_softmaxes.reserve(batch);
             for i in 0..batch {
@@ -1812,26 +1856,15 @@ pub fn spec_step_dflash(
             }
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
-            let argmax_buf = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-            let ar = gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch);
-            if let Err(e) = ar {
-                let _ = gpu.free_tensor(argmax_buf);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
+            let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);
+            gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch)?;
             let mut host_idx = vec![0i32; batch];
             {
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
                 };
-                if let Err(e) = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf) {
-                    let _ = gpu.free_tensor(argmax_buf);
-                    let _ = gpu.free_tensor(logits_batch);
-                    return Err(e);
-                }
+                gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
             }
-            let _ = gpu.free_tensor(argmax_buf);
-            let _ = gpu.free_tensor(logits_batch);
             for &idx in &host_idx {
                 drafted.push(idx as u32);
             }
@@ -1915,6 +1948,7 @@ pub fn spec_step_dflash(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
         use_temp_sampling,  // need full target logits for rejection sampling
+        verify_scratch,
     )?;
 
     // ── 7. Acceptance ──────────────────────────────────────────────────
@@ -2450,6 +2484,7 @@ pub fn spec_step_ddtree(
     target_snap: &mut DeltaNetSnapshot,
     post_seed_snap: &mut DeltaNetSnapshot,
     gdn_tape: &mut GdnTape,
+    verify_scratch: &VerifyScratch,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
@@ -2582,6 +2617,7 @@ pub fn spec_step_ddtree(
             hidden_rb,
             None,
             false, // want_full_logits=false — greedy only for now
+            verify_scratch,
         )?;
 
         // verify_out.argmax_per_pos has length N = verify_block.len().
@@ -2670,6 +2706,7 @@ pub fn spec_step_ddtree(
         hidden_rb,
         Some(gdn_tape),
         false,
+        verify_scratch,
     )?;
     target_snap.restore_to(&mut target.dn_state, gpu)?;
     gdn_tape.replay_gdn(
@@ -2744,6 +2781,7 @@ pub fn spec_step_ddtree_batched(
     post_seed_snap: &mut DeltaNetSnapshot,
     gdn_tape: &mut GdnTape,
     scratch: &DdtreeScratch,
+    verify_scratch: &VerifyScratch,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
@@ -2875,6 +2913,7 @@ pub fn spec_step_ddtree_batched(
     let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(
         gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false, ctx,
+        verify_scratch,
     )?;
     let posterior = verify_out.argmax_per_pos;
     let t_post_verify = t_all.elapsed();
@@ -2934,6 +2973,7 @@ pub fn spec_step_ddtree_batched(
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(
             gpu, target, &tape_block, position, hidden_rb, Some(gdn_tape), false,
+            verify_scratch,
         )?;
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         gdn_tape.replay_gdn(
