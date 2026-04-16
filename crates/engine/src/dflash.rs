@@ -460,15 +460,22 @@ fn gemm_dispatch(
     batch: usize,
     mq_x_rot: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    // Route HFQ4/MQ4 batched paths through the WMMA lm_head helper — the
+    // DFlash draft forward's per-layer projections (wq/wk/wv/wo/gate/up/down)
+    // and fc are ALL batched > 1, and share the same "y = A @ x" shape as
+    // lm_head. Using the WMMA residual-pre-zeroed path here unlocks ~8-10×
+    // on the same matmuls without touching AR-greedy numerics (AR on
+    // Qwen3.5 doesn't call `gpu.gemm_hfq4g256` directly — it uses the
+    // fused qkvza / gate_up / residual WMMA variants instead).
     match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
-        DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch),
+        DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
             // Use the prefix [0, batch * k) of the rotation scratch.
             let rot_view = scratch.sub_offset(0, batch * w.k);
             gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
-            gpu.gemm_hfq4g256(&w.buf, &rot_view, y, w.m, w.k, batch)
+            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     }
