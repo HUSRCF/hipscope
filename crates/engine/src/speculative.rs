@@ -1534,6 +1534,70 @@ fn verify_dflash_block_inner(
 /// × hidden=4096 × 5 layers); this cuts per-cycle D2H to the useful
 /// `B × hidden × 5 × 4` bytes (~1.3 MB). For a math prompt at ctx=1024
 /// this saves ~7 ms/cycle of PCIe + sync overhead.
+/// GPU-side scatter of the FIRST `n_rows` rows of the most recently written
+/// `block_size` slots of `hidden_rb` into a flat dst tensor laid out as
+/// `[max_ctx × num_extract × hidden]` (interleaved per-position).
+///
+/// Semantics mirror `download_hidden_block(b)` followed by a slice of the
+/// first `rows_to_keep * num_extract * hidden` f32s — the spec_step caller
+/// pattern. The ring has just been advanced by `block_size` (by a verify
+/// forward); the slots written in THAT verify occupy
+/// `[head − block_size, head)` (mod max_pos). We copy the first `n_rows`
+/// of those to rows `[dst_row_offset, dst_row_offset + n_rows)` of dst.
+///
+/// For each row r in 0..n_rows:
+/// - ring slot = (head − block_size + r) mod max_pos
+/// - dst row   = (dst_row_offset + r)
+/// - For each extract layer `ext`: D2D copy hidden×4 bytes from
+///   `hidden_rb.layer_bufs[ext][slot × hidden ..]` to
+///   `dst[(dst_row × num_extract + ext) × hidden ..]`.
+///
+/// When called after `seed_target_hidden_from_prompt` (no prior block), the
+/// caller passes `block_size = n_rows = prompt_len` and `dst_row_offset = 0`.
+///
+/// Replaces the previous D2H-then-H2D roundtrip via `target_hidden_host`
+/// Vec<f32> + `draft_forward`'s upload for the common ctx_slice=None path.
+/// Eliminates 5 blocking D2H sync points per spec step (one per extract
+/// layer) and the follow-on per-cycle H2D upload; remains about 80 small
+/// async D2D enqueues per cycle (ne × n_rows ≤ 5 × 16), which the stream
+/// dispatcher handles in ~200 µs of CPU time with zero cross-device waits.
+pub fn scatter_hidden_block_to_interleaved(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    block_size: usize,
+    n_rows: usize,
+) -> HipResult<()> {
+    assert!(n_rows <= block_size, "scatter: n_rows {n_rows} > block_size {block_size}");
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let max_pos = hidden_rb.max_positions;
+    let head = hidden_rb.head;
+    let written = hidden_rb.written;
+    assert!(block_size <= written, "scatter: block_size {block_size} > written {written}");
+    let row_bytes = hidden * 4;
+    let start_slot = (head + max_pos - block_size) % max_pos;
+
+    for r in 0..n_rows {
+        let slot = (start_slot + r) % max_pos;
+        let dst_row = dst_row_offset + r;
+        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+        for ext in 0..num_extract {
+            let src_offset_bytes = slot * row_bytes;
+            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+            gpu.hip.memcpy_dtod_at(
+                &dst.buf,
+                dst_offset_bytes,
+                &hidden_rb.layer_bufs[ext].buf,
+                src_offset_bytes,
+                row_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn download_hidden_block(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
@@ -1683,11 +1747,18 @@ pub fn spec_step_dflash(
     let mask_token = draft_cfg.mask_token_id;
 
     assert!(b >= 2, "dflash block size must be ≥ 2");
-    assert_eq!(
-        target_hidden_host.len(),
-        position * ne * h,
-        "target_hidden_host size mismatches position"
-    );
+    // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
+    // where it backs the CPU slice handed to draft_forward. On the default
+    // ctx_slice=None path the data lives on GPU in draft_scratch.target_hidden
+    // (populated by D2D scatter, no CPU shadow). Only enforce the length
+    // invariant when we actually read it.
+    if ctx_slice.is_some() {
+        assert_eq!(
+            target_hidden_host.len(),
+            position * ne * h,
+            "target_hidden_host size mismatches position"
+        );
+    }
 
     // ── 1. block_output_ids seeded with prev bonus at [0], masks at [1..B] ──
     let mut block: Vec<u32> = vec![mask_token; b];
@@ -1768,8 +1839,22 @@ pub fn spec_step_dflash(
     // Slice target_hidden_host to the last effective_ctx_len rows. When
     // ctx_slice is None, this is a no-op (ctx_start = 0). Row stride is
     // num_extract × hidden = ne * h.
-    let th_offset = ctx_start * ne * h;
-    let th_slice: &[f32] = &target_hidden_host[th_offset..];
+    //
+    // Fast path (ctx_slice == None, 2026-04-16): `draft_scratch.target_hidden`
+    // is already populated via D2D scatter at the END of the previous cycle
+    // (or seed_target_hidden_from_prompt for the first cycle). We pass
+    // `target_hidden = None` to draft_forward so it skips the H2D upload
+    // entirely — kills the per-cycle CPU roundtrip.
+    //
+    // ctx_slice=Some(N) still goes through the CPU shadow (target_hidden_host
+    // Vec) because its moving-window semantics don't map onto the append-only
+    // GPU buffer without an extra D2D shuffle. It's a diagnostic path anyway.
+    let (th_arg, _th_offset): (Option<&[f32]>, usize) = if ctx_slice.is_some() {
+        let th_offset = ctx_start * ne * h;
+        (Some(&target_hidden_host[th_offset..]), th_offset)
+    } else {
+        (None, 0)
+    };
 
     // ── 4. draft_forward ────────────────────────────────────────────────
     // noise_embedding = None: we wrote embeddings directly into
@@ -1779,7 +1864,7 @@ pub fn spec_step_dflash(
         draft_weights,
         draft_cfg,
         None,
-        Some(th_slice),
+        th_arg,
         &positions_q,
         &positions_k,
         b,
@@ -2091,9 +2176,32 @@ pub fn spec_step_dflash(
     // This matches the reference's `target_hidden = ...[:, :accept_len+1, :]`
     // pattern which slices the verify's hidden output to accept_len+1
     // rows — NOT accept_len+2.
-    let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
     let rows_to_keep = accept_len + 1;
-    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+    if ctx_slice.is_some() {
+        // ctx_slice path: CPU shadow still required for the window slice.
+        let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
+        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+    } else {
+        // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
+        // No D2H, no CPU reshape, no next-cycle H2D.
+        //
+        // Verify just wrote B slots to hidden_rb; we want the first
+        // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
+        // scatter function aligns to the verify-block origin, not the
+        // ring tail.
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            b,
+            rows_to_keep,
+        )?;
+        // Keep draft_forward's incremental-upload tracker in sync so any future
+        // ctx_slice=Some call in the same session doesn't try to re-upload what
+        // GPU already has; and so the assertion-in-draft path stays coherent.
+        draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
+    }
 
     // ── 10. Rewind DeltaNet + replay committed tokens ────────────────────
     // After verify, target state reflects B forwards. We need it to reflect

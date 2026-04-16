@@ -394,6 +394,20 @@ fn main() {
         &prompt_tokens,
     )
     .expect("seed target hidden");
+    // Mirror the prompt rows from the hidden ring buffer straight into
+    // draft_scratch.target_hidden on GPU. This primes the GPU-resident
+    // path in spec_step_dflash (ctx_slice=None) so it doesn't need to
+    // round-trip target_hidden through the CPU shadow each cycle.
+    speculative::scatter_hidden_block_to_interleaved(
+        &gpu,
+        &hidden_rb,
+        &draft_scratch.target_hidden,
+        0,
+        prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
+        prompt_tokens.len(), // n_rows:     keep all of them
+    )
+    .expect("seed scatter");
+    draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     eprintln!("prefill (per-token) in {:.2}s", t2.elapsed().as_secs_f64());
 
     // ── Initial seed_token: target's greedy pick after prefill ───────
