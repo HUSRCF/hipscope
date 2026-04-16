@@ -48,7 +48,12 @@ fn main() {
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
-    let mut adaptive_b: bool = false;
+    // Adaptive block size: on by default (2026-04-16). Shrinks B from 16
+    // → 8 when rolling τ drops below 4 so hard/creative prompts where the
+    // draft diverges per position don't pay the full 16-token verify cost.
+    // Empirically adds no regression on high-τ content (draft keeps up, τ
+    // recovers, B snaps back to 16). Opt out with --no-adaptive-b.
+    let mut adaptive_b: bool = true;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
     // CACTUS bumped acceptance (Hao & Mou 2026). 0.0 = vanilla SpS;
@@ -144,6 +149,10 @@ fn main() {
             }
             "--adaptive-b" => {
                 adaptive_b = true;
+                i += 1;
+            }
+            "--no-adaptive-b" => {
+                adaptive_b = false;
                 i += 1;
             }
             "--ngram" => {
@@ -598,13 +607,21 @@ fn main() {
             }
         }
         // Adaptive B: when rolling τ falls below threshold, shrink block_size
-        // to 8 to cut per-iter cost. Raise back to 16 when τ recovers. Only
-        // active when --adaptive-b is set.
+        // from 16 to 8 to lower per-cycle cost so we stay above AR when draft
+        // accuracy is poor. Raise back to 16 when τ recovers.
+        //
+        // Threshold tuning (2026-04-16, 9B MQ4 / 7900XTX):
+        //   AR is 7.58 ms/tok. B=16 cycle ~25 ms → break-even τ ≈ 2.3.
+        //   B=8 cycle ~16 ms → break-even τ ≈ 1.1.
+        //   B=16 amortizes per-cycle overhead better whenever τ clears 2.3,
+        //   so B=8 only wins against B=16 when τ stays in [1, 2.5].
+        // Use τ<2.5 as the trip wire; anything higher and B=16 is cleanly
+        // faster.
         let block_override = if adaptive_b {
             if accepts_window.len() >= 4 {
                 let win_tau: f64 =
                     accepts_window.iter().copied().sum::<usize>() as f64 / accepts_window.len() as f64;
-                if win_tau < 4.0 { Some(8usize) } else { None }
+                if win_tau < 2.5 { Some(8usize) } else { None }
             } else {
                 None
             }
