@@ -3156,6 +3156,11 @@ impl Gpu {
 
     /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
     /// x: [batch_size × K], y: [batch_size × M], both row-major.
+    ///
+    /// This is the portable scalar kernel — stays byte-exact with the AR
+    /// greedy prefill's numerical baseline. For the DFlash lm_head fast
+    /// path (batched, tolerates small FP16 drift for 8-10× speedup), use
+    /// `gemm_hfq4g256_batched_lmhead` instead.
     pub fn gemm_hfq4g256(
         &mut self,
         a_raw: &GpuTensor,
@@ -3199,6 +3204,47 @@ impl Gpu {
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
+    /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
+    /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).
+    ///
+    /// NOT numerically identical to `gemm_hfq4g256`. Uses FP16 tensor cores
+    /// with the accumulators in FP32 the residual kernel ships. On the
+    /// DFlash target-verify + draft-lm_head hot path this is a win (~13 ms
+    /// saved per cycle), and the small FP16 drift doesn't meaningfully
+    /// affect greedy acceptance. Do NOT use for AR greedy prefill — it will
+    /// break byte-exact quality-gate reproducibility.
+    ///
+    /// Fallbacks: non-gfx11 or HIPFIRE_FP16=0 or HIPFIRE_LM_HEAD_WMMA=0 →
+    /// routes to plain `gemm_hfq4g256`.
+    ///
+    /// Subtle: the residual-WMMA kernel goes through `ensure_fp16_x`, which
+    /// caches the FP32→FP16 conversion keyed on source pointer. DFlash
+    /// callers reuse the SAME hidden buffer pointer every cycle (draft
+    /// scratch sub-offset, verify's persistent final_hidden) but with NEW
+    /// data — so the cache entry is silently stale. Stomp the cache pointer
+    /// before the dispatch to force reconversion.
+    pub fn gemm_hfq4g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let wmma_eligible = batch_size > 1
+            && self.arch.starts_with("gfx11")
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+        if wmma_eligible {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+            self.hip.memset(&y.buf, 0, batch_size * m * 4)?;
+            return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
 
     // ========================================================================
