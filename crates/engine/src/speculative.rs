@@ -3014,9 +3014,17 @@ pub fn spec_step_ddtree_batched(
     //
     // argmax_per_pos[i] = target's argmax prediction at slot i in the
     // linearization, i.e. what comes AFTER the token at that slot.
+    // Sub-offset view sized to the exact big_n × big_n the current tree needs.
+    // scratch.attn_bias is sized for the worst case (max_n² = (1+max_budget)²),
+    // but when the actual tree is smaller (e.g. topk=1 linear-chain trees
+    // don't fill max_budget), forward_prefill_batch's assert rejects the
+    // oversized buffer. The kernel only ever reads up to big_n² floats via
+    // `tree_bias[row × block_cols + col]`, so a view is equivalent and keeps
+    // the assert semantics meaningful.
+    let attn_bias_view = scratch.attn_bias.sub_offset(0, big_n * big_n);
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
-        attn_bias: &scratch.attn_bias,
+        attn_bias: &attn_bias_view,
     };
     let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(
@@ -3060,8 +3068,16 @@ pub fn spec_step_ddtree_batched(
     // Slow path (topk>1 detour): re-capture tape on the committed prefix
     // with a second verify, then replay as before. Costs +1 forward but
     // keeps LA state byte-correct.
-    let fast_tape_ok = accepted_node_indices.iter().enumerate()
-        .all(|(i, &ni)| ni == i);
+    // HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when
+    // committed path == linearization prefix. Diagnostic — quantifies the
+    // cost of always re-running the committed tokens through a non-tree
+    // verify to fix KV cache entries at committed slots (topk>1 siblings
+    // at same depth otherwise race and the LAST write wins regardless of
+    // which sibling was committed).
+    let force_slow = std::env::var("HIPFIRE_DDTREE_FORCE_SLOW").ok().as_deref() == Some("1");
+    let fast_tape_ok = !force_slow
+        && accepted_node_indices.iter().enumerate()
+            .all(|(i, &ni)| ni == i);
     let hidden_rows_written;
     if fast_tape_ok {
         // Tape already captured in tree verify. Restore + replay directly.
