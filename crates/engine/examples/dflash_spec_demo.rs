@@ -82,6 +82,22 @@ fn main() {
     // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
     // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
+    // --chatml: wrap prompt in ChatML (<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n)
+    // — matches how infer_qwen35 calls the instruction-tuned Qwen3.5.
+    // Without this the model sees a bare continuation prompt and behaves
+    // erratically on non-obvious inputs (math, code).
+    let mut chatml: bool = false;
+    // --ar-baseline: skip DFlash entirely, greedy-decode via target only.
+    // Diagnostic for comparing DFlash outputs against pure-AR on the
+    // same tokenized prompt.
+    let mut ar_baseline: bool = false;
+    // --debug-cycle N: dump the seed/block/drafted/argmax_per_pos/accept
+    // for the first N cycles to help diagnose divergence.
+    let mut debug_cycles: usize = 0;
+    // --no-tape: disable GdnTape capture so spec_step_dflash replays via
+    // forward_prefill_batch on committed tokens (byte-exact vs AR when
+    // combined with HIPFIRE_PREFILL_BATCHED=0).
+    let mut no_tape: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -188,6 +204,22 @@ fn main() {
                 ddtree_enabled = true; // implies --ddtree
                 i += 1;
             }
+            "--chatml" => {
+                chatml = true;
+                i += 1;
+            }
+            "--ar-baseline" => {
+                ar_baseline = true;
+                i += 1;
+            }
+            "--debug-cycle" => {
+                debug_cycles = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--no-tape" => {
+                no_tape = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -264,7 +296,31 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
-    let prompt_tokens = tokenizer.encode(&prompt);
+    let mut prompt_tokens = tokenizer.encode(&prompt);
+    if chatml {
+        // Match infer_qwen35.rs: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n
+        let im_start = tokenizer.encode("<|im_start|>");
+        let im_end = tokenizer.encode("<|im_end|>");
+        let user = tokenizer.encode("user");
+        let asst = tokenizer.encode("assistant");
+        let nl = tokenizer.encode("\n");
+        let think = tokenizer.encode("<think>");
+        assert!(im_start.len() == 1, "tokenizer has no <|im_start|> special");
+        let mut chat = Vec::new();
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&user);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&prompt_tokens);
+        chat.extend_from_slice(&im_end);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&asst);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&think);
+        chat.extend_from_slice(&nl);
+        prompt_tokens = chat;
+        eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
+    }
     eprintln!("prompt: {:?}", prompt);
     eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
 
@@ -302,6 +358,19 @@ fn main() {
     // callers can switch strategies at runtime without reinit.
     let ddtree_scratch = engine::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
         .expect("alloc ddtree scratch");
+    // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
+    // rotation scratch, argmax buf). Sized to max_n = max(block_size,
+    // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
+    // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
+    // saving 0.5-1.5 ms/cycle.
+    let verify_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
+    let verify_scratch = engine::speculative::VerifyScratch::new(
+        &mut gpu,
+        verify_max_n,
+        target.config.dim,
+        target.config.vocab_size,
+        target.weights.output.k,
+    ).expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
@@ -432,6 +501,53 @@ fn main() {
     let mut profile_cycle_count: usize = 0;
     let mut profile_armed = false;
 
+    // ── AR baseline branch: skip DFlash, pure greedy AR via target ───
+    // Used to confirm whether the prompt + target alone are coherent.
+    // Same tokenization, same model, same greedy; isolates DFlash vs model.
+    if ar_baseline {
+        eprintln!("AR-BASELINE MODE: pure greedy target decode (no DFlash)");
+        let t_ar = Instant::now();
+        // Position already advanced to prompt_tokens.len() during prefill.
+        // seed_token = target's argmax at position `prompt_len` (first emit).
+        let mut cur_token = seed_token;
+        while emitted.len() < max_tokens {
+            if position >= ctx_capacity {
+                eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
+                break;
+            }
+            engine::qwen35::forward_scratch(
+                &mut gpu,
+                &target.weights,
+                &target.config,
+                cur_token,
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+            ).expect("ar forward");
+            let lg = gpu.download_f32(&target.scratch.logits).expect("logits");
+            let next = lg.iter().enumerate().fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv { (i as u32, v) } else { (best, bv) }
+            }).0;
+            emitted.push(next);
+            position += 1;
+            if next == eos_id {
+                eprintln!("eos");
+                break;
+            }
+            cur_token = next;
+        }
+        let ar_elapsed = t_ar.elapsed().as_secs_f64();
+        let text = tokenizer.decode(&emitted);
+        eprintln!("--- AR-BASELINE OUTPUT ---");
+        println!("{text}");
+        eprintln!("--------------------------");
+        eprintln!("emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
+                  emitted.len(), ar_elapsed, emitted.len() as f64 / ar_elapsed);
+        eprintln!("AR tokens: {:?}", emitted);
+        return;
+    }
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
@@ -544,6 +660,7 @@ fn main() {
                     &mut post_seed_snap,
                     &mut gdn_tape,
                     &ddtree_scratch,
+                    &verify_scratch,
                     position,
                     seed_token,
                     ctx_slice,
@@ -563,6 +680,7 @@ fn main() {
                     &mut target_snap,
                     &mut post_seed_snap,
                     &mut gdn_tape,
+                    &verify_scratch,
                     position,
                     seed_token,
                     ctx_slice,
@@ -581,10 +699,11 @@ fn main() {
                 &mut hidden_rb,
                 &mut target_hidden_host,
                 &mut target_snap,
+                &verify_scratch,
                 position,
                 seed_token,
                 ctx_slice,
-                Some(&mut gdn_tape),
+                if no_tape { None } else { Some(&mut gdn_tape) },
                 temp,
                 &mut rng_state,
                 block_override,
@@ -597,6 +716,24 @@ fn main() {
         };
         if used_pld {
             pld_accepted += step.accepted;
+        }
+
+        // Per-cycle debug for the first N cycles.
+        if stats.cycles < debug_cycles {
+            eprintln!(
+                "[cycle {}] pos={} seed={} committed={:?} bonus={} accepted={} τ={:.3}",
+                stats.cycles,
+                position,
+                seed_token,
+                step.committed.iter().skip(1).take(4).collect::<Vec<_>>(),
+                step.bonus_token,
+                step.accepted,
+                step.accepted as f64,
+            );
+            // Decode the first few committed tokens for visibility.
+            let preview: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+            let tx = tokenizer.decode(&preview);
+            eprintln!("  decoded-committed[1..]: {:?}", tx);
         }
 
         // Populate n-gram cache from newly committed tokens. `step.committed`
@@ -676,6 +813,7 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    eprintln!("DFlash tokens: {:?}", emitted);
     if pld_matcher.is_some() {
         let hit_rate = if stats.cycles > 0 {
             pld_hits as f32 / stats.cycles as f32
