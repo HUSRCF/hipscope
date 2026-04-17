@@ -386,13 +386,16 @@ fn main() {
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
     let mut prompt_tokens = tokenizer.encode(&prompt);
     if chatml {
-        // Match infer_qwen35.rs: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n
+        // Match daemon.rs production path: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n
+        // Do NOT pre-append `<think>\n` — Qwen3.5 opens a think block itself when
+        // needed, and forcing it pushes open-ended prompts into runaway
+        // chain-of-thought that loops (measured on rivers essay: baseline AR
+        // decays into ".*Wait, I need to be careful.*" repeats after ~600 tokens).
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
         let user = tokenizer.encode("user");
         let asst = tokenizer.encode("assistant");
         let nl = tokenizer.encode("\n");
-        let think = tokenizer.encode("<think>");
         assert!(im_start.len() == 1, "tokenizer has no <|im_start|> special");
         let mut chat = Vec::new();
         chat.extend_from_slice(&im_start);
@@ -403,8 +406,6 @@ fn main() {
         chat.extend_from_slice(&nl);
         chat.extend_from_slice(&im_start);
         chat.extend_from_slice(&asst);
-        chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&think);
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
         eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());

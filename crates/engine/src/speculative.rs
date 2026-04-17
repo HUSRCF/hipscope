@@ -495,8 +495,9 @@ impl GdnTape {
             if *lt != qwen35::LayerType::LinearAttention {
                 continue;
             }
-            let layer = match &weights.layers[layer_idx] {
-                qwen35::LayerWeights::DeltaNet(l) => l,
+            let conv_weight = match &weights.layers[layer_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => &l.conv_weight,
+                qwen35::LayerWeights::DeltaNetMoe(l) => &l.conv_weight,
                 _ => unreachable!("LA layer type mismatch in replay_gdn"),
             };
 
@@ -507,7 +508,7 @@ impl GdnTape {
                 &self.k_raw_scratch,
                 &self.v_scratch,
                 &self.qkv_bufs[la_idx],
-                &layer.conv_weight,
+                conv_weight,
                 &dn_state.conv_states[la_idx],
                 k_dim,
                 v_dim,
@@ -1416,7 +1417,6 @@ fn verify_dflash_block_inner(
     // the actual current `b` (≤ max_n) so downstream kernels see the right
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
-
     let batch_result = qwen35::forward_prefill_batch_with_pbs(
         gpu,
         &target.weights,
@@ -2060,6 +2060,21 @@ pub fn spec_step_dflash(
     target_snap.save_from(&target.dn_state, gpu)?;
     // Mutable variable to allow both verify capture + rollback replay usage.
     let mut gdn_tape_opt = gdn_tape;
+    // MoE targets can't populate the tape: forward_prefill_batch_with_pbs's
+    // eligibility check rejects MoE (qwen35.rs `DeltaNetMoe|FullAttnMoe => false`),
+    // so verify falls through to the per-token loop which doesn't write the
+    // tape. With Some(tape) downstream `replay_gdn` then runs on zero-init
+    // buffers, corrupting `dn_state.conv_states` and hanging the next cycle.
+    // Force None so the fallback replay path (batched forward on committed
+    // tokens) runs instead — correct at ~3-5 ms/cycle extra vs proper tape
+    // replay. Remove once batched MoE prefill + tape recording lands.
+    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
+        lw,
+        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
+    ));
+    if target_has_moe {
+        gdn_tape_opt = None;
+    }
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
