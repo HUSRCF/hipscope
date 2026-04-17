@@ -332,9 +332,10 @@ fn main() {
         draft_cfg.block_size,
         draft_cfg.target_layer_ids,
     );
-    // Load target first — its 15 GB of weights need contiguous VRAM, and
-    // allocating them after the 3.3 GB draft blob fragments the heap and
-    // OOMs on 24 GB cards. Draft weights + DflashScratch still fit after.
+    // Load target first — its 15 GB of weights need contiguous VRAM.
+    // Draft fits afterward because pool::alloc uses EXACT HIP allocation
+    // (pool.rs::alloc), so the target's per-layer buckets don't pad up
+    // to the next power of 2 and waste the room the draft needs.
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + draft_cfg.block_size + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
