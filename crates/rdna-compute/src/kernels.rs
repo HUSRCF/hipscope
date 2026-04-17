@@ -123,11 +123,24 @@ pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
 
+/// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
+/// gate_up GEMV. Block=[64,1,1] with 2 rows per block (one per warp) —
+/// halves the grid count vs the wave32 variant, which otherwise wastes
+/// half a wave64 per workgroup. Byte-exact math.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip");
+
 /// Index-aware MoE down GEMV — same pattern as the indexed gate_up,
 /// also reads scales from a device topk_weights buffer. Pairs with the
 /// GPU top-K kernel to make MoE decode hipGraph-capturable end-to-end.
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed.hip");
+
+/// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
+/// down-residual GEMV. Same 2-rows-per-block packing as the gate_up
+/// wave64 variant; atomicAdd semantics preserved per (row, krank).
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
 
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
@@ -142,11 +155,19 @@ pub const MOE_SOFTMAX_TOPK_K8_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip");
 
+/// CDNA3 wave64-native batched indexed MoE gate_up. 2 rows per block.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip");
+
 /// N-batched indexed MoE down + scaled residual. Mirrors the batched
 /// gate_up: grid.z = N, per-token routing + scaling, atomicAdd into
 /// x_residual[token×M..].
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched.hip");
+
+/// CDNA3 wave64-native batched indexed MoE down. 2 rows per block.
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
@@ -154,6 +175,10 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
 // for batched prefill (FFN down + wo projection) where N prompt tokens share
 // the same weight matrix.
 pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
+
+// CDNA3 wave64-native batched HFQ4-G256 residual GEMM. 2 rows per block
+// (one per warp), halves grid.x. Byte-exact with the wave32 kernel.
+pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64.hip");
 
 // FP16-packed variant: dequant to __half, v_pk_fma_f16 inner loop, FP32 accumulation.
 // 2× throughput over FP32 on all RDNA. Same grid/block layout.
@@ -175,6 +200,10 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
 pub const GEMM_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.hip");
+// CDNA3 wave64-native batched 4-way fused LA GEMM. 2 rows per block via
+// warp_id, halves grid.x. Byte-exact with wave32 base. Hottest DFlash
+// verify kernel on MI300X — targeted first for this port.
+pub const GEMM_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -184,6 +213,8 @@ pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/sr
 // Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FA layer projection.
 pub const GEMM_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.hip");
+// CDNA3 wave64-native batched 3-way fused FA preamble. 2 rows per block.
+pub const GEMM_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -229,10 +260,19 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../.
 // row counts. Works on every RDNA generation — see the kernel header.
 pub const FUSED_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip");
 
+// CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
+// two fused-qkvza rows per block (one per warp). Grid halves from total_m
+// to (total_m+1)/2. Byte-exact vs the wave32 base kernel.
+pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64.hip");
+
 // 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
 pub const FUSED_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip");
+
+// CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
+// block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
+pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip");
 // Note: 2-way fused gate+up uses the existing FUSED_GATE_UP_HFQ4G256_SRC
 // constant declared further down (kernels/src/fused_gate_up_hfq4g256.hip).
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
@@ -303,6 +343,8 @@ pub const GEMV_HFQ4G256_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv
 /// x layout: [batch_size × K] row-major. y layout: [batch_size × M] row-major.
 /// BATCH_TILE=8 keeps register pressure at ~26 VGPRs for good occupancy on RDNA.
 pub const GEMM_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256.hip");
+// CDNA3 wave64-native batched HFQ4-G256 GEMM (overwrite). 2 rows per block.
+pub const GEMM_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64.hip");
 
 
 /// Fused QKV Q4_K: three GEMVs in one kernel launch.

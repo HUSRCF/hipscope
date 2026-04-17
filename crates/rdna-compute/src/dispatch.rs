@@ -1520,11 +1520,23 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "fused_qkv_hfq4g256",
-            kernels::FUSED_QKV_HFQ4G256_SRC,
-            "fused_qkv_hfq4g256",
-        )?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna3 {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256_wave64",
+                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
+                "fused_qkv_hfq4g256_wave64",
+            )?;
+            let total = (q_m + k_m + v_m) as u32;
+            ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256",
+                kernels::FUSED_QKV_HFQ4G256_SRC,
+                "fused_qkv_hfq4g256",
+            )?;
+            ("fused_qkv_hfq4g256", [32u32, 1, 1], (q_m + k_m + v_m) as u32)
+        };
 
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
@@ -1552,13 +1564,12 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
 
-        let total_m = (q_m + k_m + v_m) as u32;
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256", bytes);
         let result = self.launch_maybe_blob(
-            "fused_qkv_hfq4g256", [total_m, 1, 1], [32, 1, 1], 0, &mut params,
+            func_name, [grid_x, 1, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xp);
@@ -1592,11 +1603,25 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "fused_qkvza_hfq4g256",
-            kernels::FUSED_QKVZA_HFQ4G256_SRC,
-            "fused_qkvza_hfq4g256",
-        )?;
+        // CDNA3 (MI300X / gfx94x) wave64-native path: 2 rows per block, halves
+        // grid count vs wave32 kernel which wastes half the wave slot.
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna3 {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wave64",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
+                "fused_qkvza_hfq4g256_wave64",
+            )?;
+            let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+            ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256",
+                kernels::FUSED_QKVZA_HFQ4G256_SRC,
+                "fused_qkvza_hfq4g256",
+            )?;
+            ("fused_qkvza_hfq4g256", [32u32, 1, 1], (qkv_m + z_m + beta_m + alpha_m) as u32)
+        };
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
         let ab = a_beta.buf.as_ptr();
@@ -1612,8 +1637,7 @@ impl Gpu {
         let a_m_i = alpha_m as i32;
         let k_i = k as i32;
 
-        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        let grid = [total_m, 1, 1];
+        let grid = [grid_x, 1, 1];
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(z_m, k)
@@ -1632,7 +1656,7 @@ impl Gpu {
             &k_i as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "fused_qkvza_hfq4g256", grid, [32, 1, 1], 0, &mut params,
+            func_name, grid, block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
@@ -1677,8 +1701,23 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        self.ensure_kernel("gemm_qkvza_hfq4g256", kernels::GEMM_QKVZA_HFQ4G256_SRC, "gemm_qkvza_hfq4g256")?;
-        let func = &self.functions["gemm_qkvza_hfq4g256"];
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemm_qkvza_hfq4g256_wave64",
+                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC,
+                "gemm_qkvza_hfq4g256_wave64",
+            )?;
+            ("gemm_qkvza_hfq4g256_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_qkvza_hfq4g256",
+                kernels::GEMM_QKVZA_HFQ4G256_SRC,
+                "gemm_qkvza_hfq4g256",
+            )?;
+            ("gemm_qkvza_hfq4g256", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -1716,6 +1755,7 @@ impl Gpu {
 
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let grid_x = (total_m + grid_div - 1) / grid_div;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(z_m, k)
@@ -1725,8 +1765,8 @@ impl Gpu {
         let result = unsafe {
             self.hip.launch_kernel(
                 func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
+                [grid_x, batch_tiles as u32, 1],
+                block,
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -1908,8 +1948,23 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkv_hfq4g256_fp16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        self.ensure_kernel("gemm_qkv_hfq4g256", kernels::GEMM_QKV_HFQ4G256_SRC, "gemm_qkv_hfq4g256")?;
-        let func = &self.functions["gemm_qkv_hfq4g256"];
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemm_qkv_hfq4g256_wave64",
+                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC,
+                "gemm_qkv_hfq4g256_wave64",
+            )?;
+            ("gemm_qkv_hfq4g256_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_qkv_hfq4g256",
+                kernels::GEMM_QKV_HFQ4G256_SRC,
+                "gemm_qkv_hfq4g256",
+            )?;
+            ("gemm_qkv_hfq4g256", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -1941,6 +1996,7 @@ impl Gpu {
 
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (q_m + k_m + v_m) as u32;
+        let grid_x = (total_m + grid_div - 1) / grid_div;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
@@ -1949,8 +2005,8 @@ impl Gpu {
         let result = unsafe {
             self.hip.launch_kernel(
                 func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
+                [grid_x, batch_tiles as u32, 1],
+                block,
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -2969,11 +3025,22 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_gate_up_indexed",
-            kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
-            "gemv_hfq4g256_moe_gate_up_k8_indexed",
-        )?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+            )?;
+            ("gemv_hfq4g256_moe_gate_up_k8_indexed_wave64", [64u32, 1, 1], ((m as u32) + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )?;
+            ("gemv_hfq4g256_moe_gate_up_k8_indexed", [32u32, 1, 1], m as u32)
+        };
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -2995,8 +3062,8 @@ impl Gpu {
             &self.hip, "gemv", "gemv_hfq4g256_moe_gate_up_k8_indexed", bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_gate_up_k8_indexed",
-            [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            func_name,
+            [grid_x, 8, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
@@ -3022,11 +3089,22 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_down_indexed",
-            kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC,
-            "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed",
-        )?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_indexed_wave64",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64",
+            )?;
+            ("gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64", [64u32, 1, 1], ((m as u32) + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_indexed",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC,
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed",
+            )?;
+            ("gemv_hfq4g256_moe_down_residual_scaled_k8_indexed", [32u32, 1, 1], m as u32)
+        };
         let pp  = expert_ptrs.buf.as_ptr();
         let ip  = topk_indices.buf.as_ptr();
         let wp  = topk_weights.buf.as_ptr();
@@ -3048,8 +3126,8 @@ impl Gpu {
             &self.hip, "gemv", "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed", bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed",
-            [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            func_name,
+            [grid_x, 8, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
@@ -3122,11 +3200,22 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_gate_up_indexed_batched",
-            kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
-        )?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
+            )?;
+            ("gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_batched",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
+            )?;
+            ("gemv_hfq4g256_moe_gate_up_k8_indexed_batched", [32, 1, 1], 1)
+        };
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -3149,9 +3238,10 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip, "gemv", "gemv_hfq4g256_moe_gate_up_k8_indexed_batched", bytes,
         );
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_gate_up_k8_indexed_batched",
-            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            func_name,
+            [grid_x, k_top as u32, batch_size as u32], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
@@ -3178,11 +3268,22 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_down_indexed_batched",
-            kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC,
-            "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
-        )?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_indexed_batched_wave64",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
+            )?;
+            ("gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_indexed_batched",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC,
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
+            )?;
+            ("gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched", [32, 1, 1], 1)
+        };
         let pp  = expert_ptrs.buf.as_ptr();
         let ip  = topk_indices.buf.as_ptr();
         let wp  = topk_weights.buf.as_ptr();
@@ -3205,9 +3306,10 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip, "gemv", "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched", bytes,
         );
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
-            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            func_name,
+            [grid_x, k_top as u32, batch_size as u32], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
@@ -3249,8 +3351,23 @@ impl Gpu {
             // FP16 packed on all other RDNA: ~15% prefill improvement
             return self.gemm_hfq4g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
-        self.ensure_kernel("gemm_hfq4g256_residual", kernels::GEMM_HFQ4G256_RESIDUAL_SRC, "gemm_hfq4g256_residual")?;
-        let func = &self.functions["gemm_hfq4g256_residual"];
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemm_hfq4g256_residual_wave64",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                "gemm_hfq4g256_residual_wave64",
+            )?;
+            ("gemm_hfq4g256_residual_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_hfq4g256_residual",
+                kernels::GEMM_HFQ4G256_RESIDUAL_SRC,
+                "gemm_hfq4g256_residual",
+            )?;
+            ("gemm_hfq4g256_residual", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -3269,6 +3386,7 @@ impl Gpu {
         ];
 
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
 
         // Bandwidth: weight (read once, amortized across the batch loop on-chip
         // via L1/L2), per-batch x read, per-batch y read-modify-write.
@@ -3279,8 +3397,8 @@ impl Gpu {
         let result = unsafe {
             self.hip.launch_kernel(
                 func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
+                [grid_x, batch_tiles as u32, 1],
+                block,
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -3473,7 +3591,22 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemm_hfq4g256", kernels::GEMM_HFQ4G256_SRC, "gemm_hfq4g256")?;
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemm_hfq4g256_wave64",
+                kernels::GEMM_HFQ4G256_WAVE64_SRC,
+                "gemm_hfq4g256_wave64",
+            )?;
+            ("gemm_hfq4g256_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_hfq4g256",
+                kernels::GEMM_HFQ4G256_SRC,
+                "gemm_hfq4g256",
+            )?;
+            ("gemm_hfq4g256", [32, 1, 1], 1)
+        };
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -3492,12 +3625,13 @@ impl Gpu {
         ];
 
         let batch_tiles = { const BATCH_TILE: usize = 8; ((batch_size + BATCH_TILE - 1) / BATCH_TILE) as u32 };
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
         let bytes = crate::profile::gemm_hfq4g256_bytes(m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemm_hfq4g256", bytes);
         let result = self.launch_maybe_blob(
-            "gemm_hfq4g256",
-            [m as u32, batch_tiles, 1],
-            [32, 1, 1],
+            func_name,
+            [grid_x, batch_tiles, 1],
+            block,
             0,
             &mut params,
             || {
@@ -9172,6 +9306,35 @@ impl Gpu {
                             kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_gate_up_hfq4g256",
                             kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
+                // CDNA3 (MI300X / gfx94x) wave64-native variants — cut
+                // wavefront pressure in half on the three hottest kernels
+                // (30 LA fused + 40 MoE gate_up + 40 MoE down per token
+                // on A3B). Wave32 block=[32,1,1] kernels otherwise waste
+                // the upper 32 lanes of every wave slot.
+                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                    // Single-token (draft / single-layer paths).
+                    specs.push(("fused_qkvza_hfq4g256_wave64",
+                                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_qkv_hfq4g256_wave64",
+                                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string()));
+                    // Batched (DFlash verify path — hottest).
+                    specs.push(("gemm_qkvza_hfq4g256_wave64",
+                                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_qkv_hfq4g256_wave64",
+                                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_hfq4g256_wave64",
+                                kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_hfq4g256_residual_wave64",
+                                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_down_indexed_batched_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                }
                 // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
                 // Empirically slower than the single-row kernel on gfx1100 at all
                 // tested matrix sizes (see commit log / multi-row kernel header),
@@ -9202,6 +9365,31 @@ impl Gpu {
                             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
+                // CDNA3 wave64 variants — see hfq4 branch for rationale.
+                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                    // Single-token (draft / single-layer paths).
+                    specs.push(("fused_qkvza_hfq4g256_wave64",
+                                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_qkv_hfq4g256_wave64",
+                                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string()));
+                    // Batched (DFlash verify path — hottest).
+                    specs.push(("gemm_qkvza_hfq4g256_wave64",
+                                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_qkv_hfq4g256_wave64",
+                                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_hfq4g256_wave64",
+                                kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("gemm_hfq4g256_residual_wave64",
+                                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_moe_down_indexed_batched_wave64",
+                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                }
             }
             "q8" => {
                 specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
