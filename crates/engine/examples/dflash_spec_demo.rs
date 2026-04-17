@@ -108,11 +108,16 @@ fn main() {
     // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
     // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
-    // --chatml: wrap prompt in ChatML (<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n)
-    // — matches how infer_qwen35 calls the instruction-tuned Qwen3.5.
-    // Without this the model sees a bare continuation prompt and behaves
-    // erratically on non-obvious inputs (math, code).
-    let mut chatml: bool = false;
+    // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
+    // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
+    // Default ON (2026-04-17): bare prompts send the model off-distribution.
+    // Empirically the draft's acceptance rate on raw Qwen3.5 creative prompts
+    // drops to τ<1.5 (vs τ≈5 with ChatML) — measured on 27B rivers-essay:
+    // bare gives 20 tok/s, ChatML gives 40 tok/s with identical target, draft,
+    // and kv_mode. The gap is the draft predicting a structured distribution
+    // vs a garbled one. Opt out via --no-chatml for the diagnostic
+    // "pure continuation" case.
+    let mut chatml: bool = true;
     // --ar-baseline: skip DFlash entirely, greedy-decode via target only.
     // Diagnostic for comparing DFlash outputs against pure-AR on the
     // same tokenized prompt.
@@ -248,6 +253,10 @@ fn main() {
             }
             "--chatml" => {
                 chatml = true;
+                i += 1;
+            }
+            "--no-chatml" => {
+                chatml = false;
                 i += 1;
             }
             "--ar-baseline" => {
