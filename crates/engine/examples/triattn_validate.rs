@@ -139,17 +139,19 @@ fn main() {
         for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
         for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
         let max_len = tokens.len().min(kv_seq.saturating_sub(4));
-        for (pos, tid) in tokens.iter().take(max_len).enumerate() {
-            qwen35::forward_scratch(
-                &mut gpu, &weights, &config, *tid, pos,
-                &mut kv, &mut dn, &scratch,
-            ).expect("calib forward");
-            total_tokens += 1;
-            if total_tokens >= max_tokens { break 'outer; }
-        }
+        let remaining = max_tokens.saturating_sub(total_tokens);
+        let take_len = max_len.min(remaining);
+        if take_len == 0 { break 'outer; }
+        qwen35::forward_prefill_batch(
+            &mut gpu, &weights, &config, &tokens[..take_len], 0,
+            &mut kv, &mut dn, &scratch,
+            None, None, None, None,
+        ).expect("calib batched forward");
+        total_tokens += take_len;
         if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
             eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
         }
+        if total_tokens >= max_tokens { break 'outer; }
     }
 
     let calib = triattn::take_tap().expect("tap still installed");

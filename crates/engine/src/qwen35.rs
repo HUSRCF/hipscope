@@ -3202,6 +3202,20 @@ fn forward_prefill_chunk(
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
 
+                if crate::triattn::tap_enabled() {
+                    let n_q = config.n_heads * config.head_dim;
+                    let n_k = config.n_kv_heads * config.head_dim;
+                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                    for b in 0..n {
+                        crate::triattn::record_prerope_qk(
+                            layer_idx,
+                            &q_cpu[b * n_q..(b + 1) * n_q],
+                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                        );
+                    }
+                }
+
                 // 5. Batched partial-interleaved RoPE (per-row positions).
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
@@ -3621,6 +3635,19 @@ fn forward_prefill_chunk(
                     &pbs.fa_k_batch, &layer.k_norm, &pbs.fa_k_batch,
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
+                if crate::triattn::tap_enabled() {
+                    let n_q = config.n_heads * config.head_dim;
+                    let n_k = config.n_kv_heads * config.head_dim;
+                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                    for b in 0..n {
+                        crate::triattn::record_prerope_qk(
+                            layer_idx,
+                            &q_cpu[b * n_q..(b + 1) * n_q],
+                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                        );
+                    }
+                }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.positions,
