@@ -38,6 +38,11 @@ fn gemv_rows_default(arch: &str) -> u32 {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => 1,
         "gfx1030" | "gfx1031" => 1,
+        // CDNA3 (MI300X): wave64 native. `gemv_hfq4g256_wide` uses
+        // block=[64,1,1] = exactly one wave — zero lane waste. The 32-
+        // thread multirow variants run on half a wave, so the wide
+        // kernel is the natural fit. Return rows=1 to trigger use_wide.
+        "gfx940" | "gfx941" | "gfx942" => 1,
         _ => 2,
     }
 }
