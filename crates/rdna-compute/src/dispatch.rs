@@ -6989,6 +6989,109 @@ impl Gpu {
         }
     }
 
+    /// CASK m-folding merge for asym3 K (givens3).
+    ///
+    /// Same calling convention as `kv_fold_q8` but takes `head_dim` (whole head)
+    /// since asym3 doesn't block-wise split. One thread block per
+    /// (slot, kv_head), 32 threads.
+    pub fn kv_fold_asym3(
+        &mut self,
+        src: &GpuTensor, dst: &GpuTensor,
+        src_indices: &GpuTensor, src_weights: &GpuTensor,
+        n_kv: usize, head_dim: usize, m: usize, budget: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_fold_asym3", kernels::KV_FOLD_ASYM3_SRC, "kv_fold_asym3")?;
+        let func = &self.functions["kv_fold_asym3"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ip = src_indices.buf.as_ptr();
+        let mut wp = src_weights.buf.as_ptr();
+        let mut nkv = n_kv as i32;
+        let mut hd = head_dim as i32;
+        let mut mi = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [budget as u32, n_kv as u32, 1],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// CASK m-folding merge for asym4 K (givens4).
+    pub fn kv_fold_asym4(
+        &mut self,
+        src: &GpuTensor, dst: &GpuTensor,
+        src_indices: &GpuTensor, src_weights: &GpuTensor,
+        n_kv: usize, head_dim: usize, m: usize, budget: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_fold_asym4", kernels::KV_FOLD_ASYM4_SRC, "kv_fold_asym4")?;
+        let func = &self.functions["kv_fold_asym4"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ip = src_indices.buf.as_ptr();
+        let mut wp = src_weights.buf.as_ptr();
+        let mut nkv = n_kv as i32;
+        let mut hd = head_dim as i32;
+        let mut mi = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [budget as u32, n_kv as u32, 1],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// CASK m-folding merge for asym2 K (givens2).
+    pub fn kv_fold_asym2(
+        &mut self,
+        src: &GpuTensor, dst: &GpuTensor,
+        src_indices: &GpuTensor, src_weights: &GpuTensor,
+        n_kv: usize, head_dim: usize, m: usize, budget: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_fold_asym2", kernels::KV_FOLD_ASYM2_SRC, "kv_fold_asym2")?;
+        let func = &self.functions["kv_fold_asym2"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ip = src_indices.buf.as_ptr();
+        let mut wp = src_weights.buf.as_ptr();
+        let mut nkv = n_kv as i32;
+        let mut hd = head_dim as i32;
+        let mut mi = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [budget as u32, n_kv as u32, 1],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
     pub fn kv_cache_write_q8(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,

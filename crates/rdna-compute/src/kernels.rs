@@ -520,6 +520,15 @@ pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_co
 /// CASK m-folding merge: weighted-average m Q8_0 rows into 1 per slot (arXiv:2604.10900).
 pub const KV_FOLD_Q8_SRC: &str = include_str!("../../../kernels/src/kv_fold_q8.hip");
 
+/// CASK m-folding merge for asym3 K (givens-rotated 3-bit).
+pub const KV_FOLD_ASYM3_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym3.hip");
+
+/// CASK m-folding merge for asym4 K (givens-rotated 4-bit).
+pub const KV_FOLD_ASYM4_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym4.hip");
+
+/// CASK m-folding merge for asym2 K (givens-rotated 2-bit).
+pub const KV_FOLD_ASYM2_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym2.hip");
+
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
