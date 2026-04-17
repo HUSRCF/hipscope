@@ -129,6 +129,25 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed.hip");
 
+/// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
+/// for the single-token kernel when prefilling N tokens through an MoE
+/// layer; one workgroup per token. Enables batched MoE prefill.
+pub const MOE_SOFTMAX_TOPK_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_softmax_topk_k8_batched.hip");
+
+/// N-batched indexed MoE gate_up GEMV. Extends the single-token indexed
+/// variant with a batch dimension (grid.z = N). Each (token, k-slot)
+/// block picks its own expert via topk_indices[token×K_TOP + slot] and
+/// reads the token's x row from x[token×K..].
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip");
+
+/// N-batched indexed MoE down + scaled residual. Mirrors the batched
+/// gate_up: grid.z = N, per-token routing + scaling, atomicAdd into
+/// x_residual[token×M..].
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
