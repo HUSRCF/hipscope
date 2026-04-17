@@ -36,6 +36,7 @@ fn main() {
     let mut validation_prompt = String::from(
         "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
     );
+    let mut load_sidecar = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -44,9 +45,10 @@ fn main() {
             "--max-tokens" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
             "--chunk-len" => { chunk_len = args[i + 1].parse().unwrap(); i += 2; }
             "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
+            "--load-sidecar" => { load_sidecar = true; i += 1; }
             s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar]");
                 std::process::exit(1);
             }
         }
@@ -116,49 +118,60 @@ fn main() {
     let mut dn = DeltaNetState::new(&mut gpu, &config).expect("dn");
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
 
-    // ── Phase 1: Calibrate ─────────────────────────────────────────────
-    eprintln!(
-        "calibration: {} prompts, {} FA layers × {} heads × {} bands",
-        calibration_prompts.len(),
-        config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count(),
-        config.n_heads,
-        config.head_dim / 2,
-    );
-    let calib = TriAttnCalibState::new(
-        config.n_layers, config.n_heads, config.head_dim,
-        config.rope_theta, config.partial_rotary_factor,
-    );
-    triattn::install_tap(calib);
+    // ── Phase 1: Calibrate (or load existing sidecar) ─────────────────
+    let centers = if load_sidecar {
+        eprintln!("loading sidecar from {sidecar_path}");
+        let c = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");
+        eprintln!(
+            "loaded: n_layers={} n_heads={} n_bands={} head_dim={}",
+            c.n_layers, c.n_heads, c.n_bands(), c.head_dim,
+        );
+        c
+    } else {
+        eprintln!(
+            "calibration: {} prompts, {} FA layers × {} heads × {} bands",
+            calibration_prompts.len(),
+            config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count(),
+            config.n_heads,
+            config.head_dim / 2,
+        );
+        let calib_state = TriAttnCalibState::new(
+            config.n_layers, config.n_heads, config.head_dim,
+            config.rope_theta, config.partial_rotary_factor,
+        );
+        triattn::install_tap(calib_state);
 
-    let mut total_tokens = 0usize;
-    'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
-        let tokens = tok.encode(p);
-        for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-        for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-        for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-        for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-        for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-        let max_len = tokens.len().min(kv_seq.saturating_sub(4));
-        let remaining = max_tokens.saturating_sub(total_tokens);
-        let take_len = max_len.min(remaining);
-        if take_len == 0 { break 'outer; }
-        qwen35::forward_prefill_batch(
-            &mut gpu, &weights, &config, &tokens[..take_len], 0,
-            &mut kv, &mut dn, &scratch,
-            None, None, None, None,
-        ).expect("calib batched forward");
-        total_tokens += take_len;
-        if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
-            eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
+        let mut total_tokens = 0usize;
+        'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
+            let tokens = tok.encode(p);
+            for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+            for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+            for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            let max_len = tokens.len().min(kv_seq.saturating_sub(4));
+            let remaining = max_tokens.saturating_sub(total_tokens);
+            let take_len = max_len.min(remaining);
+            if take_len == 0 { break 'outer; }
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config, &tokens[..take_len], 0,
+                &mut kv, &mut dn, &scratch,
+                None, None, None, None,
+            ).expect("calib batched forward");
+            total_tokens += take_len;
+            if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
+                eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
+            }
+            if total_tokens >= max_tokens { break 'outer; }
         }
-        if total_tokens >= max_tokens { break 'outer; }
-    }
 
-    let calib = triattn::take_tap().expect("tap still installed");
-    eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
-    let centers = calib.finalize();
-    centers.save(Path::new(&sidecar_path)).expect("save sidecar");
-    eprintln!("saved sidecar: {sidecar_path}");
+        let calib = triattn::take_tap().expect("tap still installed");
+        eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
+        let c = calib.finalize();
+        c.save(Path::new(&sidecar_path)).expect("save sidecar");
+        eprintln!("saved sidecar: {sidecar_path}");
+        c
+    };
 
     report_mrl_distribution(&centers);
 
