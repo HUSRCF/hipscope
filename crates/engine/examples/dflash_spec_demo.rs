@@ -21,14 +21,35 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use engine::cask::CaskCtx;
     use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
     use engine::hfq::HfqFile;
+    use engine::qwen35::LayerType;
     use engine::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
     use engine::tokenizer::Tokenizer;
+    use engine::triattn::{EvictionCtx, TriAttnCenters};
     use std::path::Path;
     use std::time::Instant;
+
+    enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
+    impl CaskPolicy {
+        fn maybe_evict(&self, gpu: &mut rdna_compute::Gpu, kv: &mut engine::llama::KvCache, physical: usize)
+            -> hip_bridge::HipResult<Option<usize>>
+        {
+            match self {
+                CaskPolicy::Plain(c) => c.maybe_evict(gpu, kv, physical),
+                CaskPolicy::Cask(c) => c.maybe_evict(gpu, kv, physical),
+            }
+        }
+        fn eviction_count(&self) -> usize {
+            match self {
+                CaskPolicy::Plain(c) => c.eviction_count.get(),
+                CaskPolicy::Cask(c) => c.eviction_count(),
+            }
+        }
+    }
 
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
@@ -103,6 +124,18 @@ fn main() {
     // forward_prefill_batch on committed tokens (byte-exact vs AR when
     // combined with HIPFIRE_PREFILL_BATCHED=0).
     let mut no_tape: bool = false;
+
+    // FlashCASK: TriAttention scoring + CASK core-aware m-folding merge
+    // applied to target.kv_cache between spec_step cycles. Passes the
+    // compact_offset math through target's forward pass automatically
+    // (qwen35::forward_scratch already reads kv_cache.compact_offset for
+    // RoPE phase). Only opt-in — keep spec demo unchanged by default.
+    let mut cask_sidecar: Option<String> = None;
+    let mut cask_budget: usize = 512;
+    let mut cask_beta: usize = 128;
+    let mut use_cask: bool = false;
+    let mut cask_core_frac: f32 = 0.5;
+    let mut cask_fold_m: usize = 2;
 
     let mut i = 1;
     while i < args.len() {
@@ -229,6 +262,30 @@ fn main() {
                 no_tape = true;
                 i += 1;
             }
+            "--cask-sidecar" => {
+                cask_sidecar = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--cask" => {
+                use_cask = true;
+                i += 1;
+            }
+            "--cask-budget" => {
+                cask_budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--cask-beta" => {
+                cask_beta = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--cask-core-frac" => {
+                cask_core_frac = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--cask-fold-m" => {
+                cask_fold_m = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -249,6 +306,14 @@ fn main() {
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
+    let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
+        if let Ok((free, total)) = hip.get_vram_info() {
+            let used_gb = (total - free) as f64 / 1e9;
+            let free_gb = free as f64 / 1e9;
+            eprintln!("VRAM @ {label}: used {used_gb:.2} GB, free {free_gb:.2} GB");
+        }
+    };
+    vram_report(&gpu.hip, "init");
 
     // ── Load draft ────────────────────────────────────────────────────
     let draft_hfq = HfqFile::open(Path::new(&draft_path)).expect("open draft");
@@ -267,18 +332,9 @@ fn main() {
         draft_cfg.block_size,
         draft_cfg.target_layer_ids,
     );
-    let t0 = Instant::now();
-    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft");
-    eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
-
-    let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity, draft_weights.has_mq,
-    ).expect("alloc draft scratch");
-    if draft_weights.has_mq {
-        eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
-    }
-
-    // ── Load target ───────────────────────────────────────────────────
+    // Load target first — its 15 GB of weights need contiguous VRAM, and
+    // allocating them after the 3.3 GB draft blob fragments the heap and
+    // OOMs on 24 GB cards. Draft weights + DflashScratch still fit after.
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + draft_cfg.block_size + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
@@ -296,6 +352,19 @@ fn main() {
     let mut target =
         ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg).expect("load target");
     eprintln!("target loaded in {:.2}s", t1.elapsed().as_secs_f64());
+    vram_report(&gpu.hip, "after target load");
+
+    let t0 = Instant::now();
+    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft");
+    eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
+    vram_report(&gpu.hip, "after draft load");
+
+    let mut draft_scratch = DflashScratch::new_with_mq(
+        &mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity, draft_weights.has_mq,
+    ).expect("alloc draft scratch");
+    if draft_weights.has_mq {
+        eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
+    }
 
     // ── Check vocab compatibility ─────────────────────────────────────
     assert_eq!(
@@ -410,6 +479,55 @@ fn main() {
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     eprintln!("prefill (per-token) in {:.2}s", t2.elapsed().as_secs_f64());
 
+    // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
+    // The policy evicts target.kv_cache between spec_step cycles.
+    // compact_offset is maintained on kv_cache itself, so qwen35's
+    // forward_scratch sees the right RoPE phase without extra plumbing.
+    let cask_policy: Option<CaskPolicy> = if let Some(path) = cask_sidecar.as_ref() {
+        let centers = TriAttnCenters::load(Path::new(path)).expect("load cask sidecar");
+        let fa_layer_ids: Vec<usize> = target.config.layer_types.iter().enumerate()
+            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+            .collect();
+        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
+        // Ensure target KV has enough headroom for budget+beta+B+margin. The
+        // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
+        // don't resize here; just assert.
+        assert!(
+            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_cfg.block_size + 4,
+            "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
+            target.kv_cache.max_seq,
+            cask_budget + cask_beta + draft_cfg.block_size + 4,
+        );
+        let base = EvictionCtx::new(
+            &mut gpu, &centers, fa_layer_ids,
+            cask_budget, cask_beta,
+            target.config.n_heads, target.config.n_kv_heads, target.config.head_dim,
+            n_rot, target.config.rope_theta, target.kv_cache.max_seq,
+        ).expect("build EvictionCtx for FlashCASK");
+        Some(if use_cask {
+            eprintln!("FlashCASK: CASK α={:.2} m={} budget={} β={}", cask_core_frac, cask_fold_m, cask_budget, cask_beta);
+            CaskPolicy::Cask(CaskCtx::new(base, cask_core_frac, cask_fold_m))
+        } else {
+            eprintln!("FlashCASK: TriAttention (plain) budget={} β={}", cask_budget, cask_beta);
+            CaskPolicy::Plain(base)
+        })
+    } else { None };
+
+    // Post-prefill eviction: if the prompt already filled past the
+    // threshold, compact once before decoding so the spec loop starts at
+    // budget-sized physical state.
+    let mut position: usize = prompt_tokens.len();
+    if let Some(ref p) = cask_policy {
+        if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+            .expect("post-prefill cask evict") {
+            eprintln!(
+                "FlashCASK: post-prefill compact {} -> {} (compact_offset={})",
+                position, new_phys, target.kv_cache.compact_offset,
+            );
+            position = new_phys;
+        }
+    }
+
     // ── Initial seed_token: target's greedy pick after prefill ───────
     // Target state is at position `prompt_len` after seed_target_hidden_from_prompt.
     // Its scratch.logits at this point corresponds to the LAST prompt token's output —
@@ -429,7 +547,8 @@ fn main() {
 
     // ── Decode loop ───────────────────────────────────────────────────
     let mut emitted: Vec<u32> = vec![first_token];
-    let mut position: usize = prompt_tokens.len();
+    // `position` was already declared above (it may have been advanced by a
+    // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
     let mut stats = SpecStats::new(draft_cfg.block_size);
     let eos_id: u32 = tokenizer.eos_id;
@@ -554,6 +673,12 @@ fn main() {
             }).0;
             emitted.push(next);
             position += 1;
+            if let Some(ref p) = cask_policy {
+                if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                    .expect("ar cask evict") {
+                    position = new_phys;
+                }
+            }
             if next == eos_id {
                 eprintln!("eos");
                 break;
@@ -840,6 +965,16 @@ fn main() {
         position += step.accepted + 1;
         seed_token = step.bonus_token;
 
+        // FlashCASK eviction. Fires when target.kv_cache physical hits
+        // budget+β. compact_offset is maintained on the cache so the next
+        // cycle's target.forward_scratch uses the right RoPE phase.
+        if let Some(ref p) = cask_policy {
+            if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                .expect("spec cask evict") {
+                position = new_phys;
+            }
+        }
+
         // Stop on EOS.
         if step.committed.iter().skip(1).any(|&t| t == eos_id) {
             eprintln!("eos");
@@ -868,6 +1003,13 @@ fn main() {
         stats.tau(),
         stats.mean_committed(),
     );
+    if let Some(ref p) = cask_policy {
+        eprintln!(
+            "FlashCASK: {} evictions  final compact_offset={}",
+            p.eviction_count(),
+            target.kv_cache.compact_offset,
+        );
+    }
     let accept_rate = if stats.cycles > 0 {
         stats.accepted_tokens as f32 / (stats.cycles * (draft_cfg.block_size - 1)) as f32
     } else {
