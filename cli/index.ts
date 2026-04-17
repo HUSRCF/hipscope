@@ -178,6 +178,22 @@ function applyThinkingMode(systemPrompt: string | undefined, thinking: string): 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
 // params (max_seq). The tag is optional — pass it from the caller when known,
 // else we fall back to global cfg.
+// Per-model-size KV default. Layer-count compounding of K-quant noise on
+// deep stacks (≥27B) flips argmax at decision boundaries under asym3; asym4
+// divergence stays stable ~30% longer at a trivial +32 MB/2K-ctx cost.
+// Only bumps when the resolved mode matches the arch default AND the user
+// hasn't set HIPFIRE_KV_MODE in the environment. Any explicit override
+// (config set, per-model config, env var) passes through unchanged.
+function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string | null): string {
+  if (baseMode !== "asym3") return baseMode;
+  if (process.env.HIPFIRE_KV_MODE) return baseMode; // explicit env wins
+  if (resolved.kv_cache !== ARCH_DEFAULTS.kv_cache) return baseMode; // explicit config/per-model
+  if (!tag) return baseMode;
+  const t = resolveModelTag(tag).toLowerCase();
+  const isLarge = t.includes(":27b") || t.includes(":35b") || t.includes("-27b") || t.includes("-35b");
+  return isLarge ? "asym4" : baseMode;
+}
+
 function buildLoadMessage(path: string, tag?: string | null): any {
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
@@ -189,6 +205,16 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
   }
   const params: any = { max_seq };
+
+  // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
+  // applies size-aware default so 27B+ gets asym4 automatically. Daemon
+  // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
+  const baseMode = resolveKvMode(resolved);
+  const effectiveMode = sizeAwareKvMode(baseMode, resolved, tag);
+  if (effectiveMode !== baseMode) {
+    console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
+  }
+  params.kv_mode = effectiveMode;
 
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
   // decode fast path that triggers on temperature==0 requests. Two sources:

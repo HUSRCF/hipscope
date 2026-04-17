@@ -47,6 +47,18 @@ fn main() {
         ("Question: What planet is closest to the sun? Answer:", "mercury"),
         ("Question: Solve 3x = 21. Divide both sides by 3: x =", "7"),
         ("Question: In what year did World War II end? Answer:", "1945"),
+        // Arithmetic word problems (GSM8K-shaped, single-number final answer).
+        // Answers are distinctive enough that a substring match is reliable.
+        ("Question: A train travels at 60 mph for 2.5 hours. How many miles? Let me compute: 60 × 2.5 =", "150"),
+        ("Question: 15% of 80 is what? Compute: 80 × 0.15 =", "12"),
+        ("Question: A square has a side length of 7 cm. Its perimeter is 4 × 7 =", "28"),
+        ("Question: The average of 10, 20, and 30 is (10 + 20 + 30) / 3 = 60 / 3 =", "20"),
+        ("Question: How many days are in a leap year? Answer:", "366"),
+        ("Question: What is 12 squared? 12 × 12 =", "144"),
+        ("Question: A shirt costs $40 with 25% off. Discount is 40 × 0.25 = $10. Final price: 40 - 10 =", "30"),
+        ("Question: How many hours in 3 days? 24 × 3 =", "72"),
+        ("Question: If 4 apples cost $2, how much do 10 apples cost? Price per apple: 2/4 = 0.5. Total: 10 × 0.5 =", "5"),
+        ("Question: What is the 5th prime number? 2, 3, 5, 7, 11. The 5th is", "11"),
     ];
 
     let budget_fractions: &[f32] = &[1.00, 0.50, 0.25];

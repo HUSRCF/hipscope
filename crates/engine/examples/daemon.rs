@@ -226,7 +226,9 @@ fn main() {
                 // logged but don't fail the load.
                 let draft_path = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
-                match load_model(path, max_seq, draft_path.as_deref(), &mut gpu) {
+                let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -483,8 +485,15 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_default();
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+    // Per-load kv_mode (sent in load message params) overrides the env var.
+    // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
+    // since layer-count compounding of asym3 noise flips argmax at decision
+    // boundaries on deep stacks.
+    let kv_mode = kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;

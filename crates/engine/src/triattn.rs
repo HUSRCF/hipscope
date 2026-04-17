@@ -591,7 +591,8 @@ impl EvictionCtx {
         let q8_bpp = n_kv_heads * (head_dim / 32) * 34;
         let asym3_k_bpp = n_kv_heads * (4 + (head_dim * 3) / 8);
         let asym4_k_bpp = n_kv_heads * (4 + head_dim / 2);
-        let widest_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp);
+        let asym2_k_bpp = n_kv_heads * (4 + head_dim / 4);
+        let widest_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
 
         let scores_buf = gpu.alloc_tensor(&[n_heads * max_seq], DType::F32)?;
         let k_compact = gpu.zeros(&[(budget * widest_bpp + 3) / 4], DType::F32)?;
@@ -622,15 +623,17 @@ impl EvictionCtx {
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
 
-        enum Mode { Q8, Asym3, Asym4 }
+        enum Mode { Q8, Asym2, Asym3, Asym4 }
         let (mode, k_bytes_per_pos) = if kv.quant_asym3 {
             (Mode::Asym3, self.n_kv_heads * (4 + (self.head_dim * 3) / 8))
         } else if kv.quant_asym4 {
             (Mode::Asym4, self.n_kv_heads * (4 + self.head_dim / 2))
+        } else if kv.quant_asym2 {
+            (Mode::Asym2, self.n_kv_heads * (4 + self.head_dim / 4))
         } else if kv.quant_q8 {
             (Mode::Q8, self.n_kv_heads * (self.head_dim / 32) * 34)
         } else {
-            panic!("TriAttention eviction only supports Q8, asym3, asym4 KV modes for now");
+            panic!("TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now");
         };
         let v_bytes_per_pos = self.n_kv_heads * (self.head_dim / 32) * 34;
 
@@ -650,6 +653,14 @@ impl EvictionCtx {
                     &kv.k_gpu[layer_idx], &centers_layer,
                     kv.givens_cos.as_ref().expect("asym4 KV must have cos table"),
                     kv.givens_sin.as_ref().expect("asym4 KV must have sin table"),
+                    &self.scores_buf,
+                    self.n_heads, self.n_kv_heads, self.head_dim,
+                    self.n_rot, self.rope_theta, p_q, current_physical,
+                )?,
+                Mode::Asym2 => gpu.triattn_score_asym2(
+                    &kv.k_gpu[layer_idx], &centers_layer,
+                    kv.givens_cos.as_ref().expect("asym2 KV must have cos table"),
+                    kv.givens_sin.as_ref().expect("asym2 KV must have sin table"),
                     &self.scores_buf,
                     self.n_heads, self.n_kv_heads, self.head_dim,
                     self.n_rot, self.rope_theta, p_q, current_physical,
