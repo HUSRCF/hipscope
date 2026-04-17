@@ -1,22 +1,28 @@
-//! triattn_infer — minimal command-line TriAttention inference.
+//! triattn_infer — minimal command-line TriAttention / CASK inference.
 //!
 //! Parallel to the daemon but with TriAttention eviction baked in. Accepts
 //! a prompt from stdin (if present) or `--prompt`, runs greedy decode on
-//! Qwen 3.5 with periodic eviction via EvictionCtx, prints the generated
-//! continuation to stdout. Use this binary (or copy its `prefill + decode`
-//! loop into your own driver) when you want long-context behavior without
-//! scaling the KV cache with the prompt.
+//! Qwen 3.5 with periodic eviction, prints the generated continuation to
+//! stdout. Use this binary (or copy its `prefill + decode` loop into your
+//! own driver) when you want long-context behavior without scaling the KV
+//! cache with the prompt.
 //!
 //! Usage:
 //!   triattn_infer --model PATH --sidecar PATH [--kv-mode asym3|asym4|q8]
 //!                 [--budget 512] [--beta 128] [--max-tokens 256]
+//!                 [--cask] [--core-frac 0.5] [--fold-m 2]
 //!                 [--prompt "..."]  (or pipe the prompt on stdin)
+//!
+//! `--cask` enables the CASK core-aware m-folding policy on top of
+//! TriAttention scoring (arXiv:2604.10900). Only applies to --kv-mode q8
+//! in v1; other modes silently fall back to plain TriAttention.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use engine::cask::CaskCtx;
     use engine::hfq::HfqFile;
     use engine::llama::{self, KvCache};
     use engine::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
@@ -26,6 +32,24 @@ fn main() {
     use std::io::{Read, Write};
     use std::path::Path;
 
+    enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
+    impl Policy {
+        fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
+            -> hip_bridge::HipResult<Option<usize>>
+        {
+            match self {
+                Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
+                Policy::Cask(c) => c.maybe_evict(gpu, kv, physical),
+            }
+        }
+        fn eviction_count(&self) -> usize {
+            match self {
+                Policy::Plain(c) => c.eviction_count.get(),
+                Policy::Cask(c) => c.eviction_count(),
+            }
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let mut model: Option<String> = None;
     let mut sidecar: Option<String> = None;
@@ -34,6 +58,9 @@ fn main() {
     let mut beta: usize = 128;
     let mut max_tokens: usize = 256;
     let mut prompt_arg: Option<String> = None;
+    let mut use_cask = false;
+    let mut core_frac: f32 = 0.5;
+    let mut fold_m: usize = 2;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -44,6 +71,9 @@ fn main() {
             "--beta" => { beta = args[i + 1].parse().unwrap(); i += 2; }
             "--max-tokens" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
             "--prompt" => { prompt_arg = Some(args[i + 1].clone()); i += 2; }
+            "--cask" => { use_cask = true; i += 1; }
+            "--core-frac" => { core_frac = args[i + 1].parse().unwrap(); i += 2; }
+            "--fold-m" => { fold_m = args[i + 1].parse().unwrap(); i += 2; }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -89,12 +119,17 @@ fn main() {
     let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
-    let ctx = EvictionCtx::new(
+    let base = EvictionCtx::new(
         &mut gpu, &centers, fa_layer_ids.clone(),
         budget, beta,
         config.n_heads, config.n_kv_heads, config.head_dim,
         n_rot, config.rope_theta, kv_seq,
     ).expect("build EvictionCtx");
+    let ctx = if use_cask {
+        Policy::Cask(CaskCtx::new(base, core_frac, fold_m))
+    } else {
+        Policy::Plain(base)
+    };
 
     // ChatML wrap — matches daemon's generate() framing so outputs are
     // consistent with the normal serve path.
@@ -119,9 +154,14 @@ fn main() {
     toks.extend_from_slice(&think);
     toks.extend_from_slice(&nl);
 
+    let policy_tag = if use_cask {
+        format!("CASK(core_frac={:.2}, m={})", core_frac, fold_m)
+    } else {
+        "TriAttention".to_string()
+    };
     eprintln!(
-        "triattn_infer: {} prompt tokens, budget={} beta={} kv_mode={} max_tokens={}",
-        toks.len(), budget, beta, kv_mode, max_tokens,
+        "triattn_infer: {} prompt tokens, budget={} beta={} kv_mode={} policy={} max_tokens={}",
+        toks.len(), budget, beta, kv_mode, policy_tag, max_tokens,
     );
 
     // Prefill with in-loop eviction so long prompts don't exceed the cache.
@@ -133,11 +173,13 @@ fn main() {
         if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
             physical = new_phys;
         }
+        #[allow(unused)]
+        let _ = &ctx;
     }
     let t_prefill = t0.elapsed();
     eprintln!(
         "[triattn] prefill: {:.2}s  physical={} compact_offset={} evictions={}",
-        t_prefill.as_secs_f64(), physical, kv.compact_offset, ctx.eviction_count.get(),
+        t_prefill.as_secs_f64(), physical, kv.compact_offset, ctx.eviction_count(),
     );
 
     // Decode greedy.
@@ -157,6 +199,8 @@ fn main() {
         if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
             physical = new_phys;
         }
+        #[allow(unused)]
+        let _ = &ctx;
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next = llama::argmax(&logits);
         if next == config.eos_token { break; }
@@ -172,6 +216,6 @@ fn main() {
     eprintln!(
         "\n[triattn] decode: {} tokens in {:.2}s = {:.1} tok/s  total_evictions={}  final_compact_offset={}",
         emitted.len(), t_decode.as_secs_f64(), decode_tps,
-        ctx.eviction_count.get(), kv.compact_offset,
+        ctx.eviction_count(), kv.compact_offset,
     );
 }

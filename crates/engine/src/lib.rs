@@ -15,5 +15,7 @@ pub mod dflash;
 pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
+#[cfg(feature = "deltanet")]
+pub mod cask;
 pub mod image;
 pub mod tokenizer;

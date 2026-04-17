@@ -17,6 +17,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use engine::cask::CaskCtx;
     use engine::hfq::HfqFile;
     use engine::llama::{self, KvCache};
     use engine::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
@@ -25,15 +26,47 @@ fn main() {
     use rdna_compute::Gpu;
     use std::path::Path;
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: triattn_accuracy_sweep <model> <sidecar> [kv_mode=asym3] [gen=48]");
+    enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
+    impl Policy {
+        fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
+            -> hip_bridge::HipResult<Option<usize>>
+        {
+            match self {
+                Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
+                Policy::Cask(c) => c.maybe_evict(gpu, kv, physical),
+            }
+        }
+        fn eviction_count(&self) -> usize {
+            match self {
+                Policy::Plain(c) => c.eviction_count.get(),
+                Policy::Cask(c) => c.eviction_count(),
+            }
+        }
+    }
+
+    // Positional args first, then optional flags.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let mut positional: Vec<String> = Vec::new();
+    let mut use_cask = false;
+    let mut core_frac: f32 = 0.5;
+    let mut fold_m: usize = 2;
+    let mut i = 1;
+    while i < raw_args.len() {
+        match raw_args[i].as_str() {
+            "--cask" => { use_cask = true; i += 1; }
+            "--core-frac" => { core_frac = raw_args[i + 1].parse().unwrap(); i += 2; }
+            "--fold-m" => { fold_m = raw_args[i + 1].parse().unwrap(); i += 2; }
+            _ => { positional.push(raw_args[i].clone()); i += 1; }
+        }
+    }
+    if positional.len() < 2 {
+        eprintln!("Usage: triattn_accuracy_sweep <model> <sidecar> [kv_mode=asym3] [gen=48] [--cask] [--core-frac 0.5] [--fold-m 2]");
         std::process::exit(1);
     }
-    let model_path = &args[1];
-    let sidecar_path = &args[2];
-    let kv_mode: String = args.get(3).cloned().unwrap_or_else(|| "asym3".into());
-    let gen_len: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(48);
+    let model_path = &positional[0];
+    let sidecar_path = &positional[1];
+    let kv_mode: String = positional.get(2).cloned().unwrap_or_else(|| "asym3".into());
+    let gen_len: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(48);
 
     // (prompt, expected answer substring — lowercased). Prompts chosen
     // to be small enough that the baseline passes; failures under
@@ -81,8 +114,13 @@ fn main() {
         _ => KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, seq).unwrap(),
     };
 
-    eprintln!("Accuracy sweep: {} prompts × {} budgets (kv={}, gen={})",
-        test_cases.len(), budget_fractions.len(), kv_mode, gen_len);
+    let policy_tag = if use_cask {
+        format!("CASK(α={:.2}, m={})", core_frac, fold_m)
+    } else {
+        "TriAttention".to_string()
+    };
+    eprintln!("Accuracy sweep: {} prompts × {} budgets (kv={}, policy={}, gen={})",
+        test_cases.len(), budget_fractions.len(), kv_mode, policy_tag, gen_len);
 
     // results[fraction_idx] = (pass_count, fail_count)
     let mut results: Vec<(usize, usize)> = budget_fractions.iter().map(|_| (0, 0)).collect();
@@ -113,12 +151,17 @@ fn main() {
             }
 
             let ctx_opt = if frac < 0.999 {
-                Some(EvictionCtx::new(
+                let base = EvictionCtx::new(
                     &mut gpu, &centers, fa_layer_ids.clone(),
                     budget, beta,
                     config.n_heads, config.n_kv_heads, config.head_dim,
                     n_rot, config.rope_theta, kv.max_seq,
-                ).unwrap())
+                ).unwrap();
+                Some(if use_cask {
+                    Policy::Cask(CaskCtx::new(base, core_frac, fold_m))
+                } else {
+                    Policy::Plain(base)
+                })
             } else { None };
 
             let mut physical = 0usize;
@@ -149,7 +192,7 @@ fn main() {
             }
             let text = tok.decode(&emitted).to_lowercase();
             let pass = text.contains(expected);
-            let ev = ctx_opt.as_ref().map(|c| c.eviction_count.get()).unwrap_or(0);
+            let ev = ctx_opt.as_ref().map(|c| c.eviction_count()).unwrap_or(0);
             if pass {
                 results[fi].0 += 1;
             } else {

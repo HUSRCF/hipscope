@@ -36,6 +36,7 @@ docs/superpowers/
 .dflash-ref-hf/
 .dflash-ref-hf-4b/
 dflash-papers/
+kv_research/
 
 # Python
 __pycache__/
