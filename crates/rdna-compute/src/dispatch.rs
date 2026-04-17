@@ -363,19 +363,34 @@ impl Gpu {
             self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
         }
 
-        // Convert only if source changed
-        if self.fp16_x_source_ptr != src_ptr {
-            let conv_func = &self.functions["convert_f32_to_f16"];
-            let mut in_ptr = src_ptr;
-            let mut out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
-            let mut n_val = n_elems as i32;
+        // Under graph capture, convert EVERY call: the src/dst pointers are
+        // stable (PrefillBatchScratch + persistent FP16 scratch), but the
+        // DATA at src changes every replay, so the captured convert-node
+        // needs to re-run. The pointer-equality cache would wrongly skip
+        // the node and read stale FP16 on replay. During normal dispatch
+        // the skip is still correct.
+        let must_convert = self.capture_mode || self.fp16_x_source_ptr != src_ptr;
+        if must_convert {
+            let in_ptr = src_ptr;
+            let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
+            let n_val = n_elems as i32;
+            let mut in_ptr_m = in_ptr;
+            let mut out_ptr_m = out_ptr;
+            let mut n_val_m = n_val;
             let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr as *mut _ as *mut c_void,
-                &mut out_ptr as *mut _ as *mut c_void,
-                &mut n_val as *mut _ as *mut c_void,
+                &mut in_ptr_m as *mut _ as *mut c_void,
+                &mut out_ptr_m as *mut _ as *mut c_void,
+                &mut n_val_m as *mut _ as *mut c_void,
             ];
             let grid = ((n_elems + 255) / 256) as u32;
-            unsafe { self.hip.launch_kernel(conv_func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut conv_params)?; }
+            self.launch_maybe_blob(
+                "convert_f32_to_f16", [grid, 1, 1], [256, 1, 1], 0, &mut conv_params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
+                    b
+                },
+            )?;
             self.fp16_x_source_ptr = src_ptr;
         }
 
@@ -2263,8 +2278,6 @@ impl Gpu {
         self.ensure_kernel("gemm_qkvza_hfq4g256_wmma", kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC, "gemm_qkvza_hfq4g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        // WMMA GEMM (16x16 output tiles)
-        let func = &self.functions["gemm_qkvza_hfq4g256_wmma"];
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
         let mut ab = a_beta.buf.as_ptr();
@@ -2310,16 +2323,22 @@ impl Gpu {
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_wmma", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_hfq4g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m); b.push_i32(z_m_val); b.push_i32(b_m); b.push_i32(a_m);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -2338,8 +2357,6 @@ impl Gpu {
         self.ensure_kernel("gemm_qkv_hfq4g256_wmma", kernels::GEMM_QKV_HFQ4G256_WMMA_SRC, "gemm_qkv_hfq4g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        // WMMA GEMM (16x16 output tiles)
-        let func = &self.functions["gemm_qkv_hfq4g256_wmma"];
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
         let mut av = a_v.buf.as_ptr();
@@ -2378,16 +2395,22 @@ impl Gpu {
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_hfq4g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -2406,8 +2429,6 @@ impl Gpu {
         self.ensure_kernel("gemm_gate_up_hfq4g256_wmma", kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC, "gemm_gate_up_hfq4g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        // WMMA GEMM (16x16 output tiles)
-        let func = &self.functions["gemm_gate_up_hfq4g256_wmma"];
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
         let mut xp = x_f16_ptr;
@@ -2439,16 +2460,21 @@ impl Gpu {
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_wmma", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_hfq4g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(g_m); b.push_i32(u_m); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -3066,8 +3092,6 @@ impl Gpu {
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        // WMMA GEMM
-        let func = &self.functions[kernel_name];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -3091,16 +3115,19 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [block_size, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -8163,7 +8190,6 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
-        let func = &self.functions["gated_delta_net_q8"];
 
         let n_tiles = (128 / 4) as u32;
 
@@ -8199,16 +8225,21 @@ impl Gpu {
         // happens once at the end instead of per-token, reducing noise
         // accumulation. Not byte-exact with N×1 decode calls but
         // strictly higher quality.
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_heads as u32, n_tiles, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
