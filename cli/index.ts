@@ -188,7 +188,47 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   if (max_seq > resolved.max_seq) {
     console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
   }
-  return { type: "load", model: path, params: { max_seq } };
+  const params: any = { max_seq };
+
+  // Optional DFlash draft. The daemon wires this into a greedy speculative-
+  // decode fast path that triggers on temperature==0 requests. Two sources:
+  //
+  // 1. Explicit override: HIPFIRE_DFLASH_DRAFT=<path> on the serve process.
+  //    Highest priority — lets ops force a specific draft regardless of
+  //    target name. Pass "" (empty string) to disable even when a matching
+  //    draft would otherwise be found.
+  //
+  // 2. Auto-match: look alongside the target for a file named
+  //    `qwen35-<size>-dflash-<quant>.hfq`. Size is extracted from the target
+  //    path (e.g. `qwen3.5-27b.mq4` → size=27b). Only runs when #1 is unset.
+  //
+  // If the draft file is missing the daemon logs a warning and falls back
+  // to AR (no client-visible error).
+  const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
+  if (explicit !== undefined) {
+    if (explicit.length > 0) params.draft = explicit;
+    // empty-string → explicit opt-out; leave draft unset
+  } else {
+    const bn = basename(path);
+    const m = bn.match(/qwen3?\.?5[-_]?([^.\-_]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+    if (m) {
+      const size = m[1].toLowerCase();
+      const quant = m[2].toLowerCase();
+      const candidates = [
+        resolve(`${process.cwd()}/models/qwen35-${size}-dflash-${quant}.hfq`),
+        resolve(`${process.cwd()}/../../models/qwen35-${size}-dflash-${quant}.hfq`),
+        resolve(`${homedir()}/.hipfire/models/qwen35-${size}-dflash-${quant}.hfq`),
+      ];
+      for (const c of candidates) {
+        if (existsSync(c)) {
+          params.draft = c;
+          console.error(`[hipfire] DFlash draft detected: ${c}`);
+          break;
+        }
+      }
+    }
+  }
+  return { type: "load", model: path, params };
 }
 
 // ─── Model Registry ─────────────────────────────────────

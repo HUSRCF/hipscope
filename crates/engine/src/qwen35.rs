@@ -46,7 +46,7 @@ pub struct TreeVerifyCtx<'a> {
     pub attn_bias: &'a GpuTensor,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
