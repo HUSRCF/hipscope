@@ -3215,9 +3215,29 @@ fn run_fa_layer_body(
     let kv_dim = config.n_kv_heads * config.head_dim;
     gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
+    if crate::triattn::tap_enabled() {
+        let n_q = config.n_heads * config.head_dim;
+        let n_k = config.n_kv_heads * config.head_dim;
+        let q_cpu = gpu.download_f32(&s.fa_q)?;
+        let k_cpu = gpu.download_f32(&s.fa_k)?;
+        crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+    }
+
+    // If TriAttention has compacted the cache, absolute RoPE phase diverges
+    // from the physical cache index. Temporarily load the absolute position
+    // into pos_buf for the rope call, then restore the physical position
+    // for kv_cache_write + flash attention (which both want the write slot).
+    if kv_cache.compact_offset > 0 {
+        let abs = (pos + kv_cache.compact_offset) as i32;
+        gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+    }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
         config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+    if kv_cache.compact_offset > 0 {
+        let phys = pos as i32;
+        gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+    }
 
     if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -3572,9 +3592,25 @@ fn forward_scratch_layers(
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
+                if crate::triattn::tap_enabled() {
+                    let n_q = config.n_heads * config.head_dim;
+                    let n_k = config.n_kv_heads * config.head_dim;
+                    let q_cpu = gpu.download_f32(&s.fa_q)?;
+                    let k_cpu = gpu.download_f32(&s.fa_k)?;
+                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                }
+
+                if kv_cache.compact_offset > 0 {
+                    let abs = (pos + kv_cache.compact_offset) as i32;
+                    gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                if kv_cache.compact_offset > 0 {
+                    let phys = pos as i32;
+                    gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                }
 
                 if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -3821,9 +3857,25 @@ fn forward_scratch_layers(
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
+                if crate::triattn::tap_enabled() {
+                    let n_q = config.n_heads * config.head_dim;
+                    let n_k = config.n_kv_heads * config.head_dim;
+                    let q_cpu = gpu.download_f32(&s.fa_q)?;
+                    let k_cpu = gpu.download_f32(&s.fa_k)?;
+                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                }
+
+                if kv_cache.compact_offset > 0 {
+                    let abs = (pos + kv_cache.compact_offset) as i32;
+                    gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                if kv_cache.compact_offset > 0 {
+                    let phys = pos as i32;
+                    gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                }
 
                 if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();

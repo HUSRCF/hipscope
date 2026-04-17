@@ -6640,6 +6640,239 @@ impl Gpu {
         }
     }
 
+    /// TriAttention importance scoring over a Q8 post-RoPE K cache.
+    /// Produces one score per cached position per query head; caller picks
+    /// top-B for eviction (see arXiv:2604.04921 §4).
+    ///
+    /// `centers`: `[n_heads × n_bands × 3]` float32 packed as
+    /// `(Re(E[q_f]), Im(E[q_f]), E[||q_f||])`. `scores`: `[n_heads × seq_len]`
+    /// float32 output. One block per (pos, head); 32 threads reduce across
+    /// the head's frequency bands.
+    pub fn triattn_score_q8(
+        &mut self,
+        k_cache: &GpuTensor,
+        centers: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "triattn_score_q8",
+            kernels::TRIATTN_SCORE_Q8_SRC,
+            "triattn_score_q8",
+        )?;
+        let func = &self.functions["triattn_score_q8"];
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut s_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// TriAttention importance scoring over an asym4 post-RoPE K cache.
+    /// Same shape as `triattn_score_asym3` but reads the 4-bit nibble
+    /// layout and the TURBO_C4 codebook.
+    pub fn triattn_score_asym4(
+        &mut self,
+        k_cache: &GpuTensor,
+        centers: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel(
+            "triattn_score_asym4",
+            kernels::TRIATTN_SCORE_ASYM4_SRC,
+            "triattn_score_asym4",
+        )?;
+        let func = &self.functions["triattn_score_asym4"];
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut ct_ptr = cos_theta.buf.as_ptr();
+        let mut st_ptr = sin_theta.buf.as_ptr();
+        let mut s_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut ct_ptr as *mut _ as *mut c_void,
+            &mut st_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// TriAttention importance scoring over an asym3 post-RoPE K cache.
+    /// Same contract as `triattn_score_q8` but reads asym3's Givens-rotated
+    /// 3-bit layout and applies the inverse Givens rotation on the fly to
+    /// recover post-RoPE K per band.
+    pub fn triattn_score_asym3(
+        &mut self,
+        k_cache: &GpuTensor,
+        centers: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel(
+            "triattn_score_asym3",
+            kernels::TRIATTN_SCORE_ASYM3_SRC,
+            "triattn_score_asym3",
+        )?;
+        let func = &self.functions["triattn_score_asym3"];
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut ct_ptr = cos_theta.buf.as_ptr();
+        let mut st_ptr = sin_theta.buf.as_ptr();
+        let mut s_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut ct_ptr as *mut _ as *mut c_void,
+            &mut st_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Compact a KV cache row by row: writes `dst[new_pos] = src[retain[new_pos]]`
+    /// for `new_pos` in `[0, budget)`. Works for any byte-addressable cache
+    /// layout — pass the layout's bytes-per-position.
+    ///
+    /// `retain_indices` must live on the device. Caller allocates `dst` with
+    /// at least `budget × bytes_per_pos` bytes of capacity.
+    pub fn kv_compact_gather(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        retain_indices: &GpuTensor,
+        bytes_per_pos: usize,
+        budget: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "kv_compact_gather",
+            kernels::KV_COMPACT_GATHER_SRC,
+            "kv_compact_gather",
+        )?;
+        let func = &self.functions["kv_compact_gather"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut rp = retain_indices.buf.as_ptr();
+        let mut bpp = bytes_per_pos as i32;
+        let mut b = budget as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut bpp as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+        ];
+        // Choose thread count to saturate per-row bandwidth: ~1 thread per
+        // 16-byte chunk, capped at 256 threads per block.
+        let threads = ((bytes_per_pos / 16) as u32).clamp(32, 256);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [budget as u32, 1, 1],
+                [threads, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
     pub fn kv_cache_write_q8(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,

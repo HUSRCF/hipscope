@@ -502,6 +502,18 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
+/// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
+pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
+
+/// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
+pub const TRIATTN_SCORE_ASYM3_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym3.hip");
+
+/// TriAttention scoring on asym4 (Givens-rotated 4-bit) K cache.
+pub const TRIATTN_SCORE_ASYM4_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym4.hip");
+
+/// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
+pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
+
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.

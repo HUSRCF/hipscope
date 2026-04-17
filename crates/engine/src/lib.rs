@@ -13,5 +13,7 @@ pub mod speculative;
 pub mod dflash;
 #[cfg(feature = "deltanet")]
 pub mod ddtree;
+#[cfg(feature = "deltanet")]
+pub mod triattn;
 pub mod image;
 pub mod tokenizer;
