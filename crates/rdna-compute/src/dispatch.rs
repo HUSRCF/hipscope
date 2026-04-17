@@ -6935,6 +6935,60 @@ impl Gpu {
         }
     }
 
+    /// CASK m-folding merge for Q8_0 KV cache (arXiv:2604.10900).
+    ///
+    /// Computes `budget` output rows from `budget × m` source rows via
+    /// weighted average + per-block requantization. Core (singleton)
+    /// slots are handled uniformly by the caller: set `src_indices[s×m]`
+    /// to the core source position and `src_weights[s×m] = 1.0`, rest = 0.
+    ///
+    /// All tensors live on the device. Caller allocates `dst` with at
+    /// least `budget × n_kv × n_blocks × 34` bytes.
+    pub fn kv_fold_q8(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        src_indices: &GpuTensor,     // [budget × m] i32
+        src_weights: &GpuTensor,     // [budget × m] f32
+        n_kv: usize,
+        n_blocks: usize,
+        m: usize,
+        budget: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "kv_fold_q8",
+            kernels::KV_FOLD_Q8_SRC,
+            "kv_fold_q8",
+        )?;
+        let func = &self.functions["kv_fold_q8"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ip = src_indices.buf.as_ptr();
+        let mut wp = src_weights.buf.as_ptr();
+        let mut nkv = n_kv as i32;
+        let mut nb = n_blocks as i32;
+        let mut mi = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [budget as u32, n_kv as u32, n_blocks as u32],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
     pub fn kv_cache_write_q8(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,

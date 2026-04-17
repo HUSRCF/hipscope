@@ -24,6 +24,11 @@ use crate::triattn::EvictionCtx;
 use hip_bridge::HipResult;
 use rdna_compute::Gpu;
 
+/// Hard cap on per-slot fold factor. The per-slot slot table is a fixed
+/// stack array of size MAX_FOLD_M to avoid per-eviction heap allocation
+/// of m-sized vectors. m=2 and m=4 are typical; m=8 is an upper bound.
+const MAX_FOLD_M: usize = 8;
+
 /// Core-Aware Selective KV Compression policy.
 ///
 /// Wraps a TriAttention `EvictionCtx` — scoring, kernels, scratch all
@@ -98,8 +103,15 @@ impl CaskCtx {
         let n_blocks = d / 32;
         let row_bytes = n_kv * n_blocks * 34;
 
+        // Scratch GPU buffers for per-layer (indices, weights) table. Small
+        // (budget × m × 4 B each), allocated once per call. Reusing across
+        // layers to avoid repeated allocs.
+        let table_len = budget * self.fold_m;
+        let indices_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
+        let weights_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
+
         for (fa_i, &layer_idx) in self.base.fa_layer_ids.iter().enumerate() {
-            // 1. TriAttention scoring.
+            // 1. TriAttention scoring (GPU).
             let offset = fa_i * self.base.centers_per_layer;
             let centers_layer = self.base.centers_dev
                 .sub_offset(offset, self.base.centers_per_layer);
@@ -111,7 +123,7 @@ impl CaskCtx {
             gpu.hip.device_synchronize()?;
             let scores = gpu.download_f32(&self.base.scores_buf)?;
 
-            // 2. Aggregate: per-head z-score, then max across heads.
+            // 2. Aggregate (CPU, small): per-head z-score, max across heads.
             let agg = aggregate_scores(
                 &scores[..self.base.n_heads * current_physical],
                 self.base.n_heads, current_physical,
@@ -128,74 +140,86 @@ impl CaskCtx {
             let scratch_idx: Vec<u32> = scratch_ranked.iter().map(|(_, i)| *i as u32).collect();
             let scratch_scores: Vec<f32> = scratch_ranked.iter().map(|(s, _)| *s).collect();
 
-            // 4. Download full layer K and V — small (<1 MB per layer) and
-            //    simpler than a gather kernel for v1.
-            let mut k_all = vec![0u8; current_physical * row_bytes];
-            let mut v_all = vec![0u8; current_physical * row_bytes];
-            gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
-            gpu.hip.memcpy_dtoh(&mut v_all, &kv.v_gpu[layer_idx].buf)?;
+            // 4. Build per-slot (indices, weights) table. Core slots pad with
+            //    weight=0 for unused entries (kernel skips them). Merge slots
+            //    hold m source positions with softmax weights.
+            //
+            //    Slots are sorted by effective position: core = its own pos,
+            //    merge = weighted-centroid of group. Gives temporal order in
+            //    the compacted cache.
+            let mut entries: Vec<(u32, [(u32, f32); MAX_FOLD_M])> = Vec::with_capacity(budget);
 
-            // 5. Group scratch tokens by L2-K similarity.
-            let mut merged_k = vec![0u8; merge_slots * row_bytes];
-            let mut merged_v = vec![0u8; merge_slots * row_bytes];
-            let mut merged_pos = Vec::with_capacity(merge_slots);
+            for &pos in &core_idx {
+                let mut slot = [(0u32, 0.0f32); MAX_FOLD_M];
+                slot[0] = (pos, 1.0);
+                for s in &mut slot[1..self.fold_m] { s.0 = pos; }  // indices safe; weights 0
+                entries.push((pos, slot));
+            }
 
             if merge_slots > 0 {
-                let groups = greedy_group_by_l2(
-                    &k_all, &scratch_idx, n_kv, d, self.fold_m,
-                );
-                // 6. Fold each group: softmax over z-scores weights a weighted
-                //    avg of dequantized K and V, then requant block-wise.
-                for (slot, group) in groups.iter().enumerate() {
+                // K download is only needed for grouping, not for the fold itself.
+                let mut k_all = vec![0u8; current_physical * row_bytes];
+                gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
+                let groups = greedy_group_by_l2(&k_all, &scratch_idx, n_kv, d, self.fold_m);
+                for group in &groups {
                     let abs_positions: Vec<u32> = group.iter().map(|&gi| scratch_idx[gi]).collect();
                     let raw_scores: Vec<f32> = group.iter().map(|&gi| scratch_scores[gi]).collect();
                     let weights = softmax(&raw_scores);
 
-                    let k_row = weighted_avg_q8(&k_all, &abs_positions, &weights, n_kv, d);
-                    let v_row = weighted_avg_q8(&v_all, &abs_positions, &weights, n_kv, d);
-                    merged_k[slot * row_bytes..(slot + 1) * row_bytes].copy_from_slice(&k_row);
-                    merged_v[slot * row_bytes..(slot + 1) * row_bytes].copy_from_slice(&v_row);
-
-                    // Centroid position: weighted mean for temporal ordering.
                     let centroid: f32 = abs_positions.iter().zip(weights.iter())
                         .map(|(&p, &w)| p as f32 * w).sum();
-                    merged_pos.push(centroid as u32);
+                    let mut slot = [(0u32, 0.0f32); MAX_FOLD_M];
+                    for i in 0..self.fold_m {
+                        slot[i] = (abs_positions[i], weights[i]);
+                    }
+                    entries.push((centroid as u32, slot));
                 }
             }
 
-            // 7. Assemble final cache in temporal order. Each slot is either a
-            //    verbatim core row or a merged row; positional order matters
-            //    only for later-token RoPE relative-phase consistency (keys are
-            //    already post-RoPE so their own phases are frozen).
-            let output_len = core_slots + merge_slots;
-            let mut order: Vec<(u32, SlotSrc)> = Vec::with_capacity(output_len);
-            for (i, &pos) in core_idx.iter().enumerate() {
-                order.push((pos, SlotSrc::Core(i)));
-            }
-            for (i, &pos) in merged_pos.iter().enumerate() {
-                order.push((pos, SlotSrc::Merged(i)));
-            }
-            order.sort_by_key(|&(p, _)| p);
+            entries.sort_by_key(|&(c, _)| c);
 
-            let mut final_k = vec![0u8; output_len * row_bytes];
-            let mut final_v = vec![0u8; output_len * row_bytes];
-            for (new_slot, &(_, src)) in order.iter().enumerate() {
-                let dst_rng = new_slot * row_bytes..(new_slot + 1) * row_bytes;
-                match src {
-                    SlotSrc::Core(i) => {
-                        let pos = core_idx[i] as usize;
-                        final_k[dst_rng.clone()].copy_from_slice(&k_all[pos * row_bytes..(pos + 1) * row_bytes]);
-                        final_v[dst_rng].copy_from_slice(&v_all[pos * row_bytes..(pos + 1) * row_bytes]);
-                    }
-                    SlotSrc::Merged(i) => {
-                        final_k[dst_rng.clone()].copy_from_slice(&merged_k[i * row_bytes..(i + 1) * row_bytes]);
-                        final_v[dst_rng].copy_from_slice(&merged_v[i * row_bytes..(i + 1) * row_bytes]);
-                    }
+            // Flatten to two arrays: [budget × m] each.
+            let mut flat_indices = Vec::with_capacity(table_len);
+            let mut flat_weights = Vec::with_capacity(table_len);
+            for (_, slot) in &entries {
+                for i in 0..self.fold_m {
+                    flat_indices.push(slot[i].0 as i32);
+                    flat_weights.push(slot[i].1);
                 }
             }
 
-            gpu.hip.memcpy_htod(&kv.k_gpu[layer_idx].buf, &final_k)?;
-            gpu.hip.memcpy_htod(&kv.v_gpu[layer_idx].buf, &final_v)?;
+            // 5. Upload table and run the GPU fold kernel for K and V.
+            //    src → k_compact/v_compact (scratch on EvictionCtx), then
+            //    memcpy back into the cache (matching TriAttn pattern).
+            let idx_bytes: Vec<u8> = flat_indices.iter()
+                .flat_map(|&x| x.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&indices_dev.buf, &idx_bytes)?;
+            let w_bytes: Vec<u8> = flat_weights.iter()
+                .flat_map(|&x| x.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&weights_dev.buf, &w_bytes)?;
+
+            gpu.kv_fold_q8(
+                &kv.k_gpu[layer_idx], &self.base.k_compact,
+                &indices_dev, &weights_dev,
+                n_kv, n_blocks, self.fold_m, budget,
+            )?;
+            gpu.kv_fold_q8(
+                &kv.v_gpu[layer_idx], &self.base.v_compact,
+                &indices_dev, &weights_dev,
+                n_kv, n_blocks, self.fold_m, budget,
+            )?;
+            gpu.hip.device_synchronize()?;
+
+            gpu.hip.memcpy_dtod_at(
+                &kv.k_gpu[layer_idx].buf, 0,
+                &self.base.k_compact.buf, 0,
+                budget * row_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &kv.v_gpu[layer_idx].buf, 0,
+                &self.base.v_compact.buf, 0,
+                budget * row_bytes,
+            )?;
         }
 
         // Output size is always `budget` slots (core_slots + merge_slots = budget).
@@ -203,12 +227,6 @@ impl CaskCtx {
         self.base.eviction_count.set(self.base.eviction_count.get() + 1);
         Ok(Some(budget))
     }
-}
-
-#[derive(Copy, Clone)]
-enum SlotSrc {
-    Core(usize),
-    Merged(usize),
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
