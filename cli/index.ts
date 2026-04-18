@@ -50,6 +50,18 @@ interface HipfireConfig {
   // this to true restores the demo's behavior for `hipfire serve` users.
   dflash_adaptive_b: boolean;
 
+  // `dflash_mode`:
+  //   "on"   → always attempt draft auto-discovery / honor HIPFIRE_DFLASH_DRAFT
+  //   "off"  → never load the draft; temp=0 falls back to AR
+  //   "auto" → dense Qwen3.5 → on; A3B (MoE) targets → off
+  //
+  // Rationale: A3B DFlash is a NET LOSS vs AR on non-math prompts on
+  // 7900 XTX (τ≈1.0-1.5, 2-5× slower than AR on code/prose). Only math
+  // shows DFlash-positive τ. Default-off for A3B prevents the silent
+  // slowdown when a user serves an A3B target with an auto-discovered
+  // draft. Override per-model with `hipfire config set dflash_mode on`.
+  dflash_mode: "on" | "off" | "auto";
+
   // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
   // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
   // When set, the engine compacts KV against the sidecar's band-centers
@@ -88,6 +100,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   idle_timeout: 300,
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
+  dflash_mode: "auto",
   cask_sidecar: "",
   cask: false,
   cask_budget: 512,
@@ -112,6 +125,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
     case "dflash_adaptive_b": return typeof value === "boolean";
+    case "dflash_mode": return ["on", "off", "auto"].includes(value);
     case "cask_sidecar": return typeof value === "string";  // "" = disabled
     case "cask": return typeof value === "boolean";
     case "cask_budget": return typeof value === "number" && Number.isInteger(value) && value >= 64 && value <= 65536;
@@ -157,7 +171,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
   "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
-  "dflash_adaptive_b", "cask_sidecar", "cask",
+  "dflash_adaptive_b", "dflash_mode",
+  "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
@@ -267,26 +282,56 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //
   // If the draft file is missing the daemon logs a warning and falls back
   // to AR (no client-visible error).
-  const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
-  if (explicit !== undefined) {
-    if (explicit.length > 0) params.draft = explicit;
-    // empty-string → explicit opt-out; leave draft unset
+  //
+  // `dflash_mode` gate (0.1.7 stable): the user's per-model / global config
+  // decides whether to bother. "off" skips load entirely — saves 3-4 GB
+  // VRAM for the draft weights when DFlash would net-regress anyway. "auto"
+  // gates A3B (MoE) targets off by default because their drafts reject
+  // most tokens on non-math prompts (τ≈1.0-1.5) and DFlash becomes 2-5×
+  // slower than plain AR. Exception: an A3B target *with* a TriAttention
+  // sidecar configured stays DFlash-on under auto, because long-ctx A3B on
+  // 24 GB consumer cards OOMs without eviction — the DFlash+sidecar combo
+  // is correctness-required there, and that combo does win on τ as well.
+  // Override per-model with `dflash_mode=on/off` to bypass the heuristic.
+  const targetBn = basename(path);
+  const isA3B = /a3b/i.test(targetBn);
+  const hasSidecar = !!(resolved.cask_sidecar && resolved.cask_sidecar.length > 0 && existsSync(resolved.cask_sidecar));
+  const mode = resolved.dflash_mode;
+  params.dflash_mode = mode;
+  const autoOn = !isA3B || hasSidecar;
+  const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
+  if (!dflashAllowed) {
+    if (mode === "auto" && isA3B) {
+      const hint = tag ? `config set-model ${tag} dflash_mode on` : `config set dflash_mode on`;
+      console.error(`[hipfire] DFlash disabled for A3B target (dflash_mode=auto, no sidecar). Override with 'hipfire ${hint}'.`);
+    } else if (mode === "off") {
+      console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
+    }
   } else {
-    const bn = basename(path);
-    const m = bn.match(/qwen3?\.?5[-_]?([^.\-_]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
-    if (m) {
-      const size = m[1].toLowerCase();
-      const quant = m[2].toLowerCase();
-      const candidates = [
-        resolve(`${process.cwd()}/models/qwen35-${size}-dflash-${quant}.hfq`),
-        resolve(`${process.cwd()}/../../models/qwen35-${size}-dflash-${quant}.hfq`),
-        resolve(`${homedir()}/.hipfire/models/qwen35-${size}-dflash-${quant}.hfq`),
-      ];
-      for (const c of candidates) {
-        if (existsSync(c)) {
-          params.draft = c;
-          console.error(`[hipfire] DFlash draft detected: ${c}`);
-          break;
+    const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
+    if (explicit !== undefined) {
+      if (explicit.length > 0) params.draft = explicit;
+      // empty-string → explicit opt-out; leave draft unset
+    } else {
+      // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
+      // at the quant-extension dot. Version digit is captured so the draft
+      // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
+      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+      if (m) {
+        const ver = m[1];                 // "5" or "6"
+        const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
+        const quant = m[3].toLowerCase();
+        const candidates = [
+          resolve(`${process.cwd()}/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+          resolve(`${process.cwd()}/../../models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+          resolve(`${homedir()}/.hipfire/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+        ];
+        for (const c of candidates) {
+          if (existsSync(c)) {
+            params.draft = c;
+            console.error(`[hipfire] DFlash draft detected: ${c}`);
+            break;
+          }
         }
       }
     }
