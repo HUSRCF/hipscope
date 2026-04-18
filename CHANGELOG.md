@@ -1,16 +1,86 @@
 # Changelog
 
-## Roadmap
+## v0.1.7-alpha (2026-04-18)
 
-### v0.1.7 (planned)
+Pre-release tag cutting the dflash branch against master. Gated to full
+v0.1.7 on the outcome of the Hermes-agent + hipfire stack validation
+currently running on MI300X.
 
-- **TriAttention KV-cache pruning** — opt-in long-context memory reduction via
-  pre-RoPE Q/K concentration scoring. Composes with asym3 for ≤12 GB cards at
-  32K+ context. Tracking: [#17](https://github.com/Kaden-Schutt/hipfire/issues/17).
-  Based on Mao et al. 2026 ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921))
-  with reference HIP port by [@domvox](https://github.com/domvox/triattention-ggml).
-  Measured gains on AMD are 1.3-2× KV memory at +0.3-1.8% PPL — not the paper's
-  10.7× headline. Requires relaxing byte-exact contract behind an opt-in flag.
+### Highlights
+
+- **FlashTriAttn long-context wins shipped.** DFlash speculative decode +
+  TriAttention KV eviction composes cleanly. Measured on 7900 XTX, 9B MQ4,
+  ~1500-token prompt, 200-token decode, `--cask-budget 512 --cask-beta 128`:
+  baseline 150 tok/s τ=5.31 → **FlashTriAttn 214 tok/s τ=5.36 (+42% speedup,
+  τ unchanged)**. With 1M-token wikitext sidecars, τ no longer drops — earlier
+  builds lost ~27% τ because the sidecar was under-calibrated.
+- **CASK core-aware m-folding** merges non-core KV instead of dropping.
+  Composes with FlashTriAttn. Still has a ~3% τ drop from merge smoothing —
+  the GPU merge kernel (task #82) eliminates the CPU hop; full tok/s win
+  lands in 0.1.7 stable.
+- **Qwen3.5-35B-A3B and Qwen3.6-35B-A3B MoE** end-to-end in DFlash. Batched
+  MoE prefill, fused sigmoid+residual GEMV, indexed expert dispatch. On
+  7900 XTX A3B decodes at ~115 tok/s (single turn) / 96 tok/s (multi-turn).
+- **MI300X (gfx942) wave64 port.** 10 hot HFQ4 kernels re-written for
+  block=[64,1,1] 2-rows-per-block pattern. A3B decode 48.6 → **96 tok/s**
+  on MI300X (matches 7900 XTX baseline despite the 4× memory bandwidth gap
+  between consumer and datacenter silicon).
+- **DFlash tape-replay rollback** lets multi-turn state recover from an
+  incorrect verify without a full target re-run.
+- **Batched-prefill TriAttention tap** (4.5–5× faster sidecar cals) — what
+  made it possible to calibrate 1M-token sidecars across 5 targets on one
+  MI300X overnight.
+
+### Bench snapshot (7900 XTX, MQ4, branch @ `a306013`)
+
+DFlash τ + tok/s per prompt class (ctx=4K, no CASK):
+
+| model | short | code | math |
+|-------|-------|------|------|
+| 4B    | 53 tok/s τ=1.27 | 92 tok/s τ=2.49 | 148 tok/s τ=6.0 |
+| 9B    | 112 tok/s τ=1.52 | **461 tok/s τ=9.95** | 288 tok/s τ=5.77 |
+| 27B   | 20 tok/s τ=2.21 | 41 tok/s τ=5.66 | 42 tok/s τ=6.14 |
+
+Sidecar reconstruction r̄ (1M wikitext tokens, default validation prompt):
+
+| model | mean r̄ | % heads > 0.95 R |
+|-------|---------|-----------------|
+| 4B    | 0.564   | 5.7% |
+| 9B    | 0.629   | 5.8% |
+| 27B   | 0.542   | — |
+| 3.5-A3B | 0.552 | — |
+| 3.6-A3B | 0.552 | — |
+
+Paper Figure 3 target is r̄ ≈ 0.5; we're above it on every model.
+
+### CLI + daemon config (0.1.7-alpha knobs)
+
+Per-model config (via `hipfire config` or `~/.hipfire/per_model_config.json`):
+
+```
+dflash_adaptive_b   boolean   default true     # τ-window trip-wire block shrink
+cask_sidecar        string    default ""       # path to a .triattn.bin
+cask                boolean   default false    # enable m-folding (on top of sidecar)
+cask_budget         int       default 512
+cask_beta           int       default 128
+cask_core_frac      float     default 0.5
+cask_fold_m         int       default 2
+```
+
+The daemon protocol accepts all of these in the `load` message's `params` object.
+`cask_sidecar` is accepted and logged today; the generate-loop integration
+lands in 0.1.7 stable (current serve users run DFlash without eviction —
+use `dflash_spec_demo` directly for the `--cask-sidecar` path).
+
+### Pending for v0.1.7 stable
+
+- Wire `cask_sidecar` + adaptive-B through the daemon's generate loop so
+  `hipfire serve` honors it automatically.
+- Hermes agent + hipfire stack validation on MI300X (task #125) — gates the
+  stable release.
+- GPU-side CASK merge kernel (task #82) to flip FlashCASK net-positive.
+- DDTree integration into the CLI/daemon (currently τ-positive but not yet
+  tok/s-positive without hipGraph coverage).
 
 ## v0.1.6 "deltacut" (2026-04-14)
 
