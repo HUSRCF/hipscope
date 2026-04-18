@@ -254,7 +254,8 @@ impl Gpu {
     pub fn try_init_rocblas(&mut self) {
         if self.rocblas.is_some() { return; }
         let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        if !cdna3 { return; }
+        let all_archs = std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1");
+        if !cdna3 && !all_archs { return; }
         match Rocblas::load() {
             Ok(rb) => {
                 // Bind to the active stream if present; otherwise rocBLAS uses
