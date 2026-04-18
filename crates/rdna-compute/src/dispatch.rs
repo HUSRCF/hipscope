@@ -5993,39 +5993,21 @@ impl Gpu {
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
-        let d = dst.buf.as_ptr();
-        let s = src.buf.as_ptr();
-        let p = pos_buf.as_ptr();
-        let nkv = n_kv_heads as i32;
-        let hd = head_dim as i32;
+        let func = &self.functions["kv_cache_write_q8_0"];
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &d as *const _ as *mut c_void, &s as *const _ as *mut c_void,
-            &p as *const _ as *mut c_void, &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_q8_0", bytes);
-        // Graph-capture fix (task #100): use the blob launch path so kernarg
-        // values survive after this call returns. With the raw launch_kernel
-        // path, params[] point to stack-locals that go out of scope; HIP's
-        // stream capture records the pointer-to-param rather than the value
-        // for some kernarg slots under A3B-specific stream contention,
-        // leading to stale pos/ptr values on graph replay after the first few
-        // replays — which was the symptom behind the MoE+hipGraph corruption.
-        // kv_cache_write is called twice per FA layer (K + V) so back-to-back
-        // identical kernel launches probably trigger the specific HIP path
-        // that dereferences the param pointers late.
-        let result = self.launch_maybe_blob(
-            "kv_cache_write_q8_0", [total_blocks, 1, 1], [32, 1, 1], 0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d); b.push_ptr(s); b.push_ptr(p);
-                b.push_i32(nkv); b.push_i32(hd);
-                b
-            },
-        );
+        let result = unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
