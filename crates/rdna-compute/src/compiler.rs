@@ -54,7 +54,16 @@ pub struct KernelCompiler {
 
 impl KernelCompiler {
     pub fn new(arch: &str) -> HipResult<Self> {
-        let cache_dir = std::env::temp_dir().join("hipfire_kernels");
+        // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
+        // worktrees/agents on the same machine don't clobber each other's
+        // JIT'd .hsaco blobs. /tmp was shared state: two daemons from
+        // different git states wrote the same {name}.hsaco path and
+        // thrashed each other's hash sidecars. $CWD isolation fixes that.
+        // End-user / CI can pin the old location back via
+        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters.
+        let cache_dir = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".hipfire_kernels"));
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;

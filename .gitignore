@@ -24,6 +24,7 @@
 
 # JIT-compiled kernel cache
 kernels/compiled/
+.hipfire_kernels/
 
 # Agent / tool state
 .serena/
@@ -31,6 +32,11 @@ kernels/compiled/
 .codex
 docs/superpowers/
 .worktrees/
+.dflash-reference/
+.dflash-ref-hf/
+.dflash-ref-hf-4b/
+dflash-papers/
+kv_research/
 
 # Python
 __pycache__/
@@ -45,3 +51,5 @@ __pycache__/
 .claude/
 # Personal CLI instructions
 cli/CLAUDE.md
+.pr_body_0_1_7_alpha.md
+.bench_0_1_7_alpha/

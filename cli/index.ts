@@ -42,6 +42,27 @@ interface HipfireConfig {
   // understand the knob. See docs/MULTI_MODEL_QUEUE.md path for where this
   // lives in the roadmap.
   experimental_budget_alert: boolean;
+
+  // ── DFlash runtime tuning (0.1.7-alpha) ───────────────────────────────
+  // When true, the DFlash verify cycle can auto-shrink block_size when τ
+  // drops below a trip-wire (default 2.5). Matches dflash_spec_demo's
+  // `--adaptive-b` default. Daemon previously hard-coded OFF — flipping
+  // this to true restores the demo's behavior for `hipfire serve` users.
+  dflash_adaptive_b: boolean;
+
+  // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
+  // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
+  // When set, the engine compacts KV against the sidecar's band-centers
+  // once the active token count exceeds `cask_budget + cask_beta`.
+  cask_sidecar: string;
+  // `cask` flips to the core-aware m-folding merge policy (FlashCASK) on
+  // top of plain TriAttention drop-eviction. No-op when `cask_sidecar` is
+  // empty.
+  cask: boolean;
+  cask_budget: number;       // target active-token count post-eviction
+  cask_beta: number;         // hysteresis buffer before re-triggering
+  cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
+  cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
 }
 
 // Detect GPU at import time for smart defaults
@@ -66,6 +87,13 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   port: DEFAULT_PORT,
   idle_timeout: 300,
   experimental_budget_alert: false,
+  dflash_adaptive_b: true,
+  cask_sidecar: "",
+  cask: false,
+  cask_budget: 512,
+  cask_beta: 128,
+  cask_core_frac: 0.5,
+  cask_fold_m: 2,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -83,6 +111,13 @@ function validateConfigValue(key: string, value: any): boolean {
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
+    case "dflash_adaptive_b": return typeof value === "boolean";
+    case "cask_sidecar": return typeof value === "string";  // "" = disabled
+    case "cask": return typeof value === "boolean";
+    case "cask_budget": return typeof value === "number" && Number.isInteger(value) && value >= 64 && value <= 65536;
+    case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
+    case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
+    case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     default: return false;
   }
 }
@@ -122,6 +157,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
   "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+  "dflash_adaptive_b", "cask_sidecar", "cask",
+  "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -178,6 +215,22 @@ function applyThinkingMode(systemPrompt: string | undefined, thinking: string): 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
 // params (max_seq). The tag is optional — pass it from the caller when known,
 // else we fall back to global cfg.
+// Per-model-size KV default. Layer-count compounding of K-quant noise on
+// deep stacks (≥27B) flips argmax at decision boundaries under asym3; asym4
+// divergence stays stable ~30% longer at a trivial +32 MB/2K-ctx cost.
+// Only bumps when the resolved mode matches the arch default AND the user
+// hasn't set HIPFIRE_KV_MODE in the environment. Any explicit override
+// (config set, per-model config, env var) passes through unchanged.
+function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string | null): string {
+  if (baseMode !== "asym3") return baseMode;
+  if (process.env.HIPFIRE_KV_MODE) return baseMode; // explicit env wins
+  if (resolved.kv_cache !== ARCH_DEFAULTS.kv_cache) return baseMode; // explicit config/per-model
+  if (!tag) return baseMode;
+  const t = resolveModelTag(tag).toLowerCase();
+  const isLarge = t.includes(":27b") || t.includes(":35b") || t.includes("-27b") || t.includes("-35b");
+  return isLarge ? "asym4" : baseMode;
+}
+
 function buildLoadMessage(path: string, tag?: string | null): any {
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
@@ -188,7 +241,76 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   if (max_seq > resolved.max_seq) {
     console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
   }
-  return { type: "load", model: path, params: { max_seq } };
+  const params: any = { max_seq };
+
+  // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
+  // applies size-aware default so 27B+ gets asym4 automatically. Daemon
+  // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
+  const baseMode = resolveKvMode(resolved);
+  const effectiveMode = sizeAwareKvMode(baseMode, resolved, tag);
+  if (effectiveMode !== baseMode) {
+    console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
+  }
+  params.kv_mode = effectiveMode;
+
+  // Optional DFlash draft. The daemon wires this into a greedy speculative-
+  // decode fast path that triggers on temperature==0 requests. Two sources:
+  //
+  // 1. Explicit override: HIPFIRE_DFLASH_DRAFT=<path> on the serve process.
+  //    Highest priority — lets ops force a specific draft regardless of
+  //    target name. Pass "" (empty string) to disable even when a matching
+  //    draft would otherwise be found.
+  //
+  // 2. Auto-match: look alongside the target for a file named
+  //    `qwen35-<size>-dflash-<quant>.hfq`. Size is extracted from the target
+  //    path (e.g. `qwen3.5-27b.mq4` → size=27b). Only runs when #1 is unset.
+  //
+  // If the draft file is missing the daemon logs a warning and falls back
+  // to AR (no client-visible error).
+  const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
+  if (explicit !== undefined) {
+    if (explicit.length > 0) params.draft = explicit;
+    // empty-string → explicit opt-out; leave draft unset
+  } else {
+    const bn = basename(path);
+    const m = bn.match(/qwen3?\.?5[-_]?([^.\-_]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+    if (m) {
+      const size = m[1].toLowerCase();
+      const quant = m[2].toLowerCase();
+      const candidates = [
+        resolve(`${process.cwd()}/models/qwen35-${size}-dflash-${quant}.hfq`),
+        resolve(`${process.cwd()}/../../models/qwen35-${size}-dflash-${quant}.hfq`),
+        resolve(`${homedir()}/.hipfire/models/qwen35-${size}-dflash-${quant}.hfq`),
+      ];
+      for (const c of candidates) {
+        if (existsSync(c)) {
+          params.draft = c;
+          console.error(`[hipfire] DFlash draft detected: ${c}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // 0.1.7-alpha: pass DFlash + CASK tuning through to the daemon. Daemon
+  // treats absent keys as "use engine defaults" so older daemons stay
+  // compatible even when the CLI passes new keys.
+  params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+  if (resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
+    if (existsSync(resolved.cask_sidecar)) {
+      params.cask_sidecar = resolved.cask_sidecar;
+      params.cask = resolved.cask;
+      params.cask_budget = resolved.cask_budget;
+      params.cask_beta = resolved.cask_beta;
+      params.cask_core_frac = resolved.cask_core_frac;
+      params.cask_fold_m = resolved.cask_fold_m;
+      console.error(`[hipfire] TriAttention sidecar: ${resolved.cask_sidecar}${resolved.cask ? ' (CASK m-folding)' : ' (drop-eviction)'} budget=${resolved.cask_budget} β=${resolved.cask_beta}`);
+    } else {
+      console.error(`[hipfire] WARN: cask_sidecar path missing: ${resolved.cask_sidecar} — disabling eviction for this load`);
+    }
+  }
+
+  return { type: "load", model: path, params };
 }
 
 // ─── Model Registry ─────────────────────────────────────
@@ -1697,8 +1819,10 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     const RUN_TIMEOUT = 60_000;   // 1min per generation run
 
     for (const v of variants) {
-      // Clear kernel cache so variant recompiles
-      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/"); } catch {}
+      // Clear kernel cache so variant recompiles. Cache now defaults to
+      // $CWD/.hipfire_kernels (per-worktree isolation); /tmp is legacy and
+      // still cleaned in case HIPFIRE_KERNEL_CACHE pins the old location.
+      try { const { execSync } = require("child_process"); execSync("rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/"); } catch {}
 
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
@@ -3025,11 +3149,16 @@ switch (cmd) {
       // because the OLD blob's hash still matches the OLD source we no
       // longer ship). `/tmp/hipfire_kernels` dies at reboot; this one
       // doesn't, so it's the one that actually needs the cleanup.
+      // As of the cwd-cache switch, also clean .hipfire_kernels (the new
+      // default hot-path location) in case the daemon was launched from
+      // the current cwd — leftover blobs would otherwise mask the cold
+      // update. /tmp clean is kept for the HIPFIRE_KERNEL_CACHE=/tmp pinning.
       const { rmSync } = await import("fs");
       if (existsSync(kernelDst)) {
         try { rmSync(kernelDst, { recursive: true, force: true }); } catch {}
       }
       try { rmSync("/tmp/hipfire_kernels", { recursive: true, force: true }); } catch {}
+      try { rmSync(".hipfire_kernels", { recursive: true, force: true }); } catch {}
       mkdirSync(kernelDst, { recursive: true });
       if (existsSync(kernelSrc)) {
         for (const f of readdirSync(kernelSrc)) {

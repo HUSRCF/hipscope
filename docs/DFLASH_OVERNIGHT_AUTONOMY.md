@@ -8,6 +8,12 @@ loop that generates tokens with draft + target, verifies them, and
 emits accepted tokens — by the morning of 2026-04-14. Ideally more.
 Do not stop until you ship something reviewable.
 
+**Branch you work on:** `dflash` (never `master`). The branch was cut
+from master at commit `6383440` so master is your safe rollback point.
+All commits push to `origin/dflash`. Final merge to master is a human
+review step the user does in the morning. If you accidentally commit
+to master, `git reset --hard origin/master` + cherry-pick onto dflash.
+
 ## Stop conditions (exhaustive)
 
 You may stop only if ONE of these is true:
@@ -52,10 +58,24 @@ Make judgment calls. Document them in commit messages. Examples:
 - "MQ4 draft quantize breaks accept-rate (0.78 → 0.31). Shipping with
   BF16 draft for 0.1.6; MQ4 quantize deferred to 0.1.7."
 
-### Commit + push after every phase
+### Commit + push after every phase — to the `dflash` branch
 
 Per-phase commits even if phase isn't finished. The user wakes up to
 incremental progress, not a 6-hour uncommitted diff.
+
+```bash
+git branch --show-current   # must say "dflash" before every commit
+git push origin dflash      # not master
+```
+
+Never push to master. If you discover you're on master:
+
+```bash
+git branch                  # see which branches exist
+git stash                   # save any in-flight changes
+git checkout dflash
+git stash pop
+```
 
 Commit format:
 ```
@@ -170,14 +190,14 @@ is corrupted. Options:
 
 After the user runs the overnight prompt, your first five actions are:
 
-1. `git log --oneline -5` — confirm you're on `4426270` or later
-2. `cat docs/DFLASH_PORT_PLAN.md` — the master plan
-3. `cat .claude/projects/-home-kaden-ClaudeCode-autorocm-hipfire/memory/project_016_dflash_port.md` if accessible — the memory
-4. `git log origin/master..HEAD` — any uncommitted work from a prior session
-5. Start Phase 1: clone z-lab/dflash, open model.py, begin the
-   architecture dig.
+1. `git checkout dflash` — switch to the overnight branch (never master)
+2. `git log --oneline -5` — confirm you're on commit `6383440` or later
+3. `cat docs/DFLASH_PORT_PLAN.md` — the master plan
+4. `cat .claude/projects/-home-kaden-ClaudeCode-autorocm-hipfire/memory/project_016_dflash_port.md` if accessible — the memory
+5. Start Phase 1: clone z-lab/dflash into `.dflash-reference/`, open
+   model.py, begin the architecture dig.
 
-Then work the phases. Commit + push each.
+Then work the phases. Commit + push each to `origin/dflash`.
 
 ## Wake-up report
 
@@ -203,12 +223,61 @@ You have full shell access. Use it liberally for:
   specific to those archs surfaces
 
 Do NOT:
-- Force-push to master (regular `git push origin master` only)
+- Push to master — only to `dflash`. Never force-push either branch.
 - Skip pre-commit hooks with `--no-verify` unless you've verified the
   hook is wrong
 - Upload draft model weights to HF until Phase 7 gate passes (quality
   + speed gate must clear first)
 - Blow away `~/.hipfire/models/` or the repo `models/` directory
+- Merge dflash into master — that's the user's review step in the morning
+
+## Monitor injections — check at every phase boundary
+
+There is a live monitor watching your progress on `origin/dflash`. It
+communicates via `docs/DFLASH_INJECTIONS.md`. Treat this file as a
+real-time command channel from the user.
+
+**Required checks:**
+
+1. `git pull origin dflash` at the start of every phase.
+2. `cat docs/DFLASH_INJECTIONS.md` — read the "Active injections" section.
+3. If there's an entry dated after your last applied injection:
+   - Read it in full.
+   - Apply it according to its priority level:
+     - `INFO` — add to your mental context, no action
+     - `GUIDANCE` — suggested adjustment; apply if it helps your MVP
+     - `OVERRIDE` — supersedes the autonomy contract for the stated
+       scope (e.g., "quality-gate parity relaxed for Phase 3")
+     - `ABORT` — stop current phase, follow the injection's next-step
+   - Acknowledge by appending to `docs/DFLASH_PROGRESS.md`:
+     `[injection applied <timestamp>] <one-line summary>`
+4. Commit any file changes the injection produced. Push.
+
+**Why the mailbox exists:** the monitor sees things you can't (rate of
+progress, stall patterns, whether a quality-gate failure is a real
+regression vs. an ambient cost of new code). Trust its overrides unless
+they'd clearly break the spec-decoding correctness contract.
+
+**If the mailbox file doesn't exist or is empty:** proceed with the
+autonomy contract as originally written. No injections is the default.
+
+## Emergency escalation — worker → monitor
+
+If you hit a fundamental block and need human context before morning,
+append a priority block to the END of `docs/DFLASH_INJECTIONS.md`
+yourself, titled:
+
+```
+## WORKER → MONITOR <timestamp>
+priority: HELP
+context: <1-2 sentences>
+blocked on: <specific technical question>
+```
+
+Commit + push. The monitor checks the file on its next 30-min cycle and
+will either inject an OVERRIDE/GUIDANCE or (via codex-rescue fallback)
+kick a debugging agent at the problem. While waiting, continue on
+anything parallelizable — never sit idle.
 
 ## Final rule
 

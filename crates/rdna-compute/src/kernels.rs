@@ -123,11 +123,51 @@ pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
 
+/// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
+/// gate_up GEMV. Block=[64,1,1] with 2 rows per block (one per warp) —
+/// halves the grid count vs the wave32 variant, which otherwise wastes
+/// half a wave64 per workgroup. Byte-exact math.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip");
+
 /// Index-aware MoE down GEMV — same pattern as the indexed gate_up,
 /// also reads scales from a device topk_weights buffer. Pairs with the
 /// GPU top-K kernel to make MoE decode hipGraph-capturable end-to-end.
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed.hip");
+
+/// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
+/// down-residual GEMV. Same 2-rows-per-block packing as the gate_up
+/// wave64 variant; atomicAdd semantics preserved per (row, krank).
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
+
+/// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
+/// for the single-token kernel when prefilling N tokens through an MoE
+/// layer; one workgroup per token. Enables batched MoE prefill.
+pub const MOE_SOFTMAX_TOPK_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_softmax_topk_k8_batched.hip");
+
+/// N-batched indexed MoE gate_up GEMV. Extends the single-token indexed
+/// variant with a batch dimension (grid.z = N). Each (token, k-slot)
+/// block picks its own expert via topk_indices[token×K_TOP + slot] and
+/// reads the token's x row from x[token×K..].
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip");
+
+/// CDNA3 wave64-native batched indexed MoE gate_up. 2 rows per block.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip");
+
+/// N-batched indexed MoE down + scaled residual. Mirrors the batched
+/// gate_up: grid.z = N, per-token routing + scaling, atomicAdd into
+/// x_residual[token×M..].
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched.hip");
+
+/// CDNA3 wave64-native batched indexed MoE down. 2 rows per block.
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
@@ -135,6 +175,10 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
 // for batched prefill (FFN down + wo projection) where N prompt tokens share
 // the same weight matrix.
 pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
+
+// CDNA3 wave64-native batched HFQ4-G256 residual GEMM. 2 rows per block
+// (one per warp), halves grid.x. Byte-exact with the wave32 kernel.
+pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64.hip");
 
 // FP16-packed variant: dequant to __half, v_pk_fma_f16 inner loop, FP32 accumulation.
 // 2× throughput over FP32 on all RDNA. Same grid/block layout.
@@ -156,6 +200,10 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
 pub const GEMM_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.hip");
+// CDNA3 wave64-native batched 4-way fused LA GEMM. 2 rows per block via
+// warp_id, halves grid.x. Byte-exact with wave32 base. Hottest DFlash
+// verify kernel on MI300X — targeted first for this port.
+pub const GEMM_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -165,6 +213,8 @@ pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/sr
 // Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FA layer projection.
 pub const GEMM_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.hip");
+// CDNA3 wave64-native batched 3-way fused FA preamble. 2 rows per block.
+pub const GEMM_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -210,10 +260,19 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../.
 // row counts. Works on every RDNA generation — see the kernel header.
 pub const FUSED_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip");
 
+// CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
+// two fused-qkvza rows per block (one per warp). Grid halves from total_m
+// to (total_m+1)/2. Byte-exact vs the wave32 base kernel.
+pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64.hip");
+
 // 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
 pub const FUSED_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip");
+
+// CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
+// block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
+pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip");
 // Note: 2-way fused gate+up uses the existing FUSED_GATE_UP_HFQ4G256_SRC
 // constant declared further down (kernels/src/fused_gate_up_hfq4g256.hip).
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
@@ -284,6 +343,8 @@ pub const GEMV_HFQ4G256_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv
 /// x layout: [batch_size × K] row-major. y layout: [batch_size × M] row-major.
 /// BATCH_TILE=8 keeps register pressure at ~26 VGPRs for good occupancy on RDNA.
 pub const GEMM_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256.hip");
+// CDNA3 wave64-native batched HFQ4-G256 GEMM (overwrite). 2 rows per block.
+pub const GEMM_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64.hip");
 
 
 /// Fused QKV Q4_K: three GEMVs in one kernel launch.
@@ -308,6 +369,12 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+
+/// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
+/// per-row accumulators in registers, broadcasting each weight load across
+/// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
+/// serial-GEMV loop for DFlash lm_heads.
+pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_batched.hip");
 
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
@@ -496,6 +563,33 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
+/// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
+pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
+
+/// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
+pub const TRIATTN_SCORE_ASYM3_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym3.hip");
+
+/// TriAttention scoring on asym4 (Givens-rotated 4-bit) K cache.
+pub const TRIATTN_SCORE_ASYM4_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym4.hip");
+
+/// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
+pub const TRIATTN_SCORE_ASYM2_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym2.hip");
+
+/// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
+pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
+
+/// CASK m-folding merge: weighted-average m Q8_0 rows into 1 per slot (arXiv:2604.10900).
+pub const KV_FOLD_Q8_SRC: &str = include_str!("../../../kernels/src/kv_fold_q8.hip");
+
+/// CASK m-folding merge for asym3 K (givens-rotated 3-bit).
+pub const KV_FOLD_ASYM3_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym3.hip");
+
+/// CASK m-folding merge for asym4 K (givens-rotated 4-bit).
+pub const KV_FOLD_ASYM4_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym4.hip");
+
+/// CASK m-folding merge for asym2 K (givens-rotated 2-bit).
+pub const KV_FOLD_ASYM2_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym2.hip");
+
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
@@ -567,6 +661,7 @@ pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
 pub const TOPK_LOGITS_SRC: &str = include_str!("../../../kernels/src/topk_logits.hip");
+pub const TOPK_LOGSUMEXP_BATCHED_SRC: &str = include_str!("../../../kernels/src/topk_logsumexp_batched.hip");
 
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
@@ -743,6 +838,10 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
+/// Batched argmax: one block per row, writes B indices with one kernel launch.
+/// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
+pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
@@ -774,6 +873,11 @@ pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip
 /// Fused ViT self-attention: Q@K^T → softmax → @V, reading QKV from [N, 3*hidden].
 /// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
 pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_attention.hip");
+
+/// DFlash draft cross-attention (non-causal, GQA): B queries attend to L
+/// keys/values with no causal mask. Grid=[n_heads, B]. See
+/// `kernels/src/attention_dflash.hip` for the full contract.
+pub const ATTENTION_DFLASH_SRC: &str = include_str!("../../../kernels/src/attention_dflash.hip");
 
 
 /// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)

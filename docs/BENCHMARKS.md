@@ -104,6 +104,51 @@ All three asym modes pass the multi-turn "Kaden" rare-token recall test.
 asym3 is the sweet spot — best compression of the recall-safe options. See
 [KV_CACHE.md](KV_CACHE.md) for the design rationale.
 
+## DFlash speculative decoding (preview, 0.1.6)
+
+**Status:** preview. The loop runs end-to-end and produces byte-exact
+greedy output, but per-iteration overhead outpaces the accept-rate
+gain on a 4B target. Full 2-4× speedup (promised by the DFlash paper
+and our target table in DFLASH_PORT_PLAN.md) lands in 0.1.7 after
+batched-with-hidden target prefill + batched draft lm_head + MQ4 draft
+quant ship.
+
+Bench methodology:
+
+```
+dflash_spec_demo --target qwen3.5-4b.mq4 \
+                 --draft  qwen3.5-4b.dflash.hfq \
+                 --prompt <prompt> --max N --ctx 256
+```
+
+Release build, warm-cache second run on 7900 XTX (gfx1100, 24 GB):
+
+| Prompt | Baseline | DFlash 0.1.6 | τ | accept_rate |
+|---|---:|---:|---:|---:|
+| "The quick brown fox" | 180 t/s | 30 t/s | 3.50 | 23.3% |
+| "Once upon a time," | 180 t/s | 15 t/s | 1.10 | 7.3% |
+
+- **Baseline** = non-dflash decode of the same 4B MQ4 target on same card.
+- **DFlash** = release build, warm-cache, second run.
+- **τ** = mean accepted draft tokens per cycle.
+- **accept_rate** = accepted / (cycles × (B-1)), B=16.
+
+The DFlash path is currently slower than baseline. The dominant
+per-iteration cost is: 5 F32 GEMMs × (2560 × 9728) for the draft MLP,
+15 F32 GEMVs for the per-draft-row lm_head, and 16 per-token target
+forwards for verify. Release + MQ4 draft + batched verify (all 0.1.7)
+should reverse this to the paper's expected 2-4× speedup.
+
+What 0.1.6 proves:
+
+- The loop is correct — output is deterministic and coherent.
+- Accept rates are domain-sensitive in the predicted way (repetitive
+  pangram → high τ, creative fiction → low τ).
+- All new kernels (attention_dflash, draft GEMM/rmsnorm/rotary
+  plumbing) execute without corruption on gfx1100.
+
+Full cross-arch dflash bench lands in 0.1.7 alongside the perf fixes.
+
 ## Running benchmarks yourself
 
 ```bash

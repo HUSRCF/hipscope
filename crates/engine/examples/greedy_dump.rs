@@ -63,13 +63,21 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = 2048usize;
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
-    ).unwrap();
+    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    eprintln!("greedy_dump: kv_mode={kv_mode}");
+    let mut kv_cache = match kv_mode.as_str() {
+        "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        "asym4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+    };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
-    let max_gen = kv_seq.saturating_sub(prompt_tokens.len() + 8);
+    let max_gen = std::env::var("MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| kv_seq.saturating_sub(prompt_tokens.len() + 8));
     let mut out = std::fs::File::create(out_path).expect("create out");
 
     // Route prefill through forward_prefill_batch so the quality gate
@@ -78,6 +86,7 @@ fn main() {
     qwen35::forward_prefill_batch(
         &mut gpu, &weights, &config, &prompt_tokens, 0,
         &mut kv_cache, &mut dn_state, &scratch,
+        None, None, None, None,
     ).expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();

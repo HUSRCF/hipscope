@@ -1,0 +1,319 @@
+//! TriAttention reconstruction-correlation harness (arXiv:2604.04921, §3.3).
+//!
+//! 1. Run forward on a small calibration corpus, collecting pre-RoPE Q at
+//!    each FA layer via the triattn tap. Finalize into BandCenters and save
+//!    to a `.triattn.bin` sidecar.
+//! 2. Run forward on a validation prompt with a full-capture tap that stores
+//!    pre-RoPE Q *and* K per token per FA layer.
+//! 3. For each FA layer, for each query head, predict attention logits
+//!    using the TriAttn scoring function (S_trig + S_norm) and compare
+//!    against ground-truth Q·K dot products computed on the host.
+//!    Report Pearson correlation per layer (the paper's `r̄` metric).
+//!
+//! This doesn't exercise the KV cache or eviction path; the scoring is
+//! entirely host-side to validate the math end-to-end before we wire a
+//! GPU kernel.
+
+#[cfg(not(feature = "deltanet"))]
+fn main() { eprintln!("build with --features deltanet"); }
+
+#[cfg(feature = "deltanet")]
+fn main() {
+    use engine::hfq::HfqFile;
+    use engine::llama::KvCache;
+    use engine::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
+    use engine::tokenizer::Tokenizer;
+    use engine::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
+    use std::path::Path;
+
+    // ── Parse args ─────────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+    let mut model_path: Option<String> = None;
+    let mut sidecar_path: Option<String> = None;
+    let mut corpus_path: Option<String> = None;
+    let mut max_tokens: usize = 4000;
+    let mut chunk_len: usize = 256;
+    let mut validation_prompt = String::from(
+        "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
+    );
+    let mut load_sidecar = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sidecar" => { sidecar_path = Some(args[i + 1].clone()); i += 2; }
+            "--corpus" => { corpus_path = Some(args[i + 1].clone()); i += 2; }
+            "--max-tokens" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
+            "--chunk-len" => { chunk_len = args[i + 1].parse().unwrap(); i += 2; }
+            "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
+            "--load-sidecar" => { load_sidecar = true; i += 1; }
+            s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
+            other => {
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar]");
+                std::process::exit(1);
+            }
+        }
+    }
+    let model_path = model_path.expect("need <model.mq4> positional arg");
+    let sidecar_path = sidecar_path.unwrap_or_else(|| format!("{model_path}.triattn.bin"));
+
+    // Calibration corpus: either chunks from --corpus file or 8 built-in
+    // sentences (quick-iterate mode).
+    let builtin_prompts: Vec<String> = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Federalist No. 10 addresses the problem of factions in a republic.",
+        "RoPE encodes positional information via geometric frequencies applied to Q/K.",
+        "Speculative decoding verifies many draft tokens in one forward pass.",
+        "Attention heads in a transformer specialize during training.",
+        "The Constitution of the United States was ratified in 1788.",
+        "Shakespeare wrote thirty-seven plays and over a hundred sonnets.",
+        "Pythagoras proved that a squared plus b squared equals c squared.",
+    ].iter().map(|s| s.to_string()).collect();
+    let calibration_chunks: Vec<String> = if let Some(path) = &corpus_path {
+        let text = std::fs::read_to_string(path).expect("read corpus");
+        // Chunk by paragraphs first, then merge small paragraphs up to chunk_len.
+        let paras: Vec<&str> = text.split("\n\n").map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        let mut out: Vec<String> = Vec::new();
+        for p in paras {
+            // Very rough token estimate: 4 chars/token. Keep chunks comfortably
+            // under chunk_len tokens so we never have to truncate mid-paragraph.
+            let est_tokens = p.len() / 4;
+            if est_tokens <= chunk_len {
+                out.push(p.to_string());
+            } else {
+                // Split long paragraphs on sentences.
+                let mut cur = String::new();
+                for s in p.split(". ") {
+                    let s_trim = s.trim();
+                    if s_trim.is_empty() { continue; }
+                    let cand_len = (cur.len() + s_trim.len() + 2) / 4;
+                    if cand_len > chunk_len && !cur.is_empty() {
+                        out.push(cur.trim().to_string());
+                        cur = String::new();
+                    }
+                    cur.push_str(s_trim);
+                    cur.push_str(". ");
+                }
+                if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+            }
+        }
+        eprintln!("corpus: {} chunks from {path}", out.len());
+        out
+    } else {
+        builtin_prompts
+    };
+    let calibration_prompts: Vec<&str> = calibration_chunks.iter().map(|s| s.as_str()).collect();
+
+    // ── Load model ─────────────────────────────────────────────────────
+    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let config = qwen35::config_from_hfq(&hfq).expect("config");
+    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
+
+    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+
+    let kv_seq = 512usize;
+    let mut kv = KvCache::new_gpu_q8(
+        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+    ).expect("kv q8");
+    let mut dn = DeltaNetState::new(&mut gpu, &config).expect("dn");
+    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
+
+    // ── Phase 1: Calibrate (or load existing sidecar) ─────────────────
+    let centers = if load_sidecar {
+        eprintln!("loading sidecar from {sidecar_path}");
+        let c = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");
+        eprintln!(
+            "loaded: n_layers={} n_heads={} n_bands={} head_dim={}",
+            c.n_layers, c.n_heads, c.n_bands(), c.head_dim,
+        );
+        c
+    } else {
+        eprintln!(
+            "calibration: {} prompts, {} FA layers × {} heads × {} bands",
+            calibration_prompts.len(),
+            config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count(),
+            config.n_heads,
+            config.head_dim / 2,
+        );
+        let calib_state = TriAttnCalibState::new(
+            config.n_layers, config.n_heads, config.head_dim,
+            config.rope_theta, config.partial_rotary_factor,
+        );
+        triattn::install_tap(calib_state);
+
+        let mut total_tokens = 0usize;
+        'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
+            let tokens = tok.encode(p);
+            for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+            for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+            for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            let max_len = tokens.len().min(kv_seq.saturating_sub(4));
+            let remaining = max_tokens.saturating_sub(total_tokens);
+            let take_len = max_len.min(remaining);
+            if take_len == 0 { break 'outer; }
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config, &tokens[..take_len], 0,
+                &mut kv, &mut dn, &scratch,
+                None, None, None, None,
+            ).expect("calib batched forward");
+            total_tokens += take_len;
+            if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
+                eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
+            }
+            if total_tokens >= max_tokens { break 'outer; }
+        }
+
+        let calib = triattn::take_tap().expect("tap still installed");
+        eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
+        let c = calib.finalize();
+        c.save(Path::new(&sidecar_path)).expect("save sidecar");
+        eprintln!("saved sidecar: {sidecar_path}");
+        c
+    };
+
+    report_mrl_distribution(&centers);
+
+    // ── Phase 2: Full capture on validation prompt ─────────────────────
+    // Fresh KV + DN state so the captured Qs line up with token positions
+    // starting at 0.
+    for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+    for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
+    for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+    for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+    for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+
+    let cap = TriAttnCapture::new(config.n_heads, config.n_kv_heads, config.head_dim);
+    triattn::install_capture(cap);
+
+    let val_tokens = tok.encode(&validation_prompt);
+    let val_len = val_tokens.len().min(kv_seq.saturating_sub(4));
+    eprintln!("validation: {val_len} tokens");
+    for (pos, tid) in val_tokens.iter().take(val_len).enumerate() {
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, *tid, pos,
+            &mut kv, &mut dn, &scratch,
+        ).expect("val forward");
+        triattn::capture_finish_token();
+    }
+    let capture = triattn::take_capture().expect("capture still installed");
+    assert_eq!(capture.q_samples.len(), val_len, "token count mismatch");
+
+    // ── Phase 3: Reconstruction correlation ────────────────────────────
+    // For each FA layer, for each query head, predict attention logits via
+    // the TriAttn scoring vs ground-truth Q·K dot products. Because we
+    // want to cover short-to-long distances evenly the way the paper does,
+    // we score against the LAST token's query.
+    let last = val_len - 1;
+    let p_q = last as f32;
+    let n_bands = config.head_dim / 2;
+    let d_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+
+    // Map kv_head h_kv to the set of query heads sharing it.
+    let kv_group = config.n_heads / config.n_kv_heads;
+
+    let mut per_layer_r: Vec<f32> = Vec::new();
+    for (fa_pos, &layer_idx) in capture.layer_ids_per_token[last].iter().enumerate() {
+        // Ignore layers that aren't FA (those arrays are empty).
+        if capture.q_samples[last][fa_pos].is_empty() { continue; }
+        let q_last = &capture.q_samples[last][fa_pos];
+        assert_eq!(q_last.len(), config.n_heads * config.head_dim);
+
+        let mut per_head_r = Vec::with_capacity(config.n_heads);
+        for h in 0..config.n_heads {
+            let h_kv = h / kv_group;
+            let q_head = &q_last[h * config.head_dim..(h + 1) * config.head_dim];
+
+            // Post-RoPE Q for the last position.
+            let q_post = apply_rope(q_head, p_q, d_rot, config.rope_theta);
+
+            let mut predicted = Vec::with_capacity(val_len);
+            let mut actual = Vec::with_capacity(val_len);
+
+            for i in 0..val_len {
+                if capture.k_samples[i].is_empty() { continue; }
+                let k_row = &capture.k_samples[i][fa_pos];
+                if k_row.is_empty() { continue; }
+                let k_head = &k_row[h_kv * config.head_dim..(h_kv + 1) * config.head_dim];
+
+                // Ground truth: dot product of post-RoPE Q and post-RoPE K
+                // (standard attention, no softmax — softmax is monotonic
+                // so correlation of logits ≈ correlation of softmaxed).
+                let k_post = apply_rope(k_head, i as f32, d_rot, config.rope_theta);
+                let mut dot = 0.0f32;
+                for d in 0..config.head_dim { dot += q_post[d] * k_post[d]; }
+                actual.push(dot);
+
+                // TriAttn prediction (post-RoPE path, uses stored post-RoPE K).
+                let centers_slice = center_slice(&centers, layer_idx, h);
+                let k_post_bands = triattn::kpost_per_band(&k_post);
+                let s = triattn::s_total(centers_slice, &k_post_bands, p_q, |f| centers.omega(f));
+                predicted.push(s);
+            }
+
+            let r = triattn::pearson(&actual, &predicted);
+            per_head_r.push(r);
+        }
+
+        let mean_r: f32 = per_head_r.iter().sum::<f32>() / per_head_r.len() as f32;
+        let (min_r, max_r) = per_head_r.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+        let pct_above_05 = per_head_r.iter().filter(|&&r| r > 0.5).count() as f32 * 100.0 / per_head_r.len() as f32;
+        eprintln!(
+            "layer {layer_idx:2}: r̄={mean_r:.3}  [{min_r:.3}, {max_r:.3}]  {pct_above_05:.0}% of heads > 0.5",
+        );
+        per_layer_r.push(mean_r);
+    }
+
+    if !per_layer_r.is_empty() {
+        let overall: f32 = per_layer_r.iter().sum::<f32>() / per_layer_r.len() as f32;
+        eprintln!("\n=== overall mean r̄ across FA layers: {overall:.3} ===");
+        eprintln!("paper target: ≈0.5 (Figure 3 mean), per-head 0.6-0.9 common; calibration corpus is tiny here");
+    }
+
+    fn apply_rope(x: &[f32], pos: f32, d_rot: usize, theta: f32) -> Vec<f32> {
+        let mut out = x.to_vec();
+        for f in 0..(d_rot / 2) {
+            let exponent = -2.0f32 * f as f32 / d_rot as f32;
+            let w = theta.powf(exponent);
+            let angle = w * pos;
+            let c = angle.cos();
+            let s = angle.sin();
+            let xr = x[2 * f];
+            let xi = x[2 * f + 1];
+            out[2 * f] = xr * c - xi * s;
+            out[2 * f + 1] = xr * s + xi * c;
+        }
+        out
+    }
+
+    fn center_slice(c: &TriAttnCenters, layer: usize, head: usize) -> &[BandCenter] {
+        let n_bands = c.n_bands();
+        let base = layer * c.n_heads * n_bands + head * n_bands;
+        &c.centers[base..base + n_bands]
+    }
+
+    fn report_mrl_distribution(c: &TriAttnCenters) {
+        let n_bands = c.n_bands();
+        let mut mrls = Vec::new();
+        for l in 0..c.n_layers {
+            for h in 0..c.n_heads {
+                for f in 0..n_bands {
+                    let bc = c.get(l, h, f);
+                    if bc.e_abs_q > 1e-10 {
+                        mrls.push(bc.mrl());
+                    }
+                }
+            }
+        }
+        if mrls.is_empty() { return; }
+        mrls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean: f32 = mrls.iter().sum::<f32>() / mrls.len() as f32;
+        let median = mrls[mrls.len() / 2];
+        let pct_above_095 = mrls.iter().filter(|&&r| r > 0.95).count() as f32 * 100.0 / mrls.len() as f32;
+        eprintln!(
+            "Mean Resultant Length R_f across all (layer, head, band): mean={mean:.3}, median={median:.3}, {pct_above_095:.1}% > 0.95",
+        );
+        eprintln!("paper target: ~90% of heads R > 0.95 (Figure 2C)");
+    }
+}

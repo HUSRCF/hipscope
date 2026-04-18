@@ -8,6 +8,16 @@
 #include "turbo_common.h"
 #include "givens_common.h"
 
+// ─── Tree-attention mode (DDTree batched verify) ──────────────────────────
+// When `tree_bias != nullptr`:
+//   - Effective seq_len is `block_start + block_cols` (full cache including
+//     the tree block; `positions[global_bid]` is ignored as a cutoff).
+//   - For in-block keys (t >= block_start) the score receives an additive
+//     bias `tree_bias[global_bid * block_cols + (t - block_start)]` before
+//     the tile max / exp / sum. Caller supplies -inf on non-ancestors so
+//     exp collapses to 0.
+//   - Prompt keys (t < block_start) remain unmasked.
+// When `tree_bias == nullptr` this matches the legacy causal path exactly.
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_asym3_tile_batched(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
@@ -17,6 +27,7 @@ __global__ void attention_flash_asym3_tile_batched(
     const int* __restrict__ positions,         // [total_batch]
     const float* __restrict__ cos_theta,
     const float* __restrict__ sin_theta,
+    const float* __restrict__ tree_bias,       // optional [total_batch × block_cols]
     int n_heads,
     int n_kv_heads,
     int head_dim,
@@ -24,7 +35,9 @@ __global__ void attention_flash_asym3_tile_batched(
     float scale_attn,
     int tile_size,
     int max_tiles,
-    int batch_offset
+    int batch_offset,
+    int block_start,                           // ignored when tree_bias == nullptr
+    int block_cols                             // ignored when tree_bias == nullptr
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -33,7 +46,8 @@ __global__ void attention_flash_asym3_tile_batched(
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
-    const int seq_len = positions[global_bid] + 1;
+    const bool tree_mode = (tree_bias != nullptr);
+    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -101,8 +115,16 @@ __global__ void attention_flash_asym3_tile_batched(
                       + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
-        if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+        if (tid == 0) {
+            float s = partial * scale_attn;
+            // Tree-attention bias on in-block keys. -inf bias makes exp(s-max)
+            // collapse to 0; the ancestor set always contains the root so at
+            // least one finite in-block score exists for every query row.
+            if (tree_mode && t >= block_start) {
+                s += tree_bias[global_bid * block_cols + (t - block_start)];
+            }
+            scores[t_local] = s;
+        }
     }
     __syncthreads();
 

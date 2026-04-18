@@ -17,11 +17,15 @@
 //!   → {"type":"unload"}
 //!   ← {"type":"unloaded"}
 
+use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use engine::hfq::HfqFile;
 use engine::llama;
 use engine::qwen35;
 use engine::qwen35::DeltaNetState;
 use engine::qwen35_vl;
+use engine::speculative::{
+    self, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
+};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -81,6 +85,28 @@ const IMAGE_PAD_ID: u32 = 248056;
 const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
 
+/// Optional DFlash speculative-decoding state. Populated when `load` supplies
+/// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
+/// `generate` fast path when temperature == 0 — falls back to AR sampling
+/// otherwise (DFlash is greedy-only in this integration).
+struct DflashState {
+    draft_config: DflashConfig,
+    draft_weights: DflashWeights,
+    draft_scratch: DflashScratch,
+    hidden_rb: HiddenStateRingBuffer,
+    verify_scratch: VerifyScratch,
+    target_snap: DeltaNetSnapshot,
+    gdn_tape: GdnTape,
+    /// CPU-side ring of target hidden states (num_extract × hidden per pos)
+    /// — seeded from the prompt, extended by each verify's accepted rows.
+    /// Drives the draft's diffusion forward.
+    target_hidden_host: Vec<f32>,
+    /// Max ctx the draft was initialized for (ring buffer cap).
+    ctx_capacity: usize,
+    /// Block size the draft was trained at.
+    block_size: usize,
+}
+
 struct LoadedModel {
     arch_id: u32,
     // Qwen3.5 state
@@ -103,6 +129,12 @@ struct LoadedModel {
     seq_pos: usize,              // current position in KV cache / DeltaNet state
     max_seq: usize,              // KV cache capacity
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
+    // Target model file path — cached so the DFlash fast path can reopen the
+    // HfqFile mmap to construct a transient ModelSlot without reloading
+    // weights. `HfqFile::open` is a cheap mmap operation.
+    model_path: String,
+    // DFlash speculative decoding state (populated when load supplied a draft).
+    dflash: Option<DflashState>,
 }
 
 fn main() {
@@ -186,7 +218,40 @@ fn main() {
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 let max_seq = msg.get("params").and_then(|p| p.get("max_seq")).and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
-                match load_model(path, max_seq, &mut gpu) {
+                // Optional DFlash draft model path. When supplied AND the target
+                // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
+                // alongside the target and the temp=0 generate fast path routes
+                // through `spec_step_dflash` for the 1.7-2.5× speedup on the
+                // 27B target. Non-matching archs / missing draft file are
+                // logged but don't fail the load.
+                let draft_path = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+
+                // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
+                // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
+                // Accepted here; the generate loop will honor it in the
+                // 0.1.7-stable release where we port the demo's outer τ-window
+                // trip-wire (below 2.5 → shrink block to 8).
+                let _adaptive_b = msg.get("params").and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool()).unwrap_or(true);
+
+                // 0.1.7-alpha: TriAttention / CASK eviction protocol fields.
+                // Currently accepted but not wired through the daemon generate
+                // path — the serve-time eviction integration lands in 0.1.7
+                // stable. Logged on accept so users can see their config was
+                // received even when the backend doesn't honor it yet.
+                let cask_sidecar = msg.get("params").and_then(|p| p.get("cask_sidecar"))
+                    .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                if cask_sidecar.is_some() {
+                    eprintln!(
+                        "[hipfire-daemon] cask_sidecar accepted (pending 0.1.7 stable wire-up): {}",
+                        cask_sidecar.as_deref().unwrap_or(""),
+                    );
+                }
+
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -375,7 +440,7 @@ fn main() {
                     let scratch = m.q35_scratch.as_ref().unwrap();
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
-                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch).is_ok()
+                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -443,8 +508,15 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_default();
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+    // Per-load kv_mode (sent in load message params) overrides the env var.
+    // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
+    // since layer-count compounding of asym3 noise flips argmax at decision
+    // boundaries on deep stacks.
+    let kv_mode = kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
@@ -499,6 +571,28 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
         let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
+        // Optional DFlash draft: load the draft model's weights + a fresh set
+        // of per-cycle scratch buffers (hidden ring, verify scratch, GdnTape,
+        // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
+        // is missing or arch-mismatched, we log and continue without DFlash
+        // (temp==0 requests will fall back to AR sampling).
+        let dflash = if let Some(dp) = draft_path {
+            match load_dflash_state(dp, max_seq, &config, &dn, gpu) {
+                Ok(state) => {
+                    eprintln!(
+                        "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
+                        dp, state.draft_config.n_layers, state.draft_config.hidden,
+                        state.draft_config.block_size,
+                    );
+                    Some(state)
+                }
+                Err(e) => {
+                    eprintln!("  DFlash draft load failed ({}): {} — falling back to AR only", dp, e);
+                    None
+                }
+            }
+        } else { None };
+
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
@@ -507,6 +601,8 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash,
         })
     } else {
         // Qwen3 / LLaMA
@@ -523,11 +619,22 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
         })
     }
 }
 
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // DFlash state: draft weights have free_gpu; ring / snapshot / tape /
+    // verify_scratch don't expose one — their GpuTensors / DeviceBuffers will
+    // leak until daemon exit if the caller cycles load/unload mid-session.
+    // Acceptable for the daemon since unload is rare and the weights are the
+    // bulk of the VRAM anyway.
+    if let Some(df) = m.dflash {
+        df.draft_weights.free_gpu(gpu);
+        df.draft_scratch.free_gpu(gpu);
+    }
     // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
     if let Some(kv) = m.kv_cache { kv.free_gpu(gpu); }
     if let Some(dn) = m.dn_state { dn.free_gpu(gpu); }
@@ -542,7 +649,340 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
+fn load_dflash_state(
+    draft_path: &str,
+    ctx_capacity: usize,
+    target_config: &qwen35::Qwen35Config,
+    target_dn: &DeltaNetState,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<DflashState, String> {
+    let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
+    let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
+    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
+    let draft_scratch = DflashScratch::new_with_mq(
+        gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
+    ).map_err(|e| format!("draft scratch: {e}"))?;
+
+    // Hidden ring: one row per target-layer selected by the draft config,
+    // captured during each target forward. Sized so the whole context plus
+    // one block fits without aliasing. Cheap (< 100 MB) next to the draft
+    // weights themselves.
+    let hidden_rb = HiddenStateRingBuffer::new(
+        gpu,
+        target_config.n_layers,
+        draft_config.num_extract(),
+        draft_config.hidden,
+        ctx_capacity + draft_config.block_size,
+    ).map_err(|e| format!("hidden_rb: {e}"))?;
+
+    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
+    let gdn_tape = GdnTape::new_for_config(gpu, target_config, draft_config.block_size)
+        .map_err(|e| format!("gdn_tape: {e}"))?;
+    let verify_scratch = VerifyScratch::with_prefill(
+        gpu,
+        draft_config.block_size,
+        target_config.dim,
+        target_config.vocab_size,
+        target_config.dim,
+        target_config,
+    ).map_err(|e| format!("verify_scratch: {e}"))?;
+
+    let target_hidden_host: Vec<f32> = Vec::with_capacity(
+        ctx_capacity * draft_config.num_extract() * draft_config.hidden,
+    );
+    let block_size = draft_config.block_size;
+    Ok(DflashState {
+        draft_config,
+        draft_weights,
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+        ctx_capacity,
+        block_size,
+    })
+}
+
+/// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
+/// token-streaming output but replaces the AR sample loop with
+/// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
+/// model and verifies them in one target forward, committing accept_len+1
+/// at a time.
+///
+/// Single-turn: this path always resets target state at entry, matching the
+/// stateless OpenAI chat-completions contract. Multi-turn callers that
+/// persist KV across HTTP requests are out of scope for this integration —
+/// they can keep using the AR path.
+#[allow(clippy::too_many_arguments)]
+fn generate_dflash(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+) {
+    use engine::speculative::{spec_step_dflash, ModelSlot, ModelSlotConfig, SpecStats};
+
+    // Tokenize with ChatML wrapping (identical to the AR path). System prompt
+    // is always prepended because this fast path is single-turn.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let im_start = tokenizer.encode("<|im_start|>");
+    let im_end = tokenizer.encode("<|im_end|>");
+    let nl = tokenizer.encode("\n");
+    let user_tok = tokenizer.encode("user");
+    let asst_tok = tokenizer.encode("assistant");
+
+    let mut prompt_tokens: Vec<u32> = Vec::new();
+    if let Some(sys) = system_prompt {
+        let sys_tok = tokenizer.encode("system");
+        let sys_content = tokenizer.encode(sys);
+        prompt_tokens.extend_from_slice(&im_start);
+        prompt_tokens.extend_from_slice(&sys_tok);
+        prompt_tokens.extend_from_slice(&nl);
+        prompt_tokens.extend_from_slice(&sys_content);
+        prompt_tokens.extend_from_slice(&im_end);
+        prompt_tokens.extend_from_slice(&nl);
+    }
+    let q_tokens = tokenizer.encode(prompt);
+    prompt_tokens.extend_from_slice(&im_start);
+    prompt_tokens.extend_from_slice(&user_tok);
+    prompt_tokens.extend_from_slice(&nl);
+    prompt_tokens.extend_from_slice(&q_tokens);
+    prompt_tokens.extend_from_slice(&im_end);
+    prompt_tokens.extend_from_slice(&nl);
+    prompt_tokens.extend_from_slice(&im_start);
+    prompt_tokens.extend_from_slice(&asst_tok);
+    prompt_tokens.extend_from_slice(&nl);
+
+    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+
+    // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
+    // full prefill, so we reset first to avoid double-accounting.
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    {
+        let dn = m.dn_state.as_ref().unwrap();
+        for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+    }
+    let df = m.dflash.as_mut().unwrap();
+    df.target_hidden_host.clear();
+    df.draft_scratch.reset_upload_tracking();
+
+    // Assemble a transient ModelSlot for the spec helpers — they both take
+    // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
+    // take them, build the ModelSlot, run, then put them back.
+    //
+    // ModelSlot needs its own HfqFile field but spec_step_dflash doesn't
+    // actually touch it. Reopening via mmap is essentially free (few µs).
+    let target_config = m.q35_config.as_ref().unwrap().clone();
+    let weights = m.q35_weights.take().expect("q35 weights");
+    let kv_cache = m.kv_cache.take().expect("kv cache");
+    let dn_state = m.dn_state.take().expect("dn state");
+    let scratch = m.q35_scratch.take().expect("q35 scratch");
+    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"reopen model: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.q35_weights = Some(weights); m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state); m.q35_scratch = Some(scratch);
+            return;
+        }
+    };
+    let slot_config = ModelSlotConfig::default();
+    let mut target = ModelSlot {
+        name: String::from("target"),
+        hfq,
+        config: target_config,
+        weights,
+        kv_cache,
+        dn_state,
+        scratch,
+        slot_config,
+    };
+
+    let t0 = Instant::now();
+    let ctx_capacity = df.ctx_capacity;
+    if prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt+max_tokens exceeds ctx_capacity {}"}}"#,
+            id, ctx_capacity,
+        );
+        let _ = stdout.flush();
+        // Put state back before returning so subsequent requests don't panic.
+        m.q35_weights = Some(target.weights);
+        m.kv_cache = Some(target.kv_cache);
+        m.dn_state = Some(target.dn_state);
+        m.q35_scratch = Some(target.scratch);
+        return;
+    }
+
+    // Seed target_hidden via the demo's helper — runs a per-token prefill
+    // with hidden extraction into hidden_rb, then downloads prompt-length
+    // worth of rows into target_hidden_host. The draft's first forward
+    // uses these as context.
+    if let Err(e) = speculative::seed_target_hidden_from_prompt(
+        gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
+    ) {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
+        let _ = stdout.flush();
+        m.q35_weights = Some(target.weights);
+        m.kv_cache = Some(target.kv_cache);
+        m.dn_state = Some(target.dn_state);
+        m.q35_scratch = Some(target.scratch);
+        return;
+    }
+    // Prime the draft's GPU target_hidden buffer from the prompt rows so the
+    // first spec step can skip the CPU→GPU upload of the whole context.
+    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+        gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+        0, prompt_tokens.len(), prompt_tokens.len(),
+    ) {
+        eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+    }
+    df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+
+    // First emit = target's argmax at the final prompt position. seed_target_hidden
+    // already ran the per-token forward for every prompt token; its scratch.logits
+    // holds the post-prompt logits.
+    let first_logits = match gpu.download_f32(&target.scratch.logits) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"download logits: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            return;
+        }
+    };
+    let first_token = first_logits.iter().enumerate()
+        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+            if v > bv { (i as u32, v) } else { (best, bv) }
+        }).0;
+
+    let t_prefill = Instant::now();
+
+    // Decode loop — spec_step_dflash returns a committed batch per cycle.
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut position = prompt_tokens.len();
+    let mut seed_token = first_token;
+    let mut stats = SpecStats::new(df.block_size);
+    let mut generated = 0usize;
+
+    // Emit the first token immediately so TTFT is the prefill time.
+    streamed_tokens.push(first_token);
+    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+    let new_bytes = &all_bytes[emitted_bytes..];
+    let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+    if vl > 0 {
+        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+        let _ = stdout.flush();
+        emitted_bytes += vl;
+    }
+    generated += 1;
+
+    let mut rng_state: u64 = 0x13579BDFu64;
+    // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
+    while generated < max_tokens {
+        if position + df.block_size >= ctx_capacity { break; }
+        let step = match spec_step_dflash(
+            gpu, &mut target, &df.draft_weights, &df.draft_config,
+            &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+            &mut df.target_snap, &df.verify_scratch,
+            position, seed_token,
+            None,                      // ctx_slice = full history
+            Some(&mut df.gdn_tape),
+            0.0_f32,                   // temperature
+            &mut rng_state,
+            None,                      // block_size override
+            None,                      // ngram_cache
+            &emitted,
+            0.0_f32,                   // cactus_delta
+            None,                      // pld_spine
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#, id, e);
+                let _ = stdout.flush();
+                break;
+            }
+        };
+        stats.record(&step);
+        let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+
+        let mut hit_eos = false;
+        for &tok in &committed_tail {
+            if generated >= max_tokens { break; }
+            emitted.push(tok);
+            streamed_tokens.push(tok);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            if vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += vl;
+            }
+            generated += 1;
+            if tok == target.config.eos_token || im_end_token == Some(tok) { hit_eos = true; break; }
+        }
+        position += step.accepted + 1;
+        seed_token = step.bonus_token;
+        if hit_eos { break; }
+    }
+
+    // Put target state back on LoadedModel so the next request sees fresh
+    // (reset) state. We zero DN/kv on entry anyway, but we still need the
+    // ownership back.
+    m.q35_weights = Some(target.weights);
+    m.kv_cache = Some(target.kv_cache);
+    m.dn_state = Some(target.dn_state);
+    m.q35_scratch = Some(target.scratch);
+    m.seq_pos = position;
+    m.conversation_tokens = emitted.clone();
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { prompt_tokens.len() as f64 / prefill_s } else { 0.0 };
+    let tau = if stats.cycles > 0 { stats.accepted_tokens as f64 / stats.cycles as f64 } else { 0.0 };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}}}"#,
+        id, generated, tok_s, prompt_tokens.len(),
+        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+        tau, stats.cycles,
+    );
+    let _ = stdout.flush();
+}
+
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str) {
+    // DFlash fast path — only when a draft model is loaded AND temperature is
+    // effectively 0 (DFlash is greedy-only in this integration). Skip the
+    // normal AR sampling setup entirely.
+    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
+        // Silence unused-variable warnings for the params we didn't need.
+        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
+        return;
+    }
+
     // Auto-reset on multi-turn rollover. The estimate here is intentionally
     // rough (ignores system prompt, which is only prepended on seq_pos==0);
     // undercounting only means we reset slightly later, and the EXACT
@@ -642,6 +1082,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // prefill by a large factor (prefill_tok_s ~5–10× too optimistic).
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
+            None, None, None, None,
         ).unwrap();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);

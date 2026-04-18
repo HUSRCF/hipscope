@@ -89,6 +89,7 @@ fn main() {
     qwen35::forward_prefill_batch(
         &mut gpu, &weights, &config, &prompt, 0,
         &mut kv_cache, &mut dn_state, &scratch,
+        None, None, None, None,
     ).expect("prefill failed");
     eprintln!("  prefill: {:.1}ms", t_prefill.elapsed().as_secs_f64() * 1000.0);
 

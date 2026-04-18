@@ -7,6 +7,11 @@
 // Grid: [n_heads, sub_batch_size, 1]. Block: [32, 1, 1]. Zero LDS.
 #include <hip/hip_runtime.h>
 
+// When `block_cols > 0` the reduce runs in DDTree tree-attention mode and
+// sets seq_len = `block_start + block_cols` (matching the tile kernel).
+// Otherwise it uses `positions[global_bid] + 1` (legacy causal). The tile
+// kernel's bias is already baked into the partials, so reduce only needs
+// to know how many tiles to combine.
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_asym_reduce_batched(
     const float* __restrict__ partials,        // [sub_batch × n_heads × max_tiles × stride]
@@ -16,7 +21,9 @@ __global__ void attention_flash_asym_reduce_batched(
     int head_dim,
     int tile_size,
     int max_tiles,
-    int batch_offset
+    int batch_offset,
+    int block_start,                           // ignored when block_cols == 0
+    int block_cols                             // 0 = legacy causal, >0 = tree mode
 ) {
     const int h = blockIdx.x;
     const int local_bid = blockIdx.y;
@@ -25,7 +32,8 @@ __global__ void attention_flash_asym_reduce_batched(
     const int stride = 2 + head_dim;
 
     const int global_bid = batch_offset + local_bid;
-    const int seq_len = positions[global_bid] + 1;
+    const int seq_len = (block_cols > 0) ? (block_start + block_cols)
+                                          : (positions[global_bid] + 1);
     const int n_tiles = (seq_len + tile_size - 1) / tile_size;
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;

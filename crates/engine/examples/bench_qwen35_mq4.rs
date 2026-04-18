@@ -98,6 +98,7 @@ fn main() {
         qwen35::forward_prefill_batch(
             &mut gpu, &weights, &config, &prompt_tokens, 0,
             &mut kv_cache, &mut dn_state, &scratch,
+            None, None, None, None,
         ).expect("warmup prefill failed");
         // Reset DeltaNet state for the profiled run
         dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
@@ -116,6 +117,7 @@ fn main() {
     qwen35::forward_prefill_batch(
         &mut gpu, &weights, &config, &prompt_tokens, 0,
         &mut kv_cache, &mut dn_state, &scratch,
+        None, None, None, None,
     ).expect("prefill forward failed");
     gpu.hip.device_synchronize().expect("sync after prefill");
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;

@@ -180,6 +180,7 @@ it?".to_string(),
         qwen35::forward_prefill_batch(
             &mut gpu, &weights, &config, &new_tokens, seq_pos,
             &mut kv_cache, &mut dn_state, &scratch,
+            None, None, None, None,
         ).expect("prefill");
         let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
         let prefill_tok_s = new_tokens.len() as f64 / (prefill_ms / 1000.0);

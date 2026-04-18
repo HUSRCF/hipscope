@@ -8,6 +8,11 @@
 #include "turbo_common.h"
 #include "givens_common.h"
 
+// ─── Tree-attention mode (DDTree batched verify) ──────────────────────────
+// See attention_flash_asym3_tile_batched.hip for the full contract — same
+// semantics apply here. Summary: `tree_bias != nullptr` → seq_len extends
+// to `block_start + block_cols` and in-block key scores receive the
+// per-row bias (-inf on non-ancestors, 0 on ancestors).
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_asym4_tile_batched(
     const float* __restrict__ q,
@@ -17,6 +22,7 @@ __global__ void attention_flash_asym4_tile_batched(
     const int* __restrict__ positions,
     const float* __restrict__ cos_theta,
     const float* __restrict__ sin_theta,
+    const float* __restrict__ tree_bias,       // optional [total_batch × block_cols]
     int n_heads,
     int n_kv_heads,
     int head_dim,
@@ -24,7 +30,9 @@ __global__ void attention_flash_asym4_tile_batched(
     float scale_attn,
     int tile_size,
     int max_tiles,
-    int batch_offset
+    int batch_offset,
+    int block_start,                           // ignored when tree_bias == nullptr
+    int block_cols                             // ignored when tree_bias == nullptr
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -33,7 +41,8 @@ __global__ void attention_flash_asym4_tile_batched(
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
-    const int seq_len = positions[global_bid] + 1;
+    const bool tree_mode = (tree_bias != nullptr);
+    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -88,8 +97,13 @@ __global__ void attention_flash_asym4_tile_batched(
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
-        if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+        if (tid == 0) {
+            float s = partial * scale_attn;
+            if (tree_mode && t >= block_start) {
+                s += tree_bias[global_bid * block_cols + (t - block_start)];
+            }
+            scores[t_local] = s;
+        }
     }
     __syncthreads();
 
