@@ -3,7 +3,7 @@
 
 use crate::compiler::KernelCompiler;
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipResult, HipRuntime};
+use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -163,6 +163,12 @@ pub struct Gpu {
     pub graph_exec: Option<hip_bridge::GraphExec>,
     /// The raw captured graph (kept alive for potential update operations).
     captured_graph: Option<hip_bridge::Graph>,
+
+    // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
+    /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
+    /// librocblas.so fails to load. Engine code should always gate on
+    /// `.is_some()` and fall back to the hand-rolled HFQ4 kernels otherwise.
+    pub rocblas: Option<Rocblas>,
 }
 
 impl Gpu {
@@ -217,7 +223,113 @@ impl Gpu {
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
+            rocblas: None,
         })
+    }
+
+    /// Try to load rocBLAS. Safe no-op on non-CDNA3 archs (we don't use
+    /// rocBLAS on RDNA — the hand-rolled kernels outperform it there).
+    ///
+    /// On success, sets `self.rocblas = Some(_)`; prefill dispatch paths can
+    /// then route through MFMA-backed GEMM. On failure (library missing,
+    /// symbol missing, handle init fail), logs once and leaves `None`.
+    /// Callers always fall back to the non-rocBLAS path.
+    pub fn try_init_rocblas(&mut self) {
+        if self.rocblas.is_some() { return; }
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        if !cdna3 { return; }
+        match Rocblas::load() {
+            Ok(rb) => {
+                // Bind to the active stream if present; otherwise rocBLAS uses
+                // the default (null) stream, which still works — just bigger
+                // host-side sync cost.
+                if let Some(stream) = self.active_stream.as_ref() {
+                    let raw = stream as *const _ as *mut c_void;
+                    let _ = rb.set_stream(raw);
+                }
+                eprintln!("[rocblas] loaded for {}", self.arch);
+                self.rocblas = Some(rb);
+            }
+            Err(e) => {
+                eprintln!("[rocblas] not available ({}); falling back to hand-rolled GEMMs", e);
+            }
+        }
+    }
+
+    /// Dequantize an HFQ4-G256 weight [M × K] into an FP16 buffer [M × K]
+    /// row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
+    ///
+    /// Used as a one-shot model-load step on CDNA3 when the downstream
+    /// prefill GEMM path is rocBLAS/hipBLASLt. Cost scales as O(MK) — for
+    /// a 35B-A3B target at load time, ~10 GB dequantized; MI300X handles
+    /// this in well under a second (the math is trivial, the launch is
+    /// BW-bound at HBM3 write speed).
+    pub fn dequantize_hfq4g256_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "hfq4g256 dequant: K must be multiple of 256 (got {k})");
+        self.ensure_kernel(
+            "hfq4g256_dequantize_to_f16",
+            kernels::HFQ4G256_DEQUANTIZE_TO_F16_SRC,
+            "hfq4g256_dequantize_to_f16",
+        )?;
+        let func = &self.functions["hfq4g256_dequantize_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(func, [m as u32, groups, 1], [128, 1, 1], 0,
+                self.stream_ref(), &mut params)
+        }
+    }
+
+    /// CDNA3-only: row-major M×N output = (M×K row-major A) · (K×N row-major B).
+    /// Both A and B are FP16; output is FP32 (compute_type=F32). Panics if
+    /// `self.rocblas` is None (caller must check first).
+    ///
+    /// rocBLAS is column-major. We flip the operation to (N×K B^T) · (K×M A^T)
+    /// = N×M output in col-major = M×N in row-major. No pointer shuffling
+    /// needed — just swap the arg roles.
+    pub fn rocblas_gemm_fp16_fp32_row_major(
+        &self,
+        a_fp16: &DeviceBuffer, // [M × K] row-major
+        b_fp16: &DeviceBuffer, // [K × N] row-major (i.e. leading dim = N)
+        c_fp32: &DeviceBuffer, // [M × N] row-major output
+        m: usize, n: usize, k: usize,
+    ) -> HipResult<()> {
+        use hip_bridge::{RocblasDatatype, RocblasOperation};
+        let rb = self.rocblas.as_ref()
+            .expect("rocblas_gemm_fp16_fp32: rocBLAS not initialized on this Gpu");
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // Row-major M×N = rocBLAS column-major (N × M) view:
+        //   A' (col-major N×K) is B (row-major K×N), with leading dim = N.
+        //   B' (col-major K×M) is A (row-major M×K), with leading dim = K.
+        // So: gemm(m=N, n=M, k=K, A=B, lda=N, B=A, ldb=K, C=C, ldc=N).
+        unsafe {
+            rb.gemm_ex(
+                RocblasOperation::None, RocblasOperation::None,
+                n as i32, m as i32, k as i32,
+                &alpha as *const f32 as *const c_void,
+                b_fp16.as_ptr(), RocblasDatatype::F16, n as i32,
+                a_fp16.as_ptr(), RocblasDatatype::F16, k as i32,
+                &beta as *const f32 as *const c_void,
+                c_fp32.as_ptr(), RocblasDatatype::F32, n as i32,
+                c_fp32.as_ptr(), RocblasDatatype::F32, n as i32,
+                RocblasDatatype::F32,
+            ).map_err(|e| hip_bridge::HipError::new(e.status, &format!("rocblas_gemm: {}", e.context)))
+        }
     }
 
     // ── hipGraph capture/replay ───────────────────────────────────────────
