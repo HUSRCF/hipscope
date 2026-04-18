@@ -2153,8 +2153,23 @@ pub fn forward_scratch(
     // reordering between capture and replay in one of the flash-attn or
     // GDN state-update kernels that compounds over many replays.
     // Until that's isolated, MoE always takes the direct path.
+    // HIPFIRE_GRAPH_MOE=1 (diagnostic-only): bypass the MoE guard. Required
+    // to reproduce task #100. Under-graph A3B does NOT corrupt at step 1 —
+    // it accumulates numerical drift and diverges from direct at step ~6
+    // with q8 KV or step ~114 with asym3 KV on the Count-from-1-to-20
+    // prompt. Migrating `kv_cache_write_q8_0` to the blob launch path (it
+    // was the only remaining non-blob kernel in the MoE hot path) did not
+    // resolve the drift — the root cause is elsewhere, likely DeltaNet
+    // state accumulating tiny bit-level differences across replays via a
+    // numerical-reordering path (atomics or wavefront-scheduling dependent
+    // reductions inside gated_delta_net_*). Reproducer for next dig:
+    //   HIPFIRE_GRAPH=1 HIPFIRE_GRAPH_MOE=1 HIPFIRE_SMOKE_KV=q8 \
+    //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
+    //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
+    //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
+    let allow_moe = std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1");
     let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1")
-        && config.num_experts == 0;
+        && (config.num_experts == 0 || allow_moe);
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
