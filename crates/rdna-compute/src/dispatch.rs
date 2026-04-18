@@ -169,6 +169,17 @@ pub struct Gpu {
     /// librocblas.so fails to load. Engine code should always gate on
     /// `.is_some()` and fall back to the hand-rolled HFQ4 kernels otherwise.
     pub rocblas: Option<Rocblas>,
+
+    /// FP16 shadow cache for HFQ4-G256 weights. Populated lazily on first
+    /// batched prefill through the rocBLAS path: we dequantize the MQ4
+    /// weight into an FP16 buffer once, then reuse for every subsequent
+    /// prefill call. Key is the MQ4 device pointer (usize for Hash); value
+    /// owns the GPU-side FP16 tensor. Memory is not freed until the Gpu
+    /// itself drops (weights are assumed immutable for a model's lifetime).
+    ///
+    /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
+    /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
+    fp16_shadow_cache: HashMap<usize, GpuTensor>,
 }
 
 impl Gpu {
@@ -224,6 +235,12 @@ impl Gpu {
             graph_exec: None,
             captured_graph: None,
             rocblas: None,
+            fp16_shadow_cache: HashMap::new(),
+        }).map(|mut gpu| {
+            // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
+            // available out of the box. No-op on consumer arches.
+            gpu.try_init_rocblas();
+            gpu
         })
     }
 
@@ -294,39 +311,41 @@ impl Gpu {
         }
     }
 
-    /// CDNA3-only: row-major M×N output = (M×K row-major A) · (K×N row-major B).
-    /// Both A and B are FP16; output is FP32 (compute_type=F32). Panics if
-    /// `self.rocblas` is None (caller must check first).
+    /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
-    /// rocBLAS is column-major. We flip the operation to (N×K B^T) · (K×M A^T)
-    /// = N×M output in col-major = M×N in row-major. No pointer shuffling
-    /// needed — just swap the arg roles.
-    pub fn rocblas_gemm_fp16_fp32_row_major(
+    /// Computes Y_rowmajor[N × M] = X_rowmajor[N × K] · W_transposed, where
+    /// the weight is stored row-major [M × K] but the operation needs W^T.
+    /// This matches the engine's convention (weight dotted with each row of X
+    /// produces one output column per batch row).
+    ///
+    /// rocBLAS is column-major. A row-major [M × K] matrix is byte-identical
+    /// to a column-major [K × M] matrix. So the call is:
+    ///   col-major C[M × N] = op_A(W) · X_col[K × N]
+    /// with op_A = T (transpose the col-major [K × M] view of W to get [M × K]).
+    /// X_row[N × K] viewed col-major is [K × N] with ld=K. Y_row[N × M] viewed
+    /// col-major is [M × N] with ld=M — so pointer+ld match C directly.
+    pub fn rocblas_gemm_hfq4_prefill(
         &self,
-        a_fp16: &DeviceBuffer, // [M × K] row-major
-        b_fp16: &DeviceBuffer, // [K × N] row-major (i.e. leading dim = N)
-        c_fp32: &DeviceBuffer, // [M × N] row-major output
+        w_fp16: &DeviceBuffer, // row-major [M × K]
+        x_fp16: &DeviceBuffer, // row-major [N × K]
+        y_fp32: &DeviceBuffer, // row-major [N × M]
         m: usize, n: usize, k: usize,
     ) -> HipResult<()> {
         use hip_bridge::{RocblasDatatype, RocblasOperation};
         let rb = self.rocblas.as_ref()
-            .expect("rocblas_gemm_fp16_fp32: rocBLAS not initialized on this Gpu");
+            .expect("rocblas_gemm_hfq4_prefill: rocBLAS not initialized");
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        // Row-major M×N = rocBLAS column-major (N × M) view:
-        //   A' (col-major N×K) is B (row-major K×N), with leading dim = N.
-        //   B' (col-major K×M) is A (row-major M×K), with leading dim = K.
-        // So: gemm(m=N, n=M, k=K, A=B, lda=N, B=A, ldb=K, C=C, ldc=N).
         unsafe {
             rb.gemm_ex(
-                RocblasOperation::None, RocblasOperation::None,
-                n as i32, m as i32, k as i32,
+                RocblasOperation::Transpose, RocblasOperation::None,
+                m as i32, n as i32, k as i32,
                 &alpha as *const f32 as *const c_void,
-                b_fp16.as_ptr(), RocblasDatatype::F16, n as i32,
-                a_fp16.as_ptr(), RocblasDatatype::F16, k as i32,
+                w_fp16.as_ptr(), RocblasDatatype::F16, k as i32,
+                x_fp16.as_ptr(), RocblasDatatype::F16, k as i32,
                 &beta as *const f32 as *const c_void,
-                c_fp32.as_ptr(), RocblasDatatype::F32, n as i32,
-                c_fp32.as_ptr(), RocblasDatatype::F32, n as i32,
+                y_fp32.as_ptr(), RocblasDatatype::F32, m as i32,
+                y_fp32.as_ptr(), RocblasDatatype::F32, m as i32,
                 RocblasDatatype::F32,
             ).map_err(|e| hip_bridge::HipError::new(e.status, &format!("rocblas_gemm: {}", e.context)))
         }
@@ -512,6 +531,49 @@ impl Gpu {
         }
 
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure an FP16 shadow of `w_mq4` (HFQ4-G256 format, [M × K]) exists in
+    /// `fp16_shadow_cache`. First call allocates M*K*2 bytes on device and
+    /// runs the dequantize kernel; subsequent calls return the cached pointer.
+    ///
+    /// Cache is keyed on the MQ4 device pointer — this assumes weights are
+    /// immutable after model load (standard in this engine). If the same
+    /// pointer is ever reused for a different M or K, cache would return
+    /// stale data: we don't try to detect that (weights don't reshape).
+    ///
+    /// Returns `None` if rocBLAS is not loaded (caller should fall back to
+    /// the hand-rolled GEMV path). Memory is freed when the Gpu drops.
+    fn ensure_fp16_shadow(
+        &mut self,
+        w_mq4: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<Option<*mut c_void>> {
+        if self.rocblas.is_none() { return Ok(None); }
+        let key = w_mq4.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            return Ok(Some(shadow.buf.as_ptr()));
+        }
+        // Allocate + dequantize. Use alloc_tensor so the shadow follows the
+        // same GpuTensor hygiene (tracked in pool if applicable).
+        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        self.dequantize_hfq4g256_to_f16(&w_mq4.buf, &fp16.buf, m, k)?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(Some(ptr))
+    }
+
+    /// Configurable batch threshold for MFMA dispatch. Below this we stay on
+    /// the hand-rolled GEMV — rocBLAS launch overhead eats the compute win
+    /// at tiny batches. Overridable via `HIPFIRE_ROCBLAS_MIN_BATCH` env var.
+    fn rocblas_min_batch(&self) -> usize {
+        static CACHE: OnceLock<usize> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4)
+        })
     }
 
     /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
@@ -2272,6 +2334,37 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // CDNA3 MFMA path (task #130): two back-to-back rocBLAS calls against
+        // the gate/up FP16 shadows. rocBLAS launch overhead is small compared
+        // to the GEMM work at prefill batches, so fusing into a single
+        // concatenated matrix isn't worth the extra kernel code tonight.
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        if cdna3
+            && batch_size >= self.rocblas_min_batch()
+            && self.rocblas.is_some()
+            && !self.capture_mode
+        {
+            if let Ok(Some(w_gate_ptr)) = self.ensure_fp16_shadow(a_gate, gate_m, k) {
+                if let Ok(Some(w_up_ptr)) = self.ensure_fp16_shadow(a_up, up_m, k) {
+                    let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
+                    let xb = unsafe { DeviceBuffer::from_raw(x_fp16, (batch_size * k) * 2) };
+                    let wgate = unsafe { DeviceBuffer::from_raw(w_gate_ptr, (gate_m * k) * 2) };
+                    let wup = unsafe { DeviceBuffer::from_raw(w_up_ptr, (up_m * k) * 2) };
+                    let gate_bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k);
+                    let up_bytes = crate::profile::gemv_hfq4g256_bytes(up_m, k);
+                    let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_rocblas", gate_bytes + up_bytes);
+                    let r1 = self.rocblas_gemm_hfq4_prefill(&wgate, &xb, &y_gate.buf, gate_m, batch_size, k);
+                    let r2 = if r1.is_ok() {
+                        self.rocblas_gemm_hfq4_prefill(&wup, &xb, &y_up.buf, up_m, batch_size, k)
+                    } else { Ok(()) };
+                    std::mem::forget(xb);
+                    std::mem::forget(wgate);
+                    std::mem::forget(wup);
+                    if let Some(t) = timer { t.finish(&self.hip); }
+                    return r1.and(r2);
+                }
+            }
+        }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // WMMA on gfx11+ (RDNA3/4)
@@ -3704,6 +3797,45 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+
+        // CDNA3 MFMA path (task #130): when rocBLAS is loaded and batch is
+        // big enough for the launch overhead to amortize, route through the
+        // dequantize-once FP16 shadow + rocBLAS GEMM. Expected 20-100× over
+        // the wave64 GEMV on prefill-heavy workloads (sidecar cal, DFlash
+        // target verify). Falls back to wave64 GEMV on: single-token decode
+        // (batch<4), capture mode (rocBLAS launches don't graph-capture
+        // cleanly; revisit if hipGraph becomes critical for CDNA3 prefill),
+        // or if the fp16 shadow alloc fails under VRAM pressure.
+        if cdna3
+            && batch_size >= self.rocblas_min_batch()
+            && self.rocblas.is_some()
+            && !self.capture_mode
+        {
+            if let Ok(Some(shadow_ptr)) = self.ensure_fp16_shadow(a_raw, m, k) {
+                // Convert X to FP16 via the existing ensure_fp16_x helper.
+                let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
+                // Wrap the raw device pointers as non-owning DeviceBuffers so
+                // the rocBLAS helper's signature works. The underlying memory
+                // is owned by the fp16 shadow cache / fp16_x_scratch / caller's
+                // y GpuTensor — all live beyond this call.
+                let w_buf = unsafe { DeviceBuffer::from_raw(shadow_ptr, (m * k) * 2) };
+                let x_buf = unsafe { DeviceBuffer::from_raw(x_fp16, (batch_size * k) * 2) };
+                let bytes = crate::profile::gemm_hfq4g256_bytes(m, k, batch_size);
+                let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemm_hfq4g256_rocblas", bytes);
+                let result = self.rocblas_gemm_hfq4_prefill(
+                    &w_buf, &x_buf, &y.buf,
+                    m, batch_size, k,
+                );
+                // Suppress the non-owning DeviceBuffer drop; HipError::Drop on
+                // hip_free would clobber memory we don't own.
+                std::mem::forget(w_buf);
+                std::mem::forget(x_buf);
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return result;
+            }
+            // Shadow allocation failed — fall through to the GEMV path.
+        }
+
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
             self.ensure_kernel(
                 "gemm_hfq4g256_wave64",
