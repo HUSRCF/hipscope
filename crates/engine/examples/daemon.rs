@@ -228,6 +228,29 @@ fn main() {
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
+
+                // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
+                // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
+                // Accepted here; the generate loop will honor it in the
+                // 0.1.7-stable release where we port the demo's outer τ-window
+                // trip-wire (below 2.5 → shrink block to 8).
+                let _adaptive_b = msg.get("params").and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool()).unwrap_or(true);
+
+                // 0.1.7-alpha: TriAttention / CASK eviction protocol fields.
+                // Currently accepted but not wired through the daemon generate
+                // path — the serve-time eviction integration lands in 0.1.7
+                // stable. Logged on accept so users can see their config was
+                // received even when the backend doesn't honor it yet.
+                let cask_sidecar = msg.get("params").and_then(|p| p.get("cask_sidecar"))
+                    .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                if cask_sidecar.is_some() {
+                    eprintln!(
+                        "[hipfire-daemon] cask_sidecar accepted (pending 0.1.7 stable wire-up): {}",
+                        cask_sidecar.as_deref().unwrap_or(""),
+                    );
+                }
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {

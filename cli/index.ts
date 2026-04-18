@@ -42,6 +42,27 @@ interface HipfireConfig {
   // understand the knob. See docs/MULTI_MODEL_QUEUE.md path for where this
   // lives in the roadmap.
   experimental_budget_alert: boolean;
+
+  // ── DFlash runtime tuning (0.1.7-alpha) ───────────────────────────────
+  // When true, the DFlash verify cycle can auto-shrink block_size when τ
+  // drops below a trip-wire (default 2.5). Matches dflash_spec_demo's
+  // `--adaptive-b` default. Daemon previously hard-coded OFF — flipping
+  // this to true restores the demo's behavior for `hipfire serve` users.
+  dflash_adaptive_b: boolean;
+
+  // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
+  // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
+  // When set, the engine compacts KV against the sidecar's band-centers
+  // once the active token count exceeds `cask_budget + cask_beta`.
+  cask_sidecar: string;
+  // `cask` flips to the core-aware m-folding merge policy (FlashCASK) on
+  // top of plain TriAttention drop-eviction. No-op when `cask_sidecar` is
+  // empty.
+  cask: boolean;
+  cask_budget: number;       // target active-token count post-eviction
+  cask_beta: number;         // hysteresis buffer before re-triggering
+  cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
+  cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
 }
 
 // Detect GPU at import time for smart defaults
@@ -66,6 +87,13 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   port: DEFAULT_PORT,
   idle_timeout: 300,
   experimental_budget_alert: false,
+  dflash_adaptive_b: true,
+  cask_sidecar: "",
+  cask: false,
+  cask_budget: 512,
+  cask_beta: 128,
+  cask_core_frac: 0.5,
+  cask_fold_m: 2,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -83,6 +111,13 @@ function validateConfigValue(key: string, value: any): boolean {
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
+    case "dflash_adaptive_b": return typeof value === "boolean";
+    case "cask_sidecar": return typeof value === "string";  // "" = disabled
+    case "cask": return typeof value === "boolean";
+    case "cask_budget": return typeof value === "number" && Number.isInteger(value) && value >= 64 && value <= 65536;
+    case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
+    case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
+    case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     default: return false;
   }
 }
@@ -122,6 +157,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
   "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+  "dflash_adaptive_b", "cask_sidecar", "cask",
+  "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -254,6 +291,25 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       }
     }
   }
+
+  // 0.1.7-alpha: pass DFlash + CASK tuning through to the daemon. Daemon
+  // treats absent keys as "use engine defaults" so older daemons stay
+  // compatible even when the CLI passes new keys.
+  params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+  if (resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
+    if (existsSync(resolved.cask_sidecar)) {
+      params.cask_sidecar = resolved.cask_sidecar;
+      params.cask = resolved.cask;
+      params.cask_budget = resolved.cask_budget;
+      params.cask_beta = resolved.cask_beta;
+      params.cask_core_frac = resolved.cask_core_frac;
+      params.cask_fold_m = resolved.cask_fold_m;
+      console.error(`[hipfire] TriAttention sidecar: ${resolved.cask_sidecar}${resolved.cask ? ' (CASK m-folding)' : ' (drop-eviction)'} budget=${resolved.cask_budget} β=${resolved.cask_beta}`);
+    } else {
+      console.error(`[hipfire] WARN: cask_sidecar path missing: ${resolved.cask_sidecar} — disabling eviction for this load`);
+    }
+  }
+
   return { type: "load", model: path, params };
 }
 
