@@ -1862,6 +1862,43 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // CDNA3 MFMA path — 4 back-to-back rocBLAS calls. The last two
+        // matrices (beta, alpha) are tiny (n_v_heads = 128 on A3B) so we
+        // could skip them and stay on the GEMV path, but dispatching all
+        // four via rocBLAS keeps the codepath uniform. Amortizes well.
+        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        if cdna3_outer
+            && batch_size >= self.rocblas_min_batch()
+            && self.rocblas.is_some()
+            && !self.capture_mode
+        {
+            let shadow_qkv = self.ensure_fp16_shadow(a_qkv, qkv_m, k)?;
+            let shadow_z = self.ensure_fp16_shadow(a_z, z_m, k)?;
+            let shadow_beta = self.ensure_fp16_shadow(a_beta, beta_m, k)?;
+            let shadow_alpha = self.ensure_fp16_shadow(a_alpha, alpha_m, k)?;
+            if let (Some(pq), Some(pz), Some(pb), Some(pa)) =
+                (shadow_qkv, shadow_z, shadow_beta, shadow_alpha) {
+                let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
+                let xb = unsafe { DeviceBuffer::from_raw(x_fp16, (batch_size * k) * 2) };
+                let wq = unsafe { DeviceBuffer::from_raw(pq, (qkv_m * k) * 2) };
+                let wz_b = unsafe { DeviceBuffer::from_raw(pz, (z_m * k) * 2) };
+                let wb = unsafe { DeviceBuffer::from_raw(pb, (beta_m * k) * 2) };
+                let wa = unsafe { DeviceBuffer::from_raw(pa, (alpha_m * k) * 2) };
+                let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_rocblas",
+                    crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                    + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                    + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                    + crate::profile::gemv_hfq4g256_bytes(alpha_m, k));
+                let r1 = self.rocblas_gemm_hfq4_prefill(&wq, &xb, &y_qkv.buf, qkv_m, batch_size, k);
+                let r2 = if r1.is_ok() { self.rocblas_gemm_hfq4_prefill(&wz_b, &xb, &y_z.buf, z_m, batch_size, k) } else { Ok(()) };
+                let r3 = if r2.is_ok() { self.rocblas_gemm_hfq4_prefill(&wb, &xb, &y_beta.buf, beta_m, batch_size, k) } else { Ok(()) };
+                let r4 = if r3.is_ok() { self.rocblas_gemm_hfq4_prefill(&wa, &xb, &y_alpha.buf, alpha_m, batch_size, k) } else { Ok(()) };
+                std::mem::forget(xb); std::mem::forget(wq); std::mem::forget(wz_b);
+                std::mem::forget(wb); std::mem::forget(wa);
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return r1.and(r2).and(r3).and(r4);
+            }
+        }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
@@ -2109,6 +2146,34 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // CDNA3 MFMA path — 3 back-to-back rocBLAS calls for Q, K, V.
+        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        if cdna3_outer
+            && batch_size >= self.rocblas_min_batch()
+            && self.rocblas.is_some()
+            && !self.capture_mode
+        {
+            let sq = self.ensure_fp16_shadow(a_q, q_m, k)?;
+            let sk = self.ensure_fp16_shadow(a_k, k_m, k)?;
+            let sv = self.ensure_fp16_shadow(a_v, v_m, k)?;
+            if let (Some(pq), Some(pk), Some(pv)) = (sq, sk, sv) {
+                let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
+                let xb = unsafe { DeviceBuffer::from_raw(x_fp16, (batch_size * k) * 2) };
+                let wq = unsafe { DeviceBuffer::from_raw(pq, (q_m * k) * 2) };
+                let wk = unsafe { DeviceBuffer::from_raw(pk, (k_m * k) * 2) };
+                let wv = unsafe { DeviceBuffer::from_raw(pv, (v_m * k) * 2) };
+                let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_rocblas",
+                    crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                    + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                    + crate::profile::gemv_hfq4g256_bytes(v_m, k));
+                let r1 = self.rocblas_gemm_hfq4_prefill(&wq, &xb, &y_q.buf, q_m, batch_size, k);
+                let r2 = if r1.is_ok() { self.rocblas_gemm_hfq4_prefill(&wk, &xb, &y_k.buf, k_m, batch_size, k) } else { Ok(()) };
+                let r3 = if r2.is_ok() { self.rocblas_gemm_hfq4_prefill(&wv, &xb, &y_v.buf, v_m, batch_size, k) } else { Ok(()) };
+                std::mem::forget(xb); std::mem::forget(wq); std::mem::forget(wk); std::mem::forget(wv);
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return r1.and(r2).and(r3);
+            }
+        }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
