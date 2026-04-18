@@ -588,9 +588,16 @@ impl Gpu {
     /// Configurable batch threshold for MFMA dispatch. Below this we stay on
     /// the hand-rolled GEMV — rocBLAS launch overhead eats the compute win
     /// at tiny batches. Overridable via `HIPFIRE_ROCBLAS_MIN_BATCH` env var.
+    ///
+    /// Kill-switch: `HIPFIRE_ROCBLAS_OFF=1` forces the threshold to usize::MAX,
+    /// which disables the rocBLAS path entirely for A/B benchmarking against
+    /// the hand-rolled GEMV baseline.
     fn rocblas_min_batch(&self) -> usize {
         static CACHE: OnceLock<usize> = OnceLock::new();
         *CACHE.get_or_init(|| {
+            if std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1") {
+                return usize::MAX;
+            }
             std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
