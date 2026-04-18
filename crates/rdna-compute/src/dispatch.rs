@@ -331,11 +331,33 @@ impl Gpu {
         y_fp32: &DeviceBuffer, // row-major [N × M]
         m: usize, n: usize, k: usize,
     ) -> HipResult<()> {
+        self.rocblas_gemm_hfq4_generic(w_fp16, x_fp16, y_fp32, m, n, k, 1.0, 0.0)
+    }
+
+    /// Same op as `rocblas_gemm_hfq4_prefill` but with Y += alpha·(X·W^T) +
+    /// beta·Y. Covers the residual-GEMM pattern (w_down on LA path, wo on
+    /// attention path) where the existing hand-rolled kernels fuse the add.
+    pub fn rocblas_gemm_hfq4_prefill_residual(
+        &self,
+        w_fp16: &DeviceBuffer,
+        x_fp16: &DeviceBuffer,
+        y_fp32: &DeviceBuffer,
+        m: usize, n: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rocblas_gemm_hfq4_generic(w_fp16, x_fp16, y_fp32, m, n, k, 1.0, 1.0)
+    }
+
+    fn rocblas_gemm_hfq4_generic(
+        &self,
+        w_fp16: &DeviceBuffer,
+        x_fp16: &DeviceBuffer,
+        y_fp32: &DeviceBuffer,
+        m: usize, n: usize, k: usize,
+        alpha: f32, beta: f32,
+    ) -> HipResult<()> {
         use hip_bridge::{RocblasDatatype, RocblasOperation};
         let rb = self.rocblas.as_ref()
-            .expect("rocblas_gemm_hfq4_prefill: rocBLAS not initialized");
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
+            .expect("rocblas_gemm_hfq4: rocBLAS not initialized");
         unsafe {
             rb.gemm_ex(
                 RocblasOperation::Transpose, RocblasOperation::None,
@@ -3612,6 +3634,29 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
+        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        if cdna3_outer
+            && batch_size >= self.rocblas_min_batch()
+            && self.rocblas.is_some()
+            && !self.capture_mode
+        {
+            if let Ok(Some(shadow_ptr)) = self.ensure_fp16_shadow(a_raw, m, k) {
+                let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
+                let w_buf = unsafe { DeviceBuffer::from_raw(shadow_ptr, (m * k) * 2) };
+                let x_buf = unsafe { DeviceBuffer::from_raw(x_fp16, (batch_size * k) * 2) };
+                let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                    + batch_size * k * 4 + batch_size * m * 4 * 2;
+                let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_rocblas", bytes);
+                let result = self.rocblas_gemm_hfq4_prefill_residual(
+                    &w_buf, &x_buf, &y.buf, m, batch_size, k,
+                );
+                std::mem::forget(w_buf);
+                std::mem::forget(x_buf);
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return result;
+            }
+        }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // WMMA on gfx11+ (RDNA3): 16×16 tiled, ~8-10× over scalar
