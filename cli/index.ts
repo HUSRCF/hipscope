@@ -889,7 +889,17 @@ class Engine {
         return JSON.parse(this.lines.shift()!);
       }
       const { value, done } = await this.reader.read();
-      if (done) throw new Error("daemon closed");
+      if (done) {
+        // The daemon closed its stdout. Most often this means the process
+        // exited: deliberately (e.g. friendly "no GPU" message + exit(1) on
+        // unsupported environments, see #112) or via a real crash. In either
+        // case, the daemon's stderr (which we inherit) already explained
+        // what happened, so adding a Bun-rendered stack trace from here on
+        // top is pure noise. Exit cleanly with the daemon's own code (or 1
+        // if it hasn't exited yet) and let stderr stand on its own.
+        const code = (await this.proc?.exited) ?? 1;
+        process.exit(code === 0 ? 1 : code);
+      }
       this.buffer += new TextDecoder().decode(value);
       const parts = this.buffer.split("\n");
       this.buffer = parts.pop() || "";
