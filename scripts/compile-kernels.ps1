@@ -30,14 +30,17 @@ if (-not (Test-Path $SrcDir)) {
     exit 1
 }
 
-# Locate hipcc. Standard ROCm-on-Windows install ships hipcc.bat; some versions
-# ship hipcc.exe. Prefer $env:HIP_PATH, then C:\Program Files\AMD\ROCm\<ver>\bin.
+# Locate hipcc. ROCm 6.4+ on Windows ships hipcc.exe as the preferred entry
+# point; older installs ship hipcc.bat (a Perl wrapper). Probe .exe first
+# because .bat fails with "filename / directory name / volume label syntax
+# is incorrect" on some 6.4 setups (reported by darkamgine in PR #117).
+# Fall back to .bat and the no-extension variant for older installs.
 function Find-Hipcc {
     $candidates = @()
     if ($env:HIP_PATH) {
         $candidates += @(
-            (Join-Path $env:HIP_PATH "bin\hipcc.bat"),
             (Join-Path $env:HIP_PATH "bin\hipcc.exe"),
+            (Join-Path $env:HIP_PATH "bin\hipcc.bat"),
             (Join-Path $env:HIP_PATH "bin\hipcc")
         )
     }
@@ -47,14 +50,14 @@ function Find-Hipcc {
                    Sort-Object Name -Descending
         foreach ($d in $verDirs) {
             $candidates += @(
-                (Join-Path $d.FullName "bin\hipcc.bat"),
                 (Join-Path $d.FullName "bin\hipcc.exe"),
+                (Join-Path $d.FullName "bin\hipcc.bat"),
                 (Join-Path $d.FullName "bin\hipcc")
             )
         }
         $candidates += @(
-            "C:\Program Files\AMD\ROCm\bin\hipcc.bat",
-            "C:\Program Files\AMD\ROCm\bin\hipcc.exe"
+            "C:\Program Files\AMD\ROCm\bin\hipcc.exe",
+            "C:\Program Files\AMD\ROCm\bin\hipcc.bat"
         )
     }
     # PATH fallback
