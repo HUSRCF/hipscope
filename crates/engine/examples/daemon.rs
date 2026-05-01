@@ -257,6 +257,37 @@ struct LoadedModel {
     dflash: Option<DflashState>,
 }
 
+/// Print a friendly, user-actionable message when Gpu::init fails. Matches
+/// the panic shape we used to emit (which dumped a Rust backtrace and the
+/// raw HipError debug-format) but turns it into a concrete next-step list.
+/// The most common cause on Windows (#112) is HIP SDK present but no
+/// AMD GPU driver visible to the runtime; on Linux it is usually missing
+/// `libamdhip64.so` or kernel-side amdgpu / kfd not loaded.
+fn report_gpu_init_failure(err: &hip_bridge::HipError) {
+    eprintln!();
+    eprintln!("hipfire: failed to initialize GPU runtime.");
+    eprintln!("  HIP error: {} (code {})", err.message, err.code);
+    eprintln!();
+    if cfg!(target_os = "windows") {
+        eprintln!("  Most common Windows cause: HIP SDK is loaded but no");
+        eprintln!("  AMD GPU is visible to the runtime. Verify:");
+        eprintln!("    1. AMD Adrenalin driver is installed and current.");
+        eprintln!("    2. AMD HIP SDK 6.2 or newer is installed:");
+        eprintln!("       https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html");
+        eprintln!("    3. `amdhip64.dll` is reachable (HIP_PATH set or DLL on PATH).");
+        eprintln!("    4. Reboot after driver / SDK install if you have not yet.");
+    } else {
+        eprintln!("  Most common Linux causes:");
+        eprintln!("    1. amdgpu kernel module not loaded (check `lsmod | grep amdgpu`).");
+        eprintln!("    2. /dev/kfd missing or not readable by the current user");
+        eprintln!("       (add to the `render` group; reboot).");
+        eprintln!("    3. ROCm not installed or libamdhip64.so missing");
+        eprintln!("       (check `ldconfig -p | grep amdhip64`).");
+    }
+    eprintln!();
+    eprintln!("  Run `hipfire diag` for a full environment report.");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -280,7 +311,10 @@ fn main() {
                 let _ = std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
-        let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+        let mut gpu = match rdna_compute::Gpu::init() {
+        Ok(g) => g,
+        Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
+    };
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
         for kv in &["asym3", "q8"] {
@@ -305,7 +339,10 @@ fn main() {
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = match rdna_compute::Gpu::init() {
+        Ok(g) => g,
+        Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
+    };
     let mut model: Option<LoadedModel> = None;
 
     let stdin = std::io::stdin();
