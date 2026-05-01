@@ -2,11 +2,17 @@
 # MQ3/MQ2 sweep harness — drives the daemon binary against each MQ3/MQ2
 # model artifact and records coherence + perf for the validation pass.
 #
-# Same prompt set as coherence-gate.sh's short battery (Paris cap, Python
-# square, sheep reasoning) plus a longform DL-vs-ML prompt that exercises
-# multi-paragraph generation. Each row gets: VRAM peak (from done line),
-# decode tok/s + prefill tok/s (from done line), wall, panic flag, and
-# the full output text for human eyeball.
+# Prompts are committed under benchmarks/prompts/sweep/ as separate files
+# rather than inline heredocs. CLAUDE.md mandates byte-identical prompts +
+# recorded md5 alongside any tok/s comparison across sessions; inline
+# bash-array prompts are silently reformatted by editors and have no
+# integrity check. Each row in the report records the prompt md5.
+#
+# Same prompt set as coherence-gate.sh's short battery (cap, code, reason)
+# plus a longform DL-vs-ML prompt that exercises multi-paragraph generation.
+# Each row gets: VRAM peak (from done line), decode tok/s + prefill tok/s
+# (from done line), wall, panic flag, and the full output text for human
+# eyeball.
 #
 # Models that are not on disk are SKIPPED (quants may still be running);
 # re-run after the missing artifacts land.
@@ -24,6 +30,7 @@ cd "$(dirname "$0")/.."
 EXE="./target/release/examples/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 OUT="${HIPFIRE_SWEEP_OUT:-$HOME/.hipfire/mq3-tests/sweep-$(date +%Y%m%d-%H%M%S).md}"
+PROMPTS_DIR="${HIPFIRE_SWEEP_PROMPTS_DIR:-./benchmarks/prompts/sweep}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 if [ ! -x "$EXE" ]; then
@@ -31,19 +38,37 @@ if [ ! -x "$EXE" ]; then
     exit 2
 fi
 
+if [ ! -d "$PROMPTS_DIR" ]; then
+    echo "prompts dir missing: $PROMPTS_DIR" >&2
+    exit 2
+fi
+
+USE_GPU_LOCK=0
 if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
     . "$LOCK_SCRIPT"
     gpu_acquire "mq3-mq2-sweep" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    USE_GPU_LOCK=1
 fi
+# Single composed EXIT trap so adding the scratch-dir cleanup below doesn't
+# clobber the gpu_release call. Both invocations are best-effort.
+sweep_exit_trap() {
+    if [ -n "${SCRATCH_DIR:-}" ] && [ -d "$SCRATCH_DIR" ]; then
+        rm -rf "$SCRATCH_DIR"
+    fi
+    if [ "$USE_GPU_LOCK" = 1 ]; then
+        gpu_release 2>/dev/null || true
+    fi
+}
+trap sweep_exit_trap EXIT
 
-# Format: id|prompt|max_tokens
+# Format: prompt-id|max_tokens
+# Each id maps to ${PROMPTS_DIR}/${id}.txt; read at runtime, md5 recorded.
 PROMPTS=(
-    "cap|What is the capital of France? Answer in one short sentence.|80"
-    "code|Write a one-line Python function named square that returns n*n.|180"
-    "reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
-    "longform|Explain the difference between deep learning and traditional machine learning in 3-4 sentences.|400"
+    "cap|80"
+    "code|180"
+    "reason|300"
+    "longform|400"
 )
 
 # Override-able via $1; otherwise sweep the canonical set.
@@ -63,6 +88,8 @@ else
 fi
 
 mkdir -p "$(dirname "$OUT")"
+SCRATCH_DIR="$(dirname "$OUT")/_scratch-$(date +%s)-$$"
+mkdir -p "$SCRATCH_DIR"
 
 {
     echo "# MQ3/MQ2 sweep"
@@ -72,6 +99,19 @@ mkdir -p "$(dirname "$OUT")"
     echo "- date:   $(date -Iseconds)"
     echo "- models: ${#MODELS[@]}"
     echo "- prompts/model: ${#PROMPTS[@]}"
+    echo "- prompts dir: $PROMPTS_DIR"
+    echo
+    echo "### Prompt manifest (md5 of each \`*.txt\` consumed by the run)"
+    echo
+    for pe in "${PROMPTS[@]}"; do
+        IFS='|' read -r pid _ <<< "$pe"
+        pf="$PROMPTS_DIR/${pid}.txt"
+        if [ -f "$pf" ]; then
+            echo "- \`${pid}.txt\` md5=\`$(md5sum < "$pf" | cut -d' ' -f1)\` size=$(wc -c < "$pf")B"
+        else
+            echo "- \`${pid}.txt\` MISSING at $pf"
+        fi
+    done
     echo
     echo "Hard fail = panic OR zero tokens OR 240s timeout."
     echo "Soft eyeball = read the **Output** block; flag attractor loops, off-topic, broken language."
@@ -101,11 +141,19 @@ for model in "${MODELS[@]}"; do
     } >> "$OUT"
 
     for prompt_entry in "${PROMPTS[@]}"; do
-        IFS='|' read -r pid prompt max_tok <<< "$prompt_entry"
+        IFS='|' read -r pid max_tok <<< "$prompt_entry"
         echo "== $model / $pid =="
 
-        in_file="/tmp/sweep_in_$$.jsonl"
-        out_file="/tmp/sweep_out_$$.log"
+        prompt_file="$PROMPTS_DIR/${pid}.txt"
+        if [ ! -f "$prompt_file" ]; then
+            echo "  prompt file missing: $prompt_file; skipping" >&2
+            continue
+        fi
+        prompt="$(cat "$prompt_file")"
+        prompt_md5=$(md5sum < "$prompt_file" | cut -d' ' -f1)
+
+        in_file="$SCRATCH_DIR/sweep_in_${model//\//_}_${pid}.jsonl"
+        out_file="$SCRATCH_DIR/sweep_out_${model//\//_}_${pid}.log"
         prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
 
         # max_seq=8192 to give 27B + 4096 generation budget headroom.
@@ -137,6 +185,7 @@ JL
             if [ -n "$done_line" ]; then
                 echo "- stats: \`$done_line\`"
             fi
+            echo "- prompt-file: \`$prompt_file\`  md5=\`$prompt_md5\`"
             echo "- prompt: \`$(printf '%s' "$prompt" | head -c 120)\`"
             echo
             if [ -n "$panic" ]; then
@@ -157,7 +206,8 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
             echo
         } >> "$OUT"
 
-        rm -f "$in_file" "$out_file"
+        # in_file / out_file live under SCRATCH_DIR; cleanup happens via the
+        # EXIT trap so failed runs leave evidence behind for diagnosis.
     done
 done
 
