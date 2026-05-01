@@ -103,6 +103,45 @@ fn has_mmq_i8_wmma(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
 }
 
+/// Decide whether the i8-WMMA MMQ prefill path should be used for a given
+/// GEMM call. Combines the arch gate, the env override, and an empirical
+/// batch-size threshold.
+///
+/// The MMQ kernel uses a 128×128 batch tile (vs the fp16 WMMA path's 16×16),
+/// so it amortizes its high per-launch fixed cost only when batch_size is
+/// large enough to fill multiple tiles. Empirical sweep on Qwen 3.5 9B
+/// (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
+///
+///   pp32-pp192: MMQ regresses 23-69% (per-launch overhead dominates).
+///   pp224:      within noise (-8%).
+///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
+///
+/// Default threshold is 256 — captures the pp256/pp384/pp512 wins (the
+/// pp512 case is the one issue #60 was filed about) while avoiding the
+/// catastrophic small-batch regression. Set `HIPFIRE_MMQ_MIN_BATCH=N` to
+/// override (e.g. 128 for aggressive routing, 384 for conservative).
+///
+/// `HIPFIRE_MMQ` env override:
+///   `0` / `off`            — force MMQ off (debug / regression bisect)
+///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
+///   `auto` / unset / other — auto-route by batch_size threshold (default)
+fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
+    if !has_mmq_i8_wmma(arch) {
+        return false;
+    }
+    match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => {
+            let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256);
+            batch_size >= min_batch
+        }
+    }
+}
+
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -2693,7 +2732,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
                         && self.mmq_screen_weight(a_z, z_m, k)
@@ -2995,7 +3034,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_q, q_m, k)
                         && self.mmq_screen_weight(a_k, k_m, k)
@@ -3276,7 +3315,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
@@ -3799,7 +3838,17 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemm_gate_up_hfq4g256_wmma", kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC, "gemm_gate_up_hfq4g256_wmma")?;
+        // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
+        // (Gate 1 microbench, opt-in only, default off). See
+        // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+        let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
+        let (kernel_name, kernel_src) = match variant_override.as_deref() {
+            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
+            _            => ("gemm_gate_up_hfq4g256_wmma",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut ag = a_gate.buf.as_ptr();
@@ -3832,9 +3881,9 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_hfq4g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -4844,9 +4893,8 @@ impl Gpu {
             // screened on first use: a small synthetic comparison detects
             // outlier rows where Q8_1 precision loss exceeds the threshold
             // (#87). Unsafe weights fall through to WMMA instead.
-            if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-                || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
-                && has_mmq_i8_wmma(&self.arch)
+            if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
+                || should_use_mmq(&self.arch, batch_size)
             {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
@@ -5237,7 +5285,15 @@ impl Gpu {
         //            small-M residual projections at prefill-sized batches.
         //            DFlash verify/lm_head runs at B<=16 and large-M draft
         //            FFN/lm_head also prefer k2.
-        //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
+        //   k4     — 4× K-tile pipeline. Fixed 2026-05-01 (commit pending):
+        //            output mapping was swapped relative to K2's canonical
+        //            wave32 WMMA C-mapping. Channel-test passes at K∈{256,512,4096}
+        //            × batch∈{1,2,4,16}. At m<8192 (9B residual at m=4096) K4
+        //            ties K2 within FP drift but loses to ksplit by ~33%
+        //            per-call at small batch (CU-starved grid: 3.3 vs 13
+        //            blocks/CU); auto-dispatch correctly stays on ksplit. K4
+        //            vs K2 at m≥8192 not yet benched on available models. See
+        //            plans/k4_plan.md.
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
         let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151" | "gfx1152");

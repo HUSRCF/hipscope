@@ -209,6 +209,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
+// LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
+// Gate 1 microbench measurement. See
+// docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
