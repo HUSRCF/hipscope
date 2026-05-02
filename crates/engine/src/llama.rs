@@ -2525,6 +2525,68 @@ pub fn apply_ngram_block(logits: &mut [f32], history: &[u32]) {
     }
 }
 
+/// Single-token attractor block for special tokens. Counts how many times
+/// `token_id` appears in the last `window` tokens of `history`; if it is
+/// at or above `threshold`, sets that token's logit to `-INF` so the
+/// next sample picks something else. Targets MQ4 single-token attractors
+/// on tokens that have no paired closer (e.g. a runaway emit of a
+/// solo special). For paired open/close tokens like `<tool_call>` /
+/// `</tool_call>`, prefer `apply_unclosed_attractor_block` — it triggers
+/// before the model can stack a second nested opener that breaks
+/// downstream regex parsers (see #111 codex review).
+pub fn apply_special_token_attractor_block(
+    logits: &mut [f32],
+    history: &[u32],
+    token_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if (token_id as usize) >= logits.len() || threshold == 0 || window == 0 {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let count = history[start..].iter().filter(|&&t| t == token_id).count();
+    if count >= threshold {
+        logits[token_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
+/// Open/close-paired attractor block for structured special tokens
+/// (`<tool_call>`/`</tool_call>`, `<think>`/`</think>`).
+///
+/// Counts unclosed openers in the last `window` tokens — `opens - closes`,
+/// floored at zero. When the running depth reaches `threshold`, sets
+/// `open_id`'s logit to `-INF` so the next sample cannot stack another
+/// nested opener. With `threshold = 2`, a second consecutive opener
+/// without an intervening closer is the last one the decoder is allowed
+/// to emit; the third+ are blocked. The downstream regex parser
+/// (`parseToolCalls` in cli/index.ts) tolerates a single nested opener
+/// by stripping the leading repeat before JSON parse.
+///
+/// The depth saturates at 0 from below: a stray closer at the start of
+/// the window doesn't push depth negative and create false-allow.
+pub fn apply_unclosed_attractor_block(
+    logits: &mut [f32],
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if (open_id as usize) >= logits.len() || threshold == 0 || window == 0 {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        logits[open_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
@@ -2801,4 +2863,110 @@ fn simple_rand() -> f32 {
     s ^= s << 5;
     SAMPLER_STATE.store(s, Ordering::Relaxed);
     (s as f32) / (u32::MAX as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attractor_block_below_threshold() {
+        // 2 occurrences of token 7 in window=20, threshold=3 → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![1, 2, 7, 3, 4, 7, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 7, 20, 3);
+        assert!(logits[7].is_finite(), "below threshold should leave logit untouched");
+    }
+
+    #[test]
+    fn attractor_block_at_threshold() {
+        // 3 occurrences of token 5 in last 20 → block fires.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 5, 2, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 5, 20, 3);
+        assert_eq!(logits[5], f32::NEG_INFINITY, "threshold met should -INF the logit");
+    }
+
+    #[test]
+    fn attractor_block_window_scoped() {
+        // 3 occurrences of token 9, but only 1 in the last 5 tokens (window=5,
+        // threshold=3) → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![9, 9, 1, 2, 3, 4, 5, 9, 6];
+        apply_special_token_attractor_block(&mut logits, &history, 9, 5, 3);
+        assert!(logits[9].is_finite(), "older occurrences must not count");
+    }
+
+    #[test]
+    fn attractor_block_pure_repeat() {
+        // Worst case: model emits the same special token 5x in a row. Block
+        // must fire.
+        let mut logits = vec![0.5f32; 16];
+        let history: Vec<u32> = vec![11, 11, 11, 11, 11];
+        apply_special_token_attractor_block(&mut logits, &history, 11, 20, 3);
+        assert_eq!(logits[11], f32::NEG_INFINITY);
+        // Other logits untouched.
+        assert!((logits[10] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attractor_block_oob_token_is_noop() {
+        let mut logits = vec![1.0f32; 4];
+        let history: Vec<u32> = vec![999, 999, 999];
+        // token_id past vocab size — should not panic, leave logits untouched.
+        apply_special_token_attractor_block(&mut logits, &history, 999, 20, 3);
+        for &v in &logits { assert!(v.is_finite()); }
+    }
+
+    #[test]
+    fn unclosed_block_below_threshold() {
+        // 1 open, 0 closes — depth=1 < threshold=2, no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 2];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert!(logits[5].is_finite());
+    }
+
+    #[test]
+    fn unclosed_block_paired_call_passes() {
+        // Single complete call: <tool_call>{}</tool_call> = open + close.
+        // Depth ends at 0; a follow-up second open would land at 1,
+        // still below threshold=2. Don't block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 2, 6, 5]; // open, body, body, close, open
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert!(logits[5].is_finite(), "second legit open after a complete call must pass");
+    }
+
+    #[test]
+    fn unclosed_block_two_stacked_opens_blocks_third() {
+        // The exact #111 attractor shape: <tool_call><tool_call>...
+        // After two consecutive opens with no close, depth = 2 = threshold,
+        // block fires (preventing the third).
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 5];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert_eq!(logits[5], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn unclosed_block_depth_saturates_at_zero() {
+        // Stray close at start of window must not push depth negative
+        // and let an attractor through. Window: close, open, open.
+        // depth = max(0, -1) + 1 + 1 = 2 → block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![6, 5, 5];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 20, 2);
+        assert_eq!(logits[5], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn unclosed_block_window_scoped() {
+        // 2 unclosed opens earlier in history, but the recent window=3 only
+        // sees [body, body, close]. depth = 0, allow.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 5, 1, 2, 6];
+        apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 3, 2);
+        assert!(logits[5].is_finite(), "older unclosed opens must not count once they leave the window");
+    }
 }
