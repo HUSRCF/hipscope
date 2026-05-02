@@ -81,10 +81,15 @@ fi
 
 # Build the contributors block. Authors sorted by total PR count desc;
 # within an author, PRs sorted by mergedAt desc. Project owner is dropped.
-{
-  printf '%s\n' "$START_MARK"
+#
+# jq runs into a separate file first so we can verify success and content
+# before assembling the spliced block. A silent jq failure inside a
+# brace-block would otherwise emit only the two sentinels, which the
+# splice below would then write back, wiping the contributors section.
+TMP_JQ="$( mktemp -t hipfire-credits-jq.XXXXXX )"
+trap 'rm -f "$TMP_PRS" "$TMP_BLOCK" "$TMP_OUT" "$TMP_JQ"' EXIT
 
-  jq -r --arg owner "$OWNER_LOGIN" '
+if ! jq -r --arg owner "$OWNER_LOGIN" '
     map(select(.author.login != $owner))
     | group_by(.author.login)
     | map({
@@ -103,8 +108,21 @@ fi
         + (.prs | map("- #" + (.number | tostring) + ": " + .title) | join("\n"))
         + "\n"
       )
-  ' "$TMP_PRS"
+  ' "$TMP_PRS" > "$TMP_JQ"; then
+  die "jq failed while building the contributors block. CREDITS.md unchanged."
+fi
 
+# Sanity check: every refresh expects at least one `### Author` heading
+# in the generated block. Empty output means jq parsed but emitted
+# nothing (auth scope mismatch, filter typo, owner-only repo). Refuse
+# to splice in that case so we never wipe the existing block.
+if ! grep -q '^### ' "$TMP_JQ"; then
+  die "generated block has no '### Author' headings. CREDITS.md unchanged."
+fi
+
+{
+  printf '%s\n' "$START_MARK"
+  cat "$TMP_JQ"
   printf '%s\n' "$END_MARK"
 } > "$TMP_BLOCK"
 
