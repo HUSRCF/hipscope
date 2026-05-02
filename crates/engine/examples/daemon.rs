@@ -789,13 +789,26 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
             .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
             .map(|(info, _)| info.quant_type);
-        // Whitelist: Q8_0=3, HFQ4G256=6, MQ4G256=13. Future quant formats
-        // refused by default until they're explicitly wired into both the
-        // verify GEMM and the DDTree top-K paths. If we can't locate the
-        // lm_head tensor at any known name, refuse defensively — better
-        // than letting load_weights panic later after burning ~12 GB of
-        // VRAM on a malformed model.
-        let supported = matches!(lm_qt, Some(3 | 6 | 13));
+        // MQ3 (qt=17) batched lm_head + WMMA prefill kernels exist on gfx11
+        // only (`gemm_hfq3g256_batched_lmhead` + `is_batchable_la` admits MQ3
+        // for gfx1100/1101/1102/1150/1151). On other archs, MQ3 lm_head still
+        // falls through to per-row GEMV that hangs verify. Whitelist:
+        //   - Always: Q8_0=3, HFQ4G256=6, MQ4G256=13
+        //   - gfx11 only: MQ3G256=17
+        // MQ2 (qt=18) is not yet wired into speculative.rs match arms.
+        // MQ3 WMMA family is ported to gfx11 (RDNA3) and gfx12 (RDNA4).
+        // Keep them grouped under the same flag — the builtin name differs
+        // (_w32 vs _w32_gfx12) but the dispatch wrappers route per-arch.
+        let arch_is_gfx11 = matches!(
+            gpu.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
+        );
+        let supported = match lm_qt {
+            Some(3 | 6 | 13) => true,
+            Some(17) => arch_is_gfx11,
+            _ => false,
+        };
         if !supported {
             let qt_desc = match lm_qt {
                 Some(qt) => format!("quant_type={qt}"),
@@ -803,42 +816,53 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             };
             return Err(format!(
                 "DFlash draft requested but target lm_head {} is not \
-                 supported by speculative.rs's batched GEMM paths. Only \
-                 Q8_0 (qt=3), HFQ4G256 (qt=6), and MQ4G256 (qt=13) have \
-                 batched lm_head kernels; everything else (MQ3/MQ2 \
-                 qt=17/18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) \
-                 falls through to a per-row GEMV that hangs verify. \
-                 Reload without a draft, or use an MQ4 / HFQ4 / Q8 \
-                 target. (PRD Phase 2: extend speculative.rs match arms \
-                 + add gemm_*_batched_lmhead kernels.)",
-                qt_desc
+                 supported by speculative.rs's batched GEMM paths on this arch \
+                 ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
+                 always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                 (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
+                 through to a per-row GEMV that hangs verify. Reload without a \
+                 draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
+                 speculative.rs match arms + add gemm_*_batched_lmhead kernels \
+                 for the remaining dtypes.)",
+                qt_desc, gpu.arch
             ));
         }
 
-        // Defense-in-depth (Codex stop-time review 2026-04-30): even when
-        // lm_head is supported, refuse if any body weight is MQ3 (qt=17)
-        // or MQ2 (qt=18). The eligibility gate in `qwen35::forward_prefill_batch`
-        // (`is_batchable_la` excludes MQ3/MQ2) and `dflash::gemm_dispatch`
-        // (panics on non-{F16,F32,HFQ4,MQ4} dtypes) already prevent any
-        // memory-fault path, but a model with MQ3/MQ2 body + supported
-        // lm_head would pass this guard and silently fall back to per-token
-        // forward_scratch for every spec-verify cycle — providing zero
-        // DFlash speedup over AR while wasting the draft load. Refuse
-        // cleanly at load instead. Today hipfire-quantize produces uniform
-        // models so this is overwhelmingly caught by the lm_head check
-        // above; the body scan is for future mixed-precision PRD Phase 3.
-        let mq_lowbit = hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
-            .or_else(|| hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n)));
-        if let Some((qt_label, name)) = mq_lowbit {
+        // Defense-in-depth: refuse if any body weight is MQ2 (qt=18). MQ3
+        // is now allowed on gfx11 dense (arch_id=5) because the WMMA prefill
+        // family (qkvza/qkv/gate_up/residual hfq3) and
+        // `gemm_hfq3g256_batched_lmhead` are wired. MQ3 is REFUSED on:
+        //   - non-gfx11 archs (no batched WMMA prefill kernels)
+        //   - MoE/A3B targets (arch_id=6) — the MoE LA/FA prefill branches
+        //     and `moe_ffn_all_mq4` predicate are MQ4-only; MQ3 weights
+        //     would silently fall through to HFQ4 kernels with the wrong
+        //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
+        //     batched branches and the MoE FFN expert kernels.)
+        // MQ2 body still has no batched WMMA kernels anywhere.
+        let arch_is_dense_qwen35 = hfq.arch_id == 5;
+        let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
+        let mq_unsupported = hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n));
+        let mq_unsupported = mq_unsupported.or_else(|| {
+            if !mq3_supported {
+                hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
+            } else {
+                None
+            }
+        });
+        if let Some((qt_label, name)) = mq_unsupported {
+            let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
+                format!("arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels", hfq.arch_id)
+            } else {
+                format!("arch={} lacks the corresponding batched WMMA prefill family", gpu.arch)
+            };
             return Err(format!(
                 "DFlash draft requested but model contains {qt_label} weight \
-                 `{name}`. No batched HFQ4 GEMM kernel exists for sub-4-bit \
-                 MQ formats, so the prefill fast-path (`forward_prefill_batch`) \
-                 falls back to per-token `forward_scratch` for every spec \
-                 verify cycle — defeating DFlash's speedup. Reload without \
-                 a draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: \
-                 add gemm_hfq3g256_batched_lmhead / gemm_hfq2g256_batched_lmhead \
-                 + the corresponding MQ3/MQ2 WMMA prefill kernels.)"
+                 `{name}` and {arch_reason}. The prefill fast-path falls back \
+                 to per-token `forward_scratch` for every spec verify cycle \
+                 (or worse, a kernel-stride mismatch on MoE) — defeating \
+                 DFlash's speedup. Reload without a draft, or use an MQ4 / \
+                 HFQ4 / Q8 target. (Future: port MQ3/MQ2 to MoE branches and \
+                 additional archs.)"
             ));
         }
     }

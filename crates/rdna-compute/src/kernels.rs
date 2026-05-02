@@ -53,7 +53,9 @@ pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
 /// Packing: 8 weights per 3 bytes (24 bits = 8×3 bits).
 pub const GEMV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.hip");
+pub const GEMV_HFQ3G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.gfx1100.hip");
 pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.hip");
+pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
@@ -221,6 +223,19 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/sr
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+// HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
+// lane decomposition; only the inner K-tile unpack differs (3-bit
+// cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
+// wrapper that pre-rotates X. gfx11 K2 unroll variant — gfx12 K4 to
+// follow once K2 is validated.
+pub const GEMM_QKVZA_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.hip");
+pub const GEMM_GATE_UP_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.hip");
+pub const GEMM_QKV_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.hip");
+pub const GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.gfx12.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
@@ -367,6 +382,30 @@ pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static st
             (GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC, "gemv_hfq4g256_residual_rdna3")
         }
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
+    }
+}
+
+/// Returns the HFQ3-G256 GEMV kernel source AND module name for the given arch.
+/// gfx1100/1101/1102 (RDNA3) gets the K4-unrolled 4-accumulator variant that
+/// closes the per-launch perf gap with MQ4. Other archs use the baseline.
+pub fn gemv_hfq3g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_GFX1100_SRC, "gemv_hfq3g256_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_SRC, "gemv_hfq3g256"),
+    }
+}
+
+/// Same arch dispatch as `gemv_hfq3g256_for_arch` but returns the residual
+/// variant (y[row] += A[row] · x). Used by `weight_gemv_residual` MQ3 arm
+/// to eliminate the alloc+gemv+add+free fallback chain.
+pub fn gemv_hfq3g256_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC, "gemv_hfq3g256_residual_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_RESIDUAL_SRC, "gemv_hfq3g256_residual"),
     }
 }
 
