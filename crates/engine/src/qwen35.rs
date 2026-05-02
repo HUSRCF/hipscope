@@ -559,66 +559,23 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
 
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
-        .or_else(|| hfq.tensor_data(name))
-        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-
-    match info.quant_type {
-        6 => { // HFQ4-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+    // Use pread path to avoid page cache buildup on unified-memory APUs.
+    #[cfg(unix)]
+    {
+        if let Some((info, buf)) = hfq.tensor_data_pread(&full_name)
+            .or_else(|| hfq.tensor_data_pread(name))
+        {
+            let qt = info.quant_type;
+            return load_weight_tensor_raw(gpu, qt, &buf, m, k);
         }
-        7 => { // HFQ4-G128
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
-        }
-        8 => { // HFQ6-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
-        }
-        11 => { // HFQ3-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
-        }
-        12 => { // HFQ3-G128
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
-        }
-        13 => { // MQ4-G256 — MagnumQuant
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
-        }
-        14 => { // MQ8-G256 — MagnumQuant dp4a
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
-        }
-        15 => { // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
-        }
-        17 => { // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
-        }
-        18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
-        }
-        3 => { // Q8_0
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
-        }
-        1 => { // F16 → F32
-            let f32_data: Vec<f32> = data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
-        }
-        _ => panic!("unsupported quant_type {} for {name}", info.quant_type),
+        panic!("tensor not found: {name} or {full_name}");
+    }
+    #[cfg(not(unix))]
+    {
+        let (info, data) = hfq.tensor_data(&full_name)
+            .or_else(|| hfq.tensor_data(name))
+            .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+        load_weight_tensor_raw(gpu, info.quant_type, data, m, k)
     }
 }
 
@@ -1000,6 +957,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
             config.n_layers, config.layer_types[i],
             if is_moe { " + MoE" } else { "" });
         let p = format!("layers.{i}");
+        // Track page range for this layer so we can MADV_DONTNEED after upload.
+        let layer_page_start = hfq.layer_data_range(&p);
+
 
         match (config.layer_types[i], is_moe) {
             (LayerType::LinearAttention, false) => {
@@ -1084,6 +1044,10 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     ffn: load_moe_ffn(hfq, gpu, &p, config)?,
                 }));
             }
+        }
+        // Drop mmap page cache for this layer (supplements pread-based loading).
+        if let Some((start, end)) = layer_page_start {
+            hfq.drop_pages_range(start, end - start);
         }
     }
 

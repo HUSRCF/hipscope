@@ -10,6 +10,22 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+/// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
+/// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
+/// hipMalloc'd GPU copies share physical RAM — without this, loading
+/// a 65 GB model consumes ~130 GB (mmap cache + GPU copy).
+/// Note: madvise(MADV_DONTNEED) does NOT work on MAP_SHARED file-backed
+/// mappings (memmap2 default). posix_fadvise on the fd does.
+#[cfg(unix)]
+fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
+    unsafe {
+        libc::posix_fadvise(fd, offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(unix))]
+fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
+
 pub struct HfqTensorInfo {
     pub name: String,
     pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
@@ -21,17 +37,34 @@ pub struct HfqTensorInfo {
 
 pub struct HfqFile {
     _file: File,
+    /// mmap kept for backward compat (small models, non-APU systems).
+    /// On unified-memory APUs, tensor data is read via pread instead.
     mmap: Mmap,
     pub arch_id: u32,
     pub metadata_json: String,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
+    /// Reusable read buffer for pread-based tensor reads.
+    /// Avoids page cache buildup on unified-memory APUs where mmap pages
+    /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
+    /// for mmap'd regions per Linux kernel docs).
+    pread_buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        // Sequential access hint: helps the kernel readahead and drop pages sooner.
+        #[cfg(unix)]
+        {
+            mmap.advise(memmap2::Advice::Sequential).ok();
+            // Also advise the file descriptor for the data region.
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
 
         // Parse header (32 bytes)
         let magic = &mmap[0..4];
@@ -128,13 +161,85 @@ impl HfqFile {
             cumulative_offset += data_size;
         }
 
-        Ok(Self { _file: file, mmap, arch_id, metadata_json, tensors, tensor_map })
+        Ok(Self {
+            _file: file, mmap, arch_id, metadata_json, tensors, tensor_map,
+            pread_buf: std::cell::RefCell::new(Vec::new()),
+        })
     }
 
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = *self.tensor_map.get(name)?;
         let info = &self.tensors[idx];
         Some((info, &self.mmap[info.data_offset..info.data_offset + info.data_size]))
+    }
+
+    /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
+    /// the file range. On unified-memory APUs (Strix Halo etc.), mmap pages
+    /// can't be evicted while the mapping exists, so pread + fadvise is the
+    /// only way to prevent page cache from starving hipMalloc.
+    ///
+    /// Returns (info, guard) where guard derefs to `&[u8]`. The buffer is
+    /// reused across calls — the previous data is overwritten.
+    #[cfg(unix)]
+    pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
+        use std::os::unix::io::AsRawFd;
+        let idx = *self.tensor_map.get(name)?;
+        let info = &self.tensors[idx];
+        let fd = self._file.as_raw_fd();
+        {
+            let mut buf = self.pread_buf.borrow_mut();
+            buf.resize(info.data_size, 0);
+            let mut total_read = 0usize;
+            while total_read < info.data_size {
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                        info.data_size - total_read,
+                        (info.data_offset + total_read) as libc::off_t,
+                    )
+                };
+                if n <= 0 { break; }
+                total_read += n as usize;
+            }
+            // Evict these pages from cache — works because pread doesn't hold a mapping.
+            fadvise_dontneed(fd, info.data_offset, info.data_size);
+        }
+        Some((info, self.pread_buf.borrow()))
+    }
+
+    /// Non-unix fallback: just delegates to mmap-based tensor_data.
+    #[cfg(not(unix))]
+    pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
+        self.tensor_data(name)
+    }
+
+    /// Release page cache for a byte range. Only works if the range is NOT mmap'd.
+    #[allow(dead_code)]
+    pub fn drop_pages_range(&self, offset: usize, len: usize) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            fadvise_dontneed(self._file.as_raw_fd(), offset, len);
+        }
+        #[cfg(not(unix))]
+        { let _ = (offset, len); }
+    }
+
+    /// Return the (start_offset, end_offset) byte range covering all tensors
+    /// whose name contains `prefix.` (e.g. "layers.5.").
+    #[allow(dead_code)]
+    pub fn layer_data_range(&self, prefix: &str) -> Option<(usize, usize)> {
+        let needle = format!("{prefix}.");
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for t in &self.tensors {
+            if t.name.contains(&needle) {
+                lo = lo.min(t.data_offset);
+                hi = hi.max(t.data_offset + t.data_size);
+            }
+        }
+        if lo < hi { Some((lo, hi)) } else { None }
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
