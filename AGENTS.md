@@ -1,21 +1,28 @@
-# AGENTS.md — guide for agents testing hipfire v0.1.8
+# AGENTS.md — guide for agents testing hipfire v0.1.9-alpha
 
 **Audience:** agents (or humans) running smoke / perf / correctness
-tests on hipfire v0.1.8 — particularly the new DFlash draft pull flow,
-prompt-shape adaptation, and HumanEval reproductions.
+tests on hipfire v0.1.9-alpha — particularly the production-ready MQ3
+sub-4-bit Magnum Quant family, the DFlash MQ3 cross-quant matrix, and
+the existing DFlash draft pull / prompt-shape adaptation paths
+inherited from v0.1.8.
 
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules, e.g. coherence-gate is the canonical gate).
-This file holds the *testing playbook* — how to verify v0.1.8 works,
-what to measure, what counts as pass/fail.
+This file holds the *testing playbook* — how to verify v0.1.9-alpha
+works, what to measure, what counts as pass/fail.
 
-**v0.1.8 default change you'll trip over (post-2026-04-26):**
-`dflash_mode` is now **`off`** by default (was `auto`). DFlash is
-opt-in until the genre-conditional speedup is more universally a win.
-Any test in §3 that exercises DFlash needs an explicit
-`hipfire config set dflash_mode auto` (or `on`) first, or
-`HIPFIRE_DFLASH_DRAFT=<path>` env. Bare `hipfire run <target>` without
-that config flag will NOT load the draft, even if it's installed.
+**v0.1.9-alpha default behavior to be aware of:**
+- **MQ3 is production on gfx11** (`gfx1100/1101/1102/1150/1151`) and
+  gfx12 (`gfx1200/1201`). On gfx10 / gfx906 / gfx94x, MQ3 weights still
+  load and run via per-token GEMV fallback — correct, just slower
+  prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
+  path).
+- **MQ2 is refused by default.** The quantizer requires
+  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
+  cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
+- **`dflash_mode=off` default carries over from v0.1.8.** Any test
+  exercising DFlash still needs `hipfire config set dflash_mode auto`
+  or `HIPFIRE_DFLASH_DRAFT=<path>` first.
 
 ---
 
@@ -93,9 +100,46 @@ cargo build --release --features deltanet \
 
 ---
 
-## 2 · What v0.1.8 added (test surface)
+## 2 · What v0.1.9-alpha added (test surface)
 
-### A. Phase 1: prompt-shape adaptation — **DEFAULT ON (2026-04-26)**
+### A. MQ3 production (sub-4-bit Magnum Quant)
+
+The headline of v0.1.9-alpha. MQ3 = FWHT-rotated 3-bit weight format,
+104 B/group (3.25 bpw vs MQ4's 4 bpw at 136 B/group). Three new things
+are now wired:
+
+- **K4-unrolled GEMV decode + fused residual** on gfx1100. Decode
+  matches MQ4 within 2% (9B 141 tok/s vs MQ4's 128.7).
+- **WMMA prefill family** (`gemm_qkvza/qkv/gate_up/residual hfq3`)
+  closing the 17× prefill gap that gated ship. Arch-gated to gfx11
+  wave32 WMMA. gfx12 K4 variant ships in the same release.
+- **DFlash cross-quant matrix.** MQ3↔MQ3, MQ3↔MQ4, MQ4↔MQ3 all valid
+  for dense models. MoE/A3B + MQ3 still refused at daemon load.
+
+Sweep harness for MQ3 quality + perf:
+```bash
+./scripts/mq3-mq2-sweep.sh   # 4-prompt × 5-model bench, md5-stamped
+```
+
+### B. Cache-invalidation lifecycle
+
+`Gpu::unload_model` now drains `mmq_screen_cache` + `fp16_shadow_cache`
+and tears down captured hipGraphs (verify, replay, AR forward). Three
+Codex stop-time follow-ups, all pointer-keyed cache silent-corruption
+class. Smoke test: rapid `hipfire serve` model swap loop should NOT
+emit garbage on the new model's first decode.
+
+### C. Defensive `parseToolCalls` (#111 stopgap)
+
+Three known MQ4 attractor malformations are repaired before the
+OpenAI shape returns: spec form, flat form, XML-tag corruption.
+Token-attractor root cause (calibration retrain) deferred. Smoke
+test: tool-calling prompt against `qwen3.5-9b.mq4` should never
+return raw `<tool_call>` text in `message.content`.
+
+### D. Inherited from v0.1.8 (still load-bearing)
+
+- **Phase 1: prompt-shape adaptation — DEFAULT ON (2026-04-26)**
 
 Engine-side `\n{3,}` → `\n\n` collapse before tokenize, eliminating the
 rare BPE token 1358 (`\n\n\n`) in favor of HOT token 271 (`\n\n`) on
@@ -367,7 +411,9 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-04-27 (v0.1.8-alpha — `dflash_mode` default `off`,
-docs/ rewritten, GGUF→HFQ4/MQ4 conversion path shipped, gfx12 WMMA
-kernels landed via PR #56). When this doc gets stale (more than 1-2
-releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-05-02 (v0.1.9-alpha — MQ3 production-ready: K4
+decode, WMMA prefill family, DFlash cross-quant matrix, gfx12 port,
+cache-invalidation lifecycle, defensive parseToolCalls (#111 stopgap),
+gfx906 + gfx1152 arch gating, speed-gate DPM warmup). When this doc
+gets stale (more than 1-2 releases behind HEAD), update it as part of
+the release PR.*
