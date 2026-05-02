@@ -861,28 +861,33 @@ pub fn replace_nbsp_with_space(s: &str) -> String {
 /// or hand-edited prompts often retain them.
 pub fn strip_trailing_line_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut pending_ws = 0usize;
+    // Buffer each pending whitespace character verbatim. A naive `count`
+    // approach corrupts tab indentation: `"a\tb"` would flush as `"a b"`,
+    // silently downgrading non-trailing tabs to spaces and breaking
+    // tab-significant content (Makefiles, TSV, mixed-indent Python).
+    let mut pending: Vec<char> = Vec::new();
     for ch in s.chars() {
         match ch {
-            ' ' | '\t' => pending_ws += 1,
+            ' ' | '\t' => pending.push(ch),
             '\n' => {
                 // Drop pending whitespace before the newline.
-                pending_ws = 0;
+                pending.clear();
                 out.push('\n');
             }
             _ => {
-                // Flush pending whitespace — it's mid-line, keep it.
-                for _ in 0..pending_ws {
-                    out.push(' ');
+                // Flush pending whitespace verbatim — it's mid-line, keep it
+                // exactly as it appeared (tabs stay tabs, spaces stay spaces).
+                for &p in &pending {
+                    out.push(p);
                 }
-                pending_ws = 0;
+                pending.clear();
                 out.push(ch);
             }
         }
     }
     // End-of-string trailing whitespace: PRESERVE for completion-style prompts.
-    for _ in 0..pending_ws {
-        out.push(' ');
+    for &p in &pending {
+        out.push(p);
     }
     out
 }
@@ -1201,6 +1206,26 @@ mod prompt_norm_tests {
             strip_trailing_line_ws(dirty),
             "line one\nline two\nline three\n"
         );
+    }
+
+    #[test]
+    fn strip_preserves_non_trailing_tabs() {
+        // Non-trailing tabs MUST round-trip verbatim. Tab-indented Python,
+        // Makefile recipes (tabs are syntactically required), and TSV data
+        // would silently break if we downgraded tabs to spaces in
+        // mid-line position.
+        assert_eq!(strip_trailing_line_ws("a\tb"), "a\tb");
+        assert_eq!(
+            strip_trailing_line_ws("\tdef foo():\n\t\treturn 1\n"),
+            "\tdef foo():\n\t\treturn 1\n"
+        );
+        // Mixed tab + space indentation also round-trips.
+        assert_eq!(
+            strip_trailing_line_ws("\t \tx = 1\n"),
+            "\t \tx = 1\n"
+        );
+        // Trailing tabs at end of line still get stripped.
+        assert_eq!(strip_trailing_line_ws("a\tb\t\nc"), "a\tb\nc");
     }
 
     #[test]
