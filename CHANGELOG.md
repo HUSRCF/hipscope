@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.1.9-alpha.1 (2026-05-02)
+
+Patch release. Closes #111 — MQ4 single-token attractor on `<tool_call>`
+that left agentic harnesses unable to dispatch tool calls on
+`qwen3.6:27b.mq4` (and any other MQ4-quant Qwen3+ model with structured-
+output drift). Two complementary defenses ship together:
+
+- **Engine (daemon)** — new GPU-side `apply_unclosed_attractor_block`
+  scans the recent decode window for unclosed `<tool_call>` openers
+  (`opens − closes`); when depth ≥ 2, writes a single 4-byte `-INF`
+  to the logits buffer at the opener's token offset before the next
+  `gpu.sample_top_p`. Same gate for `<think>` to head off the
+  thinking-mode boundary corruption the same reporter saw. Cost is
+  zero when not tripped, ~5 µs when tripped — no D2H, no kernel
+  change. The `(opens − closes)` invariant means legitimate multi-
+  tool turns never trip: a complete `<tool_call>...</tool_call>`
+  decrements depth before the next opener arrives.
+
+- **CLI (parser)** — `parseToolCalls` now strips any leading
+  `<tool_call>\s*` repeats from a captured block before JSON parse.
+  Defense-in-depth in case a nested opener does slip through (the
+  engine block fires before the third opener, but the second still
+  ships in the visible stream).
+
+Verified on hardware (gfx1100 / 7900 XTX / ROCm 7.2 / qwen3.6:27b.mq4)
+against the two prompts the reporter posted as still-broken after the
+v0.1.9-alpha defensive parser ship:
+
+```
+Prompt 1: "what files are in this directory?"
+→ tool_calls: [{ name: "bash", arguments: { command: "ls -la" } }]
+
+Prompt 2: "write a file here named test.md with the text test inside"
+→ tool_calls: [{ name: "write", arguments: { path: "test.md", content: "test" } }]
+```
+
+Both `finish_reason: "tool_calls"`. No attractor loop, no nested
+openers, no parser repair signal on stderr. The model emits clean spec
+JSON now that the gate is in place.
+
+Tests: 10 Rust unit tests (`llama::tests`) covering threshold edges,
+window scope, complete-pair-allow, depth-saturate-at-zero. 14 Bun tests
+(`cli/parse_tool_calls.test.ts`) including 4 new for nested-opener
+strip. Coherence-gate green on 6/6 prompts including the existing
+tool-call coverage test.
+
+Still a stopgap on the symptom. The underlying root cause is MQ4
+calibration drift on structured-output token positions; Path C
+calibration retrain (#39) is the proper fix.
+
 ## v0.1.9-alpha (2026-05-02)
 
 Headline: **MQ3 is production-ready.** The sub-4-bit Magnum Quant from
