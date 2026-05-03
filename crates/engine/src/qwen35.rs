@@ -2775,6 +2775,30 @@ pub fn forward_prefill_batch_single_chunk_captured(
         )));
     }
 
+    // Capture-mode contract: under hipStreamBeginCapture, the FA branch
+    // bakes max_ctx_len = kv_cache.physical_cap (kernels read seq_len
+    // per-row from a device buffer, but LDS is sized from this scalar).
+    // For Q8 KV at physical_cap > 15000, the FA path enters the per-
+    // position long-context fallback, which issues hip.malloc + per-row
+    // memcpy_htod inside the layer loop. Both are capture-illegal — they
+    // would either error at capture time or bake stale host bytes into
+    // the kernarg blob. Asym2/3/4 KV use pure-batched flash kernels and
+    // stay capture-safe at any context length, so reject only this exact
+    // combination here.
+    const LDS_CTX_LIMIT: usize = 15000;
+    if kv_cache.quant_q8 && !(kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4)
+        && kv_cache.physical_cap > LDS_CTX_LIMIT
+    {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch_single_chunk_captured: Q8 KV with \
+             physical_cap {} > {} hits the per-position long-context \
+             fallback, which issues hip.malloc + memcpy_htod inside the \
+             captured region. Use asym3 KV for capture at long context, \
+             or shrink physical_cap.",
+            kv_cache.physical_cap, LDS_CTX_LIMIT,
+        )));
+    }
+
     forward_prefill_chunk(
         gpu, weights, config, tokens, start_pos,
         kv_cache, dn_state, scratch, pbs, hidden_rb,
@@ -3893,12 +3917,19 @@ fn forward_prefill_chunk(
                         max_ctx_len, LDS_CTX_LIMIT,
                     );
                     // Per-position flash Q8 attention for long-context prefill.
+                    //
+                    // `pbs.positions` is raw i32 bits in an F32 slot
+                    // (slot-cosmetic, see PrefillBatchScratch::new).
+                    // `download_f32` would reinterpret those bytes as floats —
+                    // i32 15000 = 0x3A98 round-trips through f32 as ~1e-3
+                    // subnormal, which casts to 0. Reconstruct from
+                    // start_pos + b directly; the buffer is always linear.
                     let q_dim = config.n_heads * config.head_dim;
-                    let pos_host = gpu.download_f32(&pbs.positions)?;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
                     for b in 0..n {
-                        let seq_len_b = pos_host[b] as usize + 1;
-                        let pos_i32 = pos_host[b] as i32;
+                        let pos_b = start_pos + b;
+                        let seq_len_b = pos_b + 1;
+                        let pos_i32 = pos_b as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
                         let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
                         let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
@@ -4390,12 +4421,14 @@ fn forward_prefill_chunk(
                          at max_ctx_len={} > {}; tree blocks should stay small",
                         max_ctx_len, LDS_CTX_LIMIT,
                     );
+                    // See dense FullAttn branch above for the i32-vs-f32 slot
+                    // rationale; reconstruct positions from start_pos + b.
                     let q_dim_local = config.n_heads * config.head_dim;
-                    let pos_host = gpu.download_f32(&pbs.positions)?;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
                     for b in 0..n {
-                        let seq_len_b = pos_host[b] as usize + 1;
-                        let pos_i32 = pos_host[b] as i32;
+                        let pos_b = start_pos + b;
+                        let seq_len_b = pos_b + 1;
+                        let pos_i32 = pos_b as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
                         let q_b = pbs.fa_q_batch.sub_offset(b * q_dim_local, q_dim_local);
                         let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim_local, q_dim_local);

@@ -128,6 +128,26 @@ export interface HipfireConfig {
   // exceeding this fall back to WMMA. Default 0.10 — validated on both
   // qwen3.5-9b and qwen3.6-27b to produce byte-identical output vs WMMA.
   mmq_screen_threshold: number;
+
+  // ── PFlash speculative prefill (Phase 4 #93) ──────────────────────────
+  // Cross-family speculative prefill: a small drafter scores source-prompt
+  // attention importance, the daemon emits compressed token spans, target
+  // prefills the compressed stream. Off by default until per-target
+  // validation (NIAH retrieval, coherence) clears.
+  //   off    — never compress (default)
+  //   auto   — compress when source tokens >= prefill_threshold
+  //   always — compress every request (research / bench mode)
+  prefill_compression: "off" | "auto" | "always";
+  prefill_threshold: number;       // Auto-mode token cutoff. Default 32768.
+  prefill_keep_ratio: number;      // Fraction kept (0, 1]. Default 0.05.
+  prefill_alpha: number;           // Block selection strictness. Default 0.85.
+  prefill_min_keep: number;        // Floor on retained tokens. Default 2048.
+  prefill_sink: number;            // Always-keep prefix. Default 256.
+  prefill_recent: number;          // Always-keep tail. Default 1024.
+  prefill_block: number;           // Scoring block size. Default 128.
+  prefill_drafter: string;         // Path to drafter HFQ. "" disables.
+  prefill_profile: boolean;        // Per-stage timing logs.
+  prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
 }
 
 // Detect GPU at import time for smart defaults
@@ -173,6 +193,21 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // corruption); set `on` to force the sweep.
   mmq_screen: "auto",
   mmq_screen_threshold: 0.10,
+
+  // PFlash off by default. Operators opt in per target via:
+  //   hipfire config set-model <tag> prefill_compression auto
+  //   hipfire config set-model <tag> prefill_drafter ~/.hipfire/models/<drafter>.hfq
+  prefill_compression: "off",
+  prefill_threshold: 32768,
+  prefill_keep_ratio: 0.05,
+  prefill_alpha: 0.85,
+  prefill_min_keep: 2048,
+  prefill_sink: 256,
+  prefill_recent: 1024,
+  prefill_block: 128,
+  prefill_drafter: "",
+  prefill_profile: false,
+  prefill_sparse_threshold: 32768,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -203,6 +238,17 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prompt_normalize": return typeof value === "boolean";
     case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
+    case "prefill_compression": return ["off", "auto", "always"].includes(value);
+    case "prefill_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
+    case "prefill_keep_ratio": return typeof value === "number" && value > 0 && value <= 1;
+    case "prefill_alpha": return typeof value === "number" && value >= 0 && value <= 1;
+    case "prefill_min_keep": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
+    case "prefill_sink": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
+    case "prefill_recent": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
+    case "prefill_block": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4096;
+    case "prefill_drafter": return typeof value === "string";
+    case "prefill_profile": return typeof value === "boolean";
+    case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     default: return false;
   }
 }
@@ -254,6 +300,13 @@ const PER_MODEL_KEYS = [
   "cask_auto_attach",
   "prompt_normalize",
   "mmq_screen", "mmq_screen_threshold",
+  // PFlash speculative prefill (#93). Per-model so a heavy long-context
+  // target can have its own drafter / threshold without globally
+  // changing other targets.
+  "prefill_compression", "prefill_threshold", "prefill_keep_ratio",
+  "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
+  "prefill_block", "prefill_drafter", "prefill_profile",
+  "prefill_sparse_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -549,6 +602,35 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // #87 tool-call corruption).
   params.mmq_screen = resolved.mmq_screen !== "off";
   params.mmq_screen_threshold = resolved.mmq_screen_threshold;
+
+  // PFlash speculative prefill (Phase 4 #93). Params are forwarded to
+  // the daemon only when compression is enabled AND a drafter path is
+  // set; off-default leaves the existing daemon behavior unchanged.
+  // The daemon validates the drafter and emits a `pflash` status line
+  // alongside `loaded` when init succeeds.
+  if (resolved.prefill_compression !== "off"
+      && resolved.prefill_drafter
+      && resolved.prefill_drafter.length > 0) {
+    params.prefill_compression = resolved.prefill_compression;
+    params.prefill_threshold = resolved.prefill_threshold;
+    params.prefill_keep_ratio = resolved.prefill_keep_ratio;
+    params.prefill_alpha = resolved.prefill_alpha;
+    params.prefill_min_keep = resolved.prefill_min_keep;
+    params.prefill_sink = resolved.prefill_sink;
+    params.prefill_recent = resolved.prefill_recent;
+    params.prefill_block = resolved.prefill_block;
+    params.prefill_drafter = resolved.prefill_drafter;
+    params.prefill_profile = resolved.prefill_profile;
+    params.prefill_sparse_threshold = resolved.prefill_sparse_threshold;
+  } else if (resolved.prefill_compression !== "off") {
+    // Compression requested but no drafter configured -- warn instead of
+    // silently doing nothing. Mirrors the existing dflash_mode pattern.
+    console.error(
+      `[hipfire] prefill_compression=${resolved.prefill_compression} but prefill_drafter is unset. ` +
+      `Set 'hipfire config set prefill_drafter <path>' or pass per-model. ` +
+      `Continuing with PFlash disabled.`
+    );
+  }
 
   return { type: "load", model: path, params };
 }
@@ -3152,6 +3234,60 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "mmq_screen_threshold",
       desc: "max abs error tolerated per output row before falling back to WMMA. 0.10 validated on 9B/27B; lower = stricter (more weights screened, slower).",
       range: [0.01, 1.0], step: 0.01, decimals: 2,
+    },
+    prefill_compression: {
+      label: "prefill_compression",
+      desc: "PFlash speculative prefill (EXPERIMENTAL #93). off (default) = no compression. auto = compress when source >= prefill_threshold. always = compress every request. Requires prefill_drafter set; bypasses tool-call requests automatically.",
+      options: ["off", "auto", "always"],
+    },
+    prefill_threshold: {
+      label: "prefill_threshold",
+      desc: "PFlash auto-mode source-token cutoff. Below this, requests bypass with reason 'below_threshold'. Default 32768.",
+      range: [0, 524288], step: 1024,
+    },
+    prefill_keep_ratio: {
+      label: "prefill_keep_ratio",
+      desc: "PFlash compression ratio. 0.05 keeps 5% of source tokens after sink + recent + top-scoring spans. Lower = more aggressive (faster TTFT, riskier retrieval).",
+      range: [0.01, 1.0], step: 0.01, decimals: 2,
+    },
+    prefill_alpha: {
+      label: "prefill_alpha",
+      desc: "PFlash block-selection strictness (0 = lenient, 1 = strict). Default 0.85.",
+      range: [0, 1], step: 0.05, decimals: 2,
+    },
+    prefill_min_keep: {
+      label: "prefill_min_keep",
+      desc: "PFlash floor on retained source tokens. Caps over-aggressive compression on short inputs. Default 2048.",
+      range: [0, 524288], step: 256,
+    },
+    prefill_sink: {
+      label: "prefill_sink",
+      desc: "PFlash always-keep prefix tokens. Preserves system / template / first-user-turn context. Default 256.",
+      range: [0, 65536], step: 64,
+    },
+    prefill_recent: {
+      label: "prefill_recent",
+      desc: "PFlash always-keep tail tokens. Preserves recent context relevant to the next answer. Default 1024.",
+      range: [0, 65536], step: 64,
+    },
+    prefill_block: {
+      label: "prefill_block",
+      desc: "PFlash scoring block size in source tokens. Smaller = finer span granularity (more compute). Default 128.",
+      range: [1, 4096], step: 32,
+    },
+    prefill_drafter: {
+      label: "prefill_drafter",
+      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
+    },
+    prefill_profile: {
+      label: "prefill_profile",
+      desc: "Emit per-stage PFlash timing logs (score / select / gather). Off in production.",
+      options: ["true", "false"],
+    },
+    prefill_sparse_threshold: {
+      label: "prefill_sparse_threshold",
+      desc: "Phase 3 sparse-attention threshold (plumbing only; the kernel hasn't shipped). Source-token counts below this would fall back to dense drafter forward. Default 32768.",
+      range: [0, 524288], step: 1024,
     },
   };
 
