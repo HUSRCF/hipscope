@@ -1148,7 +1148,17 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
+  // thinking=off: hard-suppress by capping thinking to 1 token (model still
+  // emits <think> but is immediately force-closed). This mirrors the
+  // enable_thinking=false semantics from the OpenAI API path.
+  // Previous attempts to inject prose directives with <think>/<no_think>
+  // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
+  // reliably because it operates at the daemon level, not in the prompt.
+  if (modelCfg.thinking === "off") {
+    genMsg.max_think_tokens = 1;
+  } else if (modelCfg.max_think_tokens > 0) {
+    genMsg.max_think_tokens = modelCfg.max_think_tokens;
+  }
   if (image) {
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
@@ -1538,7 +1548,13 @@ async function serve(port: number) {
         // block, leaving message.content empty after the downstream strip.
         // Reported in #74 with qwen3.6:27b returning empty content + full
         // 8192 completion_tokens despite max_think_tokens=2048 in config.
-        if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // thinking=off: hard-suppress by capping to 1 token, same as
+        // enable_thinking=false. Overrides any per-model max_think_tokens.
+        if (effective.thinking === "off") {
+          genParams.max_think_tokens = 1;
+        } else if (effective.max_think_tokens > 0) {
+          genParams.max_think_tokens = effective.max_think_tokens;
+        }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
         // token (model emits <think> then is forced to close). Overrides
         // per-model max_think_tokens because the request semantics are more
