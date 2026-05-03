@@ -89,6 +89,25 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
+/// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
+/// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
+/// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
+/// run the same kernels, but we have no perf data and MFMA likely wants a
+/// different optimum. MI100 owners can opt in for A/B testing via
+/// `HIPFIRE_GCN5_WAVE64_HYBRID=1`. CDNA3 (gfx94x) uses rocBLAS MFMA.
+fn is_gcn5_wave64(arch: &str) -> bool {
+    if arch == "gfx906" {
+        return true;
+    }
+    if arch == "gfx908"
+        && std::env::var("HIPFIRE_GCN5_WAVE64_HYBRID")
+            .map_or(false, |v| v == "1")
+    {
+        return true;
+    }
+    false
+}
+
 /// Wave64-native arches: Vega 20 / GCN5 (gfx906), CDNA1 (gfx908, MI100),
 /// and CDNA3 (gfx94x, MI300X). On these, wave32 kernels (block=[32,1,1])
 /// waste the upper 32 lanes of every wave slot. The `*_wave64.hip` kernel
@@ -2770,6 +2789,10 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
+            if is_gcn5_wave64(&self.arch) {
+                return self.gemm_qkvza_hfq4g256_fp16_wave64(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
             if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
@@ -2954,6 +2977,86 @@ impl Gpu {
         result
     }
 
+    /// Wave64 FP16 hybrid batched 4-way fused HFQ4-G256 GEMM (qkv + z + beta + alpha).
+    /// Combines wave64 block structure (2 rows/block, full lane utilization) with
+    /// FP16 packed arithmetic (__hfma2). Target: gfx906 (MI50) prefill optimization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_fp16_wave64(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_qkvza_hfq4g256_fp16_wave64",
+            kernels::GEMM_QKVZA_HFQ4G256_FP16_WAVE64_SRC,
+            "gemm_qkvza_hfq4g256_fp16_wave64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let func = &self.functions["gemm_qkvza_hfq4g256_fp16_wave64"];
+
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let grid_x = (total_m + 1) / 2;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+                  + batch_size * k * 2  // FP16 X
+                  + batch_size * (qkv_m + z_m + beta_m + alpha_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_fp16_wave64", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// v_dot2_f32_f16-accelerated batched 4-way fused HFQ4-G256 GEMM (qkv + z + beta + alpha).
     /// RDNA2 (gfx1011/1012/1030-1032) fast path using `amd_mixed_dot`.
     /// One instruction per half2 dot with FP32 accumulation — 1.2-1.5× over FP16 packed.
@@ -3072,6 +3175,10 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
+            if is_gcn5_wave64(&self.arch) {
+                return self.gemm_qkv_hfq4g256_fp16_wave64(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+            }
             if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_q, q_m, k)
@@ -3239,6 +3346,79 @@ impl Gpu {
         result
     }
 
+    /// Wave64 FP16 hybrid batched 3-way fused HFQ4-G256 GEMM (Q + K + V).
+    /// Combines wave64 block structure (2 rows/block, full lane utilization) with
+    /// FP16 packed arithmetic (__hfma2). Target: gfx906 (MI50) prefill optimization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_hfq4g256_fp16_wave64(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_qkv_hfq4g256_fp16_wave64",
+            kernels::GEMM_QKV_HFQ4G256_FP16_WAVE64_SRC,
+            "gemm_qkv_hfq4g256_fp16_wave64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let func = &self.functions["gemm_qkv_hfq4g256_fp16_wave64"];
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let total_m = (q_m + k_m + v_m) as u32;
+        let grid_x = (total_m + 1) / 2;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+                  + batch_size * k * 2  // FP16 X
+                  + batch_size * (q_m + k_m + v_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_fp16_wave64", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// v_dot2_f32_f16-accelerated batched 3-way fused HFQ4-G256 GEMM (Q + K + V).
     /// RDNA2 (gfx1011/1012/1030-1032) fast path using `amd_mixed_dot`.
     /// One instruction per half2 dot with FP32 accumulation — 1.2-1.5× over FP16 packed.
@@ -3353,6 +3533,10 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
+            if is_gcn5_wave64(&self.arch) {
+                return self.gemm_gate_up_hfq4g256_fp16_wave64(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+            }
             if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
@@ -3540,6 +3724,72 @@ impl Gpu {
                 func,
                 [total_m, batch_tiles as u32, 1],
                 [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// GCN5 wave64 FP16 hybrid batched 2-way fused HFQ4-G256 GEMM (gate + up).
+    /// block=[64,1,1] with 2 rows/block via warp_id. Halves grid.x vs wave32.
+    /// Default-on for gfx906; gfx908 opts in via HIPFIRE_GCN5_WAVE64_HYBRID=1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_hfq4g256_fp16_wave64(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_gate_up_hfq4g256_fp16_wave64",
+            kernels::GEMM_GATE_UP_HFQ4G256_FP16_WAVE64_SRC,
+            "gemm_gate_up_hfq4g256_fp16_wave64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let func = &self.functions["gemm_gate_up_hfq4g256_fp16_wave64"];
+
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let total_m = (gate_m + up_m) as u32;
+        let grid_x = (total_m + 1) / 2;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+                  + batch_size * k * 2  // FP16 X
+                  + batch_size * (gate_m + up_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_fp16_wave64", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                [64, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -5432,6 +5682,10 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
+            if is_gcn5_wave64(&self.arch) {
+                return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
+            }
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
             // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
             // Strix Halo. Experimental — see PR #73 / issue #60.
@@ -5569,6 +5823,60 @@ impl Gpu {
                 func,
                 [m as u32, batch_tiles as u32, 1],
                 [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Wave64 FP16 hybrid batched HFQ4-G256 GEMM with fused residual add.
+    /// Combines wave64 block structure (2 rows/block, full lane utilization) with
+    /// FP16 packed arithmetic (__hfma2). Target: gfx906 (MI50) prefill optimization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_residual_fp16_wave64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,  // FP32 [batch_size × K]
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_hfq4g256_residual_fp16_wave64", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_WAVE64_SRC, "gemm_hfq4g256_residual_fp16_wave64")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let func = &self.functions["gemm_hfq4g256_residual_fp16_wave64"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let grid_x = (m as u32 + 1) / 2;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2  // FP16 X (half bandwidth!)
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_fp16_wave64", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                [64, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

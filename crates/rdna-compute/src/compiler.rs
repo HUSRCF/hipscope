@@ -15,9 +15,18 @@ use std::os::windows::process::CommandExt;
 /// Copy .hsaco and .hash files from the persistent install location (cold)
 /// into the tmpfs hot path. Used once at KernelCompiler startup to seed the
 /// hot path after reboot (when /tmp gets cleared) without forcing a full
-/// recompile. Per-file: only copy if destination is missing or stale (size
-/// mismatch or older mtime). Returns on first IO failure without rolling
-/// back — the caller falls back to reading from the cold dir directly.
+/// recompile. Returns on first IO failure without rolling back — the caller
+/// falls back to reading from the cold dir directly.
+///
+/// Skip rule: if the hot dir already has BOTH a .hsaco AND a matching .hash
+/// for this kernel, that pair was JIT-validated against the current source
+/// (the .hash file is only written after a successful compile()), so it must
+/// NOT be overwritten by a potentially-stale cold blob. Without this guard,
+/// a cold blob whose size differs from the hot one (e.g. checked-in
+/// kernels/compiled/<arch>/foo.hsaco produced by an older ROCm or a stale
+/// source revision) silently downgrades the freshly-JIT'd hot blob on every
+/// process startup. We saw this on gfx906 wave64 FP16 hybrid kernels: same
+/// source, same hipcc, but the cold blob ran ~2× slower than the hot one.
 fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(hot)?;
     for entry in std::fs::read_dir(cold)? {
@@ -27,14 +36,27 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
         if ext != "hsaco" && ext != "hash" { continue; }
         let name = match src.file_name() { Some(n) => n, None => continue };
         let dst = hot.join(name);
-        // Skip if destination already exists with same size. We don't compare
-        // mtime because std::fs::copy doesn't preserve it — the destination
-        // mtime is the copy time, which is always later than the src mtime
-        // after an update. `hipfire update` wipes both dirs before re-copy,
-        // so a same-size dst is fresh-from-this-session's seed. Mid-session
-        // a kernel source edit + install rebuild would change the size (.hsaco
-        // is opaque binary) in realistic cases; size equality + fresh wipe is
-        // sufficient for the deployment workflow.
+
+        // Don't clobber a JIT-validated hot pair. A .hash is only written by
+        // a successful KernelCompiler::compile() against the current source,
+        // so if both .hsaco AND .hash exist in hot, that pair is the source
+        // of truth — keep it regardless of size.
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !stem.is_empty() {
+            let hot_hsaco = hot.join(format!("{stem}.hsaco"));
+            let hot_hash = hot.join(format!("{stem}.hash"));
+            if hot_hsaco.exists() && hot_hash.exists() {
+                continue;
+            }
+        }
+
+        // Otherwise: skip if destination already exists with the same size.
+        // We don't compare mtime because std::fs::copy doesn't preserve it —
+        // the destination mtime is the copy time, which is always later than
+        // the src mtime after an update. `hipfire update` wipes both dirs
+        // before re-copy, so a same-size dst without a paired .hash is a
+        // fresh seed from this install. Different size means an install
+        // pulled in an updated cold blob and we should refresh hot to match.
         if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) {
             if s_meta.len() == d_meta.len() {
                 continue;

@@ -185,6 +185,11 @@ pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 // (one per warp), halves grid.x. Byte-exact with the wave32 kernel.
 pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64.hip");
 
+// GCN5/CDNA1 wave64 FP16 hybrid residual GEMM. Same __hfma2 inner loop
+// as the FP16 variant, but block=[64,1,1] with 2 rows/block via warp_id.
+// Scoped to gfx906/gfx908 — CDNA3 uses the rocBLAS MFMA path instead.
+pub const GEMM_HFQ4G256_RESIDUAL_FP16_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp16_wave64.hip");
+
 // FP16-packed variant: dequant to __half, v_pk_fma_f16 inner loop, FP32 accumulation.
 // 2× throughput over FP32 on all RDNA. Same grid/block layout.
 pub const GEMM_HFQ4G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp16.hip");
@@ -253,6 +258,10 @@ pub const GEMM_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gem
 // warp_id, halves grid.x. Byte-exact with wave32 base. Hottest DFlash
 // verify kernel on MI300X — targeted first for this port.
 pub const GEMM_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64.hip");
+// GCN5/CDNA1 wave64 FP16 hybrid 4-way fused LA GEMM. Same __hfma2
+// inner loop as the FP16 variant, but block=[64,1,1] with 2 rows/block.
+// Scoped to gfx906/gfx908 — CDNA3 uses the rocBLAS MFMA path instead.
+pub const GEMM_QKVZA_HFQ4G256_FP16_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_fp16_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -264,6 +273,10 @@ pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/sr
 pub const GEMM_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.hip");
 // CDNA3 wave64-native batched 3-way fused FA preamble. 2 rows per block.
 pub const GEMM_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64.hip");
+// GCN5/CDNA1 wave64 FP16 hybrid 3-way fused FA GEMM. Same __hfma2
+// inner loop as the FP16 variant, but block=[64,1,1] with 2 rows/block.
+// Scoped to gfx906/gfx908 — CDNA3 uses the rocBLAS MFMA path instead.
+pub const GEMM_QKV_HFQ4G256_FP16_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_fp16_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
@@ -273,6 +286,10 @@ pub const GEMM_QKV_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
 pub const GEMM_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256.hip");
+// GCN5/CDNA1 wave64 FP16 hybrid 2-way fused FFN GEMM. Same __hfma2
+// inner loop as the FP16 variant, but block=[64,1,1] with 2 rows/block.
+// Scoped to gfx906/gfx908 — CDNA3 uses the rocBLAS MFMA path instead.
+pub const GEMM_GATE_UP_HFQ4G256_FP16_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_fp16_wave64.hip");
 // FP16 packed variant — RDNA1/2 fast path (no WMMA available).
 pub const GEMM_GATE_UP_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_fp16.hip");
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
