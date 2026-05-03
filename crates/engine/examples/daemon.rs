@@ -1628,6 +1628,7 @@ fn generate_dflash(
     prompt: &str,
     system_prompt: Option<&str>,
     max_tokens: usize,
+    max_think_tokens: usize,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
 ) {
@@ -1809,6 +1810,9 @@ fn generate_dflash(
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut stats = SpecStats::new(df.block_size);
+    // max_think_tokens enforcement state (mirrors the AR path).
+    let mut think_count: usize = 0;
+    let mut prev_in_think = false;
     let mut generated = 0usize;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
@@ -1949,6 +1953,7 @@ fn generate_dflash(
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
 
         let mut hit_eos = false;
+        let mut think_cap_hit = false;
         for &tok in &committed_tail {
             if generated >= max_tokens { break; }
             emitted.push(tok);
@@ -1964,6 +1969,34 @@ fn generate_dflash(
             }
             generated += 1;
             if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
+
+            // max_think_tokens enforcement (mirrors the AR path). Track
+            // <think>/<⁄think> in decoded text and count tokens inside.
+            if max_think_tokens > 0 {
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let open_idx = raw_str.rfind("<think>");
+                let close_idx = raw_str.rfind("</think>");
+                let in_think = match (open_idx, close_idx) {
+                    (Some(o), Some(c)) => o > c,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if in_think && !prev_in_think { think_count = 0; }
+                if in_think { think_count += 1; }
+                prev_in_think = in_think;
+
+                if in_think && think_count >= max_think_tokens {
+                    // Force-close: emit </think>\n and break out of this batch.
+                    // Unlike the AR path we can't splice into the KV cache mid-
+                    // spec-cycle, so we just stream the close text and break.
+                    // The next request will start fresh.
+                    let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#, id);
+                    let _ = stdout.flush();
+                    think_cap_hit = true;
+                    break;
+                }
+            }
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
@@ -1982,7 +2015,7 @@ fn generate_dflash(
                 }
             }
         }
-        if hit_eos { break; }
+        if hit_eos || think_cap_hit { break; }
     }
 
     // Put target state back on LoadedModel so the next request sees fresh
@@ -2030,19 +2063,6 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
-        if max_think_tokens > 0 {
-            // DFlash's spec-cycle emit path doesn't yet honor max_think_tokens
-            // -- wiring close-injection through the verify loop is a separate
-            // change. Tell the operator their cap is being ignored on this
-            // path so they don't think a runaway thinking turn is a daemon
-            // hang. AR path (no draft, or temp>0) does enforce it.
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"info","id":"{}","message":"max_think_tokens={} ignored on DFlash path (only enforced on AR; set dflash_mode=off to use the AR path with the cap)"}}"#,
-                id, max_think_tokens
-            );
-            let _ = stdout.flush();
-        }
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -2063,7 +2083,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 dflash_bypass_reason = Some("dflash_decode_active");
             }
         }
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, dflash_bypass_reason, dflash_alpha);
+        // max_think_tokens is now enforced inside generate_dflash (it
+        // mirrors the AR path's <think>/</think> counter). The "ignored
+        // on DFlash" warning that used to live here is gone -- the cap
+        // is real on both paths now.
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
