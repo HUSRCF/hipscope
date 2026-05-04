@@ -37,6 +37,11 @@ pub struct HfqTensorInfo {
 
 pub struct HfqFile {
     _file: File,
+    /// Path used to open the file. Exposed via [`Self::path`] so the
+    /// weight pager can open its own file handle for paged reads without
+    /// going through this struct (cleanly separates HfqFile's mmap-based
+    /// tensor lookup from the pager's pread/io_uring transport).
+    path: std::path::PathBuf,
     /// mmap kept for backward compat (small models, non-APU systems).
     /// On unified-memory APUs, tensor data is read via pread instead.
     mmap: Mmap,
@@ -162,9 +167,26 @@ impl HfqFile {
         }
 
         Ok(Self {
-            _file: file, mmap, arch_id, metadata_json, tensors, tensor_map,
+            _file: file,
+            path: path.to_path_buf(),
+            mmap, arch_id, metadata_json, tensors, tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// Path the HFQ file was opened from. The weight pager uses this to
+    /// open its own file handle for paged reads — keeping the pager's
+    /// transport independent of this struct's lifetime / mmap.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Look up a tensor's metadata (name, quant_type, shape, byte offset/size)
+    /// without copying its data. The weight pager calls this at load time to
+    /// register byte ranges without forcing eager VRAM allocation.
+    pub fn find_tensor_info(&self, name: &str) -> Option<&HfqTensorInfo> {
+        let idx = *self.tensor_map.get(name)?;
+        Some(&self.tensors[idx])
     }
 
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {

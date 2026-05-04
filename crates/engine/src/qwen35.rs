@@ -109,6 +109,22 @@ pub struct Qwen35Config {
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
+
+    // ── Weight pager (MAD-93 v0.1) ───────────────────────────────────
+    /// If true, MoE expert weights are managed by [`crate::weight_pager::WeightPager`]
+    /// and only the active top-k experts per layer are guaranteed resident in
+    /// VRAM. Default false (all experts resident, today's behavior).
+    ///
+    /// Off-switch for the v0.1 PR: when false there is no behavior change
+    /// vs main; when true the forward path takes the paged code path which
+    /// uses a CPU-side router replica + on-demand H2D transfers.
+    pub paged_experts: bool,
+
+    /// Soft cap on VRAM bytes the weight pager is allowed to hold for paged
+    /// expert weights. Only meaningful when `paged_experts == true`. Defaults
+    /// to `u64::MAX` (no eviction — tested when VRAM is unlimited or we just
+    /// want to verify the routing path works without eviction pressure).
+    pub vram_budget_bytes: u64,
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
@@ -171,6 +187,10 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
         norm_topk_prob,
+        // MAD-93 v0.1: defaults off; runtime opts in (e.g. via CLI flag in
+        // a follow-up commit). When false, no behavior change vs main.
+        paged_experts: false,
+        vram_budget_bytes: u64::MAX,
     })
 }
 
@@ -249,7 +269,12 @@ pub struct SharedExpertWeights {
 
 pub struct MoeFfnWeights {
     pub router: WeightTensor,                 // [num_experts, hidden]
-    pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B)
+    /// Routed expert weights. Populated when this layer is fully resident
+    /// (`paged_experts == false`); **empty `Vec`** when `paged_experts == true`
+    /// (the [`crate::weight_pager::WeightPager`] owns the buffers, and the
+    /// indexed kernels read pointers from `expert_*_ptrs` which the pager
+    /// patches per-token via `patch_expert_ptr_table`).
+    pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B); empty in paged mode
     pub shared_expert: SharedExpertWeights,
     pub shared_expert_gate: WeightTensor,     // [1, hidden] — row-vector projecting to scalar
     /// Device-side array of `unsigned long long` pointers, one per
@@ -257,6 +282,17 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs:    GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
+
+    /// Layer index. Stable identity used to key
+    /// [`crate::weight_pager::WeightId::Expert`] entries.
+    pub layer_idx: u16,
+
+    /// Per-expert tensor shapes. `None` in non-paged mode (shapes are read
+    /// from `experts[i].gate_up.{m, k}` etc.); `Some` in paged mode where
+    /// `experts` is empty but kernels still need m/k for kernel-arg setup.
+    /// Qwen3.5-MoE-A3B has uniform per-expert shape so one descriptor per
+    /// layer suffices for v0.1.
+    pub expert_shape: Option<crate::weight_pager::ExpertShape>,
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -303,6 +339,13 @@ pub struct Qwen35Weights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+
+    /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
+    /// with `Qwen35Config::paged_experts == true`. The forward path uses
+    /// interior mutability (`borrow_mut`) at the MoE dispatch site to call
+    /// `ensure_resident` / `patch_expert_ptr_table`. `None` means the model
+    /// is fully resident — no behavior change vs main.
+    pub pager: Option<std::cell::RefCell<crate::weight_pager::WeightPager>>,
 }
 
 impl Qwen35Weights {
@@ -368,6 +411,12 @@ impl Qwen35Weights {
                     free_moe_ffn(gpu, l.ffn);
                 }
             }
+        }
+        // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
+        // (the per-layer `free_moe_ffn` loops ran no-ops since `ffn.experts`
+        // was empty). Drain the pager's resident set back to the GPU pool here.
+        if let Some(pager_cell) = self.pager {
+            pager_cell.into_inner().free_all(gpu);
         }
     }
 }
@@ -1025,7 +1074,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
                     wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config)?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
                 }));
             }
             (LayerType::FullAttention, true) => {
@@ -1041,7 +1090,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                     q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                     k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config)?,
+                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
                 }));
             }
         }
@@ -1051,14 +1100,27 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         }
     }
 
-    Ok(Qwen35Weights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
+    Ok(Qwen35Weights {
+        token_embd, embd_format: embd_fmt, output_norm, output, layers,
+        // MAD-93: paged construction goes through `load_weights_paged` (added
+        // alongside the moe_ffn_decode_impl wiring in a follow-up commit).
+        // The non-paged `load_weights` always returns `None` so today's
+        // callers see no behavior change.
+        pager: None,
+    })
 }
 
 /// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
-fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) -> HipResult<MoeFfnWeights> {
+fn load_moe_ffn(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    config: &Qwen35Config,
+    layer_idx: u16,
+) -> HipResult<MoeFfnWeights> {
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -1113,6 +1175,11 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) ->
     Ok(MoeFfnWeights {
         router, experts, shared_expert, shared_expert_gate,
         expert_gate_up_ptrs, expert_down_ptrs,
+        // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
+        // future work, expert_shape None (callers read shapes off `experts`
+        // directly when paged_experts==false).
+        layer_idx,
+        expert_shape: None,
     })
 }
 
