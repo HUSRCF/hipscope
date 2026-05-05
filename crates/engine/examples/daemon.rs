@@ -19,6 +19,7 @@
 
 use engine::cask::CaskCtx;
 use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
+use engine::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use engine::hfq::HfqFile;
 use engine::llama;
 use engine::qwen35;
@@ -1816,7 +1817,13 @@ fn generate_dflash(
     // Decode loop — spec_step_dflash returns a committed batch per cycle.
     let mut emitted: Vec<u32> = vec![first_token];
     let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut emitted_bytes = 0usize;
+    // `bytes_fed_to_filter` is the index into the freshly-decoded byte
+    // stream past which we have not yet handed bytes to the filter.
+    // The filter owns UTF-8 boundary buffering and any future arch
+    // quirks (Gemma 4 marker holdback, strip-think, byte-level stop_at);
+    // see crates/engine/src/eos_filter.rs.
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut stats = SpecStats::new(df.block_size);
@@ -1850,13 +1857,12 @@ fn generate_dflash(
     // Emit the first token immediately so TTFT is the prefill time.
     streamed_tokens.push(first_token);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-    let new_bytes = &all_bytes[emitted_bytes..];
-    let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
-    if vl > 0 {
-        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+    let new_bytes = &all_bytes[bytes_fed_to_filter..];
+    bytes_fed_to_filter = all_bytes.len();
+    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+        let text = std::str::from_utf8(&text_bytes).unwrap();
         let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
         let _ = stdout.flush();
-        emitted_bytes += vl;
     }
     generated += 1;
 
@@ -1969,13 +1975,12 @@ fn generate_dflash(
             emitted.push(tok);
             streamed_tokens.push(tok);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
-            if vl > 0 {
-                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
                 let _ = stdout.flush();
-                emitted_bytes += vl;
             }
             generated += 1;
             if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
@@ -2461,7 +2466,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        let mut emitted_bytes = 0usize;
+        // `bytes_fed_to_filter` is the index into the freshly-decoded
+        // byte stream past which we have not yet handed bytes to the
+        // filter. The filter owns UTF-8 boundary buffering and any
+        // future arch quirks (Gemma 4 marker holdback, strip-think,
+        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
+        let mut bytes_fed_to_filter = 0usize;
+        let mut filter = EosFilter::new(EosFilterConfig::default());
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -2491,15 +2502,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
-            // Incremental UTF-8: only emit complete sequences
+            // Incremental UTF-8 + filter routing: feed only the new
+            // bytes since last call, let the filter buffer any partial
+            // codepoint or marker prefix until disambiguated.
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
-            if vl > 0 {
-                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
                 let _ = stdout.flush();
-                emitted_bytes += vl;
             }
 
             // Write this token's K/V to the cache FIRST so the next turn
@@ -2570,16 +2582,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes = &all_bytes[emitted_bytes..];
-                        let vl = match std::str::from_utf8(new_bytes) {
-                            Ok(_) => new_bytes.len(),
-                            Err(e) => e.valid_up_to(),
-                        };
-                        if vl > 0 {
-                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+                        bytes_fed_to_filter = all_bytes.len();
+                        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                            let text = std::str::from_utf8(&text_bytes).unwrap();
                             let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
                             let _ = stdout.flush();
-                            emitted_bytes += vl;
                         }
                         generated += 1;
                     }
@@ -2675,13 +2683,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         // if that's the current state, and get stripped client-
                         // side just like any other think token).
                         let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes2 = &all_bytes2[emitted_bytes..];
-                        let vl2 = match std::str::from_utf8(new_bytes2) { Ok(_) => new_bytes2.len(), Err(e) => e.valid_up_to() };
-                        if vl2 > 0 {
-                            let t = std::str::from_utf8(&new_bytes2[..vl2]).unwrap();
+                        let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
+                        bytes_fed_to_filter = all_bytes2.len();
+                        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
+                            let t = std::str::from_utf8(&text_bytes).unwrap();
                             let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&t).unwrap_or_default());
                             let _ = stdout.flush();
-                            emitted_bytes += vl2;
                         }
                         qwen35::forward_scratch(gpu, weights, config, tok, m.seq_pos, kv, dn, scratch).unwrap();
                         m.seq_pos += 1;
@@ -2794,20 +2801,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        let mut emitted_bytes = 0usize;
+        // `bytes_fed_to_filter` is the index into the freshly-decoded
+        // byte stream past which we have not yet handed bytes to the
+        // filter. The filter owns UTF-8 boundary buffering and any
+        // future arch quirks (Gemma 4 marker holdback, strip-think,
+        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
+        let mut bytes_fed_to_filter = 0usize;
+        let mut filter = EosFilter::new(EosFilterConfig::default());
 
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
-            if vl > 0 {
-                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
                 let _ = stdout.flush();
-                emitted_bytes += vl;
             }
 
             // Scope repeat_buf to this turn's prompt + generated tokens
