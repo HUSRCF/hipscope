@@ -4,9 +4,16 @@
 use crate::compiler::KernelCompiler;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::OnceLock;
+
+thread_local! {
+    /// Per-thread cache for `Gpu::bind_thread`. Sentinel `-1` forces the
+    /// first call to issue `hipSetDevice` even when the target id is 0.
+    static LAST_BOUND_DEVICE: Cell<i32> = const { Cell::new(-1) };
+}
 
 /// gfx1100 multi-row GEMV tile selector.
 /// HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}. Default 1 = single-row kernel (legacy).
@@ -317,6 +324,7 @@ impl DType {
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
+    pub device_id: i32,
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
@@ -467,6 +475,40 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// Bind this `Gpu`'s device on the calling thread. Cached via thread_local
+    /// — only issues `hipSetDevice` when the cached id changes.
+    #[inline]
+    pub fn bind_thread(&self) -> HipResult<()> {
+        if LAST_BOUND_DEVICE.with(|c| c.get()) != self.device_id {
+            self.hip.set_device(self.device_id)?;
+            LAST_BOUND_DEVICE.with(|c| c.set(self.device_id));
+        }
+        debug_assert_eq!(
+            self.hip.current_device()?,
+            self.device_id,
+            "bind_thread invariant: current device must match self.device_id",
+        );
+        Ok(())
+    }
+
+    /// `bind_thread` for `&mut self -> ()` and `Drop` contexts. Logs to
+    /// stderr on hipSetDevice failure instead of swallowing it silently;
+    /// no debug_assert (would risk panic-in-Drop on top of an unwinding
+    /// panic).
+    #[inline]
+    pub fn bind_thread_or_warn(&self) {
+        if LAST_BOUND_DEVICE.with(|c| c.get()) != self.device_id {
+            match self.hip.set_device(self.device_id) {
+                Ok(()) => LAST_BOUND_DEVICE.with(|c| c.set(self.device_id)),
+                Err(e) => eprintln!(
+                    "WARN: bind_thread_or_warn(dev {}) failed: {} — \
+                     subsequent ops run on the currently-bound device",
+                    self.device_id, e,
+                ),
+            }
+        }
+    }
+
     /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
     ///
     /// gfx1100 (and other RDNA cards) return to a low-power DPM state when
@@ -482,6 +524,7 @@ impl Gpu {
     /// mclk; the existing JITed `gemv_hfq4g256` kernel (available on any
     /// caller that has compiled a DFlash/Qwen3.5 model) stresses sclk.
     pub fn dpm_warmup(&mut self, secs: f32) -> HipResult<()> {
+        self.bind_thread()?;
         // 256 MB scratch — large enough to defeat L2 and tax the memory
         // controller. GDDR6 on the 7900 XTX is 24 GB so 256 MB is trivial.
         const SCRATCH_BYTES: usize = 256 * 1024 * 1024;
@@ -506,15 +549,27 @@ impl Gpu {
     }
 
     pub fn init() -> HipResult<Self> {
+        Self::init_with_device(0)
+    }
+
+    pub fn init_with_device(id: i32) -> HipResult<Self> {
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
         if count == 0 {
             return Err(hip_bridge::HipError::new(0, "no GPU devices found"));
         }
-        hip.set_device(0)?;
+        if id < 0 || id >= count {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("device id {id} out of range (count={count})"),
+            ));
+        }
+        // set_device must precede try_init_rocblas — rocBLAS captures the
+        // currently-bound device into its handle.
+        hip.set_device(id)?;
 
-        let arch = hip.get_arch(0).unwrap_or_else(|_| "gfx1010".to_string());
-        let (vram_free, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
+        let arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        let (_, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
 
         // Check HIP runtime version matches GPU arch requirements
         let (hip_major, hip_minor) = hip.runtime_version().unwrap_or((0, 0));
@@ -528,9 +583,11 @@ impl Gpu {
             eprintln!("WARNING: HIP runtime {}.{} may not support {}. Minimum: {}.{}", hip_major, hip_minor, arch, min_major, min_minor);
             eprintln!("  Update your HIP runtime or kernels may fail to load.");
         }
-        eprintln!("GPU: {} ({:.1} GB VRAM, HIP {}.{})", arch, vram_total as f64 / 1e9, hip_major, hip_minor);
+        eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
 
         let compiler = KernelCompiler::new(&arch)?;
+
+        LAST_BOUND_DEVICE.with(|c| c.set(id));
 
         // Per-arch defaults for MMQ screening. See the mmq_screen and
         // mmq_screen_threshold fields below for rationale.
@@ -540,6 +597,7 @@ impl Gpu {
         Ok(Self {
             hip,
             arch,
+            device_id: id,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -618,6 +676,7 @@ impl Gpu {
     /// symbol missing, handle init fail), logs once and leaves `None`.
     /// Callers always fall back to the non-rocBLAS path.
     pub fn try_init_rocblas(&mut self) {
+        self.bind_thread_or_warn();
         if self.rocblas.is_some() { return; }
         let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
         let all_archs = std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1");
@@ -654,6 +713,7 @@ impl Gpu {
         w_fp16: &DeviceBuffer,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(k % 256 == 0, "hfq4g256 dequant: K must be multiple of 256 (got {k})");
         self.ensure_kernel(
             "hfq4g256_dequantize_to_f16",
@@ -698,6 +758,7 @@ impl Gpu {
         y_fp32: &DeviceBuffer, // row-major [N × M]
         m: usize, n: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rocblas_gemm_hfq4_generic(w_fp16, x_fp16, y_fp32, m, n, k, 1.0, 0.0)
     }
 
@@ -711,6 +772,7 @@ impl Gpu {
         y_fp32: &DeviceBuffer,
         m: usize, n: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rocblas_gemm_hfq4_generic(w_fp16, x_fp16, y_fp32, m, n, k, 1.0, 1.0)
     }
 
@@ -746,6 +808,7 @@ impl Gpu {
     /// While capturing, dispatch methods that support it will use the blob
     /// launch path so that kernarg pointers survive until graph replay.
     pub fn begin_graph_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         self.capture_blobs.clear();
         self.capture_mode = true;
         let stream = self.active_stream.as_ref()
@@ -755,6 +818,7 @@ impl Gpu {
 
     /// End capture, instantiate the graph for replay.
     pub fn end_graph_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         self.capture_mode = false;
         let stream = self.active_stream.as_ref().unwrap();
         let graph = self.hip.stream_end_capture(stream)?;
@@ -766,6 +830,7 @@ impl Gpu {
 
     /// Replay the captured graph.
     pub fn graph_launch(&self) -> HipResult<()> {
+        self.bind_thread()?;
         let exec = self.graph_exec.as_ref().expect("no captured graph to replay");
         let stream = self.active_stream.as_ref().unwrap();
         self.hip.graph_launch(exec, stream)
@@ -773,6 +838,7 @@ impl Gpu {
 
     /// Destroy the captured graph and free all retained kernarg blobs.
     pub fn graph_destroy(&mut self) {
+        self.bind_thread_or_warn();
         if let Some(exec) = self.graph_exec.take() {
             let _ = self.hip.graph_exec_destroy(exec);
         }
@@ -801,14 +867,17 @@ impl Gpu {
     // becomes free.
 
     pub fn verify_has_graph(&self, b: usize) -> bool {
+        // bind_thread: skip — pure state query
         self.verify_graph_cache.contains_key(&b)
     }
 
     pub fn verify_needs_warmup(&self, b: usize) -> bool {
+        // bind_thread: skip — pure state query
         !self.verify_warmed_up.contains(&b)
     }
 
     pub fn verify_mark_warmup_done(&mut self, b: usize) {
+        // bind_thread: skip — pure state query
         self.verify_warmed_up.insert(b);
     }
 
@@ -816,6 +885,7 @@ impl Gpu {
     /// launch_maybe_blob calls will push their kernargs into `capture_blobs`,
     /// which is drained into the per-B cache entry on end_verify_graph_capture.
     pub fn begin_verify_graph_capture(&mut self, b: usize) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert!(self.verify_capturing_b.is_none(),
             "begin_verify_graph_capture: already capturing for b={:?}",
             self.verify_capturing_b);
@@ -832,6 +902,7 @@ impl Gpu {
     /// End capture, instantiate, stash into the per-B cache (taking ownership
     /// of the current capture_blobs).
     pub fn end_verify_graph_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let b = self.verify_capturing_b.take()
             .expect("end_verify_graph_capture without matching begin");
         self.capture_mode = false;
@@ -845,6 +916,7 @@ impl Gpu {
 
     /// Replay the cached verify graph for batch size `b`.
     pub fn verify_graph_launch(&self, b: usize) -> HipResult<()> {
+        self.bind_thread()?;
         let entry = self.verify_graph_cache.get(&b)
             .unwrap_or_else(|| panic!("no captured verify graph for b={}", b));
         let stream = self.active_stream.as_ref().unwrap();
@@ -853,11 +925,13 @@ impl Gpu {
 
     /// How many captured verify graphs are in the cache (for debug logs).
     pub fn verify_graph_count(&self) -> usize {
+        // bind_thread: skip — pure state query
         self.verify_graph_cache.len()
     }
 
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self) {
+        self.bind_thread_or_warn();
         for (_, (graph, exec, _blobs)) in self.verify_graph_cache.drain() {
             let _ = self.hip.graph_exec_destroy(exec);
             let _ = self.hip.graph_destroy(graph);
@@ -874,18 +948,22 @@ impl Gpu {
     // ~192 kernel dispatches per replay.
 
     pub fn replay_has_graph(&self, n_steps: usize) -> bool {
+        // bind_thread: skip — pure state query
         self.replay_graph_cache.contains_key(&n_steps)
     }
 
     pub fn replay_needs_warmup(&self, n_steps: usize) -> bool {
+        // bind_thread: skip — pure state query
         !self.replay_warmed_up.contains(&n_steps)
     }
 
     pub fn replay_mark_warmup_done(&mut self, n_steps: usize) {
+        // bind_thread: skip — pure state query
         self.replay_warmed_up.insert(n_steps);
     }
 
     pub fn begin_replay_graph_capture(&mut self, n_steps: usize) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert!(self.replay_capturing_n.is_none(),
             "begin_replay_graph_capture: already capturing for n_steps={:?}",
             self.replay_capturing_n);
@@ -900,6 +978,7 @@ impl Gpu {
     }
 
     pub fn end_replay_graph_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let n_steps = self.replay_capturing_n.take()
             .expect("end_replay_graph_capture without matching begin");
         self.capture_mode = false;
@@ -912,6 +991,7 @@ impl Gpu {
     }
 
     pub fn replay_graph_launch(&self, n_steps: usize) -> HipResult<()> {
+        self.bind_thread()?;
         let entry = self.replay_graph_cache.get(&n_steps)
             .unwrap_or_else(|| panic!("no captured replay graph for n_steps={}", n_steps));
         let stream = self.active_stream.as_ref().unwrap();
@@ -919,10 +999,12 @@ impl Gpu {
     }
 
     pub fn replay_graph_count(&self) -> usize {
+        // bind_thread: skip — pure state query
         self.replay_graph_cache.len()
     }
 
     pub fn replay_graph_destroy_all(&mut self) {
+        self.bind_thread_or_warn();
         for (_, (graph, exec, _blobs)) in self.replay_graph_cache.drain() {
             let _ = self.hip.graph_exec_destroy(exec);
             let _ = self.hip.graph_destroy(graph);
@@ -945,6 +1027,7 @@ impl Gpu {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if let Some(stream) = self.active_stream.as_ref() {
             self.hip.memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
         } else {
@@ -959,6 +1042,7 @@ impl Gpu {
         src: &hip_bridge::DeviceBuffer,
         size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.memcpy_dtod_at_auto(dst, 0, src, 0, size)
     }
 
@@ -1008,6 +1092,7 @@ impl Gpu {
         source: &str,
         func_name: &str,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(module_name, source, func_name)
     }
 
@@ -1030,6 +1115,7 @@ impl Gpu {
         shared_mem: u32,
         kernargs: &mut [u8],
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let func = self.functions.get(func_name).ok_or_else(|| {
             hip_bridge::HipError::new(0, &format!("launch_kernel_blob: function '{func_name}' not loaded"))
         })?;
@@ -1112,6 +1198,7 @@ impl Gpu {
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
     pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
@@ -1174,6 +1261,7 @@ impl Gpu {
     /// Returns `true` if MMQ is safe for this weight, `false` if it should
     /// fall back to WMMA.
     pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        self.bind_thread_or_warn();
         let key = a_raw.buf.as_ptr() as usize;
         if let Some(&safe) = self.mmq_screen_cache.get(&key) {
             return safe;
@@ -1325,6 +1413,7 @@ impl Gpu {
     /// Each entry is (module_name, source, func_name). Turbo kernels should have
     /// TURBO_COMMON_H already prepended in their source.
     pub fn precompile_kernels(&mut self, specs: &[(&str, &str, &str)]) -> HipResult<()> {
+        self.bind_thread()?;
         // Collect (name, source) pairs for the compiler batch, skipping already-loaded
         let batch: Vec<(&str, &str)> = specs.iter()
             .filter(|(_, _, func)| !self.functions.contains_key(*func))
@@ -1359,6 +1448,7 @@ impl Gpu {
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         let numel: usize = shape.iter().product();
         let byte_size = numel * dtype.size();
         let buf = self.pool.alloc(&self.hip, byte_size)?;
@@ -1370,6 +1460,7 @@ impl Gpu {
     }
 
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, DType::F32)?;
         let bytes = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
@@ -1379,6 +1470,7 @@ impl Gpu {
     }
 
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
+        self.bind_thread()?;
         let numel = tensor.numel();
         let mut data = vec![0.0f32; numel];
         let bytes = unsafe {
@@ -1389,6 +1481,7 @@ impl Gpu {
     }
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, dtype)?;
         match self.active_stream.as_ref() {
             Some(stream) => self.hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
@@ -1406,6 +1499,7 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let byte_offset = (token_id as usize) * dim * 4;
         let byte_size = dim * 4;
         self.hip.memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
@@ -1420,6 +1514,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4lut", kernels::GEMV_Q4LUT_SRC, "gemv_q4lut")?;
         let func = &self.functions["gemv_q4lut"];
 
@@ -1448,6 +1543,7 @@ impl Gpu {
     pub fn gemv_q4wave(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4wave", kernels::GEMV_Q4WAVE_SRC, "gemv_q4wave")?;
         let func = &self.functions["gemv_q4wave"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -1467,6 +1563,7 @@ impl Gpu {
     pub fn gemv_q4as8(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4as8", kernels::GEMV_Q4AS8_SRC, "gemv_q4as8")?;
         let func = &self.functions["gemv_q4as8"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -1490,6 +1587,7 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("embedding_q8", kernels::EMBEDDING_Q8_SRC, "embedding_q8")?;
         let func = &self.functions["embedding_q8"];
 
@@ -1519,6 +1617,7 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("embedding_q4k", kernels::EMBEDDING_Q4K_SRC, "embedding_q4k")?;
         let func = &self.functions["embedding_q4k"];
 
@@ -1547,6 +1646,7 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC, "embedding_hfq4g256")?;
         let func = &self.functions["embedding_hfq4g256"];
 
@@ -1581,6 +1681,7 @@ impl Gpu {
         n: usize,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "embedding_q8_batched",
             kernels::EMBEDDING_Q8_BATCHED_SRC,
@@ -1626,6 +1727,7 @@ impl Gpu {
         n: usize,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "embedding_hfq4g256_batched",
             kernels::EMBEDDING_HFQ4G256_BATCHED_SRC,
@@ -1666,6 +1768,7 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC, "embedding_hfq4g128")?;
         let func = &self.functions["embedding_hfq4g128"];
 
@@ -1688,6 +1791,7 @@ impl Gpu {
 
     /// Upload raw bytes to GPU (for quantized weights).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
         self.hip.memcpy_htod(&buf, data)?;
         Ok(GpuTensor {
@@ -1698,6 +1802,7 @@ impl Gpu {
     }
 
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.pool.free(tensor.buf);
         Ok(())
     }
@@ -1705,6 +1810,7 @@ impl Gpu {
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
+        self.bind_thread_or_warn();
         self.pool.drain(&self.hip);
     }
 
@@ -1718,6 +1824,7 @@ impl Gpu {
     ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
     ///     entries are released back to the pool here.
     pub fn invalidate_weight_caches(&mut self) {
+        self.bind_thread_or_warn();
         self.mmq_screen_cache.clear();
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
@@ -1742,6 +1849,7 @@ impl Gpu {
     ///   * replay_graph_cache + replay_warmed_up + replay_capturing_n:
     ///     DFlash per-n_steps tape-replay graphs.
     pub fn invalidate_graph_state(&mut self) {
+        self.bind_thread_or_warn();
         self.graph_destroy();
         self.verify_graph_destroy_all();
         self.replay_graph_destroy_all();
@@ -1756,6 +1864,7 @@ impl Gpu {
         x: &GpuTensor,
         y: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv", kernels::GEMV_SRC, "gemv_f32")?;
         let func = &self.functions["gemv_f32"];
 
@@ -1808,6 +1917,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4k", kernels::GEMV_Q4K_SRC, "gemv_q4k")?;
         let func = &self.functions["gemv_q4k"];
 
@@ -1848,6 +1958,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq4g128", kernels::GEMV_HFQ4G128_SRC, "gemv_hfq4g128")?;
         let func = &self.functions["gemv_hfq4g128"];
 
@@ -1882,6 +1993,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
         let func = &self.functions["gemm_hfq4g128"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -1906,6 +2018,7 @@ impl Gpu {
 
     /// HFQ2-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq2g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq2g256", kernels::GEMV_HFQ2G256_SRC, "gemv_hfq2g256")?;
         let func = &self.functions["gemv_hfq2g256"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -1920,6 +2033,7 @@ impl Gpu {
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         if self.mq_signs1.is_some() { return Ok(()); }
         fn gen_signs(seed: u32) -> Vec<f32> {
             let mut state = seed;
@@ -1955,6 +2069,7 @@ impl Gpu {
         signs1: &GpuTensor, signs2: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "gemv_mq4g256")?;
         let func = &self.functions["gemv_mq4g256"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -1987,6 +2102,7 @@ impl Gpu {
         k: usize,
         eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "fused_rmsnorm_mq_rotate",
@@ -2054,6 +2170,7 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "fused_rmsnorm_mq_rotate",
@@ -2113,6 +2230,7 @@ impl Gpu {
         x_rot: &GpuTensor,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "fused_silu_mul_mq_rotate",
@@ -2163,6 +2281,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "fused_silu_mul_mq_rotate",
@@ -2210,6 +2329,7 @@ impl Gpu {
     /// Exposed so callers can batch one rotation across multiple GEMVs that share x
     /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         // `mq_rotate_x` lives inside the `gemv_mq4g256` module — precompile
         // writes the .hsaco/.hash sidecar under that module name, so the
@@ -2251,6 +2371,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         // Same cache-key contract as `rotate_x_mq` — see comment there.
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
@@ -2296,6 +2417,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rotate_x_mq(x, x_rot, k)?;
         // MQ4 = FWHT-rotated HFQ4-G256. dot(rot(W), rot(x)) = dot(W, x).
         // Route through the arch-specific HFQ4 kernel (4x unroll on gfx1100, etc).
@@ -2307,6 +2429,7 @@ impl Gpu {
     pub fn gemv_mq4g256_prerotated(
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
     }
 
@@ -2317,6 +2440,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
     }
@@ -2325,6 +2449,7 @@ impl Gpu {
     pub fn gemv_mq3g256_prerotated(
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
     }
 
@@ -2334,6 +2459,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
     }
@@ -2342,6 +2468,7 @@ impl Gpu {
     pub fn gemv_mq2g256_prerotated(
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
     }
 
@@ -2350,6 +2477,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_hfq6g256(a_raw, x_rot, y, m, k)
     }
@@ -2358,12 +2486,14 @@ impl Gpu {
     pub fn gemv_mq6g256_prerotated(
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq6g256(a_raw, x_rot, y, m, k)
     }
 
     /// Standalone MQ8 rotate + INT8 quantize of x into internal `mq_x_q8`/`mq_x_scales`.
     /// After this, `gemv_mq8g256_prerotated` can be called multiple times with the same x.
     pub fn rotate_quantize_x_mq8(&mut self, x: &GpuTensor, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel("mq8_rotate_quantize_x", kernels::GEMV_MQ8G256_SRC, "mq8_rotate_quantize_x")?;
 
@@ -2392,6 +2522,7 @@ impl Gpu {
     pub fn gemv_mq8g256_prerotated(
         &mut self, a_raw: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_mq8g256", kernels::GEMV_MQ8G256_SRC, "gemv_mq8g256")?;
 
         let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
@@ -2414,6 +2545,7 @@ impl Gpu {
     pub fn gemv_mq8g256_with_rotate(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.rotate_quantize_x_mq8(x, k)?;
         self.gemv_mq8g256_prerotated(a_raw, y, m, k)
     }
@@ -2425,6 +2557,7 @@ impl Gpu {
     /// gfx9xx) produce byte-exact results against the RDNA3 baseline.
     /// Uses `launch_maybe_blob` for HIPFIRE_GRAPH=1 capture safety.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq3g256")?;
         let a_ptr = a_raw.buf.as_ptr();
@@ -2463,6 +2596,7 @@ impl Gpu {
         a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq3g256_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
@@ -2495,11 +2629,13 @@ impl Gpu {
     pub fn gemv_mq3g256_residual_prerotated(
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq3g256_residual(a_raw, x_rot, y, m, k)
     }
 
     /// HFQ3-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
     pub fn gemv_hfq3g128(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq3g128", kernels::GEMV_HFQ3G128_SRC, "gemv_hfq3g128")?;
         let func = &self.functions["gemv_hfq3g128"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2514,6 +2650,7 @@ impl Gpu {
 
     /// HFQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
     pub fn gemv_hfq2g128(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq2g128", kernels::GEMV_HFQ2G128_SRC, "gemv_hfq2g128")?;
         let func = &self.functions["gemv_hfq2g128"];
         let mut ap = a_raw.buf.as_ptr(); let mut xp = x.buf.as_ptr(); let mut yp = y.buf.as_ptr();
@@ -2531,6 +2668,7 @@ impl Gpu {
     /// Used for wo and w_down in HFQ6 / MQ6 forward paths so the
     /// add_inplace_f32 follow-up launch can be elided.
     pub fn gemv_hfq6g256_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, "gemv_hfq6g256_residual")?;
         let func = &self.functions["gemv_hfq6g256_residual"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2545,6 +2683,7 @@ impl Gpu {
 
     /// HFQ6-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq6g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC, "gemv_hfq6g256")?;
         let func = &self.functions["gemv_hfq6g256"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2559,6 +2698,7 @@ impl Gpu {
 
     /// HFQ8-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq8g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq8g256", kernels::GEMV_HFQ8G256_SRC, "gemv_hfq8g256")?;
         let func = &self.functions["gemv_hfq8g256"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2573,6 +2713,7 @@ impl Gpu {
 
     /// HFQ4-G512 GEMV. K must be multiple of 512.
     pub fn gemv_hfq4g512(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq4g512", kernels::GEMV_HFQ4G512_SRC, "gemv_hfq4g512")?;
         let func = &self.functions["gemv_hfq4g512"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2587,6 +2728,7 @@ impl Gpu {
 
     /// HFQ4-G1024 GEMV. K must be multiple of 1024.
     pub fn gemv_hfq4g1024(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_hfq4g1024", kernels::GEMV_HFQ4G1024_SRC, "gemv_hfq4g1024")?;
         let func = &self.functions["gemv_hfq4g1024"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
@@ -2608,6 +2750,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
         self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
 
@@ -2771,6 +2914,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if gemv_dp4a_enabled(&self.arch) {
             return self.fused_qkv_hfq4g256_dp4a(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k,
@@ -2860,6 +3004,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if gemv_dp4a_enabled(&self.arch) {
             return self.fused_qkvza_hfq4g256_dp4a(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -3023,6 +3168,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // CDNA3 MFMA path — 4 back-to-back rocBLAS calls. The last two
         // matrices (beta, alpha) are tiny (n_v_heads = 128 on A3B) so we
         // could skip them and stay on the GEMV path, but dispatching all
@@ -3225,6 +3371,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_fp16",
             kernels::GEMM_QKVZA_HFQ4G256_FP16_SRC,
@@ -3304,6 +3451,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_fp16_wave64",
             kernels::GEMM_QKVZA_HFQ4G256_FP16_WAVE64_SRC,
@@ -3384,6 +3532,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_dot2",
             kernels::GEMM_QKVZA_HFQ4G256_DOT2_SRC,
@@ -3460,6 +3609,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // CDNA3 MFMA path — 3 back-to-back rocBLAS calls for Q, K, V.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
@@ -3628,6 +3778,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_fp16",
             kernels::GEMM_QKV_HFQ4G256_FP16_SRC,
@@ -3700,6 +3851,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_fp16_wave64",
             kernels::GEMM_QKV_HFQ4G256_FP16_WAVE64_SRC,
@@ -3772,6 +3924,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_dot2",
             kernels::GEMM_QKV_HFQ4G256_DOT2_SRC,
@@ -3841,6 +3994,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // CDNA3 MFMA path (task #130): two back-to-back rocBLAS calls against
         // the gate/up FP16 shadows. rocBLAS launch overhead is small compared
         // to the GEMM work at prefill batches, so fusing into a single
@@ -3983,6 +4137,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_dot2",
             kernels::GEMM_GATE_UP_HFQ4G256_DOT2_SRC,
@@ -4042,6 +4197,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_fp16",
             kernels::GEMM_GATE_UP_HFQ4G256_FP16_SRC,
@@ -4107,6 +4263,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_fp16_wave64",
             kernels::GEMM_GATE_UP_HFQ4G256_FP16_WAVE64_SRC,
@@ -4171,6 +4328,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_qkvza_hfq4g256_wmma", kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC, "gemm_qkvza_hfq4g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4254,6 +4412,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkvza_hfq3g256_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -4341,6 +4500,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Rotate batched x. mq_rotate_x_batched applies FWHT per-row.
         for b in 0..batch_size {
             let x_row = x.sub_offset(b * k, k);
@@ -4375,6 +4535,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq3g256_wmma_gfx12",
             kernels::GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC,
@@ -4456,6 +4617,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_wmma_gfx12",
             kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC,
@@ -4539,6 +4701,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_qkv_hfq4g256_wmma", kernels::GEMM_QKV_HFQ4G256_WMMA_SRC, "gemm_qkv_hfq4g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4614,6 +4777,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkv_hfq3g256_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
@@ -4691,6 +4855,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_wmma_gfx12",
             kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC,
@@ -4767,6 +4932,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
         // (Gate 1 microbench, opt-in only, default off). See
         // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
@@ -4844,6 +5010,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq3g256_wmma_gfx12",
             kernels::GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC,
@@ -4915,6 +5082,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_gate_up_hfq3g256_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
@@ -4980,6 +5148,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq3g256_wmma_gfx12",
             kernels::GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC,
@@ -5048,6 +5217,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         for b in 0..batch_size {
             let x_row = x.sub_offset(b * k, k);
             let x_rot_row = x_rot.sub_offset(b * k, k);
@@ -5072,6 +5242,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_wmma_gfx12",
             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
@@ -5152,6 +5323,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_hfq4g256_residual_wmma_gfx12",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
@@ -5211,6 +5383,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
 
@@ -5324,6 +5497,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_residual_scaled",
             kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
@@ -5375,6 +5549,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_residual_scaled",
             kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
@@ -5424,6 +5599,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_residual_scaled",
             kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
@@ -5477,6 +5653,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_residual_scaled",
             kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
@@ -5535,6 +5712,7 @@ impl Gpu {
         y_up:   &GpuTensor,   // [k_top × mi] — second half
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_moe_gate_up",
             kernels::GEMV_HFQ4G256_MOE_GATE_UP_SRC,
@@ -5601,6 +5779,7 @@ impl Gpu {
         scales: [f32; 8],
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_moe_down",
             kernels::GEMV_HFQ4G256_MOE_DOWN_SRC,
@@ -5662,6 +5841,7 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_softmax_topk_k8",
             kernels::MOE_SOFTMAX_TOPK_K8_SRC,
@@ -5755,6 +5935,7 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -5819,6 +6000,7 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -5882,6 +6064,7 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_softmax_topk_k8_batched",
             kernels::MOE_SOFTMAX_TOPK_K8_BATCHED_SRC,
@@ -5979,6 +6162,7 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
@@ -6047,6 +6231,7 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
@@ -6121,6 +6306,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
@@ -6434,6 +6620,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_hfq4g256_residual_fp16", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC, "gemm_hfq4g256_residual_fp16")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -6488,6 +6675,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_hfq4g256_residual_fp16_wave64", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_WAVE64_SRC, "gemm_hfq4g256_residual_fp16_wave64")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -6540,6 +6728,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_add"
@@ -6839,6 +7028,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
@@ -6911,6 +7101,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch == "gfx906" {
             // gfx906 has its own dispatcher (`gemm_hfq4g256_residual_mmq_gfx906`)
             // that handles its own quantize internally, called directly from
@@ -6992,6 +7183,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Compile both kernels (convert + WMMA GEMM share the FP16 convert)
         // Kernel variant selection
         // MW16 path: dequant weights to FP16 per-call, then run no-dequant WMMA
@@ -7030,7 +7222,24 @@ impl Gpu {
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
         let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151" | "gfx1152");
-        let auto_variant = if is_gfx115x && batch_size <= 16 {
+        // ksplit's atomicAdd reduction across K_SPLITS partials is fp-non-
+        // associative — order varies with warp scheduling, so output bytes
+        // drift between processes and between cold/hot runs. The drift is
+        // sub-argmax-margin per call but cascades on long greedy decode
+        // (>50 tokens). HIPFIRE_DETERMINISTIC=1 forces k2 (single-block
+        // K reduction) at the cost of ~33% perf on small-batch / small-M.
+        // Required when chasing multi-GPU parity: pp=1 vs pp=2 outputs
+        // can't be compared byte-for-byte when the underlying single-GPU
+        // path itself is non-deterministic.
+        // Cached — getenv on every decode token would re-parse 6× per layer
+        // × N layers per step. Read once at first dispatch.
+        static FORCE_DET: OnceLock<bool> = OnceLock::new();
+        let force_det = *FORCE_DET.get_or_init(|| {
+            std::env::var("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1")
+        });
+        let auto_variant = if force_det {
+            "k2"
+        } else if is_gfx115x && batch_size <= 16 {
             "k2"
         } else if is_gfx115x && m < 8192 {
             "k2x32"
@@ -7130,6 +7339,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_hfq3g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
         }
@@ -7188,6 +7398,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_hfq3g256_residual_wmma_gfx12",
             kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC,
@@ -7244,6 +7455,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         for b in 0..batch_size {
             let x_row = x.sub_offset(b * k, k);
             let x_rot_row = x_rot.sub_offset(b * k, k);
@@ -7318,6 +7530,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // gfx906 dp4a opt-in for the LM-head batched GEMM. PMC at 2026-05-06
         // showed gemm_hfq4g256_wave64 was 17 % of DFlash 27B steady-state
         // decode time on the FP wave64 path. The dp4a port pre-quantizes x
@@ -7513,6 +7726,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if !self.arch.starts_with("gfx11") {
             // No mw16 WMMA on non-RDNA3 — fall back to the scalar F32 GEMM.
             // This is slow but correct; non-gfx11 isn't the intended target.
@@ -7590,6 +7804,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let wmma_eligible = batch_size > 1
             && self.arch.starts_with("gfx11")
             && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
@@ -7623,6 +7838,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // WMMA eligibility: any arch with an MQ3 WMMA family ported. Today
         // that's gfx11 (RDNA3, _w32 builtin) and gfx12 (RDNA4, _w32_gfx12
         // builtin) — `gemm_hfq3g256_residual_wmma` dispatches internally to
@@ -7670,6 +7886,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
@@ -7731,6 +7948,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_hfq6g256_residual_fp16", kernels::GEMM_HFQ6G256_RESIDUAL_FP16_SRC, "gemm_hfq6g256_residual_fp16")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -7783,6 +8001,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let (kernel_name, kernel_src, block_size, row_step) =
             ("gemm_hfq6g256_residual_wmma_k2", kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize);
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
@@ -7839,6 +8058,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if has_wmma_f16_gfx12(&self.arch) {
@@ -7927,6 +8147,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq6g256_fp16",
             kernels::GEMM_QKVZA_HFQ6G256_FP16_SRC,
@@ -8006,6 +8227,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq6g256_dot2",
             kernels::GEMM_QKVZA_HFQ6G256_DOT2_SRC,
@@ -8070,6 +8292,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_qkvza_hfq6g256_wmma", kernels::GEMM_QKVZA_HFQ6G256_WMMA_SRC, "gemm_qkvza_hfq6g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -8151,6 +8374,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq6g256_wmma_gfx12",
             kernels::GEMM_QKVZA_HFQ6G256_WMMA_GFX12_SRC,
@@ -8235,6 +8459,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if has_wmma_f16_gfx12(&self.arch) {
@@ -8316,6 +8541,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq6g256_fp16",
             kernels::GEMM_QKV_HFQ6G256_FP16_SRC,
@@ -8388,6 +8614,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq6g256_dot2",
             kernels::GEMM_QKV_HFQ6G256_DOT2_SRC,
@@ -8446,6 +8673,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_qkv_hfq6g256_wmma", kernels::GEMM_QKV_HFQ6G256_WMMA_SRC, "gemm_qkv_hfq6g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -8520,6 +8748,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq6g256_wmma_gfx12",
             kernels::GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC,
@@ -8597,6 +8826,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if has_wmma_f16_gfx12(&self.arch) {
@@ -8671,6 +8901,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq6g256_fp16",
             kernels::GEMM_GATE_UP_HFQ6G256_FP16_SRC,
@@ -8736,6 +8967,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq6g256_dot2",
             kernels::GEMM_GATE_UP_HFQ6G256_DOT2_SRC,
@@ -8788,6 +9020,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_gate_up_hfq6g256_wmma", kernels::GEMM_GATE_UP_HFQ6G256_WMMA_SRC, "gemm_gate_up_hfq6g256_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -8855,6 +9088,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq6g256_wmma_gfx12",
             kernels::GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC,
@@ -8917,6 +9151,7 @@ impl Gpu {
     pub fn max_prob(
         &mut self, logits: &GpuTensor, result: &GpuTensor, vocab_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("max_prob", kernels::MAX_PROB_SRC, "max_prob")?;
         let func = &self.functions["max_prob"];
         let mut lp = logits.buf.as_ptr();
@@ -8941,6 +9176,7 @@ impl Gpu {
         yq: &GpuTensor, yk: &GpuTensor, yv: &GpuTensor,
         q_m: usize, k_m: usize, v_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
         let func = &self.functions["fused_qkv_q4k"];
 
@@ -8985,6 +9221,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("fused_gate_up_q4k", kernels::FUSED_GATE_UP_Q4K_SRC, "fused_gate_up_q4k")?;
         let func = &self.functions["fused_gate_up_q4k"];
 
@@ -9023,6 +9260,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -9080,6 +9318,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(
             batch_size <= 16,
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=16"
@@ -9131,6 +9370,7 @@ impl Gpu {
         k: usize,
         row_stride: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -9173,6 +9413,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q6k", kernels::GEMV_Q6K_SRC, "gemv_q6k")?;
         let func = &self.functions["gemv_q6k"];
 
@@ -9216,6 +9457,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4f16_g64", kernels::GEMV_Q4F16_G64_SRC, "gemv_q4f16_g64")?;
         let func = &self.functions["gemv_q4f16_g64"];
 
@@ -9256,6 +9498,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4f16_g64_wide", kernels::GEMV_Q4F16_G64_WIDE_SRC, "gemv_q4f16_g64_wide")?;
         let func = &self.functions["gemv_q4f16_g64_wide"];
 
@@ -9297,6 +9540,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_q4f16_g32", kernels::GEMV_Q4F16_G32_SRC, "gemv_q4f16_g32")?;
         let func = &self.functions["gemv_q4f16_g32"];
 
@@ -9337,6 +9581,7 @@ impl Gpu {
         n: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "argmax_f32_batched",
             kernels::ARGMAX_BATCHED_SRC,
@@ -9371,6 +9616,7 @@ impl Gpu {
 
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
+        self.bind_thread()?;
         self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;
         let func = &self.functions["argmax_f32"];
 
@@ -9410,6 +9656,7 @@ impl Gpu {
         out: &GpuTensor,
         eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
 
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
@@ -9470,6 +9717,7 @@ impl Gpu {
         n_tokens: usize, n_heads: usize, head_dim: usize,
         layer_idx: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "triattn_accumulate",
             kernels::TRIATTN_ACCUMULATE_SRC,
@@ -9521,6 +9769,7 @@ impl Gpu {
         x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,
         batch: usize, n: usize, eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
 
         let mut x_ptr = x.buf.as_ptr();
@@ -9560,6 +9809,7 @@ impl Gpu {
 
     /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
         let func = &self.functions["add_f32"];
 
@@ -9583,6 +9833,7 @@ impl Gpu {
 
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
 
         let n = a.numel() as i32;
@@ -9615,6 +9866,7 @@ impl Gpu {
 
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("mul", kernels::MUL_SRC, "mul_f32")?;
         let func = &self.functions["mul_f32"];
 
@@ -9642,6 +9894,7 @@ impl Gpu {
 
     /// out = silu(x)
     pub fn silu_f32(&mut self, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("silu", kernels::SILU_SRC, "silu_f32")?;
         let func = &self.functions["silu_f32"];
 
@@ -9663,6 +9916,7 @@ impl Gpu {
 
     /// out = silu(gate) * up — fused to avoid intermediate buffer
     pub fn silu_mul_f32(&mut self, gate: &GpuTensor, up: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, "silu_mul_f32")?;
 
         let n = gate.numel() as i32;
@@ -9698,6 +9952,7 @@ impl Gpu {
 
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("softmax", kernels::SOFTMAX_SRC, "softmax_f32")?;
 
         let rows = if x.shape.len() > 1 { x.shape[0] } else { 1 };
@@ -9745,6 +10000,7 @@ impl Gpu {
         head_dim: usize,
         freq_base: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
         let func = &self.functions["rope_f32"];
 
@@ -9789,6 +10045,7 @@ impl Gpu {
         &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, freq_base: f32, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rope_batched", kernels::ROPE_BATCHED_SRC, "rope_batched_f32")?;
         let func = &self.functions["rope_batched_f32"];
         let mut q_ptr = q.buf.as_ptr();
@@ -9833,6 +10090,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention", kernels::ATTENTION_SRC, "attention_f32")?;
         let func = &self.functions["attention_f32"];
 
@@ -9894,6 +10152,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         // Choose chunk size: aim for 4-16 chunks
@@ -9982,6 +10241,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // gfx906 dp4a opt-in: pre-quantize x to Q8_1 and use the
         // v_dot4_i32_i8 path. PMC at 2026-05-05 showed this kernel
         // was memory-bound; dp4a's 75% x-traffic reduction lands on
@@ -10095,6 +10355,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_hfq4", kernels::KV_CACHE_WRITE_HFQ4_SRC, "kv_cache_write_hfq4")?;
         let func = &self.functions["kv_cache_write_hfq4"];
         let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
@@ -10114,6 +10375,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_hfq4_kv", kernels::ATTENTION_HFQ4_KV_SRC, "attention_hfq4_kv")?;
         let func = &self.functions["attention_hfq4_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10140,6 +10402,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_int8c_f16", kernels::KV_CACHE_WRITE_INT8C_F16_SRC, "kv_cache_write_int8c_f16")?;
         let func = &self.functions["kv_cache_write_int8c_f16"];
         let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr(); let mut p = pos_buf.as_ptr();
@@ -10156,6 +10419,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_int8c_f16_kv", kernels::ATTENTION_INT8C_F16_KV_SRC, "attention_int8c_f16_kv")?;
         let func = &self.functions["attention_int8c_f16_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10180,6 +10444,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_int8c", kernels::KV_CACHE_WRITE_INT8C_SRC, "kv_cache_write_int8c")?;
         let func = &self.functions["kv_cache_write_int8c"];
         let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
@@ -10199,6 +10464,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_int8c_kv", kernels::ATTENTION_INT8C_KV_SRC, "attention_int8c_kv")?;
         let func = &self.functions["attention_int8c_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10224,6 +10490,7 @@ impl Gpu {
         &mut self, dst_data: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
         pos_buf: &DeviceBuffer, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_hfq8", kernels::KV_CACHE_WRITE_HFQ8_SRC, "kv_cache_write_hfq8")?;
         let func = &self.functions["kv_cache_write_hfq8"];
         let mut dd = dst_data.buf.as_ptr(); let mut ds = dst_scales.buf.as_ptr();
@@ -10245,6 +10512,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_hfq8_kv", kernels::ATTENTION_HFQ8_KV_SRC, "attention_hfq8_kv")?;
         let func = &self.functions["attention_hfq8_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10273,6 +10541,7 @@ impl Gpu {
         &mut self, dst_vals: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
         pos_buf: &DeviceBuffer, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_int8", kernels::KV_CACHE_WRITE_INT8_SRC, "kv_cache_write_int8")?;
         let func = &self.functions["kv_cache_write_int8"];
         let mut dv = dst_vals.buf.as_ptr(); let mut ds = dst_scales.buf.as_ptr();
@@ -10294,6 +10563,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_int8_kv", kernels::ATTENTION_INT8_KV_SRC, "attention_int8_kv")?;
         let func = &self.functions["attention_int8_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10323,6 +10593,7 @@ impl Gpu {
         &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
         seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_causal_batched", kernels::ATTENTION_CAUSAL_BATCHED_SRC, "attention_causal_batched")?;
         let func = &self.functions["attention_causal_batched"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10349,6 +10620,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q8_0_batched", kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC, "kv_cache_write_q8_0_batched")?;
         let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -10376,6 +10648,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
         let d = dst.buf.as_ptr();
         let s = src.buf.as_ptr();
@@ -10429,6 +10702,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_q8_0_kv_batched_masked(
             q, k_cache, v_cache, out, positions,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size,
@@ -10467,6 +10741,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "attention_q8_0_kv_batched",
             kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
@@ -10542,6 +10817,7 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
@@ -10653,6 +10929,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // K: rotated 4-bit
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens4",
@@ -10698,6 +10975,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens3",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC,
@@ -10925,6 +11203,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.launch_asym_k_batched(
             "kv_cache_write_asym_k_givens4_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC,
@@ -10943,6 +11222,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.launch_asym_k_batched(
             "kv_cache_write_asym_k_givens2_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC,
@@ -10963,6 +11243,7 @@ impl Gpu {
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_asym4_batched_masked(
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
@@ -10986,6 +11267,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_asym4_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
@@ -11006,6 +11288,7 @@ impl Gpu {
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_asym2_tile_batched",
             kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC,
@@ -11025,6 +11308,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // K: batched 3-bit rotated write.
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens3_batched",
@@ -11082,6 +11366,7 @@ impl Gpu {
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_asym3_batched_masked(
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
@@ -11104,6 +11389,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
             kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
@@ -11123,6 +11409,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
@@ -11215,6 +11502,7 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens2",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC,
@@ -11258,6 +11546,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
@@ -11353,6 +11642,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
@@ -11444,6 +11734,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_q8_0_kv", kernels::ATTENTION_Q8_0_KV_SRC, "attention_q8_0_kv")?;
         let func = &self.functions["attention_q8_0_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -11487,6 +11778,7 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         cycle_counts: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_q8_0_kv_timed", kernels::ATTENTION_Q8_0_KV_TIMED_SRC, "attention_q8_0_kv_timed")?;
         let func = &self.functions["attention_q8_0_kv_timed"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -11540,6 +11832,7 @@ impl Gpu {
         p_q: f32,
         seq_len: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "triattn_score_q8",
             kernels::TRIATTN_SCORE_Q8_SRC,
@@ -11598,6 +11891,7 @@ impl Gpu {
         p_q: f32,
         seq_len: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel(
             "triattn_score_asym2",
             kernels::TRIATTN_SCORE_ASYM2_SRC,
@@ -11660,6 +11954,7 @@ impl Gpu {
         p_q: f32,
         seq_len: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel(
             "triattn_score_asym4",
             kernels::TRIATTN_SCORE_ASYM4_SRC,
@@ -11723,6 +12018,7 @@ impl Gpu {
         p_q: f32,
         seq_len: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel(
             "triattn_score_asym3",
             kernels::TRIATTN_SCORE_ASYM3_SRC,
@@ -11781,6 +12077,7 @@ impl Gpu {
         bytes_per_pos: usize,
         budget: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "kv_compact_gather",
             kernels::KV_COMPACT_GATHER_SRC,
@@ -11834,6 +12131,7 @@ impl Gpu {
         m: usize,
         budget: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "kv_fold_q8",
             kernels::KV_FOLD_Q8_SRC,
@@ -11879,6 +12177,7 @@ impl Gpu {
         src_indices: &GpuTensor, src_weights: &GpuTensor,
         n_kv: usize, head_dim: usize, m: usize, budget: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel("kv_fold_asym3", kernels::KV_FOLD_ASYM3_SRC, "kv_fold_asym3")?;
         let func = &self.functions["kv_fold_asym3"];
         let mut sp = src.buf.as_ptr();
@@ -11912,6 +12211,7 @@ impl Gpu {
         src_indices: &GpuTensor, src_weights: &GpuTensor,
         n_kv: usize, head_dim: usize, m: usize, budget: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel("kv_fold_asym4", kernels::KV_FOLD_ASYM4_SRC, "kv_fold_asym4")?;
         let func = &self.functions["kv_fold_asym4"];
         let mut sp = src.buf.as_ptr();
@@ -11945,6 +12245,7 @@ impl Gpu {
         src_indices: &GpuTensor, src_weights: &GpuTensor,
         n_kv: usize, head_dim: usize, m: usize, budget: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_givens4_kernel("kv_fold_asym2", kernels::KV_FOLD_ASYM2_SRC, "kv_fold_asym2")?;
         let func = &self.functions["kv_fold_asym2"];
         let mut sp = src.buf.as_ptr();
@@ -11976,6 +12277,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q8", kernels::KV_CACHE_WRITE_Q8_SRC, "kv_cache_write_q8")?;
         let func = &self.functions["kv_cache_write_q8"];
         let mut d = dst.buf.as_ptr();
@@ -11999,6 +12301,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_q8kv", kernels::ATTENTION_Q8KV_SRC, "attention_q8kv")?;
         let func = &self.functions["attention_q8kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -12024,6 +12327,7 @@ impl Gpu {
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q4", kernels::KV_CACHE_WRITE_Q4_SRC, "kv_cache_write_q4")?;
         let func = &self.functions["kv_cache_write_q4"];
         let mut d = dst.buf.as_ptr();
@@ -12047,6 +12351,7 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_q4kv", kernels::ATTENTION_Q4KV_SRC, "attention_q4kv")?;
         let func = &self.functions["attention_q4kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -12080,6 +12385,7 @@ impl Gpu {
         pos_buf: &DeviceBuffer,
         kv_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("kv_cache_write", kernels::KV_CACHE_WRITE_SRC, "kv_cache_write")?;
         let func = &self.functions["kv_cache_write"];
 
@@ -12124,6 +12430,7 @@ impl Gpu {
         repeat_window: usize,
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
+        self.bind_thread()?;
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
 
@@ -12184,6 +12491,7 @@ impl Gpu {
         repeat_window: usize,
         repeat_penalty: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
 
@@ -12235,6 +12543,7 @@ impl Gpu {
         &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")?;
         let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
@@ -12276,6 +12585,7 @@ impl Gpu {
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize,
         freq_base: f32, batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("rope_partial_interleaved_batched",
             kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
             "rope_partial_interleaved_batched_f32")?;
@@ -12339,6 +12649,7 @@ impl Gpu {
         ratio: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("repeat_interleave_qk", kernels::REPEAT_INTERLEAVE_QK_SRC, "repeat_interleave_qk_f32")?;
         let qsp = q_src.buf.as_ptr();
         let ksp = k_src.buf.as_ptr();
@@ -12384,6 +12695,7 @@ impl Gpu {
         q_dst: &GpuTensor, k_dst: &GpuTensor,
         n_key_heads: usize, ratio: usize, head_dim: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, "repeat_interleave_qk_f32_batched")?;
         let mut qsp = q_src.buf.as_ptr();
         let mut ksp = k_src.buf.as_ptr();
@@ -12428,6 +12740,7 @@ impl Gpu {
     /// Replaces per-head memcpy loop (n_heads × 2 ioctls → 1 dispatch).
     pub fn deinterleave_f32(&mut self, interleaved: &GpuTensor, out_a: &GpuTensor, out_b: &GpuTensor,
                             n_heads: usize, head_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("deinterleave", kernels::DEINTERLEAVE_SRC, "deinterleave_f32")?;
         let inp = interleaved.buf.as_ptr();
         let ap = out_a.buf.as_ptr();
@@ -12466,6 +12779,7 @@ impl Gpu {
     /// batched prefill path.
     pub fn deinterleave_f32_batched(&mut self, interleaved: &GpuTensor, out_q: &GpuTensor, out_gate: &GpuTensor,
                                     n_heads: usize, head_dim: usize, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("deinterleave_batched", kernels::DEINTERLEAVE_BATCHED_SRC, "deinterleave_f32_batched")?;
         let mut inp = interleaved.buf.as_ptr();
         let mut qp = out_q.buf.as_ptr();
@@ -12502,6 +12816,7 @@ impl Gpu {
 
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;
         let func = &self.functions["sigmoid_f32"];
         let mut xp = x.buf.as_ptr();
@@ -12521,6 +12836,7 @@ impl Gpu {
     /// Softplus activation, in-place.
     #[cfg(feature = "deltanet")]
     pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
         let func = &self.functions["softplus_f32"];
         let mut xp = x.buf.as_ptr();
@@ -12536,6 +12852,7 @@ impl Gpu {
     /// L2 normalization per head, in-place. One warp per head.
     #[cfg(feature = "deltanet")]
     pub fn l2_norm_f32(&mut self, x: &GpuTensor, n_heads: usize, head_dim: usize, eps: f32) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("l2_norm", kernels::L2_NORM_SRC, "l2_norm_f32")?;
         let func = &self.functions["l2_norm_f32"];
         let mut xp = x.buf.as_ptr();
@@ -12560,6 +12877,7 @@ impl Gpu {
         out: &GpuTensor,
         gate: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("sigmoid_mul", kernels::SIGMOID_MUL_SRC, "sigmoid_mul_f32")?;
         let mut op = out.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
@@ -12601,6 +12919,7 @@ impl Gpu {
         topk_buf: &GpuTensor,   // DType::F32 shape [2048] = 8192 bytes
         vocab_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("topk_logits", kernels::TOPK_LOGITS_SRC, "topk_logits_f32")?;
         let func = &self.functions["topk_logits_f32"];
         let mut lp = logits.buf.as_ptr();
@@ -12636,6 +12955,7 @@ impl Gpu {
         k: usize,
         b: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(k >= 1 && k <= 8, "topk_logsumexp_batched: K={} must be in [1,8]", k);
         self.ensure_kernel(
             "topk_logsumexp_batched",
@@ -12685,6 +13005,7 @@ impl Gpu {
         a_log: &GpuTensor,
         n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "fused_sigmoid_alpha_gate",
             kernels::FUSED_SIGMOID_ALPHA_GATE_SRC,
@@ -12730,6 +13051,7 @@ impl Gpu {
         n: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "fused_sigmoid_alpha_gate",
             kernels::FUSED_SIGMOID_ALPHA_GATE_SRC,
@@ -12782,6 +13104,7 @@ impl Gpu {
         q_scale: f32,
         eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "fused_qk_l2_norm_scale",
             kernels::FUSED_QK_L2_NORM_SCALE_SRC,
@@ -12830,6 +13153,7 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "fused_qk_l2_norm_scale",
             kernels::FUSED_QK_L2_NORM_SCALE_SRC,
@@ -12875,6 +13199,7 @@ impl Gpu {
         &mut self, output: &GpuTensor, input: &GpuTensor, weight: &GpuTensor,
         state: &GpuTensor, n_channels: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("conv1d_decode", kernels::CONV1D_DECODE_SRC, "conv1d_decode_f32")?;
         let func = &self.functions["conv1d_decode_f32"];
         let mut op = output.buf.as_ptr();
@@ -12898,6 +13223,7 @@ impl Gpu {
         &mut self, x: &GpuTensor, z: &GpuTensor, weight: &GpuTensor,
         out: &GpuTensor, n_heads: usize, head_dim: usize, eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
         let xp = x.buf.as_ptr();
         let zp = z.buf.as_ptr();
@@ -12936,6 +13262,7 @@ impl Gpu {
         n_heads: usize, head_dim: usize, eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
         let mut xp = x.buf.as_ptr();
         let mut zp = z.buf.as_ptr();
@@ -12978,6 +13305,7 @@ impl Gpu {
         state: &GpuTensor, output: &GpuTensor,
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")?;
         let func = &self.functions["gated_delta_net_f32"];
         let mut qp = q.buf.as_ptr();
@@ -13010,6 +13338,7 @@ impl Gpu {
         s_q8: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
@@ -13080,6 +13409,7 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
 
         let n_tiles = (128 / 4) as u32;
@@ -13167,6 +13497,7 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gated_delta_net_q8_tree",
             kernels::GATED_DELTA_NET_Q8_TREE_SRC,
@@ -13239,6 +13570,7 @@ impl Gpu {
         s_q4: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gated_delta_net_q4", kernels::GATED_DELTA_NET_Q4_SRC, "gated_delta_net_q4")?;
         let func = &self.functions["gated_delta_net_q4"];
         let mut qp = q.buf.as_ptr();
@@ -13269,6 +13601,7 @@ impl Gpu {
     pub fn alpha_gate_f32(
         &mut self, alpha: &GpuTensor, dt_bias: &GpuTensor, a_log: &GpuTensor, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("alpha_gate", kernels::ALPHA_GATE_SRC, "alpha_gate_f32")?;
         let func = &self.functions["alpha_gate_f32"];
         let mut ap = alpha.buf.as_ptr();
@@ -13291,6 +13624,7 @@ impl Gpu {
     /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
     #[cfg(feature = "deltanet")]
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
         let func = &self.functions["scale_f32"];
         let n = x.numel();
@@ -13316,6 +13650,7 @@ impl Gpu {
     pub fn scaled_add_inplace_cpu_scalar_f32(
         &mut self, y: &GpuTensor, x: &GpuTensor, c: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "scaled_add_inplace",
             kernels::SCALED_ADD_INPLACE_SRC,
@@ -13354,6 +13689,7 @@ impl Gpu {
     pub fn scaled_add_inplace_gpu_scalar_f32(
         &mut self, y: &GpuTensor, x: &GpuTensor, c_buf: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "scaled_add_inplace",
             kernels::SCALED_ADD_INPLACE_SRC,
@@ -13390,6 +13726,7 @@ impl Gpu {
         &mut self, output: &GpuTensor, input: &GpuTensor, weight: &GpuTensor,
         state: &GpuTensor, n_channels: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("conv1d_silu", kernels::CONV1D_SILU_SRC, "conv1d_silu_f32")?;
         let func = &self.functions["conv1d_silu_f32"];
         let mut op = output.buf.as_ptr();
@@ -13427,6 +13764,7 @@ impl Gpu {
         k_dim: usize,
         v_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.conv1d_silu_split_f32_n(q_out, k_out, v_out, input, weight, state, k_dim, v_dim, 1)
     }
 
@@ -13448,6 +13786,7 @@ impl Gpu {
         v_dim: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "conv1d_silu_split",
             kernels::CONV1D_SILU_SPLIT_SRC,
@@ -13518,6 +13857,7 @@ impl Gpu {
         v_dim: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "conv1d_silu_split_tree",
             kernels::CONV1D_SILU_SPLIT_TREE_SRC,
@@ -13571,6 +13911,7 @@ impl Gpu {
         &mut self, logits: &GpuTensor, target_buf: &DeviceBuffer, loss_buf: &GpuTensor,
         vocab_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("cross_entropy_loss", kernels::CROSS_ENTROPY_LOSS_SRC, "cross_entropy_loss")?;
         let func = &self.functions["cross_entropy_loss"];
         let mut lp = logits.buf.as_ptr();
@@ -13593,6 +13934,7 @@ impl Gpu {
         &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_f16", kernels::GEMM_F16_SRC, "gemm_f16")?;
         let func = &self.functions["gemm_f16"];
         let mut wp = w.buf.as_ptr();
@@ -13619,6 +13961,7 @@ impl Gpu {
         &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_f16_wmma", kernels::GEMM_F16_WMMA_SRC, "gemm_f16_wmma")?;
         let func = &self.functions["gemm_f16_wmma"];
         let mut wp = w.buf.as_ptr();
@@ -13646,6 +13989,7 @@ impl Gpu {
         &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_f16_tiled", kernels::GEMM_F16_TILED_SRC, "gemm_f16_tiled")?;
         let func = &self.functions["gemm_f16_tiled"];
         let mut wp = w.buf.as_ptr();
@@ -13673,6 +14017,7 @@ impl Gpu {
         &mut self, w: &GpuTensor, x: &GpuTensor, bias: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_f16_bias", kernels::GEMM_F16_BIAS_SRC, "gemm_f16_bias")?;
         let func = &self.functions["gemm_f16_bias"];
         let mut wp = w.buf.as_ptr();
@@ -13700,6 +14045,7 @@ impl Gpu {
         &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemm_f32_batched", kernels::GEMM_F32_SRC, "gemm_f32_batched")?;
         let func = &self.functions["gemm_f32_batched"];
         let mut ap = a.buf.as_ptr();
@@ -13724,6 +14070,7 @@ impl Gpu {
         &mut self, x: &GpuTensor, gamma: &GpuTensor, beta: &GpuTensor,
         out: &GpuTensor, batch: usize, n: usize, eps: f32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("layernorm_f32", kernels::LAYERNORM_SRC, "layernorm_f32")?;
         let func = &self.functions["layernorm_f32"];
         let mut xp = x.buf.as_ptr();
@@ -13749,6 +14096,7 @@ impl Gpu {
 
     /// GELU tanh approximation (in-place capable if x == out)
     pub fn gelu_tanh_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gelu_tanh_f32", kernels::GELU_TANH_SRC, "gelu_tanh_f32")?;
         let func = &self.functions["gelu_tanh_f32"];
         let mut xp = x.buf.as_ptr();
@@ -13765,6 +14113,7 @@ impl Gpu {
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
     pub fn bias_add_f32(&mut self, x: &GpuTensor, bias: &GpuTensor, batch: usize, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("bias_add_f32", kernels::BIAS_ADD_SRC, "bias_add_f32")?;
         let func = &self.functions["bias_add_f32"];
         let mut xp = x.buf.as_ptr();
@@ -13786,6 +14135,7 @@ impl Gpu {
     pub fn transpose_f32(
         &mut self, src: &GpuTensor, dst: &GpuTensor, rows: usize, cols: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("transpose_f32", kernels::TRANSPOSE_SRC, "transpose_f32")?;
         let func = &self.functions["transpose_f32"];
         let mut sp = src.buf.as_ptr();
@@ -13808,6 +14158,7 @@ impl Gpu {
         &mut self, qkv: &GpuTensor, out: &GpuTensor,
         n: usize, hidden: usize, num_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("vit_attention_f32", kernels::VIT_ATTENTION_SRC, "vit_attention_f32")?;
         let func = &self.functions["vit_attention_f32"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -13841,6 +14192,7 @@ impl Gpu {
         &mut self, qkv: &GpuTensor, out: &GpuTensor,
         n: usize, hidden: usize, num_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("vit_attention_opt", kernels::VIT_ATTENTION_OPT_SRC, "vit_attention_opt")?;
         let func = &self.functions["vit_attention_opt"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -13883,6 +14235,7 @@ impl Gpu {
         q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
         b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("attention_dflash_f32", kernels::ATTENTION_DFLASH_SRC, "attention_dflash_f32")?;
         let func = &self.functions["attention_dflash_f32"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -13932,6 +14285,7 @@ impl Gpu {
     /// weight quantization and KV cache type. Runs hipcc in parallel.
     #[cfg(feature = "deltanet")]
     pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
         // asym kernels #include "turbo_common.h" + "givens_common.h"; the
         // runtime dispatch path (see ensure_givens4_kernel) prepends the
         // header bodies and strips the #includes. We mirror that exactly so
@@ -14263,6 +14617,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(head_dim % 32 == 0, "head_dim must be a multiple of 32 for Q8 KV cache");
         assert!(n_blocks > 0 && block_size > 0 && n_pos > 0);
         assert!(last_pos < n_pos, "last_pos {last_pos} >= n_pos {n_pos}");
@@ -14311,6 +14666,7 @@ impl Gpu {
 
     /// Profile all compiled kernels: hardware caps + ISA metadata + occupancy.
     pub fn profile(&self) -> (crate::profiler::GpuCapability, Vec<crate::profiler::KernelProfile>) {
+        self.bind_thread_or_warn();
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
         let cu_hint = self.hip
             .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
@@ -14324,5 +14680,17 @@ impl Gpu {
             self.compiler.compiled_kernels(),
             cu_hint,
         )
+    }
+}
+
+impl Drop for Gpu {
+    /// Defensive: bind owning device before any future per-field `Drop`
+    /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
+    /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        self.bind_thread_or_warn();
     }
 }
