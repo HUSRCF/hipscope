@@ -75,12 +75,12 @@ if [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in \
-        crates/engine/src/pflash.rs \
-        crates/engine/src/qwen35.rs \
-        crates/engine/src/llama.rs \
-        crates/engine/src/hfq.rs \
-        crates/engine/src/tokenizer.rs \
-        crates/engine/examples/pflash_niah_bench.rs \
+        crates/hipfire-arch-qwen35/src/pflash.rs \
+        crates/hipfire-arch-qwen35/src/qwen35.rs \
+        crates/hipfire-runtime/src/llama.rs \
+        crates/hipfire-runtime/src/hfq.rs \
+        crates/hipfire-runtime/src/tokenizer.rs \
+        crates/hipfire-runtime/examples/pflash_niah_bench.rs \
         crates/rdna-compute/src/lib.rs \
         crates/rdna-compute/src/kernels.rs \
         crates/rdna-compute/src/dispatch.rs \
