@@ -65,7 +65,7 @@ elif [ -f target/release/examples/test_kernelsQA ]; then
     echo "    \"passed\": $PASSED,"
     echo "    \"failed\": $FAILED"
 else
-    echo '    "error": "No test binary found. Run: cargo build --release --features deltanet --example test_kernels -p engine"'
+    echo '    "error": "No test binary found. Run: cargo build --release --features deltanet --example test_kernels -p hipfire-runtime"'
 fi
 echo '  },'
 
@@ -85,7 +85,7 @@ if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then
         echo "    \"tok_s\": $SPEED,"
         echo "    \"vram_leak\": \"$LEAK\""
     else
-        echo '    "error": "No inference test binary. Run: cargo build --release --features deltanet --example test_inference -p engine"'
+        echo '    "error": "No inference test binary. Run: cargo build --release --features deltanet --example test_inference -p hipfire-runtime"'
     fi
 elif [ -n "$MODEL" ]; then
     echo "    \"error\": \"Model not found: $MODEL\""

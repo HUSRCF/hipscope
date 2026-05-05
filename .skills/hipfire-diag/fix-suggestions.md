@@ -65,7 +65,7 @@ cargo build --release --features deltanet \
   --example test_inference \
   --example infer \
   --example infer_hfq \
-  -p engine
+  -p hipfire-runtime
 ```
 
 ## OOM during inference

@@ -69,7 +69,7 @@ gfx94x matrix.
   already runs on.
 - **DFlash spec-decode tuning** — those wins come from algorithm
   changes (n-gram cache, prompt shape, draft retraining), not kernel
-  ISA work. See `crates/engine/src/dflash.rs` and the
+  ISA work. See `crates/hipfire-runtime/src/dflash.rs` and the
   `coherence-gate-dflash.sh` battery.
 
 ## Cross-references

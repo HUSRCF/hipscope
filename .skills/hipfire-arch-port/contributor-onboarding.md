@@ -44,7 +44,7 @@ If responding to a bug report (e.g. issue #54):
 ```bash
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
-cargo build --release --features deltanet -p engine --example daemon
+cargo build --release --features deltanet -p hipfire-runtime --example daemon
 ./target/release/examples/daemon
 # In another shell:
 hipfire run qwen3.5:0.8b "What is the capital of France?"
@@ -149,15 +149,15 @@ build cache and firmware shadowing are the most common false-
 positive sources). Do NOT split the diff into "add new arch" +
 "clean up dead branch" as a workaround for a regressing gate.
 
-`crates/engine/examples/test_kernels.rs`: add a test case that
-exercises your new kernel on the new arch.
+`crates/hipfire-runtime/examples/test_kernels.rs`: add a test case
+that exercises your new kernel on the new arch.
 
 ### 6. Run all three gates locally
 
 ```bash
 ./scripts/coherence-gate.sh
 ./scripts/speed-gate.sh --fast
-cargo run --release -p engine --example test_kernels
+cargo run --release -p hipfire-runtime --example test_kernels
 ```
 
 All three must pass. If channel-test fails, you've got a per-lane

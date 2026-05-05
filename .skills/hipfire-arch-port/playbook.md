@@ -192,8 +192,8 @@ A new arch port is merge-ready ONLY when:
 
 1. **Channel-test passes** on real hardware (the contributor's
    target arch). This is correctness — `cargo run --release -p
-   engine --example test_kernels` (or the QA variant) emits "OK"
-   for every dispatched kernel on the new arch.
+   hipfire-runtime --example test_kernels` (or the QA variant)
+   emits "OK" for every dispatched kernel on the new arch.
 2. **Coherence-gate passes** (`./scripts/coherence-gate.sh`). No
    panics, no zero-tokens, no timeouts on the canonical
    small-prompt battery.

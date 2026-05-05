@@ -17,7 +17,7 @@ Channel-test caught it; the other two gates didn't.
 
 ### What it tests
 
-`crates/engine/examples/test_kernels.rs` (and `test_kernelsQA.rs`)
+`crates/hipfire-runtime/examples/test_kernels.rs` (and `test_kernelsQA.rs`)
 runs each registered GPU kernel through a battery of small, golden-
 output cases. Inputs are deterministic; outputs are compared
 element-wise against a CPU reference within a tight tolerance.
@@ -28,7 +28,7 @@ On the target hardware, with a fresh hipfire checkout:
 
 ```bash
 cd hipfire
-cargo build --release --features deltanet -p engine \
+cargo build --release --features deltanet -p hipfire-runtime \
   --example test_kernels --example test_kernelsQA
 
 ./target/release/examples/test_kernels        # smoke battery

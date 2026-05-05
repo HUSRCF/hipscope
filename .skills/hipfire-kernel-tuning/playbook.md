@@ -169,13 +169,13 @@ manually:
 git checkout <baseline-sha>
 cargo clean -p rdna-compute
 rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p engine --example bench_qwen35_mq4
+cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
 ./scripts/speed-gate.sh --fast > before.log
 
 git checkout <candidate-sha>
 cargo clean -p rdna-compute
 rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p engine --example bench_qwen35_mq4
+cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
 ./scripts/speed-gate.sh --fast > after.log
 
 diff before.log after.log
