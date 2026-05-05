@@ -31,7 +31,16 @@ set -e
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
 # Hotspots that can affect forward-pass output or speed.
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|llama\.rs|qwen35\.rs|gemm|wmma'
+#
+# Updated for post-0.1.20-a modular topology (PR 7+):
+# - File-name patterns (e.g. `qwen35\.rs`) match across the new arch
+#   crate locations (e.g. `crates/hipfire-arch-qwen35/src/qwen35.rs`).
+# - `arch\.rs` matches the Architecture trait + per-arch impls
+#   (`crates/hipfire-runtime/src/arch.rs`, `crates/hipfire-arch-*/src/arch.rs`).
+# - The 4 PR1-4 modules (loop_guard, sampler, prompt_frame, eos_filter)
+#   are all hot-path; touching any of them affects every model load.
+# - `gemma4\.rs` covered for when the gemma branch forward-ports.
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs'
 
 if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
@@ -76,8 +85,12 @@ echo
 # max_freq > 0.50 in first 128 tokens pre-EOT). Skips silently if 27B
 # target/draft aren't installed.
 SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write'
+# File-name alternation tracks the spec-decode pieces of the runtime
+# AND the qwen35 arch crate (post-PR-8, speculative.rs + pflash.rs
+# moved into crates/hipfire-arch-qwen35/src/). dflash.rs + ddtree.rs
+# stay in crates/hipfire-runtime/src/. File-name matches catch both.
 if echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
-   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
+   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|pflash\.rs'; then
     echo "=== DFlash/DDTree Coherence Battery ==="
     echo "Spec-decode path changed. Running dflash coherence battery (~3 min)..."
     echo

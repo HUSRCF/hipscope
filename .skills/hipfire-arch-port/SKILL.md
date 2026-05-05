@@ -5,9 +5,18 @@ description: Port hipfire compute kernels to a new RDNA / CDNA architecture (gfx
 
 # hipfire-arch-port
 
-Skill for adding a new GPU arch to hipfire (or fixing arch-specific
+Skill for adding a new **GPU arch** to hipfire (or fixing arch-specific
 codegen / dispatch issues). Most of the mistakes prior arch ports
 have hit are documented here so you don't repeat them.
+
+> **Note (post-0.1.20-a):** This skill is about **RDNA/CDNA hardware
+> archs** (gfx1100, gfx1201, gfx94x, etc.) — NOT model archs.
+> If you want to add a new MODEL family (Llama-3, Mixtral, etc.) you
+> implement the `Architecture` trait in your own crate. See
+> `crates/hipfire-arch-toy/` as a reference template and
+> `CONTRIBUTING.md`'s "Crate topology" section. RDNA arch routing
+> stays in `crates/rdna-compute/src/dispatch.rs` regardless of model
+> arch — they're orthogonal.
 
 ## When to use
 
