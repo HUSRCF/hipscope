@@ -12,7 +12,7 @@ fn main() { eprintln!("Build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_runtime::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::path::Path;
     use std::time::Instant;
 
@@ -45,7 +45,7 @@ fn main() {
 
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
     let mut hidden_rb = if with_extract {
-        Some(hipfire_runtime::speculative::HiddenStateRingBuffer::new(
+        Some(hipfire_arch_qwen35::speculative::HiddenStateRingBuffer::new(
             &mut gpu, config.n_layers, 5, config.dim, 32, 32,
         ).unwrap())
     } else {

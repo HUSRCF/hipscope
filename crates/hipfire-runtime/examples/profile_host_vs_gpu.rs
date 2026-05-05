@@ -27,7 +27,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_runtime::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::path::Path;
     use std::time::Instant;
 

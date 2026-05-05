@@ -16,7 +16,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
-    use hipfire_runtime::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, TriAttnCenters};
     use rdna_compute::{DType, Gpu};

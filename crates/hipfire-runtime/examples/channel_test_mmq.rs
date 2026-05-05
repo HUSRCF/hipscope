@@ -75,7 +75,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35;
+    use hipfire_arch_qwen35::qwen35;
     use std::path::Path;
 
     // ── CLI parsing ──────────────────────────────────────────────────────
@@ -312,10 +312,10 @@ fn synth_activations(batch_size: usize, k: usize, seed: u64) -> Vec<f32> {
 
 #[cfg(feature = "deltanet")]
 fn get_weight_for_site<'a>(
-    layer: &'a hipfire_runtime::qwen35::LayerWeights,
+    layer: &'a hipfire_arch_qwen35::qwen35::LayerWeights,
     site_name: &str,
 ) -> Option<&'a hipfire_runtime::llama::WeightTensor> {
-    use hipfire_runtime::qwen35::LayerWeights;
+    use hipfire_arch_qwen35::qwen35::LayerWeights;
     match layer {
         LayerWeights::DeltaNet(l) => match site_name {
             "qkvza.qkv"   => Some(&l.wqkv),
@@ -357,8 +357,8 @@ fn get_weight_for_site<'a>(
 
 /// Return the list of site names applicable to a given layer variant.
 #[cfg(feature = "deltanet")]
-fn sites_for_layer(layer: &hipfire_runtime::qwen35::LayerWeights) -> &'static [&'static str] {
-    use hipfire_runtime::qwen35::LayerWeights;
+fn sites_for_layer(layer: &hipfire_arch_qwen35::qwen35::LayerWeights) -> &'static [&'static str] {
+    use hipfire_arch_qwen35::qwen35::LayerWeights;
     match layer {
         LayerWeights::DeltaNet(_) => &[
             "qkvza.qkv",
@@ -537,8 +537,8 @@ fn seed_for_site(site_name: &str) -> u64 {
 #[cfg(feature = "deltanet")]
 fn run_site_scan(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_runtime::qwen35::Qwen35Weights,
-    _config: &hipfire_runtime::qwen35::Qwen35Config,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
 ) {
@@ -606,8 +606,8 @@ fn run_site_scan(
 #[cfg(feature = "deltanet")]
 fn run_channel_map(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_runtime::qwen35::Qwen35Weights,
-    _config: &hipfire_runtime::qwen35::Qwen35Config,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
     site_name: &str,
@@ -676,8 +676,8 @@ fn run_channel_map(
 #[cfg(feature = "deltanet")]
 fn run_layer_sweep(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_runtime::qwen35::Qwen35Weights,
-    _config: &hipfire_runtime::qwen35::Qwen35Config,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
     site_name: &str,
@@ -744,10 +744,10 @@ fn run_layer_sweep(
 #[cfg(feature = "deltanet")]
 fn run_screen(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_runtime::qwen35::Qwen35Weights,
-    _config: &hipfire_runtime::qwen35::Qwen35Config,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
 ) {
-    use hipfire_runtime::qwen35::LayerWeights;
+    use hipfire_arch_qwen35::qwen35::LayerWeights;
 
     eprintln!("\n=== screen: running mmq_screen_weight on all weight matrices ===");
     eprintln!("threshold={:.4}", gpu.mmq_screen_threshold);

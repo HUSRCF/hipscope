@@ -12,7 +12,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35::{self, LayerWeights};
+    use hipfire_arch_qwen35::qwen35::{self, LayerWeights};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();

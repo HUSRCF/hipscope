@@ -22,8 +22,8 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_runtime::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
-use hipfire_runtime::qwen35::{self, DeltaNetState};
+use hipfire_arch_qwen35::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;

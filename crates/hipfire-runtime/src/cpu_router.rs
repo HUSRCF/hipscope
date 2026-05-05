@@ -50,7 +50,7 @@ impl CpuRouter {
     /// Construct from already-dequantized F32 weights.
     /// The loader is responsible for converting from the HFQ on-disk quant
     /// (typically MQ4G256) to F32 — there's nothing CPU-paging-specific about
-    /// that step, so it lives in [`crate::qwen35`] alongside other tensor
+    /// that step, so it lives in `hipfire_arch_qwen35::qwen35` alongside other tensor
     /// dequant helpers.
     pub fn from_f32_weights(layer: u16, weights: Vec<f32>, num_experts: usize, hidden: usize) -> Self {
         debug_assert_eq!(weights.len(), num_experts * hidden);

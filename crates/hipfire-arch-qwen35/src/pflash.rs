@@ -12,9 +12,9 @@
 //! returns `Bypass` regardless of mode. Drafter loading + scoring +
 //! selection land in subsequent phases.
 
-use crate::hfq::{self, HfqFile};
-use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
-use crate::tokenizer::Tokenizer;
+use hipfire_runtime::hfq::{self, HfqFile};
+use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::tokenizer::Tokenizer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
@@ -575,7 +575,7 @@ fn dequant_q8_kv_position(
         for blk in 0..blocks_per_head {
             let bb = &head_bytes[blk * 34..(blk + 1) * 34];
             let scale_bits = u16::from_le_bytes([bb[0], bb[1]]);
-            let scale = crate::llama::f16_to_f32(scale_bits);
+            let scale = hipfire_runtime::llama::f16_to_f32(scale_bits);
             for j in 0..32 {
                 let v = bb[2 + j] as i8;
                 head_out[blk * 32 + j] = (v as f32) * scale;

@@ -18,3 +18,11 @@ serde_json = "1"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rayon = "1"
+
+# Examples in this crate (daemon, infer_qwen35, etc.) consume the
+# qwen35 arch crate. The runtime library itself does NOT depend on
+# any arch crate (preserves the `arch-* → runtime` one-way graph).
+# This is a dev-only dep for examples; it does not appear in the
+# library's public dep tree.
+[dev-dependencies]
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }

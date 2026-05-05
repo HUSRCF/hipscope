@@ -92,18 +92,18 @@ fn run(path: &str) -> Result<String, Outcome> {
 
     #[cfg(feature = "deltanet")]
     {
-        let q35_config = hipfire_runtime::qwen35::config_from_hfq(&hfq)
+        let q35_config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq)
             .ok_or_else(|| Outcome::Fail("failed to parse qwen35 config".to_string()))?;
         let linear_layers = q35_config
             .layer_types
             .iter()
-            .filter(|t| matches!(t, hipfire_runtime::qwen35::LayerType::LinearAttention))
+            .filter(|t| matches!(t, hipfire_arch_qwen35::qwen35::LayerType::LinearAttention))
             .count();
         let full_layers = q35_config.n_layers.saturating_sub(linear_layers);
         let mut gpu = rdna_compute::Gpu::init()
             .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
         let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hipfire_runtime::qwen35::load_weights(&hfq, &q35_config, &mut gpu)
+            hipfire_arch_qwen35::qwen35::load_weights(&hfq, &q35_config, &mut gpu)
         }))
         .map_err(|panic| Outcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
         .map_err(|e| Outcome::Fail(format!("weight load failed: {e}")))?;

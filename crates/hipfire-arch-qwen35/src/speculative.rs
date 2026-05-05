@@ -12,11 +12,11 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
-use crate::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
-use crate::hfq::HfqFile;
-use crate::llama::{self, KvCache};
+use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use crate::tokenizer::Tokenizer;
+use hipfire_runtime::tokenizer::Tokenizer;
 use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
@@ -1927,7 +1927,7 @@ fn verify_dflash_block_inner(
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
-            crate::llama::EmbeddingFormat::HFQ4G256 | crate::llama::EmbeddingFormat::Q8_0,
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
         && verify_scratch.prefill_batch.is_some();
 
@@ -2509,16 +2509,16 @@ pub fn spec_step_dflash(
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
-            crate::llama::EmbeddingFormat::HFQ4G256 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
                 gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::HFQ4G128 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::Q8_0 => {
+            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::F32 => {
+            hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("dflash: unsupported target embedding format for noise lookup"),
@@ -3200,16 +3200,16 @@ fn run_dflash_draft_for_logits(
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
-            crate::llama::EmbeddingFormat::HFQ4G256 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
                 gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::HFQ4G128 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::Q8_0 => {
+            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::F32 => {
+            hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("ddtree draft: unsupported target embedding format"),
@@ -3348,16 +3348,16 @@ fn run_dflash_draft_for_topk_gpu(
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
-            crate::llama::EmbeddingFormat::HFQ4G256 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
                 gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::HFQ4G128 => {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::Q8_0 => {
+            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
-            crate::llama::EmbeddingFormat::F32 => {
+            hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("ddtree draft: unsupported target embedding format"),
@@ -3471,7 +3471,7 @@ fn run_dflash_draft_for_topk_gpu(
 /// where each inner Vec is the sequence of node indices from the first
 /// child-of-root (depth 1) down to a leaf. Leaves are nodes with no children
 /// in the tree; if the tree is empty (N=0) this returns a single empty path.
-fn enumerate_paths(tree: &crate::ddtree::DdTree) -> Vec<Vec<usize>> {
+fn enumerate_paths(tree: &hipfire_runtime::ddtree::DdTree) -> Vec<Vec<usize>> {
     if tree.nodes.is_empty() {
         return vec![Vec::new()];
     }
@@ -3571,14 +3571,14 @@ pub fn spec_step_ddtree(
 
     // ── 2. Per-position top-K + log-normalize (CPU) ───────────────────────
     let (top_tokens, top_log_probs) =
-        crate::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
+        hipfire_runtime::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
     // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner: stop
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
         &top_tokens,
         &top_log_probs,
         b - 1,
@@ -3699,7 +3699,7 @@ pub fn spec_step_ddtree(
 
     // ── 6. Greedy walk: longest accepted path + bonus ─────────────────────
     let (accepted_node_indices, bonus_token) =
-        crate::ddtree::follow_verified_tree(&tree, &posterior);
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &posterior);
     let accept_len = accepted_node_indices.len();
 
     // ── 7. Build committed + drafted sequences ────────────────────────────
@@ -3896,7 +3896,7 @@ pub fn spec_step_ddtree_batched(
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
         &top_tokens,
         &top_log_probs,
         b - 1,
@@ -3929,7 +3929,7 @@ pub fn spec_step_ddtree_batched(
 
     // ── 4. Linearize the tree into (tokens, positions, mask_host, parents) ─
     let (verify_tokens, verify_positions, mask_host, parent_host) =
-        crate::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
+        hipfire_runtime::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
     let big_n = verify_tokens.len();
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
     debug_assert_eq!(parent_host.len(), big_n);
@@ -4032,7 +4032,7 @@ pub fn spec_step_ddtree_batched(
 
     // ── 8. Greedy walk: longest accepted path + bonus ─────────────────────
     let (accepted_node_indices, bonus_token) =
-        crate::ddtree::follow_verified_tree(&tree, &posterior);
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &posterior);
     let accept_len = accepted_node_indices.len();
 
     // ── 9. Build committed + drafted sequences ────────────────────────────
@@ -4450,7 +4450,7 @@ pub fn spec_step_ddtree_path_c(
     )?;
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
-    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
         &top_tokens,
         &top_log_probs,
         b - 1,
@@ -4466,7 +4466,7 @@ pub fn spec_step_ddtree_path_c(
     let main_path: Vec<usize> = if tree.nodes.is_empty() {
         Vec::new()
     } else {
-        crate::ddtree::select_main_path(&tree)
+        hipfire_runtime::ddtree::select_main_path(&tree)
     };
     if main_path.is_empty() {
         target_snap.save_from(&target.dn_state, gpu)?;
@@ -4575,7 +4575,7 @@ pub fn spec_step_ddtree_path_c(
         snaps.main_end_snap.save_from(&target.dn_state, gpu)?;
 
         // Find the unique candidate branch.
-        let branches = crate::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
+        let branches = hipfire_runtime::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
         diag_fork_sibling = branches
             .iter()
             .any(|b| b.fork_depth as usize == accepted_main);

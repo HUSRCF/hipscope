@@ -14,8 +14,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
-use hipfire_runtime::qwen35;
-use hipfire_runtime::qwen35::DeltaNetState;
+use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
 use std::path::Path;
@@ -140,7 +140,7 @@ fn main() {
         _ => llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
     };
     let mut dn_state = if std::env::var("FP32_STATE").is_ok() {
-        DeltaNetState::new_with_quant(&mut gpu, &config, hipfire_runtime::qwen35::StateQuant::FP32).unwrap()
+        DeltaNetState::new_with_quant(&mut gpu, &config, hipfire_arch_qwen35::qwen35::StateQuant::FP32).unwrap()
     } else {
         DeltaNetState::new(&mut gpu, &config).unwrap()
     };

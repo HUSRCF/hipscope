@@ -6,8 +6,8 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::qwen35;
-use hipfire_runtime::qwen35::DeltaNetState;
+use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::qwen35_vl;
 use std::io::Write;
 use std::path::Path;
@@ -285,20 +285,20 @@ fn main() {
 #[allow(dead_code)]
 fn debug_compare(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_runtime::qwen35::Qwen35Weights,
-    config: &hipfire_runtime::qwen35::Qwen35Config,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     token: u32,
     kv_cache1: &mut hipfire_runtime::llama::KvCache,
-    dn_state1: &mut hipfire_runtime::qwen35::DeltaNetState,
+    dn_state1: &mut hipfire_arch_qwen35::qwen35::DeltaNetState,
     kv_cache2: &mut hipfire_runtime::llama::KvCache,
-    dn_state2: &mut hipfire_runtime::qwen35::DeltaNetState,
-    scratch: &hipfire_runtime::qwen35::Qwen35Scratch,
+    dn_state2: &mut hipfire_arch_qwen35::qwen35::DeltaNetState,
+    scratch: &hipfire_arch_qwen35::qwen35::Qwen35Scratch,
 ) {
     // Path A: forward() 
-    let logits_a = hipfire_runtime::qwen35::forward(gpu, weights, config, token, 0, kv_cache1, dn_state1).unwrap();
+    let logits_a = hipfire_arch_qwen35::qwen35::forward(gpu, weights, config, token, 0, kv_cache1, dn_state1).unwrap();
     
     // Path B: forward_scratch()
-    hipfire_runtime::qwen35::forward_scratch(gpu, weights, config, token, 0, kv_cache2, dn_state2, scratch).unwrap();
+    hipfire_arch_qwen35::qwen35::forward_scratch(gpu, weights, config, token, 0, kv_cache2, dn_state2, scratch).unwrap();
     let logits_b = gpu.download_f32(&scratch.logits).unwrap();
     
     // Compare

@@ -3,8 +3,8 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::qwen35;
-use hipfire_runtime::qwen35::DeltaNetState;
+use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::qwen35_vl;
 use std::io::Write;
 use std::path::Path;

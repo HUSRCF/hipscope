@@ -112,6 +112,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen35"
+version = "0.1.9-alpha.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.1.9-alpha.1"
 dependencies = [
@@ -128,6 +139,7 @@ version = "0.1.9-alpha.1"
 dependencies = [
  "byteorder",
  "hip-bridge",
+ "hipfire-arch-qwen35",
  "image",
  "libc",
  "memmap2",

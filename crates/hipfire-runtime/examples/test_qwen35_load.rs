@@ -74,7 +74,7 @@ fn main() {
     // Test full weight loading
     #[cfg(feature = "deltanet")]
     {
-        use hipfire_runtime::qwen35;
+        use hipfire_arch_qwen35::qwen35;
         let q35_config = qwen35::config_from_hfq(&hfq).expect("failed to parse Qwen3.5 config");
         eprintln!("\nLoading Qwen3.5 weights...");
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");

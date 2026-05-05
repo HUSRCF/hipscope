@@ -15,9 +15,9 @@ use hipfire_runtime::hfq::HfqFile;
 #[cfg(feature = "deltanet")]
 use hipfire_runtime::llama;
 #[cfg(feature = "deltanet")]
-use hipfire_runtime::qwen35;
+use hipfire_arch_qwen35::qwen35;
 #[cfg(feature = "deltanet")]
-use hipfire_runtime::qwen35::DeltaNetState;
+use hipfire_arch_qwen35::qwen35::DeltaNetState;
 #[cfg(feature = "deltanet")]
 use hipfire_runtime::tokenizer::Tokenizer;
 #[cfg(feature = "deltanet")]

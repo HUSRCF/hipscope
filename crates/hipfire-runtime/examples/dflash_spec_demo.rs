@@ -24,8 +24,8 @@ fn main() {
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35::LayerType;
-    use hipfire_runtime::speculative::{
+    use hipfire_arch_qwen35::qwen35::LayerType;
+    use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
     use hipfire_runtime::tokenizer::Tokenizer;
@@ -409,10 +409,10 @@ fn main() {
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
-        "q8" => hipfire_runtime::speculative::KvMode::Q8,
-        "asym4" | "turbo4" => hipfire_runtime::speculative::KvMode::Asym4,
-        "asym3" | "turbo3" | "turbo" => hipfire_runtime::speculative::KvMode::Asym3,
-        "asym2" | "turbo2" => hipfire_runtime::speculative::KvMode::Asym2,
+        "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
+        "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
+        "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
+        "asym2" | "turbo2" => hipfire_arch_qwen35::speculative::KvMode::Asym2,
         other => {
             eprintln!("unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2");
             std::process::exit(1);
@@ -520,7 +520,7 @@ fn main() {
         draft_cfg.num_extract(),
         draft_cfg.hidden,
         ctx_capacity + hrb_max_block,
-        hipfire_runtime::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
+        hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
     )
     .expect("alloc hidden_rb");
 
@@ -544,7 +544,7 @@ fn main() {
     // the tape is large enough whether we run per-path DFS, batched tree,
     // or plain DFlash.
     let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
-    let mut gdn_tape = hipfire_runtime::speculative::GdnTape::new_for_config(
+    let mut gdn_tape = hipfire_arch_qwen35::speculative::GdnTape::new_for_config(
         &mut gpu, &target.config, tape_max_n,
     ).expect("alloc gdn tape");
     // DdtreeScratch: persistent attention-bias buffer for batched tree verify.
@@ -562,9 +562,9 @@ fn main() {
         kd * 2 + vd
     };
     let ddtree_n_fa_layers = target.config.layer_types.iter()
-        .filter(|t| **t == hipfire_runtime::qwen35::LayerType::FullAttention)
+        .filter(|t| **t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .count();
-    let ddtree_scratch = hipfire_runtime::speculative::DdtreeScratch::new(
+    let ddtree_scratch = hipfire_arch_qwen35::speculative::DdtreeScratch::new(
         &mut gpu,
         ddtree_budget,
         target.config.n_kv_heads,
@@ -578,7 +578,7 @@ fn main() {
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
     let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
-    let verify_scratch = hipfire_runtime::speculative::VerifyScratch::with_prefill(
+    let verify_scratch = hipfire_arch_qwen35::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
         target.config.dim,
@@ -809,7 +809,7 @@ fn main() {
     // Seeded from the prompt so multi-turn repetitions in the prompt get
     // cached. min_count gates how aggressive overrides are.
     let mut ngram_cache = if ngram {
-        let mut c = hipfire_runtime::speculative::NgramCache::new(ngram_min_count);
+        let mut c = hipfire_arch_qwen35::speculative::NgramCache::new(ngram_min_count);
         c.observe_many(&prompt_tokens);
         eprintln!(
             "ngram cache: bigrams seeded from prompt, min_count={ngram_min_count}"
@@ -820,7 +820,7 @@ fn main() {
     };
     // PLD matcher: stateless, scans (prompt ++ emitted) suffix each cycle.
     let pld_matcher = if pld_enabled {
-        let m = hipfire_runtime::speculative::PldMatcher {
+        let m = hipfire_arch_qwen35::speculative::PldMatcher {
             ngram_lens: pld_ngrams.clone(),
             max_extract: pld_max_extract,
             min_extract: pld_min_extract,
@@ -888,7 +888,7 @@ fn main() {
                 eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
                 break;
             }
-            hipfire_runtime::qwen35::forward_scratch(
+            hipfire_arch_qwen35::qwen35::forward_scratch(
                 &mut gpu,
                 &target.weights,
                 &target.config,
@@ -951,8 +951,8 @@ fn main() {
 
     // Reset Task #93 Phase B seed-oracle counters so stats reflect this run
     // only (process-cumulative counters would poison multi-run harnesses).
-    hipfire_runtime::speculative::reset_seed_oracle_stats();
-    hipfire_runtime::speculative::reset_ddtree_meta_stats();
+    hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
+    hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
 
     // Adaptive-B state: tracks current B between cycles, plus a cooldown
     // counter and a histogram for end-of-run reporting.
@@ -1536,7 +1536,7 @@ fn main() {
     );
     // DDTree meta-verifier pruner stats — only meaningful under --ddtree-*
     // with HIPFIRE_DDTREE_LOGW_CUTOFF set. Cycles == 0 on pure-DFlash runs.
-    let meta = hipfire_runtime::speculative::read_ddtree_meta_stats();
+    let meta = hipfire_arch_qwen35::speculative::read_ddtree_meta_stats();
     if meta.cycles > 0 {
         let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
         eprintln!(
@@ -1564,7 +1564,7 @@ fn main() {
     }
     // Task #93 Phase B seed-prediction oracle. Zero cycles = pure-AR or tree
     // paths that didn't invoke spec_step_dflash; skip in that case.
-    let s = hipfire_runtime::speculative::read_seed_oracle_stats();
+    let s = hipfire_arch_qwen35::speculative::read_seed_oracle_stats();
     if s.total > 0 {
         let denom = s.total as f32;
         eprintln!(

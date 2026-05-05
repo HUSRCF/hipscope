@@ -13,7 +13,7 @@ fn main() { eprintln!("Build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_runtime::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use rdna_compute::profile;
     use std::collections::BTreeMap;
     use std::path::Path;

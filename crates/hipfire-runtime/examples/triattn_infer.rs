@@ -25,7 +25,7 @@ fn main() {
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
-    use hipfire_runtime::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
     use rdna_compute::Gpu;

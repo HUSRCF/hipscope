@@ -20,8 +20,15 @@ pub trait Architecture: Send + 'static {
     fn name() -> &'static str;
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String>;
+    /// Load model weights from an HFQ file.
+    ///
+    /// PR 8: signature changed from `&mut HfqFile` (PR 7 scaffold) to
+    /// `&HfqFile`. The mmap-backed HfqFile is read-only at the syscall
+    /// level and Qwen35::load_weights only reads tensor data. Weight-pager
+    /// state mutations happen on the returned Weights object via interior
+    /// mutability (`RefCell<WeightPager>`), not on the file.
     fn load_weights(
-        hfq: &mut HfqFile,
+        hfq: &HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String>;

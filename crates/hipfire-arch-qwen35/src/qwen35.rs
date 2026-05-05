@@ -1,10 +1,10 @@
 //! Qwen3.5 model: hybrid DeltaNet (linear attention) + standard attention.
 //! Feature-gated behind `deltanet`.
 
-use crate::hfq::HfqFile;
-use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
-                    weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
-                    weight_gemv_residual, weight_gemv_swiglu_residual};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
+                              weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
+                              weight_gemv_residual, weight_gemv_swiglu_residual};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -26,7 +26,7 @@ pub enum LayerType {
 ///   Two nodes at the same tree depth share a logical position — they're
 ///   alternative futures at the same time step, not successive tokens.
 /// - `attn_bias`: `[N × N]` f32 additive bias on qk scores (with N = tokens.len()),
-///   produced by `crate::ddtree::linearize_tree`. `0.0` on ancestor-or-self
+///   produced by `hipfire_runtime::ddtree::linearize_tree`. `0.0` on ancestor-or-self
 ///   entries, `-inf` on non-ancestors. Applied to in-block keys only;
 ///   prompt keys (positions `[0, start_pos)`) remain unmasked.
 ///
@@ -50,7 +50,7 @@ pub struct TreeVerifyCtx<'a> {
     pub attn_bias: &'a GpuTensor,
     /// `[N]` i32 — for each linearized slot, the slot index of its parent
     /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `crate::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
+    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
     /// use tree-aware kernels that read parent state from the per-layer
     /// s_tape scratch in `PrefillBatchScratch`.
     pub parent_indices: Option<&'a GpuTensor>,
@@ -111,7 +111,7 @@ pub struct Qwen35Config {
     pub layer_types: Vec<LayerType>,
 
     // ── Weight pager (MAD-93 v0.1) ───────────────────────────────────
-    /// If true, MoE expert weights are managed by [`crate::weight_pager::WeightPager`]
+    /// If true, MoE expert weights are managed by [`hipfire_runtime::weight_pager::WeightPager`]
     /// and only the active top-k experts per layer are guaranteed resident in
     /// VRAM. Default false (all experts resident, today's behavior).
     ///
@@ -271,7 +271,7 @@ pub struct MoeFfnWeights {
     pub router: WeightTensor,                 // [num_experts, hidden]
     /// Routed expert weights. Populated when this layer is fully resident
     /// (`paged_experts == false`); **empty `Vec`** when `paged_experts == true`
-    /// (the [`crate::weight_pager::WeightPager`] owns the buffers, and the
+    /// (the [`hipfire_runtime::weight_pager::WeightPager`] owns the buffers, and the
     /// indexed kernels read pointers from `expert_*_ptrs` which the pager
     /// patches per-token via `patch_expert_ptr_table`).
     pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B); empty in paged mode
@@ -284,7 +284,7 @@ pub struct MoeFfnWeights {
     pub expert_down_ptrs:    GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
 
     /// Layer index. Stable identity used to key
-    /// [`crate::weight_pager::WeightId::Expert`] entries.
+    /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
 
     /// Per-expert tensor shapes. `None` in non-paged mode (shapes are read
@@ -292,7 +292,7 @@ pub struct MoeFfnWeights {
     /// `experts` is empty but kernels still need m/k for kernel-arg setup.
     /// Qwen3.5-MoE-A3B has uniform per-expert shape so one descriptor per
     /// layer suffices for v0.1.
-    pub expert_shape: Option<crate::weight_pager::ExpertShape>,
+    pub expert_shape: Option<hipfire_runtime::weight_pager::ExpertShape>,
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -345,7 +345,7 @@ pub struct Qwen35Weights {
     /// interior mutability (`borrow_mut`) at the MoE dispatch site to call
     /// `ensure_resident` / `patch_expert_ptr_table`. `None` means the model
     /// is fully resident — no behavior change vs main.
-    pub pager: Option<std::cell::RefCell<crate::weight_pager::WeightPager>>,
+    pub pager: Option<std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
 }
 
 impl Qwen35Weights {
@@ -638,19 +638,19 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        3 => crate::llama::dequantize_q8_0(data, n),
+        3 => hipfire_runtime::llama::dequantize_q8_0(data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
             let group_size: usize = 256;
             let bytes_per_group: usize = 258;
             let n_groups = data.len() / bytes_per_group;
-            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
             let mut out = Vec::with_capacity(n_groups * group_size);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let scale_bits = data[off] as u16 | ((data[off + 1] as u16) << 8);
-                let scale = crate::llama::f16_to_f32(scale_bits);
+                let scale = hipfire_runtime::llama::f16_to_f32(scale_bits);
                 let start = out.len();
                 for i in 0..256 {
                     let q = data[off + 2 + i] as i8;
@@ -689,8 +689,8 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let is_mq = info.quant_type == 13 || info.quant_type == 15;
             let mut out = Vec::with_capacity(n_groups * group_size);
             let (signs1, signs2) = if is_mq {
-                (Some(crate::llama::KvCache::gen_fwht_signs(42, 256)),
-                 Some(crate::llama::KvCache::gen_fwht_signs(1042, 256)))
+                (Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256)),
+                 Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256)))
             } else { (None, None) };
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
@@ -851,8 +851,8 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
             let n_groups = data.len() / bytes_per_group;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
@@ -3823,23 +3823,23 @@ fn forward_prefill_chunk(
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
 
-                if crate::triattn::tap_enabled() {
+                if hipfire_runtime::triattn::tap_enabled() {
                     // Try GPU path first: dispatches a reduce kernel on the
                     // device-resident Q tensor, zero PCIe transfer. Only
                     // succeeds when install_tap_gpu() was used. Falls through
                     // to CPU path otherwise.
-                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
                         gpu, layer_idx, &pbs.fa_q_batch.buf,
                         n, config.n_heads, config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                        if crate::triattn::tap_needs_k() {
+                        if hipfire_runtime::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
                             for b in 0..n {
-                                crate::triattn::record_prerope_qk(
+                                hipfire_runtime::triattn::record_prerope_qk(
                                     layer_idx,
                                     &q_cpu[b * n_q..(b + 1) * n_q],
                                     Some(&k_cpu[b * n_k..(b + 1) * n_k]),
@@ -3847,7 +3847,7 @@ fn forward_prefill_chunk(
                             }
                         } else {
                             for b in 0..n {
-                                crate::triattn::record_prerope_q(
+                                hipfire_runtime::triattn::record_prerope_q(
                                     layer_idx,
                                     &q_cpu[b * n_q..(b + 1) * n_q],
                                 );
@@ -4361,19 +4361,19 @@ fn forward_prefill_chunk(
                     &pbs.fa_k_batch, &layer.k_norm, &pbs.fa_k_batch,
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
-                if crate::triattn::tap_enabled() {
-                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                if hipfire_runtime::triattn::tap_enabled() {
+                    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
                         gpu, layer_idx, &pbs.fa_q_batch.buf,
                         n, config.n_heads, config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                        if crate::triattn::tap_needs_k() {
+                        if hipfire_runtime::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
                             for b in 0..n {
-                                crate::triattn::record_prerope_qk(
+                                hipfire_runtime::triattn::record_prerope_qk(
                                     layer_idx,
                                     &q_cpu[b * n_q..(b + 1) * n_q],
                                     Some(&k_cpu[b * n_k..(b + 1) * n_k]),
@@ -4381,7 +4381,7 @@ fn forward_prefill_chunk(
                             }
                         } else {
                             for b in 0..n {
-                                crate::triattn::record_prerope_q(
+                                hipfire_runtime::triattn::record_prerope_q(
                                     layer_idx,
                                     &q_cpu[b * n_q..(b + 1) * n_q],
                                 );
@@ -4622,25 +4622,25 @@ fn run_fa_layer_body(
     let kv_dim = config.n_kv_heads * config.head_dim;
     gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
-    if crate::triattn::tap_enabled() {
+    if hipfire_runtime::triattn::tap_enabled() {
         // Try GPU path first (matches the batched FA tap at line ~3499 in
         // forward_prefill_batch). When the calibration tap is GPU-resident
         // (CalibrateGpu) we MUST dispatch the kernel here — falling
         // through to record_prerope_qk would either silently drop the
         // sample (pre-Phase-2) or panic (post-Phase-2).
-        let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+        let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
             gpu, layer_idx, &s.fa_q.buf,
             1, config.n_heads, config.head_dim,
         )?;
         if !gpu_handled {
             let n_q = config.n_heads * config.head_dim;
             let q_cpu = gpu.download_f32(&s.fa_q)?;
-            if crate::triattn::tap_needs_k() {
+            if hipfire_runtime::triattn::tap_needs_k() {
                 let n_k = config.n_kv_heads * config.head_dim;
                 let k_cpu = gpu.download_f32(&s.fa_k)?;
-                crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                hipfire_runtime::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
             } else {
-                crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
             }
         }
     }
@@ -5018,20 +5018,20 @@ fn forward_scratch_layers(
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
-                if crate::triattn::tap_enabled() {
-                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                if hipfire_runtime::triattn::tap_enabled() {
+                    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
                         gpu, layer_idx, &s.fa_q.buf,
                         1, config.n_heads, config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&s.fa_q)?;
-                        if crate::triattn::tap_needs_k() {
+                        if hipfire_runtime::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&s.fa_k)?;
-                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                            hipfire_runtime::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
                         } else {
-                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                            hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
                         }
                     }
                 }
@@ -5309,20 +5309,20 @@ fn forward_scratch_layers(
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
-                if crate::triattn::tap_enabled() {
-                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                if hipfire_runtime::triattn::tap_enabled() {
+                    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
                         gpu, layer_idx, &s.fa_q.buf,
                         1, config.n_heads, config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&s.fa_q)?;
-                        if crate::triattn::tap_needs_k() {
+                        if hipfire_runtime::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&s.fa_k)?;
-                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                            hipfire_runtime::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
                         } else {
-                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                            hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
                         }
                     }
                 }

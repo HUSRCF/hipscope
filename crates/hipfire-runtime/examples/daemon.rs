@@ -22,11 +22,11 @@ use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::qwen35;
-use hipfire_runtime::qwen35::{DeltaNetState, LayerType};
+use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
 use hipfire_runtime::qwen35_vl;
 use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::speculative::{
+use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -387,11 +387,11 @@ fn main() {
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
     // teardowns.
-    let mut pflash_state: Option<hipfire_runtime::pflash::PflashState> = None;
+    let mut pflash_state: Option<hipfire_arch_qwen35::pflash::PflashState> = None;
     // The PflashConfig captured at load time. Per-request `prefill_*`
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
-    let mut pflash_cfg: Option<hipfire_runtime::pflash::PflashConfig> = None;
+    let mut pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -597,9 +597,9 @@ fn main() {
                                     model = Some(m);
                                     continue;
                                 }
-                                let pf_cfg = hipfire_runtime::pflash::PflashConfig {
-                                    mode: hipfire_runtime::pflash::PflashMode::parse(&pflash_mode_str)
-                                        .unwrap_or(hipfire_runtime::pflash::PflashMode::Off),
+                                let pf_cfg = hipfire_arch_qwen35::pflash::PflashConfig {
+                                    mode: hipfire_arch_qwen35::pflash::PflashMode::parse(&pflash_mode_str)
+                                        .unwrap_or(hipfire_arch_qwen35::pflash::PflashMode::Off),
                                     threshold_tokens: pflash_threshold,
                                     keep_ratio: pflash_keep_ratio,
                                     alpha: pflash_alpha,
@@ -611,14 +611,14 @@ fn main() {
                                     drafter_path: Some(pf_drafter_path.clone()),
                                     sparse_threshold: pflash_sparse_threshold,
                                 };
-                                let mut pf_state = hipfire_runtime::pflash::PflashState::new(&pf_cfg);
+                                let mut pf_state = hipfire_arch_qwen35::pflash::PflashState::new(&pf_cfg);
                                 // Pull the target tokenizer out of the loaded model
                                 // for the compat check. Both Qwen3.5 and plain
                                 // Qwen3 paths expose `tokenizer` on LoadedModel.
                                 let tgt_tok_ref = m.tokenizer.as_ref();
                                 if let Some(tok) = tgt_tok_ref {
                                     let pf_max_kv = max_seq.max(2048);
-                                    match hipfire_runtime::pflash::load_drafter(
+                                    match hipfire_arch_qwen35::pflash::load_drafter(
                                         &mut pf_state, &mut gpu,
                                         std::path::Path::new(pf_drafter_path),
                                         tok, pf_max_kv,
@@ -737,7 +737,7 @@ fn main() {
                     let pf_cfg_owned = pflash_cfg.as_ref().map(|base| {
                         let mut c = base.clone();
                         if let Some(s) = msg.get("params").and_then(|p| p.get("prefill_compression")).and_then(|v| v.as_str()) {
-                            if let Some(m) = hipfire_runtime::pflash::PflashMode::parse(s) { c.mode = m; }
+                            if let Some(m) = hipfire_arch_qwen35::pflash::PflashMode::parse(s) { c.mode = m; }
                         }
                         if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_threshold")).and_then(|v| v.as_u64()) {
                             c.threshold_tokens = v as usize;
@@ -1127,8 +1127,15 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     };
 
     if hfq.arch_id == 5 || hfq.arch_id == 6 {
-        // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B)
-        let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
+        // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B). PR 8: dispatch
+        // through the `Architecture` trait for the bring-up triple
+        // (config → load → state). Forward passes below still call
+        // `qwen35::*` directly — see crates/hipfire-arch-qwen35/src/arch.rs
+        // for why static dispatch wins for the hot path.
+        use hipfire_runtime::arch::Architecture;
+        use hipfire_arch_qwen35::Qwen35;
+        let config = <Qwen35 as Architecture>::config_from_hfq(&hfq)
+            .map_err(|e| e.to_string())?;
 
         // Detect VL model: check if vision config AND vision tensors are present
         // Text-only models may have vision config in metadata but no actual vision weights
@@ -1146,7 +1153,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             (None, None)
         };
 
-        let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+        let weights = <Qwen35 as Architecture>::load_weights(&hfq, &config, gpu)?;
 
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
@@ -1198,9 +1205,9 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // drift that degenerates output after ~200 tokens.
         let dn_quant = if config.num_experts > 0 {
             eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-            hipfire_runtime::qwen35::StateQuant::FP32
+            hipfire_arch_qwen35::qwen35::StateQuant::FP32
         } else {
-            hipfire_runtime::qwen35::StateQuant::Q8
+            hipfire_arch_qwen35::qwen35::StateQuant::Q8
         };
         let dn = DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
@@ -1308,7 +1315,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 /// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
 /// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
 fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
-    use hipfire_runtime::qwen35::LayerWeights;
+    use hipfire_arch_qwen35::qwen35::LayerWeights;
     let mut n_safe = 0usize;
     let mut n_unsafe = 0usize;
 
@@ -1418,7 +1425,7 @@ fn load_dflash_state(
         draft_config.num_extract(),
         draft_config.hidden,
         ctx_capacity + draft_config.block_size,
-        hipfire_runtime::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
+        hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
     ).map_err(|e| format!("hidden_rb: {e}"))?;
 
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
@@ -1613,7 +1620,7 @@ fn generate_dflash(
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
 ) {
-    use hipfire_runtime::speculative::{
+    use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
@@ -2026,7 +2033,7 @@ fn generate_dflash(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_runtime::pflash::PflashState>, pflash_cfg: Option<&hipfire_runtime::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
@@ -2041,7 +2048,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut dflash_bypass_reason: Option<&'static str> = None;
         let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
         if let Some(cfg) = pflash_cfg.as_ref() {
-            if cfg.mode != hipfire_runtime::pflash::PflashMode::Off {
+            if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
@@ -2128,18 +2135,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
                 .unwrap_or(false);
             if in_user || in_system {
-                hipfire_runtime::pflash::RequestKind::ToolCall
+                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
             } else {
-                hipfire_runtime::pflash::RequestKind::Text
+                hipfire_arch_qwen35::pflash::RequestKind::Text
             }
         }
-        None => hipfire_runtime::pflash::RequestKind::Text,
+        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
     };
 
     // Stashed CompressedPrompt summary (when compression actually fired);
     // appended to the `done` event later so a streaming client gets one
     // consolidated line. None means no compression happened on this request.
-    let mut pflash_summary: Option<hipfire_runtime::pflash::CompressedPrompt> = None;
+    let mut pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt> = None;
     // Bypass reason when compression was attempted but skipped (mode != Off
     // and a drafter was loaded). PRD §3.1 requires "bypass reason if
     // skipped" in the done object.
@@ -2154,7 +2161,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     //   - nothing: empty string so backwards-compatible clients see the
     //     original done shape
     fn pflash_done_fragment(
-        s: &Option<hipfire_runtime::pflash::CompressedPrompt>,
+        s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
         bypass_reason: &Option<String>,
         alpha: Option<f32>,
     ) -> String {
@@ -2177,11 +2184,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
-            let decision = hipfire_runtime::pflash::maybe_compress_prompt(
+            let decision = hipfire_arch_qwen35::pflash::maybe_compress_prompt(
                 gpu, state, cfg, &raw_q_tokens, request_kind, &[],
             );
             match decision {
-                Ok(hipfire_runtime::pflash::PflashDecision::Compressed(cp)) => {
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"select_ms":{},"gather_ms":{},"total_ms":{}}}"#,
@@ -2196,10 +2203,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     pflash_summary = Some(cp);
                     token_ids
                 }
-                Ok(hipfire_runtime::pflash::PflashDecision::Bypass { reason }) => {
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
                     // Only emit bypass events for non-trivial reasons.
                     // ModeOff is the silent default; nothing to report.
-                    if !matches!(reason, hipfire_runtime::pflash::BypassReason::ModeOff) {
+                    if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
                         let r = reason.as_str();
                         let _ = writeln!(
                             stdout,

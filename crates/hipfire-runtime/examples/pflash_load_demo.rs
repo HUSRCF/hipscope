@@ -10,8 +10,8 @@
 //! load failure.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::pflash::{self, PflashConfig, PflashState};
-use hipfire_runtime::qwen35;
+use hipfire_arch_qwen35::pflash::{self, PflashConfig, PflashState};
+use hipfire_arch_qwen35::qwen35;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -90,7 +90,7 @@ fn main() {
     }
 
     // Demonstrate the gating result that the daemon will see.
-    use hipfire_runtime::pflash::{decide_bypass, PflashMode, RequestKind};
+    use hipfire_arch_qwen35::pflash::{decide_bypass, PflashMode, RequestKind};
     let demo_cfg = PflashConfig { mode: PflashMode::Always, ..cfg.clone() };
     let probe_tokens = vec![1u32; 100];
     let bypass = decide_bypass(&state, &demo_cfg, &probe_tokens, RequestKind::Text);
@@ -124,10 +124,10 @@ fn main() {
             min_keep_tokens: 0,
             ..cfg.clone()
         };
-        match hipfire_runtime::pflash::maybe_compress_prompt(
+        match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
             &mut gpu, &mut state, &demo_cfg2, &toy_prompt, RequestKind::Text, &[],
         ) {
-            Ok(hipfire_runtime::pflash::PflashDecision::Compressed(cp)) => {
+            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
                 eprintln!("maybe_compress_prompt: source={} kept={} ratio={:.3}",
                     cp.source_tokens, cp.kept_tokens,
                     cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
@@ -161,10 +161,10 @@ fn main() {
                 let scorer_health_ok = {
                     let mut probe_state = state.drafter_loaded;
                     if probe_state {
-                        let cpu = hipfire_runtime::pflash::compute_scores_batched(
+                        let cpu = hipfire_arch_qwen35::pflash::compute_scores_batched(
                             &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
                         );
-                        let gpu_res = hipfire_runtime::pflash::compute_scores_batched_gpu(
+                        let gpu_res = hipfire_arch_qwen35::pflash::compute_scores_batched_gpu(
                             &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
                         );
                         match (cpu, gpu_res) {
@@ -200,7 +200,7 @@ fn main() {
                            scorer_health_ok={scorer_health_ok}");
                 length_ok && spans_disjoint && monotone_tokens && md5_present && scorer_health_ok
             }
-            Ok(hipfire_runtime::pflash::PflashDecision::Bypass { reason }) => {
+            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
                 eprintln!("maybe_compress_prompt unexpectedly bypassed: {reason:?}");
                 false
             }

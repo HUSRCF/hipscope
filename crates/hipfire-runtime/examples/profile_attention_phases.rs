@@ -23,7 +23,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::llama::{self, KvCache};
     use rdna_compute::{DType};
     use std::path::Path;
@@ -69,7 +69,7 @@ fn main() {
     let fa_layer_idx = {
         let mut found = None;
         for (i, l) in weights.layers.iter().enumerate() {
-            if matches!(l, hipfire_runtime::qwen35::LayerWeights::FullAttn(_)) { found = Some(i); break; }
+            if matches!(l, hipfire_arch_qwen35::qwen35::LayerWeights::FullAttn(_)) { found = Some(i); break; }
         }
         found.expect("no FA layer in model")
     };

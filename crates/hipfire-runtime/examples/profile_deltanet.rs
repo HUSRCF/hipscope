@@ -7,7 +7,7 @@ fn main() { eprintln!("Build with --features deltanet"); }
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35;
+    use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::llama;
     use rdna_compute::DType;
     use std::path::Path;

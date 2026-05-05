@@ -7,7 +7,7 @@ fn main() { eprintln!("Build with --features deltanet"); }
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::llama;
     use std::io::Write;
     use std::path::Path;
@@ -51,7 +51,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
 
-    use hipfire_runtime::speculative::{KvMode, ModelSlot, ModelSlotConfig};
+    use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
     let state_quant = if q4_state { qwen35::StateQuant::Q4 } else { qwen35::StateQuant::Q8 };
     if q4_state { eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"); }
     eprintln!("KV cache: {kv_mode_str}");
@@ -66,9 +66,9 @@ fn main() {
     // Optional draft model slot (Phase 1 of speculative decode). Validated for
     // tokenizer compatibility, smoke-tested, then parked. The REPL still runs
     // the target model alone until Phase 2 wires in the verify-and-accept loop.
-    let mut draft_slot: Option<hipfire_runtime::speculative::ModelSlot> = None;
+    let mut draft_slot: Option<hipfire_arch_qwen35::speculative::ModelSlot> = None;
     if let Some(ref dpath) = draft_model {
-        use hipfire_runtime::speculative::{KvMode, ModelSlot, ModelSlotConfig};
+        use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
         let vram_before = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
 
         let draft_cfg = ModelSlotConfig {
@@ -120,10 +120,10 @@ fn main() {
     }
     // Snapshots for DeltaNet state rollback during verify-and-accept. Allocated
     // once and reused across REPL turns. Only materialized in spec mode.
-    let mut target_snap: Option<hipfire_runtime::speculative::DeltaNetSnapshot> = None;
-    let mut draft_snap: Option<hipfire_runtime::speculative::DeltaNetSnapshot> = None;
+    let mut target_snap: Option<hipfire_arch_qwen35::speculative::DeltaNetSnapshot> = None;
+    let mut draft_snap: Option<hipfire_arch_qwen35::speculative::DeltaNetSnapshot> = None;
     if spec_active {
-        use hipfire_runtime::speculative::DeltaNetSnapshot;
+        use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
         target_snap = Some(DeltaNetSnapshot::new_for(&mut gpu, &target_slot.dn_state).unwrap());
         if let Some(ref d) = draft_slot {
             draft_snap = Some(DeltaNetSnapshot::new_for(&mut gpu, &d.dn_state).unwrap());
@@ -156,7 +156,7 @@ fn main() {
     let mut total_tokens: usize = 0;
     // Aggregate speculative decode stats across REPL turns (only populated when
     // --speculative is active). Shown via /stats.
-    let mut spec_stats = hipfire_runtime::speculative::SpecStats::new(spec_k);
+    let mut spec_stats = hipfire_arch_qwen35::speculative::SpecStats::new(spec_k);
 
     // REPL
     let stdin = std::io::stdin();
@@ -317,7 +317,7 @@ fn main() {
                 let pos = seq_pos + generated;
                 if pos + spec_k + 1 >= max_seq { break; }
 
-                let step = hipfire_runtime::speculative::spec_step_greedy(
+                let step = hipfire_arch_qwen35::speculative::spec_step_greedy(
                     &mut gpu, &mut target_slot, draft_ref, pos, spec_k, ts, ds,
                 ).unwrap();
                 spec_stats.record(&step);
