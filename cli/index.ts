@@ -1427,7 +1427,7 @@ async function serve(port: number) {
       }
 
       try {
-        const body = await req.json();
+        const body = (await req.json()) as any;
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1601,6 +1601,10 @@ async function serve(port: number) {
           ? body.chat_template_kwargs : {};
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
+
+        // Include usage 
+        // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
+        const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -1809,6 +1813,7 @@ async function serve(port: number) {
 
         if (body.stream) {
           const enc = new TextEncoder();
+          let completionTokens = 0;
           let streamCancelled = false;
           e.generating = true;
           const hasTool = tools.length > 0;
@@ -1843,6 +1848,7 @@ async function serve(port: number) {
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
+                    completionTokens++;
                     let text = msg.text as string;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
@@ -1925,9 +1931,12 @@ async function serve(port: number) {
                         })}\n\n`));
                       }
                     } else {
+                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: msg.prefill_tokens + completionTokens } },
+                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
