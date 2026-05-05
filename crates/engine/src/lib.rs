@@ -27,3 +27,4 @@ pub mod image;
 pub mod tokenizer;
 pub mod pflash;
 pub mod eos_filter;
+pub mod prompt_frame;

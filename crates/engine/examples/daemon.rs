@@ -1621,34 +1621,17 @@ fn generate_dflash(
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
     // is always prepended because this fast path is single-turn.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let im_start = tokenizer.encode("<|im_start|>");
-    let im_end = tokenizer.encode("<|im_end|>");
-    let nl = tokenizer.encode("\n");
-    let user_tok = tokenizer.encode("user");
-    let asst_tok = tokenizer.encode("assistant");
-
-    let mut prompt_tokens: Vec<u32> = Vec::new();
-    if let Some(sys) = system_prompt {
-        let sys_tok = tokenizer.encode("system");
-        let sys_content = tokenizer.encode(sys);
-        prompt_tokens.extend_from_slice(&im_start);
-        prompt_tokens.extend_from_slice(&sys_tok);
-        prompt_tokens.extend_from_slice(&nl);
-        prompt_tokens.extend_from_slice(&sys_content);
-        prompt_tokens.extend_from_slice(&im_end);
-        prompt_tokens.extend_from_slice(&nl);
+    let prompt_tokens = engine::prompt_frame::ChatFrame {
+        tokenizer,
+        system: system_prompt,
+        user: prompt,
+        assistant_prefix: engine::prompt_frame::AssistantPrefix::Plain,
+        raw: false,
     }
-    let q_tokens = tokenizer.encode(prompt);
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&user_tok);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&q_tokens);
-    prompt_tokens.extend_from_slice(&im_end);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&asst_tok);
-    prompt_tokens.extend_from_slice(&nl);
+    .build();
 
+    // `im_end_token` is still needed downstream for the EOS check.
+    let im_end = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
 
     // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
@@ -2099,11 +2082,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
     }
 
-    let im_start = tokenizer.encode("<|im_start|>");
+    // `nl` is needed for the trailer write after natural <|im_end|>
+    // termination; `im_end` derives the EOS-check token id. Other
+    // ChatML scaffolding tokens are now built inside engine::prompt_frame.
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
-    let user_tok = tokenizer.encode("user");
-    let asst_tok = tokenizer.encode("assistant");
     let raw_q_tokens = tokenizer.encode(prompt);
 
     // ── PFlash compression (Phase 4.1 #93) ──────────────────────────────
@@ -2248,32 +2231,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         raw_q_tokens
     };
 
-    let mut new_tokens = Vec::new();
-
-    // System prompt: prepend on first turn only (seq_pos == 0)
-    if m.seq_pos == 0 {
-        if let Some(sys) = system_prompt {
-            let sys_tok = tokenizer.encode("system");
-            let sys_content = tokenizer.encode(sys);
-            new_tokens.extend_from_slice(&im_start);
-            new_tokens.extend_from_slice(&sys_tok);
-            new_tokens.extend_from_slice(&nl);
-            new_tokens.extend_from_slice(&sys_content);
-            new_tokens.extend_from_slice(&im_end);
-            new_tokens.extend_from_slice(&nl);
-        }
+    // ChatML framing via the canonical engine::prompt_frame module.
+    // System prompt is prepended only on the first turn (seq_pos == 0)
+    // — subsequent turns continue the conversation in-place. The user
+    // body comes in pre-tokenized as `q_tokens` because PFlash may
+    // have compressed it upstream.
+    let new_tokens = engine::prompt_frame::ChatFrame {
+        tokenizer,
+        system: if m.seq_pos == 0 { system_prompt } else { None },
+        user: "", // unused: we pass tokens directly via build_with_user_tokens
+        assistant_prefix: engine::prompt_frame::AssistantPrefix::Plain,
+        raw: false,
     }
-
-    // User turn
-    new_tokens.extend_from_slice(&im_start);
-    new_tokens.extend_from_slice(&user_tok);
-    new_tokens.extend_from_slice(&nl);
-    new_tokens.extend_from_slice(&q_tokens);
-    new_tokens.extend_from_slice(&im_end);
-    new_tokens.extend_from_slice(&nl);
-    new_tokens.extend_from_slice(&im_start);
-    new_tokens.extend_from_slice(&asst_tok);
-    new_tokens.extend_from_slice(&nl);
+    .build_with_user_tokens(&q_tokens);
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -2929,45 +2899,33 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
         .expect("vision forward failed");
 
-    // Build VL prompt
-    let im_start = tokenizer.encode("<|im_start|>");
-    let im_end = tokenizer.encode("<|im_end|>");
+    // Build VL prompt via engine::prompt_frame. The VL user body splices
+    // vision tokens (`<|vision_start|>` + N × `<|image_pad|>` +
+    // `<|vision_end|>`) BEFORE the textual prompt, separated by a newline.
+    // We pre-assemble that as the user-body token sequence and pass it
+    // through `build_with_user_tokens` so the role/newline/im_end
+    // scaffolding stays canonical.
     let nl = tokenizer.encode("\n");
-    let user_tok = tokenizer.encode("user");
-    let asst_tok = tokenizer.encode("assistant");
+    let im_end = tokenizer.encode("<|im_end|>");
     let q_tokens = tokenizer.encode(prompt);
 
-    let mut prompt_tokens: Vec<u32> = Vec::new();
-
-    // System prompt on first turn
-    if m.seq_pos == 0 {
-        if let Some(sys) = system_prompt {
-            let sys_tok = tokenizer.encode("system");
-            let sys_content = tokenizer.encode(sys);
-            prompt_tokens.extend_from_slice(&im_start);
-            prompt_tokens.extend_from_slice(&sys_tok);
-            prompt_tokens.extend_from_slice(&nl);
-            prompt_tokens.extend_from_slice(&sys_content);
-            prompt_tokens.extend_from_slice(&im_end);
-            prompt_tokens.extend_from_slice(&nl);
-        }
-    }
-
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&user_tok);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.push(VISION_START_ID);
+    let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
+    user_body.push(VISION_START_ID);
     for _ in 0..n_visual_tokens {
-        prompt_tokens.push(IMAGE_PAD_ID);
+        user_body.push(IMAGE_PAD_ID);
     }
-    prompt_tokens.push(VISION_END_ID);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&q_tokens);
-    prompt_tokens.extend_from_slice(&im_end);
-    prompt_tokens.extend_from_slice(&nl);
-    prompt_tokens.extend_from_slice(&im_start);
-    prompt_tokens.extend_from_slice(&asst_tok);
-    prompt_tokens.extend_from_slice(&nl);
+    user_body.push(VISION_END_ID);
+    user_body.extend_from_slice(&nl);
+    user_body.extend_from_slice(&q_tokens);
+
+    let prompt_tokens = engine::prompt_frame::ChatFrame {
+        tokenizer,
+        system: if m.seq_pos == 0 { system_prompt } else { None },
+        user: "", // unused: we pass tokens directly via build_with_user_tokens
+        assistant_prefix: engine::prompt_frame::AssistantPrefix::Plain,
+        raw: false,
+    }
+    .build_with_user_tokens(&user_body);
 
     // KV-budget guard — physical_cap without eviction, absolute window with.
     // Mirrors the textual generate() contract; reserves trailer slots so
