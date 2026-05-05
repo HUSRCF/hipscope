@@ -4,7 +4,7 @@ members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
-    "crates/engine",
+    "crates/hipfire-runtime",
     "crates/hipfire-quantize",
     "crates/redline",
 ]

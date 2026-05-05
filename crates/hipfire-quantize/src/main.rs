@@ -1227,7 +1227,7 @@ fn is_gguf_input(p: &Path) -> bool {
 }
 
 /// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
-/// names that `engine::hfq::load_weights_hfq` expects. The mapping is
+/// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
 /// the canonical llama.cpp ↔ HF convention.
 ///
 /// Returns None for tensors that don't have a known safetensors equivalent
@@ -1280,7 +1280,7 @@ fn gguf_is_embed_tensor(name: &str) -> bool {
     name == "token_embd.weight"
 }
 
-/// Build the `config` JSON object that `engine::hfq::config_from_hfq`
+/// Build the `config` JSON object that `hipfire_runtime::hfq::config_from_hfq`
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
 /// `<arch>.*` metadata keys.
@@ -1550,7 +1550,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         let is_2d = info.shape.len() == 2;
         let k_dim = if is_2d { info.shape[0] } else { n_elements };
 
-        // Translate to the safetensors-style name `engine::hfq::load_weights_hfq`
+        // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
         let out_name = gguf_to_safetensors_name(&info.name)

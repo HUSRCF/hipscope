@@ -9410,7 +9410,7 @@ impl Gpu {
     /// `[0, block_start + block_cols)`, applying an additive bias from
     /// `tree_bias[b × block_cols + (t - block_start)]` for in-block keys.
     /// Caller passes `-inf` on non-ancestor slots and `0.0` on ancestors
-    /// (see `engine::ddtree::linearize_tree`).
+    /// (see `hipfire_runtime::ddtree::linearize_tree`).
     ///
     /// When `tree_bias` is `None`, `block_start` / `block_cols` are ignored
     /// and behavior is byte-identical to the legacy causal path.
