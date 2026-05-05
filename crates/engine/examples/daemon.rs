@@ -2479,11 +2479,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // last `ngram_window` tokens, force EOS. This catches answer-phase
         // repetition loops that the think cap and repeat penalty miss.
         // Operates on token IDs (no decode overhead).
-        let ngram_loop_threshold: usize = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let ngram_window: usize = std::env::var("HIPFIRE_NGRAM_WINDOW")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-        let ngram_loop_enabled = ngram_loop_threshold > 0;
+        // Implementation lives in `engine::loop_guard`; defaults read from
+        // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
+        // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
+        let loop_guard = engine::loop_guard::LoopGuard::from_env();
 
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
@@ -2593,27 +2592,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // N-gram loop detector: check if any 4-gram in the recent window
             // repeats excessively. When detected, emit an info message and
             // force EOS to prevent wasting the remaining token budget on
-            // repetitive output.
-            if ngram_loop_enabled && streamed_tokens.len() >= 4 {
-                let window_start = streamed_tokens.len().saturating_sub(ngram_window);
-                let window = &streamed_tokens[window_start..];
-                if window.len() >= 4 {
-                    let mut ngram_counts = std::collections::HashMap::<[u32; 4], usize>::new();
-                    for w in window.windows(4) {
-                        let key = [w[0], w[1], w[2], w[3]];
-                        *ngram_counts.entry(key).or_insert(0) += 1;
-                    }
-                    let max_count = ngram_counts.values().copied().max().unwrap_or(0);
-                    if max_count >= ngram_loop_threshold {
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                            id, max_count, window.len()
-                        );
-                        let _ = stdout.flush();
-                        break;
-                    }
-                }
+            // repetitive output. Logic lives in `engine::loop_guard`.
+            if let Some(engine::loop_guard::StopReason::NgramRepeat { count, .. }) =
+                loop_guard.check(&streamed_tokens)
+            {
+                let window_len = loop_guard.window_len(streamed_tokens.len());
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+                    id, count, window_len
+                );
+                let _ = stdout.flush();
+                break;
             }
 
             // Budget-alert injection: once we hit the configured token count,

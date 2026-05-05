@@ -3,6 +3,7 @@
 pub mod gguf;
 pub mod hfq;
 pub mod llama;
+pub mod loop_guard;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
