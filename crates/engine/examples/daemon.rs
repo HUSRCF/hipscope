@@ -1221,7 +1221,17 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
-        let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
+        // MoE models (num_experts > 0) have ~10x smaller hidden-state
+        // magnitudes than dense models, making Q8 DeltaNet state quantization
+        // error proportionally larger. Use FP32 state to avoid cumulative
+        // drift that degenerates output after ~200 tokens.
+        let dn_quant = if config.num_experts > 0 {
+            eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
+            engine::qwen35::StateQuant::FP32
+        } else {
+            engine::qwen35::StateQuant::Q8
+        };
+        let dn = DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
         // identical to sizing-by-max_seq; under eviction it's much smaller.
