@@ -179,6 +179,71 @@ unreproducible — see
 
 ---
 
+## Crate topology
+
+The 0.1.20 modularization split `crates/engine/` into a runtime crate
+and per-arch crates. The post-modular workspace:
+
+```
+crates/
+  hip-bridge/              HIP/ROCm FFI
+  rdna-compute/            kernel dispatch + per-RDNA-arch routing
+                           (gfx1100/01/02/1150/1151/1152/1200/1201)
+  hipfire-runtime/         LM runtime: KV cache, sampler, loop_guard,
+                           prompt_frame, eos_filter, spec decode,
+                           eviction, paging
+  hipfire-arch-qwen35/     Qwen3.5 family (DeltaNet hybrid, MoE)
+  hipfire-arch-qwen35-vl/  Qwen3.5-VL (vision)
+  hipfire-arch-llama/      Llama-family (currently a facade — see
+                           PR 14 for physical split)
+  hipfire-arch-toy/        minimal stub arch (reference for porters)
+  hipfire-quantize/        safetensors → .mq4 / .hfq quantizer CLI
+```
+
+### Where does X go?
+
+- **"I want to add a new model architecture"** → new
+  `crates/hipfire-arch-<name>/` crate, implement `Architecture` trait.
+  Copy `crates/hipfire-arch-toy/` as a template.
+- **"I want to fix a kernel bug or add a kernel"** → `kernels/src/*.hip`
+  for the kernel + `crates/rdna-compute/src/dispatch.rs` for the
+  dispatch wiring. Stays in rdna-compute regardless of which arch
+  uses it.
+- **"I want to tune sampler / repeat_penalty / blocked tokens
+  behavior"** → `crates/hipfire-runtime/src/sampler.rs`.
+- **"I want to add an end-of-turn marker for an arch"** → arch crate's
+  `eos_filter_overrides()` returning
+  `EosFilterOverrides { stop_at: ..., holdback_prefixes: ... }`.
+- **"I want to add a CLI feature / daemon API endpoint"** →
+  `crates/hipfire-runtime/examples/daemon.rs`. (Or, if it's CLI-side,
+  the cli crate / TUI.)
+- **"I want to optimize for a specific RDNA generation"** →
+  `crates/rdna-compute/src/dispatch.rs`. NEVER inside an arch crate
+  (that fragments per-arch knowledge across the workspace).
+- **"I want to add a new quant format"** → `kernels/src/` for the
+  kernel + `crates/rdna-compute` for dispatch routing +
+  `crates/hipfire-quantize` for the quantizer CLI. Arches consume via
+  the runtime API automatically.
+
+### Per-arch overrides via the `Architecture` trait
+
+Every arch crate `impl Architecture for Foo` and may override four
+behavior structs. Defaults assume Qwen3.5 family conventions (ChatML
+prompt frame, `<think>` strip, default sampler/loop-guard config).
+
+| Override | When to use | Example |
+|---|---|---|
+| `LoopGuardOverrides` | Base/instruct model legitimately repeats short phrases (structured output, code boilerplate) | `LoopGuardOverrides { ngram_threshold: Some(8), .. }` |
+| `SamplerOverrides` | Add arch-specific blocked tokens (e.g. `<tool_call>` openers) or per-arch `repeat_penalty` | `SamplerOverrides { blocked_tokens: vec![99999], .. }` |
+| `PromptFrameOverrides` | Non-ChatML completion model (no `<|im_start|>` framing) | `PromptFrameOverrides { raw: Some(true) }` |
+| `EosFilterOverrides` | Arch-specific end-of-turn markers (Gemma's `<end_of_turn>`, etc.) | `EosFilterOverrides { stop_at: vec![b"<end_of_turn>".to_vec()], .. }` |
+
+Field-level docs live on
+`crates/hipfire-runtime/src/arch.rs`; worked examples are in
+`crates/hipfire-arch-toy/src/arch.rs` (one of each, default-bodied).
+
+---
+
 ## Skills (agent-driven workflows)
 
 | Skill | When to use |

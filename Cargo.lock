@@ -144,6 +144,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-toy"
+version = "0.1.9-alpha.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.1.20-a"
 dependencies = [

@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.1.20 — engine modularization
+
+The `crates/engine/` monolith is split into a runtime crate plus
+per-arch crates. The new layout is contributor-facing: each arch is
+its own crate that implements the `Architecture` trait declared in
+`hipfire-runtime`, so adding a new model family is a localized change
+instead of a 5K-line edit to `engine/src/`. Behavior is unchanged for
+end users — the daemon, CLI, and kernel surface are byte-identical.
+
+### Migration guide for contributors
+
+Grep'ing for old paths? Map:
+
+```
+Old path                                  → New path
+crates/engine/src/lib.rs                  → crates/hipfire-runtime/src/lib.rs
+crates/engine/src/qwen35.rs               → crates/hipfire-arch-qwen35/src/qwen35.rs
+crates/engine/src/qwen35_vl.rs            → crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs
+crates/engine/src/image.rs                → crates/hipfire-arch-qwen35-vl/src/image.rs
+crates/engine/src/llama.rs                → crates/hipfire-runtime/src/llama.rs (facade-stage; PR 14 physically splits)
+crates/engine/src/speculative.rs          → crates/hipfire-arch-qwen35/src/speculative.rs
+crates/engine/src/pflash.rs               → crates/hipfire-arch-qwen35/src/pflash.rs
+crates/engine/src/loop_guard.rs           → crates/hipfire-runtime/src/loop_guard.rs (NEW in PR 1)
+crates/engine/src/sampler.rs              → crates/hipfire-runtime/src/sampler.rs (NEW in PR 3)
+crates/engine/src/prompt_frame.rs         → crates/hipfire-runtime/src/prompt_frame.rs (NEW in PR 2)
+crates/engine/src/eos_filter.rs           → crates/hipfire-runtime/src/eos_filter.rs (NEW in PR 4)
+```
+
+`engine` itself is gone; downstream consumers (`use engine::...`)
+update to `use hipfire_runtime::...` (runtime symbols) or
+`use hipfire_arch_qwen35::...` (arch-specific symbols).
+
+### What this enables
+
+- Compile-time isolation per arch: a change in `hipfire-arch-qwen35`
+  doesn't trigger a recompile of the LLaMA forward path.
+- Clean trait-based bring-up for new arches: implement
+  `Architecture` in your own crate, register the `arch_id`, done.
+  See `crates/hipfire-arch-toy/` for a copy-paste template.
+- Forward-port path for the gemma branch: gemma4 lands as
+  `crates/hipfire-arch-gemma4/` without re-touching the qwen35 code.
+- Selective build for downstream library consumers: feature flags
+  `arch-qwen35` / `arch-qwen35-vl` / `arch-llama` on
+  `hipfire-runtime` (PR 12) trim the resolved dep graph to only the
+  arches the consumer actually needs.
+- Per-arch policy overrides without a daemon `match arch_id` ladder:
+  `LoopGuardOverrides`, `SamplerOverrides`, `PromptFrameOverrides`,
+  `EosFilterOverrides` are returned by the arch's trait impl.
+
+### Known limitations
+
+- `hipfire-arch-llama` is currently a facade. The LLaMA-family
+  forward body (`forward_scratch*`, `forward_prefill_batch*`, etc.)
+  still lives in `crates/hipfire-runtime/src/llama.rs` because the
+  qwen35 hybrid path's pflash drafter reaches into shared transformer
+  primitives (`KvCache`, `WeightTensor`, GEMV dispatch helpers,
+  dequantizers) that haven't been extracted into a dedicated
+  `runtime::transformer` sub-module yet. PR 14 (planned) will physically
+  split the LLaMA-arch-only functions out once that extraction lands.
+- In-tree binary feature-gating is limited by a cargo cycle.
+  `hipfire-runtime`'s examples (`daemon`, `infer_qwen35`, etc.) consume
+  the arch crates via `[dev-dependencies]`. Cargo's resolver follows
+  dev-dep edges in both directions, so building an example with
+  `--no-default-features` from inside the workspace re-activates the
+  arch features unconditionally. Downstream library consumers (who
+  don't enter the dev-dep cycle) respect `--no-default-features`
+  faithfully. PR 12 documents the tradeoff in
+  `crates/hipfire-runtime/Cargo.toml`.
+
+### How to add a new arch
+
+Copy `crates/hipfire-arch-toy/` as a starting template. The toy crate
+is a minimum-viable `Architecture` trait impl with hardcoded stub
+values and heavy explanatory comments — no real model logic. See
+`CONTRIBUTING.md` "Crate topology" for the full decision tree.
+
 ## v0.1.9-alpha.1 (2026-05-02)
 
 Patch release. Closes #111 — MQ4 single-token attractor on `<tool_call>`
