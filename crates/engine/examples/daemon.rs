@@ -25,6 +25,7 @@ use engine::llama;
 use engine::qwen35;
 use engine::qwen35::{DeltaNetState, LayerType};
 use engine::qwen35_vl;
+use engine::sampler::{self, SamplerConfig};
 use engine::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
@@ -110,46 +111,15 @@ struct CaskConfig {
 /// repeat-penalty alone doesn't break a strong single-token loop fast
 /// enough at the user-validated `RP=1.05` floor.
 ///
-/// Both helpers below scan the recent `window` generated tokens
-/// (CPU-side u32 comparisons over ~20 tokens) and, when tripped, write
-/// a single 4-byte `-INF` into the GPU logits buffer at offset
-/// `open_id * 4` via `memcpy_htod_offset`. No D2H, no kernel change,
-/// ~5 µs only on turns that trip; zero cost otherwise.
-///
-/// `gpu_block_attractor_unclosed` is the right call for paired
-/// open/close special tokens (`<tool_call>` / `</tool_call>`,
-/// `<think>` / `</think>`). It blocks the next emission when there
-/// are ≥ `threshold` opens minus closes in the window — i.e. unclosed
-/// nested openers. With `threshold = 2`, the helper trips before the
-/// model can emit a third nested opener; a second opener is still
-/// possible (we can only block the *next* token), but the parser-side
-/// strip in `parseToolCalls` (#111 stopgap) recovers from a single
-/// nested opener.
-///
-/// `gpu_block_attractor_token` is the simpler fallback for unpaired
-/// tokens: trips on `count >= threshold` regardless of structure.
-fn gpu_block_attractor_unclosed(
-    gpu: &rdna_compute::Gpu,
-    logits_buf: &hip_bridge::DeviceBuffer,
-    history: &[u32],
-    open_id: u32,
-    close_id: u32,
-    window: usize,
-    threshold: usize,
-) {
-    if window == 0 || threshold == 0 { return; }
-    let start = history.len().saturating_sub(window);
-    let mut depth: i32 = 0;
-    for &t in &history[start..] {
-        if t == open_id { depth += 1; }
-        else if t == close_id && depth > 0 { depth -= 1; }
-    }
-    if depth >= threshold as i32 {
-        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
-        let _ = gpu.hip.memcpy_htod_offset(logits_buf, (open_id as usize) * 4, &bytes);
-    }
-}
-
+/// The unclosed-opener depth counter has moved to
+/// `engine::sampler::collect_unclosed_attractor_blocks` (PR 3 of the
+/// engine-modularization plan); the resulting blocked-token list is
+/// applied to the GPU logits buffer by `engine::sampler::sample`
+/// before the sampling kernel launches. The `gpu_block_attractor_token`
+/// helper below is the simpler fallback for unpaired tokens — trips on
+/// `count >= threshold` regardless of structure — kept here as
+/// reference for a future per-token attractor block.
+#[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
     logits_buf: &hip_bridge::DeviceBuffer,
@@ -2434,35 +2404,57 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut rng_state: u32 = 0x13579BDFu32;
         let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
 
+        // Build the list of paired (open, close) attractor pairs once;
+        // sampler::collect_unclosed_attractor_blocks decides per-call
+        // which openers (if any) trip the depth threshold.
+        let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
+            .into_iter()
+            .chain(think_pair.into_iter())
+            .collect();
+
         // First sample: use conversation so far as scope.
         let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-        let scope_start0 = ngram_scope.len().saturating_sub(repeat_buf_cap);
-        let scope0 = &ngram_scope[scope_start0..];
-        let bytes0: Vec<u8> = scope0.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        if !bytes0.is_empty() {
-            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
-        }
         // #111 attractor block: empty `ngram_scope` on first sample (no
         // generated tokens yet), so the unclosed-depth is always 0 and
-        // this is a no-op here. Still call it for symmetry with the
-        // loop body, in case a future change moves this block into a
-        // multi-step warmup.
-        if let Some((open, close)) = tool_call_pair {
-            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-        }
-        if let Some((open, close)) = think_pair {
-            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-        }
-        let (tok0, rng0) = gpu.sample_top_p(
-            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            vocab_size, temp, top_p, rng_state, scope0.len(), repeat_penalty,
-        ).unwrap();
+        // `blocked` is empty. Still call collect_* for symmetry with
+        // the loop body, in case a future change moves this block into
+        // a multi-step warmup.
+        let mut blocked0: Vec<u32> = Vec::new();
+        sampler::collect_unclosed_attractor_blocks(
+            ngram_scope,
+            &attractor_pairs,
+            20,
+            2,
+            &mut blocked0,
+        );
+        let cfg0 = SamplerConfig {
+            temperature: temp,
+            top_p,
+            repeat_penalty,
+            // Window is bounded by the GPU repeat_buf capacity (sized
+            // at 64 in ForwardScratch::new). Pre-PR3 code did this
+            // bound by setting `scope_start = len - repeat_buf_cap`
+            // and passing `scope.len()` to the kernel; we let
+            // sampler::sample do the same `min(window, buf_cap)`
+            // internally.
+            repeat_window: repeat_buf_cap,
+            blocked_tokens: blocked0,
+        };
+        let tok0 = sampler::sample(
+            gpu,
+            &scratch.logits,
+            &scratch.sample_buf,
+            &scratch.repeat_buf,
+            vocab_size,
+            ngram_scope,
+            &cfg0,
+            &mut rng_state,
+        );
         // First token is ready (sample_top_p's D2H forces GPU sync). This is
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
         let t_prefill = Instant::now();
         let mut next_token = tok0;
-        rng_state = rng0;
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -2644,24 +2636,31 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     let _ = stdout.flush();
                     // Fall through — resample next token as normal
                     let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-                    let scope_start = ngram_scope.len().saturating_sub(repeat_buf_cap);
-                    let scope = &ngram_scope[scope_start..];
-                    let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
-                    if !bytes.is_empty() {
-                        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
-                    }
-                    if let Some((open, close)) = tool_call_pair {
-                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-                    }
-                    if let Some((open, close)) = think_pair {
-                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-                    }
-                    let (tok, rng) = gpu.sample_top_p(
-                        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                        vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
-                    ).unwrap();
-                    next_token = tok;
-                    rng_state = rng;
+                    let mut blocked: Vec<u32> = Vec::new();
+                    sampler::collect_unclosed_attractor_blocks(
+                        ngram_scope,
+                        &attractor_pairs,
+                        20,
+                        2,
+                        &mut blocked,
+                    );
+                    let cfg = SamplerConfig {
+                        temperature: temp,
+                        top_p,
+                        repeat_penalty,
+                        repeat_window: repeat_buf_cap,
+                        blocked_tokens: blocked,
+                    };
+                    next_token = sampler::sample(
+                        gpu,
+                        &scratch.logits,
+                        &scratch.sample_buf,
+                        &scratch.repeat_buf,
+                        vocab_size,
+                        ngram_scope,
+                        &cfg,
+                        &mut rng_state,
+                    );
                     continue;
                 }
                 let nudge_tokens = tokenizer.encode(budget_alert_text);
@@ -2711,32 +2710,40 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 if generated >= max_tokens { break; }
             }
 
-            // Upload fresh repeat window (scope = generated tokens so far).
+            // Decide which paired-opener tokens (if any) trip the depth
+            // threshold over a 20-token window. #111 attractor block —
+            // cheap when not tripped, ~5 µs per blocked token when
+            // tripped (single 4-byte H2D into the logits buffer
+            // performed inside sampler::sample).
             let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-            let scope_start = ngram_scope.len().saturating_sub(repeat_buf_cap);
-            let scope = &ngram_scope[scope_start..];
-            let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            if !bytes.is_empty() {
-                gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
-            }
-            // #111 attractor block — see helper docstrings. Counts unclosed
-            // opens in a 20-token window; trips at depth ≥ 2. Cheap when
-            // not tripped, ~5 µs when tripped (single 4-byte H2D into the
-            // logits buffer).
-            if let Some((open, close)) = tool_call_pair {
-                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-            }
-            if let Some((open, close)) = think_pair {
-                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
-            }
-            // GPU sample: reads scratch.logits (already on GPU), writes token+rng
-            // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.
-            let (tok, rng) = gpu.sample_top_p(
-                &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
-            ).unwrap();
-            next_token = tok;
-            rng_state = rng;
+            let mut blocked: Vec<u32> = Vec::new();
+            sampler::collect_unclosed_attractor_blocks(
+                ngram_scope,
+                &attractor_pairs,
+                20,
+                2,
+                &mut blocked,
+            );
+            let cfg = SamplerConfig {
+                temperature: temp,
+                top_p,
+                repeat_penalty,
+                repeat_window: repeat_buf_cap,
+                blocked_tokens: blocked,
+            };
+            // GPU sample: reads scratch.logits (already on GPU), writes
+            // token+rng to scratch.sample_buf. Blocks only on the 8-byte
+            // D2H readback inside sampler::sample.
+            next_token = sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                vocab_size,
+                ngram_scope,
+                &cfg,
+                &mut rng_state,
+            );
         }
         // m.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to
@@ -3010,9 +3017,34 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     }
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
-    // Generate
+    // Generate. CPU-side sampling — VL path predates the GPU sampler
+    // and downloads logits each step. The order of ops is preserved
+    // from pre-PR3:
+    //   - first sample: top-p only (no penalty, no ngram block);
+    //   - subsequent samples: positional ngram-block, then
+    //     repeat_penalty, then top-p sample.
+    //
+    // The positional ngram block writes -INF to the
+    // *next-token-after-an-earlier-ngram-match* position — a
+    // per-history-pattern decision rather than the identity-only
+    // contract of SamplerConfig::blocked_tokens — so it stays inline
+    // rather than going through the SamplerConfig path.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+    let vl_cfg_first = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty: 1.0,
+        repeat_window: 0,
+        blocked_tokens: Vec::new(),
+    };
+    let vl_cfg = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        blocked_tokens: Vec::new(),
+    };
+    let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
     let t_prefill = Instant::now();
     let mut generated = 0;
 
@@ -3036,8 +3068,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
-        llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
-        next_token = llama::sample_top_p(&logits, temp, top_p);
+        next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
