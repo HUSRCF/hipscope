@@ -9,7 +9,7 @@ Skill for adding a new **GPU arch** to hipfire (or fixing arch-specific
 codegen / dispatch issues). Most of the mistakes prior arch ports
 have hit are documented here so you don't repeat them.
 
-> **Note (post-0.1.20-a):** This skill is about **RDNA/CDNA hardware
+> **Note (post-0.1.20):** This skill is about **RDNA/CDNA hardware
 > archs** (gfx1100, gfx1201, gfx94x, etc.) — NOT model archs.
 > If you want to add a new MODEL family (Llama-3, Mixtral, etc.) you
 > implement the `Architecture` trait in your own crate. See

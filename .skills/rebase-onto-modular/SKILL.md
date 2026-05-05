@@ -1,12 +1,12 @@
 ---
 name: rebase-onto-modular
-description: Use when porting a hipfire feature/fix branch authored against pre-0.1.20-a master onto post-modular master. Walks through the engine→hipfire-runtime + per-arch-crate split mechanically, then surfaces semantic conflicts that need human judgment.
+description: Use when porting a hipfire feature/fix branch authored against pre-0.1.20 master onto post-modular master. Walks through the engine→hipfire-runtime + per-arch-crate split mechanically, then surfaces semantic conflicts that need human judgment.
 ---
 
 # rebase-onto-modular
 
-Hipfire's 0.1.20-a release split the monolithic `engine` crate into a runtime
-crate plus per-arch crates. Branches authored before 0.1.20-a need their
+Hipfire's 0.1.20 release split the monolithic `engine` crate into a runtime
+crate plus per-arch crates. Branches authored before 0.1.20 need their
 import paths, Cargo deps, and (sometimes) trait-dispatch sites rewritten
 before they compile against current master.
 
@@ -20,7 +20,7 @@ then guides human resolution of the remaining 20%.
   in the diff).
 - They (or you, on their behalf) want to bring it onto post-modular master.
 
-## Topology recap (post-0.1.20-a)
+## Topology recap (post-0.1.20)
 
 ```
 crates/
@@ -131,7 +131,7 @@ until you delete it.
 
 ## Reference
 
-- Migration map: `CHANGELOG.md` 0.1.20-a entry
+- Migration map: `CHANGELOG.md` 0.1.20 entry
 - Crate topology: `CONTRIBUTING.md` "Crate topology" section
 - Architecture trait: `crates/hipfire-runtime/src/arch.rs`
 - Toy arch template: `crates/hipfire-arch-toy/`

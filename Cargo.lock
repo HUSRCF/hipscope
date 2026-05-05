@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "hip-bridge"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "libloading",
  "thiserror",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.1.9-alpha.1"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -329,14 +329,14 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "hip-bridge",
 ]
 
 [[package]]
 name = "redline"
-version = "0.1.20-a"
+version = "0.1.20"
 dependencies = [
  "libc",
  "libloading",

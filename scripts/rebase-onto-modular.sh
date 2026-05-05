@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rebase-onto-modular.sh — port a pre-modular branch to post-modular master.
 #
-# As of 0.1.20-a, hipfire's monolithic `engine` crate split into
+# As of 0.1.20, hipfire's monolithic `engine` crate split into
 # `hipfire-runtime` + per-arch crates. Branches authored against pre-modular
 # master need their import paths + Cargo deps rewritten to compile.
 #
@@ -165,7 +165,7 @@ if ! git diff --quiet; then
 
     Auto-applied by scripts/rebase-onto-modular.sh.
 
-    Path renames + use-statement rewrites against the 0.1.20-a crate split:
+    Path renames + use-statement rewrites against the 0.1.20 crate split:
       crates/engine/* → crates/hipfire-runtime/* (default)
                      → crates/hipfire-arch-qwen35/*    (qwen35, speculative, pflash)
                      → crates/hipfire-arch-qwen35-vl/* (qwen35_vl, image)

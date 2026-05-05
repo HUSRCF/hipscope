@@ -32,7 +32,7 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
 # Hotspots that can affect forward-pass output or speed.
 #
-# Updated for post-0.1.20-a modular topology (PR 7+):
+# Updated for post-0.1.20 modular topology (PR 7+):
 # - File-name patterns (e.g. `qwen35\.rs`) match across the new arch
 #   crate locations (e.g. `crates/hipfire-arch-qwen35/src/qwen35.rs`).
 # - `arch\.rs` matches the Architecture trait + per-arch impls
