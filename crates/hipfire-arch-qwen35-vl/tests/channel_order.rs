@@ -12,11 +12,11 @@
 //! If someone removes the swap, these assertions fail before any vision
 //! inference runs.
 //!
-//! See `crates/engine/src/image.rs` for the swap itself.
+//! See `crates/hipfire-arch-qwen35-vl/src/image.rs` for the swap itself.
 
 use std::path::PathBuf;
 
-use hipfire_runtime::image::load_and_preprocess;
+use hipfire_arch_qwen35_vl::image::load_and_preprocess;
 use image::{ImageBuffer, Rgb};
 
 /// Write a 32x32 solid-color PNG to a temp path and return the path.

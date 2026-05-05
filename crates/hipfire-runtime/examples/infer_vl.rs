@@ -5,7 +5,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
-use hipfire_runtime::qwen35_vl;
+use hipfire_arch_qwen35_vl::qwen35_vl;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,10 +37,18 @@ fn main() {
     eprintln!("Image: {image_path}");
     eprintln!("Question: {question}");
 
-    // Load model
+    // Load model. PR 9: bring-up triple (config → load → state) goes
+    // through the `Architecture` trait for both Qwen35 (text) and
+    // Qwen35Vl (vision). Forward calls (`qwen35::forward_scratch`,
+    // `qwen35_vl::vision_forward`) stay direct static dispatch.
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_arch_qwen35::Qwen35;
+    use hipfire_arch_qwen35_vl::Qwen35Vl;
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
-    let text_config = qwen35::config_from_hfq(&hfq).expect("failed to read text config");
-    let vision_config = qwen35_vl::vision_config_from_hfq(&hfq).expect("failed to read vision config");
+    let text_config = <Qwen35 as Architecture>::config_from_hfq(&hfq)
+        .expect("failed to read text config");
+    let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq)
+        .expect("failed to read vision config");
     eprintln!("Text: dim={}, layers={}, vocab={}", text_config.dim, text_config.n_layers, text_config.vocab_size);
     eprintln!("Vision: hidden={}, layers={}, heads={}, patch={}",
         vision_config.hidden_size, vision_config.num_layers, vision_config.num_heads, vision_config.patch_size);
@@ -51,7 +59,7 @@ fn main() {
 
     // Load and preprocess image
     eprintln!("Preprocessing image...");
-    let (pixels, img_h, img_w) = hipfire_runtime::image::load_and_preprocess(
+    let (pixels, img_h, img_w) = hipfire_arch_qwen35_vl::image::load_and_preprocess(
         Path::new(image_path),
         vision_config.patch_size,
         vision_config.spatial_merge_size,
@@ -63,7 +71,7 @@ fn main() {
     eprintln!("Image: {}x{} → {}x{} patches → {} visual tokens", img_w, img_h, grid_h, grid_w, n_visual_tokens);
 
     // Extract patches for vision encoder
-    let patches = hipfire_runtime::image::extract_patches(
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
     );
@@ -73,10 +81,11 @@ fn main() {
 
     // Load vision weights (GPU-side for fast inference)
     eprintln!("Loading vision weights...");
-    let vision_weights = qwen35_vl::load_vision_weights(&hfq, &vision_config, &mut gpu)
+    let vision_weights = <Qwen35Vl as Architecture>::load_weights(&hfq, &vision_config, &mut gpu)
         .expect("failed to load vision weights");
 
-    // Run vision encoder (GPU linear layers + CPU attention)
+    // Run vision encoder (GPU linear layers + CPU attention).
+    // Forward = direct static call, not trait-dispatched (see arch.rs).
     eprintln!("Running vision encoder...");
     let t_vis = Instant::now();
     let visual_tokens = qwen35_vl::vision_forward(&mut gpu, &vision_weights, &vision_config, &patches, grid_h, grid_w)
@@ -85,7 +94,8 @@ fn main() {
     assert_eq!(visual_tokens.len(), n_visual_tokens * text_config.dim);
 
     eprintln!("Loading text weights...");
-    let weights = qwen35::load_weights(&hfq, &text_config, &mut gpu).expect("failed to load text weights");
+    let weights = <Qwen35 as Architecture>::load_weights(&hfq, &text_config, &mut gpu)
+        .expect("failed to load text weights");
 
     let kv_seq = 2048usize;
     let mut kv_cache = llama::KvCache::new_gpu(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();

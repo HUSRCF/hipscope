@@ -1,14 +1,14 @@
 //! Qwen3.5-VL vision encoder: SigLIP-2 ViT + spatial merger.
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
-use crate::hfq::HfqFile;
-use crate::llama::{f16_to_f32, f32_to_f16};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VisionConfig {
     pub hidden_size: usize,
     pub num_heads: usize,

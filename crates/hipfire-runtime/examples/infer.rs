@@ -8,7 +8,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
-use hipfire_runtime::qwen35_vl;
+use hipfire_arch_qwen35_vl::qwen35_vl;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +87,7 @@ fn main() {
         eprintln!("Vision: hidden={}, layers={}, heads={}", vision_config.hidden_size, vision_config.num_layers, vision_config.num_heads);
 
         let img = image_path.as_ref().unwrap();
-        let (pixels, img_h, img_w) = hipfire_runtime::image::load_and_preprocess(
+        let (pixels, img_h, img_w) = hipfire_arch_qwen35_vl::image::load_and_preprocess(
             Path::new(img),
             vision_config.patch_size,
             vision_config.spatial_merge_size,
@@ -96,7 +96,7 @@ fn main() {
         let grid_w = img_w / vision_config.patch_size;
         n_visual_tokens = (grid_h * grid_w) / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
-        let patches = hipfire_runtime::image::extract_patches(
+        let patches = hipfire_arch_qwen35_vl::image::extract_patches(
             &pixels, 3, img_h, img_w,
             vision_config.patch_size, vision_config.temporal_patch_size,
         );

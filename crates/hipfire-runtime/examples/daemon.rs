@@ -24,7 +24,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
-use hipfire_runtime::qwen35_vl;
+use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
@@ -1134,16 +1134,21 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // for why static dispatch wins for the hot path.
         use hipfire_runtime::arch::Architecture;
         use hipfire_arch_qwen35::Qwen35;
+        use hipfire_arch_qwen35_vl::Qwen35Vl;
         let config = <Qwen35 as Architecture>::config_from_hfq(&hfq)
             .map_err(|e| e.to_string())?;
 
-        // Detect VL model: check if vision config AND vision tensors are present
-        // Text-only models may have vision config in metadata but no actual vision weights
-        let vision_config = qwen35_vl::vision_config_from_hfq(&hfq);
+        // Detect VL model: vision_config presence (from HFQ metadata) AND
+        // actual vision tensors are required. Text-only Qwen3.5 models can
+        // have vision_config in metadata without the patch_embed weights.
+        // PR 9: bring-up triple now goes through the Qwen35Vl trait impl;
+        // forward (`qwen35_vl::vision_forward`) stays a direct static call.
         let has_vision_tensors = hfq.tensor_data("model.visual.patch_embed.proj.weight").is_some();
+        let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq).ok();
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
             if has_vision_tensors {
-                let vw = qwen35_vl::load_vision_weights(&hfq, &vc, gpu).map_err(|e| format!("{e}"))?;
+                let vw = <Qwen35Vl as Architecture>::load_weights(&hfq, &vc, gpu)
+                    .map_err(|e| format!("{e}"))?;
                 eprintln!("  VL model: vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
                 (Some(vc), Some(vw))
             } else {
@@ -2887,7 +2892,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // Load and preprocess image (smart resize matching HuggingFace)
     eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
-    let (pixels, img_h, img_w) = hipfire_runtime::image::load_and_preprocess(
+    let (pixels, img_h, img_w) = hipfire_arch_qwen35_vl::image::load_and_preprocess(
         Path::new(image_path),
         vision_config.patch_size,
         vision_config.spatial_merge_size,
@@ -2899,7 +2904,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
     // Extract patches and run vision encoder
-    let patches = hipfire_runtime::image::extract_patches(
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
     );

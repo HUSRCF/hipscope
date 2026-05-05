@@ -16,13 +16,13 @@ byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rayon = "1"
 
-# Examples in this crate (daemon, infer_qwen35, etc.) consume the
-# qwen35 arch crate. The runtime library itself does NOT depend on
-# any arch crate (preserves the `arch-* → runtime` one-way graph).
-# This is a dev-only dep for examples; it does not appear in the
-# library's public dep tree.
+# Examples in this crate (daemon, infer_qwen35, infer_vl, etc.) consume
+# the arch crates. The runtime library itself does NOT depend on any
+# arch crate (preserves the `arch-* → runtime` one-way graph). These
+# are dev-only deps for examples; they do not appear in the library's
+# public dep tree.
 [dev-dependencies]
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
