@@ -2,8 +2,10 @@
 //! Usage: cargo run --release --example infer_hfq <model.hfq> [flags] [prompt text...]
 //! Flags: --q8kv, --fp32kv, --givens4, --givens2, --hfq4kv, --temp T
 
-use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, KvCache, ForwardScratch};
+use hipfire_arch_llama::Llama;
+use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{self, KvCache};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,9 +47,10 @@ fn main() {
     if temp == 0.0 { eprintln!("Sampling: GREEDY"); }
     else { eprintln!("Sampling: temp={temp}, top_p={top_p}"); }
 
-    // Parse HFQ
+    // Parse HFQ. PR 11: bring-up triple via `Architecture` trait dispatch.
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
-    let config = hfq::config_from_hfq(&hfq).expect("failed to read model config");
+    let config = <Llama as Architecture>::config_from_hfq(&hfq)
+        .expect("failed to read model config");
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
 
@@ -96,10 +99,11 @@ fn main() {
     // Init GPU
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
 
-    // Load weights
+    // Load weights via the trait.
     eprintln!("Loading weights...");
     let t0 = Instant::now();
-    let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = <Llama as Architecture>::load_weights(&hfq, &config, &mut gpu)
+        .expect("failed to load weights");
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // KV cache
@@ -119,8 +123,8 @@ fn main() {
         KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     };
 
-    // Persistent scratch buffers (zero-alloc forward pass)
-    let scratch = ForwardScratch::new(&mut gpu, &config).unwrap();
+    // Persistent scratch buffers (zero-alloc forward pass) via the trait.
+    let scratch = <Llama as Architecture>::new_state(&mut gpu, &config).unwrap();
     let mut rng_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
     if rng_state == 0 { rng_state = 1; }

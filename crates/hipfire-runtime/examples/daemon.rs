@@ -22,6 +22,7 @@ use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
+use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -1297,11 +1298,17 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
         // the FA/LA hybrid wiring from arch_id 5/6). physical_cap == max_seq.
-        let config = hipfire_runtime::hfq::config_from_hfq(&hfq).ok_or("failed to read LLaMA config")?;
-        let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+        // PR 11: dispatch through the `Architecture` trait for the bring-up
+        // triple (config → load → scratch). Forward passes below still call
+        // `llama::*` directly — see crates/hipfire-arch-llama/src/arch.rs
+        // for why static dispatch wins for the hot path.
+        use hipfire_runtime::arch::Architecture;
+        let config = <Llama as Architecture>::config_from_hfq(&hfq)
+            .map_err(|e| e.to_string())?;
+        let weights = <Llama as Architecture>::load_weights(&hfq, &config, gpu)?;
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
-        let scratch = llama::ForwardScratch::new(gpu, &config).map_err(|e| format!("{e}"))?;
+        let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             q35_config: None, q35_weights: None, q35_scratch: None,

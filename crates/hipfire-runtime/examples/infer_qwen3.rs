@@ -10,9 +10,11 @@
 //! via `hipfire_runtime::loop_guard::LoopGuard`. The default keeps today's bare
 //! semantics so kernel/loading sanity probes are unchanged byte-for-byte.
 
+use hipfire_arch_llama::Llama;
+use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -75,9 +77,12 @@ fn main() {
         eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
     }
 
-    // Parse HFQ
+    // Parse HFQ. PR 11: route bring-up triple through `Architecture` trait
+    // dispatch — same hybrid pattern as PR 8's qwen35 daemon path. Forward
+    // calls below stay direct `llama::*` static dispatch for the hot loop.
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
-    let config = hfq::config_from_hfq(&hfq).expect("failed to read model config");
+    let config = <Llama as Architecture>::config_from_hfq(&hfq)
+        .expect("failed to read model config");
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
 
@@ -142,10 +147,11 @@ fn main() {
     // Init GPU
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
 
-    // Load weights
+    // Load weights via the trait — same dispatch path as the daemon.
     eprintln!("Loading weights...");
     let t0 = Instant::now();
-    let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = <Llama as Architecture>::load_weights(&hfq, &config, &mut gpu)
+        .expect("failed to load weights");
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // KV cache
@@ -165,8 +171,8 @@ fn main() {
         KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     };
 
-    // Persistent scratch buffers (zero-alloc forward pass)
-    let scratch = ForwardScratch::new(&mut gpu, &config).unwrap();
+    // Persistent scratch buffers (zero-alloc forward pass) via the trait.
+    let scratch = <Llama as Architecture>::new_state(&mut gpu, &config).unwrap();
     let mut rng_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
     if rng_state == 0 { rng_state = 1; }
