@@ -390,6 +390,11 @@ pub struct Gpu {
     /// Set via `HIPFIRE_BLOB_FORCE=1` at init. Blobs accumulate unbounded in
     /// `capture_blobs` while set — only intended for short diagnostic runs.
     pub force_blob_path: bool,
+    /// Diagnostic: when true, gfx906 MMQ residual quantizes X to Q8_1 then
+    /// returns FP16 wave64 instead of running dp4a — isolates the cost of
+    /// the activation pre-quantize pass. Read once via `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1`
+    /// at init so the per-call hot path doesn't hit `env::var`'s global lock.
+    pub mmq_diag_quantize_only: bool,
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
@@ -645,6 +650,7 @@ impl Gpu {
                 .unwrap_or(mmq_screen_threshold_default),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
+            mmq_diag_quantize_only: std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
@@ -6636,200 +6642,27 @@ impl Gpu {
                 return result;
             }
         }
+
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // gfx906 dp4a MMQ residual path — default-on at batch ≥ 16.
-            // Falls through to FP16 wave64 when MMQ is forced off
-            // (HIPFIRE_MMQ=0) or screening rejects the weight.
-            //
-            // DEBUG: HIPFIRE_MMQ_DUMP=N dumps the inputs (a_raw, x) and the
-            // FP16 wave64 reference output (y_after - y_before) for the
-            // 0-indexed Nth residual call to /tmp/mmq_dump_<call_idx>/.
-            // Used to feed real production data into the standalone
-            // correctness test. Forces non-MMQ path so we get the FP16
-            // reference Y; rerun without the env var to test the MMQ path.
-            //
-            // Files written:
-            //   /tmp/mmq_dump_<n>/a_raw.bin    — HFQ4 weights (raw bytes)
-            //   /tmp/mmq_dump_<n>/x.f32        — FP32 activations [N × K]
-            //   /tmp/mmq_dump_<n>/y_in.f32     — FP32 Y (input residual stream)
-            //   /tmp/mmq_dump_<n>/y_out.f32    — FP32 Y after FP16 wave64
-            //   /tmp/mmq_dump_<n>/shape.txt    — "M K N" line
-            if let Ok(dump_n) = std::env::var("HIPFIRE_MMQ_DUMP")
-                .map(|s| s.parse::<usize>().unwrap_or(usize::MAX)) {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static DUMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-                let cur = DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                if cur == dump_n && self.arch == "gfx906" && batch_size > 1 {
-                    let dir = format!("/tmp/mmq_dump_{cur}");
-                    std::fs::create_dir_all(&dir).ok();
-
-                    // Weights: HFQ4 group bytes count = m * (k/256) * 136
-                    let weight_bytes = m * (k / 256) * 136;
-                    let mut a_host = vec![0u8; weight_bytes];
-                    self.hip.memcpy_dtoh(&mut a_host, &a_raw.buf).ok();
-                    std::fs::write(format!("{dir}/a_raw.bin"), &a_host).ok();
-
-                    // Activations: FP32 [N × K]
-                    let mut x_host = vec![0f32; batch_size * k];
-                    let x_bytes = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            x_host.as_mut_ptr() as *mut u8, x_host.len() * 4)
-                    };
-                    self.hip.memcpy_dtoh(x_bytes, &x.buf).ok();
-                    std::fs::write(format!("{dir}/x.f32"),
-                        unsafe { std::slice::from_raw_parts(
-                            x_host.as_ptr() as *const u8, x_host.len() * 4) }).ok();
-
-                    // Y before residual GEMM
-                    let mut y_host = vec![0f32; batch_size * m];
-                    let y_bytes = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            y_host.as_mut_ptr() as *mut u8, y_host.len() * 4)
-                    };
-                    self.hip.memcpy_dtoh(y_bytes, &y.buf).ok();
-                    std::fs::write(format!("{dir}/y_in.f32"),
-                        unsafe { std::slice::from_raw_parts(
-                            y_host.as_ptr() as *const u8, y_host.len() * 4) }).ok();
-
-                    std::fs::write(format!("{dir}/shape.txt"),
-                        format!("{m} {k} {batch_size}\n")).ok();
-
-                    // Run the FP16 wave64 path normally, then dump y_out.
-                    let _ = self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
-                    self.hip.device_synchronize().ok();
-
-                    let mut y_out_host = vec![0f32; batch_size * m];
-                    let y_out_bytes = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            y_out_host.as_mut_ptr() as *mut u8, y_out_host.len() * 4)
-                    };
-                    self.hip.memcpy_dtoh(y_out_bytes, &y.buf).ok();
-                    std::fs::write(format!("{dir}/y_out.f32"),
-                        unsafe { std::slice::from_raw_parts(
-                            y_out_host.as_ptr() as *const u8, y_out_host.len() * 4) }).ok();
-
-                    // ALSO run the dp4a kernel into a scratch Y (starting from
-                    // the same y_in we already saved) and dump that output as
-                    // y_mmq.f32. This lets us compare MMQ output IN-PROCESS vs
-                    // OUT-OF-PROCESS to detect cross-kernel state corruption.
-                    let y_mmq_scratch = self.zeros(&[batch_size * m], DType::F32).ok();
-                    if let Some(y_mmq) = y_mmq_scratch {
-                        // Restore y_in into the scratch buffer (we have it on host)
-                        let y_in_bytes = unsafe {
-                            std::slice::from_raw_parts(y_host.as_ptr() as *const u8, y_host.len() * 4)
-                        };
-                        self.hip.memcpy_htod(&y_mmq.buf, y_in_bytes).ok();
-                        let _ = self.gemm_hfq4g256_residual_mmq_gfx906(
-                            a_raw, x, &y_mmq, m, k, batch_size);
-                        self.hip.device_synchronize().ok();
-
-                        let mut y_mmq_host = vec![0f32; batch_size * m];
-                        let y_mmq_bytes = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                y_mmq_host.as_mut_ptr() as *mut u8, y_mmq_host.len() * 4)
-                        };
-                        self.hip.memcpy_dtoh(y_mmq_bytes, &y_mmq.buf).ok();
-                        std::fs::write(format!("{dir}/y_mmq.f32"),
-                            unsafe { std::slice::from_raw_parts(
-                                y_mmq_host.as_ptr() as *const u8, y_mmq_host.len() * 4) }).ok();
-
-                        // Quick numerical compare
-                        let mut max_err = 0f32;
-                        let mut sum_sq_err = 0f64;
-                        let mut sum_sq_ref = 0f64;
-                        for i in 0..(batch_size * m) {
-                            let r = y_out_host[i];
-                            let q = y_mmq_host[i];
-                            let e = (r - q).abs();
-                            if e > max_err { max_err = e; }
-                            sum_sq_err += (e as f64).powi(2);
-                            sum_sq_ref += (r as f64).powi(2);
-                        }
-                        let rms_err = (sum_sq_err / (batch_size * m) as f64).sqrt() as f32;
-                        let rms_ref = (sum_sq_ref / (batch_size * m) as f64).sqrt() as f32;
-                        let nrmse = rms_err / rms_ref.max(1e-12);
-                        eprintln!("  [mmq-dump] in-process MMQ vs FP16: \
-                            max_abs={max_err:.4e} NRMSE={:.4}%", nrmse * 100.0);
-
-                        self.free_tensor(y_mmq).ok();
-                    }
-
-                    eprintln!("  [mmq-dump] wrote {dir}/{{a_raw.bin,x.f32,y_in.f32,y_out.f32,y_mmq.f32,shape.txt}}");
-                    return Ok(());
-                }
-            }
-
-            // gfx906 dp4a MMQ residual path — default-on at
-            // batch_size ≥ 16. The redesigned kernel
-            // (gemm_hfq4g256_residual_mmq_gfx906_x{N}, see
-            // body.cuh) supersedes the original Phase 1 design;
-            // see docs/plans/gfx906-mmq-prd.md and
-            // docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md.
-            // Falls through to FP16 wave64 if mmq_screen rejects this
-            // weight (catches degenerate quant groups like row 3994).
             if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
                 } else {
                     true
                 };
-                // HIPFIRE_MMQ_K_FILTER=N restricts MMQ to calls where k==N.
-                let k_filter = std::env::var("HIPFIRE_MMQ_K_FILTER").ok().and_then(|s| s.parse::<usize>().ok());
-                let k_match = k_filter.map_or(true, |kf| k == kf);
-                // HIPFIRE_MMQ_CALL_FILTER=N:M activates MMQ only for residual
-                // calls whose 0-indexed call number is in [N, M). Used to
-                // bisect which call corrupts the model. Call counter resets
-                // per process (not per prefill — keeping it simple for now).
-                let call_filter = std::env::var("HIPFIRE_MMQ_CALL_FILTER").ok();
-                // HIPFIRE_MMQ_LAYER_FILTER=lo:hi maps to call indices via
-                // 2 residual calls per layer (attn-out + mlp-down). Layer N
-                // → calls [2N, 2N+1].
-                let layer_filter = std::env::var("HIPFIRE_MMQ_LAYER_FILTER").ok();
-                let call_idx = {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-                    COUNTER.fetch_add(1, Ordering::Relaxed)
-                };
-                let call_match = match &call_filter {
-                    None => true,
-                    Some(s) => {
-                        let parts: Vec<&str> = s.split(':').collect();
-                        let lo: usize = parts.first().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        let hi: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
-                        call_idx >= lo && call_idx < hi
-                    }
-                };
-                let layer_match = match &layer_filter {
-                    None => true,
-                    Some(s) => {
-                        let parts: Vec<&str> = s.split(':').collect();
-                        let lo: usize = parts.first().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        let hi: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
-                        let layer = call_idx / 2;
-                        layer >= lo && layer < hi
-                    }
-                };
-                if use_mmq && k_match && call_match && layer_match {
-                    if std::env::var("HIPFIRE_MMQ_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!("  [mmq-trace] call={call_idx} residual_mmq_gfx906 m={m} k={k} bs={batch_size}");
-                    }
+                if use_mmq {
                     return self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, x, y, m, k, batch_size);
                 }
-                // else: screening rejected this weight, fall through to wave64
             }
+
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
             }
+
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
-            // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
-            // Strix Halo. Experimental — see PR #73 / issue #60.
-            //
-            // When mmq_screen is true (default), each weight matrix is
-            // screened on first use: a small synthetic comparison detects
-            // outlier rows where Q8_1 precision loss exceeds the threshold
-            // (#87). Unsafe weights fall through to WMMA instead.
             if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
                 || should_use_mmq(&self.arch, batch_size)
             {
@@ -6841,22 +6674,22 @@ impl Gpu {
                 if use_mmq {
                     return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
                 }
-                // else: screening rejected this weight, fall through to WMMA
             }
-            // WMMA on gfx12 (RDNA4): K2-unroll port, validated by
-            // test_wmma_residual_gfx12 against the dot2 fp16 reference.
-            // Closes the 9B-prefill residual gap (was ~42% of GEMM time on
-            // the dot2 fallback below).
+
+            // WMMA on gfx12 (RDNA4): K2-unroll port
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
+
             // WMMA on gfx11+ (RDNA3): 16×16 tiled, ~8-10× over scalar
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
+
             // FP16 packed on all other RDNA: ~15% prefill improvement
             return self.gemm_hfq4g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
+
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
@@ -6894,8 +6727,6 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let grid_x = (m as u32 + grid_div - 1) / grid_div;
 
-        // Bandwidth: weight (read once, amortized across the batch loop on-chip
-        // via L1/L2), per-batch x read, per-batch y read-modify-write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
             + batch_size * k * 4
             + batch_size * m * 4 * 2;
@@ -7117,14 +6948,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
-        // wave64 kernel instead of running the dp4a kernel.
-        if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
-            return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
-        }
         // Quantize activations to Q8_1.
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        if std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1") {
+
+        // Diagnostic: HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1 isolates the cost of
+        // the Q8_1 activation pre-quantize by running the FP16 wave64 path
+        // *after* paying the quantize cost. The flag is read once at init
+        // (see `Gpu::new`) so this check is a single bool load, not a
+        // per-call env::var lookup.
+        if self.mmq_diag_quantize_only {
+            let _ = x_q8_ptr;
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
 
