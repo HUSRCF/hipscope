@@ -95,6 +95,7 @@ pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/g
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
@@ -228,6 +229,21 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../k
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+// gfx906 MMQ kernel (see docs/plans/gfx906-mmq-prd.md and
+// docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
+// Topology: nwarps=4, runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64},
+// per-mmq_x X_STRIDE (33 or 40) for ds_read_b128 alignment vs
+// bank-conflict tradeoff.
+// Shared body + per-mmq_x wrapper files.
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x8.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x16.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X24_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x24.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x32.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x40.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
@@ -357,6 +373,9 @@ pub const FUSED_QKVZA_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fu
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
 // to (total_m+1)/2. Byte-exact vs the wave32 base kernel.
 pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see fused_gate_up_hfq4g256_wave64_dp4a.hip for the
+// math derivation and lane-mapping invariants.
+pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip");
 
 // 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
@@ -366,6 +385,9 @@ pub const FUSED_QKV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fuse
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
 pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see fused_gate_up_hfq4g256_wave64_dp4a.hip for the
+// math derivation and lane-mapping invariants.
+pub const FUSED_QKV_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_wave64_dp4a.hip");
 // Note: 2-way fused gate+up uses the existing FUSED_GATE_UP_HFQ4G256_SRC
 // constant declared further down (kernels/src/fused_gate_up_hfq4g256.hip).
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
@@ -462,6 +484,11 @@ pub const GEMV_HFQ4G256_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv
 pub const GEMM_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256.hip");
 // CDNA3 wave64-native batched HFQ4-G256 GEMM (overwrite). 2 rows per block.
 pub const GEMM_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see kernels/src/gemm_hfq4g256_wave64_dp4a.hip for the
+// math + lane-mapping invariants. Targets the LM-head batched GEMM that
+// PMC at 2026-05-06 showed was 17.0 % of DFlash 27B steady-state decode
+// time on the FP wave64 path.
+pub const GEMM_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64_dp4a.hip");
 
 /// One-shot dequantize HFQ4-G256 matrix → FP16 row-major. Used when the
 /// downstream prefill GEMM path uses rocBLAS MFMA kernels (CDNA3 only —
@@ -579,6 +606,15 @@ pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
 /// gate_m + up_m to (total + 1) / 2. Byte-exact with the wave32 base.
 pub const FUSED_GATE_UP_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip
+// for the math + lane-mapping invariants. Per-kernel PMC at 2026-05-05
+// showed this kernel was memory-bound (3.86 % MemUnitStalled, 41 %
+// VALUBusy) so dp4a's 75 % x-traffic reduction lands on the right
+// bottleneck. Activations must be pre-quantized to block_q8_1_mmq
+// (use ensure_q8_1_mmq_x). Skip on gemv_residual — it was ILP-bound
+// and got its win from the prefetch variant instead.
+pub const FUSED_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip");
+
 
 
 /// INT8 co-located KV v2: [f16 scale (2B)][padding (2B)][int8 × head_dim] = 132 bytes per head.

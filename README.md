@@ -61,6 +61,40 @@ concrete published numbers to target, n_gen-aware bench methodology,
 and pointers at where the fat is. Cached snapshot at
 `.research-cache/lucebox-dflash27b.html` for forensic reproducibility.
 
+## Inspiration: gfx906 (MI50/MI60) optimizations
+
+hipfire's gfx906 prefill MMQ kernel and AR-decode optimizations were
+shaped by two community forks of `llama.cpp` that target Vega 20:
+
+- **[iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)**
+  — the original fork that ported and tuned gfx906-specific code paths
+  (warp-cooperative GEMV via half-wave split, Y-tile prefetch via
+  inline-asm `global_load_dword`, `__builtin_amdgcn_readfirstlane`-based
+  SGPR hoisting, separate HBM-load → register-cache → LDS-store
+  pipelining in the MMQ body). The "2602.01 version" commit
+  `eec153c086df6a9e7a69499bea3639597c085fff` was the canonical reference
+  we audited against.
+- **[skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)**
+  — fork-of-fork that propagates iacop's optimizations (commit
+  `42c298c` "port iacop optimizations") and tracks upstream more
+  aggressively. The accompanying
+  [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
+  is the best public reference for gfx906 ISA quirks (LDS bank-conflict
+  patterns at stride 32, dp4a issue-rate ceiling, Q8_1 activation
+  layout) — we used it as a sanity-check for several PMC-driven
+  redesign decisions.
+
+And of course an extra shout-out to `ggml-org/llama.cpp` itself: the
+templated `mmq_x` body in `mul_mat_q.cu` was the architectural scaffold
+we ported to gfx906 (templated mmq_x ladder, per-thread accumulator
+layout, MMQ_TILE_NE_K=32 sub-block factoring, Q8_1 quantize math). The
+inner loop is gfx906-specific; the outer shape is descendant.
+
+A standalone gfx906 perf investigation log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
+the prefill MMQ redesign log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`](docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
+
 ## Documentation
 
 | Page | Topic |
