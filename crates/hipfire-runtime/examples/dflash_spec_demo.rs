@@ -13,6 +13,38 @@
 //! context view to the last N positions (instead of the full accumulated
 //! history). Useful if the draft was trained on shorter contexts than the
 //! prompt+decode length we're handing it at inference.
+//!
+//! --prompts-file <path>: alternative to --prompt for resident-bench
+//! mode (issue #173). Reads a JSON-lines manifest where each line is
+//! `{"label":"...","prompt":"...","max":N}` (`max` optional, defaults
+//! to global --max; lines starting with '#' or empty are skipped).
+//! Loads target+drafter once and runs each row against the resident
+//! pair, with full state reset between rows. Each row's stderr output
+//! is bracketed by `@@@ ROW <i>: <label> @@@` / `@@@ ROW <i> END @@@`
+//! markers so downstream parsers can split a multi-row stream.
+//! `--prompts-file` rejects `--cask-sidecar` (CASK eviction state has
+//! no per-row reset path; combining them would silently inflate the
+//! `FlashCASK: N evictions` report). Single `--prompt` mode emits no
+//! row separators — output stays byte-identical to the legacy path.
+//!
+//! Per-process diagnostics that gate on env vars (`HIPFIRE_PROFILE`,
+//! `HIPFIRE_HOST_TIMING`, `HIPFIRE_DPM_WARMUP_SECS`,
+//! `HIPFIRE_DFLASH_LOOP_BREAK*`) apply **per-row**, not per-process,
+//! in `--prompts-file` mode. E.g. `HIPFIRE_PROFILE=1` collects a
+//! kernel-profile report for every row in the manifest. This is
+//! usually what you want for benching — per-row isolation — but
+//! note the report cadence changes vs single-prompt invocations.
+//!
+//! BENCHING NOTE: per CLAUDE.md "Prompt-structure τ sensitivity",
+//! perf benches must use COMMITTED prompt fixtures (e.g. files under
+//! `benchmarks/prompts/`), not heredoc strings — one stray newline
+//! reformat by an editor swings τ ~17%. The recommended pattern is
+//! to assemble the JSON-lines manifest at runtime from committed
+//! `.txt` fixtures via `jq -nR --arg p "$(cat path/to/prompt.txt)"
+//! '{label:"...",prompt:$p,max:N}'` (or commit the JSONL fixture
+//! directly, see `benchmarks/prompts/longcode_pflash.jsonl` for an
+//! example of the latter shape). Smoke / correctness tests that
+//! don't compare numbers across sessions can inline prompts safely.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -62,6 +94,7 @@ fn main() {
     let mut target_path: Option<String> = None;
     let mut draft_path: Option<String> = None;
     let mut prompt: Option<String> = None;
+    let mut prompts_file: Option<String> = None;
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
@@ -180,6 +213,10 @@ fn main() {
             }
             "--prompt" => {
                 prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompts-file" => {
+                prompts_file = Some(args[i + 1].clone());
                 i += 2;
             }
             "--max" => {
@@ -360,12 +397,79 @@ fn main() {
     }
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
-    let prompt = prompt.expect("--prompt required");
-    let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
+
+    // Build the prompt manifest. Either --prompt (single row, no separator
+    // emitted, byte-identical output to the legacy single-prompt path) or
+    // --prompts-file (multi-row, JSON-lines, `@@@ ROW` separators).
+    //
+    // See docs/plans/173-bench-residents-prompts.md and issue #173.
+    if prompt.is_some() && prompts_file.is_some() {
+        eprintln!("--prompt and --prompts-file are mutually exclusive");
+        std::process::exit(1);
+    }
+    if prompts_file.is_some() && cask_sidecar.is_some() {
+        // EvictionCtx.eviction_count has no reset path; cumulative counts
+        // across rows would be silently wrong-looking in the FlashCASK
+        // report. Fail fast rather than ship misleading numbers.
+        eprintln!("--prompts-file + --cask-sidecar is not supported (eviction state would leak across rows)");
+        std::process::exit(1);
+    }
+    // Each row is (label, raw_prompt, row_max_tokens). row_max_tokens
+    // defaults to the global --max if the manifest line omits it.
+    let prompts: Vec<(String, String, usize)> = if let Some(pf) = prompts_file.as_ref() {
+        let raw = std::fs::read_to_string(pf)
+            .unwrap_or_else(|e| { eprintln!("--prompts-file: read {pf}: {e}"); std::process::exit(1); });
+        let mut out = Vec::new();
+        for (idx, line) in raw.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[prompts-file] skipping line {}: invalid JSON: {e}", idx + 1);
+                    continue;
+                }
+            };
+            let label = v.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if label.contains("@@@") || label.contains('\n') {
+                eprintln!("[prompts-file] skipping line {}: label must not contain '@@@' or newline", idx + 1);
+                continue;
+            }
+            let p = match v.get("prompt").and_then(|x| x.as_str()) {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("[prompts-file] skipping line {}: missing 'prompt'", idx + 1);
+                    continue;
+                }
+            };
+            let m = v.get("max").and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(max_tokens);
+            out.push((label, p, m));
+        }
+        if out.is_empty() {
+            eprintln!("--prompts-file: no usable rows in {pf}");
+            std::process::exit(1);
+        }
+        out
+    } else {
+        let p = prompt.unwrap_or_else(|| {
+            eprintln!("--prompt or --prompts-file required");
+            std::process::exit(1);
+        });
+        vec![(String::new(), p, max_tokens)]
+    };
+    let multi_row = prompts.len() > 1 || prompts_file.is_some();
 
     eprintln!("=== dflash_spec_demo ===");
     eprintln!("target: {target_path}");
     eprintln!("draft:  {draft_path}");
+    if multi_row {
+        eprintln!("prompts: {} rows from {}", prompts.len(),
+            prompts_file.as_deref().unwrap_or("--prompt"));
+    }
     if let Some(n) = ctx_slice {
         eprintln!("ctx_slice: last {n} positions only (bisect mode)");
     }
@@ -478,37 +582,7 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
-    if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
-        tokenizer.dump_prompt_heat(&prompt);
-    }
-    let mut prompt_tokens = tokenizer.encode(&prompt);
-    if chatml {
-        // Match daemon.rs production path: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n
-        // Do NOT pre-append `<think>\n` — Qwen3.5 opens a think block itself when
-        // needed, and forcing it pushes open-ended prompts into runaway
-        // chain-of-thought that loops (measured on rivers essay: baseline AR
-        // decays into ".*Wait, I need to be careful.*" repeats after ~600 tokens).
-        let im_start = tokenizer.encode("<|im_start|>");
-        let im_end = tokenizer.encode("<|im_end|>");
-        let user = tokenizer.encode("user");
-        let asst = tokenizer.encode("assistant");
-        let nl = tokenizer.encode("\n");
-        assert!(im_start.len() == 1, "tokenizer has no <|im_start|> special");
-        let mut chat = Vec::new();
-        chat.extend_from_slice(&im_start);
-        chat.extend_from_slice(&user);
-        chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&prompt_tokens);
-        chat.extend_from_slice(&im_end);
-        chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&im_start);
-        chat.extend_from_slice(&asst);
-        chat.extend_from_slice(&nl);
-        prompt_tokens = chat;
-        eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
-    }
-    eprintln!("prompt: {:?}", prompt);
-    eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
+    // Per-row tokenize + ChatML wrap is done inside the per-row loop below.
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
     // Size for the max block we may use this session so adaptive-B-up
@@ -589,6 +663,121 @@ fn main() {
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
+    // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
+    // The policy evicts target.kv_cache between spec_step cycles.
+    // compact_offset is maintained on kv_cache itself, so qwen35's
+    // forward_scratch sees the right RoPE phase without extra plumbing.
+    //
+    // Built ONCE outside the per-row loop. The
+    // `--prompts-file + --cask-sidecar` rejection above ensures
+    // cask_policy is only ever Some(...) in single-prompt mode (1
+    // iteration), so eviction_count carrying across rows isn't a
+    // concern in practice — but locating the build here documents
+    // the invariant "this object's lifetime is the process, not the
+    // row." If a future change lifts the rejection, eviction_count
+    // would need an explicit reset hook; today it doesn't have one.
+    let cask_policy: Option<CaskPolicy> = if let Some(path) = cask_sidecar.as_ref() {
+        let centers = TriAttnCenters::load(Path::new(path)).expect("load cask sidecar");
+        let fa_layer_ids: Vec<usize> = target.config.layer_types.iter().enumerate()
+            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+            .collect();
+        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
+        // Ensure target KV has enough headroom for budget+beta+B+margin. The
+        // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
+        // don't resize here; just assert.
+        assert!(
+            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_scratch_b + 4,
+            "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
+            target.kv_cache.max_seq,
+            cask_budget + cask_beta + draft_scratch_b + 4,
+        );
+        let base = EvictionCtx::new(
+            &mut gpu, &centers, fa_layer_ids,
+            cask_budget, cask_beta,
+            target.config.n_heads, target.config.n_kv_heads, target.config.head_dim,
+            n_rot, target.config.rope_theta, target.kv_cache.max_seq,
+        ).expect("build EvictionCtx for FlashCASK");
+        Some(if use_cask {
+            eprintln!("FlashCASK: CASK α={:.2} m={} budget={} β={}", cask_core_frac, cask_fold_m, cask_budget, cask_beta);
+            CaskPolicy::Cask(CaskCtx::new(base, cask_core_frac, cask_fold_m))
+        } else {
+            eprintln!("FlashCASK: TriAttention (plain) budget={} β={}", cask_budget, cask_beta);
+            CaskPolicy::Plain(base)
+        })
+    } else { None };
+
+    // ── Per-row loop ──────────────────────────────────────────────────
+    // Issue #173: when --prompts-file is used, run multiple prompts
+    // against the resident (target, draft) pair to amortize the ~17 GB
+    // model H2D. Single --prompt mode runs once with no separator, so
+    // existing parsers see byte-identical output.
+    //
+    // State reset list at top of each iteration is the canonical block
+    // from docs/plans/173-bench-residents-prompts.md "Per-row reset
+    // (exhaustive)" — anything not zeroed by
+    // `seed_target_hidden_from_prompt → target.reset_state(gpu)`
+    // (which only touches DeltaNet recurrent state).
+    for (row_idx, (row_label, row_raw_prompt, row_max_tokens)) in prompts.iter().enumerate() {
+        let row_max_tokens: usize = *row_max_tokens;
+        if multi_row {
+            eprintln!("@@@ ROW {row_idx}: {row_label} @@@");
+        }
+
+        // ── Per-row state reset ────────────────────────────────────
+        // Required for correctness on row 2+. See plan §"Per-row reset".
+        target_hidden_host.clear();
+        // KV write head + RoPE compaction. seed_target_hidden_from_prompt
+        // calls target.reset_state but that only zeros DN buffers;
+        // compact_offset (set by CASK eviction) persists otherwise.
+        target.kv_cache.compact_offset = 0;
+        // Draft scratch upload-tracking. The per-row scatter +
+        // abs_positions seed below is what re-primes these.
+        draft_scratch.reset_upload_tracking();
+        // Hidden ring-buffer head/written counters (GPU buffers stay).
+        hidden_rb.reset();
+        // Spec / DDTree thread-local diagnostic counters that already
+        // had reset paths.
+        hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
+        hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
+        // Host-timing counters (only relevant when HIPFIRE_HOST_TIMING=1,
+        // but the call is cheap and keeps the cumulative-vs-per-row
+        // semantics right when the flag flips on mid-battery).
+        hip_bridge::launch_counters::reset();
+
+        // ── Per-row tokenize + ChatML wrap ─────────────────────────
+        let prompt_normalized =
+            hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
+        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+            tokenizer.dump_prompt_heat(&prompt_normalized);
+        }
+        let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
+        if chatml {
+            // Match daemon.rs production path: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n
+            let im_start = tokenizer.encode("<|im_start|>");
+            let im_end = tokenizer.encode("<|im_end|>");
+            let user = tokenizer.encode("user");
+            let asst = tokenizer.encode("assistant");
+            let nl = tokenizer.encode("\n");
+            assert!(im_start.len() == 1, "tokenizer has no <|im_start|> special");
+            let mut chat = Vec::new();
+            chat.extend_from_slice(&im_start);
+            chat.extend_from_slice(&user);
+            chat.extend_from_slice(&nl);
+            chat.extend_from_slice(&prompt_tokens);
+            chat.extend_from_slice(&im_end);
+            chat.extend_from_slice(&nl);
+            chat.extend_from_slice(&im_start);
+            chat.extend_from_slice(&asst);
+            chat.extend_from_slice(&nl);
+            prompt_tokens = chat;
+            eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
+        }
+        eprintln!("prompt: {:?}", prompt_normalized);
+        eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
+        // Shadow `max_tokens` (CLI default) with this row's value so the
+        // existing decode-loop body keeps working unchanged.
+        let max_tokens = row_max_tokens;
+
     // ── Prefill: seed target_hidden via per-token forward_with_hidden ──
     eprintln!("seeding target_hidden from prompt ({} tokens)...", prompt_tokens.len());
     let t2 = Instant::now();
@@ -624,43 +813,11 @@ fn main() {
     eprintln!("prefill in {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
     vram_report(&gpu.hip, "after_prefill");
 
-    // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
-    // The policy evicts target.kv_cache between spec_step cycles.
-    // compact_offset is maintained on kv_cache itself, so qwen35's
-    // forward_scratch sees the right RoPE phase without extra plumbing.
-    let cask_policy: Option<CaskPolicy> = if let Some(path) = cask_sidecar.as_ref() {
-        let centers = TriAttnCenters::load(Path::new(path)).expect("load cask sidecar");
-        let fa_layer_ids: Vec<usize> = target.config.layer_types.iter().enumerate()
-            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
-            .collect();
-        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
-        // Ensure target KV has enough headroom for budget+beta+B+margin. The
-        // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
-        // don't resize here; just assert.
-        assert!(
-            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_scratch_b + 4,
-            "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
-            target.kv_cache.max_seq,
-            cask_budget + cask_beta + draft_scratch_b + 4,
-        );
-        let base = EvictionCtx::new(
-            &mut gpu, &centers, fa_layer_ids,
-            cask_budget, cask_beta,
-            target.config.n_heads, target.config.n_kv_heads, target.config.head_dim,
-            n_rot, target.config.rope_theta, target.kv_cache.max_seq,
-        ).expect("build EvictionCtx for FlashCASK");
-        Some(if use_cask {
-            eprintln!("FlashCASK: CASK α={:.2} m={} budget={} β={}", cask_core_frac, cask_fold_m, cask_budget, cask_beta);
-            CaskPolicy::Cask(CaskCtx::new(base, cask_core_frac, cask_fold_m))
-        } else {
-            eprintln!("FlashCASK: TriAttention (plain) budget={} β={}", cask_budget, cask_beta);
-            CaskPolicy::Plain(base)
-        })
-    } else { None };
-
     // Post-prefill eviction: if the prompt already filled past the
     // threshold, compact once before decoding so the spec loop starts at
-    // budget-sized physical state.
+    // budget-sized physical state. cask_policy is built once before the
+    // for-loop; the rejection of --prompts-file + --cask-sidecar
+    // guarantees this only runs in single-prompt mode.
     let mut position: usize = prompt_tokens.len();
     if let Some(ref p) = cask_policy {
         if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
@@ -925,7 +1082,18 @@ fn main() {
         eprintln!("emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
                   emitted.len(), ar_elapsed, emitted.len() as f64 / ar_elapsed);
         eprintln!("AR tokens: {:?}", emitted);
-        return;
+        // End-of-row for the AR-baseline path. In single-prompt mode this
+        // is the last (only) iteration so `continue` falls out of the
+        // 1-iteration loop and `fn main()` returns — equivalent to the
+        // historical `return;` here. In --prompts-file mode `continue`
+        // proceeds to the next row, and we emit the row END marker first
+        // so the multi-row protocol stays consistent across DFlash and
+        // AR-baseline rows. (Without this, --ar-baseline + --prompts-file
+        // would silently drop every row past 0.)
+        if multi_row {
+            eprintln!("@@@ ROW {row_idx} END @@@");
+        }
+        continue;
     }
 
     // HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
@@ -949,10 +1117,8 @@ fn main() {
         }
     }
 
-    // Reset Task #93 Phase B seed-oracle counters so stats reflect this run
-    // only (process-cumulative counters would poison multi-run harnesses).
-    hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
-    hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
+    // (Seed-oracle + ddtree-meta counter resets moved to the per-row reset
+    // block at the top of the multi-prompt loop — see issue #173.)
 
     // Adaptive-B state: tracks current B between cycles, plus a cooldown
     // counter and a histogram for end-of-run reporting.
@@ -1643,5 +1809,10 @@ fn main() {
             tau_pld,
             tau_dflash,
         );
+    }
+        // ── End of per-row loop body ──────────────────────────────
+        if multi_row {
+            eprintln!("@@@ ROW {row_idx} END @@@");
+        }
     }
 }
