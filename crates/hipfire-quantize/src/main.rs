@@ -1701,6 +1701,7 @@ fn main() {
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
+    let q8_router_flag = args.iter().any(|a| a == "--q8-router");
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -1790,6 +1791,11 @@ fn main() {
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
     let is_moe = arch_id == 6;
+    // Q8 router: always on for MoE models. 4-bit router quantization destroys
+    // routing precision on precision-sensitive models (Qwen3.6-A3B: 152/256
+    // expert rows drop below 0.99 cosine similarity at HFQ4G256). Cost: ~0.05%
+    // model size. See github.com/Kaden-Schutt/hipfire/issues/171.
+    let q8_router = is_moe || q8_router_flag;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
@@ -1906,7 +1912,10 @@ fn main() {
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
-            let supports_mq4 = inner_k % 256 == 0;
+            let supports_g256 = inner_k % 256 == 0;
+            let expert_mq6 = use_mq6g256 && supports_g256;
+            let expert_hfq6 = use_hfq6 && supports_g256;
+            let expert_hfq4 = use_hfq4g256 && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -1920,7 +1929,16 @@ fn main() {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if supports_mq4 {
+                let (quantized, qt, gs) = if expert_mq6 {
+                    let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32)
+                } else if expert_hfq6 {
+                    let q = quantize_hfq6g256(&f32_slice);
+                    (q, QuantType::HFQ6G256, 256u32)
+                } else if expert_hfq4 {
+                    let q = quantize_hfq4g256(&f32_slice);
+                    (q, QuantType::HFQ4G256, 256u32)
+                } else if supports_g256 {
                     let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32)
                 } else {
@@ -1937,7 +1955,7 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -2067,6 +2085,11 @@ fn main() {
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 }
+            } else if q8_router && is_q8_tensor(name) {
+                // Q8 router for MoE: keep mlp.gate.weight and
+                // shared_expert_gate.weight at Q8 regardless of --format.
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_mq4g256 && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
