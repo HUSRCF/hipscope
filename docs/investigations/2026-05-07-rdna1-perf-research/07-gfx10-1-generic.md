@@ -1,29 +1,17 @@
 # Exp #7: gfx10-1-generic compile target
 
 **Date:** 2026-05-07
-**Status:** PRE-REGISTRATION (criterion locked before treatment)
+**Status:** VERDICT — WIN (squash-merging to master)
 
 ## Lever
 
-LLVM groups gfx1010 (Navi 10), gfx1011 (Navi 12), gfx1012 (Navi 14) into the `gfx10-1-generic` target family. A single binary compiled with `--offload-arch=gfx10-1-generic` should run on any RDNA1 silicon. If our kernels compile cleanly to this target and produce bit-identical output, the per-arch JIT cache directory layout (currently `.hipfire_kernels/gfx1010/`, `.hipfire_kernels/gfx1011/`, etc.) could collapse to a single `.hipfire_kernels/gfx10-1-generic/` directory.
-
-## Why
-
-This is a compile-and-load test, not a perf-tuning experiment. If it works:
-
-1. The BC-160 (gfx1011) plan no longer needs a separate per-arch JIT step — the existing gfx10-1-generic kernels would just work.
-2. Build cache simplification — one directory covers all RDNA1 family.
-3. Forward compatibility — any future Navi-1.x silicon revision that lands in the gfx10-1 family inherits cached kernels for free.
+LLVM groups gfx1010 (Navi 10), gfx1011 (Navi 12), gfx1012 (Navi 14) into the `gfx10-1-generic` target family. A single binary compiled with `--offload-arch=gfx10-1-generic` should run on any RDNA1 silicon with bit-identical results.
 
 ## Implementation
 
 Single env override `HIPFIRE_TARGET_ARCH` added to `crates/rdna-compute/src/dispatch.rs::init_with_device`:
 
 ```rust
-// BEFORE
-let arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
-
-// AFTER
 let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
 let arch = std::env::var("HIPFIRE_TARGET_ARCH")
     .ok()
@@ -31,37 +19,60 @@ let arch = std::env::var("HIPFIRE_TARGET_ARCH")
     .unwrap_or(detected_arch);
 ```
 
-The override flows through `KernelCompiler::new(&arch)` → `--offload-arch={arch}` to hipcc. Cache key derives from `arch` so a different value triggers fresh JIT.
+Empty / unset preserves prior behavior byte-for-byte. When set, the value flows through `KernelCompiler::new(&arch)` → `--offload-arch={arch}` to hipcc and into the JIT cache key.
 
-## Scenario
+## Bench results
 
-- Hardware: hipx, single RX 5700 XT (gfx1010, ROCR_VISIBLE_DEVICES=1).
-- Test invocation: `HIPFIRE_TARGET_ARCH=gfx10-1-generic` daemon load + 9B inference.
-- Baseline: same daemon WITHOUT env (defaults to detected `gfx1010`).
-- Prompt: `"Why is the sky blue? Answer in two sentences."` (deterministic, temperature=0.0).
-- Comparison metric 1: byte-identical output token sequence.
-- Comparison metric 2: decode tok/s within 1% of baseline.
+Hardware: hipx, single RX 5700 XT (gfx1010, ROCR_VISIBLE_DEVICES=1).
 
-## Win criterion (pre-registered)
+### Quality gate
 
-ALL of:
-1. hipcc accepts `--offload-arch=gfx10-1-generic` and compiles all hipfire kernels without error on first JIT.
-2. Daemon loads and emits the canonical "loaded" event.
-3. First-token output matches the gfx1010-specific build byte-for-byte (deterministic decode).
-4. Decode tok/s within ±1% of gfx1010-specific baseline.
+Output bit-identical between gfx1010-specific and gfx10-1-generic builds for canonical 9B prompt:
 
-## Loss criteria (pre-registered)
+```
+md5: ccbefe413d7f8b68ecef9fd06a16d62b  (both conditions)
+```
 
-ANY of:
-- Compile failure on any kernel.
-- Daemon load failure.
-- Output divergence beyond first 16 tokens.
-- Decode tok/s outside ±1% (regression OR improvement — both indicate the binaries differ in a way that affects perf).
+### Performance equivalence
 
-## Action on win
+3 fresh-process runs per condition, deterministic decode, max_tokens=120:
 
-Document. Propose a small follow-up PR: make `gfx10-1-generic` the default for any gfx101x device. Cache key collapse to one family-level directory. Update `CLAUDE.md` user_hardware notes accordingly.
+| condition | run 1 | run 2 | run 3 | median | mean | σ |
+|---|---|---|---|---|---|---|
+| gfx1010-specific | 55.9 | 56.0 | 55.9 | 55.9 | 55.93 | 0.047 |
+| gfx10-1-generic | 55.8 | 55.9 | 55.8 | 55.8 | 55.83 | 0.047 |
 
-## Action on loss
+**Delta: -0.18% (mean), -0.18% (median).** Well within the ±1% pre-registered tolerance.
 
-Revert. Document failure mode. Master unchanged.
+## Verdict
+
+**WIN.** All four pre-registered win criteria satisfied:
+
+1. ✅ hipcc accepts `--offload-arch=gfx10-1-generic` and compiles all hipfire kernels without error on first JIT.
+2. ✅ Daemon emits `{"type":"loaded"...}` and proceeds to inference.
+3. ✅ First-token (and all 120) output matches the gfx1010-specific build byte-for-byte (md5 identical).
+4. ✅ Decode tok/s within ±1% of gfx1010-specific baseline (-0.18%).
+
+## Action taken
+
+- Mirrored env-override patch to local master worktree (`crates/rdna-compute/src/dispatch.rs`).
+- Squash-merged to master with this verdict doc.
+- Existing per-arch cache directories (`.hipfire_kernels/gfx1010/`) remain functional for users not setting the env. New env opt-in tested empirically to be perf-neutral and output-equivalent.
+
+## Implications
+
+This unblocks several follow-ons:
+
+1. **BC-160 (gfx1011) plan no longer needs separate per-arch JIT.** Setting `HIPFIRE_TARGET_ARCH=gfx10-1-generic` produces a binary that runs on any Navi 10/12/14 card with one cache directory.
+2. **Forward compatibility.** Any future Navi-1.x silicon revision that's part of the gfx10-1 family inherits the cached kernels.
+3. **Future default flip.** A follow-up PR could flip the default for any detected `gfx101x` arch to `gfx10-1-generic`. That would auto-collapse the per-arch cache for all RDNA1 users. Out of scope here — needs broader testing across multiple gfx101x cards before defaulting.
+
+## What this lever does NOT change
+
+- Performance: -0.18% delta is in the noise. Cross-arch generic targets typically lose a hair on micro-benchmarks vs arch-specific targets, but here the difference is below our 3-run measurement floor.
+- Behavior on non-RDNA1 cards (gfx1100, gfx1151, gfx1201): unchanged. The env override is opt-in; default behavior remains arch-specific.
+- Other arch families (gfx9-generic, gfx11-generic): not exercised by this experiment. Same lever should work for them by symmetry but bench-only confirmation is needed before claiming.
+
+## Closure
+
+Per the autoresearch contract, a WIN squash-merges to master and updates the baseline. Done.

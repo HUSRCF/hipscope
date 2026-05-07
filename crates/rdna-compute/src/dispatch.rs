@@ -575,7 +575,15 @@ impl Gpu {
         // currently-bound device into its handle.
         hip.set_device(id)?;
 
-        let arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        // HIPFIRE_TARGET_ARCH overrides the detected GPU arch for kernel
+        // compilation. Used to test cross-arch family targets like
+        // `gfx10-1-generic` (covers Navi 10/12/14) without per-arch JIT
+        // cache fragmentation. Empty / unset preserves prior behavior.
+        let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        let arch = std::env::var("HIPFIRE_TARGET_ARCH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(detected_arch);
         let (_, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
 
         // Check HIP runtime version matches GPU arch requirements
