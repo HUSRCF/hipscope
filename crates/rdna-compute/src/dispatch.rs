@@ -2124,11 +2124,13 @@ impl Gpu {
     }
 
     /// MQ4-Lloyd GEMV (4-bit + per-block 16-entry fp16 codebook). K must be a
-    /// multiple of 256. Slow generic chip-agnostic kernel — no fast path yet
-    /// (option B from the #115 follow-up extension; ppl-only viability check).
+    /// multiple of 256. gfx1100/1101/1102/1151 use the K4-unrolled + LDS-codebook
+    /// variant (cooperative double-load for the 64-entry table). Other archs
+    /// fall back to the chip-agnostic baseline switch-dispatch path.
     pub fn gemv_mq4g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_mq4g256_lloyd", kernels::GEMV_MQ4G256_LLOYD_SRC, "gemv_mq4g256_lloyd")?;
+        let (src, module) = kernels::gemv_mq4g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_mq4g256_lloyd")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
