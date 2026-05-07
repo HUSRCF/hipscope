@@ -859,6 +859,18 @@ pub fn weight_gemv_residual(
             gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ4G256Lloyd => {
+            // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
+            // single-acc fast variant (see kernel header for why single-acc).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         _ => {
             // Fallback: plain weight_gemv into a scratch, then add_inplace.
             // Allocates a scratch each call; only used for niche dtypes.
@@ -932,6 +944,18 @@ pub fn weight_gemv_swiglu_residual(
             };
             gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ4G256Lloyd => {
+            // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
+            // single-acc fast variant of the residual GEMV.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_mq4g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ6G256 => {
             // MQ6 down + residual fusion: same FWHT rotate + fused-residual
