@@ -55,8 +55,8 @@ the case we want filed.
 ```bash
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p engine
-cargo build --release --features deltanet --example test_kernels -p engine
+cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release --features deltanet --example test_kernels -p hipfire-runtime
 cargo build --release -p hipfire-quantize
 ```
 

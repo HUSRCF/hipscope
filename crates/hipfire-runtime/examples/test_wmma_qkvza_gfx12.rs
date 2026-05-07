@@ -4,7 +4,7 @@
 //! qkv/z/beta/alpha routing of the DeltaNet LinearAttention preamble.
 //! Compares against the validated `gemm_qkvza_hfq4g256_dot2` reference.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkvza_gfx12
 
 use rdna_compute::{DType, Gpu};

@@ -44,7 +44,7 @@ git checkout <candidate>
 # 2. Rebuild from clean
 cargo clean -p rdna-compute
 rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p engine \
+cargo build --release --features deltanet -p hipfire-runtime \
     --example bench_qwen35_mq4
 
 # 3. Run the gate
@@ -156,7 +156,7 @@ deterministic attractors.
 - Long-context drift past the prompts the gates exercise.
 
 For correctness on a new arch port: run
-`crates/engine/examples/test_kernels.rs` on the target hardware. It
+`crates/hipfire-runtime/examples/test_kernels.rs` on the target hardware. It
 runs each kernel through small golden cases against a CPU reference.
 That's the load-bearing correctness gate; the perf and coherence
 gates are optimization gates.

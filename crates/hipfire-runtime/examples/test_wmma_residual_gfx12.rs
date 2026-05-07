@@ -18,7 +18,7 @@
 //! Bails with a clear message on non-gfx12 archs (this kernel uses the
 //! `_w32_gfx12` builtin which does not exist on gfx11).
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_residual_gfx12
 
 use rdna_compute::Gpu;

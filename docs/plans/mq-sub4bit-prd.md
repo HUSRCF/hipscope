@@ -412,7 +412,7 @@ Same shape as existing MQ4 WMMA family but with 3-bit unpack inside the K-tile l
 ## 9. Appendix: Q0 Test Reproduction
 
 ```bash
-cargo run --release --example verify_mq_kernel -p engine
+cargo run --release --example verify_mq_kernel -p hipfire-runtime
 ```
 
 Expected output (gfx1100, release):

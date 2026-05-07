@@ -959,7 +959,7 @@ class Engine {
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
-    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
+    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
     this.reader = this.proc.stdout!.getReader();
@@ -4281,7 +4281,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4291,7 +4291,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p engine --example daemon");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.

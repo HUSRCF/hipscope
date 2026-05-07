@@ -7,7 +7,7 @@
 //!
 //! Bails on non-gfx12 (the `_w32_gfx12` builtin doesn't exist on gfx11).
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_gate_up_gfx12
 
 use rdna_compute::{DType, Gpu};

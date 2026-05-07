@@ -11,7 +11,7 @@
 //!   [4..8)   f32 zero
 //!   [8..200) 192B packed 6-bit values
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkv_hfq6_gfx12
 
 use rdna_compute::{DType, Gpu};

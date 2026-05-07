@@ -5,7 +5,7 @@
 //! Compares the new WMMA kernel against a CPU reference that decodes the
 //! same packed HFQ3 bytes via the unpack pattern from gemv_hfq3g256.hip.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkvza_hfq3
 
 use rdna_compute::{DType, Gpu};

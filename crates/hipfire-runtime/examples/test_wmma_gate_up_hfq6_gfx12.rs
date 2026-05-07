@@ -4,7 +4,7 @@
 //! gate_up routing from test_wmma_gate_up_gfx12. Compares against the
 //! validated `gemm_gate_up_hfq6g256_dot2` reference.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_gate_up_hfq6_gfx12
 
 use rdna_compute::{DType, Gpu};

@@ -103,7 +103,7 @@ cargo build --release --features deltanet \
   --example dflash_spec_demo \
   --example encode_prompt \
   --example run \
-  -p engine
+  -p hipfire-runtime
 ```
 
 ---
