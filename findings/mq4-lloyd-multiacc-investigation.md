@@ -169,6 +169,54 @@ deployments are clean.
 The investigation infrastructure (multiacc_diag kernel + Rust binding +
 diag binaries) is in this PR for future reuse on a gfx1100 host.
 
+## Update 2026-05-07 — gfx1100 confirmation (closes Q1)
+
+Open question 1 answered on gfx1100 (7900 XTX, ROCm 7.2). Per-call
+multi-acc-vs-CPU drift on real Qwen3.5-9B weights is essentially the
+same magnitude as gfx1151:
+
+| Tensor (K) | MQ3-Lloyd gfx1100 | MQ3-Lloyd gfx1151 | MQ4-Lloyd gfx1100 | MQ4-Lloyd gfx1151 |
+|---|---:|---:|---:|---:|
+| `mlp.gate_proj` (K=4096)   | 5.96e-7 | 5.66e-7 | 5.36e-7 | 5.36e-7 |
+| `mlp.down_proj` (K=12288)  | 2.35e-6 | 2.32e-6 | 1.76e-6 | 1.76e-6 |
+
+So Q2 (does MQ4-Lloyd multi-acc drift on gfx1100 too) is also
+answered yes — same per-call magnitude as gfx1151. Single-acc is the
+universally correct choice; multi-acc reorder noise is intrinsic to
+the kernel structure, not arch-specific.
+
+Full-coverage PPL drift on gfx1100, `qwen3.5-9b.mq3-lloyd`,
+ctx=2048 warmup=8 offset=0, calib-5m corpus:
+
+| Variant | NLL/tok | PPL | Δ vs slow |
+|---|---:|---:|---:|
+| Multi-acc production (PR #181) | 3.170653 | 23.8230 | **−0.0093** |
+| Slow generic (`HIPFIRE_LLOYD_FORCE_BASELINE=1`) | 3.179968 | 24.0460 | (canonical) |
+| Single-acc port (issue #188 WIP) | 3.179968 | 24.0460 | **byte-equal** |
+
+Same magnitude as gfx1151's drift (Δ NLL ±0.01 nats), but **opposite
+sign** — gfx1100 multi-acc lands NLL-favorable, gfx1151 multi-acc
+lands NLL-disfavorable. Both consistent with fp32 reorder noise; the
+direction is essentially random across the compiler's per-arch FMA
+scheduling. The "MQ3 fine, MQ4 broken" framing was always coverage,
+never a structural MQ4 bug — re-confirmed.
+
+Decode perf cost of porting MQ3-Lloyd to single-acc on gfx1100
+(`probe_commits.sh` cross-process A/B, 3 samples each, gen=30
+GRAPH=1 KV=asym3, qwen3.5-9b.mq3-lloyd):
+
+| Variant | Mean | Δ vs multi-acc |
+|---|---:|---:|
+| Multi-acc (production) | 121.7 tok/s | — |
+| Single-acc (5 kernels ported, K4+LDS preserved) | 119.2 tok/s | **−2.05%** |
+
+Misses PR #181's ≥120 tok/s ship gate by 0.8 tok/s. The decision
+(keep multi-acc + document arch-dependency vs port single-acc + accept
+2% perf hit vs arch-conditional dispatch) is open for maintainer input
+at issue #188. Single-acc implementation is on branch
+`feat/188-mq3-lloyd-single-acc-gfx1100` (one commit, mechanical
+5-file edit pattern).
+
 ## Repro
 
 ```sh
