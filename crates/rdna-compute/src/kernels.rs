@@ -43,10 +43,26 @@ pub const GEMV_MQ2G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv
 pub const GEMV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
 pub const GEMV_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd.hip");
-/// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook (cooperative
-/// double-load — 64 LDS entries vs MQ3-Lloyd's 32). 74 VGPR / 18 SGPR /
-/// 256 B LDS / 0 spills (matches MQ3-Lloyd gfx1100 register profile).
+/// gfx1100 (RDNA3) variant: K4 unroll + 64-slot LDS-codebook (two-phase
+/// cooperative load) + SINGLE linear accumulator. 71 VGPR / 18 SGPR /
+/// 256 B LDS / 0 spills. See kernel header for why single-acc (multi-acc K4
+/// produced 1.7% PPL drift on Qwen3.5-9B vs slow generic).
 pub const GEMV_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd.gfx1100.hip");
+
+/// MQ4G256Lloyd residual GEMV: y[row] += A[row] · x. Eliminates the
+/// alloc + gemv + add_inplace_f32 + free fallback chain on residual paths.
+pub const GEMV_MQ4G256_LLOYD_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd_residual.hip");
+pub const GEMV_MQ4G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd_residual.gfx1100.hip");
+/// MQ4G256Lloyd fused gate+up GEMV: 2 GEMVs in one launch (FFN preamble).
+pub const FUSED_GATE_UP_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq4g256_lloyd.hip");
+pub const FUSED_GATE_UP_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq4g256_lloyd.gfx1100.hip");
+/// MQ4G256Lloyd fused QKVZA GEMV: 4 GEMVs in one launch (LinearAttention
+/// preamble — qkv + z + beta + alpha).
+pub const FUSED_QKVZA_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq4g256_lloyd.hip");
+pub const FUSED_QKVZA_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq4g256_lloyd.gfx1100.hip");
+/// MQ4G256Lloyd fused QKV GEMV: 3 GEMVs in one launch (FullAttention preamble).
+pub const FUSED_QKV_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.hip");
+pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.gfx1100.hip");
 
 /// Returns the MQ4G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) and gfx1151 (RDNA3.5 Strix Halo APU) get the
@@ -65,6 +81,59 @@ pub fn gemv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
             (GEMV_MQ4G256_LLOYD_GFX1100_SRC, "gemv_mq4g256_lloyd_rdna3")
         }
         _ => (GEMV_MQ4G256_LLOYD_SRC, "gemv_mq4g256_lloyd"),
+    }
+}
+
+/// Same arch dispatch as `gemv_mq4g256_lloyd_for_arch` but returns the residual
+/// variant (y[row] += A[row] · x).
+pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (GEMV_MQ4G256_LLOYD_RESIDUAL_SRC, "gemv_mq4g256_lloyd_residual");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
+            (GEMV_MQ4G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq4g256_lloyd_residual_rdna3")
+        }
+        _ => (GEMV_MQ4G256_LLOYD_RESIDUAL_SRC, "gemv_mq4g256_lloyd_residual"),
+    }
+}
+
+/// Arch dispatch for fused gate+up MQ4-Lloyd. Mirrors MQ3-Lloyd's selector.
+pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_GATE_UP_MQ4G256_LLOYD_SRC, "fused_gate_up_mq4g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
+            (FUSED_GATE_UP_MQ4G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq4g256_lloyd_rdna3")
+        }
+        _ => (FUSED_GATE_UP_MQ4G256_LLOYD_SRC, "fused_gate_up_mq4g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKVZA MQ4-Lloyd (4-way demux: qkv/z/beta/alpha).
+pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKVZA_MQ4G256_LLOYD_SRC, "fused_qkvza_mq4g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
+            (FUSED_QKVZA_MQ4G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq4g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKVZA_MQ4G256_LLOYD_SRC, "fused_qkvza_mq4g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKV MQ4-Lloyd (3-way demux: q/k/v).
+pub fn fused_qkv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
+            (FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC, "fused_qkv_mq4g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd"),
     }
 }
 /// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
