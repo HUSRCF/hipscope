@@ -280,7 +280,7 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
 
 #[cfg(feature = "deltanet")]
 fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
-    let hfq = HfqFile::open(model_path)
+    let mut hfq = HfqFile::open(model_path)
         .map_err(|e| CaseOutcome::Fail(format!("failed to open HFQ: {e}")))?;
     let model_label = classify_qwen35_candidate(&hfq)?;
     let config = qwen35::config_from_hfq(&hfq)
@@ -289,7 +289,7 @@ fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
     let mut gpu = rdna_compute::Gpu::init()
         .map_err(|e| CaseOutcome::Skip(format!("GPU init unavailable: {e}")))?;
     let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        qwen35::load_weights(&hfq, &config, &mut gpu)
+        qwen35::load_weights(&mut hfq, &config, &mut gpu)
     }))
     .map_err(|panic| CaseOutcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
     .map_err(|e| CaseOutcome::Fail(format!("failed to load weights: {e}")))?;

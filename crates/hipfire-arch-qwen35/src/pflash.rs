@@ -482,7 +482,7 @@ pub fn load_drafter(
     target_tokenizer: &Tokenizer,
     max_kv_seq: usize,
 ) -> HipResult<()> {
-    let hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
+    let mut hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
         "pflash: open drafter HFQ at {}: {e}", path.display(),
     )))?;
     let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).ok_or_else(||
@@ -506,7 +506,7 @@ pub fn load_drafter(
         if is_hybrid {
             let q35_cfg = qwen35::config_from_hfq(&hfq).ok_or_else(||
                 hip_bridge::HipError::new(0, "pflash: hybrid tensors detected but qwen35 config parse failed"))?;
-            let weights = qwen35::load_weights(&hfq, &q35_cfg, gpu)?;
+            let weights = qwen35::load_weights(&mut hfq, &q35_cfg, gpu)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
             let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
             let kv = KvCache::new_gpu_q8(gpu, q35_cfg.n_layers, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq)?;

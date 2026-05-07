@@ -48,7 +48,7 @@ fn main() {
     else { eprintln!("Sampling: temp={temp}, top_p={top_p}"); }
 
     // Parse HFQ. PR 11: bring-up triple via `Architecture` trait dispatch.
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = <Llama as Architecture>::config_from_hfq(&hfq)
         .expect("failed to read model config");
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
@@ -102,7 +102,7 @@ fn main() {
     // Load weights via the trait.
     eprintln!("Loading weights...");
     let t0 = Instant::now();
-    let weights = <Llama as Architecture>::load_weights(&hfq, &config, &mut gpu)
+    let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
         .expect("failed to load weights");
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 

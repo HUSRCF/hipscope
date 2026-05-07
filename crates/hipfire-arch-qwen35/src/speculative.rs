@@ -197,13 +197,13 @@ impl ModelSlot {
         slot_config: ModelSlotConfig,
     ) -> HipResult<Self> {
         let name = name.into();
-        let hfq = HfqFile::open(path).map_err(|e| {
+        let mut hfq = HfqFile::open(path).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("open {} ({}): {}", path.display(), name, e))
         })?;
         let config = qwen35::config_from_hfq(&hfq).ok_or_else(|| {
             hip_bridge::HipError::new(0, &format!("invalid Qwen3.5 config in {} ({})", path.display(), name))
         })?;
-        let weights = qwen35::load_weights(&hfq, &config, gpu)?;
+        let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
 
         let n_kv_layers = config
             .layer_types

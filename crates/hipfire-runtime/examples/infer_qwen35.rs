@@ -71,7 +71,7 @@ fn main() {
         eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
     }
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
     eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
 
@@ -130,7 +130,7 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());

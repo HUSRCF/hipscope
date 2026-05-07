@@ -58,7 +58,7 @@ impl Architecture for Llama {
     }
 
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {

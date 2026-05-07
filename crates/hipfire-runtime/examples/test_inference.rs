@@ -20,7 +20,7 @@ fn main() {
     eprintln!("=== hipfire inference integration tests ===");
     eprintln!("Model: {model_path}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer not found");
@@ -31,7 +31,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let mut passed = 0;
     let mut failed = 0;

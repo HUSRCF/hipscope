@@ -128,7 +128,7 @@ pub trait Architecture: Send + 'static {
     /// (lazy load + LRU eviction for >VRAM models) is wired through
     /// `WeightTensor` and is not arch-specific.
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String>;

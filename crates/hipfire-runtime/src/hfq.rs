@@ -42,9 +42,13 @@ pub struct HfqFile {
     /// going through this struct (cleanly separates HfqFile's mmap-based
     /// tensor lookup from the pager's pread/io_uring transport).
     path: std::path::PathBuf,
-    /// mmap kept for backward compat (small models, non-APU systems).
-    /// On unified-memory APUs, tensor data is read via pread instead.
-    mmap: Mmap,
+    /// mmap for tensor data access on discrete-GPU systems where GPU VRAM
+    /// is separate from system RAM (no double-buffering cost).
+    /// `None` on unified-memory APUs (Strix Halo etc.) where mmap pages
+    /// and hipMalloc share physical RAM — keeping the mmap alive doubles
+    /// memory consumption. Dropped after header/index parsing via
+    /// `drop_mmap()`. When `None`, all tensor reads go through `pread`.
+    mmap: Option<Mmap>,
     pub arch_id: u32,
     pub metadata_json: String,
     tensors: Vec<HfqTensorInfo>,
@@ -169,9 +173,24 @@ impl HfqFile {
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
-            mmap, arch_id, metadata_json, tensors, tensor_map,
+            mmap: Some(mmap), arch_id, metadata_json, tensors, tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// Drop the mmap to free the virtual address mapping. After this call,
+    /// `tensor_data()` returns `None` and all reads go through `tensor_data_pread()`.
+    ///
+    /// On unified-memory APUs (Strix Halo, Steam Deck, etc.), GPU and CPU
+    /// share physical RAM. Keeping the mmap alive while hipMalloc copies
+    /// tensor data into GPU buffers doubles memory consumption (mmap pages
+    /// + GPU copy both resident). Dropping the mmap after header/index
+    /// parsing lets the kernel reclaim those pages.
+    ///
+    /// On discrete-GPU systems this is unnecessary (GPU VRAM is separate),
+    /// so callers should only invoke this when UMA is detected.
+    pub fn drop_mmap(&mut self) {
+        self.mmap = None;
     }
 
     /// Path the HFQ file was opened from. The weight pager uses this to
@@ -192,7 +211,12 @@ impl HfqFile {
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = *self.tensor_map.get(name)?;
         let info = &self.tensors[idx];
-        Some((info, &self.mmap[info.data_offset..info.data_offset + info.data_size]))
+        debug_assert!(
+            self.mmap.is_some(),
+            "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
+        );
+        let mmap = self.mmap.as_ref()?;
+        Some((info, &mmap[info.data_offset..info.data_offset + info.data_size]))
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -234,6 +258,44 @@ impl HfqFile {
     #[cfg(not(unix))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         self.tensor_data(name)
+    }
+
+    /// Read tensor data using the best available path:
+    /// - Unix with pread support: pread + fadvise_dontneed (avoids page cache buildup)
+    /// - Fallback: mmap slice (returns None if mmap was dropped)
+    ///
+    /// Returns owned Vec<u8> to avoid lifetime issues with the pread RefCell.
+    pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
+        let idx = *self.tensor_map.get(name)?;
+        let info = &self.tensors[idx];
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            let mut buf = vec![0u8; info.data_size];
+            let mut total_read = 0usize;
+            while total_read < info.data_size {
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                        info.data_size - total_read,
+                        (info.data_offset + total_read) as libc::off_t,
+                    )
+                };
+                if n <= 0 { break; }
+                total_read += n as usize;
+            }
+            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            return Some((info, buf));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mmap = self.mmap.as_ref()?;
+            Some((info, mmap[info.data_offset..info.data_offset + info.data_size].to_vec()))
+        }
     }
 
     /// Release page cache for a byte range. Only works if the range is NOT mmap'd.

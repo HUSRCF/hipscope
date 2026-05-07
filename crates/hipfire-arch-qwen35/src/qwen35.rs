@@ -661,8 +661,8 @@ impl DeltaNetState {
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
-        .or_else(|| hfq.tensor_data(name))
+    let (info, data) = hfq.tensor_data_vec(&full_name)
+        .or_else(|| hfq.tensor_data_vec(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let mut f32_data: Vec<f32> = match info.quant_type {
@@ -680,8 +680,8 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
 /// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
 fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
-        .or_else(|| hfq.tensor_data(name))
+    let (info, data) = hfq.tensor_data_vec(&full_name)
+        .or_else(|| hfq.tensor_data_vec(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
@@ -786,14 +786,14 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
 /// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
 fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
-        .or_else(|| hfq.tensor_data(name))
+    let (info, data) = hfq.tensor_data_vec(&full_name)
+        .or_else(|| hfq.tensor_data_vec(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        3 => hipfire_runtime::llama::dequantize_q8_0(data, n),
+        3 => hipfire_runtime::llama::dequantize_q8_0(&data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
             let group_size: usize = 256;
@@ -1188,26 +1188,35 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     load_any_as_f32(hfq, gpu, name, n)
 }
 
-pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+    // Drop the mmap on unix to avoid double-buffering on UMA systems.
+    // All tensor data reads go through pread + fadvise_dontneed, which
+    // doesn't require the mmap. On discrete-GPU systems this is harmless
+    // (pread is slightly slower than mmap but avoids page cache buildup).
+    #[cfg(unix)]
+    hfq.drop_mmap();
+
     eprintln!("  loading token_embd...");
-    let embd_info = hfq.tensor_data("model.language_model.embed_tokens.weight")
+    let (embd_meta, embd_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight")
         .expect("embed_tokens not found");
-    let (token_embd, embd_fmt) = if embd_info.0.quant_type == 6 {
-        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
-    } else if embd_info.0.quant_type == 7 {
-        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
-    } else if embd_info.0.quant_type == 3 {
+    let embd_qt = embd_meta.quant_type;
+    let (token_embd, embd_fmt) = if embd_qt == 6 {
+        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_data.len() / 1_000_000);
+        (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::HFQ4G256)
+    } else if embd_qt == 7 {
+        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_data.len() / 1_000_000);
+        (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::HFQ4G128)
+    } else if embd_qt == 3 {
         // Q8_0: [f16 scale][32 × int8] per block — upload raw, use Q8 embedding lookup
-        eprintln!("    (Q8_0 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
+        eprintln!("    (Q8_0 raw, {} MB)", embd_data.len() / 1_000_000);
+        (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::Q8_0)
     } else {
-        let f32_data: Vec<f32> = embd_info.1.chunks_exact(2)
+        let f32_data: Vec<f32> = embd_data.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
     };
+    drop(embd_data); // free source buffer before loading more tensors
 
     eprintln!("  loading output_norm...");
     // Final output norm: on Qwen3.5/3.6-MoE (A3B, arch_id=6) this tensor is
@@ -1225,34 +1234,31 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     };
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
-    let lm_head_info = hfq.tensor_data("lm_head.weight")
-        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
+    let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
+        .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
     let output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
-        load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
+        load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
-        eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
-        let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
-        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            let dtype = match embd_info.0.quant_type {
+        eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
+        let (_, tied_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight").unwrap();
+        if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
+            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
+            let dtype = match embd_qt {
                 6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256, _ => unreachable!()
             };
             WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
-        } else if embd_info.0.quant_type == 13 {
-            // MQ4-G256 tied embedding — produced by hipfire-quantize
-            // `--format mq4-all`. DFlash uses this to make the target's
-            // lm_head (tied to embed_tokens) hit the batched MQ4 GEMM path.
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+        } else if embd_qt == 13 {
+            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
-        } else if embd_info.0.quant_type == 14 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+        } else if embd_qt == 14 {
+            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
-        } else if embd_info.0.quant_type == 3 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+        } else if embd_qt == 3 {
+            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
         } else {
-            let f32_data: Vec<f32> = embd_data.chunks_exact(2)
+            let f32_data: Vec<f32> = tied_data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {

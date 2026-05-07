@@ -47,7 +47,7 @@ enum Outcome {
 }
 
 fn run(path: &str) -> Result<String, Outcome> {
-    let hfq = HfqFile::open(Path::new(path))
+    let mut hfq = HfqFile::open(Path::new(path))
         .map_err(|e| Outcome::Fail(format!("failed to open HFQ: {e}")))?;
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
         .map_err(|e| Outcome::Fail(format!("bad metadata JSON: {e}")))?;
@@ -103,7 +103,7 @@ fn run(path: &str) -> Result<String, Outcome> {
         let mut gpu = rdna_compute::Gpu::init()
             .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
         let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hipfire_arch_qwen35::qwen35::load_weights(&hfq, &q35_config, &mut gpu)
+            hipfire_arch_qwen35::qwen35::load_weights(&mut hfq, &q35_config, &mut gpu)
         }))
         .map_err(|panic| Outcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
         .map_err(|e| Outcome::Fail(format!("weight load failed: {e}")))?;

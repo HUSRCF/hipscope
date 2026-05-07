@@ -55,7 +55,7 @@ impl Architecture for Toy {
     /// The weight pager (lazy-load + LRU eviction) is wired through
     /// `WeightTensor` and is not arch-specific.
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         _gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {

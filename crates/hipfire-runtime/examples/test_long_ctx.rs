@@ -97,12 +97,12 @@ it?".to_string(),
     eprintln!("turns: {}", turns.len());
 
     // ── Load model ──────────────────────────────────────────────────────
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     // Size the KV cache for the sum of all turn prompts + generations, with slack.
     let max_seq = 8192usize;

@@ -73,6 +73,26 @@ impl SafetensorsFile {
         Some((meta, &self.mmap[start..end]))
     }
 
+    /// Advise the kernel to drop page cache for a tensor's data region.
+    /// On UMA systems this is critical: 234 GB of mmap'd safetensors
+    /// pages compete with hipMalloc for the same physical RAM.
+    #[cfg(unix)]
+    fn drop_tensor_pages(&self, name: &str) {
+        if let Some(meta) = self.tensors.get(name) {
+            let start = self.header_size + meta.data_offsets[0];
+            let len = meta.data_offsets[1] - meta.data_offsets[0];
+            use std::os::unix::io::AsRawFd;
+            // POSIX_FADV_DONTNEED = 4
+            unsafe {
+                extern "C" { fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32; }
+                posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn drop_tensor_pages(&self, _name: &str) {}
+
     fn tensor_names(&self) -> Vec<&str> {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
@@ -1298,6 +1318,70 @@ struct HfqTensor {
     shape: Vec<u32>,
     group_size: u32,
     data: Vec<u8>,
+    /// When data is spilled to disk, this holds the byte count.
+    /// `data` is empty and the bytes live in the spill file.
+    spilled_len: u64,
+}
+
+/// Streaming tensor spill file. When the quantizer accumulates more than
+/// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
+/// tensors to this file. At write_hfq time, spilled data is copied from
+/// the spill file instead of from memory, keeping peak RSS bounded.
+struct TensorSpill {
+    file: std::io::BufWriter<File>,
+    path: PathBuf,
+    offset: u64,
+}
+
+impl TensorSpill {
+    fn new(dir: &Path) -> std::io::Result<Self> {
+        let path = dir.join(".hipfire_quant_spill.tmp");
+        let file = std::io::BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(&path)?,
+        );
+        Ok(Self { file, path, offset: 0 })
+    }
+
+    /// Write tensor data to the spill file. Returns the byte count written.
+    fn spill(&mut self, data: &[u8]) -> std::io::Result<u64> {
+        use std::io::Write;
+        self.file.write_all(data)?;
+        self.offset += data.len() as u64;
+        Ok(data.len() as u64)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.flush()
+    }
+
+    fn cleanup(self) {
+        // Explicit cleanup — Drop impl handles the actual removal.
+        drop(self);
+    }
+}
+
+impl Drop for TensorSpill {
+    fn drop(&mut self) {
+        // Ensure the temp file is removed even on panic.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spill tensors whose data is in memory to the spill file, freeing RAM.
+/// Called after each layer's expert batch to keep peak RSS bounded.
+fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+    let in_mem: usize = tensors.iter().filter(|t| t.spilled_len == 0).map(|t| t.data.len()).sum();
+    if in_mem < threshold { return; }
+    for t in tensors.iter_mut() {
+        if t.spilled_len == 0 && !t.data.is_empty() {
+            let len = spill.spill(&t.data).unwrap_or(0);
+            t.spilled_len = len;
+            t.data = Vec::new(); // free the memory
+        }
+    }
+    let _ = spill.flush();
 }
 
 fn write_hfq(
@@ -1305,6 +1389,7 @@ fn write_hfq(
     arch: u32,
     metadata_json: &str,
     tensors: &[HfqTensor],
+    spill: Option<&mut TensorSpill>,
 ) -> std::io::Result<()> {
     let mut f = File::create(path)?;
 
@@ -1335,7 +1420,8 @@ fn write_hfq(
         // group size
         index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
         // data size (offset computed at read time from cumulative sizes)
-        index_bytes.extend_from_slice(&(t.data.len() as u64).to_le_bytes());
+        let data_len = if t.spilled_len > 0 { t.spilled_len } else { t.data.len() as u64 };
+        index_bytes.extend_from_slice(&data_len.to_le_bytes());
     }
 
     // Data starts after index, aligned to 4096
@@ -1360,9 +1446,32 @@ fn write_hfq(
     let pad_size = (data_offset - data_start_unaligned) as usize;
     f.write_all(&vec![0u8; pad_size])?;
 
-    // Write tensor data
-    for t in tensors {
-        f.write_all(&t.data)?;
+    // Write tensor data — from spill file or from memory
+    if let Some(spill) = spill {
+        let _ = spill.flush();
+        let mut spill_reader = std::io::BufReader::new(
+            File::open(&spill.path)?
+        );
+        let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
+        for t in tensors {
+            if t.spilled_len > 0 {
+                // Copy from spill file
+                let mut remaining = t.spilled_len as usize;
+                while remaining > 0 {
+                    let chunk = remaining.min(buf.len());
+                    use std::io::Read;
+                    spill_reader.read_exact(&mut buf[..chunk])?;
+                    f.write_all(&buf[..chunk])?;
+                    remaining -= chunk;
+                }
+            } else {
+                f.write_all(&t.data)?;
+            }
+        }
+    } else {
+        for t in tensors {
+            f.write_all(&t.data)?;
+        }
     }
 
     Ok(())
@@ -1907,6 +2016,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
             shape,
             group_size,
             data,
+            spilled_len: 0,
         });
     }
 
@@ -1924,7 +2034,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
 
-    write_hfq(output, arch_id, &metadata_json, &hfq_tensors)?;
+    write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())
 }
@@ -1977,6 +2087,9 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
+    // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
+    // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
+    let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
@@ -2165,6 +2278,10 @@ fn main() {
     let mut hfq_tensors = Vec::new();
     let mut total_params = 0u64;
     let mut quantized_params = 0u64;
+    // Spill file for large models — keeps peak RSS bounded by flushing
+    // completed tensor data to disk when accumulated memory exceeds 32 GB.
+    let spill_dir = output_path.parent().unwrap_or(Path::new("."));
+    let mut spill = TensorSpill::new(spill_dir).ok();
     let mut total_quant_error = 0.0f64;
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
@@ -2222,13 +2339,15 @@ fn main() {
             // Strip the trailing base; what remains is the parent path with `experts.` already on the end
             let parent = &name[..name.len() - base_name.len()];
 
-            // Inner MQ4G256 quantization helpers — we know we want MQ4 for experts
-            // (router/shared_expert use the standard format-flag path below).
+            // Inner quantization for experts — respects --format flag.
+            // MQ6 reduces quantization error that compounds across 48 MoE
+            // layers × 9 expert contributions per layer at the cost of ~50%
+            // more VRAM per expert. MQ4 is the default for VRAM efficiency.
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
-            let expert_mq6 = use_mq6g256 && supports_g256;
+            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp) && supports_g256;
             let expert_hfq6 = use_hfq6 && supports_g256;
             let expert_hfq4 = use_hfq4g256 && supports_g256;
 
@@ -2266,6 +2385,7 @@ fn main() {
                     shape: inner_shape_clone.clone(),
                     group_size: gs,
                     data: quantized,
+                    spilled_len: 0,
                 }
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
@@ -2275,6 +2395,11 @@ fn main() {
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
             hfq_tensors.append(&mut new_tensors);
+            // Drop source pages and spill quantized data after each expert batch.
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
+            }
             continue;
         }
 
@@ -2325,6 +2450,7 @@ fn main() {
                     shape,
                     group_size: 32,
                     data: quantized,
+                    spilled_len: 0,
                 });
             } else {
             // Choose quant format per tensor
@@ -2405,10 +2531,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 {
+            } else if use_mq4g256 || use_mq4_mq6exp {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
@@ -2610,6 +2736,7 @@ fn main() {
                 shape,
                 group_size: gs,
                 data: quantized,
+                spilled_len: 0,
             });
             } // end else (non-Q8HFQ path)
         } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
@@ -2634,6 +2761,7 @@ fn main() {
                 shape,
                 group_size: gs,
                 data: quantized,
+                spilled_len: 0,
             });
         } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
             // Store vision weights as original BF16 (zero precision loss)
@@ -2647,6 +2775,7 @@ fn main() {
                 shape,
                 group_size: 0,
                 data: raw_data.to_vec(),
+                spilled_len: 0,
             });
         } else if is_vision && vision_quant == "bf16" {
             // Non-BF16 source (F16/F32) — store as F16
@@ -2660,7 +2789,7 @@ fn main() {
                 name, meta.shape, data.len() as f64 / 1024.0);
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(), quant_type: QuantType::F16,
-                shape, group_size: 0, data,
+                shape, group_size: 0, data, spilled_len: 0,
             });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
@@ -2692,12 +2821,16 @@ fn main() {
                 shape,
                 group_size: 0,
                 data: f16_data,
+                spilled_len: 0,
             });
         }
+        // Release source file page cache after each tensor to prevent
+        // mmap'd pages from starving GPU allocations on UMA systems.
+        st_files[*file_idx].drop_tensor_pages(name);
     }
 
     // Summary
-    let total_bytes: usize = hfq_tensors.iter().map(|t| t.data.len()).sum();
+    let total_bytes: usize = hfq_tensors.iter().map(|t| if t.spilled_len > 0 { t.spilled_len as usize } else { t.data.len() }).sum();
     let mean_quant_error = if quantized_params > 0 {
         total_quant_error / quantized_params as f64
     } else { 0.0 };
@@ -2714,7 +2847,12 @@ fn main() {
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
-    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors).unwrap();
+    // Final spill before writing
+    if let Some(ref mut s) = spill {
+        maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
+    }
+    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()).unwrap();
+    if let Some(s) = spill { s.cleanup(); }
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);

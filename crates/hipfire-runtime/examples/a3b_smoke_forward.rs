@@ -29,7 +29,7 @@ fn main() {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 
     eprintln!("Opening: {model_path}");
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     assert!(config.num_experts > 0, "this smoke test expects a MoE model");
 
@@ -39,7 +39,7 @@ fn main() {
 
     eprintln!("Loading weights ...");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Loaded {} layers.", weights.layers.len());
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")

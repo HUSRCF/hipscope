@@ -16,13 +16,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).expect("Usage: profile_deltanet <model.hfq>");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to open HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to parse config");
     eprintln!("dim={}, heads={}, linear_heads={}, head_dim={}",
         config.dim, config.n_heads, config.linear_num_key_heads, config.linear_key_head_dim);
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights failed");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights failed");
     let mut dn_state = qwen35::DeltaNetState::new(&mut gpu, &config).unwrap();
     let mut kv_cache = llama::KvCache::new_gpu(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 128,
