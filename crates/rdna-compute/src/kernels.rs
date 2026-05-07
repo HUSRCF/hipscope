@@ -70,6 +70,11 @@ pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../ker
 /// `examples/diag_mq4_lloyd_multiacc.rs` calls.
 pub const GEMV_MQ4G256_LLOYD_MULTIACC_DIAG_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd_multiacc_diag.gfx1100.hip");
 
+/// MQ4-Lloyd WMMA prefill kernels (Phase 5b — see
+/// docs/plans/mq4-lloyd-wmma-prefill.md). gfx1100+ only at Phase A.
+/// fp16-LDS chosen per MQ3 Phase A's empirical bench (no fp32 sibling).
+pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip");
+
 /// Returns the MQ4G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) and gfx1151 (RDNA3.5 Strix Halo APU) get the
 /// K4-unrolled + LDS-codebook fast variant; other archs fall back to the
