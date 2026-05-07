@@ -2168,6 +2168,40 @@ impl Gpu {
         self.gemv_mq4g256_lloyd(a_raw, x_rot, y, m, k)
     }
 
+    /// DIAGNOSTIC ONLY: K4 multi-accumulator MQ4-Lloyd GEMV. NOT for production.
+    /// Used by examples/diag_mq4_lloyd_multiacc.rs to compare against the slow
+    /// generic kernel on real model rows. See the kernel header for the
+    /// open question this exists to investigate.
+    pub fn gemv_mq4g256_lloyd_multiacc_diag(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256_lloyd_multiacc_diag",
+            kernels::GEMV_MQ4G256_LLOYD_MULTIACC_DIAG_GFX1100_SRC,
+            "gemv_mq4g256_lloyd_multiacc_diag",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mq4g256_lloyd_multiacc_diag", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
     /// MQ4-Lloyd GEMV with fused residual add: y[row] += A[row] · x. Mirrors
     /// gemv_mq3g256_lloyd_residual; same single-acc bug fix applies.
     pub fn gemv_mq4g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {

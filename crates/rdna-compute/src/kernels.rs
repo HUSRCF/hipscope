@@ -63,6 +63,12 @@ pub const FUSED_QKVZA_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../k
 /// MQ4G256Lloyd fused QKV GEMV: 3 GEMVs in one launch (FullAttention preamble).
 pub const FUSED_QKV_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.hip");
 pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq4g256_lloyd.gfx1100.hip");
+/// DIAGNOSTIC ONLY — broken K4 multi-accumulator MQ4-Lloyd kernel kept for
+/// the open-question investigation of why MQ3-Lloyd's multi-acc works but
+/// MQ4-Lloyd's doesn't. NOT used in the production dispatch path; reachable
+/// only via the explicit `Gpu::gemv_mq4g256_lloyd_multiacc_diag` method that
+/// `examples/diag_mq4_lloyd_multiacc.rs` calls.
+pub const GEMV_MQ4G256_LLOYD_MULTIACC_DIAG_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd_multiacc_diag.gfx1100.hip");
 
 /// Returns the MQ4G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) and gfx1151 (RDNA3.5 Strix Halo APU) get the
