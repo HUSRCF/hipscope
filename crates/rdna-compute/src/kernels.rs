@@ -36,6 +36,113 @@ pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");
 
+/// MQ2G256Lloyd: 2-bit + per-block 4-entry fp16 codebook (72 B/group).
+pub const GEMV_MQ2G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256_lloyd.hip");
+
+/// MQ3G256Lloyd: 3-bit + per-block 8-entry fp16 codebook (112 B/group).
+pub const GEMV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.hip");
+/// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
+pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.gfx1100.hip");
+/// MQ3G256Lloyd residual GEMV: y[row] += A[row] dot x. Eliminates the
+/// add_inplace_f32 launch on the residual path (~4.4% of decode time).
+pub const GEMV_MQ3G256_LLOYD_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.hip");
+pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.gfx1100.hip");
+/// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
+/// per FFN). Mirrors fused_gate_up_hfq4g256.{,gfx1100.}hip.
+pub const FUSED_GATE_UP_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.hip");
+pub const FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.gfx1100.hip");
+/// MQ3G256Lloyd fused QKVZA GEMV: four LA-preamble GEMVs (wqkv + wz + w_beta
+/// + w_alpha) in one launch. Saves 3 launches per LA layer per token + lets
+/// the 16-row beta/alpha tails co-schedule with the 6144-row qkv body.
+/// Mirrors fused_qkvza_hfq4g256.hip.
+pub const FUSED_QKVZA_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.hip");
+pub const FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.gfx1100.hip");
+/// MQ3G256Lloyd fused QKV GEMV: three FA-preamble GEMVs (wq + wk + wv) in
+/// one launch. Saves 2 launches per FA layer per token. Mirrors
+/// fused_qkv_hfq4g256.hip — sibling of fused_qkvza for FullAttention.
+pub const FUSED_QKV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.hip");
+pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.gfx1100.hip");
+
+/// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
+/// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
+/// that closes the per-launch perf gap from the divergent-execution switch.
+/// Other archs use the baseline (slower but correct switch-dispatch path).
+pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    // Debug escape hatch: HIPFIRE_LLOYD_FORCE_BASELINE=1 forces the slow generic
+    // switch-dispatch kernel even on RDNA3, so the K4+LDS variant can be
+    // logits-Δ'd against the baseline on the same model file. No perf cost when
+    // unset (one missed-getenv per dispatch arm), and ensure_kernel short-
+    // circuits after the first call regardless.
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ3G256_LLOYD_GFX1100_SRC, "gemv_mq3g256_lloyd_rdna3")
+        }
+        _ => (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd"),
+    }
+}
+
+/// Same arch dispatch as `gemv_mq3g256_lloyd_for_arch` but returns the residual
+/// variant (y[row] += A[row] · x). HIPFIRE_LLOYD_FORCE_BASELINE=1 also routes
+/// here to the baseline (for parity-test purposes).
+pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq3g256_lloyd_residual_rdna3")
+        }
+        _ => (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual"),
+    }
+}
+
+/// Arch dispatch for fused gate+up MQ3-Lloyd. Same arch matrix as the GEMV
+/// variants. Used by `qwen35.rs` FFN forward when both `w_gate` and `w_up`
+/// are MQ3G256Lloyd to collapse 2 GEMV launches into 1.
+pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKVZA MQ3-Lloyd. Used by `qwen35.rs` LA decode
+/// when all four projections (wqkv, wz, w_beta, w_alpha) are MQ3G256Lloyd
+/// to collapse 4 GEMV launches into 1.
+pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKV MQ3-Lloyd. Used by `qwen35.rs` FA decode
+/// when wq, wk, wv are all MQ3G256Lloyd to collapse 3 GEMV launches into 1.
+pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkv_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd"),
+    }
+}
+
 
 /// HFQ8-G256: flat 8-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][256B data] = 264 bytes per 256 weights (1.03 B/w).

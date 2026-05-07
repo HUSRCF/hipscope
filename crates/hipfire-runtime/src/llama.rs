@@ -598,6 +598,24 @@ pub fn weight_gemv(
             };
             gpu.gemv_mq2g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
+        DType::MQ2G256Lloyd => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq2g256_lloyd_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
+        DType::MQ3G256Lloyd => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mq3g256_lloyd_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::MQ8G256 => {
             gpu.ensure_mq_signs()?;
             gpu.gemv_mq8g256_with_rotate(&w.buf, x, y, w.m, w.k)
@@ -639,7 +657,8 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256 => {
+        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
             gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
             Ok(Some(x_rot_scratch))
         }
@@ -673,7 +692,8 @@ pub fn rotate_x_for_mq<'a>(
     x_rot_scratch: &'a GpuTensor,
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
-        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256 => {
+        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
             gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
             Ok(Some(x_rot_scratch))
         }
@@ -726,6 +746,20 @@ pub fn weight_gemv_prerotated(
         DType::MQ2G256 => {
             if let Some(xr) = x_rot {
                 gpu.gemv_mq2g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ2G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq2g256_lloyd(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ3G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq3g256_lloyd(&w.buf, xr, y, w.m, w.k)
             } else {
                 weight_gemv(gpu, w, x, y)
             }
@@ -794,6 +828,21 @@ pub fn weight_gemv_residual(
             gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq3g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ3G256Lloyd => {
+            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
+            // the Lloyd residual GEMV. Eliminates the alloc + gemv +
+            // add_inplace_f32 + free fallback chain (~4.4% of decode time on
+            // 9B Lloyd-MQ3 per the 2026-05-06 decode profile). gfx1100
+            // picks the K4 + LDS-codebook chip variant.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq3g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         _ => {
             // Fallback: plain weight_gemv into a scratch, then add_inplace.
             // Allocates a scratch each call; only used for niche dtypes.
@@ -853,6 +902,20 @@ pub fn weight_gemv_swiglu_residual(
             };
             gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq3g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ3G256Lloyd => {
+            // Same fusion as MQ3 / MQ4 / MQ6: silu(gate)*up rotated into
+            // mq_x_rot, then the Lloyd-MQ3 residual GEMV does down +
+            // residual in one launch. Saves one silu_mul_f32 launch versus
+            // the generic three-step path (silu_mul + rotate + gemv_residual).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_mq3g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ6G256 => {
             // MQ6 down + residual fusion: same FWHT rotate + fused-residual

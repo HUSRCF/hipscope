@@ -304,6 +304,8 @@ pub enum DType {
     MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
     MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
     MQ2G256,   // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
+    MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -315,7 +317,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -2031,6 +2033,307 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// MQ2-Lloyd GEMV (2-bit + per-block 4-entry fp16 codebook). K must be a
+    /// multiple of 256. Same launch shape as gemv_hfq2g256 — header is the
+    /// only layout difference.
+    pub fn gemv_mq2g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_mq2g256_lloyd", kernels::GEMV_MQ2G256_LLOYD_SRC, "gemv_mq2g256_lloyd")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// MQ2-Lloyd GEMV with engine-side x rotation (matches `gemv_mq2g256_with_rotate`).
+    pub fn gemv_mq2g256_lloyd_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq2g256_lloyd, both of which bind.
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq2g256_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// MQ3-Lloyd GEMV (3-bit + per-block 8-entry fp16 codebook). K must be a
+    /// multiple of 256. gfx1100/1101/1102 use the K4-unrolled + LDS-codebook
+    /// variant; other archs fall back to the baseline switch-dispatch path.
+    pub fn gemv_mq3g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_mq3g256_lloyd")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3-Lloyd GEMV with engine-side x rotation.
+    pub fn gemv_mq3g256_lloyd_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq3g256_lloyd, both of which bind.
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq3g256_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// MQ3-Lloyd GEMV with fused residual add: y[row] += A[row] · x. Used by
+    /// `weight_gemv_residual` MQ3-Lloyd arm to eliminate the alloc + gemv +
+    /// add_inplace_f32 + free fallback chain (saves ~4.4% of decode time on
+    /// 9B Lloyd-MQ3, gfx1100, per the 2026-05-06 decode profile).
+    pub fn gemv_mq3g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_mq3g256_lloyd_residual")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq3g256_lloyd_residual", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3-Lloyd residual GEMV with engine-side x rotation.
+    pub fn gemv_mq3g256_lloyd_residual_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq3g256_lloyd_residual.
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
+    }
+
+    /// Fused Gate+Up MQ3-Lloyd: two GEMVs in one launch. Mirrors
+    /// `fused_gate_up_hfq4g256` for the Lloyd-MQ3 dtype. Caller is
+    /// responsible for pre-rotating x (FWHT) before invoking; the kernel
+    /// itself only does the GEMV. Both `a_gate` and `a_up` must be MQ3-Lloyd
+    /// matrices with the same K and codebook layout.
+    pub fn fused_gate_up_mq3g256_lloyd(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor, x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "fused_gate_up_mq3g256_lloyd")?;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void, &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
+        ];
+        let total = (gate_m + up_m) as u32;
+        // Bandwidth: A_gate + A_up read, x read once, y_gate + y_up written.
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(gate_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(up_m, k)
+            - k * 4;  // x is shared, don't double-count
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_gate_up_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_gate_up_mq3g256_lloyd", [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Fused QKVZA MQ3-Lloyd: 4 LA-preamble GEMVs in one launch. Used by
+    /// qwen35.rs DeltaNet decode when wqkv + wz + w_beta + w_alpha are
+    /// all MQ3G256Lloyd. Mirrors `fused_qkvza_hfq4g256` — same routing
+    /// (grid = qkv_m + z_m + beta_m + alpha_m, block picks A by gid),
+    /// Lloyd K4+LDS body on gfx1100. Caller is responsible for
+    /// pre-rotating x (FWHT); the kernel only does the GEMVs.
+    pub fn fused_qkvza_mq3g256_lloyd(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_qkvza_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "fused_qkvza_mq3g256_lloyd")?;
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void, &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void, &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void, &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        // Bandwidth: 4 weight matrices read once each, x shared (read once).
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(qkv_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(z_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(beta_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(alpha_m, k)
+            - 3 * (k * 4); // x is shared, don't quadruple-count
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkvza_mq3g256_lloyd", [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Fused QKV MQ3-Lloyd: 3 FA-preamble GEMVs in one launch. Used by
+    /// qwen35.rs FullAttention decode when wq + wk + wv are all
+    /// MQ3G256Lloyd. Sibling of `fused_qkvza_mq3g256_lloyd` for the
+    /// 3-projection FA case (vs LA's 4-projection QKVZA). Caller is
+    /// responsible for pre-rotating x; the kernel only does the GEMVs.
+    pub fn fused_qkv_mq3g256_lloyd(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void, &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let total = (q_m + k_m + v_m) as u32;
+        // Bandwidth: 3 weight matrices read once each, x shared (read once).
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(q_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(k_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(v_m, k)
+            - 2 * (k * 4); // x is shared, don't triple-count
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_mq3g256_lloyd", [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_i); b.push_i32(k_m_i); b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
         self.bind_thread()?;
@@ -2844,6 +3147,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3093,6 +3397,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -5888,6 +6193,7 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -6114,6 +6420,7 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
@@ -6809,6 +7116,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
         // wave64 kernel instead of running the dp4a kernel.
         if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
@@ -6929,6 +7237,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -7656,6 +7965,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128 * batch_size] block_q8_1_mmq via the
         // shared scratch. Stride layout: kblock-major (matches
         // quantize_q8_1_mmq_ds4 at gemm_hfq4g256_residual_mmq.hip:80).
@@ -10308,6 +10618,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128] block_q8_1_mmq via the existing shared
         // scratch path. Batch=1 for GEMV.
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;

@@ -163,6 +163,10 @@ name = "pflash_load_demo"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "perplexity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "pflash_niah_bench"
 required-features = ["arch-qwen35"]
 

@@ -91,6 +91,12 @@ SHORT_TESTS=(
     # drift between bit-widths is comparable.
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    # MQ3-Lloyd coverage (PR #115 — research-gated format, --allow-mq3-lloyd
+    # at quantize time only; no runtime gate). 4B + 9B exercise the K4 +
+    # fp32-LDS-codebook gfx1100 kernel + tail-rotation logic. Runs anywhere
+    # with the model file present.
+    "qwen3.5-4b.mq3-lloyd|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b.mq3-lloyd|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
     # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
