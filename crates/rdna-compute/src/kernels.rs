@@ -41,6 +41,9 @@ pub const GEMV_MQ2G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv
 
 /// MQ3G256Lloyd: 3-bit + per-block 8-entry fp16 codebook (112 B/group).
 pub const GEMV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.hip");
+/// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
+/// Slow generic chip-agnostic variant only — no gfx1100 fast path yet.
+pub const GEMV_MQ4G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd.hip");
 /// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
 pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.gfx1100.hip");
 /// MQ3G256Lloyd residual GEMV: y[row] += A[row] dot x. Eliminates the

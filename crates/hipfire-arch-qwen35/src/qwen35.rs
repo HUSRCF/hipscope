@@ -743,6 +743,10 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
         }
+        21 => { // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook (160 bytes/group)
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -994,6 +998,51 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     out.push(scale * q6 + zero);
                     out.push(scale * q7 + zero);
                 }
+            }
+            out
+        }
+        21 => {
+            // MQ4-G256-Lloyd (qt 21, 160 B/group): 16 fp16 codebook entries +
+            // 4-bit indices (128 nibble-packed bytes, low nibble = idx[2i],
+            // high nibble = idx[2i+1]). Decode is direct lookup `cb[idx]`
+            // then inverse FWHT for CPU consumers (DeltaNet conv1d).
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 160;
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let mut cb = [0.0f32; 16];
+                for k in 0..16 {
+                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
+                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
+                }
+                let start = out.len();
+                for i in 0..128 {
+                    let byte_val = data[off + 32 + i] as usize;
+                    out.push(cb[byte_val & 0xF]);
+                    out.push(cb[(byte_val >> 4) & 0xF]);
+                }
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let scale_inv = 0.0625;
+                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
             }
             out
         }

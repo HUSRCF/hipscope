@@ -892,6 +892,108 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
     output
 }
 
+/// MagnumQuant HFQ4-G256-Lloyd: per-block 16-entry fp16 codebook fitted via
+/// Lloyd's algorithm. 32 B header (16 fp16) + 128 B packed 4-bit indices =
+/// 160 B/group (vs uniform MQ4's 136 B — +17.6% bandwidth). Direct extension
+/// of MQ3-Lloyd with K=16; the conjecture (from
+/// `benchmarks/results/devlog_20260506_lloyd_mq4_extension.md`) is that the
+/// 16-centroid placement narrows the MQ4 → MQ6 ppl gap at lower bandwidth
+/// than uniform MQ6 (200 B/group).
+fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 160;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            // Initial centroid placement: 16 evenly-spaced percentiles
+            // (1/32, 3/32, ..., 31/32) of the rotated block.
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut cb: [f32; 16] = [0.0; 16];
+            for k in 0..16 {
+                let frac = (2 * k + 1) as f32 / 32.0;
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                cb[k] = sorted[idx];
+            }
+
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 8;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 16];
+                    let mut counts = [0u32; 16];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..16 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..16 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            }
+
+            // Sort centroids ascending; remap indices.
+            let mut order: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 16];
+            let mut inv: [u8; 16] = [0; 16];
+            for new_idx in 0..16 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+
+            // Header: 16 fp16 centroids = 32 bytes.
+            for k in 0..16 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+
+            // Data: 128 bytes — same nibble packing as uniform MQ4
+            // (low nibble = idx[2i], high nibble = idx[2i+1]) so kernel
+            // unpack code is identical; only the recon changes from
+            // `min + scale*q` to `cb[q]`.
+            for i in 0..128 {
+                let lo = indices[2 * i]     & 0x0F;
+                let hi = indices[2 * i + 1] & 0x0F;
+                out_chunk[32 + i] = lo | (hi << 4);
+            }
+        });
+
+    output
+}
+
 /// MagnumQuant HFQ2-G256-Lloyd: per-block 4-entry fp16 codebook fitted via
 /// Lloyd's algorithm to minimize squared reconstruction error on FWHT-rotated
 /// weights. 8 B header (4 fp16) + 64 B packed 2-bit indices = 72 B/group —
@@ -1310,6 +1412,7 @@ enum QuantType {
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
     MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    MQ4G256Lloyd = 21, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
 }
 
 struct HfqTensor {
@@ -1829,6 +1932,7 @@ enum GgufFormat {
     Mq2,
     Mq2Lloyd,
     Mq3Lloyd,
+    Mq4Lloyd,
 }
 
 impl GgufFormat {
@@ -1842,6 +1946,7 @@ impl GgufFormat {
             "mq2" | "mq2g256" => Some(Self::Mq2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
+            "mq4-lloyd" | "mq4g256-lloyd" | "mq4lloyd" => Some(Self::Mq4Lloyd),
             _ => None,
         }
     }
@@ -1856,6 +1961,7 @@ impl GgufFormat {
             Self::Mq2 => "MQ2G256",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
+            Self::Mq4Lloyd => "MQ4G256Lloyd",
         }
     }
 }
@@ -1906,7 +2012,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(format,
         GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd);
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd);
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
@@ -1986,6 +2092,10 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Mq4Lloyd => {
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                 }
             }
         } else {
@@ -2094,6 +2204,7 @@ fn main() {
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
+    let use_mq4g256_lloyd = format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
 
@@ -2149,6 +2260,28 @@ fn main() {
              \n\
              To opt in for research anyway, pass --allow-mq2-lloyd or set\n\
              HIPFIRE_ALLOW_MQ2_LLOYD=1. Don't ship MQ2-Lloyd artifacts to users."
+        );
+        std::process::exit(1);
+    }
+    // MQ4-Lloyd: extension of MQ3-Lloyd to K=16 centroids. Conjectured to
+    // narrow the MQ4 → MQ6 ppl gap at +17.6% bandwidth over uniform MQ4
+    // (160 vs 136 B/group). Per
+    // benchmarks/results/devlog_20260506_lloyd_mq4_extension.md the
+    // 9B projection is ppl 8.0–9.3 (vs uniform MQ4 ppl 10.34, MQ6 ppl 9.36).
+    // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
+    // numbers land.
+    let allow_mq4_lloyd = args.iter().any(|a| a == "--allow-mq4-lloyd")
+        || std::env::var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
+    if use_mq4g256_lloyd && !allow_mq4_lloyd {
+        eprintln!(
+            "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
+             4-bit indices (160 B/group, +17.6% over uniform MQ4). Hypothesis is\n\
+             non-uniform codebook narrows the MQ4 → MQ6 ppl gap at lower bandwidth\n\
+             than uniform MQ6. Ppl evidence pending — DO NOT ship MQ4-Lloyd\n\
+             artifacts to users until quality is validated against baseline\n\
+             MQ4/MQ6 ppl on the target model.\n\
+             \n\
+             To proceed, pass --allow-mq4-lloyd or set HIPFIRE_ALLOW_MQ4_LLOYD=1."
         );
         std::process::exit(1);
     }
@@ -2561,9 +2694,21 @@ fn main() {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
-            } else if (use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq3g256_lloyd) && is_embed {
+            } else if (use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq3g256_lloyd || use_mq4g256_lloyd) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mq4g256_lloyd {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                } else {
+                    // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
             } else if use_mq3g256_lloyd {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
