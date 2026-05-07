@@ -238,12 +238,19 @@ changes (e.g. wiring more inference paths through the fast kernels).
 The kernel header in `gemv_mq4g256_lloyd.gfx1100.hip` warns against
 switching back to multi-acc without re-validating PPL byte-equality.
 
-**MQ3-Lloyd:** existing multi-acc kernels remain. They were validated
-on gfx1100 (the calibrated arch) where the drift may be smaller, and
-the production deployment on gfx1151 currently uses partial coverage
-(only basic GEMV multi-acc; fused/residual stay slow). Porting MQ3
-to single-acc would close the residual full-coverage drift gap on
-gfx1151 — not blocking, but a clean follow-up.
+**MQ3-Lloyd:** existing multi-acc kernels remain. The follow-up
+gfx1100 measurement (see findings update 2026-05-07) showed gfx1100
+multi-acc drift is the *same magnitude* as gfx1151's but with
+*opposite sign* (NLL-favorable on gfx1100, NLL-disfavorable on
+gfx1151) — consistent with intrinsic fp32 reorder noise where the
+direction is essentially random across the compiler's per-arch FMA
+scheduling. Both arches carry the same drift envelope; coherence
+gates clear it on either side. PR #189 enabled MQ3-Lloyd full
+coverage on gfx1151 for deployment parity with the gfx1100 deployment
+shape. A single-acc port for MQ3-Lloyd is tracked under issue #188 —
+the trade-off is ~2% decode perf cost on gfx1100 (121.7 → 119.2 tok/s,
+just below #181's ≥120 ship gate) for byte-equal PPL parity with
+slow generic; pending maintainer call.
 
 ## Performance footnote (gfx1151, conformance-only)
 
@@ -262,25 +269,34 @@ gfx1100 ships at ~120 tok/s on 9B per the 2026-05-06 devlog; MQ4-Lloyd
 should land in a similar range, possibly slightly lower due to the
 larger 160 B/group bandwidth. To be measured.
 
-## Open follow-ups (gfx1100 sessions)
+## Open follow-ups — status (2026-05-07 update)
 
-1. **Validate this all on gfx1100.** PPL byte-equality (sanity), decode
-   tok/s, and the issue #182 quality framing (vs MQ4 7.78 wikitext2-test).
-2. **Bisect MQ3 vs MQ4 multi-acc drift on gfx1100.** Is the
-   coverage-amplified drift gfx1151-specific (LDS-scheduling artifact)
-   or universal? If gfx1100 is byte-equal under multi-acc, the gfx1151
-   drift is an arch quirk and multi-acc could ship for gfx1100 with
-   arch-conditional dispatch. If gfx1100 also drifts, single-acc is
-   universally correct (already shipping for MQ4; would extend to MQ3).
-3. **MQ3-Lloyd → single-acc port.** Cleans up the residual gfx1151
-   full-coverage drift; possibly small per-call perf difference. Low
-   priority — current MQ3 deployments are clean.
-4. **Smaller-model MQ4-Lloyd PPL.** Issue #182 suggested measuring
-   0.8B + 4B first; we landed on 9B directly. A short re-run on 0.8B /
-   4B would confirm the Lloyd ratio is stable across model scales.
-5. **Cross-corpus calibration.** Confirm the ~1.9× absolute-level gap
-   between calib-5m.txt and the issue's wikitext2-test path is purely
-   corpus, not implementation.
+1. **Validate on gfx1100** — *partially closed*. Multi-acc drift
+   bisect on gfx1100 done (see #2 below); PPL byte-equality + decode
+   tok/s + issue #182 wikitext2-test quality framing still pending the
+   final maintainer pass on the calibrated arch.
+2. **Bisect MQ3 vs MQ4 multi-acc drift on gfx1100** — **closed**.
+   Drift is *universal* across gfx1100 + gfx1151 (same per-call
+   magnitude ~5e-7 to 2e-6 on real Qwen3.5-9B weights). Full-coverage
+   PPL drift on gfx1100 is the *same magnitude* as gfx1151 but
+   *opposite sign* — fp32 reorder direction is essentially random per
+   arch. See `findings/mq4-lloyd-multiacc-investigation.md` "Update
+   2026-05-07" section for the data. Conclusion: single-acc is
+   universally correct for MQ4-Lloyd (already shipping); MQ3-Lloyd
+   would benefit too at ~2% decode cost (issue #188).
+3. **MQ3-Lloyd → single-acc port** — **WIP under issue #188**.
+   Branch `feat/188-mq3-lloyd-single-acc-gfx1100` has the 5-kernel
+   port; gfx1100 cross-process A/B shows 121.7 → 119.2 tok/s on
+   Qwen3.5-9B (−2.05%, misses #181's ≥120 ship gate by 0.8 tok/s).
+   Maintainer decision pending: keep multi-acc + accept arch-dependent
+   reorder drift, port single-acc + accept 2% perf hit, or
+   arch-conditional dispatch. Out of scope for this MQ4-Lloyd PR.
+4. **Smaller-model MQ4-Lloyd PPL** — *pending*. Issue #182 suggested
+   0.8B + 4B first; landed on 9B directly. Quick re-run would confirm
+   Lloyd ratio is stable across model scales.
+5. **Cross-corpus calibration** — *pending*. Confirm the ~1.9×
+   absolute-level gap between local calib-5m.txt and issue #182's
+   wikitext2-test path is purely corpus, not implementation.
 
 ## Artifacts
 
@@ -306,14 +322,16 @@ Findings docs:
 - `findings/mq4-lloyd-9b-ppl.md` — Phase 1 viability + quality projection
 - `findings/mq4-lloyd-multiacc-investigation.md` — multi-acc bisect
 
-Side commit on `lloyd-max-mq3-spike` (out of PR):
+Sibling PR (out of MQ4-Lloyd scope):
 
-- `9af4136 feat(mq3-lloyd): enable fast GEMV on gfx1151 (Strix Halo APU)`
-  — adds gfx1151 to the basic-GEMV arm of `gemv_mq3g256_lloyd_for_arch`.
-  Verified byte-equal PPL at 10 decimals. Residual + fused MQ3-Lloyd
-  variants intentionally NOT enabled on gfx1151 (would trigger the
-  same multi-acc full-coverage drift surfaced in this devlog;
-  bisecting which fused variant drifts on gfx1151 is a follow-up).
+- **PR #189 — `feat(mq3-lloyd): enable fast variants on gfx1151
+  (Strix Halo APU) — parity with gfx1100`** — adds gfx1151 to all 5
+  MQ3-Lloyd matchers, matching gfx1100's existing full-coverage
+  deployment shape. ~2× decode speedup on Qwen3.5-9B (18.2 →
+  46.4 tok/s) with the same documented multi-acc drift envelope as
+  gfx1100. Cross-references this devlog and findings doc.
+  See `benchmarks/results/devlog_20260507_mq3_lloyd_gfx1151.md` for
+  the full perf + drift snapshot.
 
 ## Bench-host quirks
 
