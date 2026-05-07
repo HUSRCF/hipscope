@@ -590,8 +590,10 @@ fn main() {
                 let pp = msg.get("params").and_then(|p| p.get("pp"))
                     .and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                 if pp > 1 {
-                    if draft_path.is_some() {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#);
+                    if draft_path.is_some()
+                        && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
+                    {
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap."}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
