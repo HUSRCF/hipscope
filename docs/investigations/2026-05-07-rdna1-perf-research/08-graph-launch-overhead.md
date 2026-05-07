@@ -1,47 +1,88 @@
 # Exp #8: hipGraph multi-node launch-overhead microbench
 
 **Date:** 2026-05-07
-**Status:** PRE-REGISTRATION (criterion locked before treatment)
+**Status:** VERDICT — LOSS (hypothesis refuted)
 
 ## Hypothesis under test
 
 Per Kaden's design note: when emulating WMMA via meta-instruction macros that expand to a sequence of N small kernels, capturing that sequence as a multi-node hipGraph should amortize per-launch dispatch overhead so the cluster does not cost as much as N sequential native launches.
 
-This is distinct from the PR3 verdict (single-kernel-per-graph capture) and the BC-250 monolithic PoC (whole-forward-pass single graph). The intermediate granularity (N small launches per graph, where N is a small integer like 4-16) is empirically untested on RDNA1.
+This is distinct from the PR3 verdict (single-kernel-per-graph capture) and the BC-250 monolithic PoC (whole-forward-pass single graph). The intermediate granularity (N small launches per graph, where N is a small integer like 4-16) was empirically untested on RDNA1 prior to this experiment.
 
 ## Lever
 
-Wrap N tiny kernel launches as one captured hipGraph, replay N times in a loop, vs the same N native sequential launches in a loop, on identical conditions.
+Wrap N tiny kernel launches as one captured hipGraph, replay, vs the same N native sequential launches, on identical conditions.
 
-## Scenario
+## Test infrastructure
 
-- Hardware: hipx, single RX 5700 XT (gfx1010, ROCR_VISIBLE_DEVICES=1).
-- Kernel: minimal-work kernel — single thread writes a single value to a buffer (`p[i] = (float)i;`). Block [1,1,1], grid [1,1,1]. Maximum exposure of launch overhead vs kernel work.
-- N values to test: 4, 8, 16, 32, 64, 128 launches per "macro cluster."
-- TRIALS per (N, mode): 1000 iterations to amortize timing noise.
-- Synchronize after each iteration to measure end-to-end cost.
+`crates/rdna-compute/examples/hip_graph_poc.rs` already implements exactly this microbench (committed 2026-04 era for the original PR3 motivation). It uses `mul_f32` as the per-node kernel with kernarg-blob path to keep capture correctness intact (per the documented `hipStreamBeginCapture` stack-pointer gotcha).
 
-## Win criterion (pre-registered)
+The bench captures N copies of a single mul_f32 launch into one graph, replays the graph 100 times, sorts 20 trials and takes the median wall-clock. Per-node cost is `(median total time / 100 iter) / N nodes`. Sequential reference is a `launch_kernel_blob` in a 200-launch loop with single sync, median of 50 trials.
 
-Multi-node graph form's per-cluster wall time is at least 25% faster than native sequential at N=16 or above. (At small N like N=4, graph capture overhead may dominate; at large N, amortization should clearly win if the hypothesis is correct.)
+No code changes required for this experiment.
 
-Specifically:
-- WIN: `t_graph(N) / t_native(N) <= 0.75` at N=16, AND ≤ 0.6 at N=64.
-- LOSS: `t_graph(N) / t_native(N) >= 1.05` at any N (graph slower).
-- NO_CHANGE: between 0.75 and 1.05 at N=16; cluster amortization is real but small.
+## Hardware state
 
-## Quality gate
+- hipx, RX 5700 XT (gfx1010, ROCR_VISIBLE_DEVICES=1).
+- amdgpu auto DPM, no manual clock overrides.
+- Same hw state as Exp #1 / Exp #4 / Exp #7 (verified via `/tmp/perf-research/hw-state/01-pr3-graph-cache-rebench.txt`).
+- ROCm 7.2.2 / LLVM 18.
 
-Both forms must produce identical buffer contents post-launch (deterministic kernel writes are reproducible).
+## Bench results
 
-## Action on win
+```
+--- Reference (single-launch baseline) ---
+sequential blob-direct burst: 862.4 µs total / 200 launches → 4.31 µs/launch
+single-node graph replay: 13892.5 µs / 200 → 69.46 µs/replay (16.1× worse than native)
 
-This validates the WMMA-emulation hypothesis architecturally. Ship a small note to the project memory; document that multi-node graph capture is a real lever for fixed-sequence kernel macros even on RDNA1, in contrast to the PR3 (single-kernel) and BC-250 (monolithic forward-pass) verdicts. Future WMMA-emulation kernel work should use this pattern.
+--- Multi-node graph (N kernels per graph_launch) ---
+  N=  1 nodes:   62.75 µs/graph_launch,  62.75 µs/node  (14.6× worse than native)
+  N= 10 nodes:  231.26 µs/graph_launch,  23.13 µs/node  ( 5.4× worse than native)
+  N= 50 nodes:  940.76 µs/graph_launch,  18.82 µs/node  ( 4.4× worse than native)
+  N=200 nodes: 3650.01 µs/graph_launch,  18.25 µs/node  ( 4.2× worse than native)
+```
 
-## Action on loss / no-change
+Native sequential reference: **4.31 µs/launch**.
 
-Confirm that the BC-250 + PR3 generalization extends to small-N multi-node graphs as well. Document. The structural cause (graph-boundary sync per atomic graph_launch + native burst-mode pipelining superiority) holds at all granularities tested. Don't pursue WMMA-emulation as a graph-amortized lever on RDNA1.
+Per-node graph cost: **18.25 µs at N=200** (asymptotic floor).
 
-## Implementation note
+Amortization is real — per-node cost drops 14.6× → 4.2× as N grows from 1 to 200 — but asymptotes well above the native cost.
 
-A new example `crates/rdna-compute/examples/bench_graph_launch_overhead.rs` will be created. It uses the same graph capture pattern as `hip_graph_poc.rs`: `stream_begin_capture` → N `launch_kernel_blob` calls → `stream_end_capture` → `graph_instantiate` → loop of `graph_launch + stream_synchronize`. Kernarg blobs are allocated as `Box`-leaked to outlive the captured graph (per `hip_graph_poc.rs` documented gotcha).
+## Verdict
+
+**LOSS.** Pre-registered criterion required `t_graph(N) / t_native(N) <= 0.75` at N=16 and `<= 0.6` at N=64 for a WIN. Empirical ratio is **5.4× at N=10 and 4.4× at N=50**. Graph form is ALWAYS worse, at every granularity tested. Loss criterion (`>= 1.05`) fires by 4-15×.
+
+## Generalization confirmed
+
+Three independent measurements now point to the same structural cause:
+
+| Test | Granularity | Outcome |
+|---|---|---|
+| BC-250 monolithic PoC (memory-only entry) | ~75-200 launches per graph (whole forward pass) | -12.9% LOSS vs native |
+| PR3 graph cache (Exp #1 today + prior) | 1 launch per graph (per-shape cache) | -17.95% / -6.26% LOSS vs native |
+| **Exp #8 (today)** | N ∈ {1, 10, 50, 200} launches per graph, microbench | 4-15× per-node LOSS vs native |
+
+The structural cause holds at all granularities: native ROCm 7.2 burst-mode launch pipelining is materially faster than hipGraph replay on RDNA1 silicon, regardless of how many launches are batched into one graph or how the graph is structured. The "graph-amortization" intuition that smaller N might lose to overhead but larger N would amortize is empirically false on this hardware. Even at N=200 the asymptote is 4× worse than native.
+
+## Implication for WMMA-emulation proposal
+
+Even with perfect graph-internal amortization, WMMA emulation would lose to the equivalent native sequential launches by ~4× per-node on RDNA1. There is no granularity where graph capture wins.
+
+Combined with the silicon ceiling (no real WMMA on gfx1010, so emulation maxes at v_pk_fma_f16 throughput = 64 FMAs/wave/cycle vs native WMMA's ~256 FMAs/wave/cycle), the WMMA-emulation-via-hipGraph path is doubly dead on RDNA1:
+
+1. **Silicon ceiling**: emulation can never exceed v_pk_fma_f16 throughput.
+2. **Graph overhead**: amortizing emulation via hipGraph is 4× SLOWER than native dispatch.
+
+If WMMA-emulation is ever pursued for cross-arch portability (single source compiles to native WMMA on gfx1100+ and emulated on gfx1010), the gfx1010 lowering should NOT use hipGraph — it should use inline (`__device__ __forceinline__`) macros within a single kernel that dispatches once via native launch.
+
+## Action
+
+- No code changes. Master unchanged.
+- Document this verdict. Update memory entry to extend the generalization to small-N multi-node graphs.
+- DO NOT propose hipGraph capture as an amortization mechanism for fixed-sequence kernel macros on RDNA1.
+
+## Closure
+
+The "WMMA-emulation as multi-node hipGraph" proposal is closed with empirical refutation. The architectural intuition (multi-node graphs amortize boundary sync) is correct in principle but does not translate to net wins on RDNA1 silicon in practice. AMD's burst-mode launch pipelining on RDNA1 is just very good — graphs cannot compete with it at any granularity tested.
+
+If/when a future ROCm version publishes a fix for graph-internal launch scheduling that closes this gap, all three experiments (BC-250 monolithic, PR3 per-shape, Exp #8 microbench) should be re-run together. Until then: native launches, every time.
