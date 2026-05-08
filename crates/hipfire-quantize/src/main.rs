@@ -1383,11 +1383,22 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
         return QuantLevel::Promote6;
     }
 
-    // Rule 5: edge layers (first 2 + last 2)
+    // Rule 5: edge layers (first 2 + last 2).
+    // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
+    // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
+    // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
     if n_layers > 0 {
         if let Some(idx) = parse_layer_idx(name) {
             if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                return QuantLevel::Promote6;
+                if is_moe {
+                    // MoE: promote all tensors in edge layers (attn + FFN)
+                    return QuantLevel::Promote6;
+                }
+                // Dense: promote FFN only — attn stays at Base
+                let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                if is_ffn {
+                    return QuantLevel::Promote6;
+                }
             }
         }
     }
@@ -3196,13 +3207,25 @@ mod tests {
     }
 
     #[test]
-    fn kmap_edge_layers_promote6() {
-        // First 2 layers
-        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
-        // Last 2 layers
-        assert_eq!(kmap_resolve("model.layers.62.self_attn.v_proj.weight", 64, false), QuantLevel::Promote6);
+    fn kmap_edge_layers_dense_ffn_only() {
+        // Dense: FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote6);
         assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        // Dense: attn in edge layers — NOT promoted
+        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.0.linear_attn.in_proj_qkv.weight", 64, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_moe_attn_and_ffn() {
+        // MoE: both attn and FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote6);
     }
 
     #[test]
@@ -3246,8 +3269,14 @@ mod tests {
 
     #[test]
     fn kmap_gguf_names() {
-        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Promote6);
+        // GGUF edge-layer FFN (dense) — promoted
+        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote6);
         assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        // GGUF edge-layer attn (dense) — NOT promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Base);
+        // GGUF edge-layer attn (MoE) — promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote6);
+        // GGUF middle-layer — base
         assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
     }
 }
