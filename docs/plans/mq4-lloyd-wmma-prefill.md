@@ -215,6 +215,45 @@ Mechanical, auditable yes/no items (mirrored from MQ3 plan, MQ4-substituted):
 | 30 % to 60 % | **Investigate.** Likely culprits: VGPR pressure with the larger 512 B LDS, K-tile schedule on the 8-byte-per-tile decode (MQ3 was 6 bytes), reconvergent-sync timing on the longer cooperative load. Re-bench after each variant. |
 | < 30 % | **Stop.** Request maintainer input — there's a structural issue in the WMMA + 512 B LDS combination that needs deeper investigation than this Phase 5b scope allows. |
 
+### Phase C result on gfx1100 (2026-05-08, branch HEAD `1934aae`)
+
+Cross-process A/B (3 fresh invocations × 2 models, `--prefill 256
+--prefill-runs 3` with in-process median, mean across invocations)
+on Qwen3.5-9B at gfx1100 (7900 XTX, ROCm 7.2):
+
+| Comparison | Numerator | Denominator | Ratio |
+|---|---|---|---|
+| Lloyd-MQ4 prefill / uniform-MQ4 prefill | 1393.4 | 2299.5 | **60.6 %** |
+| Lloyd-MQ4 prefill / pre-B per-token fallback | 1393.4 | ~120 | ~11.6 × |
+| **Sibling reference: MQ3-Lloyd Phase C, same hardware** | 1516.6 | 1719.6 | 88.2 % |
+
+**Decision: SHIP per rule.** 60.6 % ≥ 60 % clears the hard ship gate.
+The 80 % soft target estimate is missed by ~19 pp; the gap to the MQ3
+sibling's 88.2 % on the same hardware is the dominant signal. Per the
+investigate-bucket text above, the candidate root causes are 2× LDS
+footprint, longer 8-byte-per-tile decode K-schedule, and longer
+cooperative-load sync. None of these are correctness issues — they
+are perf-optimization headroom for follow-up work and **out of scope
+for this PR**, which targeted correctness + a working ship gate.
+
+Decode regression check via `probe_commits.sh` (master `85678ed`
+canonical `--prefill 16 --gen 30`): uniform MQ4 117.1 → 117.3 tok/s
+(+0.2 % noise) on master vs HEAD — no decode regression on the
+non-Lloyd path. Lloyd MQ4 decode 97.3 tok/s on HEAD; master returns
+BENCH_FAIL because Lloyd format runtime gating is removed during
+Phase 5b (matches the MQ3-Lloyd Phase 5 pattern).
+
+Full Phase C devlog with raw numbers and per-comparison breakdown:
+`benchmarks/results/devlog_20260508_mq4_lloyd_wmma_phase_c.md`.
+
+**gfx1151 + gfx12 ship-gate ratios are not yet measured.** Phase B2
+established a pre/post-B2 12.3× speedup on gfx1151 (different
+comparison: same-machine self-ratio, not Lloyd-vs-uniform). The
+Lloyd-vs-uniform-MQ4 ratio on gfx1151 should track gfx1100's within
+arch-class noise since both numerator and denominator share the
+LPDDR5x bandwidth ceiling, but this is unverified. RDNA4 (gfx12)
+remains help-wanted per PR #197.
+
 ## Out of scope (deferred)
 
 - **MQ2-Lloyd WMMA prefill** — research-only format; MQ2 is permanently behind `--allow-mq2-lloyd` per PR #115.
