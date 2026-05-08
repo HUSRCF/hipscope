@@ -21,6 +21,17 @@ the MQ3-Lloyd sibling at 88.2 % on the same hardware.
 **Decision: SHIP per rule, with explicit watch-item that perf
 optimization is the most likely follow-up area.**
 
+### Two-point result (added 2026-05-08, after the initial 9B run)
+
+| Model | Lloyd prefill | uniform prefill | Lloyd / uniform |
+|---|---|---|---|
+| Qwen3.5-9B  | 1516.6 tok/s | 1719.6 tok/s | 60.6 % |
+| Qwen3.5-4B  | 2588.1 tok/s | 3589.9 tok/s | **72.1 %** |
+
+The 4B data point shows the Lloyd / uniform ratio is **11.5 pp better**
+at the smaller scale. See "## 4B data point" below for the full raw
+numbers + analysis.
+
 ## Bench config
 
 | Field | Value |
@@ -158,6 +169,53 @@ Output:
 
 Coherent reasoning, correct numerical answer, clean `<|im_end|>`
 termination, no attractor loops. Status OK on gfx1100.
+
+## 4B data point (added 2026-05-08, branch HEAD `5fce3e3`)
+
+Quantized `qwen3.5-4b.mq4-lloyd` from `/data/models/qwen/Qwen3.5-4B/`
+and re-ran the same Phase C cross-process A/B at the smaller model
+scale to get a second hardware-ratio data point. Same gfx1100 host,
+same bench config, same `--prefill 256 --prefill-runs 3` methodology.
+
+```
+=== qwen3.5-4b.mq4 (uniform) ===
+  run 1: prefill_median=3591.6 tok/s, gen=152.3 tok/s
+  run 2: prefill_median=3594.9 tok/s, gen=152.2 tok/s
+  run 3: prefill_median=3583.1 tok/s, gen=151.9 tok/s
+  → prefill mean = 3589.9 tok/s   gen mean = 152.1 tok/s
+
+=== qwen3.5-4b.mq4-lloyd ===
+  run 1: prefill_median=2602.3 tok/s, gen=136.7 tok/s
+  run 2: prefill_median=2567.6 tok/s, gen=136.4 tok/s
+  run 3: prefill_median=2594.3 tok/s, gen=136.2 tok/s
+  → prefill mean = 2588.1 tok/s   gen mean = 136.4 tok/s
+```
+
+| Comparison (4B) | Numerator | Denominator | Ratio |
+|---|---|---|---|
+| Lloyd-MQ4 prefill / uniform-MQ4 prefill | 2588.1 | 3589.9 | **72.1 %** |
+| Lloyd-MQ4 decode / uniform-MQ4 decode (prefill-256 shape) | 136.4 | 152.1 | 89.7 % |
+
+**Lloyd / uniform prefill at 4B (72.1 %) is 11.5 pp better than at 9B
+(60.6 %).** The plan's investigate-bucket candidates (2× LDS footprint,
+longer 8-byte-per-tile decode K-schedule, longer cooperative-load sync)
+all scale with K. At 4B's K=2560 dims the per-row codebook + cooperative-
+load overhead is a smaller fraction of total work than at 9B's K=4096
+dims and 12288 down-proj K. Useful precedent: the MQ4 / MQ3 ratio gap
+narrows at smaller scales, suggesting the Phase C investigate-bucket
+candidates do close partially when re-tuned for the larger LDS regime.
+
+Run-to-run variance is exceptionally tight on uniform 4B (range 11.8
+tok/s, ~0.3 % range/mean), tight on Lloyd 4B (range 34.7 tok/s, ~1.3 %
+range/mean) — same envelope as the 9B numbers above.
+
+Smoke test (daemon, two prompts):
+- "What is the capital of France? ..." → 12 tokens, "The capital of France is Paris.<|im_end|>", clean
+- "A farmer has 17 sheep ..." → 19 tokens, "If all but 9 die, then 9 sheep are left.<|im_end|>", clean
+
+Bench binary md5: `71234969e9d9461a5c6fbc86449ba6c4` (same as 9B run).
+Model md5 (4B uniform): `93b9b5f2bd075922c50f3f8c9a5ad3e3`.
+Model md5 (4B Lloyd):   `d13028f6a1f4fda772c17bb6c3f3a0bc`.
 
 ## What this validates
 
