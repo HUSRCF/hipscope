@@ -1,6 +1,6 @@
 """Hipfire-internal KLD reference format — Python reader.
 
-Format spec (rev-3.1, see docs/plans/issue-113-quant-quality-eval.md
+Format spec (β, see docs/plans/issue-113-quant-quality-eval.md
 §"Hipfire-derived top-K format"):
 
     Header (32 bytes):
@@ -17,16 +17,25 @@ Format spec (rev-3.1, see docs/plans/issue-113-quant-quality-eval.md
       n_ctx × n_chunk × uint32 token IDs
 
     Per-chunk × per-scored-token (n_ctx − 1 − n_ctx/2 tokens per chunk):
-      fp32 max_logit
-      fp32 log_sum_exp
-      uint32 top_indices[top_k]
-      fp32   top_logits[top_k]
-      fp32   sum_exp_residual
+      uint32 top_indices[top_k]    (vocab IDs, descending log-prob)
+      fp32   top_log_probs[top_k]  (log P(i), descending)
+      fp32   sum_p_residual        (sum P(i) for i NOT in top-K, in [0, 1])
+      fp32   reserved_pad          (zero, for 8-byte alignment)
+
+Per-token block size: 8 + 8 * top_k bytes. At top_k=256: 2056 B/token.
 
 Reconstruction at consumer:
-  log_prob[i] = logit[i] - max_logit - log_sum_exp
-  where logit[i] is top_logits[j] if i == top_indices[j] for some j.
-  For i not in top-K, the bulk mass is bounded by sum_exp_residual.
+  log P(i) = top_log_probs[j] if i == top_indices[j] for some j
+  Σ_{i not in top-K} P(i) = sum_p_residual
+
+Why log-probs (β) rather than raw logits + max_logit + log_sum_exp (α)?
+KLD math operates on log-probs directly. llama.cpp's
+--kl-divergence-base format encodes log-probs already (the per-token
+'min_log_prob' + 'scale' encoding reconstructs to log-probs, not raw
+logits — see tools/perplexity/perplexity.cpp:222-225 on commit
+9dcf83552). Storing log-probs in the hipfire format avoids unnecessary
+machinery to back out max_logit / log_sum_exp from llama.cpp's
+encoding.
 """
 
 from __future__ import annotations
@@ -52,8 +61,8 @@ class KldRefHeader:
 
     @property
     def per_token_bytes(self) -> int:
-        # 2*4 (max_logit, log_sum_exp) + top_k*4 (indices) + top_k*4 (logits) + 4 (residual)
-        return 12 + self.top_k * 8
+        # top_k*4 (indices) + top_k*4 (log_probs) + 4 (sum_p_residual) + 4 (pad)
+        return 8 + self.top_k * 8
 
     @property
     def scored_per_chunk(self) -> int:
@@ -66,12 +75,10 @@ class KldRefHeader:
 
 @dataclass
 class TokenBlock:
-    """Per-token reference distribution (top-K + residual)."""
-    max_logit: float
-    log_sum_exp: float
-    top_indices: list[int]   # len == top_k
-    top_logits: list[float]  # len == top_k, in original logit space (not log-prob)
-    sum_exp_residual: float
+    """Per-token reference distribution (top-K log-probs + residual prob mass)."""
+    top_indices: list[int]      # len == top_k
+    top_log_probs: list[float]  # len == top_k, descending log P(i)
+    sum_p_residual: float       # Σ P(i) for i NOT in top-K, in [0, 1]
 
 
 def read_header(f) -> KldRefHeader:
@@ -91,6 +98,12 @@ def read_header(f) -> KldRefHeader:
     )
 
 
+def write_header(f, header: KldRefHeader) -> None:
+    f.write(MAGIC)
+    f.write(struct.pack("<IIII", header.version, header.n_ctx, header.n_vocab, header.n_chunk))
+    f.write(struct.pack("<HHI", header.top_k, header.flags, 0))
+
+
 def read_tokens(f, header: KldRefHeader) -> list[int]:
     n = header.n_ctx * header.n_chunk
     raw = f.read(n * 4)
@@ -104,17 +117,26 @@ def read_block(f, header: KldRefHeader) -> TokenBlock:
     if len(raw) != header.per_token_bytes:
         raise ValueError(f"short read on block: got {len(raw)}, want {header.per_token_bytes}")
     off = 0
-    max_logit, log_sum_exp = struct.unpack_from("<ff", raw, off); off += 8
     top_indices = list(struct.unpack_from(f"<{header.top_k}I", raw, off))
     off += header.top_k * 4
-    top_logits = list(struct.unpack_from(f"<{header.top_k}f", raw, off))
+    top_log_probs = list(struct.unpack_from(f"<{header.top_k}f", raw, off))
     off += header.top_k * 4
-    (sum_exp_residual,) = struct.unpack_from("<f", raw, off); off += 4
+    (sum_p_residual,) = struct.unpack_from("<f", raw, off); off += 4
+    # last 4 bytes are reserved_pad — ignored
     return TokenBlock(
-        max_logit=max_logit, log_sum_exp=log_sum_exp,
-        top_indices=top_indices, top_logits=top_logits,
-        sum_exp_residual=sum_exp_residual,
+        top_indices=top_indices, top_log_probs=top_log_probs,
+        sum_p_residual=sum_p_residual,
     )
+
+
+def write_block(f, header: KldRefHeader, block: TokenBlock) -> None:
+    if len(block.top_indices) != header.top_k:
+        raise ValueError(f"top_indices length {len(block.top_indices)} != top_k {header.top_k}")
+    if len(block.top_log_probs) != header.top_k:
+        raise ValueError(f"top_log_probs length {len(block.top_log_probs)} != top_k {header.top_k}")
+    f.write(struct.pack(f"<{header.top_k}I", *block.top_indices))
+    f.write(struct.pack(f"<{header.top_k}f", *block.top_log_probs))
+    f.write(struct.pack("<ff", block.sum_p_residual, 0.0))
 
 
 def iter_blocks(f, header: KldRefHeader) -> Iterator[TokenBlock]:
