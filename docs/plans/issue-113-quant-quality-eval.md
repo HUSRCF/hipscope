@@ -23,7 +23,7 @@ PPL collapses the full output distribution to one scalar per token (probability 
 
 llama.cpp's `llama-perplexity --kl-divergence` mode emits both PPL and mean/median/p99 KLD in one pass. PPL stays as a secondary sanity column.
 
-**Caveat on top-K=256 truncation (M1):** Qwen 3.5/3.6 has ~151K-token vocab; top-K=256 covers ~0.17%. `sum_exp_residual` corrects mean-KLD in expectation but provides **zero information about the structure of the truncated tail** — exactly the regime DFlash speculative acceptance and high-temperature sampling are most sensitive to. KLD on top-K=256 is a **necessary but not sufficient** signal for those use cases. Step 1.6 of sequencing measures the residual mass fraction; if it exceeds 2%, raise K to 512.
+**Caveat on top-K=256 truncation (M1):** Qwen 3.5/3.6 has **248,320-token vocab** (corrected from earlier "~151K" estimate after Step 1.6 measured the actual reference); top-K=256 covers ~0.103%. `sum_p_residual` corrects mean-KLD in expectation but provides **zero information about the structure of the truncated tail** — exactly the regime DFlash speculative acceptance and high-temperature sampling are most sensitive to. KLD on top-K=256 is a **necessary but not sufficient** signal for those use cases. Step 1.6 of sequencing measures the residual mass fraction empirically; the 9B BF16 reference at top_k=256 has median residual 0.41% (under the 0.5% gate), p99 17.9%, max 72.0% — passing the gate, with a long-tail caveat to flag in the result write-up.
 
 ## The Pareto-positioning outcome
 
@@ -217,7 +217,7 @@ Per-chunk × per-scored-token (only n_ctx − 1 − n_ctx/2 tokens scored per ch
     min_logit clipped to max_logit − 16
 ```
 
-**No magic-version field. No top-K. Full vocab.** Storage at Qwen 151,936 vocab × 1024 chunks × 1023 scored tokens/chunk = **~318 GB per reference**, or ~636 GB for 2 models. **Unhostable on HF.**
+**No magic-version field. No top-K. Full vocab.** Storage at Qwen 248,320 vocab × 1175 chunks × 1023 scored tokens/chunk = **~597 GB per reference** (corrected after Step 1.6 measured the actual chunking — llama-perplexity emitted 1175 chunks not the 1024 we'd planned). For 2 models = ~1.2 TB. **Unhostable on HF.**
 
 ### Numerics (verified Step 0)
 
@@ -254,7 +254,7 @@ Per-chunk × per-scored-token (n_ctx − 1 − n_ctx/2 tokens per chunk):
   fp32   reserved_pad               [zero, for 8-byte alignment]
 ```
 
-Per-token storage: `top_k*4 + top_k*4 + 4 + 4 = 8 + 8*top_k` bytes. At top_k=256: **2,056 B per token** (~150× smaller than llama.cpp's native 304 KB). At 1024 × 1023 = 1,047,552 scored tokens × 2,056 B = **~2.15 GB per reference**, or ~4.3 GB for 2 references (9B + qwen3.6-27B) — fits HF.
+Per-token storage: `top_k*4 + top_k*4 + 4 + 4 = 8 + 8*top_k` bytes. At top_k=256: **2,056 B per token** (~150× smaller than llama.cpp's native 304 KB). At 1175 × 1023 = 1,202,025 scored tokens × 2,056 B = **~2.47 GB per reference**, or ~4.94 GB for 2 references (9B + qwen3.6-27B) — fits HF. (n_chunk=1175 corrected from earlier 1024 estimate after Step 1.6 measured the actual llama-perplexity chunking on the slice; n_chunk depends on tokenized slice length / n_ctx.)
 
 Reconstruction at consumer: `log P(i) = top_log_probs[j]` if `i == top_indices[j]` for some `j`. For `i` not in top-K, the bulk mass is bounded by `sum_p_residual`. KLD math proceeds with top-K from candidate × top-K from reference, plus a residual cross-term.
 
@@ -304,8 +304,8 @@ Per-model BF16 reference logit dumps live at **`hipfire-models/hipfire-eval-refs
 Files (corrected after Step 0; format = hipfire top-K-reduced, not llama.cpp full-vocab):
 
 ```
-qwen3.5-9b-bf16.kldref.bin     (~2.15 GB, top-K=256 + residual + meta, see Binary format §)
-qwen3.6-27b-bf16.kldref.bin    (~2.15 GB)
+qwen3.5-9b-bf16.kldref.bin     (~2.47 GB, top-K=256 + residual + meta, see Binary format §)
+qwen3.6-27b-bf16.kldref.bin    (~2.47 GB — same size at top_k=256, vocab-independent)
 README.md                       (producer commands, slice md5, llama.cpp commit pin, host_arch=gfx1151, model SHA256)
 ```
 
@@ -415,8 +415,8 @@ Numbers above are illustrative — real numbers come from the eval runs.
 Storage (corrected after Step 0; format β: 8 + 8*top_k bytes/token):
 - Slice text: ~1 MB in git.
 - Slice tokens.bin (post-bridge): ~8 MB if 1024 × 2048 × 4 B, in git.
-- Per-model BF16 reference (hipfire top-K β format): **~2.15 GB** on HF Hub (top_k=256: 8+8*256 = 2,056 B/token × 1024 chunks × 1023 tokens/chunk). Two models = **~4.3 GB external**. Comfortable on hipfire-models org.
-- Reference-build transient: ~318 GB of full-vocab uint16 streams from llama-perplexity per model dump, but never lands on disk — FIFO-piped through `build_kld_ref`'s top-K reducer. Disk requirement during a ref dump = ~3 GB scratch + the ~2.15 GB output.
+- Per-model BF16 reference (hipfire top-K β format): **~2.47 GB** on HF Hub (top_k=256: 8+8*256 = 2,056 B/token × 1175 chunks × 1023 tokens/chunk). Two models = **~4.94 GB external**. Comfortable on hipfire-models org.
+- Reference-build transient: ~597 GB of full-vocab uint16 streams from llama-perplexity per model dump, but never lands on disk — FIFO-piped through `build_kld_ref`'s top-K reducer. Disk requirement during a ref dump = ~3 GB scratch + the ~2.47 GB output.
 - Per-quant per-sequence KLDs (CI reproducibility): 1024 × 4 B per row = 4 KB; total across 20+7 rows = ~110 KB; in git or attached to the result file.
 - Optional `--keep-logs` for per-token logits (debugging only): ~2-5 GB per variant per arch, not persisted by default.
 
@@ -434,7 +434,7 @@ Storage (corrected after Step 0; format β: 8 + 8*top_k bytes/token):
 | 8 | Prompt-normalize default | Force OFF in eval. Canary runs both ON and OFF as a hedge. (m2) |
 | 9 | p99 as gate | No, column-only. p99 used in plot's tail-shading and per-row narrative ("tail worse than mean"). |
 | 10 | Bootstrap CI | Column in result table. Per-sequence KLDs persisted by default for reproducibility. |
-| 11 (new) | Top-K choice for 151K vocab | Step 1.6 sanity check on residual mass. Default 256, raise to 512 if residual >2%. |
+| 11 (new) | Top-K choice for 248K vocab | Step 1.6 measured (2026-05-08, on partial 9B BF16 ref): median 0.41% < 0.5% gate, p99 17.9%, max 72.0%. **Top-K=256 confirmed**, with long-tail caveat for tokens with very flat distributions (~1% of all tokens). |
 | 12 (new) | sum_exp_residual numerics | log-sum-exp + fp64 accumulation, verified against llama.cpp on canary. |
 | 13 (new) | Historical baselines comparable? | No. Document in result-file preamble. |
 | 14 (new) | KV mode for eval | `asym3`, recorded per-row. |
