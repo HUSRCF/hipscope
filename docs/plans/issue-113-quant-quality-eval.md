@@ -485,40 +485,74 @@ entirely. Approximation:
 27B dump still to come) produce the correct ref artifact for both
 tracks. eval_gguf is the only missing piece.
 
-## Sequencing (rev-3.3; Step 0 done, format β locked, qwen3.5-27B dropped, GGUF arch locked)
+## Sequencing (rev-3.3; status snapshot 2026-05-08 ~18:00)
 
-**Step 0 (DONE — pre-work, see plan rev-3.1 status banner):** read `tools/perplexity/perplexity.cpp` on the pinned llama.cpp commit `9dcf83552`. Verified the `--kl-divergence-base` binary layout (full-vocab uint16, **not** top-K — see §Binary format), the `sum_exp_residual` numerics (log-sum-exp + fp64 ✓), and confirmed `llama-perplexity` does **not** accept pre-tokenized input. Storage estimate corrected from "3-8 GB/ref" to "~318 GB/ref native, ~2.2 GB/ref hipfire-derived".
+Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
-**Decision:** adopt **option B** (hipfire-internal top-K-reduced format derived from llama.cpp's full-vocab via FIFO streaming). Reasons: (a) ~150× smaller, fits HF; (b) avoids 1-2 days of llama.cpp C++ patching; (c) `kld_reduce.py` becomes the canonical reducer (we lose "shared metric impl with llama-perplexity" but that was never deeply load-bearing — the reducer was always going to live in our tree).
+**✓ Step 0 (DONE 2026-05-08):** read `tools/perplexity/perplexity.cpp` on the pinned llama.cpp commit `9dcf83552`. Verified the `--kl-divergence-base` binary layout (full-vocab uint16, **not** top-K), `sum_exp_residual` numerics (log-sum-exp + fp64 ✓), and that `llama-perplexity` does **not** accept pre-tokenized input. Storage estimate corrected from "3-8 GB/ref" to "~318 GB/ref native, ~2.5 GB/ref hipfire-derived". **Decision:** adopt option B (hipfire-internal top-K-reduced format derived from llama.cpp's full-vocab via FIFO streaming) — ~150× smaller, fits HF, avoids 1-2 days of llama.cpp C++ patching.
 
-**Step 1:** land harness skeleton — slice + `kld_reduce.py` + `eval_gguf.sh` + `tokenizer_parity.py` + canary fixture (11 sequences, 10 short + 1 long-ctx) + `manifest.json` schema. Includes the hipfire reference format reader/writer in a small `kldref` module.
+**✓ Step 1 (DONE):** harness skeleton landed. `benchmarks/quality-baselines/{slice,harness,refs,results}/` with READMEs, kldref_format.py (β format reader/writer + HFKSEQ sidecar), kld_reduce.py (bootstrap CI + result-table emitter; smoke-tested with 8 synthetic per-seq files), manifest.json schema, make_slice.sh generator (uses .venv/bin/python3), canary.md skeleton. Commits b68864a + later.
 
-**Step 1.5:** tokenizer-parity check (M3). Run `tokenizer_parity.py`. Pass → continue. Fail → bridge work or drop GGUF anchor track (see §"Tokenizer alignment + bridge investigation").
+**✓ Step 1.5 (DONE 2026-05-08, verdict: parity FAILS but doesn't block):** ran `tokenizer_parity.py` on the 9B BF16 GGUF (`/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-BF16.gguf`) + slice md5 `83b0205a`. hipfire produced 2,407,713 tokens, llama.cpp 2,407,712 (Δ = 1). 45.9% of positions differ; structural pattern ([2071, 110] ↔ [220, 28495]) — known llama.cpp-vs-HF Qwen BPE divergence. **Doesn't block the eval pipeline:** eval_hipfire reads token IDs from the reference file (which llama-perplexity wrote during ref dump); never re-tokenizes. See §"Step 1.5 verdict" for the full reasoning. GGUF anchor track stays viable.
 
-**Step 1.6:** top-K residual-mass sanity check (M1). Build a one-off dumper (or use a mini variant of `build_kld_ref --dump-residual-stats` mode) that reads full-vocab logits for 10 random tokens from the canary fixture and reports median residual mass. If <0.5%, top-K=256 confirmed. If >2%, raise to 512 and update header version + manifest schema.
+**✓ Step 1.6 (DONE 2026-05-08, verdict: top-K=256 confirmed):** sampled 50,000 blocks from the partial 9B BF16 ref. Median residual 0.41% (under the 0.5% gate), mean 1.81%, p99 17.94%, max 72.0%. Top-K=256 confirmed. Long-tail caveat (~1% of tokens have residual >17%) flagged for the eval write-up. Surfaced two corrections to estimates: n_vocab is 248,320 (not 151,936), n_chunk is 1175 (not 1024) — folded into the plan.
 
-**Step 2:** write `build_kld_ref.rs` — Rust orchestrator that spawns `llama-perplexity --kl-divergence-base /tmp/kldref.fifo`, reads the full-vocab uint16 stream from the FIFO, top-K-reduces in flight (fp64 accumulators), writes the hipfire format spec'd in §Binary format. Verify bit-tolerance: top-K logprobs computed from native llama.cpp output match what we'd get from a separate `llama-perplexity` candidate-side run on the same model + slice.
+**✓ Step 2 (DONE):** wrote `crates/hipfire-runtime/examples/build_kld_ref.rs` — Rust orchestrator that mkfifo's, spawns llama-perplexity, reads the full-vocab uint16 stream, top-K-reduces in-flight (fp64 accumulators), writes the hipfire β format. End-to-end-validated by running the 9B BF16 dump (Step 4). Throughput: 375 reduced tokens/sec on gfx1151. Commit a31d4f6.
 
-**Step 3:** write `eval_hipfire.rs`. Reads the hipfire-internal reference. Runs hipfire's quant variants. Computes per-token KLD on the fly (no second binary file written; just per-sequence KLDs in the result). log-sum-exp + fp64 in the residual cross-term computation. Validate bit-tolerance against `kld_reduce.py` on a synthetic 10-token fixture.
+**✓ Step 3 (DONE):** wrote `crates/hipfire-runtime/examples/eval_hipfire.rs` — reads hipfire β reference, runs hipfire variants chunk-by-chunk via `forward_scratch`, computes per-token KLD via top-K-of-ref + residual cross-term (rev-3.3 enhancement), bins per-sequence, writes HFKSEQ. Builds clean (`cargo build --release --features deltanet`). Commits d4adac8 (initial) + f9dd19e (residual cross-term). Not yet run end-to-end; queued for Step 5.
 
-**Step 4:** dump 9B BF16 reference on gfx1151 via `build_kld_ref` → upload to `hipfire-models/hipfire-eval-refs` → manifest. Verify canary passes (both NORMALIZE_PROMPT settings — m2). 9B CPU BF16 sanity check (m3).
+**✓ Step 4-9b (DONE 2026-05-08):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. **Pending sub-steps:** upload to `hipfire-models/hipfire-eval-refs`, fill `manifest.json` with sha256 + producer_cmd, verify canary on both NORMALIZE_PROMPT settings.
 
-**Step 5:** run hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). **Validate via canary, NOT against PR #115 PPLs** (B2 / S2 — historical reproduction is impossible). The canary's expected per-sequence KLDs are the harness validation; PPL plausibility ranges (within ~30% of historical) are a sanity check, not a reproduction.
+**⏸ Step 5 (next-up):** run hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). gfx1151 first (Kevin's local), gfx1100 follow-up when host available. Each run ~75 min on gfx1151 (eval_hipfire's per-token forward+KLD). The first canary candidate (qwen3.5-9b.mq4) doubles as the canary-expected-KLD source — its 11 per-sequence KLDs become the committed `canary.md` expected-values.
 
-**Step 6:** repeat steps 4–5 for qwen3.6-27B.
+**⏸ Step 6:** repeat Step 4 (dump 27B BF16 ref) + Step 5 (run 5 hipfire variants × 2 archs) for qwen3.6-27B. BF16 GGUF still being downloaded as of 2026-05-08.
 
-**Step 7:** GGUF anchor track on qwen3.6-27B (gfx1151 only). Architecture locked at rev-3.3 (see §"GGUF anchor architecture"). Substeps:
+**✓ Step 7.A (DONE 2026-05-08):** wrote `crates/hipfire-runtime/examples/eval_gguf.rs` — mirrors eval_hipfire.rs's KLD math but uses FIFO-streamed llama-perplexity as the candidate-logit source. Same residual cross-term as eval_hipfire. Builds clean. Not yet run end-to-end. Commit f9dd19e.
 
-- **Step 7.A:** write `eval_gguf.rs` — mirror eval_hipfire.rs's KLD math + HFKSEQ output, but use FIFO-streamed llama-perplexity (`--kl-divergence-base /tmp/cand.fifo`) as the candidate-logit source instead of hipfire `forward_scratch`. Reuses the FIFO-orchestration scaffolding from `build_kld_ref.rs`. Add residual cross-term to both eval_gguf and eval_hipfire (~5 lines each per the rev-3.3 enhancement). ~half day.
-- **Step 7.B:** run all 7 GGUF candidates (Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S) on the same qwen3.6-27B BF16 ref (cached from Step 6). Each ~1.5 hr.
+**⏸ Step 7.B:** run all 7 GGUF candidates (Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S) on the qwen3.6-27B BF16 ref (cached from Step 6). Each ~1.5 hr on gfx1151.
 
-**Step 8:** measure DFlash τ (canonical merge_sort prompt, md5-pinned) for each variant where a draft model exists. Add as the `DFlash τ` column (S8).
+**— Step 8:** measure DFlash τ (canonical merge_sort prompt, md5-pinned) for each variant where a draft model exists. Adds the `DFlash τ` column to the result table.
 
-**Step 9:** write up `results/2026-05-XX-quant-pareto.md` with the full table + Pareto plot + caveats preamble. Post comments on #113 (positioning), #116 (positioning + recalibration input), #197 (MQ4-Lloyd promotion-or-not editorial recommendation).
+**— Step 9:** write up `results/2026-05-XX-quant-pareto.md` with the full table + Pareto plot + caveats preamble. Post comments on #113 (positioning), #116 (positioning + recalibration input), #197 (MQ4-Lloyd promotion-or-not editorial recommendation).
 
-**Step 10 (optional):** Unsloth corroboration plot if same-model dense data exists.
+**— Step 10 (optional):** Unsloth corroboration plot if same-model dense data exists.
 
-**Step 11 (follow-up, not this PR):** p99-gate calibration once mean-KLD CI variance is understood empirically. GEMV single-acc port (universal multi-acc drift fix) if the gfx1100-vs-gfx1151 KLD delta is >10%.
+**— Step 11 (follow-up, not this PR):** p99-gate calibration once mean-KLD CI variance is understood empirically. GEMV single-acc port (universal multi-acc drift fix) if the gfx1100-vs-gfx1151 KLD delta is >10%.
+
+### Code-state snapshot
+
+| File / artifact | Status |
+|---|---|
+| `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt` | ✓ committed (10.5 MB, md5 `83b0205a304bf4e52172ecdb05f2e895`) |
+| `benchmarks/quality-baselines/slice/slice.md5` | ✓ committed |
+| `benchmarks/quality-baselines/slice/make_slice.sh` | ✓ committed (uses .venv/bin/python3) |
+| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; slice_md5 filled; references map empty pending uploads |
+| `benchmarks/quality-baselines/harness/kldref_format.py` | ✓ committed (β format reader/writer) |
+| `benchmarks/quality-baselines/harness/kld_reduce.py` | ✓ committed (bootstrap CI + table emitter) |
+| `benchmarks/quality-baselines/harness/tokenizer_parity.py` | ✓ committed (full impl, tested 2026-05-08) |
+| `benchmarks/quality-baselines/harness/canary.md` | ✓ committed (11 sequences populated; expected KLDs TBD) |
+| `benchmarks/quality-baselines/harness/eval_gguf.sh` | stub committed; superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
+| `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on 9B |
+| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
+| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
+| `crates/hipfire-runtime/examples/tokenize_slice.rs` | ✓ committed (used by tokenizer_parity.py) |
+| `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 53 min wall); local only (gitignored) |
+| `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin` | — pending (BF16 GGUF download in flight) |
+
+### Sibling work executed
+
+- **PR #201 cherry-picked** into this branch (commits 1d8c140 + 4f99c19): O(N²) → O(N log N) BPE encoder fix. Reduced full-slice tokenization from a projected ~30 min to **19 sec actual**. Made `tokenize_slice.rs` + `tokenizer_parity.py` tractable.
+- **llama.cpp `build-strix` rebuilt** against ROCm 7.12 + gfx1151 with all targets (50+ binaries: llama-perplexity, llama-tokenize, llama-cli, etc.). Local path: `/home/kread/git/llm/llama.cpp/build-strix/bin/`. Required because the existing build was linked against `libamdhip64.so.6` (rocm-7.1) which doesn't exist on the system; rocm-7.12 ships `.so.7`.
+- **Project venv at `.venv/`**: holds `numpy`, `datasets`, `huggingface_hub`, etc. for the harness's Python scripts. Per the repo-preference memory: Python deps go in venv, not pip --user.
+
+### What's NOT yet done (blocking summary)
+
+1. **9B BF16 ref upload to HF** — file is ready, just needs `hf upload hipfire-models/hipfire-eval-refs ...` + manifest.json fill-in (one entry).
+2. **First canary candidate run** (qwen3.5-9b.mq4 vs the 9B BF16 ref) — produces real per-sequence KLDs, populates canary.md's expected-values column.
+3. **27B BF16 GGUF download** in flight; once done, repeat the Step-4 dump for qwen3.6-27B.
+4. **Bulk hipfire-track runs** (5 variants × 2 archs × 2 models = 20 runs) — currently ~75 min × 20 = ~25 GPU-hours on gfx1151.
+5. **GGUF anchor runs** (7 variants × 1 model on gfx1151) — currently ~1.5 hr × 7 = ~10 GPU-hours.
+6. **DFlash τ + write-up** — Step 8 + 9.
 
 ## References
 
