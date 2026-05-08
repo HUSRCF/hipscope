@@ -254,3 +254,9 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
+
+# build_kld_ref needs no GPU / arch features — it just orchestrates
+# llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
+[[example]]
+name = "build_kld_ref"
+required-features = []
