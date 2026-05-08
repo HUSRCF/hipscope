@@ -71,9 +71,62 @@ pub const FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../ker
 pub const GEMV_MQ4G256_LLOYD_MULTIACC_DIAG_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256_lloyd_multiacc_diag.gfx1100.hip");
 
 /// MQ4-Lloyd WMMA prefill kernels (Phase 5b — see
-/// docs/plans/mq4-lloyd-wmma-prefill.md). gfx1100+ only at Phase A.
-/// fp16-LDS chosen per MQ3 Phase A's empirical bench (no fp32 sibling).
+/// docs/plans/mq4-lloyd-wmma-prefill.md). 16-row × 16-batch tile, per-row
+/// LDS-staged fp16 codebook (512 B/workgroup, no cvt at decode — fp16
+/// inherited from MQ3 Phase A's 7.15% bench win).
 pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip");
+/// gfx12 (RDNA4) sibling — code-complete but runtime-unvalidated locally per Phase B1 plan.
+pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma.gfx12.hip");
+/// MQ4G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
+pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.hip");
+pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx12.hip");
+/// MQ4G256Lloyd WMMA fused QKV (FA preamble: q + k + v, 3-way).
+pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma.hip");
+pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma.gfx12.hip");
+/// MQ4G256Lloyd WMMA fused gate+up (FFN, 2-way).
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip");
+
+/// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
+/// the given arch. Mirrors `gemm_mq3g256_lloyd_residual_wmma_for_arch`'s arch
+/// matrix. The C symbol is unsuffixed on both archs (the gfx12 .hip drops the
+/// `_gfx12` suffix from the C symbol so the unsuffixed dispatch lookup works).
+pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna3"),
+        _ => (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma"),
+    }
+}
+pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma"),
+    }
+}
+pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma"),
+    }
+}
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma"),
+    }
+}
 
 /// Returns the MQ4G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) and gfx1151 (RDNA3.5 Strix Halo APU) get the
