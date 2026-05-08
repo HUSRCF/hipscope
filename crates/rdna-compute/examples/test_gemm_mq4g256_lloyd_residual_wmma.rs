@@ -13,7 +13,7 @@
 //! Phase A acceptance includes logging the actual MQ4 max-abs and confirming it
 //! stays in the same envelope.
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{Gpu, DType, LLOYD_MQ4_GROUP_BYTES};
 
 /// f32 → IEEE 754 binary16 little-endian, RTNE on dropped 13 mantissa bits.
 fn f32_to_f16_le(v: f32) -> [u8; 2] {
@@ -94,7 +94,7 @@ fn build_lloyd_row(
     codebooks: &[[f32; 16]],
     indices: &[[u8; 256]],
 ) -> (Vec<u8>, Vec<[f32; 16]>) {
-    let mut out = Vec::with_capacity(groups_per_row * 160);
+    let mut out = Vec::with_capacity(groups_per_row * LLOYD_MQ4_GROUP_BYTES);
     let mut roundtripped = Vec::with_capacity(groups_per_row);
     for g in 0..groups_per_row {
         let cb = &codebooks[g];
@@ -108,7 +108,7 @@ fn build_lloyd_row(
         let packed = pack_4bit_group(&indices[g]);
         out.extend_from_slice(&packed);
     }
-    assert_eq!(out.len(), groups_per_row * 160);
+    assert_eq!(out.len(), groups_per_row * LLOYD_MQ4_GROUP_BYTES);
     (out, roundtripped)
 }
 
@@ -181,7 +181,7 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (f32, f32, f32, f64) 
         .map(|i| ((i as i32 % 11) as f32 - 5.0) * 0.001)
         .collect();
 
-    let mut a_flat: Vec<u8> = Vec::with_capacity(m * groups_per_row * 160);
+    let mut a_flat: Vec<u8> = Vec::with_capacity(m * groups_per_row * LLOYD_MQ4_GROUP_BYTES);
     for row in &a_rows {
         a_flat.extend_from_slice(row);
     }

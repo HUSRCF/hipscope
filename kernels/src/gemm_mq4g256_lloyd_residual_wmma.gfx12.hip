@@ -7,6 +7,14 @@
 // half8_t lane-split / K4-unroll / contiguous-rows output mapping from
 // gemm_mq3g256_lloyd_residual_wmma.gfx12.hip and gemm_hfq4g256_residual_wmma.gfx12.hip.
 //
+// **K4 vs gfx11's K2 — why the difference**: gfx12 splits its 32-thread wave
+// into a (m_lane=tid&15, k_grp=tid>>4) lane-group layout so each lane only
+// reads half the K-tile per iteration. K4 unroll spreads the same total
+// K-coverage across the same wall time as gfx11's K2 (which uses the full
+// tile per lane). The K-unroll is hardware-shape driven, not a perf knob —
+// porting K4 to gfx11 wouldn't help because gfx11's full-tile-per-lane
+// mapping doesn't have the lane-group split to amortize over.
+//
 // **gfx12 variant: code-complete, runtime-unvalidated locally** — the bench
 // host has gfx1100/gfx1151 only. RDNA4 reviewers please run the parity
 // test on this kernel before relying on it (see plan §"Risks D2").

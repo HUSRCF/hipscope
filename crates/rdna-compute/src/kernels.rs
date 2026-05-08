@@ -88,14 +88,28 @@ pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../ker
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip");
 
 /// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
-/// the given arch. Mirrors `gemm_mq3g256_lloyd_residual_wmma_for_arch`'s arch
-/// matrix. The C symbol is unsuffixed on both archs (the gfx12 .hip drops the
-/// `_gfx12` suffix from the C symbol so the unsuffixed dispatch lookup works).
+/// the given arch.
+///
+/// **Arch matrix** (matched by all 4 MQ4-Lloyd `*_for_arch` selectors):
+/// - `gfx1100/1101/1102/1151` → rdna3 module (gfx11 source)
+/// - `gfx1200/1201` → rdna4 module (gfx12 source, `_w32_gfx12` builtin + K4-unroll
+///   half8_t lane-split — see `*.gfx12.hip` headers for why K4 vs gfx11's K2)
+/// - everything else → default arm (gfx11 source, generic module name)
+///
+/// **gfx1150 is intentionally excluded** to keep symmetric arch coverage with the
+/// MQ4-Lloyd GEMV/fused decode path (which only validates gfx1100/1101/1102/1151);
+/// admitting gfx1150 to one and not the other is the asymmetry called out in the
+/// PR #195 review (GLM-5 L1 / Claude M3). gfx1150 hardware can be enabled here
+/// after a parity + bench round on Strix-Halo-class hardware.
+///
+/// The C symbol is unsuffixed on both gfx11 and gfx12 (the gfx12 `.hip` files drop
+/// the `_gfx12` suffix from the C symbol so the unsuffixed dispatch lookup
+/// resolves under both per-arch hsaco caches).
 pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna3"),
         _ => (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma"),
     }
@@ -104,7 +118,7 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna3"),
         _ => (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma"),
     }
@@ -113,7 +127,7 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna3"),
         _ => (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma"),
     }
@@ -122,7 +136,7 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna3"),
         _ => (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma"),
     }

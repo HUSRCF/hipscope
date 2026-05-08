@@ -8,7 +8,7 @@
 //! GPU's view. Tolerance set to 3× the max-abs observed at K=12288 in MQ4
 //! Phase A devlog (2.24e-4).
 
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, LLOYD_MQ4_GROUP_BYTES};
 
 // ---------- f16 helpers (same as Phase A test) ----------
 
@@ -75,7 +75,7 @@ fn build_lloyd_matrix(
     m: usize, k: usize, proj_id: usize,
 ) -> (Vec<u8>, Vec<Vec<[f32; 16]>>, Vec<Vec<[u8; 256]>>) {
     let groups_per_row = k / 256;
-    let mut all_bytes = Vec::with_capacity(m * groups_per_row * 160);
+    let mut all_bytes = Vec::with_capacity(m * groups_per_row * LLOYD_MQ4_GROUP_BYTES);
     let mut codebooks_per_row = Vec::with_capacity(m);
     let mut indices_per_row = Vec::with_capacity(m);
     for row in 0..m {
@@ -108,7 +108,7 @@ fn build_lloyd_matrix(
         codebooks_per_row.push(cbs);
         indices_per_row.push(idxs);
     }
-    assert_eq!(all_bytes.len(), m * groups_per_row * 160);
+    assert_eq!(all_bytes.len(), m * groups_per_row * LLOYD_MQ4_GROUP_BYTES);
     (all_bytes, codebooks_per_row, indices_per_row)
 }
 

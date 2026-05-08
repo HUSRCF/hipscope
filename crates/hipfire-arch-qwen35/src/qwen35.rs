@@ -3794,9 +3794,17 @@ pub fn forward_prefill_batch_with_pbs(
 // produces dead code (safe but useless) or silent prefill corruption
 // (HFQ4-stride GEMM reading a different-stride weight block). See
 // docs/plans/mq-lloyd-batched-prefill-followup.md for the full
-// checklist + rationale. MQ3G256Lloyd / MQ2G256Lloyd intentionally
-// excluded today: no batched Lloyd-prefill kernel exists; per-token
-// fallback is correct.
+// checklist + rationale.
+//
+// Lloyd-format coverage as of issue #182 Phase B2:
+//   - MQ4G256Lloyd: BATCHABLE here; matchers + dispatch wired together
+//     (see commit ca21a58 / Phase B2 of issue #182).
+//   - MQ3G256Lloyd: not in this PR's scope; tracked in PR #195
+//     (issue #116 Phase 5) where it lands together with its own
+//     matcher + dispatch arms.
+//   - MQ2G256Lloyd: research-only format permanently behind
+//     --allow-mq2-lloyd at quantize time (PR #115). No batched
+//     kernel ships for it; per-token fallback is correct.
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256

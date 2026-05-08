@@ -32,6 +32,10 @@ optimization is the most likely follow-up area.**
 | Cross-process A/B | 3 fresh process invocations × 2 models |
 | In-process samples | 3 timed prefills per invocation; in-process median |
 | Reported metric | mean of in-process medians across the 3 invocations |
+| Bench binary md5 | `71234969e9d9461a5c6fbc86449ba6c4` (target/release/examples/bench_qwen35_mq4 at HEAD `0a34ba6`; identical at HEAD `1934aae`) |
+| Model md5 (uniform) | `31a8d8dc7603226801b08d8319015602` (qwen3.5-9b.mq4) |
+| Model md5 (Lloyd)   | `b3eea80aeade0b56c153a054b1143ab2` (qwen3.5-9b.mq4-lloyd) |
+| Prompt | N/A — `bench_qwen35_mq4` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) internally; no user prompt |
 
 `--prefill 256` rather than the probe-commits canonical `--prefill 16`
 because 16 is too small to meaningfully exercise the batched-prefill
@@ -127,6 +131,34 @@ batched-prefill path is correct (B1 parity + B3 coherence-gate green +
 decode-regression check clean), it just leaves headroom that the
 similar but lighter MQ3-Lloyd path captures.
 
+## gfx1100 coherence-gate (added post-review, 2026-05-08)
+
+Re-ran `scripts/coherence-gate.sh` on the gfx1100 Phase C bench host
+after the post-review-fix commit to close the validation gap that
+PR #195's review flagged on its sibling (S2 in `mq3-lloyd-wmma-code-rev-claude.md`).
+The MQ4-Lloyd row is the canonical regression-prevention site for the
+Phase B2 wiring — the gate already runs on gfx1151 via Phase B3, but
+the gfx1100 coherence wasn't explicitly captured for this PR until now.
+
+```
+## qwen3.5-9b.mq4-lloyd — reason-mq4-lloyd-9b
+
+- wall: 54.4s  status: **OK**
+- stats: tokens=53, prefill_tokens=36, prefill_tok_s=690.3, decode_tok_s=91.2
+- prompt: "A farmer has 17 sheep. All but 9 die. How many are left? ..."
+
+Output:
+  <think>
+  </think>
+  **Reasoning:** The phrase "all but 9 die" means that every sheep except
+  for 9 survived. Therefore, the number of sheep remaining is exactly
+  the number mentioned in the exception clause.
+  **Final Number:** 9<|im_end|>
+```
+
+Coherent reasoning, correct numerical answer, clean `<|im_end|>`
+termination, no attractor loops. Status OK on gfx1100.
+
 ## What this validates
 
 - gfx1100 batched-prefill correctness: uniform MQ4 decode is
@@ -134,10 +166,10 @@ similar but lighter MQ3-Lloyd path captures.
   B2 dispatch wiring doesn't perturb the non-Lloyd path
 - Lloyd-MQ4 prefill is **multi-× faster than the pre-B per-token
   fallback** — the user-facing improvement Phase 5b was opened for
-- Cross-process variance is tight on uniform MQ4 (range 6.0 tok/s,
-  ~0.3 %) and reasonable on Lloyd MQ4 (range 22.2 tok/s, ~1.6 %) —
-  measurements are stable enough to support the ship/investigate
-  decision
+- Cross-process variance (range/mean, *not* stddev/mean) is tight on
+  uniform MQ4 (range 6.0 tok/s, ~0.3 % range/mean) and reasonable on
+  Lloyd MQ4 (range 22.2 tok/s, ~1.6 % range/mean) — measurements are
+  stable enough to support the ship/investigate decision
 
 ## What this does NOT validate
 
