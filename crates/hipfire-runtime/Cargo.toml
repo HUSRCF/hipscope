@@ -264,3 +264,9 @@ required-features = []
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
+
+# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
+# No GPU / arch features needed (tokenizer is pure CPU).
+[[example]]
+name = "tokenize_slice"
+required-features = []
