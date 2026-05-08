@@ -52,7 +52,15 @@ fn main() {
             "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--ref"   => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--kv-mode" => { kv_mode = argv[i + 1].clone(); i += 2; }
+            "--kv-mode" => {
+                let v = argv[i + 1].clone();
+                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
+                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                    std::process::exit(1);
+                }
+                kv_mode = v;
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3]");
                 std::process::exit(0);
@@ -67,11 +75,32 @@ fn main() {
         kv_mode,
     };
 
+    // -------- eval-mode env vars (must precede Gpu::init / forward) --------
+    // Per plan §"Eval-mode hipfire flags": force OFF for prompt normalize +
+    // graph capture; record kv-mode in env for downstream tooling. Logged so
+    // a user reading the run output sees the override explicitly.
+    // SAFETY: single-threaded init phase; no other threads observing env.
+    unsafe {
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
+        std::env::set_var("HIPFIRE_GRAPH", "0");
+        std::env::set_var("HIPFIRE_KV_MODE", &args.kv_mode);
+    }
+    eprintln!("eval_hipfire: forced HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE={}", args.kv_mode);
+
+    // -------- ref sha256 sanity (M1) --------
+    verify_ref_sha256(&args.ref_path);
+
     // -------- load model --------
     let mut hfq = HfqFile::open(&args.model).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("eval_hipfire: arch={} model={}", gpu.arch, args.model.display());
+    // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
+    // Set if running on gfx12; harmless on other arches.
+    if gpu.arch.starts_with("gfx12") {
+        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+        eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
+    }
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     // -------- read reference (HFKLDR β) header + tokens --------
@@ -159,9 +188,14 @@ fn main() {
                 &mut kv_cache, &mut dn_state, &scratch,
             ).expect("forward");
 
-            // Score only positions in [n_ctx/2 + 1, n_ctx) — matches llama-perplexity's
-            // "second-half tokens" convention (n_ctx − 1 − n_ctx/2 scored per chunk).
-            let scoring_start = n_ctx / 2 + 1;
+            // Score logit-positions [n_ctx/2, n_ctx-2], predicting tokens at
+            // [n_ctx/2 + 1, n_ctx-1]. Yields exactly `n_ctx - 1 - n_ctx/2`
+            // scored positions per chunk, matching what build_kld_ref wrote.
+            //
+            // Off-by-one was previously `n_ctx/2 + 1`, which under-read 1
+            // ref block per chunk and shifted every comparison by 1 logit
+            // position. Caught by the consolidated review's C1 finding.
+            let scoring_start = n_ctx / 2;
             if pos < scoring_start {
                 continue;
             }
@@ -245,8 +279,6 @@ fn main() {
                     c + 1, n_chunk, total_scored_done, total_scored, pct, rate
                 );
             }
-
-            let _ = sum_p_residual; // residual term currently dropped; available for later
         }
 
         // Per-chunk aggregates
@@ -286,4 +318,63 @@ fn main() {
     let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
     eprintln!("eval_hipfire: slice-mean KLD = {:.6} ({}-chunk mean of per-chunk means)", overall_mean, n_chunk);
     eprintln!("eval_hipfire: wrote {}", args.output.display());
+}
+
+/// Verify the reference file's sha256 against
+/// `<repo>/benchmarks/quality-baselines/harness/manifest.json`.
+///
+/// Layout assumption: ref lives at `.../refs/<name>.kldref.bin`,
+/// manifest at `.../harness/manifest.json` (sibling to refs/).
+///
+/// If the manifest entry is absent, warn and continue (developer
+/// pre-upload state). If sha256 disagrees, abort.
+#[cfg(feature = "deltanet")]
+fn verify_ref_sha256(ref_path: &std::path::Path) {
+    use std::process::Command;
+    let manifest_path = match ref_path.parent().and_then(|p| p.parent()) {
+        Some(p) => p.join("harness").join("manifest.json"),
+        None => {
+            eprintln!("warning: cannot locate harness/manifest.json; skipping ref sha256 check");
+            return;
+        }
+    };
+    if !manifest_path.exists() {
+        eprintln!("warning: {} missing; skipping ref sha256 check", manifest_path.display());
+        return;
+    }
+    let manifest_file = std::fs::File::open(&manifest_path)
+        .expect("open manifest.json");
+    let manifest: serde_json::Value = serde_json::from_reader(manifest_file)
+        .expect("parse manifest.json");
+    let ref_name = ref_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let expected = manifest
+        .get("references")
+        .and_then(|r| r.get(ref_name))
+        .and_then(|r| r.get("sha256"))
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let expected = match expected {
+        Some(s) => s,
+        None => {
+            eprintln!("warning: no manifest entry / sha256 for {ref_name}; skipping check");
+            return;
+        }
+    };
+    eprintln!("eval_hipfire: computing sha256 of {} ...", ref_path.display());
+    let out = Command::new("sha256sum")
+        .arg(ref_path)
+        .output()
+        .expect("invoke sha256sum");
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty sha256sum output");
+    if actual != expected {
+        eprintln!("ERROR: ref sha256 mismatch for {}", ref_path.display());
+        eprintln!("  expected: {expected}");
+        eprintln!("  actual:   {actual}");
+        std::process::exit(2);
+    }
+    eprintln!("eval_hipfire: verified ref sha256 = {actual}");
 }

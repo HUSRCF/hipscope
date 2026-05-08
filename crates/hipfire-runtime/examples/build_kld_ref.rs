@@ -26,7 +26,6 @@ use std::process::{Command, Stdio};
 const HIPFIRE_MAGIC: &[u8; 8] = b"HFKLDR\0\0";
 const HIPFIRE_VERSION: u32 = 1;
 const LLAMA_MAGIC: &[u8; 8] = b"_logits_";
-#[allow(dead_code)]
 const PINNED_LLAMACPP_COMMIT: &str = "9dcf83552887bb898b4a98a5761361e504e31fc3";
 
 struct Args {
@@ -85,6 +84,10 @@ impl Drop for FifoGuard {
 
 fn main() {
     let args = parse_args();
+
+    // 0. Sanity checks (H1 + M4): pinned llama.cpp commit + slice md5.
+    verify_llama_commit(&args.llama_perplexity_bin);
+    verify_slice_md5(&args.slice);
 
     // 1. mkfifo
     let fifo_path = PathBuf::from(format!("/tmp/hipfire-kldref-{}.fifo", std::process::id()));
@@ -271,4 +274,106 @@ fn main() {
         "build_kld_ref: average reduction throughput: {:.0} tokens/sec",
         total_scored as f64 / elapsed
     );
+}
+
+/// Verify that the resolved llama-perplexity binary was built from the
+/// pinned commit. The binary's `--version` output looks like:
+///
+///   ```
+///   version: 9076 (9dcf83552)
+///   ```
+///
+/// We require the parenthesized short hash to be a prefix of
+/// `PINNED_LLAMACPP_COMMIT`. Format drift (different headers, different
+/// uint16 packing) silently corrupts the reduction, so a hard-fail here
+/// is cheap insurance.
+fn verify_llama_commit(bin: &str) {
+    let out = match Command::new(bin).arg("--version").output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ERROR: failed to invoke `{bin} --version`: {e}");
+            std::process::exit(2);
+        }
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let needle = "version: ";
+    let after_version = match combined.find(needle) {
+        Some(i) => &combined[i + needle.len()..],
+        None => {
+            eprintln!("ERROR: could not find 'version: ' in `{bin} --version` output");
+            eprintln!("--- captured output ---\n{combined}\n---");
+            std::process::exit(2);
+        }
+    };
+    let open = match after_version.find('(') {
+        Some(i) => i,
+        None => {
+            eprintln!("ERROR: malformed `--version` output: no '(' after version number");
+            std::process::exit(2);
+        }
+    };
+    let after_paren = &after_version[open + 1..];
+    let close = match after_paren.find(')') {
+        Some(i) => i,
+        None => {
+            eprintln!("ERROR: malformed `--version` output: no ')' after commit hash");
+            std::process::exit(2);
+        }
+    };
+    let hash = &after_paren[..close];
+    if !PINNED_LLAMACPP_COMMIT.starts_with(hash) {
+        eprintln!("ERROR: llama-perplexity commit mismatch");
+        eprintln!("  binary:           {bin}");
+        eprintln!("  expected (pinned): {PINNED_LLAMACPP_COMMIT}");
+        eprintln!("  actual (--version): {hash}");
+        eprintln!("  Either rebuild llama.cpp at the pinned commit, or update");
+        eprintln!("  PINNED_LLAMACPP_COMMIT in this binary AND in the plan.");
+        std::process::exit(2);
+    }
+    eprintln!("build_kld_ref: verified llama.cpp commit prefix {hash}");
+}
+
+/// Verify the slice file's md5 against the sibling `slice.md5` (one-line
+/// `<md5>` or `md5sum` output). Aborts on mismatch; warns and continues
+/// if no sibling md5 file is present (developer regen).
+fn verify_slice_md5(slice_path: &std::path::Path) {
+    let md5_path = match slice_path.parent() {
+        Some(p) => p.join("slice.md5"),
+        None => {
+            eprintln!("warning: cannot resolve slice.md5 sibling; skipping check");
+            return;
+        }
+    };
+    if !md5_path.exists() {
+        eprintln!(
+            "warning: {} not found; skipping slice md5 check",
+            md5_path.display()
+        );
+        return;
+    }
+    let expected = fs::read_to_string(&md5_path)
+        .expect("read slice.md5")
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty slice.md5");
+    let out = Command::new("md5sum").arg(slice_path).output()
+        .expect("invoke md5sum");
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty md5sum output");
+    if actual != expected {
+        eprintln!("ERROR: slice md5 mismatch");
+        eprintln!("  slice:    {}", slice_path.display());
+        eprintln!("  expected: {expected}");
+        eprintln!("  actual:   {actual}");
+        std::process::exit(2);
+    }
+    eprintln!("build_kld_ref: verified slice md5 = {actual}");
 }

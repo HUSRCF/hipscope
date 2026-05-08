@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 const HIPFIRE_MAGIC: &[u8; 8] = b"HFKLDR\0\0";
 const SEQKLD_MAGIC: &[u8; 8] = b"HFKSEQ\0\0";
 const LLAMA_MAGIC: &[u8; 8] = b"_logits_";
+const PINNED_LLAMACPP_COMMIT: &str = "9dcf83552887bb898b4a98a5761361e504e31fc3";
 
 struct Args {
     candidate_gguf: PathBuf,
@@ -88,6 +89,11 @@ impl Drop for FifoGuard {
 
 fn main() {
     let args = parse_args();
+
+    // ---------- Sanity (H1 + M1 + M4) ----------
+    verify_llama_commit(&args.llama_perplexity_bin);
+    verify_slice_md5(&args.slice);
+    verify_ref_sha256(&args.ref_path);
 
     // ---------- Open ref file, read header + tokens ----------
     let ref_file = File::open(&args.ref_path).expect("open ref");
@@ -343,4 +349,112 @@ fn main() {
     }
 
     eprintln!("eval_gguf: wrote {}", args.output.display());
+}
+
+/// See build_kld_ref.rs::verify_llama_commit — same logic.
+fn verify_llama_commit(bin: &str) {
+    let out = match Command::new(bin).arg("--version").output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ERROR: failed to invoke `{bin} --version`: {e}");
+            std::process::exit(2);
+        }
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let needle = "version: ";
+    let after_version = match combined.find(needle) {
+        Some(i) => &combined[i + needle.len()..],
+        None => {
+            eprintln!("ERROR: could not find 'version: ' in `{bin} --version` output");
+            std::process::exit(2);
+        }
+    };
+    let open = after_version.find('(').expect("malformed --version output");
+    let after_paren = &after_version[open + 1..];
+    let close = after_paren.find(')').expect("malformed --version output");
+    let hash = &after_paren[..close];
+    if !PINNED_LLAMACPP_COMMIT.starts_with(hash) {
+        eprintln!("ERROR: llama-perplexity commit mismatch");
+        eprintln!("  expected (pinned): {PINNED_LLAMACPP_COMMIT}");
+        eprintln!("  actual (--version): {hash}");
+        std::process::exit(2);
+    }
+    eprintln!("eval_gguf: verified llama.cpp commit prefix {hash}");
+}
+
+fn verify_slice_md5(slice_path: &std::path::Path) {
+    let md5_path = match slice_path.parent() {
+        Some(p) => p.join("slice.md5"),
+        None => return,
+    };
+    if !md5_path.exists() {
+        eprintln!("warning: {} not found; skipping slice md5 check", md5_path.display());
+        return;
+    }
+    let expected = fs::read_to_string(&md5_path)
+        .expect("read slice.md5")
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty slice.md5");
+    let out = Command::new("md5sum").arg(slice_path).output()
+        .expect("invoke md5sum");
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty md5sum output");
+    if actual != expected {
+        eprintln!("ERROR: slice md5 mismatch (expected {expected}, got {actual})");
+        std::process::exit(2);
+    }
+    eprintln!("eval_gguf: verified slice md5 = {actual}");
+}
+
+fn verify_ref_sha256(ref_path: &std::path::Path) {
+    let manifest_path = match ref_path.parent().and_then(|p| p.parent()) {
+        Some(p) => p.join("harness").join("manifest.json"),
+        None => {
+            eprintln!("warning: cannot locate harness/manifest.json; skipping ref sha256 check");
+            return;
+        }
+    };
+    if !manifest_path.exists() {
+        eprintln!("warning: {} missing; skipping ref sha256 check", manifest_path.display());
+        return;
+    }
+    let manifest_file = File::open(&manifest_path).expect("open manifest.json");
+    let manifest: serde_json::Value = serde_json::from_reader(manifest_file)
+        .expect("parse manifest.json");
+    let ref_name = ref_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let expected = manifest
+        .get("references")
+        .and_then(|r| r.get(ref_name))
+        .and_then(|r| r.get("sha256"))
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let expected = match expected {
+        Some(s) => s,
+        None => {
+            eprintln!("warning: no manifest entry / sha256 for {ref_name}; skipping check");
+            return;
+        }
+    };
+    eprintln!("eval_gguf: computing sha256 of {} ...", ref_path.display());
+    let out = Command::new("sha256sum").arg(ref_path).output()
+        .expect("invoke sha256sum");
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
+        .expect("empty sha256sum output");
+    if actual != expected {
+        eprintln!("ERROR: ref sha256 mismatch (expected {expected}, got {actual})");
+        std::process::exit(2);
+    }
+    eprintln!("eval_gguf: verified ref sha256 = {actual}");
 }
