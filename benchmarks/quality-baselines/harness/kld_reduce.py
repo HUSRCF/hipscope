@@ -44,6 +44,7 @@ class Row:
     mean_kld_ci_lo: float    # 95% bootstrap lower
     mean_kld_ci_hi: float
     p99_kld: float
+    ppl: float | None = None  # exp(mean NLL) over all scored tokens; None for v1 inputs
     notes: str = ""
 
 
@@ -67,26 +68,30 @@ def parse_filename(name: str) -> tuple[str, str]:
 
 
 def reduce_one(path: Path) -> Row:
-    means, p99s = read_per_seq_kld(path)
+    means, p99s, nlls = read_per_seq_kld(path)
     variant, arch = parse_filename(path.name)
     means_arr = np.asarray(means, dtype=np.float64)
     p99s_arr = np.asarray(p99s, dtype=np.float64)
+    nlls_arr = np.asarray(nlls, dtype=np.float64)
     mean, ci_lo, ci_hi = bootstrap_mean_ci(means_arr)
     p99 = float(np.percentile(p99s_arr, 99))
+    finite_nll = nlls_arr[np.isfinite(nlls_arr)]
+    ppl: float | None = float(np.exp(finite_nll.mean())) if finite_nll.size else None
     return Row(
         variant=variant, arch=arch, n_chunks=len(means),
         mean_kld=mean, mean_kld_ci_lo=ci_lo, mean_kld_ci_hi=ci_hi,
-        p99_kld=p99,
+        p99_kld=p99, ppl=ppl,
     )
 
 
 def render_markdown_table(rows: list[Row]) -> str:
     out = []
-    out.append("| Variant | Arch | n_chunks | Mean KLD ± 95% CI | p99 KLD | Notes |")
-    out.append("|---|---|---:|---|---:|---|")
+    out.append("| Variant | Arch | n_chunks | Mean KLD ± 95% CI | p99 KLD | PPL | Notes |")
+    out.append("|---|---|---:|---|---:|---:|---|")
     for r in sorted(rows, key=lambda r: (r.variant, r.arch)):
         ci = f"{r.mean_kld:.4f} (CI {r.mean_kld_ci_lo:.4f}–{r.mean_kld_ci_hi:.4f})"
-        out.append(f"| {r.variant} | {r.arch} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {r.notes} |")
+        ppl = f"{r.ppl:.3f}" if r.ppl is not None else "—"
+        out.append(f"| {r.variant} | {r.arch} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |")
     return "\n".join(out)
 
 

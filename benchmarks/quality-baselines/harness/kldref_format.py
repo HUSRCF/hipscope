@@ -158,44 +158,82 @@ def open_ref(path: str | Path) -> tuple[KldRefHeader, list[int], Iterator[TokenB
 
 # ---------- Per-sequence-KLD result format (small sidecar) ----------
 
-# After eval_hipfire.rs / eval_gguf.sh run a candidate against a ref, they
+# After eval_hipfire.rs / eval_gguf.rs run a candidate against a ref, they
 # emit a small "per-sequence-KLD" file that kld_reduce.py aggregates.
 #
-# Layout (very simple, designed to be human-inspectable too):
+# Layout (v1, deprecated but still readable):
 #   bytes  0-7   magic "HFKSEQ\0\0"
 #   bytes  8-11  version (uint32, 1)
 #   bytes 12-15  n_chunk (uint32)
 #   bytes 16-19  reserved (uint32, zero)
 #   bytes 20-?   n_chunk × {fp64 mean_kld_seq, fp64 mean_p99_seq}
 #                  (16 B per sequence)
-# Total size: 20 + n_chunk * 16
+#
+# Layout (v2, current):
+#   bytes  0-7   magic "HFKSEQ\0\0"
+#   bytes  8-11  version (uint32, 2)
+#   bytes 12-15  n_chunk (uint32)
+#   bytes 16-19  reserved (uint32, zero)
+#   bytes 20-?   n_chunk × {fp64 mean_kld_seq, fp64 mean_p99_seq, fp64 mean_nll_seq}
+#                  (24 B per sequence)
+#
+# v2 adds mean_nll per sequence, enabling the PPL column in the result table
+# (PPL = exp(mean_nll)). Reading v1 returns mean_nll = NaN per chunk, which
+# the reducer renders as `—` in the PPL column.
 
 SEQKLD_MAGIC = b"HFKSEQ\x00\x00"
-SEQKLD_VERSION = 1
+SEQKLD_VERSION = 2
 
 
-def write_per_seq_kld(path: str | Path, mean_kld_per_seq: list[float], p99_kld_per_seq: list[float]) -> None:
-    if len(mean_kld_per_seq) != len(p99_kld_per_seq):
-        raise ValueError("mean and p99 sequences must have same length")
+def write_per_seq_kld(
+    path: str | Path,
+    mean_kld_per_seq: list[float],
+    p99_kld_per_seq: list[float],
+    mean_nll_per_seq: list[float] | None = None,
+) -> None:
+    """Write HFKSEQ (v2 if mean_nll_per_seq provided, else v1)."""
     n_chunk = len(mean_kld_per_seq)
+    if len(p99_kld_per_seq) != n_chunk:
+        raise ValueError("mean and p99 sequences must have same length")
+    if mean_nll_per_seq is not None and len(mean_nll_per_seq) != n_chunk:
+        raise ValueError("mean and nll sequences must have same length")
+
+    version = 2 if mean_nll_per_seq is not None else 1
     with open(path, "wb") as f:
         f.write(SEQKLD_MAGIC)
-        f.write(struct.pack("<III", SEQKLD_VERSION, n_chunk, 0))
-        for m, p in zip(mean_kld_per_seq, p99_kld_per_seq):
-            f.write(struct.pack("<dd", m, p))
+        f.write(struct.pack("<III", version, n_chunk, 0))
+        if version == 2:
+            for m, p, n in zip(mean_kld_per_seq, p99_kld_per_seq, mean_nll_per_seq):
+                f.write(struct.pack("<ddd", m, p, n))
+        else:
+            for m, p in zip(mean_kld_per_seq, p99_kld_per_seq):
+                f.write(struct.pack("<dd", m, p))
 
 
-def read_per_seq_kld(path: str | Path) -> tuple[list[float], list[float]]:
+def read_per_seq_kld(
+    path: str | Path,
+) -> tuple[list[float], list[float], list[float]]:
+    """Read HFKSEQ (v1 or v2). Returns (mean_klds, p99_klds, mean_nlls).
+    For v1 inputs, mean_nlls is filled with NaN."""
     with open(path, "rb") as f:
         magic = f.read(8)
         if magic != SEQKLD_MAGIC:
             raise ValueError(f"bad magic: {magic!r}")
         version, n_chunk, _reserved = struct.unpack("<III", f.read(12))
-        if version != SEQKLD_VERSION:
-            raise ValueError(f"unsupported version {version}")
-        means, p99s = [], []
-        for _ in range(n_chunk):
-            m, p = struct.unpack("<dd", f.read(16))
-            means.append(m)
-            p99s.append(p)
-        return means, p99s
+        if version not in (1, 2):
+            raise ValueError(f"unsupported HFKSEQ version {version}")
+        means, p99s, nlls = [], [], []
+        if version == 2:
+            for _ in range(n_chunk):
+                m, p, n = struct.unpack("<ddd", f.read(24))
+                means.append(m)
+                p99s.append(p)
+                nlls.append(n)
+        else:  # v1
+            import math
+            for _ in range(n_chunk):
+                m, p = struct.unpack("<dd", f.read(16))
+                means.append(m)
+                p99s.append(p)
+                nlls.append(math.nan)
+        return means, p99s, nlls

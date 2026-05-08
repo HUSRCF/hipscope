@@ -221,8 +221,13 @@ fn main() {
         }
         std::process::exit(2);
     }
-    drop(ref_tokens);
     drop(cand_tokens);
+    // Decode ref_tokens once for actual-next-token lookups during NLL accumulation.
+    let tokens: Vec<u32> = ref_tokens
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    drop(ref_tokens);
     eprintln!("eval_gguf: verified cand tokens match ref tokens ({cand_tokens_bytes} bytes)");
 
     // ---------- Per-token loop ----------
@@ -250,6 +255,12 @@ fn main() {
 
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(ref_n_chunk);
     let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(ref_n_chunk);
+    let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(ref_n_chunk);
+
+    // Logit-positions for scored tokens within a chunk: [n_ctx/2, n_ctx-2].
+    // The j-th scored token (0-indexed) has logit-pos = n_ctx/2 + j and
+    // predicts the actual token at logit-pos+1, i.e. tokens[c*n_ctx + n_ctx/2 + j + 1].
+    let scoring_start = ref_n_ctx / 2;
 
     let progress_interval = (total_scored / 100).max(1);
     let t0 = std::time::Instant::now();
@@ -257,8 +268,10 @@ fn main() {
 
     for c in 0..ref_n_chunk {
         let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+        let mut chunk_nll_sum: f64 = 0.0;
+        let mut chunk_nll_count: usize = 0;
 
-        for _ in 0..scored_per_chunk {
+        for j in 0..scored_per_chunk {
             // Read candidate's per-token block
             cand_in.read_exact(&mut cand_block_buf).expect("read cand block");
 
@@ -317,6 +330,19 @@ fn main() {
             }
             if kld_token < 0.0 && kld_token > -1e-6 { kld_token = 0.0; }
 
+            // NLL: -log P_cand(actual_next_token). actual next token at
+            // chunk c, logit-pos (scoring_start + j) is tokens[c*n_ctx + scoring_start + j + 1].
+            let actual_next = tokens[c * ref_n_ctx + scoring_start + j + 1] as usize;
+            if actual_next < cand_n_vocab {
+                let stored_off = 8 + actual_next * 2;
+                let stored = u16::from_le_bytes(
+                    cand_block_buf[stored_off..stored_off + 2].try_into().unwrap()
+                );
+                let log_p_cand = (cand_scale as f64) * (stored as f64) + (cand_min_log_prob as f64);
+                chunk_nll_sum += -log_p_cand;
+                chunk_nll_count += 1;
+            }
+
             chunk_klds.push(kld_token);
             total_done += 1;
 
@@ -335,6 +361,7 @@ fn main() {
         if chunk_klds.is_empty() {
             mean_kld_per_seq.push(0.0);
             p99_kld_per_seq.push(0.0);
+            mean_nll_per_seq.push(f64::NAN);
             continue;
         }
         let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
@@ -342,31 +369,49 @@ fn main() {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
         let p99 = sorted[p99_idx];
+        let mean_nll = if chunk_nll_count > 0 {
+            chunk_nll_sum / chunk_nll_count as f64
+        } else { f64::NAN };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
+        mean_nll_per_seq.push(mean_nll);
     }
     eprintln!();
 
-    // ---------- Write HFKSEQ output ----------
+    // ---------- Write HFKSEQ output (v2: adds mean_nll per chunk) ----------
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(SEQKLD_MAGIC).unwrap();
-    out.write_all(&1u32.to_le_bytes()).unwrap();                  // version
+    out.write_all(&2u32.to_le_bytes()).unwrap();                  // version = 2
     out.write_all(&(ref_n_chunk as u32).to_le_bytes()).unwrap();   // n_chunk
     out.write_all(&0u32.to_le_bytes()).unwrap();                  // reserved
-    for (m, p) in mean_kld_per_seq.iter().zip(p99_kld_per_seq.iter()) {
+    for ((m, p), n) in mean_kld_per_seq.iter()
+        .zip(p99_kld_per_seq.iter())
+        .zip(mean_nll_per_seq.iter())
+    {
         out.write_all(&m.to_le_bytes()).unwrap();
         out.write_all(&p.to_le_bytes()).unwrap();
+        out.write_all(&n.to_le_bytes()).unwrap();
     }
     out.flush().unwrap();
 
     let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_nll: f64 = if nll_finite.is_empty() {
+        f64::NAN
+    } else {
+        nll_finite.iter().copied().sum::<f64>() / nll_finite.len() as f64
+    };
+    let overall_ppl = overall_nll.exp();
     let elapsed = t0.elapsed().as_secs_f64();
     eprintln!(
         "eval_gguf: scored {total_done} tokens in {:.1}s ({:.0} tok/s)",
         elapsed, total_done as f64 / elapsed.max(1e-9)
     );
-    eprintln!("eval_gguf: slice-mean KLD = {:.6} ({}-chunk mean of per-chunk means)", overall_mean, ref_n_chunk);
+    eprintln!(
+        "eval_gguf: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}",
+        overall_mean, overall_nll, overall_ppl
+    );
 
     // ---------- Wait for child ----------
     let status = child.wait().expect("failed to wait on child");

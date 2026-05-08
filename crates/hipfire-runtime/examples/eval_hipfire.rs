@@ -183,6 +183,7 @@ fn main() {
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut p99_kld_per_seq:  Vec<f64> = Vec::with_capacity(n_chunk);
+    let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut block_buf = vec![0u8; per_token_block_bytes];
     let t0 = Instant::now();
     let mut total_scored_done = 0usize;
@@ -196,6 +197,10 @@ fn main() {
 
         let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
         let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+        // NLL accumulator: log P_cand(actual_next_token) per scored position.
+        // PPL = exp(-mean(NLL)) over all scored tokens.
+        let mut chunk_nll_sum: f64 = 0.0;
+        let mut chunk_nll_count: usize = 0;
 
         for pos in 0..(n_ctx - 1) {
             qwen35::forward_scratch(
@@ -285,6 +290,15 @@ fn main() {
             chunk_klds.push(kld_token);
             total_scored_done += 1;
 
+            // NLL: -log P_cand(actual_next_token). The actual next token is
+            // chunk_tokens[pos+1]; log P_cand at that vocab idx = logit - log_z.
+            let actual_next = chunk_tokens[pos + 1] as usize;
+            if actual_next < cand_logits.len() {
+                let nll = -((cand_logits[actual_next] as f64) - log_z);
+                chunk_nll_sum += nll;
+                chunk_nll_count += 1;
+            }
+
             if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
                 let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                 let elapsed = t0.elapsed().as_secs_f64();
@@ -300,6 +314,7 @@ fn main() {
         if chunk_klds.is_empty() {
             mean_kld_per_seq.push(0.0);
             p99_kld_per_seq.push(0.0);
+            mean_nll_per_seq.push(f64::NAN);
             continue;
         }
         let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
@@ -307,8 +322,12 @@ fn main() {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
         let p99 = sorted[p99_idx];
+        let mean_nll = if chunk_nll_count > 0 {
+            chunk_nll_sum / chunk_nll_count as f64
+        } else { f64::NAN };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
+        mean_nll_per_seq.push(mean_nll);
     }
     eprintln!();
     eprintln!(
@@ -317,21 +336,35 @@ fn main() {
         total_scored_done as f64 / t0.elapsed().as_secs_f64().max(1e-9),
     );
 
-    // -------- write HFKSEQ output --------
+    // -------- write HFKSEQ output (v2: adds mean_nll per chunk) --------
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
-    out.write_all(&1u32.to_le_bytes()).unwrap();             // version
+    out.write_all(&2u32.to_le_bytes()).unwrap();             // version = 2
     out.write_all(&(n_chunk as u32).to_le_bytes()).unwrap(); // n_chunk
     out.write_all(&0u32.to_le_bytes()).unwrap();             // reserved
-    for (m, p) in mean_kld_per_seq.iter().zip(p99_kld_per_seq.iter()) {
+    for ((m, p), n) in mean_kld_per_seq.iter()
+        .zip(p99_kld_per_seq.iter())
+        .zip(mean_nll_per_seq.iter())
+    {
         out.write_all(&m.to_le_bytes()).unwrap();
         out.write_all(&p.to_le_bytes()).unwrap();
+        out.write_all(&n.to_le_bytes()).unwrap();
     }
     out.flush().unwrap();
 
     let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
-    eprintln!("eval_hipfire: slice-mean KLD = {:.6} ({}-chunk mean of per-chunk means)", overall_mean, n_chunk);
+    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_nll: f64 = if nll_finite.is_empty() {
+        f64::NAN
+    } else {
+        nll_finite.iter().copied().sum::<f64>() / nll_finite.len() as f64
+    };
+    let overall_ppl = overall_nll.exp();
+    eprintln!(
+        "eval_hipfire: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}",
+        overall_mean, overall_nll, overall_ppl
+    );
     eprintln!("eval_hipfire: wrote {}", args.output.display());
 }
 
