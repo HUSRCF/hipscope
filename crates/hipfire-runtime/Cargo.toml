@@ -270,3 +270,9 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "tokenize_slice"
 required-features = []
+
+# eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "eval_gguf"
+required-features = []

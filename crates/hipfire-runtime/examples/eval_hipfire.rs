@@ -196,12 +196,20 @@ fn main() {
             }
             let log_z = (max_logit as f64) + sum_exp.ln();
 
-            // Sum over reference's top-K.
-            // KLD ≈ Σ_{i in top_K_P} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
-            // The residual term (mass outside top-K of P) is dropped — it's small
-            // by construction (top_k chosen so residual < 2%). See plan §"Top-K
-            // choice (M1)" + "Caveat on top-K=256 truncation".
+            // KLD = top-K-of-reference contribution + residual cross-term.
+            //
+            // Top-K contribution:
+            //   Σ_{i in top_K_P_ref} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
+            //
+            // Residual cross-term (per rev-3.3):
+            //   sum_p_residual_ref * (log sum_p_residual_ref - log sum_p_residual_cand)
+            // where sum_p_residual_cand = 1 - Σ_{i in ref_top_K} P_cand(i).
+            // Assumes the ref-tail and cand-tail miss similarly. Reduces bias on
+            // flat-distribution tokens (~1% of all tokens have residual >17% per
+            // Step 1.6's empirical p99). See plan §"GGUF anchor architecture
+            // (rev-3.3)" — residual-term enhancement.
             let mut kld_token = 0.0f64;
+            let mut sum_p_cand_at_ref_top = 0.0f64;
             for j in 0..top_k {
                 let ref_idx = top_indices[j] as usize;
                 if ref_idx >= cand_logits.len() {
@@ -211,10 +219,19 @@ fn main() {
                 let log_p_ref = top_log_probs[j] as f64;
                 let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
                 let p_ref = log_p_ref.exp();
+                let p_cand = log_p_cand.exp();
                 kld_token += p_ref * (log_p_ref - log_p_cand);
+                sum_p_cand_at_ref_top += p_cand;
             }
-            // Optional clamp on small-negative roundoff
-            if kld_token < 0.0 && kld_token > -1e-9 { kld_token = 0.0; }
+            // Residual cross-term. Only meaningful when both residuals are > 0.
+            let sum_p_residual_ref = sum_p_residual as f64;
+            let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
+            if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
+                kld_token += sum_p_residual_ref
+                    * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+            }
+            // Clamp small-negative roundoff to zero (KLD is ≥ 0 in theory).
+            if kld_token < 0.0 && kld_token > -1e-6 { kld_token = 0.0; }
 
             chunk_klds.push(kld_token);
             total_scored_done += 1;
