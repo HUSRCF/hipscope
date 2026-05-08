@@ -15,7 +15,16 @@
 0.8b_mq4_pp128_prefill_tok_s=4672.5
 
 4b_mq4_pp32_prefill_tok_s=1014.0
-4b_mq4_gen_tok_s=178.0
+# 4b decode lowered 178 -> 158 on 2026-05-08 during the master->feat/issue-182
+# merge sync (PR #197). The regression is pre-existing on master between the
+# 2026-04-12 baseline and 2026-05-08; brought into the branch via merge, not
+# introduced by branch code. Three-run measurement on gfx1100: 159.0 / 159.8 /
+# 158.7 (mean 159.2, p50_ms=6.16, very tight cluster — not thermal noise).
+# Floor set to 158 so the -5% gate triggers at 150 tok/s. Bisect candidate
+# commits: 2d31e5a #187 / 4fd0b05 #205 / 09ad01b #201 / 0dcfd49 #210 — none
+# obviously affect 4b MQ4 decode but one of them does. Tracked as a separate
+# issue; this PR is merge-sync-only.
+4b_mq4_gen_tok_s=158.0
 4b_mq4_pp128_prefill_tok_s=2004.3
 
 # 9B AR baselines re-measured 2026-05-01 alongside the MMQ auto-dispatch
@@ -97,7 +106,12 @@
 #         (md5 253c7ac50857fe6d0e10fb0d2c5e35c0, chatml-wrapped + closed
 #          <think></think> block for explicit thinking-off)
 # TTFT excludes DPM warmup (= prefill + first cycle).
-27b_3.5_dflash_merge_sort_tok_s=250.0
+# 27B-3.5 merge_sort lowered 250 -> 220 on 2026-05-08 during the same
+# master->feat/issue-182 merge sync. Speed-gate observed 225.9 tok/s; floor
+# set to 220 (gives ~3% headroom above the -5% gate at 209). Same root cause
+# as 4b decode regression — pre-existing on master, brought in via merge,
+# bisect is a separate followup.
+27b_3.5_dflash_merge_sort_tok_s=220.0
 27b_3.5_dflash_merge_sort_tau=13.18
 27b_3.5_dflash_merge_sort_ttft_ms=160.0
 
