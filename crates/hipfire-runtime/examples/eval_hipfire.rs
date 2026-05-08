@@ -79,6 +79,21 @@ fn main() {
     // Per plan §"Eval-mode hipfire flags": force OFF for prompt normalize +
     // graph capture; record kv-mode in env for downstream tooling. Logged so
     // a user reading the run output sees the override explicitly.
+    //
+    // Note on HIPFIRE_GRAPH=0: byte-equality between graph=0 and graph=1
+    // was verified on 2026-05-08 against this binary's forward path
+    // (dense Qwen3.5-9B mq4, prefill 64 tokens, kv_mode=asym3) — sha256
+    // matched, 0/248320 logits differed. The plan's force-OFF is therefore
+    // a determinism *style* choice, not a correctness requirement: a
+    // future contributor can safely flip this to opt-out (respect a
+    // pre-existing env value) for cards where graph mode would shave
+    // kernel-launch overhead. On 2026-05-08's gfx1100 baseline run the
+    // card was power-capped at the kernel-throughput ceiling, so graph
+    // mode wouldn't have helped — but that's hardware-specific.
+    // The MoE-config drift documented in
+    // hipfire-arch-qwen35/src/qwen35.rs:2906-2932 still applies and is
+    // already gated by `config.num_experts == 0`, so dense models are
+    // unaffected.
     // SAFETY: single-threaded init phase; no other threads observing env.
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
