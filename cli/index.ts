@@ -954,7 +954,9 @@ class Engine {
 
   async start() {
     const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
+      ...(envBin ? [envBin] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
@@ -4477,7 +4479,9 @@ switch (cmd) {
     // ── 4. Daemon binary + models ──────────────────────────
     console.log("");
     const exe2 = process.platform === "win32" ? ".exe" : "";
+    const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
+      ...(envBin2 ? [envBin2] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
