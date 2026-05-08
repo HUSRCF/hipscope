@@ -95,6 +95,12 @@ Result table grows a per-arch column. If gfx1100 and gfx1151 KLDs diverge by mor
 
 ## Tokenizer alignment + bridge investigation
 
+**Resolved 2026-05-08 (Step 1.5 ran on 9B BF16 GGUF):** the parity check failed structurally — hipfire and llama.cpp diverge on ~46% of token positions on the slice. **However, the divergence does not block the eval pipeline.** See §"Step 1.5 verdict" below for the full reasoning. tl;dr: `eval_hipfire.rs` reads token IDs from the reference file (written by llama-perplexity); it never re-tokenizes the slice. So whichever tokenizer produced the IDs in the reference is the only tokenizer that matters; the candidate model just consumes valid IDs from its vocabulary.
+
+The original concern (below) was over-cautious. Keeping the §"Tokenizer alignment + bridge investigation" framing for context, but the bridge work / drop-anchor decision tree is moot: we proceed with llama-perplexity for both BF16 reference dump AND GGUF candidate evaluations, eval_hipfire reads token IDs from reference, no re-tokenization anywhere in the pipeline.
+
+### Original concern (pre-Step-1.5)
+
 llama.cpp tokenizes via per-GGUF tokenizer; hipfire uses the upstream Qwen tokenizer through hipfire's loader. **If these tokenize the slice differently, the entire GGUF-anchor track is invalid.**
 
 **Step 1.5 (mandatory before any reference dump):** byte-identical tokenizer-parity check.
@@ -133,6 +139,33 @@ step 1.5 tokenizer-parity result:
 ```
 
 (M7)
+
+### Step 1.5 verdict (2026-05-08, 9B BF16 GGUF + slice md5 `83b0205a`)
+
+Empirically:
+- hipfire produced 2,407,713 tokens
+- llama.cpp produced 2,407,712 tokens (Δ = 1)
+- 1,104,899 of 2,407,712 positions differ (45.9%)
+- 11,638 contiguous diff runs, mostly length 2
+- **Every divergence is the same pattern**: hipfire emits `[2071, 110]` where llama.cpp emits `[220, 28495]` — same merge work, different pair chosen by the BPE merge-priority tiebreaker on a specific byte sequence. Streams realign within 2 tokens.
+
+This is a known behavior difference between llama.cpp's GGUF-bundled BPE encoder and the upstream HF Qwen tokenizer. PR #201's encoder has been verified byte-identical to HF tokenizers; the divergence is on llama.cpp's side, not hipfire's.
+
+**Why this doesn't block the eval pipeline:**
+
+`eval_hipfire.rs` reads the per-token reference's `tokens` field (written by llama-perplexity during the BF16 ref dump) and feeds those IDs directly into `forward_scratch`. It **never re-tokenizes the slice**. So the candidate model just consumes the reference's token IDs — same vocabulary, valid input regardless of which BPE produced them.
+
+| | producer | consumer | tokenizer agreement needed? |
+|---|---|---|---|
+| BF16 reference | llama-perplexity → ref file | (none) | — |
+| hipfire candidate | hipfire forward_scratch | KLD vs ref | **No** (reads token IDs from ref) |
+| GGUF candidate | llama-perplexity on same slice | KLD vs ref | only that llama-perplexity is deterministic on its own slice (which it is) |
+
+**Implication for §"GGUF anchor track is viable":** the anchor track is viable. We can run Q3_K_S etc. against the same BF16 reference and compare KLDs.
+
+**The only place tokenizer parity would matter:** if a USER ran hipfire on the same slice TEXT and expected to get the same per-token NLL/PPL as llama.cpp — they wouldn't, because the tokenization differs. But that's a user-facing comparison, not the eval pipeline. The Pareto plot's KLD axis is internally consistent (all measurements use llama-perplexity's tokenization).
+
+**Decision: proceed with both tracks (hipfire candidates + GGUF anchors) using llama-perplexity tokenization throughout.** No bridge work, no anchor-track drop. The plan rev-3.2 already permits this — we're just observing that the pessimistic fallback (drop anchor on parity fail) was unnecessary.
 
 ## Repo layout (committed)
 
