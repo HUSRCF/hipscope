@@ -260,3 +260,7 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "build_kld_ref"
 required-features = []
+
+[[example]]
+name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
