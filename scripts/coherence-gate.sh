@@ -97,6 +97,13 @@ SHORT_TESTS=(
     # with the model file present.
     "qwen3.5-4b.mq3-lloyd|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
     "qwen3.5-9b.mq3-lloyd|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # MQ4-Lloyd coverage (issue #182 Phase B3 — regression-prevention
+    # companion to B2's batched WMMA prefill wiring). Exercises
+    # gemm_*_mq4g256_lloyd_wmma family + nibble-pair decode + per-row LDS
+    # codebook (16 entries × 16 rows = 512 B/workgroup). 9B row catches
+    # any mid-layer corruption that would surface as token-loop attractor.
+    # gfx11 + gfx12 only (refused on other archs by is_batchable_la).
+    "qwen3.5-9b.mq4-lloyd|reason-mq4-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
     # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
