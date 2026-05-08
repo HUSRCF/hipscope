@@ -1,7 +1,8 @@
 # Quant quality eval — KLD-primary harness for MQ3/MQ4 (uniform + Lloyd) + Q8 reference proxy + GGUF anchors
 
-**Status:** plan rev-3 (2026-05-08). Folds the multi-reviewer adversarial review (Claude + GLM-5 + Gemini consolidated; 3 blockers / 8 serious / 9 medium / 10 minor) into the plan body. The standalone review files were dropped after fold-in.
+**Status:** plan rev-3.1 (2026-05-08). Step 0 (read llama.cpp `tools/perplexity/perplexity.cpp` on the pinned commit) executed; binary-format spec replaced with the verified format + the hipfire-internal top-K-reduced derivative (option B). Storage estimate corrected from "3-8 GB/ref" to actuals.
 **Tracking:** #113 (uniform), #116 (Lloyd, mirror sub-section).
+**Pinned llama.cpp commit:** `9dcf83552887bb898b4a98a5761361e504e31fc3` (master, 2026-05-08).
 
 ## Goal & non-goal
 
@@ -155,34 +156,107 @@ benchmarks/quality-baselines/
 
 (m9 — moved manifest.json under harness/ for dependency clarity.)
 
-## Binary format pinning
+## Binary format
 
-`eval_hipfire.rs` emits **llama.cpp's exact `--kl-divergence-base` binary layout**. This makes `llama-perplexity --kl-divergence-base <hipfire.bin>` work as the reducer for both tracks; `kld_reduce.py` is a sanity wrapper / cross-check.
+### llama.cpp's native `--kl-divergence-base` format (verified Step 0)
 
-**Prerequisite (S6 — 1 hour, before sequencing step 1):** read `examples/perplexity/perplexity.cpp` on the pinned llama.cpp commit. Replace the layout below with the actual layout, citing line numbers in this section. The layout below is **inferred and unverified**; treat as a sketch until step 0 confirms.
+For reference; we **do not use this format directly** for the cached reference (see "Hipfire derived format" below). Verified against `tools/perplexity/perplexity.cpp` on commit `9dcf83552`:
 
 ```
-header (inferred — verify):
-  u32 magic
-  u32 version
-  u32 n_tokens
-  u32 top_k
-per-token block:
-  fp32 logprob_target
-  fp32 logprobs_topk[top_k]
-  u32  topk_indices[top_k]
-  fp32 sum_exp_residual
+Header (16 bytes):
+  bytes  0-7   magic "_logits_"     (8 ASCII chars, no null) [perplexity.cpp:1709]
+  bytes  8-11  n_ctx                (uint32)                  [line 1718]
+  bytes 12-15  n_vocab              (int32)                   [line 1726]
+  bytes 16-19  n_chunk              (int32)                   [line 1727]
+
+Tokens:
+  n_ctx × n_chunk × int32 token IDs                           [line 1737]
+
+Per-chunk × per-scored-token (only n_ctx − 1 − n_ctx/2 tokens scored per chunk):
+  nv = 2 × ((n_vocab + 1) / 2) + 4   uint16 values             [line 1752]
+    [0..1]    scale          (fp32, packed as 2 × uint16)
+    [2..3]    min_log_prob   (fp32, packed as 2 × uint16)
+    [4..nv]   stored[i]      (uint16, FULL vocab)              [line 100-101 producer]
+    Reconstruction: log_prob[i] = scale * stored[i] + min_log_prob   [line 222-225 consumer]
+    Quantization: stored = nearest_int((logit[i] − min_logit) / scale), 0 if logit ≤ min_logit
+    min_logit clipped to max_logit − 16
 ```
 
-**Numerical strategy (S4):** `sum_exp_residual` over Qwen's 151K vocab requires:
-- **log-sum-exp** formulation to avoid overflow on extreme logits.
-- **double-precision (fp64) accumulation** to avoid bias on long sums of small values.
+**No magic-version field. No top-K. Full vocab.** Storage at Qwen 151,936 vocab × 1024 chunks × 1023 scored tokens/chunk = **~318 GB per reference**, or ~955 GB for 3 models. **Unhostable on HF.**
 
-llama.cpp uses both in `softmax_f32` and the perplexity-mode reducer. `eval_hipfire.rs` MUST match. Verify by computing top-K + residual on 10 random tokens of the 9B canary fixture and comparing bit-for-bit (within fp32 tolerance) against `llama-perplexity`'s output for the same inputs.
+### Numerics (verified Step 0)
 
-**MUST top-K-reduce in-flight (M9 / Gemini 5.2):** for Qwen's 151K vocab × 2M tokens × fp32, dumping full-vocab logits would cost **~1.2 TB**. `eval_hipfire.rs` MUST compute top-K + residual per token *before* writing to disk. Never dump full-vocab logits as an intermediate. The plan's storage estimate (3-8 GB per reference) assumes top-K reduction has happened.
+llama.cpp's reference producer uses:
+- `double sum_exp = 0.0` accumulator [line 87] — fp64 ✓
+- `log_sum_exp = log(sum_exp)` formulation [line 91] — log-sum-exp ✓
 
-**Top-K choice (M1 sub-step 1.6):** before bulk eval, run a residual-mass sanity check on 10 random tokens from the 9B canary fixture. Compute fraction of probability mass in the truncated tail (i.e. `sum_exp_residual / (sum_exp_residual + sum_exp_topk)`). If the median is <0.5%, top-K=256 is fine. If >2%, raise to top-K=512 (storage doubles, still within budget). Record the actual K chosen in `manifest.json`.
+`build_kld_ref` (below) and `eval_hipfire.rs` MUST match these conventions. Verify by computing top-K + residual on 10 random tokens of the 9B canary fixture and comparing fp32-tolerance against the values llama-perplexity produces in-memory (uses fp64 accumulator → fp32 output).
+
+### Hipfire-derived top-K format (option B — what we actually use)
+
+Step 0 surfaced that llama.cpp's native format is unhostable. We adopt **option B**: produce a hipfire-controlled top-K-reduced format from llama.cpp's full-vocab inference output. This trades "shared metric impl with llama.cpp" for "fits on HF" — `kld_reduce.py` becomes the canonical KLD reducer; `llama-perplexity --kl-divergence-base` is no longer used as our consumer.
+
+**Format spec:**
+
+```
+Header (32 bytes):
+  bytes  0-7   magic "HFKLDR\0\0"   (8 ASCII chars, null-padded)
+  bytes  8-11  version              (uint32, currently 1)
+  bytes 12-15  n_ctx                (uint32)
+  bytes 16-19  n_vocab              (uint32)            [for sanity vs candidate]
+  bytes 20-23  n_chunk              (uint32)
+  bytes 24-25  top_k                (uint16, e.g. 256)
+  bytes 26-27  flags                (uint16, currently 0)
+  bytes 28-31  reserved             (uint32, zero)
+
+Tokens:
+  n_ctx × n_chunk × uint32 token IDs
+
+Per-chunk × per-scored-token (n_ctx − 1 − n_ctx/2 tokens per chunk):
+  fp32 max_logit                    [for reconstruction of full softmax]
+  fp32 log_sum_exp                  [the log-Z; sum over ALL vocab]
+  uint32 top_indices[top_k]         [vocab IDs, descending logit]
+  fp32   top_logits[top_k]          [the unnormalized logits, fp32]
+  fp32   sum_exp_residual           [sum exp(logit_i − max_logit) over i NOT in top_k]
+```
+
+Per-token storage: `2*4 + top_k*4 + top_k*4 + 4 = 12 + 8*top_k` bytes. At top_k=256: **2,060 B per token** (~25× smaller than llama.cpp's native 304 KB). At 1024 × 1023 = 1,047,552 scored tokens × 2,060 B = **~2.16 GB per reference**, or ~6.5 GB for 3 references — fits HF.
+
+Reconstruction at consumer: log-prob for any vocab id `i` is `logit[i] − max_logit − log_sum_exp`, where `logit[i]` is `top_logits[j]` if `i = top_indices[j]` for some j, otherwise unknown but `sum_exp_residual` constrains the bulk mass. KLD math then proceeds with top-K from candidate × top-K from reference, plus residual cross-terms.
+
+**Why this format vs llama.cpp's:**
+- 150× smaller per token (top-K + residual vs full uint16)
+- Stored values are fp32 not affine-quantized uint16 → no quantization noise in the reference
+- top_k explicit + stored in header → no dependency on n_vocab divisibility
+- Full vocab IDs preserved (top_indices) so consumer can match against candidate's top-K
+- Token ID stride preserved so `eval_hipfire.rs` can align without re-tokenizing the slice
+
+**Producer:** `benchmarks/quality-baselines/harness/build_kld_ref.rs`. Architecture:
+
+```
+build_kld_ref --bf16-gguf qwen3.5-9b-bf16.gguf \
+              --slice slice.txt \
+              --top-k 256 \
+              --output refs/qwen3.5-9b-bf16.kldref.bin
+
+[1] mkfifo /tmp/kldref.fifo
+[2] spawn: llama-perplexity -m <gguf> -f <slice> --kl-divergence-base /tmp/kldref.fifo -c <n_ctx>
+[3] read header from FIFO (16 bytes) → parse n_ctx, n_vocab, n_chunk
+[4] read tokens from FIFO (n_ctx*n_chunk*4 bytes) → write directly to output
+[5] for each per-token block (nv*2 bytes from FIFO):
+       reconstruct logits from (scale, min_log_prob, stored[])
+       compute max_logit, log_sum_exp (fp64)
+       top-K-reduce (nlargest by logit)
+       compute sum_exp_residual = sum_{i not in top_k} exp(logit[i] - max_logit)  [fp64]
+       write hipfire per-token block (12 + 8*top_k bytes)
+[6] join llama-perplexity, rm fifo
+```
+
+The FIFO sidesteps the 318 GB transient: llama.cpp streams full-vocab uint16, hipfire's reducer reads + reduces in-flight, ~2 GB lands on disk.
+
+**Top-K choice (M1):** at top_k=256, residual-mass sanity (Step 1.6) checks median fraction of probability outside top-256 on 10 canary tokens. <0.5% → 256 OK; >2% → raise to 512. Record actual K in manifest. Earlier rev-3 estimate stands.
+
+**Numerics:** all sums (log_sum_exp, sum_exp_residual) computed in fp64, written as fp32. Matches llama.cpp's accumulator precision.
 
 ## Reference dump → HF Hub
 
@@ -190,32 +264,34 @@ Per-model BF16 reference logit dumps live at **`hipfire-models/hipfire-eval-refs
 
 **On the org choice:** `hipfire-models` is a new HF org created 2026-05-08 (see project memory; we already use it for the dev-stage Lloyd quants at `hipfire-models/qwen3.5-{4b-dev,9b-dev,9b}` and `hipfire-models/qwen3.6-27b-dev`). The legacy registry (`cli/registry.json`) still references `schuttdev/hipfire-*` for non-Lloyd quants where the canonical owner has write access. **Eval refs go to `hipfire-models` because Kevin (org admin) has write access; `schuttdev` is read-only.** This will look like an inconsistency in committed state at PR review time — flag it in the PR description.
 
-Files:
+Files (corrected after Step 0; format = hipfire top-K-reduced, not llama.cpp full-vocab):
 
 ```
-qwen3.5-9b-bf16.kldref.bin     (~3-5 GB, top-K=256 + residual)
-qwen3.5-27b-bf16.kldref.bin    (~5-8 GB)
-qwen3.6-27b-bf16.kldref.bin    (~5-8 GB)
+qwen3.5-9b-bf16.kldref.bin     (~2.2 GB, top-K=256 + residual + meta, see Binary format §)
+qwen3.5-27b-bf16.kldref.bin    (~2.2 GB — same shape; top-K shrinks the n_vocab dependency to a constant)
+qwen3.6-27b-bf16.kldref.bin    (~2.2 GB)
 README.md                       (producer commands, slice md5, llama.cpp commit pin, host_arch=gfx1151, model SHA256)
 ```
+
+(All three are ~the same size at top_k=256: per-token block size is `12 + 8*top_k = 2,060 B` independent of n_vocab. n_vocab is only stored in the header for sanity-check.)
 
 In-tree `manifest.json` carries `{sha256, hf_url, producer_cmd, model_sha256, llamacpp_commit, slice_md5, host_arch, top_k}` per reference. `scripts/fetch-eval-refs.sh` reads manifest, pulls via `hf` CLI into `~/.cache/hipfire-eval-refs/`, verifies SHA256.
 
 ## Reference dump methodology (one-time per model, on gfx1151)
 
+```bash
+cargo run --release --example build_kld_ref -p hipfire-runtime -- \
+  --bf16-gguf  models/qwen3.5-9b-bf16.gguf \
+  --slice      benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --top-k      256 \
+  --output     refs/qwen3.5-9b-bf16.kldref.bin
 ```
-llama-perplexity \
-  -m qwen3.5-9b-bf16.gguf \
-  -f benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-  --kl-divergence-base refs/qwen3.5-9b-bf16.kldref.bin \
-  -c 2048 -b 512
-```
 
-**BF16 only**, produced by **llama.cpp only** (B3). The hipfire runtime does not support BF16 inference — see `crates/hipfire-runtime/src/llama.rs:481`, which panics on any `GgmlType` outside `{F32, F16, Q4_0, Q8_0, Q4K, Q6K}`. `eval_hipfire.rs` runs hipfire's quantized variants only (Q8, MQ3-uniform, MQ4-uniform, MQ3-Lloyd, MQ4-Lloyd) and scores them against the externally-produced BF16 reference.
+**BF16 only**, produced via llama.cpp's inference (B3). The hipfire runtime does not support BF16 inference — see `crates/hipfire-runtime/src/llama.rs:481`, which panics on any `GgmlType` outside `{F32, F16, Q4_0, Q8_0, Q4K, Q6K}`. `build_kld_ref` orchestrates llama-perplexity as a subprocess, reads its full-vocab uint16 stream via FIFO, computes top-K + residual in flight, and writes the hipfire-internal format. `eval_hipfire.rs` runs hipfire's quantized variants only (Q8, MQ3-uniform, MQ4-uniform, MQ3-Lloyd, MQ4-Lloyd) and scores them against the externally-produced BF16 reference.
 
-gfx1151 has 137 GB UMA — 27B BF16 fits with huge headroom.
+gfx1151 has 137 GB UMA — 27B BF16 fits with huge headroom. Disk needs are minimal (~2 GB output) since the FIFO sidesteps the 318 GB transient.
 
-**Producer command + SHA recorded** alongside the reference SHA in `manifest.json` so divergence-debugging 6 months from now is trivial.
+**Producer command + SHA recorded** alongside the reference SHA in `manifest.json` so divergence-debugging 6 months from now is trivial. The pinned llama.cpp commit (`9dcf83552`) is also recorded — if a future contributor rebuilds llama.cpp from a different commit and the producer format changes, the SHA mismatch surfaces it.
 
 ## Reference-drift canary (clarified)
 
@@ -300,10 +376,11 @@ Numbers above are illustrative — real numbers come from the eval runs.
 - **9B CPU BF16 sanity (m3):** ~30 min.
 - **Total: ~75 GPU-hours wall-clock.** Add ~20% padding for retries, tokenizer-parity / bridge investigation, and binary-format source-read (S6) → **~90 GPU-hours.**
 
-Storage:
+Storage (corrected after Step 0):
 - Slice text: ~1 MB in git.
 - Slice tokens.bin (post-bridge): ~8 MB if 1024 × 2048 × 4 B, in git.
-- Per-model BF16 reference: ~3-8 GB on HF Hub. Three models = ~10-25 GB external. Acceptable on hipfire-models org's HF storage.
+- Per-model BF16 reference (hipfire top-K format): **~2.2 GB** on HF Hub (top_k=256: 12+8*256 = 2,060 B/token × 1024 chunks × 1023 tokens/chunk). Three models = **~6.5 GB external**. Comfortable on hipfire-models org.
+- Reference-build transient: 318 GB of full-vocab uint16 streams from llama-perplexity per model dump, but never lands on disk — FIFO-piped through `build_kld_ref`'s top-K reducer. Disk requirement during a ref dump = ~3 GB scratch + the ~2.2 GB output.
 - Per-quant per-sequence KLDs (CI reproducibility): 1024 × 4 B per row = 4 KB; total across 30+7 rows = ~150 KB; in git or attached to the result file.
 - Optional `--keep-logs` for per-token logits (debugging only): ~3-8 GB per variant per arch, not persisted by default.
 
@@ -326,28 +403,32 @@ Storage:
 | 13 (new) | Historical baselines comparable? | No. Document in result-file preamble. |
 | 14 (new) | KV mode for eval | `asym3`, recorded per-row. |
 | 15 (new) | DFlash τ included? | Yes, as a column on rows where a draft exists. Canonical merge_sort prompt + md5. |
+| 16 (rev-3.1) | Reference format | **Hipfire-internal top-K-reduced** (option B), derived from llama.cpp's full-vocab native format via FIFO streaming in `build_kld_ref`. Native format is too large (~318 GB/ref). |
+| 17 (rev-3.1) | llama-perplexity tokens-as-input flag | Confirmed absent on commit `9dcf83552`. Tokenizer-parity (Step 1.5) is the primary mitigation; if it fails, drop GGUF anchor track (rev-3 plan stands). |
 
-## Sequencing (rev-3, with explicit prerequisites)
+## Sequencing (rev-3.1; Step 0 done, format pivoted to option B)
 
-**Step 0 (PRE-WORK, ~1 hour, before any harness code is written):** read `examples/perplexity/perplexity.cpp` on the pinned llama.cpp commit. Verify the `--kl-divergence-base` binary layout, the `sum_exp_residual` numerics (log-sum-exp + fp64), and whether any tokens-as-input flag exists. Replace the inferred §"Binary format pinning" layout with the actual layout, citing line numbers. (S6, S4 prerequisites; informs B1 bridge-feasibility.)
+**Step 0 (DONE — pre-work, see plan rev-3.1 status banner):** read `tools/perplexity/perplexity.cpp` on the pinned llama.cpp commit `9dcf83552`. Verified the `--kl-divergence-base` binary layout (full-vocab uint16, **not** top-K — see §Binary format), the `sum_exp_residual` numerics (log-sum-exp + fp64 ✓), and confirmed `llama-perplexity` does **not** accept pre-tokenized input. Storage estimate corrected from "3-8 GB/ref" to "~318 GB/ref native, ~2.2 GB/ref hipfire-derived".
 
-**Step 1:** land harness skeleton — slice + `kld_reduce.py` + `eval_gguf.sh` + `tokenizer_parity.py` + canary fixture (11 sequences, 10 short + 1 long-ctx) + `manifest.json` schema.
+**Decision:** adopt **option B** (hipfire-internal top-K-reduced format derived from llama.cpp's full-vocab via FIFO streaming). Reasons: (a) ~150× smaller, fits HF; (b) avoids 1-2 days of llama.cpp C++ patching; (c) `kld_reduce.py` becomes the canonical reducer (we lose "shared metric impl with llama-perplexity" but that was never deeply load-bearing — the reducer was always going to live in our tree).
 
-**Step 1.5:** tokenizer-parity check (M3). Run `tokenizer_parity.py`. Pass → continue. Fail → Step 2.
+**Step 1:** land harness skeleton — slice + `kld_reduce.py` + `eval_gguf.sh` + `tokenizer_parity.py` + canary fixture (11 sequences, 10 short + 1 long-ctx) + `manifest.json` schema. Includes the hipfire reference format reader/writer in a small `kldref` module.
 
-**Step 1.6:** top-K residual-mass sanity check (M1). Dump full-vocab logits for 10 random tokens from canary, compute residual fraction. If <0.5%, top-K=256 confirmed. If >2%, raise to 512 and update §"Binary format pinning" + manifest schema.
+**Step 1.5:** tokenizer-parity check (M3). Run `tokenizer_parity.py`. Pass → continue. Fail → bridge work or drop GGUF anchor track (see §"Tokenizer alignment + bridge investigation").
 
-**Step 2 (only if Step 1.5 fails):** bridge feasibility investigation (B1). 30-min llama-perplexity source read. If patch ≤ 2 days, commit to it and budget. If not, drop GGUF anchor track entirely and skip future GGUF steps.
+**Step 1.6:** top-K residual-mass sanity check (M1). Build a one-off dumper (or use a mini variant of `build_kld_ref --dump-residual-stats` mode) that reads full-vocab logits for 10 random tokens from the canary fixture and reports median residual mass. If <0.5%, top-K=256 confirmed. If >2%, raise to 512 and update header version + manifest schema.
 
-**Step 3:** write `eval_hipfire.rs`. Top-K-reduce in-flight (M9). Output llama.cpp KLD-base format (S6 prereq). log-sum-exp + fp64 (S4). Verify bit-for-bit against llama.cpp on 10 canary tokens.
+**Step 2:** write `build_kld_ref.rs` — Rust orchestrator that spawns `llama-perplexity --kl-divergence-base /tmp/kldref.fifo`, reads the full-vocab uint16 stream from the FIFO, top-K-reduces in flight (fp64 accumulators), writes the hipfire format spec'd in §Binary format. Verify bit-tolerance: top-K logprobs computed from native llama.cpp output match what we'd get from a separate `llama-perplexity` candidate-side run on the same model + slice.
 
-**Step 4:** dump 9B BF16 reference on gfx1151 → upload to `hipfire-models/hipfire-eval-refs` → manifest. Verify canary passes (both NORMALIZE_PROMPT settings — m2). 9B CPU BF16 sanity check (m3).
+**Step 3:** write `eval_hipfire.rs`. Reads the hipfire-internal reference. Runs hipfire's quant variants. Computes per-token KLD on the fly (no second binary file written; just per-sequence KLDs in the result). log-sum-exp + fp64 in the residual cross-term computation. Validate bit-tolerance against `kld_reduce.py` on a synthetic 10-token fixture.
+
+**Step 4:** dump 9B BF16 reference on gfx1151 via `build_kld_ref` → upload to `hipfire-models/hipfire-eval-refs` → manifest. Verify canary passes (both NORMALIZE_PROMPT settings — m2). 9B CPU BF16 sanity check (m3).
 
 **Step 5:** run hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). **Validate via canary, NOT against PR #115 PPLs** (B2 / S2 — historical reproduction is impossible). The canary's expected per-sequence KLDs are the harness validation; PPL plausibility ranges (within ~30% of historical) are a sanity check, not a reproduction.
 
 **Step 6:** repeat steps 4–5 for 27B and 27B-3.6.
 
-**Step 7:** GGUF anchor track on 27B-3.6 (gfx1151 only, conditional on Step 1.5/2 outcome).
+**Step 7:** GGUF anchor track on 27B-3.6 (gfx1151 only, conditional on Step 1.5 outcome). Each GGUF candidate eval also goes through `llama-perplexity` as the inference engine but writes the same hipfire-internal format via the same `build_kld_ref`-style FIFO trick (a separate `eval_gguf_candidate.rs` or a `--mode candidate` flag on build_kld_ref). KLD then computed by `kld_reduce.py` against the cached BF16 ref.
 
 **Step 8:** measure DFlash τ (canonical merge_sort prompt, md5-pinned) for each variant where a draft model exists. Add as the `DFlash τ` column (S8).
 
