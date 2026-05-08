@@ -10,17 +10,22 @@
 # md5 will change, all prior result tables become incomparable.
 #
 # Dependencies:
-#   - python3 with `datasets` and `tokenizers` (or `transformers`)
-#   - pinned tokenizer: Qwen3.5/3.6 tokenizer.json (any file should work since
-#     the slice is just text; tokenizer is only used to count windows)
+#   - Project venv at REPO_ROOT/.venv with `datasets` installed.
+#     Set up via:  python3 -m venv .venv && .venv/bin/pip install datasets
 #
 # Usage:
-#   ./make_slice.sh [--tokenizer-path <path>]
+#   ./make_slice.sh
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-TOKENIZER_PATH="${1:-${HOME}/.hipfire/models/qwen3.5-9b.mq4}"
+REPO_ROOT="$(cd ../../.. && pwd)"
+PYTHON="${REPO_ROOT}/.venv/bin/python3"
+if [ ! -x "$PYTHON" ]; then
+    echo "make_slice.sh: $PYTHON not found." >&2
+    echo "Set up the venv:  cd ${REPO_ROOT} && python3 -m venv .venv && .venv/bin/pip install datasets" >&2
+    exit 2
+fi
 
 OUT="wikitext2-1024s-2048ctx.txt"
 N_SEQ=1024
@@ -34,7 +39,7 @@ fi
 
 echo "make_slice.sh: generating $OUT (target: $N_SEQ sequences × $N_CTX tokens)..."
 
-python3 <<PYEOF
+"$PYTHON" <<PYEOF
 import sys
 from datasets import load_dataset
 
