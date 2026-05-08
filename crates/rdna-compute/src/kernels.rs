@@ -111,7 +111,12 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna3"),
-        _ => (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq4g256_lloyd_residual_wmma"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA residual: unsupported arch {arch}. The is_batchable_la upstream \
+             gate should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_mq4g256_lloyd_residual_wmma_for_arch (160 B Lloyd stride would mismatch \
+             any default kernel)."
+        ),
     }
 }
 pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -120,7 +125,11 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA qkvza: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_qkvza_mq4g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -129,7 +138,11 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA qkv: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_qkv_mq4g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -138,7 +151,11 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA gate_up: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_gate_up_mq4g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 
@@ -244,7 +261,12 @@ pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
             (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq3g256_lloyd_residual_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq3g256_lloyd_residual_wmma_rdna3"),
-        _ => (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq3g256_lloyd_residual_wmma"),
+        _ => panic!(
+            "MQ3-Lloyd WMMA residual: unsupported arch {arch}. The is_batchable_la upstream \
+             gate should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_mq3g256_lloyd_residual_wmma_for_arch (112 B Lloyd stride would mismatch \
+             any default kernel)."
+        ),
     }
 }
 pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -253,7 +275,11 @@ pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
             (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq3g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ3-Lloyd WMMA qkvza: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_qkvza_mq3g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -262,7 +288,11 @@ pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
             (GEMM_QKV_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq3g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkv_mq3g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkv_mq3g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ3-Lloyd WMMA qkv: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_qkv_mq3g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
@@ -271,7 +301,11 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
             (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna4"),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna3"),
-        _ => (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma"),
+        _ => panic!(
+            "MQ3-Lloyd WMMA gate_up: unsupported arch {arch}. The is_batchable_la upstream gate \
+             should reject this; if you reached here, is_batchable_la was extended without \
+             updating gemm_gate_up_mq3g256_lloyd_wmma_for_arch."
+        ),
     }
 }
 /// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
