@@ -1,6 +1,6 @@
 # Quant quality eval — KLD-primary harness for MQ3/MQ4 (uniform + Lloyd) + Q8 reference proxy + GGUF anchors
 
-**Status:** plan rev-3.2 (2026-05-08). Step 0 done; format simplified from α (logits + max_logit + log_sum_exp + sum_exp_residual) to β (log-probs + sum_p_residual) — KLD-equivalent, no machinery to back out llama.cpp's encoding. qwen3.5-27B dropped from the matrix (superseded by qwen3.6-27B).
+**Status:** plan rev-3.3 (2026-05-08). Step 0 done; format β locked; qwen3.5-27B dropped (superseded by qwen3.6-27B); GGUF anchor architecture locked (no FIFO tee / no llama.cpp-native cached ref needed — both tracks use the same hipfire-β ref, candidate-side KLD math is identical, only the cand-logit source differs). Step 1.5 + 1.6 verdicts in §"Step 1.5 verdict" and §"Open questions resolved" row 11.
 **Tracking:** #113 (uniform), #116 (Lloyd, mirror sub-section).
 **Pinned llama.cpp commit:** `9dcf83552887bb898b4a98a5761361e504e31fc3` (master, 2026-05-08).
 
@@ -444,7 +444,48 @@ Storage (corrected after Step 0; format β: 8 + 8*top_k bytes/token):
 | 18 (rev-3.2) | Reference format detail (α vs β) | β: log-probs + sum_p_residual + reserved_pad. 8 + 8*top_k bytes/token. KLD-equivalent to α; avoids machinery to back out llama.cpp's encoded `min_log_prob` to raw logits. Used as final spec. |
 | 19 (rev-3.2) | qwen3.5-27B in eval matrix | **Dropped.** Superseded by qwen3.6-27B (newer training corpus, same parameter budget). Matrix is now 9B (qwen3.5) + 27B (qwen3.6). Drops ~20 GPU-hours from the bench commitment. |
 
-## Sequencing (rev-3.2; Step 0 done, format β locked, qwen3.5-27B dropped)
+## GGUF anchor architecture (rev-3.3, locked 2026-05-08)
+
+After Step 1.5's verdict ("tokenizer parity fails but doesn't block"), the
+GGUF anchor track architecture became clearer:
+
+**The cached BF16 reference (hipfire-β format, top-K + residual) is
+sufficient input for BOTH hipfire candidates AND GGUF candidates.**
+No FIFO tee, no re-dump, no llama.cpp-native cached ref needed.
+
+Why: KLD is computed candidate-side, looking up cand's log-prob at the
+*ref's* top_indices. `eval_hipfire.rs` already does this; we add
+`eval_gguf.rs` mirroring the same KLD math but using a different
+source for cand's logits.
+
+| binary | cand-logit source | per-token KLD math |
+|---|---|---|
+| `build_kld_ref` (DONE) | (writes ref, no cand) | — |
+| `eval_hipfire` (DONE) | hipfire `forward_scratch` returns full vocab logits | for each tok: read ref's top_indices + top_log_probs from ref file; compute log_p_cand[ref_top_indices] from hipfire's full vocab; KLD = Σ P_ref * (log_p_ref − log_p_cand) over ref's top-K |
+| `eval_gguf` (NEW, ~half day) | spawn `llama-perplexity --kl-divergence-base <fifo>` on the GGUF candidate; read full-vocab uint16 from FIFO; reconstruct candidate's log-probs for any token via `scale * stored[i] + min_log_prob` | identical math to eval_hipfire |
+
+Both candidate-side binaries write HFKSEQ (per-sequence mean+p99 KLD)
+that `kld_reduce.py` aggregates. `eval_gguf` is a near-clone of
+`build_kld_ref`'s FIFO-orchestration code but processes blocks
+differently (KLD against ref's top_indices instead of own top-K
+reduction).
+
+**Residual-term enhancement (rev-3.3):** both candidate binaries should
+include a residual cross-term in the KLD computation, not drop it
+entirely. Approximation:
+- `kld_residual ≈ sum_p_residual_ref * (log(sum_p_residual_ref) − log(sum_p_residual_cand))`
+  - where `sum_p_residual_cand = 1 − Σ_{i in ref_top_K} P_cand(i)`
+- This assumes both distributions miss similarly in the tail; reduces
+  bias on flat-distribution tokens (~1% of all scored tokens have
+  residual mass > 17%, per Step 1.6).
+- Add to both `eval_hipfire.rs` and `eval_gguf.rs` in their respective
+  per-token KLD inner loops. ~5 lines each.
+
+**No artifact rework needed:** the 9B BF16 ref dump in flight (and the
+27B dump still to come) produce the correct ref artifact for both
+tracks. eval_gguf is the only missing piece.
+
+## Sequencing (rev-3.3; Step 0 done, format β locked, qwen3.5-27B dropped, GGUF arch locked)
 
 **Step 0 (DONE — pre-work, see plan rev-3.1 status banner):** read `tools/perplexity/perplexity.cpp` on the pinned llama.cpp commit `9dcf83552`. Verified the `--kl-divergence-base` binary layout (full-vocab uint16, **not** top-K — see §Binary format), the `sum_exp_residual` numerics (log-sum-exp + fp64 ✓), and confirmed `llama-perplexity` does **not** accept pre-tokenized input. Storage estimate corrected from "3-8 GB/ref" to "~318 GB/ref native, ~2.2 GB/ref hipfire-derived".
 
@@ -466,7 +507,10 @@ Storage (corrected after Step 0; format β: 8 + 8*top_k bytes/token):
 
 **Step 6:** repeat steps 4–5 for qwen3.6-27B.
 
-**Step 7:** GGUF anchor track on qwen3.6-27B (gfx1151 only, conditional on Step 1.5 outcome). Each GGUF candidate eval also goes through `llama-perplexity` as the inference engine but writes the same hipfire-internal format via the same `build_kld_ref`-style FIFO trick (a separate `eval_gguf_candidate.rs` or a `--mode candidate` flag on build_kld_ref). KLD then computed by `kld_reduce.py` against the cached BF16 ref.
+**Step 7:** GGUF anchor track on qwen3.6-27B (gfx1151 only). Architecture locked at rev-3.3 (see §"GGUF anchor architecture"). Substeps:
+
+- **Step 7.A:** write `eval_gguf.rs` — mirror eval_hipfire.rs's KLD math + HFKSEQ output, but use FIFO-streamed llama-perplexity (`--kl-divergence-base /tmp/cand.fifo`) as the candidate-logit source instead of hipfire `forward_scratch`. Reuses the FIFO-orchestration scaffolding from `build_kld_ref.rs`. Add residual cross-term to both eval_gguf and eval_hipfire (~5 lines each per the rev-3.3 enhancement). ~half day.
+- **Step 7.B:** run all 7 GGUF candidates (Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S) on the same qwen3.6-27B BF16 ref (cached from Step 6). Each ~1.5 hr.
 
 **Step 8:** measure DFlash τ (canonical merge_sort prompt, md5-pinned) for each variant where a draft model exists. Add as the `DFlash τ` column (S8).
 
