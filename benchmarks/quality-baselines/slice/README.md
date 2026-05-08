@@ -8,19 +8,26 @@ shared bytes = comparable numbers).
 ## Files
 
 - `make_slice.sh` — deterministic generator. Fetches wikitext-2 train,
-  picks 1024 non-overlapping 2048-token windows (counted with a
-  pinned tokenizer), concatenates into `wikitext2-1024s-2048ctx.txt`.
-  Records md5 in `slice.md5`. Run once when first standing up the
-  eval; output committed.
+  writes ~10 MB of concatenated text into
+  `wikitext2-1024s-2048ctx.txt`. Records md5 in `slice.md5`. Run once
+  when first standing up the eval; output committed. Uses
+  `.venv/bin/python3` (project venv, not pip --user).
 - `wikitext2-1024s-2048ctx.txt` — the slice. ~10 MB. **Generated; do
   not edit by hand.**
-- `slice.md5` — md5 tripwire. The harness asserts this matches before
-  any eval run; mismatch = abort.
-- `tokens.bin` — u32 token IDs, post-tokenizer-parity check. Present
-  if Step 1.5 fell back to the token-input bridge (per the plan); in
-  the happy case where llama.cpp's tokenizer matches hipfire's on
-  this slice, this file is absent and both stacks tokenize the text
-  natively.
+- `slice.md5` — md5 tripwire (`83b0205a304bf4e52172ecdb05f2e895`).
+  `build_kld_ref` and `eval_gguf` md5sum the slice against this
+  sibling and abort on mismatch (M4 of the consolidated review).
+
+There is no `tokens.bin` in this directory and there isn't expected
+to be one. Step 1.5 (tokenizer-parity, ran 2026-05-08) measured a
+45.9% structural divergence between hipfire's HF-Qwen BPE and
+llama.cpp's GGUF-bundled BPE on this slice. **The divergence does
+not block the eval pipeline:** `eval_hipfire` reads token IDs from
+the reference file (written by llama-perplexity during the BF16 ref
+dump), and `eval_gguf` consumes its candidate's tokens from the same
+llama-perplexity tokenization. Neither re-tokenizes the slice text
+itself. See plan §"Step 1.5 verdict" and §"GGUF anchor architecture
+(rev-3.3)" for the reasoning.
 
 ## Why wikitext-2 train, not test?
 

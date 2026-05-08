@@ -172,21 +172,27 @@ This is a known behavior difference between llama.cpp's GGUF-bundled BPE encoder
 ```
 benchmarks/quality-baselines/
 ├── slice/
-│   ├── wikitext2-1024s-2048ctx.txt        # frozen prompt bytes, ~1 MB
-│   ├── slice.md5                          # checksum
-│   └── tokens.bin                         # u32 token IDs (post-bridge or absent if bridge skipped)
+│   ├── wikitext2-1024s-2048ctx.txt        # frozen prompt bytes, ~10 MB
+│   ├── slice.md5                          # checksum (md5 tripwire)
+│   └── make_slice.sh                      # deterministic regenerator (uses .venv/bin/python3)
 ├── harness/
-│   ├── manifest.json                      # {sha256, hf_url, producer_cmd, llamacpp_commit, host_arch}
-│   ├── eval_gguf.sh                       # llama.cpp --kl-divergence wrapper
-│   ├── eval_hipfire.rs                    # binary: dumps logits in llama.cpp's KLD format
-│   ├── kld_reduce.py                      # reducer + bootstrap CI
+│   ├── manifest.json                      # {sha256, hf_repo, producer_cmd, llamacpp_commit, host_arch, …}
+│   ├── kldref_format.py                   # HFKLDR + HFKSEQ-v2 reader/writer
+│   ├── kld_reduce.py                      # reducer + bootstrap CI + PPL column
 │   ├── tokenizer_parity.py                # step 1.5
 │   ├── canary.md                          # 11-seq fixture (10 short + 1 long-ctx)
 │   └── README.md                          # how to add a quant
 ├── refs/
-│   └── (downloaded blobs, .gitignored — fetched via fetch-eval-refs.sh)
+│   └── (downloaded blobs, .gitignored — fetched via scripts/fetch-eval-refs.sh)
 └── results/
     └── 2026-05-XX-quant-pareto.md          # output table + plot
+
+# Producer / candidate-side binaries live in
+# crates/hipfire-runtime/examples/:
+#   build_kld_ref.rs   — BF16 ref dump (llama-perplexity FIFO + top-K reduce)
+#   eval_hipfire.rs    — hipfire candidate scorer (forward + KLD + NLL)
+#   eval_gguf.rs       — GGUF candidate scorer (llama-perplexity FIFO + KLD + NLL)
+#   tokenize_slice.rs  — slice tokenizer for parity check
 ```
 
 (m9 — moved manifest.json under harness/ for dependency clarity.)
@@ -531,7 +537,7 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 | `benchmarks/quality-baselines/harness/kld_reduce.py` | ✓ committed (bootstrap CI + table emitter) |
 | `benchmarks/quality-baselines/harness/tokenizer_parity.py` | ✓ committed (full impl, tested 2026-05-08) |
 | `benchmarks/quality-baselines/harness/canary.md` | ✓ committed (11 sequences populated; expected KLDs TBD) |
-| `benchmarks/quality-baselines/harness/eval_gguf.sh` | stub committed; superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
+| `benchmarks/quality-baselines/harness/eval_gguf.sh` | deleted (was stub); superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
 | `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on 9B |
 | `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
 | `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
