@@ -25,6 +25,7 @@ fn main() {
     let mut ctx_len: usize = 2048;
     let mut warmup: usize = 8;
     let mut offset: usize = 0;
+    let mut kv_mode: String = "q8".to_string();
 
     while let Some(flag) = args.next() {
         let val = args.next().expect("flag missing value");
@@ -32,6 +33,7 @@ fn main() {
             "--ctx" => ctx_len = val.parse().unwrap(),
             "--warmup" => warmup = val.parse().unwrap(),
             "--offset" => offset = val.parse().unwrap(),
+            "--kv-mode" => kv_mode = val,
             _ => panic!("unknown flag: {flag}"),
         }
     }
@@ -72,9 +74,19 @@ fn main() {
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
 
     let kv_max = window.len() + 16;
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-    ).unwrap();
+    eprintln!("KV mode: {kv_mode}");
+    let mut kv_cache = match kv_mode.as_str() {
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "asym4" => KvCache::new_gpu_asym4(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        other => panic!("unknown --kv-mode: {other} (q8, asym4, asym3)"),
+    };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
 
@@ -119,7 +131,7 @@ fn main() {
     println!("Corpus:   {corpus_path}");
     println!("Tokens:   offset={offset} ctx={} warmup={warmup}", window.len());
     println!("Scored:   {scored}");
-    println!("NLL/tok:  {:.6}", avg_nll);
+    println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", ppl);
     println!("Elapsed:  {:.1}s ({:.1} tok/s)", elapsed,
              scored as f64 / elapsed.max(1e-9));
