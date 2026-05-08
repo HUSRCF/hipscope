@@ -123,15 +123,15 @@ fn main() {
         "eval_gguf: ref n_ctx={ref_n_ctx} n_vocab={ref_n_vocab} n_chunk={ref_n_chunk} top_k={top_k}"
     );
 
-    // Skip ref's tokens block. eval_gguf uses llama-perplexity's own tokenization
-    // (passes --kl-divergence-base which writes BOTH ref + cand starting from the
-    // same slice text). The ref's tokens were written by the same llama-perplexity
-    // binary on the same slice, so candidate tokenizes identically. We don't read
-    // the ref's tokens; we trust them implicitly via the per-token block sequencing.
+    // Hold ref's tokens block in memory; we'll byte-compare against the
+    // candidate's tokens block once it lands on the FIFO (H7 — guard against
+    // tokenizer drift between the BF16 ref's GGUF and the candidate GGUF).
+    // Without this check, a different-tokenizer candidate produces blocks
+    // for a different token sequence than the ref's, and every per-token
+    // KLD is computed against the wrong reference distribution.
     let ref_tokens_bytes = ref_n_ctx * ref_n_chunk * 4;
-    let mut skip_tokens = vec![0u8; ref_tokens_bytes];
-    ref_in.read_exact(&mut skip_tokens).expect("skip ref tokens");
-    drop(skip_tokens);
+    let mut ref_tokens = vec![0u8; ref_tokens_bytes];
+    ref_in.read_exact(&mut ref_tokens).expect("read ref tokens");
 
     // ---------- Set up FIFO + spawn llama-perplexity on the candidate ----------
     let fifo_path = PathBuf::from(format!("/tmp/hipfire-eval-gguf-{}.fifo", std::process::id()));
@@ -193,11 +193,37 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Skip candidate's tokens block (n_ctx * n_chunk int32s — same data as ref's).
+    // Read candidate's tokens block and compare byte-for-byte against
+    // ref's (H7). Same tokenizer.json on both sides produces identical
+    // token IDs from identical slice bytes — anything else means the
+    // candidate's GGUF was built from a different tokenizer, in which
+    // case every subsequent KLD is meaningless.
     let cand_tokens_bytes = cand_n_ctx * cand_n_chunk * 4;
-    let mut skip_cand_tokens = vec![0u8; cand_tokens_bytes];
-    cand_in.read_exact(&mut skip_cand_tokens).expect("skip cand tokens");
-    drop(skip_cand_tokens);
+    let mut cand_tokens = vec![0u8; cand_tokens_bytes];
+    cand_in.read_exact(&mut cand_tokens).expect("read cand tokens");
+    if ref_tokens != cand_tokens {
+        // Find first diverging position (in u32 space) for diagnostics.
+        let mut first_diff = None;
+        for (i, (r, c)) in ref_tokens.chunks_exact(4).zip(cand_tokens.chunks_exact(4)).enumerate() {
+            if r != c {
+                let r_id = u32::from_le_bytes(r.try_into().unwrap());
+                let c_id = u32::from_le_bytes(c.try_into().unwrap());
+                first_diff = Some((i, r_id, c_id));
+                break;
+            }
+        }
+        eprintln!("ERROR: candidate tokenization disagrees with ref.");
+        eprintln!("  This means the BF16 ref's GGUF and the candidate GGUF use");
+        eprintln!("  different tokenizers (or were built from different vocab");
+        eprintln!("  snapshots). KLD math against this candidate is invalid.");
+        if let Some((pos, r_id, c_id)) = first_diff {
+            eprintln!("  first divergence at token index {pos}: ref={r_id} cand={c_id}");
+        }
+        std::process::exit(2);
+    }
+    drop(ref_tokens);
+    drop(cand_tokens);
+    eprintln!("eval_gguf: verified cand tokens match ref tokens ({cand_tokens_bytes} bytes)");
 
     // ---------- Per-token loop ----------
     // For each scored token (n_chunk × scored_per_chunk):
