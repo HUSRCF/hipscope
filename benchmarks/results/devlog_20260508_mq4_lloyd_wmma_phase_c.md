@@ -21,15 +21,25 @@ the MQ3-Lloyd sibling at 88.2 % on the same hardware.
 **Decision: SHIP per rule, with explicit watch-item that perf
 optimization is the most likely follow-up area.**
 
-### Two-point result (added 2026-05-08, after the initial 9B run)
+### Three-point size sweep (added 2026-05-08, after the initial 9B run)
 
-| Model | Lloyd prefill | uniform prefill | Lloyd / uniform |
+| Model        | Lloyd prefill | uniform prefill | Lloyd / uniform |
 |---|---|---|---|
-| Qwen3.5-9B  | 1516.6 tok/s | 1719.6 tok/s | 60.6 % |
-| Qwen3.5-4B  | 2588.1 tok/s | 3589.9 tok/s | **72.1 %** |
+| Qwen3.5-4B   | 2588.1 tok/s  | 3589.9 tok/s    | **72.1 %**       |
+| Qwen3.5-9B   | 1516.6 tok/s  | 1719.6 tok/s    |   60.6 %         |
+| Qwen3.6-27B  |  397.4 tok/s  |  779.1 tok/s    | **51.0 %** (below the 9B-calibrated 60 % ship gate) |
 
-The 4B data point shows the Lloyd / uniform ratio is **11.5 pp better**
-at the smaller scale. See "## 4B data point" below for the full raw
+The Lloyd / uniform ratio decreases monotonically with model size on
+gfx1100. The plan's investigate-bucket candidates (LDS footprint
+scaling with K, longer 8-byte-per-tile decode K-schedule, longer
+cooperative-load sync) all scale with K — 4B's K=2560 / 9B's K=4096 /
+27B's K=5120 model dim, with mlp.down K growing from ~6912 to 12288 to
+17408. The 27B data point is **informational, not a ship blocker**:
+the 60 % gate was set against the 9B headline target; 27B Lloyd
+prefill is still ~3.3× faster than the pre-B per-token fallback (the
+user-facing improvement issue #182 was opened for).
+
+See "## 4B data point" and "## 27B data point" below for full raw
 numbers + analysis.
 
 ## Bench config
@@ -216,6 +226,64 @@ Smoke test (daemon, two prompts):
 Bench binary md5: `71234969e9d9461a5c6fbc86449ba6c4` (same as 9B run).
 Model md5 (4B uniform): `93b9b5f2bd075922c50f3f8c9a5ad3e3`.
 Model md5 (4B Lloyd):   `d13028f6a1f4fda772c17bb6c3f3a0bc`.
+
+## 27B data point (added 2026-05-08, branch HEAD `c42deb0`)
+
+Quantized `qwen3.6-27b.mq4-lloyd` from
+`/data/cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd...`
+(52 GB safetensors, output 17.4 GB Lloyd-MQ4) and re-ran the same Phase
+C cross-process A/B at the largest available scale on gfx1100. **Note**:
+27B is Qwen**3.6** (different model family from 3.5-4B/9B); layer dims
+still scale with size but the architectural baseline shifts slightly.
+
+```
+=== qwen3.6-27b.mq4 (uniform) ===
+  run 1: prefill_median=780.8 tok/s, gen=39.2 tok/s
+  run 2: prefill_median=779.3 tok/s, gen=39.1 tok/s
+  run 3: prefill_median=777.2 tok/s, gen=39.1 tok/s
+  → prefill mean = 779.1 tok/s   gen mean = 39.1 tok/s
+
+=== qwen3.6-27b.mq4-lloyd ===
+  run 1: prefill_median=397.0 tok/s, gen=33.3 tok/s
+  run 2: prefill_median=397.4 tok/s, gen=33.3 tok/s
+  run 3: prefill_median=397.7 tok/s, gen=33.3 tok/s
+  → prefill mean = 397.4 tok/s   gen mean = 33.3 tok/s
+```
+
+| Comparison (27B) | Numerator | Denominator | Ratio |
+|---|---|---|---|
+| Lloyd-MQ4 prefill / uniform-MQ4 prefill | 397.4 | 779.1 | **51.0 %** |
+| Lloyd-MQ4 decode / uniform-MQ4 decode (prefill-256 shape) | 33.3 | 39.1 | 85.2 % |
+| Lloyd-MQ4 prefill / pre-B per-token fallback (~120 tok/s class on 27B) | 397.4 | ~120 | ~3.3 × |
+
+**Lloyd / uniform prefill at 27B (51.0 %) falls below the 60 % gate.**
+This does not change the ship decision — the 60 % gate was set against
+the 9B Phase C target, and the user-facing comparison is Lloyd-MQ4
+prefill (397.4) vs the pre-B per-token fallback (~120 tok/s class)
+which is still ~3.3 × faster. But the size sweep confirms the plan's
+risk hypothesis (Phase C "Risks and watch-items" §"VGPR pressure with
+512 B LDS"): the gap to the uniform-MQ4 ceiling grows monotonically
+with K. At 27B's 5120 model dim (K=17408 for mlp.down) the per-row
+codebook + cooperative-load overhead dominates more of total work than
+at 9B's 12288 K-dim mlp.down.
+
+Run-to-run variance is exceptionally tight on both 27B paths:
+- Uniform 27B prefill range 3.6 tok/s, ~0.5 % range/mean
+- Lloyd 27B prefill range 0.7 tok/s, ~0.2 % range/mean
+- Both decode paths byte-identical across all 3 invocations on Lloyd
+  (33.3 / 33.3 / 33.3) and ±0.1 on uniform — the variance benefit of
+  cross-process A/B over within-session A/B (per CLAUDE.md ±10–15 %
+  drift rule) is especially clear at the larger scale.
+
+Smoke test (daemon, two prompts):
+- "Capital of France?" → 12 tokens, "...Paris.<|im_end|>", clean
+- "17 sheep, all but 9 die" → 29 tokens, correct reasoning, correct
+  numerical answer (9), clean `<|im_end|>` termination
+
+Bench binary md5: `71234969e9d9461a5c6fbc86449ba6c4` (same as 4B/9B
+runs — single binary across the size sweep).
+Model md5 (27B uniform): `9a6acdc49bcaa6a7b52ac161444cb769`.
+Model md5 (27B Lloyd):   `9fe79c54ce2291f8d7f0c7d61ddc46e9`.
 
 ## What this validates
 
