@@ -179,6 +179,11 @@ fn main() {
         other => panic!("unknown --kv-mode: {other}"),
     };
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
+    // DeltaNet state allocated once and reset in place per chunk. Allocating
+    // per chunk leaks ~6 MB × n_la_layers/chunk because DeltaNetState has no
+    // Drop impl (only an explicit free_gpu) — OOM'd at ~chunk 1013/1175 in a
+    // prior gfx1100 run with 21.5 GB VRAM.
+    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
 
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
@@ -189,11 +194,9 @@ fn main() {
     let mut total_scored_done = 0usize;
 
     for c in 0..n_chunk {
-        // Re-create DeltaNet state per chunk (cheap, GPU mallocs zero buffers).
-        // Avoids needing a `reset` method on DeltaNetState. KvCache positions
-        // are passed explicitly via `pos` to forward_scratch — overwriting
-        // from position 0 each chunk is sufficient.
-        let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+        // KvCache positions are passed explicitly via `pos` to forward_scratch
+        // — overwriting from position 0 each chunk is sufficient.
+        dn_state.reset(&mut gpu);
 
         let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
         let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
