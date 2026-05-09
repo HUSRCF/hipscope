@@ -106,12 +106,20 @@ fn main() {
     // 2. Spawn llama-perplexity (writes to FIFO; blocks on FIFO open(write)
     //    until we open(read) below — Linux FIFO rendezvous semantics).
     eprintln!("build_kld_ref: spawning {} ...", args.llama_perplexity_bin);
+    // --no-mmap: read all weights into one allocation upfront. Without
+    // this, mmap demand-paging on a 50 GB BF16 model causes eviction
+    // cycles when working-set ≈ available RAM (observed on gfx1151's
+    // 124 GB UMA: 27B BF16 stalled in load_tensors for 10+ hours
+    // because pages were paged in / evicted / re-paged repeatedly).
+    // --no-mmap forces a single sequential read into pinned RAM at
+    // startup, then no further IO during inference.
     let mut child = Command::new(&args.llama_perplexity_bin)
         .args(["-m", &args.bf16_gguf.display().to_string()])
         .args(["-f", &args.slice.display().to_string()])
         .args(["-c", &args.n_ctx.to_string()])
         .args(["-b", &args.n_batch.to_string()])
         .args(["--kl-divergence-base", &fifo_path.display().to_string()])
+        .arg("--no-mmap")
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())
         .spawn()
