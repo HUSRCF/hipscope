@@ -1,6 +1,6 @@
 # Quant quality eval — KLD-primary harness for MQ3/MQ4 (uniform + Lloyd) + Q8 reference proxy + GGUF anchors
 
-**Status:** plan rev-3.3 (2026-05-08). Step 0 done; format β locked; qwen3.5-27B dropped (superseded by qwen3.6-27B); GGUF anchor architecture locked (no FIFO tee / no llama.cpp-native cached ref needed — both tracks use the same hipfire-β ref, candidate-side KLD math is identical, only the cand-logit source differs). Step 1.5 + 1.6 verdicts in §"Step 1.5 verdict" and §"Open questions resolved" row 11.
+**Status:** plan rev-3.3 (2026-05-09 ~20:30). Steps 0–4, 6 part-A, 7.A done (both BF16 refs produced); Step 5 (canary candidate) in progress on gfx1100. Format β locked; qwen3.5-27B dropped (superseded by qwen3.6-27B); GGUF anchor architecture locked (no FIFO tee / no llama.cpp-native cached ref needed — both tracks use the same hipfire-β ref, candidate-side KLD math is identical, only the cand-logit source differs). Step 1.5 + 1.6 verdicts in §"Step 1.5 verdict" and §"Open questions resolved" row 11.
 **Tracking:** #113 (uniform), #116 (Lloyd, mirror sub-section).
 **Pinned llama.cpp commit:** `9dcf83552887bb898b4a98a5761361e504e31fc3` (master, 2026-05-08).
 
@@ -491,7 +491,7 @@ entirely. Approximation:
 27B dump still to come) produce the correct ref artifact for both
 tracks. eval_gguf is the only missing piece.
 
-## Sequencing (rev-3.3; status snapshot 2026-05-08 ~18:00)
+## Sequencing (rev-3.3; status snapshot 2026-05-09 ~20:30)
 
 Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
@@ -507,11 +507,11 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
 **✓ Step 3 (DONE):** wrote `crates/hipfire-runtime/examples/eval_hipfire.rs` — reads hipfire β reference, runs hipfire variants chunk-by-chunk via `forward_scratch`, computes per-token KLD via top-K-of-ref + residual cross-term (rev-3.3 enhancement), bins per-sequence, writes HFKSEQ. Builds clean (`cargo build --release --features deltanet`). Commits d4adac8 (initial) + f9dd19e (residual cross-term). Not yet run end-to-end; queued for Step 5.
 
-**✓ Step 4-9b (DONE 2026-05-08):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. **Pending sub-steps:** upload to `hipfire-models/hipfire-eval-refs`, fill `manifest.json` with sha256 + producer_cmd, verify canary on both NORMALIZE_PROMPT settings.
+**✓ Step 4-9b (DONE 2026-05-08):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. sha256 `06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7`; manifest.json populated (commit `0214e8c`). **Pending sub-steps:** upload to `hipfire-models/hipfire-eval-refs`, verify canary on both NORMALIZE_PROMPT settings.
 
-**⏸ Step 5 (next-up):** run hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). gfx1151 first (Kevin's local), gfx1100 follow-up when host available. Each run ~75 min on gfx1151 (eval_hipfire's per-token forward+KLD). The first canary candidate (qwen3.5-9b.mq4) doubles as the canary-expected-KLD source — its 11 per-sequence KLDs become the committed `canary.md` expected-values.
+**⏳ Step 5 (in progress on gfx1100):** running hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). First canary candidate (qwen3.5-9b.mq4 vs 9B BF16 ref) launched 2026-05-08 on gfx1100; throughput ~47.5 tok/s, total run ~7 hours (slower than the plan's 75 min estimate — gfx1100 is power-capped at the kernel-throughput ceiling per the rocm-smi snapshot). The first run doubles as the canary-expected-KLD source — its per-sequence KLDs become the committed `canary.md` expected-values when complete. Pre-Step-5 review-hardening fix bundle landed (commits `e407128` + `0214e8c` + `e7898f4` + `fd06646` + `3dee758` + `41b5977` + `dec913e`): C1 scoring window off-by-one, H1 commit-pin enforcement, H2 eval-mode env vars, H3 stale dead code, M1 sha256 ref validation, M3 PPL accumulator + HFKSEQ v2, M4 slice md5 enforcement, M5 fetch-eval-refs.sh, H7 cand-vs-ref token compare.
 
-**⏸ Step 6:** repeat Step 4 (dump 27B BF16 ref) + Step 5 (run 5 hipfire variants × 2 archs) for qwen3.6-27B. BF16 GGUF still being downloaded as of 2026-05-08.
+**✓ Step 6 part-A (DONE 2026-05-09):** dumped 27B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin`, **2.48 GB**, 2h 3m wall-time, 162 reduced tokens/sec. Same shape as 9B (per-token block size depends on top_k, not n_vocab). sha256 `8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446`; manifest.json populated (commit `52879fe`). **Required `--no-mmap`** (now passed automatically by build_kld_ref): demand-paging on 50 GB BF16 weights caused eviction-cycle stall on the 124 GB UMA host until enabled. GGUF copied locally to `~/models-local/Qwen3.6-27B/` from NFS to reduce per-page-fault read latency. VM `enertree` shut down to free working-set RAM. **Pending Step 6 part-B:** run 5 hipfire variants × 2 archs = 10 runs on the 27B ref.
 
 **✓ Step 7.A (DONE 2026-05-08):** wrote `crates/hipfire-runtime/examples/eval_gguf.rs` — mirrors eval_hipfire.rs's KLD math but uses FIFO-streamed llama-perplexity as the candidate-logit source. Same residual cross-term as eval_hipfire. Builds clean. Not yet run end-to-end. Commit f9dd19e.
 
@@ -532,18 +532,19 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 | `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt` | ✓ committed (10.5 MB, md5 `83b0205a304bf4e52172ecdb05f2e895`) |
 | `benchmarks/quality-baselines/slice/slice.md5` | ✓ committed |
 | `benchmarks/quality-baselines/slice/make_slice.sh` | ✓ committed (uses .venv/bin/python3) |
-| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; slice_md5 filled; references map empty pending uploads |
+| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; both 9B and 27B refs registered with sha256 + producer_cmd; `hf_url` null pending HF upload |
 | `benchmarks/quality-baselines/harness/kldref_format.py` | ✓ committed (β format reader/writer) |
 | `benchmarks/quality-baselines/harness/kld_reduce.py` | ✓ committed (bootstrap CI + table emitter) |
 | `benchmarks/quality-baselines/harness/tokenizer_parity.py` | ✓ committed (full impl, tested 2026-05-08) |
 | `benchmarks/quality-baselines/harness/canary.md` | ✓ committed (11 sequences populated; expected KLDs TBD) |
 | `benchmarks/quality-baselines/harness/eval_gguf.sh` | deleted (was stub); superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
-| `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on 9B |
-| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
-| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed (with residual cross-term); not yet run end-to-end |
+| `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on both 9B + 27B; auto-passes `--no-mmap` to llama-perplexity (commit `52879fe`) |
+| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed (with residual cross-term, NLL accumulator, env-var forcing, sha256 verify); first end-to-end run on gfx1100 in progress |
+| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed (with residual cross-term, NLL accumulator, cand-vs-ref token compare, commit-pin verify); not yet run end-to-end |
 | `crates/hipfire-runtime/examples/tokenize_slice.rs` | ✓ committed (used by tokenizer_parity.py) |
-| `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 53 min wall); local only (gitignored) |
-| `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin` | — pending (BF16 GGUF download in flight) |
+| `scripts/fetch-eval-refs.sh` | ✓ committed (M5; uses `.venv/bin/python3` + huggingface_hub) |
+| `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 53 min wall, 2026-05-08); local only (gitignored) |
+| `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 2h 3m wall, 2026-05-09); local only (gitignored) |
 
 ### Sibling work executed
 
@@ -553,11 +554,11 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
 ### What's NOT yet done (blocking summary)
 
-1. **9B BF16 ref upload to HF** — file is ready, just needs `hf upload hipfire-models/hipfire-eval-refs ...` + manifest.json fill-in (one entry).
-2. **First canary candidate run** (qwen3.5-9b.mq4 vs the 9B BF16 ref) — produces real per-sequence KLDs, populates canary.md's expected-values column.
-3. **27B BF16 GGUF download** in flight; once done, repeat the Step-4 dump for qwen3.6-27B.
-4. **Bulk hipfire-track runs** (5 variants × 2 archs × 2 models = 20 runs) — currently ~75 min × 20 = ~25 GPU-hours on gfx1151.
-5. **GGUF anchor runs** (7 variants × 1 model on gfx1151) — currently ~1.5 hr × 7 = ~10 GPU-hours.
+1. **9B BF16 ref upload to HF** — file ready, sha256 in manifest; needs `hf upload hipfire-models/hipfire-eval-refs ...` + setting the manifest's `hf_repo` field.
+2. **27B BF16 ref upload to HF** — same as 9B; both refs were produced on the same gfx1151 host.
+3. **Canary candidate run completion** (qwen3.5-9b.mq4 vs 9B BF16 ref) — running on gfx1100 since 2026-05-08; ETA was ~7 hours from launch. Output populates canary.md's expected-values.
+4. **Bulk hipfire-track runs** (5 variants × 2 archs × 2 models = 20 runs minus the canary). At 47.5 tok/s on gfx1100 ≈ 7h/run × 19 ≈ ~5–6 days of wall-clock if serialized; gfx1151 is the parallel slot. The plan's original "~25 GPU-hours" estimate was at 9B-on-gfx1151 throughput; revised upward by the gfx1100 power-cap finding.
+5. **GGUF anchor runs** (7 variants × 1 model on gfx1151) — currently ~1.5 hr × 7 = ~10 GPU-hours. Not yet end-to-end-validated.
 6. **DFlash τ + write-up** — Step 8 + 9.
 
 ## References
