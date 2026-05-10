@@ -493,6 +493,34 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/
 // validated on R9700 in PR #56's channel-tests.
 pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 
+// Batched 3-way fused HFP4-G32 GEMM (FA preamble: Q + K + V). Sister of
+// GEMM_QKV_HFQ4G256_WMMA_SRC for the FP4 (E2M1 + UE8M0 g32 + FP16 row
+// scale) family. Same WMMA shape (16x16x16 f16) and lane decomposition;
+// only the per-row layout (16-B header + 17-B blocks) and per-tile
+// dequant arithmetic (row_scale * 2^(block_e-127) * E2M1_LUT[nibble])
+// differ from the HFQ4G256 anchor.
+pub const GEMM_QKV_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfp4g32_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_QKV_HFP4G32_WMMA_SRC. half8_t lane-split
+// + K4 unroll (each iter consumes 2 HFP4 blocks). Same C-output mapping
+// as gemm_qkv_hfq4g256_wmma.gfx12 (validated on R9700).
+pub const GEMM_QKV_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfp4g32_wmma.gfx12.hip");
+
+// HFP4-G32 residual GEMM (used for wo + w_down). Mirrors the K2 HFQ4
+// variant — canonical wave32 WMMA C-output mapping `acc[j] = C[2*j +
+// (tid>>4)][tid & 15]`.
+pub const GEMM_HFP4G32_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_wmma.hip");
+pub const GEMM_HFP4G32_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_wmma.gfx12.hip");
+
+// HFP4-G32 batched 2-way fused GEMM (gate + up). Sister of
+// GEMM_QKV_HFP4G32_WMMA_SRC for the FFN preamble.
+pub const GEMM_GATE_UP_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfp4g32_wmma.hip");
+pub const GEMM_GATE_UP_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfp4g32_wmma.gfx12.hip");
+
+// HFP4-G32 batched 4-way fused GEMM (qkv + z + beta + alpha) for the
+// Qwen3.5 DeltaNet LA preamble.
+pub const GEMM_QKVZA_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.hip");
+pub const GEMM_QKVZA_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.gfx12.hip");
+
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.

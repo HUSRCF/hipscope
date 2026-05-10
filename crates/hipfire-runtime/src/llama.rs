@@ -1186,12 +1186,15 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     if always_ok {
         return true;
     }
-    let mq3_with_wmma = matches!(dt, DType::MQ3G256)
+    // HFP4G32 / MFP4G32 + MQ3G256 require WMMA. Same arch gate as MQ3.
+    let wmma_only = matches!(dt,
+        DType::MQ3G256 | DType::HFP4G32 | DType::MFP4G32
+    )
         && matches!(arch,
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
             | "gfx1200" | "gfx1201"
         );
-    mq3_with_wmma
+    wmma_only
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
@@ -1518,11 +1521,13 @@ fn forward_prefill_chunk(
     // 2. Per-layer loop.
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
-        let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32);
         let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
+        let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
 
-        // attn_norm (+ FWHT for MQ).
+        // attn_norm (+ FWHT for MQ — includes MFP4G32 since rotation is the
+        // same FWHT pattern as MQ4).
         if qkv_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
@@ -1545,6 +1550,14 @@ fn forward_prefill_chunk(
             )?;
         } else if qkv_is_mq3 {
             gpu.gemm_qkv_hfq3g256_wmma(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                layer.wq.m, layer.wk.m, layer.wv.m,
+                layer.wq.k, n,
+            )?;
+        } else if qkv_is_fp4 {
+            gpu.gemm_qkv_hfp4g32(
                 &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                 &pbs.x_rot_batch,
                 &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
@@ -1690,9 +1703,10 @@ fn forward_prefill_chunk(
         }
 
         // wo + residual.
-        let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32);
         let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
+        let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let wo_input = if wo_is_mq {
             gpu.rotate_x_mq_batched(
                 &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
@@ -1705,14 +1719,18 @@ fn forward_prefill_chunk(
             gpu.gemm_hfq6g256_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
         } else if wo_is_mq3 {
             gpu.gemm_hfq3g256_residual_wmma(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+        } else if wo_is_fp4 {
+            gpu.gemm_hfp4g32_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
         } else {
             gpu.gemm_hfq4g256_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
         }
 
-        // FFN: rmsnorm (+ FWHT for MQ), gate+up, silu_mul, w_down + residual.
-        let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        // FFN: rmsnorm (+ FWHT for MQ — includes MFP4G32), gate+up, silu_mul,
+        // w_down + residual.
+        let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32);
         let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
+        let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
@@ -1737,6 +1755,13 @@ fn forward_prefill_chunk(
                 &pbs.gate_ffn_batch, &pbs.up_batch,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
             )?;
+        } else if ffn_is_fp4 {
+            gpu.gemm_gate_up_hfp4g32(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch, &pbs.up_batch,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+            )?;
         } else {
             gpu.gemm_gate_up_hfq4g256(
                 &layer.w_gate.buf, &layer.w_up.buf,
@@ -1745,9 +1770,10 @@ fn forward_prefill_chunk(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
             )?;
         }
-        let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32);
         let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
+        let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         if w_down_is_mq {
             gpu.fused_silu_mul_rotate_mq_batched(
                 &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
@@ -1760,6 +1786,8 @@ fn forward_prefill_chunk(
             gpu.gemm_hfq6g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
         } else if w_down_is_mq3 {
             gpu.gemm_hfq3g256_residual_wmma(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        } else if w_down_is_fp4 {
+            gpu.gemm_hfp4g32_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
         } else {
             gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
         }
@@ -4030,6 +4058,19 @@ mod tests {
         }
         for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx942"] {
             assert!(!is_batchable_la(DType::MQ3G256, arch), "MQ3 must fall back on {arch}");
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_fp4_wmma_only() {
+        // HFP4G32 / MFP4G32 require WMMA — same arch gate as MQ3.
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            assert!(is_batchable_la(DType::HFP4G32, arch), "HFP4G32 should batch on {arch}");
+            assert!(is_batchable_la(DType::MFP4G32, arch), "MFP4G32 should batch on {arch}");
+        }
+        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx942"] {
+            assert!(!is_batchable_la(DType::HFP4G32, arch), "HFP4G32 must fall back on {arch}");
+            assert!(!is_batchable_la(DType::MFP4G32, arch), "MFP4G32 must fall back on {arch}");
         }
     }
 
