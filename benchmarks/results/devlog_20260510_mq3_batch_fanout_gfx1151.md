@@ -199,7 +199,8 @@ through `forward_scratch` + GEMV, untouched.
 - ✅ gfx12 explicitly excluded from `_mb4` selectors
 - ✅ 9B: MQ3 +76.6 %, MQ3-Lloyd +67.6 %
 - ✅ 4B: MQ3-Lloyd +60.6 % (4B uniform-MQ3 model not on this host)
-- ⏳ gfx1100 cross-arch confirmation — bench help-wanted (no local hardware)
+- ✅ gfx1100 cross-arch confirmation: 9B-MQ3 +16.7 %, 9B-MQ3-Lloyd +27.1 %,
+  4B-MQ3-Lloyd +16.9 % (see "gfx1100 cross-arch confirmation" section below)
 
 ## Bench config (reproducer)
 
@@ -231,3 +232,120 @@ gpu_release
 | Model md5 (4B-MQ3-Lloyd) | `865a2ab1e7d97ae02b02be95e08cc852` |
 | Branch HEAD | `feat/mq3-batch-fanout` (off `upstream/master a4e42c5`) |
 | Prompt | N/A — synthetic deterministic token sequence (token ids `0..prefill_len`) |
+
+---
+
+## gfx1100 cross-arch confirmation (2026-05-10)
+
+**Hardware:** AMD Radeon RX 7900 XT (gfx1100 RDNA3, 21.5 GB GDDR6 ~800 GB/s).
+**ROCm:** HIP 7.2.53211 (vs maintainer's 7.12 on gfx1151).
+**Bench binary md5:** `a09ce9fd129825563cf73ab09e067dae` (differs from gfx1151
+binary because of arch-specific compile; built from same `a268d3d1` source).
+**Model md5s:** identical to maintainer's three values above (verified).
+**Local-vs-maintainer offset:** this gfx1100 is the RX 7900 XT, ~10 % slower
+than the maintainer's perf-optimized gfx1100 reference; multiply local absolute
+tok/s by 1.10 for cross-machine comparison. The Δ % (the load-bearing number
+for cross-arch confirmation) is unaffected.
+
+### HFQ3 _mb4 == _wmma parity (gfx1100)
+
+```
+GPU: gfx1100
+Verifying HFQ3 _mb4 == _wmma at all shapes (TOL=1e-4).
+[all 13 shapes: max_abs=0.000e0  max_rel=0.000e0  rms=0.000e0  PASS]
+ALL PASS — HFQ3 _mb4 produces output bit-equivalent to _wmma
+```
+
+`max_abs = 0.000e0` across all 13 shapes (5 residual + 3 qkvza + 3 qkv + 2
+gate_up). **Bit-exact on gfx1100 RDNA3 just as on gfx1151 RDNA3.5** —
+confirms the WMMA accumulation order is identical between the two archs.
+mb4 multiplexes 4 sub-tiles in time, each acc independent, so no
+fp32-reorder envelope opens up regardless of arch.
+
+### Cross-process A/B (3 runs × 2 modes, prefill=256, asym3, GRAPH=1)
+
+#### qwen3.5-9b.mq3 (uniform / HFQ3)
+
+| Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
+|---|---|---|---|---|---|
+| `MB4=0` | 1720.2 | 1715.5 | 1712.5 | **1716.1 tok/s** | 119.4 |
+| `MB4=1` | 2006.2 | 2001.6 | 1999.9 | **2002.6 tok/s** | 118.7 |
+| Δ      |        |        |        | **+286.5 (+16.7 %)** | -0.5 % |
+
+#### qwen3.5-9b.mq3-lloyd
+
+| Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
+|---|---|---|---|---|---|
+| `MB4=0` | 1458.5 | 1459.8 | 1472.1 | **1463.5 tok/s** | 112.3 |
+| `MB4=1` | 1857.7 | 1862.1 | 1859.4 | **1859.7 tok/s** | 112.2 |
+| Δ      |        |        |        | **+396.2 (+27.1 %)** | -0.1 % |
+
+#### qwen3.5-4b.mq3-lloyd
+
+| Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
+|---|---|---|---|---|---|
+| `MB4=0` | 2641.7 | 2648.3 | 2633.9 | **2641.3 tok/s** | 149.7 |
+| `MB4=1` | 3100.2 | 3073.7 | 3092.3 | **3088.7 tok/s** | 151.0 |
+| Δ      |        |        |        | **+447.4 (+16.9 %)** | +0.8 % |
+
+Stddev across the 3 runs is <0.5 % per cell — every Δ is many sigma outside noise.
+
+### Decode regression — none (matches gfx1151)
+
+`gen_tok_s` invariant across MB4 modes for all three models:
+- 9B-MQ3 (uniform): 119.4 vs 118.7 — within ±0.5 %
+- 9B-MQ3-Lloyd: 112.3 vs 112.2 — within ±0.1 %
+- 4B-MQ3-Lloyd: 149.7 vs 151.0 — within ±0.8 %
+
+`bw_gib_s` (decode bandwidth) likewise invariant (±1 GiB/s on 9B's ~478 GiB/s
+plateau; ±1 GiB/s on 4B's ~315 GiB/s). Same conclusion as gfx1151: mb4 only
+touches the prefill batched path.
+
+### gfx1151 vs gfx1100 — Δ comparison
+
+| Model | gfx1151 Δ | gfx1100 Δ |
+|---|---|---|
+| qwen3.5-9b.mq3 (uniform) | +76.6 % | **+16.7 %** |
+| qwen3.5-9b.mq3-lloyd | +67.6 % | **+27.1 %** |
+| qwen3.5-4b.mq3-lloyd | +60.6 % | **+16.9 %** |
+
+The gfx1100 wins are smaller in % terms but absolute throughput is far
+higher: 9B-MQ3 baseline jumps from gfx1151's 518 tok/s to gfx1100's 1716
+tok/s (3.3×) — consistent with GDDR6 vs LPDDR5x bandwidth ratio.
+Pre-mb4 the kernels were not as bandwidth-starved on gfx1100 as on
+gfx1151 (per-kernel GiB/s on gfx1151 was 9-14, vs the GDDR6 ceiling
+~800 — gfx1100 had more headroom to begin with), so mb4's contribution
+is smaller in proportional terms but still real and well outside noise.
+
+### Lloyd / uniform-MQ3 ratio at 9B — mb4 helps Lloyd MORE on gfx1100
+
+| Phase | gfx1151 ratio | gfx1100 ratio |
+|---|---|---|
+| Pre-mb4  | 97.1 % | **85.3 %** |
+| Post-mb4 | 92.1 % | **92.9 %** |
+
+Notable: pre-mb4 Lloyd was hit *harder* by the 16×16 wall on gfx1100
+(85 %) than on gfx1151 (97 %) — the extra cooperative codebook +
+syncthread overhead matters more when the SIMDs are otherwise faster.
+mb4 closes that gap entirely: post-mb4 the gfx1100 Lloyd / uniform
+ratio (92.9 %) lands essentially on top of gfx1151's (92.1 %). The
+fanout fix is doing exactly what it should on the bigger GPU.
+
+### Format ranking on gfx1100 (post-mb4 prefill)
+
+| Model | Prefill tok/s on gfx1100 |
+|---|---|
+| qwen3.5-9b.mq3 (uniform) | 2002.6 |
+| qwen3.5-9b.mq3-lloyd     | 1859.7 |
+
+Unlike gfx1151 (where Lloyd post-mb4 at 843 narrowly beat uniform-MQ4
+at 801), on gfx1100 uniform-MQ3 stays ahead of Lloyd-MQ3 by ~7 %.
+Different bandwidth profile, different ranking.
+
+### What's locked in for gfx1100
+
+- ✅ Bit-exact HFQ3 `_mb4` == `_wmma` parity across all 13 shapes
+- ✅ +16.7 % / +27.1 % / +16.9 % prefill on 9B-MQ3 / 9B-Lloyd / 4B-Lloyd
+- ✅ Decode untouched (<1 % drift across all three models)
+- ✅ Tight stddev (<0.5 %) across 3 fresh-process runs per cell
+- ✅ `bw_gib_s` invariant — mb4 confined to prefill path as designed
