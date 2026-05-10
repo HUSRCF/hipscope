@@ -743,7 +743,23 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
         }
-        21 => { // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook (160 bytes/group)
+        21 => { // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale. See docs/quant-formats/hfp4.md.
+                // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs); refuse here so a
+                // stale or externally-quantized file fails at load instead of panicking on
+                // first dispatch.
+            assert!(k % 256 == 0, "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0 })
+        }
+        24 => { // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
+                // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
+            assert!(k % 256 == 0, "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0 })
+        }
+        30 => { // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook (160 bytes/group).
+                // Renumbered from qtype 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+                // Models quantized pre-renumber MUST be re-quantized.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0 })
         }
@@ -1001,11 +1017,12 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             }
             out
         }
-        21 => {
-            // MQ4-G256-Lloyd (qt 21, 160 B/group): 16 fp16 codebook entries +
+        30 => {
+            // MQ4-G256-Lloyd (qt 30, 160 B/group): 16 fp16 codebook entries +
             // 4-bit indices (128 nibble-packed bytes, low nibble = idx[2i],
             // high nibble = idx[2i+1]). Decode is direct lookup `cb[idx]`
             // then inverse FWHT for CPU consumers (DeltaNet conv1d).
+            // Renumbered from qt 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
             let group_size: usize = 256;
             let bytes_per_group: usize = 160;
             let n_groups = data.len() / bytes_per_group;
