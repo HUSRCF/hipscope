@@ -1241,14 +1241,20 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  // thinking=off: hard-suppress by capping thinking to 1 token (model still
-  // emits <think> but is immediately force-closed). This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path.
+  // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
+  // a closed `<think></think>` block via assistant_prefix=closed_think, so
+  // the model never starts a thinking turn at all. This mirrors the
+  // enable_thinking=false semantics from the OpenAI API path
+  // (cli/index.ts ~1668-1680). The Jinja path keys off max_think_tokens==1
+  // for `enable_thinking=false`; the legacy ChatFrame path keys off
+  // assistant_prefix=closed_think. Setting both makes either daemon path
+  // do the right thing.
   // Previous attempts to inject prose directives with <think>/<no_think>
   // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
   // reliably because it operates at the daemon level, not in the prompt.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
+    genMsg.assistant_prefix = "closed_think";
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
