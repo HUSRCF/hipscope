@@ -77,6 +77,11 @@ pub const GEMV_MQ4G256_LLOYD_MULTIACC_DIAG_GFX1100_SRC: &str = include_str!("../
 pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip");
 /// gfx12 (RDNA4) sibling — code-complete but runtime-unvalidated locally per Phase B1 plan.
 pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma.gfx12.hip");
+/// Phase D-A: 16×64 output tile per WG (4 batch sub-tiles share A_reg decode).
+/// Shipped to close the batch ≥ 128 GiB/s gap diagnosed in
+/// `benchmarks/results/devlog_20260509_mq4_lloyd_gfx1151_bench.md`. Same 160 B
+/// stride and codebook decode as `_wmma`; only the batch-fanout and grid shape change.
+pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb4.hip");
 /// MQ4G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.hip");
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx12.hip");
@@ -86,6 +91,13 @@ pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../k
 /// MQ4G256Lloyd WMMA fused gate+up (FFN, 2-way).
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.hip");
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip");
+
+/// Phase D-B: 16×64 output tile per WG (4 batch sub-tiles share A_reg decode).
+/// Same shape as `_wmma`; only the per-WG output fanout and grid differ.
+/// gfx11 only (gfx12 sibling deferred per Phase D plan).
+pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma_mb4.hip");
+pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.hip");
 
 /// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch.
@@ -116,6 +128,20 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
              gate should reject this; if you reached here, is_batchable_la was extended without \
              updating gemm_mq4g256_lloyd_residual_wmma_for_arch (160 B Lloyd stride would mismatch \
              any default kernel)."
+        ),
+    }
+}
+/// Phase D-A selector — same arch matrix as `_wmma_for_arch` (gfx1100/1101/1102/1151
+/// only; gfx12 sibling deferred per the Phase D plan). Single-arch source since
+/// the kernel's tile shape is gfx11/wave32 specific.
+pub fn gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+            (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb4_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA mb4 residual: unsupported arch {arch}. Phase D-A is gfx11-only; \
+             gfx12 sibling deferred. is_batchable_la must not admit gfx12 to the mb4 path \
+             (160 B Lloyd stride would mismatch any default kernel)."
         ),
     }
 }
@@ -155,6 +181,36 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
             "MQ4-Lloyd WMMA gate_up: unsupported arch {arch}. The is_batchable_la upstream gate \
              should reject this; if you reached here, is_batchable_la was extended without \
              updating gemm_gate_up_mq4g256_lloyd_wmma_for_arch."
+        ),
+    }
+}
+
+/// Phase D-B selectors for fused siblings. Same arch matrix as the residual
+/// `_mb4` selector (gfx11 only — gfx12 sibling deferred per Phase D plan).
+pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+            (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA mb4 qkvza: unsupported arch {arch}. Phase D-B is gfx11-only."
+        ),
+    }
+}
+pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+            (GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq4g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA mb4 qkv: unsupported arch {arch}. Phase D-B is gfx11-only."
+        ),
+    }
+}
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA mb4 gate_up: unsupported arch {arch}. Phase D-B is gfx11-only."
         ),
     }
 }

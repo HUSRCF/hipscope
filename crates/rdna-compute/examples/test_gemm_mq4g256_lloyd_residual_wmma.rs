@@ -144,7 +144,57 @@ fn cpu_reference_gemm(
     y
 }
 
-fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (f32, f32, f32, f64) {
+/// Bench harness for one variant. `bench_fn` is the kernel to measure;
+/// `name` is just for the printf. Returns (max_abs, max_rel, rms, us/call).
+fn bench_variant(
+    gpu: &mut Gpu,
+    m: usize, k: usize, n: usize,
+    d_a: &rdna_compute::GpuTensor,
+    d_x: &rdna_compute::GpuTensor,
+    y_init: &[f32],
+    y_ref: &[f32],
+    bench_fn: impl Fn(&mut Gpu, &rdna_compute::GpuTensor, &rdna_compute::GpuTensor, &rdna_compute::GpuTensor),
+) -> (f32, f32, f32, f64) {
+    let d_y = gpu.upload_f32(y_init, &[n, m]).unwrap();
+    bench_fn(gpu, d_a, d_x, &d_y);
+    let y_gpu = gpu.download_f32(&d_y).unwrap();
+
+    let n_warmup = 3usize;
+    let n_iter = 20usize;
+    let d_y_bench = gpu.zeros(&[n, m], DType::F32).unwrap();
+    for _ in 0..n_warmup {
+        bench_fn(gpu, d_a, d_x, &d_y_bench);
+    }
+    let _ = gpu.download_f32(&d_y_bench).unwrap();
+    let t0 = std::time::Instant::now();
+    for _ in 0..n_iter {
+        bench_fn(gpu, d_a, d_x, &d_y_bench);
+    }
+    let _ = gpu.download_f32(&d_y_bench).unwrap();
+    let elapsed_us_per_call = t0.elapsed().as_secs_f64() * 1e6 / n_iter as f64;
+    gpu.free_tensor(d_y_bench).unwrap();
+
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    let mut sum_sq_err = 0.0f64;
+    let total = n * m;
+    for i in 0..total {
+        let abs = (y_gpu[i] - y_ref[i]).abs();
+        let denom = y_ref[i].abs().max(1e-3);
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(abs / denom);
+        sum_sq_err += (abs as f64) * (abs as f64);
+    }
+    let rms_err = (sum_sq_err / total as f64).sqrt() as f32;
+
+    gpu.free_tensor(d_y).unwrap();
+    (max_abs, max_rel, rms_err, elapsed_us_per_call)
+}
+
+fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
+    (f32, f32, f32, f64),  // _wmma   (Phase A)
+    (f32, f32, f32, f64),  // _wmma_mb4 (Phase D-A)
+) {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
     let groups_per_row = k / 256;
 
@@ -188,48 +238,26 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (f32, f32, f32, f64) 
 
     let d_a = gpu.upload_raw(&a_flat, &[a_flat.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
-    let d_y = gpu.upload_f32(&y_init, &[n, m]).unwrap();
-
-    // 1. Parity check.
-    gpu.gemm_mq4g256_lloyd_residual_wmma(&d_a, &d_x, &d_y, m, k, n).unwrap();
-    let y_gpu = gpu.download_f32(&d_y).unwrap();
-
-    // 2. Bench on a separate scratch Y.
-    let n_warmup = 3usize;
-    let n_iter = 20usize;
-    let d_y_bench = gpu.zeros(&[n, m], DType::F32).unwrap();
-    for _ in 0..n_warmup {
-        gpu.gemm_mq4g256_lloyd_residual_wmma(&d_a, &d_x, &d_y_bench, m, k, n).unwrap();
-    }
-    let _ = gpu.download_f32(&d_y_bench).unwrap();
-
-    let t0 = std::time::Instant::now();
-    for _ in 0..n_iter {
-        gpu.gemm_mq4g256_lloyd_residual_wmma(&d_a, &d_x, &d_y_bench, m, k, n).unwrap();
-    }
-    let _ = gpu.download_f32(&d_y_bench).unwrap();
-    let elapsed_us_per_call = t0.elapsed().as_secs_f64() * 1e6 / n_iter as f64;
-    gpu.free_tensor(d_y_bench).unwrap();
 
     let y_ref = cpu_reference_gemm(m, k, n, &codebooks_per_row, &indices_per_row, &x, &y_init);
 
-    let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
-    let mut sum_sq_err = 0.0f64;
-    let total = n * m;
-    for i in 0..total {
-        let abs = (y_gpu[i] - y_ref[i]).abs();
-        let denom = y_ref[i].abs().max(1e-3);
-        max_abs = max_abs.max(abs);
-        max_rel = max_rel.max(abs / denom);
-        sum_sq_err += (abs as f64) * (abs as f64);
-    }
-    let rms_err = (sum_sq_err / total as f64).sqrt() as f32;
+    let phase_a = bench_variant(
+        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+        |gpu, d_a, d_x, d_y| {
+            gpu.gemm_mq4g256_lloyd_residual_wmma(d_a, d_x, d_y, m, k, n).unwrap();
+        },
+    );
+
+    let phase_d = bench_variant(
+        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+        |gpu, d_a, d_x, d_y| {
+            gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n).unwrap();
+        },
+    );
 
     gpu.free_tensor(d_a).unwrap();
     gpu.free_tensor(d_x).unwrap();
-    gpu.free_tensor(d_y).unwrap();
-    (max_abs, max_rel, rms_err, elapsed_us_per_call)
+    (phase_a, phase_d)
 }
 
 fn main() {
@@ -245,6 +273,12 @@ fn main() {
         (256,  4096, 256),
         (1024, 4096,  64),
         (1024, 12288, 64),  // qwen3.5-9b mlp.down_proj K dim
+        // Production prefill shapes — the regime where _mb4's 4× weight
+        // reuse should pay off. These mirror the per-kernel sizes seen in
+        // the gfx1151 9B prefill profile (devlog 2026-05-09).
+        (4096, 4096, 256),
+        (4096, 12288, 256),
+        (14336, 4096, 256),  // 9B-Lloyd FFN gate/up output dim
     ];
 
     // Phase A starting tolerance: 1.75e-4 = 3× MQ3 Phase A's observed max-abs
@@ -256,29 +290,53 @@ fn main() {
     let phase_a_tolerance = 1.75e-4f32;
 
     let mut all_pass = true;
-    let mut global_max_abs = 0f32;
-    let mut total_us = 0.0f64;
+    let mut global_max_abs_a = 0f32;
+    let mut global_max_abs_d = 0f32;
+    let mut total_us_a = 0.0f64;
+    let mut total_us_d = 0.0f64;
 
-    println!("{:>5} {:>6} {:>4}  {:>11}  {:>11}  {:>11}  {:>10}  {}",
-             "M", "K", "N", "max_abs", "max_rel", "rms", "us/call", "verdict");
+    println!("{:>5} {:>6} {:>4}  {:>4}  {:>11}  {:>11}  {:>11}  {:>10}  {}",
+             "M", "K", "N", "kern", "max_abs", "max_rel", "rms", "us/call", "verdict");
 
     for &(m, k, n) in cases {
-        let (max_abs, max_rel, rms, us_per_call) = run_one(&mut gpu, m, k, n);
-        let pass = max_abs < phase_a_tolerance;
-        let tag = if pass { "PASS" } else { "FAIL" };
+        let (phase_a, phase_d) = run_one(&mut gpu, m, k, n);
+
+        let (a_max_abs, a_max_rel, a_rms, a_us) = phase_a;
+        let pass_a = a_max_abs < phase_a_tolerance;
+        let tag_a = if pass_a { "PASS" } else { "FAIL" };
         println!(
-            "{:>5} {:>6} {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag}",
-            m, k, n, max_abs, max_rel, rms, us_per_call
+            "{:>5} {:>6} {:>4}  {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag_a}",
+            m, k, n, "_wmma", a_max_abs, a_max_rel, a_rms, a_us
         );
-        if !pass { all_pass = false; }
-        if max_abs > global_max_abs { global_max_abs = max_abs; }
-        total_us += us_per_call;
+
+        let (d_max_abs, d_max_rel, d_rms, d_us) = phase_d;
+        let pass_d = d_max_abs < phase_a_tolerance;
+        let tag_d = if pass_d {
+            let speedup = a_us / d_us;
+            if speedup >= 1.0 {
+                format!("PASS  ({:.2}× faster)", speedup)
+            } else {
+                format!("PASS  ({:.2}× slower)", 1.0 / speedup)
+            }
+        } else { "FAIL".to_string() };
+        println!(
+            "{:>5} {:>6} {:>4}  {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag_d}",
+            m, k, n, "_mb4", d_max_abs, d_max_rel, d_rms, d_us
+        );
+        println!();
+
+        if !pass_a || !pass_d { all_pass = false; }
+        if a_max_abs > global_max_abs_a { global_max_abs_a = a_max_abs; }
+        if d_max_abs > global_max_abs_d { global_max_abs_d = d_max_abs; }
+        total_us_a += a_us;
+        total_us_d += d_us;
     }
-    println!();
-    println!("Max-abs across all shapes  : {:.3e}", global_max_abs);
-    println!("Phase A tolerance (initial): {:.3e}", phase_a_tolerance);
-    println!("Suggested B1 tolerance (~3× observed): {:.3e}", global_max_abs * 3.0);
-    println!("Aggregate wall time (sum across shapes): {:.1} us", total_us);
+    println!("Max-abs across all shapes (_wmma): {:.3e}", global_max_abs_a);
+    println!("Max-abs across all shapes (_mb4 ): {:.3e}", global_max_abs_d);
+    println!("Phase A tolerance (initial)      : {:.3e}", phase_a_tolerance);
+    println!("Aggregate us/call (_wmma)        : {:.1}", total_us_a);
+    println!("Aggregate us/call (_mb4 )        : {:.1}", total_us_d);
+    println!("Aggregate speedup _mb4 / _wmma   : {:.2}×", total_us_a / total_us_d);
 
     if !all_pass {
         eprintln!("\nFAIL: one or more shapes exceeded {:.3e} absolute", phase_a_tolerance);
