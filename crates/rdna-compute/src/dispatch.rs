@@ -2374,6 +2374,64 @@ impl Gpu {
         result
     }
 
+    /// Phase D experiment: 16×32 fanout sibling of `gemm_mq4g256_lloyd_residual_wmma`.
+    /// Half the per-WG weight reuse of mb4 but 2× the WG count and ~21 fewer
+    /// VGPRs — targets the small-M residual case where mb4 is occupancy-bound.
+    pub fn gemm_mq4g256_lloyd_residual_wmma_mb2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb2")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 31) / 32;
+
+        let weight_bytes = m * (k / 256) * LLOYD_MQ4_GROUP_BYTES;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_mq4g256_lloyd_residual_wmma_mb2", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_mq4g256_lloyd_residual_wmma_mb2",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// MQ4-Lloyd WMMA fused QKVZA GEMM (LA preamble: qkv + z + beta + alpha).
     /// 4-way fused — one launch covers all four projections of the LA layer.
     /// Phase B1 sibling of `gemm_mq4g256_lloyd_residual_wmma` (kernels-only,

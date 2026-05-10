@@ -192,7 +192,8 @@ fn bench_variant(
 }
 
 fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
-    (f32, f32, f32, f64),  // _wmma   (Phase A)
+    (f32, f32, f32, f64),  // _wmma     (Phase A)
+    (f32, f32, f32, f64),  // _wmma_mb2 (Phase D experiment)
     (f32, f32, f32, f64),  // _wmma_mb4 (Phase D-A)
 ) {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
@@ -244,11 +245,21 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
     let phase_a = bench_variant(
         gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
         |gpu, d_a, d_x, d_y| {
+            // Force MB4=0 to skip the size-gated routing.
+            std::env::set_var("HIPFIRE_LLOYD_MB4", "0");
             gpu.gemm_mq4g256_lloyd_residual_wmma(d_a, d_x, d_y, m, k, n).unwrap();
+            std::env::remove_var("HIPFIRE_LLOYD_MB4");
         },
     );
 
-    let phase_d = bench_variant(
+    let phase_d_mb2 = bench_variant(
+        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+        |gpu, d_a, d_x, d_y| {
+            gpu.gemm_mq4g256_lloyd_residual_wmma_mb2(d_a, d_x, d_y, m, k, n).unwrap();
+        },
+    );
+
+    let phase_d_mb4 = bench_variant(
         gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
         |gpu, d_a, d_x, d_y| {
             gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n).unwrap();
@@ -257,7 +268,7 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
 
     gpu.free_tensor(d_a).unwrap();
     gpu.free_tensor(d_x).unwrap();
-    (phase_a, phase_d)
+    (phase_a, phase_d_mb2, phase_d_mb4)
 }
 
 fn main() {
@@ -290,53 +301,53 @@ fn main() {
     let phase_a_tolerance = 1.75e-4f32;
 
     let mut all_pass = true;
-    let mut global_max_abs_a = 0f32;
-    let mut global_max_abs_d = 0f32;
     let mut total_us_a = 0.0f64;
-    let mut total_us_d = 0.0f64;
+    let mut total_us_mb2 = 0.0f64;
+    let mut total_us_mb4 = 0.0f64;
 
-    println!("{:>5} {:>6} {:>4}  {:>4}  {:>11}  {:>11}  {:>11}  {:>10}  {}",
-             "M", "K", "N", "kern", "max_abs", "max_rel", "rms", "us/call", "verdict");
+    println!("{:>5} {:>6} {:>4}  {:>5}  {:>11}  {:>11}  {:>10}  {}",
+             "M", "K", "N", "kern", "max_abs", "rms", "us/call", "verdict");
 
-    for &(m, k, n) in cases {
-        let (phase_a, phase_d) = run_one(&mut gpu, m, k, n);
-
-        let (a_max_abs, a_max_rel, a_rms, a_us) = phase_a;
-        let pass_a = a_max_abs < phase_a_tolerance;
-        let tag_a = if pass_a { "PASS" } else { "FAIL" };
-        println!(
-            "{:>5} {:>6} {:>4}  {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag_a}",
-            m, k, n, "_wmma", a_max_abs, a_max_rel, a_rms, a_us
-        );
-
-        let (d_max_abs, d_max_rel, d_rms, d_us) = phase_d;
-        let pass_d = d_max_abs < phase_a_tolerance;
-        let tag_d = if pass_d {
-            let speedup = a_us / d_us;
-            if speedup >= 1.0 {
-                format!("PASS  ({:.2}× faster)", speedup)
+    let mut emit_row = |label: &str, m: usize, k: usize, n: usize,
+                        result: (f32, f32, f32, f64), ref_us: f64| -> bool {
+        let (max_abs, _max_rel, rms, us_per_call) = result;
+        let pass = max_abs < phase_a_tolerance;
+        let tag = if pass {
+            if (us_per_call - ref_us).abs() < 1.0 {
+                "PASS  (ref)".to_string()
             } else {
-                format!("PASS  ({:.2}× slower)", 1.0 / speedup)
+                let speedup = ref_us / us_per_call;
+                if speedup >= 1.0 {
+                    format!("PASS  ({:.2}× faster)", speedup)
+                } else {
+                    format!("PASS  ({:.2}× slower)", 1.0 / speedup)
+                }
             }
         } else { "FAIL".to_string() };
         println!(
-            "{:>5} {:>6} {:>4}  {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag_d}",
-            m, k, n, "_mb4", d_max_abs, d_max_rel, d_rms, d_us
+            "{:>5} {:>6} {:>4}  {:>5}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag}",
+            m, k, n, label, max_abs, rms, us_per_call
         );
-        println!();
+        pass
+    };
 
-        if !pass_a || !pass_d { all_pass = false; }
-        if a_max_abs > global_max_abs_a { global_max_abs_a = a_max_abs; }
-        if d_max_abs > global_max_abs_d { global_max_abs_d = d_max_abs; }
-        total_us_a += a_us;
-        total_us_d += d_us;
+    for &(m, k, n) in cases {
+        let (phase_a, phase_d_mb2, phase_d_mb4) = run_one(&mut gpu, m, k, n);
+        let ref_us = phase_a.3;
+        all_pass &= emit_row("_wmma", m, k, n, phase_a, ref_us);
+        all_pass &= emit_row("_mb2", m, k, n, phase_d_mb2, ref_us);
+        all_pass &= emit_row("_mb4", m, k, n, phase_d_mb4, ref_us);
+        println!();
+        total_us_a += phase_a.3;
+        total_us_mb2 += phase_d_mb2.3;
+        total_us_mb4 += phase_d_mb4.3;
     }
-    println!("Max-abs across all shapes (_wmma): {:.3e}", global_max_abs_a);
-    println!("Max-abs across all shapes (_mb4 ): {:.3e}", global_max_abs_d);
     println!("Phase A tolerance (initial)      : {:.3e}", phase_a_tolerance);
     println!("Aggregate us/call (_wmma)        : {:.1}", total_us_a);
-    println!("Aggregate us/call (_mb4 )        : {:.1}", total_us_d);
-    println!("Aggregate speedup _mb4 / _wmma   : {:.2}×", total_us_a / total_us_d);
+    println!("Aggregate us/call (_mb2)         : {:.1}  (vs _wmma: {:.2}×)",
+             total_us_mb2, total_us_a / total_us_mb2);
+    println!("Aggregate us/call (_mb4)         : {:.1}  (vs _wmma: {:.2}×)",
+             total_us_mb4, total_us_a / total_us_mb4);
 
     if !all_pass {
         eprintln!("\nFAIL: one or more shapes exceeded {:.3e} absolute", phase_a_tolerance);
