@@ -1352,12 +1352,35 @@ fn parse_layer_idx(name: &str) -> Option<usize> {
     None
 }
 
+/// Stride for alternating-mode promotion: edge layers always promoted,
+/// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
+/// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
+/// On MoE 3.6-35B-A3B: stride=3 gives PPL 8K=19.96 at 21.8 GB vs full
+/// K-map PPL 8K=20.07 at 27.7 GB.
+const ALTERNATING_STRIDE: usize = 3;
+
+/// llama.cpp-style alternating promotion: edge layers always promoted,
+/// middle layers promoted every `stride` layers.
+fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
+    if n_layers == 0 || stride == 0 { return false; }
+    if idx < 2 || idx >= n_layers.saturating_sub(2) { return true; }
+    (idx - 2) % stride == 0
+}
+
 /// Resolve the quantization level for a tensor based on its name, the model's
-/// layer count, and whether the model is MoE. See spec for rule ordering.
+/// layer count, whether the model is MoE, and the K-map mode.
+///
+/// `kmap_mode`: 0 = full (all candidates promoted), 1 = alternating
+/// (experts + ffn_down every 3rd middle layer, edge layers always),
+/// 2 = typed (ffn_down + attn_v everywhere).
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    kmap_resolve_mode(name, n_layers, is_moe, 0)
+}
+
+fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -1380,10 +1403,63 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
 
     // Rule 4: MoE expert FFN weights
     if is_moe && name.contains("mlp.experts.") {
+        if kmap_mode == 1 {
+            // Alternating: promote expert groups only in positional layers
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                return QuantLevel::Base;
+            }
+        }
         return QuantLevel::Promote6;
     }
 
-    // Rule 5: edge layers (first 2 + last 2).
+    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    if kmap_mode == 2 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 1 (alternating): ffn_down in edge + every 3rd middle layer.
+    // Edge-layer rule mirrors mode 0 below: attn+FFN for MoE (full promotion
+    // gives -19.8% PPL on 3.6-35B-A3B), FFN only for dense (attn promotion
+    // regresses PPL +3.1% on 27B). Bench: asym4 KV, ctx=8192, wikitext-2-test.
+    // See ppl_kmap_20260508.md.
+    if kmap_mode == 1 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                // Edge layers: attn+FFN for MoE, FFN only for dense.
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    if is_moe {
+                        return QuantLevel::Promote6;
+                    }
+                    let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                    if is_ffn {
+                        return QuantLevel::Promote6;
+                    }
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Rule 5 (full mode 0): edge layers (first 2 + last 2).
     // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
     // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
     // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
@@ -1960,7 +2036,7 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool) -> std::io::Result<()> {
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool, kmap_mode: u8) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -2029,7 +2105,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
         for info in &gguf.tensors {
             let out_name = gguf_to_safetensors_name(&info.name)
                 .unwrap_or_else(|| info.name.clone());
-            let level = kmap_resolve(&out_name, n_layers, is_moe);
+            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2039,7 +2115,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
             map.insert(out_name, level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors", counts[0]);
@@ -2267,6 +2344,18 @@ fn main() {
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
+    // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
+    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
+    // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
+    let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| match v.as_str() {
+            "full" | "0" => 0,
+            "alternating" | "alt" | "1" => 1,
+            "typed" | "2" => 2,
+            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using alternating"); 1 }
+        })
+        .unwrap_or(1);
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -2358,7 +2447,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -2471,7 +2560,7 @@ fn main() {
         let mut map = HashMap::new();
         let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
         for (name, _fi) in &all_tensors {
-            let level = kmap_resolve(name, n_layers, is_moe);
+            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2481,7 +2570,8 @@ fn main() {
             map.insert(name.to_string(), level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({format} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({format} base, {n_layers} layers{}, mode={mode_label}):",
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
             eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
@@ -3278,5 +3368,111 @@ mod tests {
         assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote6);
         // GGUF middle-layer — base
         assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
+    }
+
+    // ── Alternating mode tests ───────────────────────────────────────────
+
+    #[test]
+    fn positional_promote_edges() {
+        assert!(is_positional_promote(0, 40, 3));
+        assert!(is_positional_promote(1, 40, 3));
+        assert!(is_positional_promote(38, 40, 3));
+        assert!(is_positional_promote(39, 40, 3));
+    }
+
+    #[test]
+    fn positional_promote_stride3() {
+        // Middle layers: every 3rd starting from idx 2
+        assert!(is_positional_promote(2, 40, 3));  // edge
+        assert!(!is_positional_promote(3, 40, 3));
+        assert!(!is_positional_promote(4, 40, 3));
+        assert!(is_positional_promote(5, 40, 3));
+        assert!(!is_positional_promote(6, 40, 3));
+        assert!(!is_positional_promote(7, 40, 3));
+        assert!(is_positional_promote(8, 40, 3));
+    }
+
+    #[test]
+    fn kmap_alternating_moe_experts() {
+        // MoE experts: promoted in positional layers, base in others
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Promote6 // edge layer
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Promote6 // stride hit (5-2=3, 3%3==0)
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Base // not on stride
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_ffn_down() {
+        // ffn_down promoted in positional layers, base in others
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Promote6 // edge
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.5.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Promote6 // stride
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.3.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Base // not on stride
+        );
+        // gate_proj NOT promoted in middle layers
+        assert_eq!(
+            kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_n_layers_zero() {
+        // With n_layers=0, alternating mode should return Base for everything
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_gguf_names() {
+        // GGUF ffn_down in edge layer
+        assert_eq!(
+            kmap_resolve_mode("blk.0.ffn_down.weight", 40, false, 1),
+            QuantLevel::Promote6
+        );
+        // GGUF ffn_down in middle non-stride layer
+        assert_eq!(
+            kmap_resolve_mode("blk.3.ffn_down.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+        // GGUF ffn_gate stays base in middle
+        assert_eq!(
+            kmap_resolve_mode("blk.5.ffn_gate.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_typed_promotes_down_and_v() {
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 2),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 2),
+            QuantLevel::Promote6
+        );
+        // gate_proj stays base
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
+            QuantLevel::Base
+        );
     }
 }
