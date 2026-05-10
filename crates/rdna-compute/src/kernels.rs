@@ -82,6 +82,10 @@ pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../..
 /// `benchmarks/results/devlog_20260509_mq4_lloyd_gfx1151_bench.md`. Same 160 B
 /// stride and codebook decode as `_wmma`; only the batch-fanout and grid shape change.
 pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb4.hip");
+/// Phase D experiment: 16×32 output tile (2 batch sub-tiles per WG). Lower
+/// VGPR pressure (~85 vs mb4's 106) at the cost of half the per-WG weight
+/// reuse — better at small-M residual where mb4 is occupancy-bound.
+pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB2_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb2.hip");
 /// MQ4G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.hip");
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx12.hip");
@@ -182,6 +186,15 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
              should reject this; if you reached here, is_batchable_la was extended without \
              updating gemm_gate_up_mq4g256_lloyd_wmma_for_arch."
         ),
+    }
+}
+
+/// Phase D experiment selector for residual mb2 (16×32 output tile).
+pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+            (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB2_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb2_rdna3"),
+        _ => panic!("MQ4-Lloyd WMMA mb2 residual: unsupported arch {arch}. gfx11-only."),
     }
 }
 

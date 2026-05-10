@@ -518,6 +518,76 @@ matches the 276.6 baseline, no regression.
   may not be optimal on GDDR6 hardware where L2 absorbs more of the
   duplicate-fetch pressure on the `_wmma` family
 
+## Phase D follow-up — mb2 investigation (negative result)
+
+After Phase D-A + D-B landed, post-D profile showed `residual_mb4` was
+the laggard at 16.4 GiB/s vs the fused siblings at 23-30 GiB/s.
+Hypothesis: residual's small total_m (4096 = model dim) leaves mb4
+occupancy-bound — only 1024 WGs across 40 CUs, with VGPR=106 forcing
+2-occupancy slot. **mb2** (16×32 output tile, 2 sub-tiles per WG)
+trades half the per-WG weight reuse for 2× the WG count and ~21
+fewer VGPRs, predicting a win for residual specifically.
+
+### Parity (gfx1151, 3-way A/B vs `_wmma` baseline)
+
+mb2 bit-exact across all 11 shapes (max_abs / max_rel / rms identical
+to `_wmma` and `_mb4`). Production-shape comparison:
+
+| Shape (M×K×N) | `_wmma` µs | `_mb2` µs (vs ref) | `_mb4` µs (vs ref) | Winner |
+|---|---|---|---|---|
+| 4096×4096×256 (wo) | 1211.1 | **857.7** (1.41×) | 885.3 (1.37×) | mb2 (3% margin) |
+| 4096×12288×256 (mlp.down) | 3566.0 | 2755.8 (1.29×) | **2620.5** (1.36×) | mb4 |
+| 14336×4096×256 (gate_up out) | 4697.5 | 2958.4 (1.59×) | **2140.0** (2.20×) | mb4 decisive |
+
+mb2 does NOT dominate residual at production scale. The wo case
+(K=4096, 16 groups) is the only place mb2 nudges ahead, and only by
+3 %. mlp.down (K=12288, 48 groups) is mb4 territory because per-group
+sync overhead dominates and mb4 amortizes it across 4× more output
+cells per WG. The occupancy hypothesis was right at small batches
+(prefill ≤ 64) but doesn't survive the per-group-overhead picture
+at K=12288.
+
+### Computed integrated impact
+
+K-aware routing — mb2 for wo (K=4096), mb4 for mlp.down (K=12288):
+- wo with mb2: 858 µs × 32 calls = 27.5 ms (vs mb4 28.3 ms — saves 0.8 ms)
+- mlp.down with mb4: 2621 µs × 32 calls = 83.9 ms (unchanged)
+- Total residual savings: 0.8 ms / 327 ms wall ≈ **0.3 %**.
+
+Not worth the dispatch complexity. mb4-everywhere on residual is
+within noise of optimal across both shape clusters.
+
+### Remaining lever budget
+
+| Lever | Status | Estimated upside |
+|---|---|---|
+| Multi-batch-tile fanout (D-A + D-B) | ✅ Shipped | +30 pp Lloyd/uniform on 9B |
+| mb2 for residual | ❌ Investigated, not shipped | ~0.3 % |
+| Async LDS prefetch / double-buffer codebook | ⏳ Not tried | ~5-10 % on K=12288 cases only |
+| Multi-row-tile (32×64 or 64×64 output) | ⏳ Not tried | Maybe +5 pp; significant rewrite |
+| Per-arch K-schedule (K4 vs K2) | ⏳ Not tried | Marginal; needs bench |
+| __launch_bounds__ retuning | ⏳ Not tried | Likely 0-3 % |
+| 8-batch-tile (`_mb8`) | ⏳ Not tried | Probably regresses (occupancy) |
+
+Format-tax structural floor: 1/1.176 = **85 %** (Lloyd's +17.6 %
+weight footprint vs HFQ4). 9B is at 71.3 %, gap-to-floor 13.7 pp; 4B
+is at 82.8 %, gap-to-floor 2.2 pp (essentially at-floor). The simple
+architectural levers are exhausted; remaining headroom is split
+between the format tax (immutable) and harder rewrites (multi-row-
+tile, async prefetch).
+
+### What's preserved as documented dead code
+
+`gemm_mq4g256_lloyd_residual_wmma_mb2.hip` ships with the branch but
+is NOT wired into the size gate. Available as prior art for:
+- Future gfx1100 cross-arch tuning (different L2 / bandwidth ratio
+  may make mb2 the right pick there)
+- Future register-pressure-constrained arch ports
+- Reference implementation if a Phase E ever revisits this
+The dispatch method `gemm_mq4g256_lloyd_residual_wmma_mb2` exists,
+the parity test verifies correctness 3-way, but production routing
+goes mb4-only.
+
 ## Reproducer
 
 ```bash
