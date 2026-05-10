@@ -872,14 +872,18 @@ async function runViaHttp(
   port: number, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+  system?: string,
 ): Promise<boolean> {
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper doesn't expose — fall back to local spawn.
   if (image) return false;
 
+  const messages: any[] = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
   const body: any = {
     model, stream: true,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
@@ -1191,7 +1195,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1215,7 +1219,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
   if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1262,6 +1266,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
+  if (system) genMsg.system = system;
 
   let inThink = false;
   let stripNextLeadingNl = false;
@@ -4001,13 +4006,15 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
       "--max-tokens": { default: 512 },
+      "--system": { default: undefined },
     };
+    const stringFlags = new Set(["--image", "--system"]);
     const flags: Record<string, string> = {};
     const flagIndices = new Set<number>();
     for (const key of Object.keys(flagDefs)) {
@@ -4017,7 +4024,7 @@ switch (cmd) {
         // Reject flag values that look like other flags
         if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
         // Validate numeric flags
-        if (key !== "--image" && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
+        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
         flags[key] = val;
         flagIndices.add(idx); flagIndices.add(idx + 1);
       } else if (idx >= 0) {
@@ -4025,6 +4032,7 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
+    const system = flags["--system"];
     const runCfg = resolveModelConfig(model);
     const temp = Number(flags["--temp"] ?? runCfg.temperature);
     const topP = Number(flags["--top-p"] ?? runCfg.top_p);
@@ -4036,7 +4044,7 @@ switch (cmd) {
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     break;
   }
   case "chat": {
