@@ -63,17 +63,44 @@ arch ∈ {gfx1100,1101,1102,1150,1151}`. Env override
 
 ## Parity (gfx1151)
 
-`test_gemm_mq3g256_lloyd_residual_wmma` with `HIPFIRE_MQ3_MB4=1` (force-on):
-bit-exact across all 8 shapes (max_abs/max_rel/rms identical to last
-digit between `_wmma` and `_mb4`).
+**MQ3-Lloyd `_mb4` vs `_wmma`** (both run with synthetic shapes,
+compared against fp64 CPU reference):
+- `test_gemm_mq3g256_lloyd_residual_wmma` with `HIPFIRE_MQ3_MB4=1`:
+  bit-exact across all 8 residual shapes (max_abs/max_rel/rms identical
+  to last digit between `_wmma` and `_mb4`).
+- `test_gemm_fused_mq3g256_lloyd_wmma` with `HIPFIRE_MQ3_MB4=1`: bit-exact
+  across all 8 fused shapes (qkvza, qkv, gate_up).
 
-`test_gemm_fused_mq3g256_lloyd_wmma` with `HIPFIRE_MQ3_MB4=1`: bit-exact
-across all 8 fused shapes (qkvza, qkv, gate_up).
+**HFQ3 `_mb4` vs `_wmma`** (`test_gemm_hfq3g256_wmma`, GPU-vs-GPU
+comparison — both kernels run on identical inputs, output diff
+measured directly):
 
-HFQ3 has no dedicated parity test; correctness verified end-to-end by
-the integrated 9B bench (gen tok/s and weight-bytes-per-second both
-invariant across MB4 modes — a logits corruption would break the gen
-phase or shift the bandwidth column).
+```
+GPU: gfx1151
+Verifying HFQ3 _mb4 == _wmma at all shapes (TOL=1e-04).
+--- residual M=64    K=1024  N=16   max_abs=0.000e0  PASS
+--- residual M=64    K=1024  N=64   max_abs=0.000e0  PASS
+--- residual M=256   K=4096  N=256  max_abs=0.000e0  PASS
+--- residual M=1024  K=4096  N=64   max_abs=0.000e0  PASS
+--- residual M=1024  K=12288 N=64   max_abs=0.000e0  PASS
+--- qkvza M=(64+16+8+8)     K=1024 N=16   PASS  all=0.000e0
+--- qkvza M=(256+32+16+16)  K=4096 N=64   PASS  all=0.000e0
+--- qkvza M=(512+64+32+32)  K=4096 N=32   PASS  all=0.000e0
+--- qkv   M=(64+64+64)      K=1024 N=16   PASS  all=0.000e0
+--- qkv   M=(256+32+32)     K=4096 N=64   PASS  all=0.000e0
+--- qkv   M=(512+64+64)     K=4096 N=32   PASS  all=0.000e0
+--- gate_up M=(256+256)     K=1024 N=16   PASS  all=0.000e0
+--- gate_up M=(1024+1024)   K=4096 N=64   PASS  all=0.000e0
+ALL PASS — HFQ3 _mb4 produces output bit-equivalent to _wmma
+```
+
+**Bit-exact, zero diff** across all 13 shapes. HFQ3 `_mb4` produces
+output literally identical to `_wmma` for the same inputs — no
+fp32-reorder envelope opens up, since both kernels use the same
+WMMA accumulation order per output (one acc per 16×16 sub-tile;
+mb4 multiplexes 4 sub-tiles in time but each acc is independent).
+Strongest possible correctness signal — `_mb4` inherits `_wmma`'s
+production-validated correctness mechanically.
 
 ## Cross-process A/B (gfx1151, 9B prefill=256, asym3, GRAPH=1)
 
@@ -95,6 +122,22 @@ phase or shift the bandwidth column).
 | `MB4=0` | 503.7 | 501.8 | 503.1 | **502.9 tok/s** | 49.0 |
 | `MB4=1` | 823.4 | 852.8 | 852.1 | **842.8 tok/s** | 48.8 |
 | Δ      |       |       |       | **+339.9 (+67.6 %)** | -0.2 |
+
+### qwen3.5-4b.mq3-lloyd
+
+(No 4B uniform-MQ3 model on this host; just the Lloyd self-A/B.)
+
+| Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
+|---|---|---|---|---|---|
+| `MB4=0` | 980.8  | 997.0  | 985.6  | **987.8 tok/s**  | 70.4 |
+| `MB4=1` | 1596.8 | 1596.2 | 1566.3 | **1586.4 tok/s** | 69.9 |
+| Δ      |        |        |        | **+598.6 (+60.6 %)** | -0.5 |
+
+Notable: 4B-MQ3-Lloyd post-mb4 (1586 tok/s) is essentially equal to
+4B-MQ4-Lloyd post-Phase-D (1607 tok/s) on the same hardware. At 4B
+both formats are in the same compute-bound regime; the LPDDR5x
+bandwidth ceiling that punishes MQ4-Lloyd's larger format at 9B
+isn't fully exposed at 4B.
 
 ### Lloyd / uniform-MQ3 ratio
 
@@ -149,12 +192,13 @@ through `forward_scratch` + GEMV, untouched.
 
 ## What's locked in
 
-- ✅ Bit-exact parity on residual + 3 fused MQ3-Lloyd kernels (16 shapes)
-- ✅ HFQ3 mb4 correctness via integrated bench gen/bandwidth invariance
+- ✅ Bit-exact parity on residual + 3 fused MQ3-Lloyd kernels (16 shapes vs CPU reference)
+- ✅ HFQ3 _mb4 == _wmma bit-exact across 13 shapes (`test_gemm_hfq3g256_wmma`, GPU-vs-GPU)
 - ✅ Size-gated default routing — production-safe at all prefill sizes
 - ✅ Env override `HIPFIRE_MQ3_MB4={0,1}` for A/B benching
 - ✅ gfx12 explicitly excluded from `_mb4` selectors
-- ✅ Both 9B-MQ3 (+76.6%) and 9B-MQ3-Lloyd (+67.6%) clear large gains
+- ✅ 9B: MQ3 +76.6 %, MQ3-Lloyd +67.6 %
+- ✅ 4B: MQ3-Lloyd +60.6 % (4B uniform-MQ3 model not on this host)
 - ⏳ gfx1100 cross-arch confirmation — bench help-wanted (no local hardware)
 
 ## Bench config (reproducer)
@@ -184,5 +228,6 @@ gpu_release
 | Bench binary md5 | `5230b8391b4c00659b86b27112947352` |
 | Model md5 (9B-MQ3) | `e4412f6dd785e82de2ece629f33ecc14` |
 | Model md5 (9B-MQ3-Lloyd) | `ba99df5e20f44a49fe45f2fa3ce05f59` |
+| Model md5 (4B-MQ3-Lloyd) | `865a2ab1e7d97ae02b02be95e08cc852` |
 | Branch HEAD | `feat/mq3-batch-fanout` (off `upstream/master a4e42c5`) |
 | Prompt | N/A — synthetic deterministic token sequence (token ids `0..prefill_len`) |
