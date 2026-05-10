@@ -59,9 +59,11 @@ extern "C" __global__ void attention_dflash_f32(
     }
     __syncthreads();
 
-    // Online-softmax running state.
-    float m_run = -1e30f;  // running max of all scores seen so far
-    float l_run = 0.0f;    // running sum of exp(scores - m_run)
+    // Online-softmax running state. m_run starts at -INFINITY so the
+    // first-tile bootstrap is exact: alpha = exp(-inf - finite) = 0
+    // by IEEE-754, no reliance on FP underflow of (-1e30 - finite).
+    float m_run = -INFINITY;  // running max of all scores seen so far
+    float l_run = 0.0f;       // running sum of exp(scores - m_run)
 
     int n_tiles = (L + tile_size - 1) / tile_size;
     for (int t = 0; t < n_tiles; ++t) {
@@ -70,7 +72,7 @@ extern "C" __global__ void attention_dflash_f32(
         if (tile_len > tile_size) tile_len = tile_size;
 
         // Phase A: compute scores for this tile, track tile-local max.
-        float local_max = -1e30f;
+        float local_max = -INFINITY;
         for (int j = tid; j < tile_len; j += nthreads) {
             int abs_j = tile_start + j;
             const float* k_ptr = k + abs_j * kv_stride + kv_head * head_dim;
