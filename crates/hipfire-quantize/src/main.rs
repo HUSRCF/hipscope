@@ -741,9 +741,16 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 
 /// Quantize a row-major 2D weight tensor of shape `[m, k]` to HFP4G32.
 /// Returns `m * (16 + 17 * (k/32))` bytes — 16-B row header + per-block payloads, repeated per row.
+///
+/// K%256 — not K%32 — because the v1 GEMV kernel
+/// (`crates/rdna-compute/src/dispatch.rs::gemv_hfp4g32`) iterates 256 elements
+/// per work-item and panics on K%256!=0. The byte format itself is K%32-aligned;
+/// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
+/// makes the failure mode "quantize rejects bad input" rather than "runtime
+/// panics on first dispatch with a tensor a previous step already accepted."
 fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
     assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
-    assert!(k % 32 == 0, "HFP4G32 requires k % 32 == 0, got k={}", k);
+    assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
     for r in 0..m {
