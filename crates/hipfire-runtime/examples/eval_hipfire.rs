@@ -12,7 +12,16 @@
 //!                --output <path-to-output.kldseq> \
 //!                [--variant <name>=auto-from-model-path] \
 //!                [--arch <name>=auto-from-gpu] \
-//!                [--kv-mode <mode>=asym3]
+//!                [--kv-mode <mode>=asym3] \
+//!                [--scoring-mode <per-token|prefill>=per-token]
+//!
+//! Scoring modes (per docs/plans/eval_hipfire_speedup.md):
+//!   per-token: forward_scratch in a per-position loop. Canonical baseline.
+//!   prefill:   forward_prefill_batch (transformer stack batched, lm_head
+//!              fan-out per scored position). ~7-19× faster on gfx1151 9B
+//!              Q3/Q4 variants per Step 0 microbench. Requires the model's
+//!              LA dtype to be in `is_batchable_la`'s OK set; auto-falls-
+//!              back to per-token inside `forward_prefill_batch` otherwise.
 //!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
@@ -28,7 +37,8 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
+    use hipfire_runtime::llama::{KvCache, weight_gemv};
+    use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
     use std::path::PathBuf;
@@ -40,12 +50,16 @@ fn main() {
         ref_path: PathBuf,
         output: PathBuf,
         kv_mode: String,
+        scoring_mode: String,
+        max_chunks: Option<usize>,
     }
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut kv_mode = "asym3".to_string();
+    let mut scoring_mode = "per-token".to_string();
+    let mut max_chunks: Option<usize> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -61,8 +75,21 @@ fn main() {
                 kv_mode = v;
                 i += 2;
             }
+            "--scoring-mode" => {
+                let v = argv[i + 1].clone();
+                if !matches!(v.as_str(), "per-token" | "prefill") {
+                    eprintln!("--scoring-mode must be one of: per-token prefill (got {v})");
+                    std::process::exit(1);
+                }
+                scoring_mode = v;
+                i += 2;
+            }
+            "--max-chunks" => {
+                max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
+                i += 2;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--scoring-mode per-token] [--max-chunks N]");
                 std::process::exit(0);
             }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
@@ -73,6 +100,8 @@ fn main() {
         ref_path: ref_path.expect("--ref required"),
         output: output.expect("--output required"),
         kv_mode,
+        scoring_mode,
+        max_chunks,
     };
 
     // -------- eval-mode env vars (must precede Gpu::init / forward) --------
@@ -99,8 +128,18 @@ fn main() {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
         std::env::set_var("HIPFIRE_KV_MODE", &args.kv_mode);
+        // For prefill scoring, pre-allocate the PrefillBatchScratch via
+        // Qwen35Scratch's HIPFIRE_PREFILL_REUSE_PBS hook so the 1175 chunk
+        // calls don't each pay 25-tensor alloc/free overhead. (Plan §M1.)
+        if args.scoring_mode == "prefill" {
+            std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
+        }
     }
-    eprintln!("eval_hipfire: forced HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE={}", args.kv_mode);
+    eprintln!(
+        "eval_hipfire: forced HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 \
+         HIPFIRE_KV_MODE={} scoring_mode={}",
+        args.kv_mode, args.scoring_mode
+    );
 
     // -------- ref sha256 sanity (M1) --------
     verify_ref_sha256(&args.ref_path);
@@ -143,7 +182,18 @@ fn main() {
         std::process::exit(2);
     }
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
-    let total_scored = scored_per_chunk * n_chunk;
+    // Effective chunk count after --max-chunks cap (V5 / dev-smoke). Tokens
+    // and ref blocks for chunks beyond the cap are read but not scored —
+    // the ref-block stream advances per scored position, not per chunk, so
+    // the cap is enforced at the outer loop.
+    let effective_n_chunk = match args.max_chunks {
+        Some(m) => m.min(n_chunk),
+        None => n_chunk,
+    };
+    if let Some(m) = args.max_chunks {
+        eprintln!("eval_hipfire: --max-chunks {m} → effective_n_chunk = {effective_n_chunk}/{n_chunk}");
+    }
+    let total_scored = scored_per_chunk * effective_n_chunk;
     let per_token_block_bytes = 8 + 8 * top_k;
     eprintln!(
         "eval_hipfire: ref n_ctx={n_ctx} n_vocab={ref_n_vocab} n_chunk={n_chunk} top_k={top_k}"
@@ -185,6 +235,22 @@ fn main() {
     // prior gfx1100 run with 21.5 GB VRAM.
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
 
+    // Hidden-state capture buffer for prefill mode. forward_prefill_batch
+    // with per_token_hidden_out=Some(buf) writes one row per scored token
+    // (post-output-norm hidden state); we then loop weight_gemv per row to
+    // recover logits — the "option C / per-token GPU lm_head fan-out"
+    // resolution from the rev-2 plan (§"lm_head fan-out options").
+    // Shape: [scored_per_chunk, dim]; ~16 MB at scored_per_chunk=1023, dim=4096.
+    let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
+    let hidden_buf = if args.scoring_mode == "prefill" {
+        Some(
+            gpu.alloc_tensor(&[scored_per_chunk, config.dim], DType::F32)
+                .expect("alloc hidden_buf"),
+        )
+    } else {
+        None
+    };
+
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut p99_kld_per_seq:  Vec<f64> = Vec::with_capacity(n_chunk);
@@ -193,123 +259,172 @@ fn main() {
     let t0 = Instant::now();
     let mut total_scored_done = 0usize;
 
-    for c in 0..n_chunk {
-        // KvCache positions are passed explicitly via `pos` to forward_scratch
+    // Per-position KLD + NLL inner body. Reads the next ref block, downloads
+    // the candidate logits from scratch.logits (caller is responsible for
+    // having populated those), computes top-K-of-ref KLD with residual
+    // cross-term, and returns (kld_token, optional_nll). The closure
+    // explicitly mutates `ref_in` and `block_buf` so per-chunk state stays
+    // outside; the rest is read-only. Same math both modes use.
+    let score_position = |gpu: &mut rdna_compute::Gpu,
+                          scratch_logits: &rdna_compute::GpuTensor,
+                          ref_in: &mut BufReader<File>,
+                          block_buf: &mut [u8],
+                          actual_next: usize| -> (f64, Option<f64>) {
+        ref_in.read_exact(block_buf).expect("read ref block");
+        let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
+        let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
+        for j in 0..top_k {
+            top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+        }
+        let lp_off = top_k * 4;
+        for j in 0..top_k {
+            top_log_probs.push(f32::from_le_bytes(
+                block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap(),
+            ));
+        }
+        let resid_off = top_k * 8;
+        let sum_p_residual =
+            f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
+
+        let cand_logits = gpu.download_f32(scratch_logits).expect("download logits");
+
+        // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
+        let mut max_logit = f32::NEG_INFINITY;
+        for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
+        let mut sum_exp = 0.0f64;
+        for &v in cand_logits.iter() {
+            sum_exp += ((v - max_logit) as f64).exp();
+        }
+        let log_z = (max_logit as f64) + sum_exp.ln();
+
+        // KLD = Σ_{i in top_K_P_ref} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
+        //     + residual cross-term  (sum_p_residual_ref * Δlog_residual)
+        let mut kld_token = 0.0f64;
+        let mut sum_p_cand_at_ref_top = 0.0f64;
+        for j in 0..top_k {
+            let ref_idx = top_indices[j] as usize;
+            if ref_idx >= cand_logits.len() { continue; }
+            let log_p_ref = top_log_probs[j] as f64;
+            let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
+            let p_ref = log_p_ref.exp();
+            let p_cand = log_p_cand.exp();
+            kld_token += p_ref * (log_p_ref - log_p_cand);
+            sum_p_cand_at_ref_top += p_cand;
+        }
+        let sum_p_residual_ref = sum_p_residual as f64;
+        let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
+        if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
+            kld_token += sum_p_residual_ref
+                * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+        }
+        if kld_token < 0.0 && kld_token > -1e-6 { kld_token = 0.0; }
+
+        let nll = if actual_next < cand_logits.len() {
+            Some(-((cand_logits[actual_next] as f64) - log_z))
+        } else {
+            None
+        };
+        (kld_token, nll)
+    };
+
+    let scoring_start = n_ctx / 2;
+    for c in 0..effective_n_chunk {
+        // KvCache positions are passed explicitly via `pos` (or `start_pos`)
         // — overwriting from position 0 each chunk is sufficient.
         dn_state.reset(&mut gpu);
 
         let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
         let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
-        // NLL accumulator: log P_cand(actual_next_token) per scored position.
-        // PPL = exp(-mean(NLL)) over all scored tokens.
         let mut chunk_nll_sum: f64 = 0.0;
         let mut chunk_nll_count: usize = 0;
 
-        for pos in 0..(n_ctx - 1) {
-            qwen35::forward_scratch(
-                &mut gpu, &weights, &config, chunk_tokens[pos], pos,
-                &mut kv_cache, &mut dn_state, &scratch,
-            ).expect("forward");
-
-            // Score logit-positions [n_ctx/2, n_ctx-2], predicting tokens at
-            // [n_ctx/2 + 1, n_ctx-1]. Yields exactly `n_ctx - 1 - n_ctx/2`
-            // scored positions per chunk, matching what build_kld_ref wrote.
-            //
-            // Off-by-one was previously `n_ctx/2 + 1`, which under-read 1
-            // ref block per chunk and shifted every comparison by 1 logit
-            // position. Caught by the consolidated review's C1 finding.
-            let scoring_start = n_ctx / 2;
-            if pos < scoring_start {
-                continue;
-            }
-
-            // Read corresponding reference block.
-            ref_in.read_exact(&mut block_buf).expect("read ref block");
-
-            // Parse β block: u32 indices[K] | f32 log_probs[K] | f32 residual | f32 pad
-            let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
-            let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
-            for j in 0..top_k {
-                top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
-            }
-            let lp_off = top_k * 4;
-            for j in 0..top_k {
-                top_log_probs.push(f32::from_le_bytes(block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap()));
-            }
-            let resid_off = top_k * 8;
-            let sum_p_residual = f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
-            // pad: ignored
-
-            // Download candidate logits at this position.
-            let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
-
-            // KLD via top-K-of-reference approximation (fp64 throughout).
-            // Compute candidate's log-Z = log Σ exp(logit_i)
-            let mut max_logit = f32::NEG_INFINITY;
-            for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
-            let mut sum_exp = 0.0f64;
-            for &v in cand_logits.iter() {
-                sum_exp += ((v - max_logit) as f64).exp();
-            }
-            let log_z = (max_logit as f64) + sum_exp.ln();
-
-            // KLD = top-K-of-reference contribution + residual cross-term.
-            //
-            // Top-K contribution:
-            //   Σ_{i in top_K_P_ref} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
-            //
-            // Residual cross-term (per rev-3.3):
-            //   sum_p_residual_ref * (log sum_p_residual_ref - log sum_p_residual_cand)
-            // where sum_p_residual_cand = 1 - Σ_{i in ref_top_K} P_cand(i).
-            // Assumes the ref-tail and cand-tail miss similarly. Reduces bias on
-            // flat-distribution tokens (~1% of all tokens have residual >17% per
-            // Step 1.6's empirical p99). See plan §"GGUF anchor architecture
-            // (rev-3.3)" — residual-term enhancement.
-            let mut kld_token = 0.0f64;
-            let mut sum_p_cand_at_ref_top = 0.0f64;
-            for j in 0..top_k {
-                let ref_idx = top_indices[j] as usize;
-                if ref_idx >= cand_logits.len() {
-                    eprintln!("warn: ref idx {ref_idx} >= n_vocab {}", cand_logits.len());
+        if args.scoring_mode == "per-token" {
+            // Canonical per-token path: forward_scratch per position; the
+            // scoring window is [scoring_start, n_ctx-2] inclusive.
+            for pos in 0..(n_ctx - 1) {
+                qwen35::forward_scratch(
+                    &mut gpu, &weights, &config, chunk_tokens[pos], pos,
+                    &mut kv_cache, &mut dn_state, &scratch,
+                ).expect("forward_scratch");
+                if pos < scoring_start {
                     continue;
                 }
-                let log_p_ref = top_log_probs[j] as f64;
-                let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
-                let p_ref = log_p_ref.exp();
-                let p_cand = log_p_cand.exp();
-                kld_token += p_ref * (log_p_ref - log_p_cand);
-                sum_p_cand_at_ref_top += p_cand;
-            }
-            // Residual cross-term. Only meaningful when both residuals are > 0.
-            let sum_p_residual_ref = sum_p_residual as f64;
-            let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
-            if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-                kld_token += sum_p_residual_ref
-                    * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
-            }
-            // Clamp small-negative roundoff to zero (KLD is ≥ 0 in theory).
-            if kld_token < 0.0 && kld_token > -1e-6 { kld_token = 0.0; }
-
-            chunk_klds.push(kld_token);
-            total_scored_done += 1;
-
-            // NLL: -log P_cand(actual_next_token). The actual next token is
-            // chunk_tokens[pos+1]; log P_cand at that vocab idx = logit - log_z.
-            let actual_next = chunk_tokens[pos + 1] as usize;
-            if actual_next < cand_logits.len() {
-                let nll = -((cand_logits[actual_next] as f64) - log_z);
-                chunk_nll_sum += nll;
-                chunk_nll_count += 1;
-            }
-
-            if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
-                let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
-                let elapsed = t0.elapsed().as_secs_f64();
-                let rate = total_scored_done as f64 / elapsed.max(1e-9);
-                eprint!(
-                    "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, n_chunk, total_scored_done, total_scored, pct, rate
+                let actual_next = chunk_tokens[pos + 1] as usize;
+                let (kld, nll) = score_position(
+                    &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
                 );
+                chunk_klds.push(kld);
+                if let Some(n) = nll {
+                    chunk_nll_sum += n;
+                    chunk_nll_count += 1;
+                }
+                total_scored_done += 1;
+                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                    let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    eprint!(
+                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                        c + 1, n_chunk, total_scored_done, total_scored, pct, rate
+                    );
+                }
+            }
+        } else {
+            // Prefill mode: batch the transformer stack via two
+            // forward_prefill_batch calls (prefix + scored region), then
+            // weight_gemv per scored position on the captured hidden states.
+            let h_buf = hidden_buf.as_ref().expect("hidden_buf in prefill mode");
+
+            // 1. Prefix: positions [0, scoring_start), no logit capture.
+            //    Writes KV positions [0, scoring_start).
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config,
+                &chunk_tokens[0..scoring_start],
+                0,
+                &mut kv_cache, &mut dn_state, &scratch,
+                None, None, None, None,
+            ).expect("forward_prefill_batch prefix");
+
+            // 2. Scored region: tokens [scoring_start, n_ctx-1) at positions
+            //    [scoring_start, n_ctx-2]. Captures post-output-norm hidden
+            //    state per row. The slice length is scored_per_chunk
+            //    (= n_ctx - 1 - n_ctx/2) so h_buf is exactly filled.
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config,
+                &chunk_tokens[scoring_start..(n_ctx - 1)],
+                scoring_start,
+                &mut kv_cache, &mut dn_state, &scratch,
+                None, Some(h_buf), None, None,
+            ).expect("forward_prefill_batch scored");
+
+            // 3. lm_head fan-out + KLD per scored position. weight_gemv
+            //    writes into scratch.logits each iteration; score_position
+            //    then reads + computes KLD. Same per-position math as the
+            //    per-token branch.
+            for j in 0..scored_per_chunk {
+                let row_view = h_buf.sub_offset(j * config.dim, config.dim);
+                weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
+                    .expect("weight_gemv lm_head");
+                let pos = scoring_start + j;
+                let actual_next = chunk_tokens[pos + 1] as usize;
+                let (kld, nll) = score_position(
+                    &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
+                );
+                chunk_klds.push(kld);
+                if let Some(n) = nll {
+                    chunk_nll_sum += n;
+                    chunk_nll_count += 1;
+                }
+                total_scored_done += 1;
+                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                    let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    eprint!(
+                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                        c + 1, n_chunk, total_scored_done, total_scored, pct, rate
+                    );
+                }
             }
         }
 
@@ -344,7 +459,7 @@ fn main() {
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
     out.write_all(&2u32.to_le_bytes()).unwrap();             // version = 2
-    out.write_all(&(n_chunk as u32).to_le_bytes()).unwrap(); // n_chunk
+    out.write_all(&(effective_n_chunk as u32).to_le_bytes()).unwrap(); // n_chunk (post --max-chunks)
     out.write_all(&0u32.to_le_bytes()).unwrap();             // reserved
     for ((m, p), n) in mean_kld_per_seq.iter()
         .zip(p99_kld_per_seq.iter())
