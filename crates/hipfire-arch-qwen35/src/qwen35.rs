@@ -2946,19 +2946,22 @@ pub fn forward_scratch(
     //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
     let allow_moe = std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1");
     // hipGraph per-forward-pass capture/replay default policy:
-    //   - gfx12 (RDNA4): default-ON. Empirically +2.4% decode on 9B
-    //     Qwen 3.5 MFP4G32 (5-run mean, all positive, tight variance,
-    //     measured 2026-05-11). Launch overhead amortization survives
-    //     ROCm 7.2 burst-mode pipelining — different from the per-gemv
-    //     graph cache experiment which lost (PR3 LOSS, 2026-05-07).
-    //   - other archs: default-OFF (opt-in via HIPFIRE_GRAPH=1) since
-    //     not yet A/B'd on those.
+    //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
+    //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
+    //   - gfx11 (RDNA3 / 3.5): default-ON. +0.6-0.7% decode on 9B and
+    //     0.8B HFP4G32 on 7900 XTX (5-run mean per model, all positive,
+    //     variance 1.001-1.010×, 2026-05-11). Smaller win than gfx12 —
+    //     gfx11 has less per-launch overhead to amortize — but real
+    //     and consistent across model sizes.
+    //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
+    //     HIPFIRE_GRAPH=1) since not yet A/B'd on those.
     //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
     //     graph path numerically drifts after ~30-50 tokens on MoE
     //     (see surrounding comment block for repro).
     // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
     let graph_env = std::env::var("HIPFIRE_GRAPH").ok();
-    let graph_arch_default = gpu.arch.starts_with("gfx12");
+    let graph_arch_default =
+        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
     let graph_enabled = match graph_env.as_deref() {
         Some("0") => false,
         Some("1") => true,
