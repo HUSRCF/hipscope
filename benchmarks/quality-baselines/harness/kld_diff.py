@@ -107,15 +107,35 @@ def main() -> None:
     gate_ci = ci_overlaps
     gates = [gate_abs, gate_rel, gate_rho, gate_p99, gate_ci]
     all_pass = all(gates)
-    # Ranking-preservation heuristic: per-seq sign of (A - B) is mostly one
-    # direction → systematic bias; mostly equal → noise. We don't have other
-    # variants here, but flag if more than 90% of per-seq deltas are
-    # one-signed (suggests systematic bias even if mean delta passes).
+    # Sign-test for systematic bias: under H0 of no bias, per-seq sign of
+    # (A - B) is Bernoulli(0.5). Reject H0 (call it "one-sided / systematic
+    # bias") when a binomial two-tailed p-value < 0.001 — i.e. the observed
+    # one-sided count is wildly inconsistent with chance. Prior rev used a
+    # naive 90%-threshold heuristic which missed the canonical V1 gfx1100
+    # MQ4 result (n=1175, ~80–88% one-signed, definitively systematic but
+    # below the 90% bar).
     if n > 0:
-        pos_frac = float((delta > 0).sum()) / n
-        neg_frac = float((delta < 0).sum()) / n
-        one_sided = max(pos_frac, neg_frac) > 0.90
+        pos = int((delta > 0).sum())
+        neg = int((delta < 0).sum())
+        pos_frac = pos / n
+        neg_frac = neg / n
+        ones = max(pos, neg)
+        # Binomial CDF: P(X >= ones | n, 0.5). Two-tailed via *2.
+        from math import comb
+        # tail_p = 2 * Σ_{k=ones..n} C(n,k) * 0.5^n
+        # For large n this underflows; switch to log-domain for n>200.
+        if n <= 200:
+            tail = sum(comb(n, k) for k in range(ones, n + 1)) * (0.5 ** n)
+            p_value = min(1.0, 2.0 * tail)
+        else:
+            # Normal approx: under H0, count ~ N(n/2, sqrt(n)/2). Standardise.
+            from math import erfc, sqrt
+            z = (ones - n / 2) / (sqrt(n) / 2)
+            p_value = float(erfc(z / sqrt(2.0)))
+        one_sided = p_value < 0.001
     else:
+        pos_frac = neg_frac = 0.0
+        p_value = 1.0
         one_sided = False
 
     # --- report ---
@@ -130,7 +150,7 @@ def main() -> None:
     if one_sided:
         print(
             f"  WARN: {max(pos_frac, neg_frac):.0%} of per-seq deltas are "
-            f"one-signed — systematic bias suspected even if mean passes"
+            f"one-signed (sign-test p={p_value:.2e}) — systematic bias"
         )
     print()
     print("# Gates")
@@ -153,7 +173,12 @@ def main() -> None:
         print("VERDICT: PASS — prefill ≡ per-token within tolerance for this variant.")
         sys.exit(0)
     elif one_sided:
-        print("VERDICT: HARD FAIL — systematic bias suspected; root-cause via V0 microtests before flipping default.")
+        print(
+            "VERDICT: HARD FAIL — systematic bias detected (sign-test "
+            f"p={p_value:.2e}). For prefill-vs-per-token comparisons this "
+            "is the expected kernel-path effect documented in PRD §5.3. "
+            "Investigate via V0 microtests if you see this on a same-mode A/B."
+        )
         sys.exit(2)
     else:
         print("VERDICT: SOFT FAIL — some gates failed but no systematic bias detected. See plan §M5 escalation tree.")

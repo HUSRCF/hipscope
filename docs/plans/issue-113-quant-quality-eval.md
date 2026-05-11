@@ -26,7 +26,9 @@ PPL collapses the full output distribution at each position to one scalar — th
 
 llama.cpp's `llama-perplexity --kl-divergence` mode emits both PPL and mean/median/p99 KLD in one pass. PPL stays as a secondary sanity column in the result table.
 
-**Top-K=256 truncation caveat (M1).** Qwen 3.5/3.6 has a 248,320-token vocab. Top-K=256 covers ~0.103% of vocab IDs but typically the bulk of the probability mass: empirical sampling of the 9B BF16 reference shows median `sum_p_residual` = 0.41% (under the 0.5% gate), mean 1.81%, p99 17.94%, max 72.0%. The residual cross-term (§4.4) corrects mean-KLD in expectation; ~1% of all scored tokens have residual mass >17% (flat distributions) where the top-K approximation is loosest. Flagged in the result write-up.
+**Top-K=256 truncation caveat (M1).** Qwen 3.5/3.6 has a 248,320-token vocab. Top-K=256 covers ~0.103% of vocab IDs but typically the bulk of the probability mass: empirical sampling of the 9B BF16 reference shows median `sum_p_residual` = 0.41% (under the 0.5% gate), mean 1.81%, p99 17.94%, max 72.0%. The residual cross-term (§4.4) corrects mean-KLD in expectation; ~1% of all scored tokens have residual mass >17% (flat distributions) where the top-K approximation is loosest.
+
+**All reported KLD values are *lower bounds* on the true full-vocab KLD.** The residual cross-term assumes both distributions miss similarly in the tail — true for high-bit quants whose tail closely tracks BF16, less true for low-bit quants whose tail is precisely what gets scrambled. The bias is therefore **variant-dependent**: a coarser quant has more tail-mass divergence that the cross-term under-counts. Cross-variant ordering (e.g. "MQ4 worse than Q4_K_M") remains valid in direction; the *magnitude* of the gap is a lower bound and the true gap may be wider. Captured in the §8 result-table caveats preamble.
 
 ---
 
@@ -275,6 +277,10 @@ And the CLI default since 2026-05-11:
 - `Mode` column: hipfire MQ rows with mode="per-token" are historical
   and measure ~7% higher mean-KLD than prefill (kernel-path numerical
   difference, see §5.3). Do NOT cross-compare rows of different mode.
+- **All KLD values are lower bounds.** The top-K=256 residual cross-term
+  assumes both distributions miss similarly in the tail — looser for
+  coarser quants whose tail is more scrambled. Cross-variant ordering
+  (direction) is reliable; absolute magnitudes are conservative. See §2.
 ```
 
 ---
@@ -339,9 +345,13 @@ When a variant has been scored in two modes (e.g., MQ4 per-token vs prefill on g
 
 For prefill-vs-per-token A/B on hipfire MQ formats, the gates intentionally fail — that's how we discovered the kernel-path divergence is real (§5.3). The diff tool is the diagnostic; the verdict is editorial.
 
-### V2 — Canary-fixture pre-commit gate
+### V2 — Canary-fixture pre-commit gate (currently informational, not enforced)
 
-`eval_hipfire` on the 11-seq canary fixture, then `kld_diff.py` against the committed expected-KLDs in `canary.md`. Runs in a few minutes. Catches harness regressions on the live decode path. Limitation: cannot detect shared-mode bugs that affect both modes identically; issue-113's existing coherence-gate is the backstop.
+`eval_hipfire` on the 11-seq canary fixture, then `kld_diff.py` against the committed expected-KLDs in `canary.md`. Designed to run in a few minutes and catch harness regressions on the live decode path.
+
+**Status:** `canary.md` ships with expected-KLD slots TBD-populated. Until a baseline is run and the slots filled in, V2 cannot fire — it's informational only, not enforced. Populating the canary is on the deferred list (§13).
+
+Limitation acknowledged even once populated: V2 catches divergence between modes / between releases, but cannot detect a shared-mode bug that affects both paths identically. issue-113's existing coherence-gate is the backstop for shared regressions in the live decode path.
 
 ### V3 — Cross-arch sanity (gfx1100 ≡ gfx1151)
 
@@ -385,12 +395,12 @@ Two scope changes from rev-3.3:
 - BF16 references: 9B (gfx1151, 53 min, 375 reduced tok/s) + 27B (gfx1151, 2h 3m, 162 reduced tok/s). Uploaded to `hipfire-models/qwen-kldref` (dataset); manifest wired; fetch script smoke-tested end-to-end.
 - Hipfire data: 4 historical per-token kldseqs (MQ3, MQ4, MQ3-Lloyd, MQ6 on gfx1100); 1 canonical prefill kldseq (MQ4 on gfx1100 full slice = 0.817).
 - GGUF anchors: all 7 9B anchors on gfx1151 (Q8_0/Q6_K/Q4_K_M + UD-Q3/Q4/Q5/Q6_K_XL). Q8_0 establishes the near-lossless floor (KLD 0.0163); UD-Q4_K_XL beats vanilla Q4_K_M by ~1.9× (0.067 vs 0.125).
-- Scoring-mode A/B: V1 gfx1100 MQ4 full slice + gfx1151 MQ3/MQ4 partial (50 chunks). Kernel-path divergence confirmed cross-arch.
+- Scoring-mode A/B: V1 gfx1100 MQ4 full slice (canonical) + gfx1151 MQ3/MQ4 partial 50-chunk smoke runs (not archived; sign-test p<1e-100 on the gfx1100 result confirms kernel-path divergence is not noise).
 
 **Deferred (post-Pivot, not blocking PR):**
 - 27B hipfire matrix (~150 GPU-h).
 - 9B-Q8 + 9B-MQ4-Lloyd hipfire rows on gfx1100.
-- gfx1151 hipfire full-slice pass.
+- gfx1151 hipfire full-slice pass (the 50-chunk smoke runs from V1 development were not archived; reproducible via `--max-chunks 50`).
 - DFlash τ column (Step 8) — editorial signal mooted by Pivot.
 - Pareto writeup (Step 9) — wait until HFP4/MFP4 .hfq files exist.
 - HFP4G32 / MFP4G32 .hfq files for 9B (depends on `hipfire-quantize --format hfp4`; eval-side is wired through auto-fallback).
