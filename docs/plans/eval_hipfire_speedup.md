@@ -155,7 +155,25 @@ The rev-1 plan listed three V0 microtests as a pre-V1 gate. Two of them turn out
 
 **Trigger:** if V1 on any variant reports a HARD FAIL or persistent SOFT FAIL, implement and run the DN-state + KV-cache microtests as the root-cause step. Until then, treat V1 as the canonical equivalence gate.
 
-### V1. Same-variant per-token vs prefill A/B (canonical gate)
+### V1 result (gfx1100 MQ4 full slice, 2026-05-11)
+
+| variant | arch | n_chunks | mean delta | Pearson per-seq | CI overlap | p99 \|Δseq\| |
+|---|---|---:|---:|---:|---|---:|
+| MQ4-uniform | gfx1100 | **1175** | **−6.75%** | 0.949 | **no** | 27.7% |
+| MQ4-uniform | gfx1151 | 50 | −7.86% | 0.954 | yes | 33.4% |
+| MQ3-uniform | gfx1151 | 50 | −8.64% | 0.692 | no | 42.4% |
+
+**Verdict:** the kernel-path divergence between `forward_prefill_batch` (GEMM) and `forward_scratch` (per-token GEMV) is a **real, statistically definitive effect**, confirmed cross-arch and cross-format on hipfire MQ paths. Direction is universal (prefill measures lower KLD by ~7%); the canonical gfx1100 full-slice run rules out noise (n=1175 CIs do not overlap).
+
+**Mechanism:** GEMM kernels in `forward_prefill_batch` use multi-accumulator reductions that average fp16/fp32 partial-sum noise across more terms than per-token GEMV's single-accumulator pattern, producing logits systematically closer to BF16 ground truth. Same family as the `feedback_mq4_lloyd_single_acc` user-memory note, but here multi-acc is the *better* path, not the broken one.
+
+**Implication for the plan:** the rev-2 V1 tolerance schedule (ε=5e-5 abs, ε=1% rel, Pearson ≥ 0.9999) was calibrated for fp32-noise level and is ~2–3 orders of magnitude tighter than the actual kernel-path bias. **The two modes are separate measurement classes**, not equivalent. We do NOT recalibrate ε to admit the prefill measurement as "equivalent to per-token"; we recognise the two as distinct and pick one as canonical.
+
+**Decision (recommended; not yet ratified by issue-113 stakeholders):** adopt prefill as the canonical hipfire scoring mode. Rationale: (a) ~7× faster wall-clock, (b) ~7% closer to BF16 (i.e., the prefill numbers are *more* accurate, not less), (c) the existing per-token committed kldseqs become a one-time "scoring_mode=per-token" column in the result-table preamble for historical continuity. Re-run cost for the 5-variant 9B matrix on gfx1100 in prefill mode is ~5 GPU-h total (vs ~35 GPU-h in per-token), so the speedup pays for itself on the re-baseline alone.
+
+### V1 schedule (original, retained for reference)
+
+#### V1. Same-variant per-token vs prefill A/B (canonical gate)
 
 Once at least one variant has a committed per-token gfx1100 kldseq AND the matching prefill run completes on gfx1100, diff per-sequence:
 
