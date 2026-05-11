@@ -164,6 +164,44 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
+/// gfx12 (RDNA4) WMMA fp8. Same gating as fp16 (both are gfx12-only
+/// builtins); separate helper to allow finer-grained future gating
+/// (e.g. if a future RDNA arch lands fp16 WMMA without fp8). The
+/// fp8 prefill kernels are opt-in via HIPFIRE_FP8_WMMA=1 until they
+/// are perf-validated and made default on gfx12.
+fn has_wmma_fp8_gfx12(arch: &str) -> bool {
+    arch.starts_with("gfx12")
+}
+
+/// Opt-in gate for the fp8 prefill WMMA and decode dot4 kernels.
+/// Cached in a OnceLock — reading HIPFIRE_FP8_WMMA via `std::env::var`
+/// on every dispatch costs a syscall + String alloc which was visible
+/// as ~4 µs/call overhead in tight bench loops, swamping the FP8 win.
+fn is_fp8_wmma_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1")
+    })
+}
+
+/// Minimum batch size at which the FP8 WMMA prefill path is enabled.
+/// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
+/// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
+/// see project_fp8_wmma_hfp4g32_2026_05_10.md). Decode (batch_size=1)
+/// must never hit FP8 WMMA. Threshold tuned conservatively; A/B against
+/// FP16 WMMA on the production prefill bench can lower it later.
+const FP8_WMMA_MIN_BATCH: usize = 1024;
+
+/// Minimum output dimension M at which the FP8-dot4 decode GEMV path
+/// is enabled. Below this, the fallback wins or ties on gfx1201
+/// (measured 0.92-1.03× on wo M=2048 K=2048 vs 1.17-1.21× on FFN
+/// shapes M ≥ 4096 — see mq_rotate_x_dual_fp8 bench, 2026-05-11).
+/// This is the empirical embodiment of "Option α" mixed-precision
+/// routing — choose the kernel that wins for the actual shape rather
+/// than uniformly applying FP8 everywhere.
+const FP8_GEMV_MIN_M: usize = 4096;
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -372,6 +410,18 @@ pub struct Gpu {
     /// Pointer to the last FP32 source that was converted to fp16_x_scratch.
     /// If the next GEMM uses the same X, skip the conversion.
     pub fp16_x_source_ptr: *mut c_void,
+    /// FP8 (E4M3) scratch buffer for the gfx12 FP8-WMMA prefill path.
+    /// Sized to max(batch_size × K) × 1 byte. Cached by src_ptr like
+    /// `fp16_x_scratch`.
+    fp8_x_scratch: Option<hip_bridge::DeviceBuffer>,
+    fp8_x_scratch_bytes: usize,
+    fp8_x_source_ptr: *mut c_void,
+    /// FP8 (E4M3) sibling of `mq_x_rot`. Filled by
+    /// `mq_rotate_x_dual_fp8` so the FP8 decode GEMV can read FP8
+    /// activations without a separate pack launch. Lifetime is tied
+    /// to mq_x_rot; reallocated together.
+    pub mq_x_rot_fp8: Option<hip_bridge::DeviceBuffer>,
+    pub mq_x_rot_fp8_bytes: usize,
     /// Q8_1/MMQ scratch for prefill activations. Layout matches llama.cpp's
     /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
@@ -647,6 +697,11 @@ impl Gpu {
             fp16_x_scratch: None,
             fp16_x_scratch_bytes: 0,
             fp16_x_source_ptr: std::ptr::null_mut(),
+            fp8_x_scratch: None,
+            fp8_x_scratch_bytes: 0,
+            fp8_x_source_ptr: std::ptr::null_mut(),
+            mq_x_rot_fp8: None,
+            mq_x_rot_fp8_bytes: 0,
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
@@ -1227,6 +1282,51 @@ impl Gpu {
         }
 
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
+    /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
+    /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
+    /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
+    fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        self.ensure_kernel("pack_f32_to_fp8_gfx12", kernels::PACK_F32_TO_FP8_GFX12_SRC, "pack_f32_to_fp8_gfx12")?;
+
+        let src_ptr = x.buf.as_ptr();
+        let needed = n_elems; // 1 byte per element
+
+        if self.fp8_x_scratch_bytes < needed {
+            self.fp8_x_scratch = Some(self.hip.malloc(needed)?);
+            self.fp8_x_scratch_bytes = needed;
+            self.fp8_x_source_ptr = std::ptr::null_mut();
+        }
+
+        let must_convert = self.capture_mode || self.fp8_x_source_ptr != src_ptr;
+        if must_convert {
+            let in_ptr = src_ptr;
+            let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
+            let n_val = n_elems as i32;
+            let mut in_ptr_m = in_ptr;
+            let mut out_ptr_m = out_ptr;
+            let mut n_val_m = n_val;
+            let mut conv_params: Vec<*mut c_void> = vec![
+                &mut in_ptr_m as *mut _ as *mut c_void,
+                &mut out_ptr_m as *mut _ as *mut c_void,
+                &mut n_val_m as *mut _ as *mut c_void,
+            ];
+            // 16 elements per thread, 256 threads per block = 4096 elements/block.
+            let grid = ((n_elems + 4095) / 4096) as u32;
+            self.launch_maybe_blob(
+                "pack_f32_to_fp8_gfx12", [grid, 1, 1], [256, 1, 1], 0, &mut conv_params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
+                    b
+                },
+            )?;
+            self.fp8_x_source_ptr = src_ptr;
+        }
+
+        Ok(self.fp8_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure prefill activations are quantized into a llama.cpp-style
@@ -2714,6 +2814,12 @@ impl Gpu {
     ) -> HipResult<()> {
         assert!(k % 256 == 0, "gemv_hfp4g32 requires K%256==0 in v1, got K={}", k);
         self.bind_thread()?;
+        // Shape-gated: FP8 dot4 only when M is large enough that it
+        // actually wins (FFN shapes). At M < 4096 the fallback wins or
+        // ties; uniform-FP8 was net-negative in 9B Qwen 3.5 decode.
+        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && m >= FP8_GEMV_MIN_M {
+            return self.gemv_hfp4g32_fp8_gfx12(a_raw, x, y, m, k);
+        }
         let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfp4g32")?;
         let func = &self.functions["gemv_hfp4g32"];
@@ -2731,6 +2837,33 @@ impl Gpu {
         ];
         // LDS: 16-entry FP16 LUT = 32 bytes.
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 32, self.stream_ref(), &mut params) }
+    }
+
+    /// gfx12 FP8-dot4 decode-path GEMV for HFP4G32. Uses
+    /// `dot4_f32_fp8_fp8` to cut inner-loop ALU vs the dequant/FMA
+    /// fallback. Activation X is consumed as FP8 (E4M3); when called
+    /// via `gemv_hfp4g32` (env-gated routing for HFP4G32 weights, no
+    /// rotation), this function calls `ensure_fp8_x` to pack F32 → FP8
+    /// scratch. The MFP4G32 rotation path uses
+    /// `rotate_x_mq_dual_fp8` + `gemv_hfp4g32_fp8_gfx12_with_fp8_ptr`
+    /// instead so the FP8 pack is fused into the rotation kernel.
+    pub fn gemv_hfp4g32_fp8_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gemv_hfp4g32_fp8 requires K%256==0, got K={}", k);
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_fp8_gfx12",
+            kernels::GEMV_HFP4G32_FP8_GFX12_SRC,
+            "gemv_hfp4g32_fp8_gfx12",
+        )?;
+        let x_fp8_ptr = self.ensure_fp8_x(x, k)?;
+        self.gemv_hfp4g32_fp8_gfx12_with_fp8_ptr(a_raw, x_fp8_ptr, y, m, k)
     }
 
     /// Fused RMSNorm + MagnumQuant FWHT rotation. Replaces the
@@ -2802,6 +2935,7 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        self.invalidate_x_caches_for(xrp);
         result
     }
 
@@ -2864,6 +2998,7 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
         result
     }
 
@@ -2916,6 +3051,7 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
         result
     }
 
@@ -2970,7 +3106,27 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
         result
+    }
+
+    /// Invalidate any `ensure_*_x` caches whose source pointer matches
+    /// `dst_ptr`. Must be called by any kernel that overwrites data at
+    /// `dst_ptr` since the caches key on raw pointer equality and have
+    /// no way to detect data changes otherwise. The `mq_x_rot` scratch
+    /// buffer used by the MagnumQuant rotation wrappers is the canonical
+    /// case — its pointer is stable across all gemv calls but its data
+    /// changes per rotation; without this invalidation, the FP8/FP16
+    /// activation scratch returns stale data on every call after the
+    /// first within a forward pass (silent correctness bug — coherence
+    /// detectors miss it because output stays vaguely on-topic).
+    fn invalidate_x_caches_for(&mut self, dst_ptr: *mut c_void) {
+        if self.fp16_x_source_ptr == dst_ptr {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+        if self.fp8_x_source_ptr == dst_ptr {
+            self.fp8_x_source_ptr = std::ptr::null_mut();
+        }
     }
 
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
@@ -3008,6 +3164,7 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
         result
     }
 
@@ -3055,6 +3212,7 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
         result
     }
 
@@ -3090,6 +3248,14 @@ impl Gpu {
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Shape-gated FP8 routing (Option α empirical embodiment): only
+        // when M ≥ FP8_GEMV_MIN_M does FP8 dot4 win measurably on this
+        // path. Below threshold (e.g. wo M=2048), the FP8 fused-rotation
+        // costs more than the dot4 ALU savings — keep the F32 fallback.
+        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && m >= FP8_GEMV_MIN_M {
+            let x_fp8_ptr = self.rotate_x_mq_dual_fp8(x, x_rot, k)?;
+            return self.gemv_hfp4g32_fp8_gfx12_with_fp8_ptr(a_raw, x_fp8_ptr, y, m, k);
+        }
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
     }
@@ -3101,6 +3267,94 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
+    }
+
+    /// Fused FWHT rotation + FP8 pack for the decode FP8 path.
+    /// Writes both F32 (into `x_rot`) and FP8 (into `mq_x_rot_fp8`
+    /// sibling scratch) in one kernel launch. Returns the FP8 buffer's
+    /// device pointer for the caller to feed directly to the FP8 GEMV.
+    /// gfx12-only — uses cvt_pk_fp8_f32.
+    fn rotate_x_mq_dual_fp8(
+        &mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize,
+    ) -> HipResult<*mut c_void> {
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "mq_rotate_x_dual_fp8_gfx12",
+            kernels::MQ_ROTATE_X_DUAL_FP8_GFX12_SRC,
+            "mq_rotate_x_dual_fp8_gfx12",
+        )?;
+        // Lazily allocate the FP8 sibling scratch sized to match k bytes.
+        if self.mq_x_rot_fp8_bytes < k {
+            self.mq_x_rot_fp8 = Some(self.hip.malloc(k)?);
+            self.mq_x_rot_fp8_bytes = k;
+        }
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let xfp = self.mq_x_rot_fp8.as_ref().unwrap().as_ptr();
+        let n_groups = (k / 256) as u32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &xfp as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::mq_rotate_bytes(k) + k; // +1 byte/elem fp8 write
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x_dual_fp8_gfx12",
+            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(xfp);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        // Same x_rot dst as the standalone rotation path → invalidate
+        // any ensure_*_x caches that were keyed by this pointer.
+        self.invalidate_x_caches_for(xrp);
+        result?;
+        Ok(xfp)
+    }
+
+    /// FP8-dot4 GEMV variant that takes an FP8 device pointer directly
+    /// (bypassing `ensure_fp8_x`). Used by `gemv_mfp4g32_with_rotate`
+    /// after the fused rotation+pack kernel produces the FP8 buffer
+    /// in-place.
+    fn gemv_hfp4g32_fp8_gfx12_with_fp8_ptr(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_fp8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gemv_hfp4g32_fp8 requires K%256==0, got K={}", k);
+        self.ensure_kernel(
+            "gemv_hfp4g32_fp8_gfx12",
+            kernels::GEMV_HFP4G32_FP8_GFX12_SRC,
+            "gemv_hfp4g32_fp8_gfx12",
+        )?;
+        let func = &self.functions["gemv_hfp4g32_fp8_gfx12"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_fp8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 32, self.stream_ref(), &mut params) }
     }
 
     /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
@@ -6003,6 +6257,17 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // FP8 WMMA gate: only at batch sizes where the prefill bench
+        // measured ≥1× vs FP16 WMMA. At small batches (decode FA QKV
+        // calls this with batch_size=1) the FP8 path measures
+        // 0.71-0.84×, so we keep the FP16 path there. Threshold is
+        // conservative — see project_fp8_wmma_hfp4g32_2026_05_10.md
+        // for the full N sweep. The decode-path FP8 win is on the
+        // GEMV side (gemv_hfp4g32_fp8_gfx12), not WMMA.
+        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && batch_size >= FP8_WMMA_MIN_BATCH {
+            return self.gemm_qkv_hfp4g32_wmma_fp8_gfx12(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+        }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkv_hfp4g32_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
@@ -6147,6 +6412,88 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfp4g32_wmma_gfx12", bytes);
         let result = self.launch_maybe_blob(
             "gemm_qkv_hfp4g32_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 FP8-WMMA variant of `gemm_qkv_hfp4g32_wmma_gfx12`. Same
+    /// 16x16x16 tile shape, same C-mapping; weight LUT pre-converts
+    /// E2M1->E4M3 bytes (no scale) and per-output-row row_scale * UE8M0
+    /// is applied to the F32 accumulator after each WMMA pair via
+    /// lane-shuffle. Activation is converted FP16->FP8 inline by
+    /// cvt_pk_fp8_f32 (unscaled — post-RMSNorm magnitudes are bounded
+    /// well below E4M3 saturation). Opt-in via HIPFIRE_FP8_WMMA=1.
+    pub fn gemm_qkv_hfp4g32_wmma_fp8_gfx12(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qkv_hfp4g32_wmma_fp8_gfx12",
+            kernels::GEMM_QKV_HFP4G32_WMMA_FP8_GFX12_SRC,
+            "gemm_qkv_hfp4g32_wmma_fp8_gfx12",
+        )?;
+        let x_fp8_ptr = self.ensure_fp8_x(x, batch_size * k)?;
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_fp8_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(q_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(k_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(v_m, k)
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfp4g32_wmma_fp8_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_hfp4g32_wmma_fp8_gfx12",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

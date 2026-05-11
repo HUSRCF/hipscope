@@ -275,6 +275,11 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/sr
 /// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
 pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
+// gfx12 (RDNA4) FP8-dot4 decode-path variant. dot4_f32_fp8_fp8 cuts inner-loop
+// ALU ~2-2.4× vs the fallback dequant/FMA chain; biggest win on ALU-bound
+// small-M attention shapes (k_proj/v_proj at ~16-20% peak BW on R9700).
+// Activation X consumed as FP8 (E4M3), pre-packed by `ensure_fp8_x`.
+pub const GEMV_HFP4G32_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32_fp8.gfx12.hip");
 
 
 
@@ -504,6 +509,24 @@ pub const GEMM_QKV_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/g
 // + K4 unroll (each iter consumes 2 HFP4 blocks). Same C-output mapping
 // as gemm_qkv_hfq4g256_wmma.gfx12 (validated on R9700).
 pub const GEMM_QKV_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfp4g32_wmma.gfx12.hip");
+// gfx12 FP8-WMMA variant of GEMM_QKV_HFP4G32_WMMA_GFX12_SRC. Uses
+// wmma_f32_16x16x16_fp8_fp8 (~1.87x raw issue throughput vs fp16 WMMA
+// on gfx1201, microbenched). Weight LUT pre-converts E2M1->E4M3 bytes
+// (no scale baked); per-output-row row_scale * UE8M0_block is applied
+// to the F32 accumulator after each WMMA-pair via lane-shuffle.
+// Activation X is consumed in pre-packed FP8 (E4M3) layout, produced
+// by PACK_F32_TO_FP8_GFX12_SRC + ensure_fp8_x.
+pub const GEMM_QKV_HFP4G32_WMMA_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfp4g32_wmma_fp8.gfx12.hip");
+// Activation pre-pass for FP8 WMMA kernels: F32 -> E4M3 elementwise,
+// no scaling. Memory-BW-bound; lifts the FP8 GEMM kernels above FP16
+// parity by moving the cvt out of the WMMA inner loop.
+pub const PACK_F32_TO_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/pack_f32_to_fp8.gfx12.hip");
+// Fused MagnumQuant FWHT rotation + FP8 (E4M3) pack — gfx12 only.
+// Writes both F32 (for legacy consumers) and FP8 outputs in one launch.
+// Replaces the standalone mq_rotate_x + pack_f32_to_fp8 sequence on the
+// FP8 decode path so the pack launch is no longer on the critical path
+// of every weight_gemv(MFP4G32) call.
+pub const MQ_ROTATE_X_DUAL_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/mq_rotate_x_dual.gfx12.hip");
 
 // HFP4-G32 residual GEMM (used for wo + w_down). Mirrors the K2 HFQ4
 // variant — canonical wave32 WMMA C-output mapping `acc[j] = C[2*j +

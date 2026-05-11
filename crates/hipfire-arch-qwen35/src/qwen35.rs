@@ -2945,8 +2945,26 @@ pub fn forward_scratch(
     //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
     //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
     let allow_moe = std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1");
-    let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1")
-        && (config.num_experts == 0 || allow_moe);
+    // hipGraph per-forward-pass capture/replay default policy:
+    //   - gfx12 (RDNA4): default-ON. Empirically +2.4% decode on 9B
+    //     Qwen 3.5 MFP4G32 (5-run mean, all positive, tight variance,
+    //     measured 2026-05-11). Launch overhead amortization survives
+    //     ROCm 7.2 burst-mode pipelining — different from the per-gemv
+    //     graph cache experiment which lost (PR3 LOSS, 2026-05-07).
+    //   - other archs: default-OFF (opt-in via HIPFIRE_GRAPH=1) since
+    //     not yet A/B'd on those.
+    //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
+    //     graph path numerically drifts after ~30-50 tokens on MoE
+    //     (see surrounding comment block for repro).
+    // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
+    let graph_env = std::env::var("HIPFIRE_GRAPH").ok();
+    let graph_arch_default = gpu.arch.starts_with("gfx12");
+    let graph_enabled = match graph_env.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => graph_arch_default,
+    };
+    let use_graph = graph_enabled && (config.num_experts == 0 || allow_moe);
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
