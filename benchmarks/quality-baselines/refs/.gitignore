@@ -1,0 +1,5 @@
+# BF16 reference dumps live external (HF Hub, ~2.2 GB each).
+# Use ../scripts/fetch-eval-refs.sh (lands in Step 4) to pull them
+# locally. They're not in git — manifest.json is the index.
+*.kldref.bin
+*.bin

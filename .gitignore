@@ -90,3 +90,7 @@ research/
 .codeinsight+research/
 
 bench/coherence-results/
+
+# kld_reduce.py outputs when run from repo root
+result-data.json
+result-table.md

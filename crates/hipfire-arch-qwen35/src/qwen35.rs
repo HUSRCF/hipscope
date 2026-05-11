@@ -584,6 +584,37 @@ impl DeltaNetState {
         for t in self.conv_states { let _ = gpu.free_tensor(t); }
     }
 
+    /// Reset all DeltaNet recurrent buffers to zero in place. Lets callers
+    /// reuse a single `DeltaNetState` across independent chunks/sequences
+    /// without allocating per chunk (which leaks since DeltaNetState has no
+    /// Drop). Mirrors `ModelSlot::reset_state` in speculative.rs.
+    pub fn reset(&mut self, gpu: &mut Gpu) {
+        match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                for s in &self.s_matrices {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+                for s in &self.s_scales {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+                for s in &self.conv_states {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+            }
+            None => {
+                for s in &self.s_matrices {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.s_scales {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+            }
+        }
+    }
+
     /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is
     /// allocated on the device that owns the layer in the multi-GPU band
     /// split: `gpus.devices[gpus.device_for_layer(orig_layer_idx)]` for the

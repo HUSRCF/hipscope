@@ -570,6 +570,7 @@ impl Tokenizer {
             push_pair(&mut heap, &syms, &gen, i, i + 1);
         }
 
+
         // 6. Main merge loop. Each pop is O(log N); validation is O(1);
         // splice is O(1); two pushes are O(log N). Total O(N log N).
         while let Some(Reverse((rank, l, gen_at_push))) = heap.pop() {
