@@ -2,10 +2,73 @@
 
 Tracking issues #113 (uniform MQ-family quality) and #116 (Lloyd
 quality). Plan: `docs/plans/issue-113-quant-quality-eval.md`
-(rev-3.3).
+(rev-3.4). Companion plan for the prefill-mode scoring path:
+`docs/plans/eval_hipfire_speedup.md` (rev-2).
 
 This directory holds the eval harness: slice + scripts +
 canary fixture + reference manifest + result tables.
+
+## Quick-start (download BF16 references, then run an eval)
+
+The two BF16 reference dumps (Qwen3.5-9B and Qwen3.6-27B, ~2.5 GB
+each) live at HF Hub **dataset** repo
+[`hipfire-models/qwen-kldref`](https://huggingface.co/datasets/hipfire-models/qwen-kldref).
+The `manifest.json` in `harness/` is the SHA-pinned index. To pull
+them locally and verify SHA256 in one step:
+
+```bash
+# 1. From the repo root, set up the project venv (one-time).
+python3 -m venv .venv
+.venv/bin/pip install huggingface_hub
+
+# 2. Pull both refs into benchmarks/quality-baselines/refs/.
+./scripts/fetch-eval-refs.sh
+```
+
+What the script does (read `scripts/fetch-eval-refs.sh` for the
+authoritative recipe):
+
+1. Parses `benchmarks/quality-baselines/harness/manifest.json`.
+2. For each entry under `.references`, checks
+   `benchmarks/quality-baselines/refs/<name>` — if present, verifies
+   sha256 against the manifest's expected value; if missing, pulls
+   it via `huggingface_hub.hf_hub_download(repo_id=hf_repo,
+   repo_type=hf_repo_type, filename=name)` and then verifies sha256.
+3. Returns non-zero on any SHA256 mismatch or download failure.
+
+The refs are gitignored. After `fetch-eval-refs.sh` succeeds the
+runtime examples (`eval_hipfire`, `eval_gguf`) find them at the
+paths `eval_hipfire --ref benchmarks/quality-baselines/refs/<name>`.
+The examples' internal `verify_ref_sha256` re-checks the SHA on
+each invocation, so a corrupted local ref is caught at run start.
+
+### Alternative download paths
+
+If you only want one ref (e.g. just the 9B), inline Python:
+
+```bash
+.venv/bin/python3 - <<'EOF'
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id="hipfire-models/qwen-kldref",
+    repo_type="dataset",
+    filename="qwen3.5-9b-bf16.kldref.bin",
+    local_dir="benchmarks/quality-baselines/refs/",
+)
+EOF
+```
+
+Or via the `hf` CLI (requires `pip install huggingface_hub[cli]`):
+
+```bash
+hf download --repo-type dataset hipfire-models/qwen-kldref \
+  qwen3.5-9b-bf16.kldref.bin qwen3.6-27b-bf16.kldref.bin \
+  --local-dir benchmarks/quality-baselines/refs/
+```
+
+Either way: after the download, verify against the manifest with
+`./scripts/fetch-eval-refs.sh` (re-running it idempotently is the
+intended pattern — files already present + valid SHA are skipped).
 
 ## Layout
 
@@ -74,6 +137,7 @@ invocations; nothing in this directory needs to know their paths.
 ## References
 
 - llama.cpp pinned commit: `9dcf83552887bb898b4a98a5761361e504e31fc3`.
-- HF refs repo: `hipfire-models/hipfire-eval-refs` (created
-  2026-05-08; uploads pending Step 4–6 completion).
-- Plan: `docs/plans/issue-113-quant-quality-eval.md`.
+- HF refs repo: [`hipfire-models/qwen-kldref`](https://huggingface.co/hipfire-models/qwen-kldref)
+  (both 9B and 27B BF16 references uploaded 2026-05-11).
+- Plan: `docs/plans/issue-113-quant-quality-eval.md` (rev-3.4).
+- Sibling plan: `docs/plans/eval_hipfire_speedup.md` (prefill scoring).

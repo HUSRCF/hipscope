@@ -68,13 +68,14 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def hf_download(repo_id: str, filename: str, dest_dir: Path) -> Path:
+def hf_download(repo_id: str, filename: str, dest_dir: Path, repo_type: str) -> Path:
     from huggingface_hub import hf_hub_download
 
     out = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
         local_dir=str(dest_dir),
+        repo_type=repo_type,
     )
     return Path(out)
 
@@ -83,6 +84,7 @@ failed: list[str] = []
 for name, entry in refs.items():
     expected = entry.get("sha256")
     hf_repo = entry.get("hf_repo")
+    hf_repo_type = entry.get("hf_repo_type", "model")
     dest = dest_dir / name
 
     if not expected:
@@ -114,9 +116,9 @@ for name, entry in refs.items():
         )
         continue
 
-    print(f"[{name}] fetching {hf_repo}/{name} ...", file=sys.stderr)
+    print(f"[{name}] fetching {hf_repo_type} {hf_repo}/{name} ...", file=sys.stderr)
     try:
-        out = hf_download(hf_repo, name, dest_dir)
+        out = hf_download(hf_repo, name, dest_dir, hf_repo_type)
     except Exception as e:
         print(f"[{name}] download failed: {e}", file=sys.stderr)
         failed.append(name)
