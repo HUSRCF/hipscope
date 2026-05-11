@@ -34,15 +34,16 @@ The runtime documents the constraint on the function the plan calls:
 
 For Qwen3.5-9B, `qwen35.full_attention_interval = 4` → 24 of 32 layers are DeltaNet (linear-attention with a recurrent state); only 8 are full-attention. The rev-1 plan extrapolated from this comment that the asymptotic speedup would be bounded to ~2× by DN's per-token cost.
 
-**Step 0 (run 2026-05-11 on gfx1151, hipcc 7.12) disproved that extrapolation.** Despite DN's per-token inner loop, the batched preamble + FA + FFN + lm_head amortizes the dispatch overhead heavily enough that prefill mode reaches **7–19× wall-clock speedup vs per-token forward_scratch** across all measured eligible variants:
+**Step 0 (run 2026-05-11 on gfx1151 + gfx1100) disproved that extrapolation.** Despite DN's per-token inner loop, the batched preamble + FA + FFN + lm_head amortizes the dispatch overhead heavily enough that prefill mode reaches **7–20× wall-clock speedup vs per-token forward_scratch** across all measured eligible variants. The speedup ratio is arch-independent (gfx1100 and gfx1151 land in the same regime), confirming the speedup is structural (GEMM-vs-GEMV at 2048-token batch) rather than a specific kernel-tuning artifact:
 
-| variant | per-token (tok/s) | prefill (tok/s) | speedup |
-|---|---:|---:|---:|
-| 9B-MQ4-uniform | 44.4 | 842.0 | **19.0×** |
-| 9B-MQ3-Lloyd | 46.1 | 391.7 | **8.5×** |
-| 9B-MQ3-uniform | 52.2 | 396.7 | **7.6×** |
+| arch | variant | per-token (tok/s) | prefill (tok/s) | speedup |
+|---|---|---:|---:|---:|
+| gfx1100 | 9B-MQ4-uniform | 107.9 | 2162.1 | **20.0×** |
+| gfx1151 | 9B-MQ4-uniform | 44.4 | 842.0 | **19.0×** |
+| gfx1151 | 9B-MQ3-Lloyd | 46.1 | 391.7 | **8.5×** |
+| gfx1151 | 9B-MQ3-uniform | 52.2 | 396.7 | **7.6×** |
 
-Source: `prefill_microbench` example, n_ctx=2048, kv_mode=asym3, gfx1151, mean of 3 iterations after 1 warmup. forward_prefill_batch (no lm_head fan-out, no per_token_hidden_out capture — just transformer-stack work) vs forward_scratch×2048.
+Source: `prefill_microbench` example, n_ctx=2048, kv_mode=asym3, mean of 3 iterations after 1 warmup. forward_prefill_batch (no lm_head fan-out, no per_token_hidden_out capture — just transformer-stack work) vs forward_scratch×2048. Absolute throughput scales ~2.5× from gfx1151 LPDDR5x (~256 GB/s) to gfx1100 GDDR6 (~960 GB/s) in both modes — both paths are bandwidth-bound at this model size.
 
 Why C1 was overstated: DN's per-token inner loop is sequential, but the **non-DN** kernels (FA, FFN gate_up/down, the rmsnorm/rotate preamble) consume the majority of per-token wall-clock under the GEMV regime — and prefill mode batches all of them. The DN inner loop becomes the floor on prefill cost, not a 1:1 cost-replication of the per-token path.
 
