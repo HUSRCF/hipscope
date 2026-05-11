@@ -379,6 +379,11 @@ fn main() {
     eprintln!();
 
     // ---------- Write HFKSEQ output (v2: adds mean_nll per chunk) ----------
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).expect("create output parent dir");
+        }
+    }
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(SEQKLD_MAGIC).unwrap();

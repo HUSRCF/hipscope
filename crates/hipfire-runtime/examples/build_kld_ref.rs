@@ -162,6 +162,11 @@ fn main() {
     eprintln!("build_kld_ref: read {} tokens ({} bytes)", n_tokens, tokens.len());
 
     // 6. Open output, write hipfire β header + tokens.
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).expect("create output parent dir");
+        }
+    }
     let output_file = File::create(&args.output).expect("failed to create output");
     let mut output = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
     output.write_all(HIPFIRE_MAGIC).unwrap();
