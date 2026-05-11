@@ -16,12 +16,16 @@
 //!                [--scoring-mode <per-token|prefill>=per-token]
 //!
 //! Scoring modes (per docs/plans/eval_hipfire_speedup.md):
-//!   per-token: forward_scratch in a per-position loop. Canonical baseline.
-//!   prefill:   forward_prefill_batch (transformer stack batched, lm_head
-//!              fan-out per scored position). ~7-19× faster on gfx1151 9B
-//!              Q3/Q4 variants per Step 0 microbench. Requires the model's
-//!              LA dtype to be in `is_batchable_la`'s OK set; auto-falls-
-//!              back to per-token inside `forward_prefill_batch` otherwise.
+//!   prefill:   (default, canonical since 2026-05-11) forward_prefill_batch
+//!              (transformer stack batched, lm_head fan-out per scored
+//!              position). ~7× wall-clock vs per-token on gfx1100/gfx1151
+//!              9B Q3/Q4. Requires the model's LA dtype to be in
+//!              `is_batchable_la`'s OK set; auto-falls-back to per-token
+//!              inside `forward_prefill_batch` otherwise (e.g., MQ4-Lloyd,
+//!              HFP4G32, MFP4G32 — no batched kernel yet).
+//!   per-token: forward_scratch in a per-position loop. Historical baseline,
+//!              retained for direct comparison against the 2026-05-08 kldseqs
+//!              under `results/2026-05-08/per-seq/*__per-token.kldseq`.
 //!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
@@ -58,7 +62,7 @@ fn main() {
     let mut ref_path: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut kv_mode = "asym3".to_string();
-    let mut scoring_mode = "per-token".to_string();
+    let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
     let mut i = 1;
     while i < argv.len() {
@@ -89,7 +93,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--scoring-mode per-token] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--scoring-mode prefill] [--max-chunks N]");
                 std::process::exit(0);
             }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
