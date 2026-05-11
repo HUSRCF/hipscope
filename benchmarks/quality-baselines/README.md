@@ -1,9 +1,8 @@
 # Quant quality eval — KLD-primary harness
 
 Tracking issues #113 (uniform MQ-family quality) and #116 (Lloyd
-quality). Plan: `docs/plans/issue-113-quant-quality-eval.md`
-(rev-3.4). Companion plan for the prefill-mode scoring path:
-`docs/plans/eval_hipfire_speedup.md` (rev-2).
+quality). Canonical reference: `docs/plans/issue-113-quant-quality-eval.md`
+(PRD). The prefill-mode scoring methodology is §5 of that PRD.
 
 This directory holds the eval harness: slice + scripts +
 canary fixture + reference manifest + result tables.
@@ -117,8 +116,7 @@ invocations; nothing in this directory needs to know their paths.
 
 ## Status (2026-05-11)
 
-- Plan: `docs/plans/issue-113-quant-quality-eval.md` (rev-3.4).
-- Sibling plan: `docs/plans/eval_hipfire_speedup.md` (rev-2).
+- PRD: `docs/plans/issue-113-quant-quality-eval.md` (scoring-mode in §5).
 - Steps 0–4 (harness skeleton, format readers, BF16 ref dumps): **done**.
 - Step 5 (hipfire candidate scoring): **per-token done** for 9B MQ3/MQ4/
   MQ3-Lloyd/MQ6 on gfx1100. **Prefill canonical** since 2026-05-11
@@ -137,5 +135,4 @@ invocations; nothing in this directory needs to know their paths.
 - llama.cpp pinned commit: `9dcf83552887bb898b4a98a5761361e504e31fc3`.
 - HF refs repo: [`hipfire-models/qwen-kldref`](https://huggingface.co/hipfire-models/qwen-kldref)
   (both 9B and 27B BF16 references uploaded 2026-05-11).
-- Plan: `docs/plans/issue-113-quant-quality-eval.md` (rev-3.4).
-- Sibling plan: `docs/plans/eval_hipfire_speedup.md` (prefill scoring).
+- PRD: `docs/plans/issue-113-quant-quality-eval.md`.

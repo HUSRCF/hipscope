@@ -75,11 +75,9 @@ already have the ref locally.
 
 ## Plan reference
 
-`docs/plans/issue-113-quant-quality-eval.md` (currently rev-3.3,
-2026-05-08) is the source of truth for design decisions. Steps 0–4
-done; Step 7.A (`eval_gguf.rs`) done; Step 5 (first canary candidate)
-running on gfx1100 as of 2026-05-08; Step 6 (27B BF16 ref dump)
-running on gfx1151 in parallel.
+`docs/plans/issue-113-quant-quality-eval.md` is the canonical PRD —
+source of truth for binary format, eval matrix, scoring modes,
+validation methodology, and pivot decisions.
 
 ## Pinned llama.cpp commit
 

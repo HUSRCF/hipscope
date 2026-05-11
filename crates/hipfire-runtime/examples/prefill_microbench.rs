@@ -1,4 +1,8 @@
-//! prefill_microbench — Step 0 gate for eval_hipfire_speedup plan.
+//! prefill_microbench — scoring-mode speedup measurement.
+//!
+//! Originally the Step 0 gate for the eval_hipfire_speedup sub-plan
+//! (now folded into docs/plans/issue-113-quant-quality-eval.md §5);
+//! retained as a standalone tool for re-measurement when kernels change.
 //!
 //! Times one 2048-token chunk through two paths on a hipfire model:
 //!   A) per-token forward_scratch × n_ctx  (matches eval_hipfire's current
@@ -12,11 +16,12 @@
 //! are reset by re-using position 0 for forward_scratch and resetting
 //! dn_state explicitly.
 //!
-//! Decision rule (docs/plans/eval_hipfire_speedup.md §"Step plan"):
-//!   ≥ 4× speedup → continue with rev-2 plan as designed
-//!   2-4×         → continue but rescope target wall-clock
-//!   < 2×         → halt; DN sequentiality dominates — pursue a batched DN
-//!                  kernel instead, not an eval_hipfire refactor
+//! Decision rule (now folded into issue-113-quant-quality-eval.md §5;
+//! retained here as the original gate framing):
+//!   ≥ 4× speedup → use prefill mode as canonical (current state)
+//!   2-4×         → use prefill but expect more modest wall-clock wins
+//!   < 2×         → DN sequentiality dominates; pursue a batched DN kernel
+//!                  instead of relying on eval_hipfire-side batching
 //!
 //! Usage:
 //!   prefill_microbench --model <path-to-hfq-model> \
@@ -238,7 +243,7 @@ fn main() {
     );
     eprintln!("speedup (per-token / prefill) : mean {:.2}×  best {:.2}×", speedup_mean, speedup_best);
     eprintln!();
-    eprintln!("Decision rule (docs/plans/eval_hipfire_speedup.md):");
+    eprintln!("Decision rule (docs/plans/issue-113-quant-quality-eval.md §5):");
     eprintln!("  ≥ 4×    : continue with rev-2 plan as designed");
     eprintln!("  2× – 4× : continue with rescoped target");
     eprintln!("  < 2×    : halt; DN sequentiality dominates — pursue batched-DN kernel instead");

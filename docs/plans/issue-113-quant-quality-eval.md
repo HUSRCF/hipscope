@@ -1,250 +1,61 @@
-# Quant quality eval — KLD-primary harness for MQ3/MQ4 (uniform + Lloyd) + Q8 reference proxy + GGUF anchors
+# Quant Quality Eval (KLD-Primary) PRD
 
-**Status:** plan rev-3.3 (2026-05-09 ~20:30). Steps 0–4, 6 part-A, 7.A done (both BF16 refs produced); Step 5 (canary candidate) in progress on gfx1100. Format β locked; qwen3.5-27B dropped (superseded by qwen3.6-27B); GGUF anchor architecture locked (no FIFO tee / no llama.cpp-native cached ref needed — both tracks use the same hipfire-β ref, candidate-side KLD math is identical, only the cand-logit source differs). Step 1.5 + 1.6 verdicts in §"Step 1.5 verdict" and §"Open questions resolved" row 11.
-**Tracking:** #113 (uniform), #116 (Lloyd, mirror sub-section).
-**Pinned llama.cpp commit:** `9dcf83552887bb898b4a98a5761361e504e31fc3` (master, 2026-05-08).
+**Status:** Active (canonical reference)
+**Last updated:** 2026-05-11
+**Owner:** hipfire eval
+**Tracking:** #113 (uniform MQ), #116 (Lloyd-MQ), #182 (MQ4-Lloyd)
+**Pinned llama.cpp commit:** `9dcf83552887bb898b4a98a5761361e504e31fc3`
 
-## Goal & non-goal
+---
 
-**Goal:** produce a **hipfire-internal Pareto curve** (mean-KLD vs size, per (model, variant, arch)) plus a `DFlash τ` correlate per row. The combined table answers two questions:
+## 1. Executive Summary
 
-1. **User-facing positioning** — "where does each hipfire MQ-family quant sit on a (size, KLD) plot?" The plot is the deliverable.
-2. **Product decisions** — "is MQ4-Lloyd worth keeping shipped after PR #197 lands?", "should the MQ3 ship gate be recalibrated?" KLD is one input among many to those decisions.
+A KLD-primary quality eval for hipfire quant formats against a BF16 reference, with a llama.cpp GGUF anchor track for cross-codebase calibration. KLD against BF16 measures the exact perturbation a quant introduces over the whole output distribution, where PPL — top-1 probability alone — would miss tail collapses that hurt DFlash speculative acceptance, RAG retrieval, factual recall, and sampling diversity.
 
-**Secondary goal (degradable):** anchor the hipfire Pareto curve against llama.cpp's GGUF Q-family Pareto via a single shared corpus run on llama.cpp. **This is degradable** — it depends on a tokenizer-parity check (step 2 below) and possibly a token-input bridge to llama-perplexity. If those costs explode, drop the GGUF anchor track and ship the hipfire-internal-only Pareto. The plan's primary value does not depend on the GGUF anchor.
+**Deliverable:** a 2-axis Pareto plot (size GB on x, mean-KLD on y) with hipfire quant points (HFP4G32 / MFP4G32 as canonical going forward; MQ family rows retained as historical) and GGUF Q-family anchor points, bootstrap-CI error bars, p99-KLD shading. The result *table* below the plot is the reproducibility artifact; the plot is the user-facing message.
 
-**Non-goal:** **KLD is not an implementation ship gate.** Coherence-gate + perf-gate remain the gating signals for shipping a kernel/format. KLD informs **editorial decisions** (promotion to default, deprecation note, recalibrated thresholds) — it does not automatically revert or block any PR.
+**Active focus (post 2026-05-11 Pivot):** HFP4G32 + MFP4G32 (PR #224 / #225) are the RDNA-optimal successors to the MQ family. The MQ family's coarse single-fp32-scale-per-256 grouping is structurally noisier than community K-quants by a wide margin (hipfire MQ4 KLD 0.876 vs vanilla Q4_K_M 0.125 at near-equivalent size on the 9B slice). Once `Qwen3.5-9B-HFP4G32.hfq` / `.MFP4G32.hfq` exist, they slot into the matrix and become the canonical hipfire-side rows. MQ rows are kept for historical continuity.
 
-This non-goal is the resolution of the previous "decides ship-or-not" framing for MQ4-Lloyd: **PR #197 ships on its own merits (kernel correctness + perf gate). The KLD result for MQ4-Lloyd lands as a comment recommending whether to *promote it as default* over MQ4-uniform.** No automatic revert path. (S7)
+**Non-goal — KLD is not a ship gate.** Coherence-gate and perf-gate remain the gating signals for shipping a kernel/format. KLD informs editorial decisions: promotion-to-default, deprecation notes, recalibrated thresholds. It does not automatically revert or block any PR.
 
-## Why KLD over PPL
+---
 
-PPL collapses the full output distribution to one scalar per token (probability of the actual next token). A quant can preserve top-1 perfectly while scrambling the tail; PPL won't see it, but DFlash speculative acceptance, RAG retrieval, factual recall, and sampling diversity all will. KLD against a BF16 reference measures exactly the perturbation the quant introduces.
+## 2. Why KLD over PPL
 
-llama.cpp's `llama-perplexity --kl-divergence` mode emits both PPL and mean/median/p99 KLD in one pass. PPL stays as a secondary sanity column.
+PPL collapses the full output distribution at each position to one scalar — the probability of the *actual* next token. A quant can preserve top-1 perfectly while scrambling the tail; PPL won't see it. KLD against BF16 measures `Σ P_ref(i) · (log P_ref(i) − log P_cand(i))` over the full vocab, surfacing exactly the perturbation the quant introduces.
 
-**Caveat on top-K=256 truncation (M1):** Qwen 3.5/3.6 has **248,320-token vocab** (corrected from earlier "~151K" estimate after Step 1.6 measured the actual reference); top-K=256 covers ~0.103%. `sum_p_residual` corrects mean-KLD in expectation but provides **zero information about the structure of the truncated tail** — exactly the regime DFlash speculative acceptance and high-temperature sampling are most sensitive to. KLD on top-K=256 is a **necessary but not sufficient** signal for those use cases. Step 1.6 of sequencing measures the residual mass fraction empirically; the 9B BF16 reference at top_k=256 has median residual 0.41% (under the 0.5% gate), p99 17.9%, max 72.0% — passing the gate, with a long-tail caveat to flag in the result write-up.
+llama.cpp's `llama-perplexity --kl-divergence` mode emits both PPL and mean/median/p99 KLD in one pass. PPL stays as a secondary sanity column in the result table.
 
-## The Pareto-positioning outcome
+**Top-K=256 truncation caveat (M1).** Qwen 3.5/3.6 has a 248,320-token vocab. Top-K=256 covers ~0.103% of vocab IDs but typically the bulk of the probability mass: empirical sampling of the 9B BF16 reference shows median `sum_p_residual` = 0.41% (under the 0.5% gate), mean 1.81%, p99 17.94%, max 72.0%. The residual cross-term (§4.4) corrects mean-KLD in expectation; ~1% of all scored tokens have residual mass >17% (flat distributions) where the top-K approximation is loosest. Flagged in the result write-up.
 
-**Deliverable:** a 2-axis plot (size GB on x, mean-KLD on y) with hipfire MQ-family points + GGUF Q-family anchor points (if anchor track survives) + bootstrap-CI error bars + p99-KLD shading. The plot is the headline.
+---
 
-The result **table** below is the reproducibility artifact, not the user-facing message. (S1 / m6)
-
-```
-       (size GB) →
-    | Q8_0  ●
-    | Q6_K   ●
-    | MQ4-lloyd      ★  ★ has CI error bars
-    | Q5_K_M       ●
-    | MQ4-uniform     ★
-    | Q5_K_S        ●
-    | MQ3-lloyd        ★
-    | Q4_K_M         ●
-    | MQ3-uniform     ★
-    | Q3_K_M           ●
-    +-------------- mean KLD →
-```
-
-A single representative GGUF callout ("MQ3-Lloyd sits between Q4_K_M and Q5_K_S at equivalent size") replaces the rev-2 "Mapped to" column. Reader looks at the plot for the rest.
-
-## Gate structure (revised, locked)
+## 3. Gate Structure
 
 | Gate | Type | Decision rule |
 |---|---|---|
 | Coherence-gate (existing) | hard ship gate | unchanged |
 | Perf-gate (existing) | hard ship gate | unchanged |
-| KLD eval | **editorial signal** | informs comments on #113, #116, #197; does not gate PRs |
+| KLD eval (this PRD) | editorial signal | informs comments on #113, #116, #197; does not gate PRs |
 
-(S7) — single narrative: KLD is editorial. No automatic-revert language anywhere in the plan.
+For #113 (uniform MQ): positioning comment on the issue (now mostly historical post-Pivot). For #116 (Lloyd-MQ): positioning + recalibration input. For #182 / PR #197 (MQ4-Lloyd): editorial decision on promotion-to-default; PR #197 ships on coherence + perf alone.
 
-**For #113 (uniform MQ3/MQ4):** result is a positioning comment on the issue. The original 5%-MQ3-vs-MQ4 framing is superseded.
+---
 
-**For #116 (Lloyd):** result is a positioning comment + recalibration input.
+## 4. Reference Format & Pipeline
 
-**For #182 / PR #197 (MQ4-Lloyd):** result feeds an *editorial* decision on whether to promote MQ4-Lloyd as the default over MQ4-uniform, or to mark it "supported but not recommended" in the registry. PR #197 ships on coherence + perf alone; KLD doesn't gate the merge.
+### 4.1 Why a hipfire-internal top-K reference (not llama.cpp's native)
 
-## Eval matrix
+llama.cpp's `--kl-divergence-base` format is full-vocab uint16-quantized log-probs, ~318 GB per 9B-class reference at our slice size (1175 chunks × 1023 scored tokens/chunk × 304 KB/token). Unhostable on HF. We pipe llama-perplexity's full-vocab output through `build_kld_ref` which top-K-reduces (k=256) and writes a custom format (~2.48 GB/ref, ~150× smaller) that fits on HF Hub.
 
-Per model: 9B (qwen3.5) / 27B (qwen3.6).
-
-(Dropped qwen3.5-27B from rev-3.1: superseded by qwen3.6-27B which has the same parameter budget and a newer training corpus. Carrying both adds eval time without an editorially-actionable signal.)
-
-| Track | Variants |
-|---|---|
-| Hipfire (all evaluated together) | Q8-uniform, MQ4-uniform, MQ3-uniform, MQ4-lloyd, MQ3-lloyd |
-| GGUF anchors (secondary, conditional) | Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S — qwen3.6-27B only |
-
-Total: 5 hipfire variants × 2 models × 2 archs = 20 hipfire runs. GGUF anchors (7 runs) on qwen3.6-27B only, gfx1151 only. 2 BF16 reference dumps (one-time per model, gfx1151 only — see B3 below).
-
-Q8-uniform plays a dual role: it's the **reference proxy** (closest hipfire can get to BF16, since hipfire's runtime doesn't support BF16 — see B3) AND a hipfire-side sanity check that the eval harness reproduces "near-zero KLD" for a known-good quant. Title and table reflect this.
-
-## Arch coverage
-
-Each hipfire variant evaluated on **two archs**: gfx1100 (canonical ship target, GDDR6) and gfx1151 (deployment, Strix Halo APU, LPDDR5x).
-
-| Why gfx1100 | Why gfx1151 |
-|---|---|
-| canonical ship-gate target, matches CI / production deploy | the bench/dev host that produces BF16 refs (only host with enough RAM for 27B BF16 — 137 GB UMA) |
-
-BF16 reference dumps are **produced on gfx1151** via `llama-perplexity` (not via hipfire's runtime — see B3). All quant evals score against that same reference regardless of where the quant was scored — references are arch-independent (just bytes).
-
-Result table grows a per-arch column. If gfx1100 and gfx1151 KLDs diverge by more than canary tolerance, that's a finding (decode-path multi-acc drift surfaces as a quant-quality artifact — m4).
-
-**Light cross-host BF16 sanity (m3):** as part of step 4, produce a 9B-only BF16 reference on CPU (~30 min) and compare to gfx1151 BF16 ref via mean-KLD on 100 random tokens. If <0.001, gfx1151 is a neutral observer for the BF16 path. If >0.01, escalate. Not extended to 27B (CPU BF16 27B is days).
-
-## Tokenizer alignment + bridge investigation
-
-**Resolved 2026-05-08 (Step 1.5 ran on 9B BF16 GGUF):** the parity check failed structurally — hipfire and llama.cpp diverge on ~46% of token positions on the slice. **However, the divergence does not block the eval pipeline.** See §"Step 1.5 verdict" below for the full reasoning. tl;dr: `eval_hipfire.rs` reads token IDs from the reference file (written by llama-perplexity); it never re-tokenizes the slice. So whichever tokenizer produced the IDs in the reference is the only tokenizer that matters; the candidate model just consumes valid IDs from its vocabulary.
-
-The original concern (below) was over-cautious. Keeping the §"Tokenizer alignment + bridge investigation" framing for context, but the bridge work / drop-anchor decision tree is moot: we proceed with llama-perplexity for both BF16 reference dump AND GGUF candidate evaluations, eval_hipfire reads token IDs from reference, no re-tokenization anywhere in the pipeline.
-
-### Original concern (pre-Step-1.5)
-
-llama.cpp tokenizes via per-GGUF tokenizer; hipfire uses the upstream Qwen tokenizer through hipfire's loader. **If these tokenize the slice differently, the entire GGUF-anchor track is invalid.**
-
-**Step 1.5 (mandatory before any reference dump):** byte-identical tokenizer-parity check.
-
-```python
-# benchmarks/quality-baselines/harness/tokenizer_parity.py — concrete sketch
-import subprocess, struct
-# hipfire side: wraps hipfire's Qwen tokenizer (HF tokenizers lib for now;
-# later via eval_hipfire.rs --tokenize-only mode if added).
-hf_ids = hf_tokenizer.encode(open('slice.txt').read())
-# llama.cpp side: invokes llama-tokenize with the GGUF's bundled tokenizer.
-gguf_ids = subprocess.check_output([
-    'llama-tokenize', '-m', 'qwen3.5-9b-q8_0.gguf',
-    '-f', 'slice.txt', '--ids'
-]).decode().split()
-gguf_ids = [int(x) for x in gguf_ids]
-assert len(hf_ids) == len(gguf_ids), f"len mismatch {len(hf_ids)} vs {len(gguf_ids)}"
-for i, (a, b) in enumerate(zip(hf_ids, gguf_ids)):
-    assert a == b, f"token {i}: hf={a} gguf={b}"
-```
-
-**Step 2 (bridge feasibility investigation, ~30 min):** read `examples/perplexity/perplexity.cpp` on the pinned llama.cpp commit. Verify whether `llama-perplexity` accepts pre-tokenized input via any flag. If yes, document the exact invocation. If no:
-
-- **2a-bridge:** estimate the cost of patching `llama-perplexity` to add `--input-tokens`. If <2 days (most likely), commit to the patch and either upstream or vendor the binary. Update §"Storage and cost" with the patch cost.
-- **2b-drop:** drop the GGUF anchor track entirely. The hipfire-internal Pareto + bootstrap CIs is the deliverable. Plan still ships.
-
-**Step 2 sequencing branches:**
-
-```
-step 1.5 tokenizer-parity result:
-  PASS → continue (steps 3, 4, 5, ...)
-  FAIL → step 2 bridge feasibility:
-    bridge feasible (≤ 2 days) → patch llama-perplexity, continue
-    bridge not feasible       → drop GGUF anchor track, continue
-                                 with hipfire-internal Pareto only
-```
-
-(M7)
-
-### Step 1.5 verdict (2026-05-08, 9B BF16 GGUF + slice md5 `83b0205a`)
-
-Empirically:
-- hipfire produced 2,407,713 tokens
-- llama.cpp produced 2,407,712 tokens (Δ = 1)
-- 1,104,899 of 2,407,712 positions differ (45.9%)
-- 11,638 contiguous diff runs, mostly length 2
-- **Every divergence is the same pattern**: hipfire emits `[2071, 110]` where llama.cpp emits `[220, 28495]` — same merge work, different pair chosen by the BPE merge-priority tiebreaker on a specific byte sequence. Streams realign within 2 tokens.
-
-This is a known behavior difference between llama.cpp's GGUF-bundled BPE encoder and the upstream HF Qwen tokenizer. PR #201's encoder has been verified byte-identical to HF tokenizers; the divergence is on llama.cpp's side, not hipfire's.
-
-**Why this doesn't block the eval pipeline:**
-
-`eval_hipfire.rs` reads the per-token reference's `tokens` field (written by llama-perplexity during the BF16 ref dump) and feeds those IDs directly into `forward_scratch`. It **never re-tokenizes the slice**. So the candidate model just consumes the reference's token IDs — same vocabulary, valid input regardless of which BPE produced them.
-
-| | producer | consumer | tokenizer agreement needed? |
-|---|---|---|---|
-| BF16 reference | llama-perplexity → ref file | (none) | — |
-| hipfire candidate | hipfire forward_scratch | KLD vs ref | **No** (reads token IDs from ref) |
-| GGUF candidate | llama-perplexity on same slice | KLD vs ref | only that llama-perplexity is deterministic on its own slice (which it is) |
-
-**Implication for §"GGUF anchor track is viable":** the anchor track is viable. We can run Q3_K_S etc. against the same BF16 reference and compare KLDs.
-
-**The only place tokenizer parity would matter:** if a USER ran hipfire on the same slice TEXT and expected to get the same per-token NLL/PPL as llama.cpp — they wouldn't, because the tokenization differs. But that's a user-facing comparison, not the eval pipeline. The Pareto plot's KLD axis is internally consistent (all measurements use llama-perplexity's tokenization).
-
-**Decision: proceed with both tracks (hipfire candidates + GGUF anchors) using llama-perplexity tokenization throughout.** No bridge work, no anchor-track drop. The plan rev-3.2 already permits this — we're just observing that the pessimistic fallback (drop anchor on parity fail) was unnecessary.
-
-## Repo layout (committed)
-
-```
-benchmarks/quality-baselines/
-├── slice/
-│   ├── wikitext2-1024s-2048ctx.txt        # frozen prompt bytes, ~10 MB
-│   ├── slice.md5                          # checksum (md5 tripwire)
-│   └── make_slice.sh                      # deterministic regenerator (uses .venv/bin/python3)
-├── harness/
-│   ├── manifest.json                      # {sha256, hf_repo, producer_cmd, llamacpp_commit, host_arch, …}
-│   ├── kldref_format.py                   # HFKLDR + HFKSEQ-v2 reader/writer
-│   ├── kld_reduce.py                      # reducer + bootstrap CI + PPL column
-│   ├── tokenizer_parity.py                # step 1.5
-│   ├── canary.md                          # 11-seq fixture (10 short + 1 long-ctx)
-│   └── README.md                          # how to add a quant
-├── refs/
-│   └── (downloaded blobs, .gitignored — fetched via scripts/fetch-eval-refs.sh)
-└── results/
-    └── 2026-05-XX-quant-pareto.md          # output table + plot
-
-# Producer / candidate-side binaries live in
-# crates/hipfire-runtime/examples/:
-#   build_kld_ref.rs   — BF16 ref dump (llama-perplexity FIFO + top-K reduce)
-#   eval_hipfire.rs    — hipfire candidate scorer (forward + KLD + NLL)
-#   eval_gguf.rs       — GGUF candidate scorer (llama-perplexity FIFO + KLD + NLL)
-#   tokenize_slice.rs  — slice tokenizer for parity check
-```
-
-(m9 — moved manifest.json under harness/ for dependency clarity.)
-
-## Binary format
-
-### llama.cpp's native `--kl-divergence-base` format (verified Step 0)
-
-For reference; we **do not use this format directly** for the cached reference (see "Hipfire derived format" below). Verified against `tools/perplexity/perplexity.cpp` on commit `9dcf83552`:
-
-```
-Header (16 bytes):
-  bytes  0-7   magic "_logits_"     (8 ASCII chars, no null) [perplexity.cpp:1709]
-  bytes  8-11  n_ctx                (uint32)                  [line 1718]
-  bytes 12-15  n_vocab              (int32)                   [line 1726]
-  bytes 16-19  n_chunk              (int32)                   [line 1727]
-
-Tokens:
-  n_ctx × n_chunk × int32 token IDs                           [line 1737]
-
-Per-chunk × per-scored-token (only n_ctx − 1 − n_ctx/2 tokens scored per chunk):
-  nv = 2 × ((n_vocab + 1) / 2) + 4   uint16 values             [line 1752]
-    [0..1]    scale          (fp32, packed as 2 × uint16)
-    [2..3]    min_log_prob   (fp32, packed as 2 × uint16)
-    [4..nv]   stored[i]      (uint16, FULL vocab)              [line 100-101 producer]
-    Reconstruction: log_prob[i] = scale * stored[i] + min_log_prob   [line 222-225 consumer]
-    Quantization: stored = nearest_int((logit[i] − min_logit) / scale), 0 if logit ≤ min_logit
-    min_logit clipped to max_logit − 16
-```
-
-**No magic-version field. No top-K. Full vocab.** Storage at Qwen 248,320 vocab × 1175 chunks × 1023 scored tokens/chunk = **~597 GB per reference** (corrected after Step 1.6 measured the actual chunking — llama-perplexity emitted 1175 chunks not the 1024 we'd planned). For 2 models = ~1.2 TB. **Unhostable on HF.**
-
-### Numerics (verified Step 0)
-
-llama.cpp's reference producer uses:
-- `double sum_exp = 0.0` accumulator [line 87] — fp64 ✓
-- `log_sum_exp = log(sum_exp)` formulation [line 91] — log-sum-exp ✓
-
-`build_kld_ref` (below) and `eval_hipfire.rs` MUST match these conventions. Verify by computing top-K + residual on 10 random tokens of the 9B canary fixture and comparing fp32-tolerance against the values llama-perplexity produces in-memory (uses fp64 accumulator → fp32 output).
-
-### Hipfire-derived top-K format (option B — what we actually use)
-
-Step 0 surfaced that llama.cpp's native format is unhostable. We adopt **option B**: produce a hipfire-controlled top-K-reduced format from llama.cpp's full-vocab inference output. This trades "shared metric impl with llama.cpp" for "fits on HF" — `kld_reduce.py` becomes the canonical KLD reducer; `llama-perplexity --kl-divergence-base` is no longer used as our consumer.
-
-**Format spec:**
+### 4.2 Binary format (HFKLDR β)
 
 ```
 Header (32 bytes):
   bytes  0-7   magic "HFKLDR\0\0"   (8 ASCII chars, null-padded)
   bytes  8-11  version              (uint32, currently 1)
   bytes 12-15  n_ctx                (uint32)
-  bytes 16-19  n_vocab              (uint32)            [for sanity vs candidate]
+  bytes 16-19  n_vocab              (uint32, sanity vs candidate)
   bytes 20-23  n_chunk              (uint32)
   bytes 24-25  top_k                (uint16, e.g. 256)
   bytes 26-27  flags                (uint16, currently 0)
@@ -254,155 +65,202 @@ Tokens:
   n_ctx × n_chunk × uint32 token IDs
 
 Per-chunk × per-scored-token (n_ctx − 1 − n_ctx/2 tokens per chunk):
-  uint32 top_indices[top_k]         [vocab IDs, descending log-prob]
-  fp32   top_log_probs[top_k]       [log P(i), descending; fp32]
-  fp32   sum_p_residual             [Σ P(i) for i NOT in top-K, in [0, 1]; fp32]
-  fp32   reserved_pad               [zero, for 8-byte alignment]
+  uint32 top_indices[top_k]     vocab IDs, descending log-prob
+  fp32   top_log_probs[top_k]   log P(i), descending
+  fp32   sum_p_residual         Σ P(i) for i NOT in top-K, in [0, 1]
+  fp32   reserved_pad           zero, for 8-byte alignment
 ```
 
-Per-token storage: `top_k*4 + top_k*4 + 4 + 4 = 8 + 8*top_k` bytes. At top_k=256: **2,056 B per token** (~150× smaller than llama.cpp's native 304 KB). At 1175 × 1023 = 1,202,025 scored tokens × 2,056 B = **~2.47 GB per reference**, or ~4.94 GB for 2 references (9B + qwen3.6-27B) — fits HF. (n_chunk=1175 corrected from earlier 1024 estimate after Step 1.6 measured the actual llama-perplexity chunking on the slice; n_chunk depends on tokenized slice length / n_ctx.)
+Per-token block size: `8 + 8*top_k` bytes. At top_k=256: 2,056 B/token.
 
-Reconstruction at consumer: `log P(i) = top_log_probs[j]` if `i == top_indices[j]` for some `j`. For `i` not in top-K, the bulk mass is bounded by `sum_p_residual`. KLD math proceeds with top-K from candidate × top-K from reference, plus a residual cross-term.
+**Why log-probs (β) not raw logits.** llama.cpp's native format already encodes log-probs (via `min_log_prob` + `scale` reconstructing to log-probs, see `tools/perplexity/perplexity.cpp:222-225` on the pinned commit). Storing log-probs directly avoids backing out `max_logit` / `log_sum_exp` from the encoding (underdetermined when the logit range is clipped at 16). KLD operates on log-probs natively.
 
-**Why log-probs (β) rather than raw logits + max_logit + log_sum_exp (α)?** llama.cpp's `--kl-divergence-base` format encodes log-probs already (the per-token `min_log_prob` + `scale` reconstruct to log-probs, not raw logits — see `tools/perplexity/perplexity.cpp:222-225`). Storing log-probs directly avoids backing out `max_logit` / `log_sum_exp` from llama.cpp's encoding (an underdetermined problem when the logit range is exactly clipped to 16). KLD operates on log-probs natively, so no information loss for our use case.
-
-**Why this format vs llama.cpp's:**
-- 150× smaller per token (top-K + residual vs full uint16)
-- Stored values are fp32 not affine-quantized uint16 → no quantization noise in the reference
-- top_k explicit + stored in header → no dependency on n_vocab divisibility
-- Full vocab IDs preserved (top_indices) so consumer can match against candidate's top-K
-- Token ID stride preserved so `eval_hipfire.rs` can align without re-tokenizing the slice
-
-**Producer:** `crates/hipfire-runtime/examples/build_kld_ref.rs`. Architecture:
-
-```
-build_kld_ref --bf16-gguf qwen3.5-9b-bf16.gguf \
-              --slice slice.txt \
-              --top-k 256 \
-              --output refs/qwen3.5-9b-bf16.kldref.bin
-
-[1] mkfifo /tmp/kldref-<pid>.fifo
-[2] spawn: llama-perplexity -m <gguf> -f <slice> --kl-divergence-base /tmp/kldref-<pid>.fifo -c <n_ctx> --kl-divergence
-[3] read llama.cpp header from FIFO (16 bytes) → parse n_ctx, n_vocab, n_chunk
-[4] read tokens from FIFO (n_ctx * n_chunk * 4 bytes) → write hipfire header + tokens to output
-[5] for each per-token block (nv*2 bytes from FIFO):
-       parse scale (fp32), min_log_prob (fp32) from first 8 bytes
-       reconstruct log-probs: log_p[i] = scale * stored[i] + min_log_prob   [fp32 → fp64]
-       top-K-reduce (nlargest by log_p)
-       compute sum_p_residual = 1 - Σ_{i ∈ top_k} exp(log_p[i])             [fp64]
-       (clamp ≥ 0 to absorb fp roundoff)
-       write hipfire β per-token block (8 + 8*top_k bytes)
-[6] join llama-perplexity, unlink fifo
-```
-
-The FIFO sidesteps the 318 GB transient: llama.cpp streams full-vocab uint16, hipfire's reducer reads + reduces in-flight, ~2.15 GB lands on disk.
-
-**Top-K choice (M1):** at top_k=256, residual-mass sanity (Step 1.6) checks median `sum_p_residual` value on 10 canary tokens. <0.5% → 256 OK; >2% → raise to 512. Record actual K in manifest. Earlier rev-3 estimate stands.
-
-**Numerics:** all sums (log-prob reconstruction, top-K accumulators, residual computation) use fp64 internally, written as fp32. Matches llama.cpp's accumulator precision.
-
-## Reference dump → HF Hub
-
-Per-model BF16 reference logit dumps live at **`hipfire-models/hipfire-eval-refs`** (m1).
-
-**On the org choice:** `hipfire-models` is a new HF org created 2026-05-08 (see project memory; we already use it for the dev-stage Lloyd quants at `hipfire-models/qwen3.5-{4b-dev,9b-dev,9b}` and `hipfire-models/qwen3.6-27b-dev`). The legacy registry (`cli/registry.json`) still references `schuttdev/hipfire-*` for non-Lloyd quants where the canonical owner has write access. **Eval refs go to `hipfire-models` because Kevin (org admin) has write access; `schuttdev` is read-only.** This will look like an inconsistency in committed state at PR review time — flag it in the PR description.
-
-Files (corrected after Step 0; format = hipfire top-K-reduced, not llama.cpp full-vocab):
-
-```
-qwen3.5-9b-bf16.kldref.bin     (~2.47 GB, top-K=256 + residual + meta, see Binary format §)
-qwen3.6-27b-bf16.kldref.bin    (~2.47 GB — same size at top_k=256, vocab-independent)
-README.md                       (producer commands, slice md5, llama.cpp commit pin, host_arch=gfx1151, model SHA256)
-```
-
-(Both refs are the same size at top_k=256: per-token block size is `8 + 8*top_k = 2,056 B` independent of n_vocab. n_vocab is only stored in the header for sanity-check.)
-
-In-tree `manifest.json` carries `{sha256, hf_url, producer_cmd, model_sha256, llamacpp_commit, slice_md5, host_arch, top_k}` per reference. `scripts/fetch-eval-refs.sh` reads manifest, pulls via `hf` CLI into `~/.cache/hipfire-eval-refs/`, verifies SHA256.
-
-## Reference dump methodology (one-time per model, on gfx1151)
+### 4.3 Producer: `build_kld_ref`
 
 ```bash
-cargo run --release --example build_kld_ref -p hipfire-runtime -- \
-  --bf16-gguf  models/qwen3.5-9b-bf16.gguf \
-  --slice      benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-  --top-k      256 \
-  --output     refs/qwen3.5-9b-bf16.kldref.bin
+cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- \
+  --bf16-gguf <path>.gguf \
+  --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --top-k 256 \
+  --output refs/<name>.kldref.bin
 ```
 
-**BF16 only**, produced via llama.cpp's inference (B3). The hipfire runtime does not support BF16 inference — see `crates/hipfire-runtime/src/llama.rs:481`, which panics on any `GgmlType` outside `{F32, F16, Q4_0, Q8_0, Q4K, Q6K}`. `build_kld_ref` orchestrates llama-perplexity as a subprocess, reads its full-vocab uint16 stream via FIFO, computes top-K + residual in flight, and writes the hipfire-internal format. `eval_hipfire.rs` runs hipfire's quantized variants only (Q8, MQ3-uniform, MQ4-uniform, MQ3-Lloyd, MQ4-Lloyd) and scores them against the externally-produced BF16 reference.
+Architecture:
 
-gfx1151 has 137 GB UMA — 27B BF16 fits with huge headroom. Disk needs are minimal (~2 GB output) since the FIFO sidesteps the 318 GB transient.
+1. `mkfifo /tmp/kldref-<pid>.fifo`
+2. spawn `llama-perplexity -m <gguf> -f <slice> --kl-divergence-base /tmp/kldref-<pid>.fifo -c <n_ctx> --kl-divergence`
+3. read llama.cpp header from FIFO (16 bytes); parse n_ctx / n_vocab / n_chunk
+4. read tokens from FIFO (n_ctx × n_chunk × uint32); write hipfire header + tokens
+5. for each per-token block (nv × uint16 from FIFO): reconstruct log-probs → top-K-reduce (nlargest by log_p) → compute `sum_p_residual` → write β-format block
+6. join llama-perplexity; unlink fifo
 
-**Producer command + SHA recorded** alongside the reference SHA in `manifest.json` so divergence-debugging 6 months from now is trivial. The pinned llama.cpp commit (`9dcf83552`) is also recorded — if a future contributor rebuilds llama.cpp from a different commit and the producer format changes, the SHA mismatch surfaces it.
+The FIFO sidesteps the 318 GB transient: llama.cpp streams full-vocab uint16, hipfire reduces in-flight, ~2.48 GB lands on disk. Throughput: 375 reduced tok/s on gfx1151 for 9B BF16, 162 tok/s for 27B BF16.
 
-## Reference-drift canary (clarified)
+**Numerics.** Log-prob reconstruction, top-K accumulators, and residual computation use fp64 internally, written as fp32. Matches llama.cpp's accumulator precision (`double sum_exp` + `log_sum_exp` formulation). 27B BF16 producer requires `--no-mmap` (passed automatically by `build_kld_ref`): demand-paging on 50 GB BF16 weights stalls in eviction-cycle on the 124 GB UMA host.
 
-The canary serves a different purpose than the SHA256 manifest check (S5):
+### 4.4 Consumers: `eval_hipfire` and `eval_gguf`
 
-- **SHA256 in `manifest.json`** = **reference identity guard.** Detects re-uploads or file-corruption.
-- **Canary fixture** = **harness output reproducibility guard.** Detects if `eval_hipfire.rs` regresses (kernel changes, fp accumulator changes) such that the same model + same reference yields different KLD.
+Both consumers read the same β-format reference. They differ only in how they obtain candidate logits at each scored position:
 
-Q8 is so close to BF16 that small reference *content* changes don't move the canary KLD much, so the canary is poorly suited to catch silent reference replacement — that's SHA256's job. Both checks run before each eval; they validate independent failure modes.
+| binary | candidate-logit source | per-token KLD math |
+|---|---|---|
+| `eval_hipfire` | hipfire's runtime (forward_scratch or forward_prefill_batch → batched lm_head) | identical |
+| `eval_gguf` | spawn `llama-perplexity --kl-divergence-base <fifo>` on a GGUF; read full-vocab uint16 from FIFO; reconstruct candidate's log-probs | identical |
 
-**Canary fixture (M8):** 11 wikitext sequences:
-- 10 short (≤500 tokens each) — fast harness check.
-- **1 near-max ctx (1800-2000 tokens)** — catches RoPE / KV-cache drift that only emerges late in the context window.
+Per-position KLD math (top-K-of-reference + residual cross-term):
 
-Expected KLD per sequence committed in `canary.md`. Tolerance per sequence stated explicitly.
+```
+KLD_token = Σ_{i in ref_top_K} P_ref(i) · (log_p_ref(i) − log_p_cand(i))
+          + sum_p_residual_ref · (log sum_p_residual_ref − log sum_p_residual_cand)
+where  sum_p_residual_cand = max(0, 1 − Σ_{i in ref_top_K} P_cand(i))
+```
 
-## Eval-mode hipfire flags
+The residual cross-term assumes both distributions miss similarly in the tail. Reduces bias on the ~1% of flat-distribution tokens with high residual mass. Source: rev-3.3 architecture decision (`benchmarks/results/devlog_20260507_mq3_lloyd_gfx1151.md`).
 
-`eval_hipfire.rs` always sets:
+Both consumers emit HFKSEQ (per-sequence mean + p99 KLD + mean NLL for PPL), aggregated by `kld_reduce.py`.
+
+### 4.5 Tokenization (Step 1.5 verdict)
+
+Tokenizer parity check ran 2026-05-08: hipfire's BPE encoder vs llama.cpp's GGUF-bundled BPE encoder disagree on 45.9% of token positions over the slice — a known structural divergence in how Qwen's BPE merge-priority tiebreaker resolves a specific byte sequence (hipfire emits `[2071, 110]` where llama.cpp emits `[220, 28495]`). Streams realign within 2 tokens.
+
+**Why this doesn't block the pipeline:** `eval_hipfire.rs` reads token IDs from the reference file (written by llama-perplexity during the ref dump) and feeds those IDs directly into the candidate model. **It never re-tokenizes the slice.** All measurements use llama-perplexity's tokenization end-to-end; the KLD axis is internally consistent.
+
+| | producer | consumer | parity needed? |
+|---|---|---|---|
+| BF16 reference | llama-perplexity → ref file | (none) | — |
+| hipfire candidate | hipfire forward | KLD vs ref | **No** — reads token IDs from ref |
+| GGUF candidate | llama-perplexity on same slice | KLD vs ref | only that llama-perplexity is deterministic, which it is |
+
+---
+
+## 5. Scoring Modes (hipfire candidates)
+
+`eval_hipfire` supports two scoring modes for hipfire candidates, selected via `--scoring-mode`. **Prefill is the canonical default since 2026-05-11.**
+
+### 5.1 Per-token mode (`--scoring-mode per-token`)
+
+Loop `forward_scratch` once per position. Bandwidth-bound at ~44–107 tok/s depending on arch + variant (gfx1100 ≈ 2.4× faster than gfx1151 on the same model due to higher GDDR6 bandwidth). Full 1175-chunk wall-clock: ~7 h/run on gfx1100, longer on gfx1151.
+
+### 5.2 Prefill mode (`--scoring-mode prefill`, canonical)
+
+For each chunk:
+
+1. **Prefix call:** `forward_prefill_batch(tokens[0..n_ctx/2])` with no logit capture. Writes KV positions `[0, n_ctx/2)`.
+2. **Scored call:** `forward_prefill_batch(tokens[n_ctx/2..n_ctx-1])` with `per_token_hidden_out=Some(&hidden_buf)`. Writes the post-output-norm hidden state per row into the caller's buffer.
+3. **lm_head fan-out:** loop `weight_gemv(weights.output, hidden_row, scratch.logits)` per scored position; download + compute KLD per position (existing per-position math).
+
+Scratch reuse: `HIPFIRE_PREFILL_REUSE_PBS=1` is set automatically so the caller-owned `PrefillBatchScratch` is allocated once and reused across all chunks (avoids ~25 alloc/free pairs per chunk).
+
+**Wall-clock speedup measured** (prefill_microbench, n_ctx=2048, kv_mode=asym3, mean of 3 iters):
+
+| arch | variant | per-token (tok/s) | prefill (tok/s) | inference speedup |
+|---|---|---:|---:|---:|
+| gfx1100 | 9B-MQ4 | 107.9 | 2162.1 | 20.0× |
+| gfx1151 | 9B-MQ4 | 44.4 | 842.0 | 19.0× |
+| gfx1151 | 9B-MQ3-Lloyd | 46.1 | 391.7 | 8.5× |
+| gfx1151 | 9B-MQ3 | 52.2 | 396.7 | 7.6× |
+
+The ~19-20× ratio is arch-independent — speedup is structural (GEMM-vs-GEMV at 2048-token batch), not a chip-specific tuning artifact. Including the per-position KLD compute overhead (top-K extract + residual + NLL), the **end-to-end wall-clock speedup is ~7×** for full-slice runs.
+
+### 5.3 The two modes are not equivalent — kernel-path numerical divergence
+
+V1 (gfx1100 MQ4 full slice, 1175 chunks, 2026-05-11) measured a **−6.75% mean-KLD shift** of prefill vs per-token (Pearson per-seq 0.949; bootstrap CIs do not overlap). Confirmed on gfx1151 at n=50 (−7.86% MQ4, −8.64% MQ3) with consistent direction.
+
+**Mechanism.** Prefill mode's batched GEMM kernels use multi-accumulator reductions that average fp16/fp32 partial-sum noise across more terms than per-token GEMV's single-accumulator pattern. The result is logits systematically closer to BF16 ground truth — prefill is both faster *and* more accurate against the BF16 reference, but the bias makes the two modes separate measurement classes.
+
+**Implication.** Mode is recorded in the result table as a first-class column. **Rows of different mode are not cross-comparable.** Pre-existing per-token gfx1100 kldseqs from 2026-05-08 (mq3, mq4, mq3-lloyd, mq6) are retained as historical-only rows; re-running them in prefill mode is on the menu but deferred per the Pivot (§11).
+
+### 5.4 Eligibility — auto-fallback
+
+`forward_prefill_batch` consults `is_batchable_la(dtype, arch)` (qwen35.rs:3823) before dispatching. Variants outside the batchable set auto-fall-back to per-token internally — the new default is safe.
+
+| variant | gfx1100 / gfx1151 / gfx1101-1102 / gfx1150 | gfx1200/1201 | other archs |
+|---|---|---|---|
+| Q8 / MQ4 / MQ6 / HFQ4-G256 / HFQ6-G256 | prefill | prefill | prefill |
+| MQ3 (uniform) | prefill (gfx11 WMMA) | prefill (gfx12 WMMA) | per-token fallback |
+| MQ3-Lloyd | prefill (gfx11) | prefill if `HIPFIRE_LLOYD_GFX12=1` | per-token fallback |
+| MQ4-Lloyd | per-token (issue #182 not yet in batchable set) | per-token | per-token |
+| HFP4G32 | per-token (no GEMM kernel; PR #224 v2 deferred) | per-token | per-token |
+| MFP4G32 | per-token (same kernel family as HFP4G32) | per-token | per-token |
+
+When HFP4/MFP4 lands a batched WMMA kernel (PR #224 v2), those variants enter the batchable set and inherit prefill scoring automatically.
+
+---
+
+## 6. Eval Matrix
+
+Per model: 9B (qwen3.5) / 27B (qwen3.6). qwen3.5-27B was dropped post-rev-3.1 (superseded by qwen3.6-27B; same parameter budget, newer training corpus).
+
+| Track | Variants | Scoring | Status |
+|---|---|---|---|
+| Hipfire (canonical, post-Pivot) | HFP4G32, MFP4G32 | prefill (when batched kernel lands) / per-token (today) | Awaiting .hfq files |
+| Hipfire (historical) | MQ3, MQ4, MQ3-Lloyd, MQ6 | per-token (2026-05-08 runs), + MQ4 prefill (2026-05-11) | Partial committed |
+| GGUF anchors (9B) | Q8_0, Q6_K, Q4_K_M, UD-Q3/Q4/Q5/Q6_K_XL | n/a (single path) | All 7 committed (gfx1151) |
+| GGUF anchors (27B) | Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S | n/a | Deferred per Pivot |
+
+Q8 plays a dual role for hipfire: closest-to-BF16 reference proxy AND a harness sanity check that the eval reproduces near-zero KLD for a known-good quant.
+
+### 6.1 Arch coverage
+
+Each hipfire variant is evaluated on **two archs**: gfx1100 (canonical ship target, GDDR6) and gfx1151 (deployment, Strix Halo APU, LPDDR5x). BF16 reference dumps are produced on gfx1151 only (sole host with enough RAM for 27B BF16 in 137 GB UMA).
+
+References are arch-independent (just bytes); a quant scored on either arch compares against the same reference. The result table grows a per-arch column. **Cross-arch KLD divergence > canary tolerance is itself a finding** — decode-path multi-acc drift would surface as a quant-quality artifact.
+
+---
+
+## 7. Eval-Mode Hipfire Flags
+
+`eval_hipfire` always sets the following so future replays match byte-for-byte:
 
 ```
 HIPFIRE_NORMALIZE_PROMPT=0     # raw byte-stream-through; eval is byte-deterministic
 HIPFIRE_GRAPH=0                # capture-mode adds capture-illegal paths; eval doesn't need it
-HIPFIRE_KV_MODE=asym3          # canonical KV-mode for ship benches (M6)
-HIPFIRE_LLOYD_GFX12=1          # if running on gfx1200/1201 — see PR #195 hardening commit
-HIPFIRE_PREFILL_REUSE_PBS=1    # caller-owned PrefillBatchScratch; set automatically by
-                               # --scoring-mode prefill so the 1175 chunk calls don't
-                               # each pay ~25-tensor alloc/free overhead
+HIPFIRE_KV_MODE=asym3          # canonical KV-mode for ship benches
+HIPFIRE_LLOYD_GFX12=1          # if running on gfx1200/1201 — PR #195 gate
+HIPFIRE_PREFILL_REUSE_PBS=1    # set automatically by --scoring-mode prefill
 ```
 
-Also (canonical from 2026-05-11):
+And the CLI default since 2026-05-11:
 
 ```
---scoring-mode prefill         # forward_prefill_batch + per-token GPU weight_gemv
-                               # lm_head fan-out. ~7× wall-clock vs per-token. See
-                               # docs/plans/eval_hipfire_speedup.md §"V1 result".
+--scoring-mode prefill         # canonical hipfire scoring mode
 ```
 
-All recorded per-row in the result table so future replays match.
+`HIPFIRE_GRAPH=0` is currently a determinism style choice, not a correctness requirement (byte-equality between graph=0 and graph=1 was verified on 2026-05-08 against a dense Qwen3.5-9B-mq4 prefill of 64 tokens, kv_mode=asym3). `HIPFIRE_NORMALIZE_PROMPT=0` matches eval-determinism intent; the canary fixture runs both ON and OFF as a hedge.
 
-**On the scoring-mode flip (2026-05-11):** `eval_hipfire` originally only had a per-token scoring path (forward_scratch × n_ctx). The eval_hipfire_speedup plan landed `--scoring-mode prefill` and V1 measured a ~7% systematic mean-KLD shift between modes on hipfire MQ formats (prefill lower because GEMM's multi-accumulator reductions average fp16/fp32 partial-sum noise that per-token GEMV doesn't). The two modes are separate measurement classes, not equivalent. **Prefill is canonical going forward**; the four existing committed per-token gfx1100 kldseqs (`qwen3.5-9b.{mq3,mq4,mq3-lloyd,mq6}__gfx1100__per-token.kldseq` in `results/2026-05-08/per-seq/`) are retained as `scoring_mode=per-token` historical rows in the result table preamble. Re-running them in prefill mode is on the path to producing the canonical Pareto.
+**Historical-baseline drift caveat.** `HIPFIRE_NORMALIZE_PROMPT` was flipped to ON by default on 2026-04-26. Lloyd findings (`benchmarks/results/lloyd_max_findings_20260501.md`) were likely run with normalize ON. The new eval forces OFF — PPLs in the new table will not reproduce historical baselines on the same corpus.
 
-**On NORMALIZE_PROMPT off (m2):** Gemini's adversarial review argued raw-byte-stream might push the model into garbage-in-garbage-out logit regions. We disagree — wikitext-2 is well-formed text without weird whitespace runs; normalize OFF doesn't push the model into a degenerate input regime. As a hedge, **the canary fixture runs with both `NORMALIZE_PROMPT=0` and `=1`**. If KLD diverges meaningfully between the two, that's a finding (and we revisit the choice). If they're identical, confirms eval-mode-OFF is a safe choice for the bulk run.
+---
 
-**Historical-baseline drift caveat (M4 + M5):** `HIPFIRE_NORMALIZE_PROMPT` was flipped to ON by default on 2026-04-26. The Lloyd findings doc (`lloyd_max_findings_20260501.md`) is from after that date, so its baselines were likely run with normalize ON. The new eval forces OFF. **PPLs in the new table will not reproduce historical baselines on the same corpus** — and that mismatch will look like a regression unless flagged. Same caveat applies to `HIPFIRE_GRAPH`. Document in §"Result table format" below.
-
-## Result table format (rev-3 schema; rev-3.4 adds `Mode` column)
+## 8. Result Table Format
 
 ```markdown
-| Model     | Variant       | Arch    | Mode      | Size GB | Mean KLD ± 95% CI | p99 KLD | PPL    | DFlash τ | Notes |
-|-----------|---------------|---------|-----------|---------|--------------------|---------|--------|----------|-------|
-| 9B        | Q8-uniform    | gfx1100 | prefill   | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | reference proxy |
-| 9B        | Q8-uniform    | gfx1151 | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | within canary tol |
-| 9B        | MQ4-uniform   | gfx1100 | 5.2     | 0.014 ± 0.002      | 0.18    | 10.34  | 8.05     | |
-| 9B        | MQ4-uniform   | gfx1151 | 5.2     | 0.014 ± 0.002      | 0.18    | 10.34  | 8.10     | |
-| 9B        | MQ3-uniform   | gfx1100 | 4.1     | 0.087 ± 0.009      | 1.44    | 42.0   | 6.2      | |
-| 9B        | MQ3-uniform   | gfx1151 | 4.1     | 0.091 ± 0.010      | 1.51    | 42.8   | 6.1      | +5% mean vs gfx1100 — multi-acc drift surfacing |
-| 9B        | MQ4-lloyd     | gfx1100 | 6.5     | 0.012 ± 0.002      | 0.16    | 10.20  | 8.20     | |
-| 9B        | MQ3-lloyd     | gfx1100 | 4.4     | 0.039 ± 0.005      | 0.71    | 18.5   | 7.6      | tail worse than mean |
+| Model | Variant     | Arch    | Mode      | Size GB | Mean KLD ± 95% CI | p99 KLD | PPL    | DFlash τ | Notes |
+|-------|-------------|---------|-----------|---------|--------------------|---------|--------|----------|-------|
+| 9B    | Q8-uniform  | gfx1100 | prefill   | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | reference proxy |
+| 9B    | HFP4G32     | gfx1100 | per-token | 5.2     | TBD                |         |        |          | awaiting .hfq |
+| 9B    | MFP4G32     | gfx1100 | per-token | 5.2     | TBD                |         |        |          | awaiting .hfq |
+| 9B    | MQ4         | gfx1100 | prefill   | 5.2     | 0.817 ± 0.013      | 19.52   | 14.89  | TBD      | historical comparison |
+| 9B    | MQ4         | gfx1100 | per-token | 5.2     | 0.876 ± 0.013      | 19.99   | —      | TBD      | HISTORICAL (do not cross-compare mode) |
 ... (per model, per arch)
 ```
 
-Numbers above are illustrative — real numbers come from the eval runs.
+**`Mode` column.** First-class field. `prefill` (canonical hipfire), `per-token` (historical hipfire), `gguf` (eval_gguf). Mandatory; do NOT compare rows of different mode (see §5.3).
 
-**`DFlash τ` column (S8):** for each variant where a draft model exists in the hipfire registry, the τ value comes from the canonical `merge_sort` prompt (per CLAUDE.md "Prompt-structure τ sensitivity"; byte-identical prompt with md5 recorded in the result file's preamble). `n/a` for variants with no compatible draft (Q8-uniform, sometimes MQ4-Lloyd before draft variants exist). The τ row anchors the editorial decision: "MQ4-Lloyd has lower mean-KLD than MQ4-uniform but lower τ — don't promote".
+**Filename convention (post-2026-05-11):**
 
-**`Mean KLD ± 95% CI` (M2):** bootstrap CI from 10,000 resamples of per-sequence KLDs. Per-sequence KLDs persisted by default (1024 × 4 B = 4 KB per row) so CI is reproducible without re-running.
+```
+<variant>__<arch>__<scoring_mode>.kldseq      preferred 3-segment form
+<variant>__<arch>.kldseq                      legacy 2-segment form (auto-tagged
+                                              gguf if variant contains "gguf-",
+                                              else per-token)
+```
 
-**Mandatory notes section** at the top of the result file:
+**`Mean KLD ± 95% CI`** uses 10,000-resample bootstrap on per-sequence means. Per-seq KLDs are persisted by default (8 KB per row at 1175 chunks), so CIs are reproducible without re-running.
+
+**`DFlash τ` column** (deferred per Pivot): for each variant where a draft model exists, τ from the canonical `merge_sort` prompt (per CLAUDE.md "Prompt-structure τ sensitivity"; byte-identical prompt + md5 in the result file's preamble).
+
+**Mandatory caveats preamble** for any result file:
 
 ```
 ## Caveats for direct comparison
@@ -410,207 +268,157 @@ Numbers above are illustrative — real numbers come from the eval runs.
 - PPL column was measured with HIPFIRE_NORMALIZE_PROMPT=0 and
   HIPFIRE_GRAPH=0. Historical baselines in
   benchmarks/results/lloyd_max_findings_20260501.md were likely run
-  with normalize ON (default flipped 2026-04-26) and may not match
-  the values in this table even on the same logical corpus.
+  with normalize ON (default flipped 2026-04-26) and may not match.
 - The eval slice (wikitext2-1024s-2048ctx.txt) is a frozen committed
-  fixture introduced by this harness; PR #115's corpus
-  (dev/bench/data/wikitext2-test.txt) is not committed and was a
-  single contiguous window, not multi-sequence. Cross-PR PPL
-  reproduction is not attempted.
+  fixture; PR #115's corpus is not committed.
 - Both archs use HIPFIRE_KV_MODE=asym3.
-- `Mode` column indicates eval_hipfire scoring mode for hipfire MQ rows
-  (canonical: prefill, since 2026-05-11) or "gguf" for llama.cpp GGUF
-  anchors. Rows with mode="per-token" are historical (the four
-  qwen3.5-9b.{mq3,mq4,mq3-lloyd,mq6}__gfx1100__per-token.kldseq files
-  from 2026-05-08); they measure a ~7% higher mean-KLD than the prefill
-  re-run will, on the same model + slice. See
-  docs/plans/eval_hipfire_speedup.md §"V1 result" for the kernel-path
-  numerical analysis. **Do not cross-compare rows of different mode.**
+- `Mode` column: hipfire MQ rows with mode="per-token" are historical
+  and measure ~7% higher mean-KLD than prefill (kernel-path numerical
+  difference, see §5.3). Do NOT cross-compare rows of different mode.
 ```
 
-## Storage and cost (rewritten with realistic numbers, S3)
+---
 
-**Bench-host commitment is much larger than rev-2 estimated.** Pre-reserve before starting. (Costs updated post-rev-3.1 to reflect dropping qwen3.5-27B; matrix is now 2 models × 5 variants × 2 archs = 20 hipfire runs.)
+## 9. Reference Distribution
 
-- **gfx1100 subset:** 5 hipfire variants × 2 models × ~67 min/run = **~11 GPU-hours**.
-- **gfx1151 subset:** 5 hipfire variants × 2 models × ~3 hours/run = **~30 GPU-hours**.
-- **GGUF anchors:** 7 runs on gfx1151 × ~1.5 hr = **~10 GPU-hours**.
-- **BF16 reference dumps:** 2 models × ~1.5 hr (gfx1151) = **~3 GPU-hours**.
-- **9B CPU BF16 sanity (m3):** ~30 min.
-- **Total: ~55 GPU-hours wall-clock.** Add ~20% padding for retries and harness shakedown → **~65 GPU-hours.**
+BF16 reference dumps are SHA-pinned, content-addressed, and uploaded to HF Hub at dataset repo [`hipfire-models/qwen-kldref`](https://huggingface.co/datasets/hipfire-models/qwen-kldref):
 
-Storage (corrected after Step 0; format β: 8 + 8*top_k bytes/token):
-- Slice text: ~1 MB in git.
-- Slice tokens.bin (post-bridge): ~8 MB if 1024 × 2048 × 4 B, in git.
-- Per-model BF16 reference (hipfire top-K β format): **~2.47 GB** on HF Hub (top_k=256: 8+8*256 = 2,056 B/token × 1175 chunks × 1023 tokens/chunk). Two models = **~4.94 GB external**. Comfortable on hipfire-models org.
-- Reference-build transient: ~597 GB of full-vocab uint16 streams from llama-perplexity per model dump, but never lands on disk — FIFO-piped through `build_kld_ref`'s top-K reducer. Disk requirement during a ref dump = ~3 GB scratch + the ~2.47 GB output.
-- Per-quant per-sequence KLDs (CI reproducibility): 1024 × 4 B per row = 4 KB; total across 20+7 rows = ~110 KB; in git or attached to the result file.
-- Optional `--keep-logs` for per-token logits (debugging only): ~2-5 GB per variant per arch, not persisted by default.
+```
+qwen3.5-9b-bf16.kldref.bin     2.48 GB  sha256 06948cd3…
+qwen3.6-27b-bf16.kldref.bin    2.48 GB  sha256 8af83b38…
+```
 
-## Open questions resolved (rev-2 → rev-3)
+(Both refs are the same size at top_k=256: per-token block is `8 + 8·top_k = 2,056 B` independent of n_vocab. n_vocab is in the header for sanity.)
 
-| # | Q | rev-3 resolution |
-|---|---|---|
-| 1 | Threshold recalibration | Outcome reframed: not a threshold. Pareto-positioning + editorial decisions replace pass/fail gate. |
-| 2 | BF16 vs Q8 reference | BF16 only, produced by llama.cpp on gfx1151 (137 GB UMA). hipfire's runtime cannot run BF16 — see B3. |
-| 3 | HF org for refs | `hipfire-models/hipfire-eval-refs` (justification in §Reference dump → HF Hub). |
-| 4 | MQ4-Lloyd inclusion | Yes, full row × both archs. Result feeds editorial decision on promotion-to-default; does NOT gate PR #197. |
-| 5 | Tokenizer divergence | Step 1.5 byte-identical check. Step 2 explicit branches: bridge if feasible, drop GGUF anchor track if not. |
-| 6 | Coherence × KLD × perf | Coherence + perf are hard ship gates (unchanged). KLD is editorial signal only. (S7) |
-| 7 | Arch coverage | Both gfx1100 and gfx1151. BF16 refs on gfx1151 only. 9B CPU sanity check (m3). |
-| 8 | Prompt-normalize default | Force OFF in eval. Canary runs both ON and OFF as a hedge. (m2) |
-| 9 | p99 as gate | No, column-only. p99 used in plot's tail-shading and per-row narrative ("tail worse than mean"). |
-| 10 | Bootstrap CI | Column in result table. Per-sequence KLDs persisted by default for reproducibility. |
-| 11 (new) | Top-K choice for 248K vocab | Step 1.6 measured (2026-05-08, on partial 9B BF16 ref): median 0.41% < 0.5% gate, p99 17.9%, max 72.0%. **Top-K=256 confirmed**, with long-tail caveat for tokens with very flat distributions (~1% of all tokens). |
-| 12 (new) | sum_exp_residual numerics | log-sum-exp + fp64 accumulation, verified against llama.cpp on canary. |
-| 13 (new) | Historical baselines comparable? | No. Document in result-file preamble. |
-| 14 (new) | KV mode for eval | `asym3`, recorded per-row. |
-| 15 (new) | DFlash τ included? | Yes, as a column on rows where a draft exists. Canonical merge_sort prompt + md5. |
-| 16 (rev-3.1) | Reference format | **Hipfire-internal top-K-reduced** (option B), derived from llama.cpp's full-vocab native format via FIFO streaming in `build_kld_ref`. Native format is too large (~318 GB/ref). |
-| 17 (rev-3.1) | llama-perplexity tokens-as-input flag | Confirmed absent on commit `9dcf83552`. Tokenizer-parity (Step 1.5) is the primary mitigation; if it fails, drop GGUF anchor track (rev-3 plan stands). |
-| 18 (rev-3.2) | Reference format detail (α vs β) | β: log-probs + sum_p_residual + reserved_pad. 8 + 8*top_k bytes/token. KLD-equivalent to α; avoids machinery to back out llama.cpp's encoded `min_log_prob` to raw logits. Used as final spec. |
-| 19 (rev-3.2) | qwen3.5-27B in eval matrix | **Dropped.** Superseded by qwen3.6-27B (newer training corpus, same parameter budget). Matrix is now 9B (qwen3.5) + 27B (qwen3.6). Drops ~20 GPU-hours from the bench commitment. |
+In-tree `benchmarks/quality-baselines/harness/manifest.json` carries per-reference `{sha256, size_bytes, host_arch, llamacpp_commit, slice_md5, top_k, n_ctx, n_vocab, n_chunk, producer_cmd, hf_repo, hf_repo_type, comment}`.
 
-## GGUF anchor architecture (rev-3.3, locked 2026-05-08)
+**Download recipe (agent + human readable):**
 
-After Step 1.5's verdict ("tokenizer parity fails but doesn't block"), the
-GGUF anchor track architecture became clearer:
+```bash
+# From repo root, one-time:
+python3 -m venv .venv
+.venv/bin/pip install huggingface_hub
 
-**The cached BF16 reference (hipfire-β format, top-K + residual) is
-sufficient input for BOTH hipfire candidates AND GGUF candidates.**
-No FIFO tee, no re-dump, no llama.cpp-native cached ref needed.
+# Pull both refs into benchmarks/quality-baselines/refs/, verify SHA256:
+./scripts/fetch-eval-refs.sh
+```
 
-Why: KLD is computed candidate-side, looking up cand's log-prob at the
-*ref's* top_indices. `eval_hipfire.rs` already does this; we add
-`eval_gguf.rs` mirroring the same KLD math but using a different
-source for cand's logits.
+`scripts/fetch-eval-refs.sh` is idempotent — files already present + matching SHA256 are skipped. The runtime examples' `verify_ref_sha256` re-checks SHA on each invocation, so a corrupted local ref is caught at run start. Alternative paths (inline `hf_hub_download` for single-file, `hf download --repo-type dataset` for CLI) documented in the harness README.
 
-| binary | cand-logit source | per-token KLD math |
-|---|---|---|
-| `build_kld_ref` (DONE) | (writes ref, no cand) | — |
-| `eval_hipfire` (DONE) | hipfire `forward_scratch` returns full vocab logits | for each tok: read ref's top_indices + top_log_probs from ref file; compute log_p_cand[ref_top_indices] from hipfire's full vocab; KLD = Σ P_ref * (log_p_ref − log_p_cand) over ref's top-K |
-| `eval_gguf` (NEW, ~half day) | spawn `llama-perplexity --kl-divergence-base <fifo>` on the GGUF candidate; read full-vocab uint16 from FIFO; reconstruct candidate's log-probs for any token via `scale * stored[i] + min_log_prob` | identical math to eval_hipfire |
+**Reference-drift canary** is a separate guard from the SHA256 check:
+- SHA256 in manifest = reference identity guard (catches re-uploads, corruption)
+- Canary fixture = harness output reproducibility guard (catches `eval_hipfire` regression that yields different KLD on the same model + same reference)
 
-Both candidate-side binaries write HFKSEQ (per-sequence mean+p99 KLD)
-that `kld_reduce.py` aggregates. `eval_gguf` is a near-clone of
-`build_kld_ref`'s FIFO-orchestration code but processes blocks
-differently (KLD against ref's top_indices instead of own top-K
-reduction).
+Canary is 11 wikitext sequences — 10 short (≤500 tokens) + 1 near-max ctx (1800–2000 tokens, catches RoPE / KV-cache drift). Per-sequence expected KLDs in `harness/canary.md` (populated from first canary run).
 
-**Residual-term enhancement (rev-3.3):** both candidate binaries should
-include a residual cross-term in the KLD computation, not drop it
-entirely. Approximation:
-- `kld_residual ≈ sum_p_residual_ref * (log(sum_p_residual_ref) − log(sum_p_residual_cand))`
-  - where `sum_p_residual_cand = 1 − Σ_{i in ref_top_K} P_cand(i)`
-- This assumes both distributions miss similarly in the tail; reduces
-  bias on flat-distribution tokens (~1% of all scored tokens have
-  residual mass > 17%, per Step 1.6).
-- Add to both `eval_hipfire.rs` and `eval_gguf.rs` in their respective
-  per-token KLD inner loops. ~5 lines each.
+---
 
-**No artifact rework needed:** the 9B BF16 ref dump in flight (and the
-27B dump still to come) produce the correct ref artifact for both
-tracks. eval_gguf is the only missing piece.
+## 10. Validation
 
-## Pivot (2026-05-11)
+Sequenced gates from cheapest to most expensive.
 
-Two scope changes since rev-3.3:
+### V0 — Pre-validation kernel-equivalence microtests (deferred to V1 failure)
 
-1. **Scoring mode for hipfire MQ is now prefill (canonical), not per-token.** Decided after V1 measured a ~7% kernel-path bias between modes on MQ4 (gfx1100 full slice, 1175 chunks; Pearson 0.949, CIs do not overlap). Prefill is both ~7× faster and ~7% closer to BF16. See `docs/plans/eval_hipfire_speedup.md` §"V1 result". The four committed per-token gfx1100 kldseqs (mq3, mq4, mq3-lloyd, mq6) are renamed to `*__per-token.kldseq` and retained as historical-only rows in the result table preamble. Re-running the MQ matrix in prefill mode is on the menu but **deferred** — see point 2.
-2. **MQ matrix is paused; focus shifts to HFP4G32 / MFP4G32.** The MQ format's coarse single-fp32-scale-per-256 grouping is structurally noisier than community K-quants by a wide margin (see partial Pareto in `results/2026-05-10/per-seq/`: hipfire MQ4 KLD 0.876 vs vanilla Q4_K_M 0.125 at near-equivalent size). HFP4/MFP4 (PR #224, PR #225) are the RDNA-optimal successors. Once 9B-HFP4G32.hfq and 9B-MFP4G32.hfq exist, the eval matrix slots them in alongside the GGUF anchors. The HFP4/MFP4 batched-prefill kernel from PR #224 v2 is deferred upstream; until it lands, those variants auto-fallback to per-token scoring (correct, ~7× slower than batchable MQ — still tolerable).
+Two of the originally-planned three V0 microtests are automatically true or unnecessary:
 
-## Sequencing (rev-3.4; status snapshot 2026-05-11 ~14:30)
+- **`rmsnorm_batched ≡ rmsnorm_f32`** verified by code inspection. `dispatch.rs:10704` and `dispatch.rs:10817` dispatch the same kernel (`kernels::RMSNORM_SRC` named `"rmsnorm_f32"`) with the same launch config. No runtime test needed.
+- **DN-state byte-equality** and **KV-cache continuity across split prefill calls** are end-to-end correctness properties that V1 validates implicitly at full-slice scale (1175 chunks × 1023 positions). If V1 passes, both hold by induction; if V1 fails, V0 fires as the localization tool.
 
-Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
+**Trigger:** if V1 on any variant reports a HARD FAIL or persistent SOFT FAIL, implement and run the DN-state + KV-cache microtests as the root-cause step.
 
-**✓ Step 0 (DONE 2026-05-08):** read `tools/perplexity/perplexity.cpp` on the pinned llama.cpp commit `9dcf83552`. Verified the `--kl-divergence-base` binary layout (full-vocab uint16, **not** top-K), `sum_exp_residual` numerics (log-sum-exp + fp64 ✓), and that `llama-perplexity` does **not** accept pre-tokenized input. Storage estimate corrected from "3-8 GB/ref" to "~318 GB/ref native, ~2.5 GB/ref hipfire-derived". **Decision:** adopt option B (hipfire-internal top-K-reduced format derived from llama.cpp's full-vocab via FIFO streaming) — ~150× smaller, fits HF, avoids 1-2 days of llama.cpp C++ patching.
+### V1 — Same-variant, same-arch A/B (when applicable)
 
-**✓ Step 1 (DONE):** harness skeleton landed. `benchmarks/quality-baselines/{slice,harness,refs,results}/` with READMEs, kldref_format.py (β format reader/writer + HFKSEQ sidecar), kld_reduce.py (bootstrap CI + result-table emitter; smoke-tested with 8 synthetic per-seq files), manifest.json schema, make_slice.sh generator (uses .venv/bin/python3), canary.md skeleton. Commits b68864a + later.
+When a variant has been scored in two modes (e.g., MQ4 per-token vs prefill on gfx1100), `kld_diff.py` computes per-sequence:
 
-**✓ Step 1.5 (DONE 2026-05-08, verdict: parity FAILS but doesn't block):** ran `tokenizer_parity.py` on the 9B BF16 GGUF (`/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-BF16.gguf`) + slice md5 `83b0205a`. hipfire produced 2,407,713 tokens, llama.cpp 2,407,712 (Δ = 1). 45.9% of positions differ; structural pattern ([2071, 110] ↔ [220, 28495]) — known llama.cpp-vs-HF Qwen BPE divergence. **Doesn't block the eval pipeline:** eval_hipfire reads token IDs from the reference file (which llama-perplexity wrote during ref dump); never re-tokenizes. See §"Step 1.5 verdict" for the full reasoning. GGUF anchor track stays viable.
-
-**✓ Step 1.6 (DONE 2026-05-08, verdict: top-K=256 confirmed):** sampled 50,000 blocks from the partial 9B BF16 ref. Median residual 0.41% (under the 0.5% gate), mean 1.81%, p99 17.94%, max 72.0%. Top-K=256 confirmed. Long-tail caveat (~1% of tokens have residual >17%) flagged for the eval write-up. Surfaced two corrections to estimates: n_vocab is 248,320 (not 151,936), n_chunk is 1175 (not 1024) — folded into the plan.
-
-**✓ Step 2 (DONE):** wrote `crates/hipfire-runtime/examples/build_kld_ref.rs` — Rust orchestrator that mkfifo's, spawns llama-perplexity, reads the full-vocab uint16 stream, top-K-reduces in-flight (fp64 accumulators), writes the hipfire β format. End-to-end-validated by running the 9B BF16 dump (Step 4). Throughput: 375 reduced tokens/sec on gfx1151. Commit a31d4f6.
-
-**✓ Step 3 (DONE):** wrote `crates/hipfire-runtime/examples/eval_hipfire.rs` — reads hipfire β reference, runs hipfire variants chunk-by-chunk via `forward_scratch`, computes per-token KLD via top-K-of-ref + residual cross-term (rev-3.3 enhancement), bins per-sequence, writes HFKSEQ. Builds clean (`cargo build --release --features deltanet`). Commits d4adac8 (initial) + f9dd19e (residual cross-term). Not yet run end-to-end; queued for Step 5.
-
-**✓ Step 4-9b (DONE 2026-05-08; HF upload 2026-05-11):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. sha256 `06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7`. **Uploaded** to dataset repo `hipfire-models/qwen-kldref` (note: not the originally-named `hipfire-eval-refs`); manifest.json wired with `hf_repo` + `hf_repo_type=dataset`; `scripts/fetch-eval-refs.sh` smoke-tested end-to-end. **Canary verification (both NORMALIZE_PROMPT settings) deferred — not blocking PR.**
-
-**✓ Step 5 part-A (DONE 2026-05-08; partial — 4/5 variants, gfx1100 only):** ran hipfire per-token track for 9B-MQ3, MQ4, MQ3-Lloyd, MQ6 on gfx1100. ~7 h/run × 4 = ~28 GPU-h. Outputs at `results/2026-05-08/per-seq/*__per-token.kldseq` (renamed 2026-05-11 to the `__<mode>` 3-segment convention). Per-token mq4 slice-mean 0.876; mq3 2.62; mq3-lloyd 1.69; mq6 0.625. The MQ4 row is the canary-expected source. **9B-Q8 + 9B-MQ4-Lloyd per-token runs not done; gfx1151 hipfire pass not done; deferred per Pivot.**
-
-**✓ Step 5 part-B (DONE 2026-05-11):** implemented `eval_hipfire --scoring-mode prefill` (see `docs/plans/eval_hipfire_speedup.md`). Canonical V1 result on gfx1100 MQ4 prefill (full slice, 1175 chunks): KLD 0.817, PPL 14.89 — committed at `results/2026-05-11/per-seq/qwen3.5-9b.mq4__gfx1100__prefill.kldseq`. Prefill is now the canonical hipfire scoring mode going forward. The 4 per-token kldseqs above are retained as historical-only.
-
-**✓ Step 6 part-A (DONE 2026-05-09; HF upload 2026-05-11):** dumped 27B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin`, **2.48 GB**, 2h 3m wall-time, 162 reduced tokens/sec. Same shape as 9B (per-token block size depends on top_k, not n_vocab). sha256 `8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446`. **Required `--no-mmap`** (now passed automatically by build_kld_ref): demand-paging on 50 GB BF16 weights caused eviction-cycle stall on the 124 GB UMA host until enabled. **Uploaded** to dataset repo `hipfire-models/qwen-kldref`. **Step 6 part-B (27B hipfire matrix) deferred per Pivot.**
-
-**✓ Step 7.A (DONE 2026-05-08):** wrote `crates/hipfire-runtime/examples/eval_gguf.rs` — mirrors eval_hipfire.rs's KLD math but uses FIFO-streamed llama-perplexity as the candidate-logit source. Same residual cross-term as eval_hipfire. Builds clean.
-
-**✓ Step 7.B (DONE 2026-05-10):** ran 7 GGUF anchor candidates on the 9B BF16 ref on gfx1151: Q8_0, Q6_K, Q4_K_M, UD-Q3_K_XL, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL. ~50 min/run × 7 = ~6 GPU-h. All under `results/2026-05-10/per-seq/qwen3.5-9b.gguf-*__gfx1151.kldseq`. Q8_0 KLD 0.0163 (near-lossless floor); UD-Q4_K_XL 0.0670 (unsloth's dynamic 4-bit beats vanilla Q4_K_M 0.1249 by ~1.9×). Commit `6c00a55`. **27B anchor runs deferred per Pivot.**
-
-**⏸ Step 8 (DFlash τ):** deferred per Pivot. Plan was to measure τ for each variant where a draft model exists; the editorial usefulness ("MQ4-Lloyd has lower mean-KLD than MQ4-uniform but lower τ — don't promote") is moot since the MQ family is no longer the active focus.
-
-**⏸ Step 9 (writeup):** deferred per Pivot. The Pareto plot that would land in `results/2026-05-XX-quant-pareto.md` should wait until HFP4/MFP4 candidates exist — without them the hipfire side of the plot is just "MQ is much worse than community Q-quants," which is already conclusively shown by the partial data and doesn't need a writeup of its own.
-
-**— Step 10 (optional, deferred):** Unsloth corroboration plot.
-
-**— Step 11 (follow-up, not this PR):** HFP4G32 / MFP4G32 eval slots once .hfq files exist for 9B (auto-fallback path is wired). p99-gate calibration. GEMV single-acc port if cross-arch KLD delta is >10%.
-
-### Code-state snapshot
-
-| File / artifact | Status |
+| metric | tolerance |
 |---|---|
-| `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt` | ✓ committed (10.5 MB, md5 `83b0205a304bf4e52172ecdb05f2e895`) |
-| `benchmarks/quality-baselines/slice/slice.md5` | ✓ committed |
-| `benchmarks/quality-baselines/slice/make_slice.sh` | ✓ committed (uses .venv/bin/python3) |
-| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; both 9B and 27B refs registered with sha256 + producer_cmd + `hf_repo: hipfire-models/qwen-kldref` + `hf_repo_type: dataset` (uploaded 2026-05-11) |
-| `benchmarks/quality-baselines/harness/kldref_format.py` | ✓ committed (β format reader/writer) |
-| `benchmarks/quality-baselines/harness/kld_reduce.py` | ✓ committed (bootstrap CI + table emitter) |
-| `benchmarks/quality-baselines/harness/tokenizer_parity.py` | ✓ committed (full impl, tested 2026-05-08) |
-| `benchmarks/quality-baselines/harness/canary.md` | ✓ committed (11 sequences populated; expected KLDs TBD) |
-| `benchmarks/quality-baselines/harness/eval_gguf.sh` | deleted (was stub); superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
-| `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on both 9B + 27B; auto-passes `--no-mmap` to llama-perplexity (commit `52879fe`) |
-| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed; `--scoring-mode prefill` (default) + `--max-chunks N` + auto-mkdir output. End-to-end-validated 2026-05-11 on gfx1100 MQ4 (1175 chunks, slice-mean 0.817). |
-| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed; end-to-end-validated 2026-05-10 on all 7 9B GGUF anchors on gfx1151. |
-| `crates/hipfire-runtime/examples/prefill_microbench.rs` | ✓ committed; Step 0 gate. 9B-MQ4 19-20× speedup on both gfx1100 and gfx1151. |
-| `crates/hipfire-runtime/examples/tokenize_slice.rs` | ✓ committed (used by tokenizer_parity.py) |
-| `benchmarks/quality-baselines/harness/kld_diff.py` | ✓ committed; V1/V2 four-metric A/B (mean delta, Pearson per-seq, p99 \|Δ\|, bootstrap CI overlap). |
-| `scripts/fetch-eval-refs.sh` | ✓ committed (M5; uses `.venv/bin/python3` + huggingface_hub) |
-| `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 53 min wall, 2026-05-08); local only (gitignored) |
-| `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 2h 3m wall, 2026-05-09); local only (gitignored) |
+| mean delta abs / rel | per-variant, empirically calibrated |
+| Pearson per-seq | ≥ 0.9999 expected, but kernel-path mode differences relax this (see §5.3) |
+| p99 \|Δseq\| | ≤ 5% of variant's mean KLD |
+| 95% bootstrap CI overlap | yes |
 
-### Sibling work executed
+For prefill-vs-per-token A/B on hipfire MQ formats, the gates intentionally fail — that's how we discovered the kernel-path divergence is real (§5.3). The diff tool is the diagnostic; the verdict is editorial.
 
-- **PR #201 cherry-picked** into this branch (commits 1d8c140 + 4f99c19): O(N²) → O(N log N) BPE encoder fix. Reduced full-slice tokenization from a projected ~30 min to **19 sec actual**. Made `tokenize_slice.rs` + `tokenizer_parity.py` tractable.
-- **llama.cpp `build-strix` rebuilt** against ROCm 7.12 + gfx1151 with all targets (50+ binaries: llama-perplexity, llama-tokenize, llama-cli, etc.). Local path: `/home/kread/git/llm/llama.cpp/build-strix/bin/`. Required because the existing build was linked against `libamdhip64.so.6` (rocm-7.1) which doesn't exist on the system; rocm-7.12 ships `.so.7`.
-- **Project venv at `.venv/`**: holds `numpy`, `datasets`, `huggingface_hub`, etc. for the harness's Python scripts. Per the repo-preference memory: Python deps go in venv, not pip --user.
+### V2 — Canary-fixture pre-commit gate
 
-### What's done since rev-3.3 (2026-05-11 PR scope)
+`eval_hipfire` on the 11-seq canary fixture, then `kld_diff.py` against the committed expected-KLDs in `canary.md`. Runs in a few minutes. Catches harness regressions on the live decode path. Limitation: cannot detect shared-mode bugs that affect both modes identically; issue-113's existing coherence-gate is the backstop.
 
-1. **9B BF16 ref uploaded to HF** at `hipfire-models/qwen-kldref` (dataset repo). Manifest wired; `scripts/fetch-eval-refs.sh` smoke-tested end-to-end.
-2. **27B BF16 ref uploaded to HF** at the same dataset repo.
-3. **9B-MQ4 canary completed** on gfx1100; slice-mean KLD 0.876 (per-token mode). canary.md still TBD-populated, but the kldseq is the reference data.
-4. **Partial hipfire matrix on gfx1100** (4 of 5 variants in per-token mode: MQ3, MQ4, MQ3-Lloyd, MQ6) — committed at `results/2026-05-08/per-seq/`. MQ4-Lloyd and Q8 not done; deferred.
-5. **7 GGUF anchor runs on gfx1151** complete and committed at `results/2026-05-10/per-seq/`.
-6. **eval_hipfire prefill mode** shipped (sibling plan: `docs/plans/eval_hipfire_speedup.md`); V1 result confirms ~7% kernel-path bias between modes, prefill is canonical going forward.
+### V3 — Cross-arch sanity (gfx1100 ≡ gfx1151)
 
-### What's deferred (not blocking PR; mostly post-Pivot)
+Same variant in same mode on both archs. Divergence > canary tolerance is a finding (multi-acc decode drift surfaces as quant-quality artifact). Required when both archs have a committed row.
 
-1. **27B hipfire matrix** (Step 6 part-B, would be ~150 GPU-h; deferred per Pivot — MQ pivot supersedes).
-2. **9B-Q8 + 9B-MQ4-Lloyd per-token rows** on gfx1100 (not strictly needed under the Pivot).
-3. **DFlash τ column** (Step 8) — editorial signal moot under the Pivot.
-4. **Pareto writeup** (Step 9) — wait until HFP4/MFP4 candidates exist.
-5. **gfx1151 hipfire pass** (V3 cross-arch sanity) — partial 9B-MQ3 + 9B-MQ4 50-chunk data lives in `/tmp/smoke/` from validation but not committed; the 50-chunk partials show ~7-8% prefill-vs-per-token bias consistent with the gfx1100 full-slice result.
-6. **HFP4G32 / MFP4G32 .hfq files for 9B** — depend on `hipfire-quantize --format hfp4` runs (separate work; eval-side support is already wired through auto-fallback).
+### V5 — `--max-chunks N` for dev smoke
 
-## References
+50-chunk runs (~5–8 min) for code-correctness smoke during development. **Not a substitute** for full-slice statistics — Pearson ≥ 0.9999 over 50 chunks is a much weaker test than over 1175 (variance ~1/N).
 
-- Issue #113 — uniform MQ3 quality (this doc supersedes the PPL-only / 5%-gate scoping).
-- Issue #116 — Lloyd-MQ3 ship gates (this doc adds *positioning*, not a third gate).
-- Issue #182 / PR #197 — MQ4-Lloyd WMMA prefill (this doc decides promotion-to-default *post-merge*, not whether PR #197 itself merges).
-- PR #195 — MQ3-Lloyd WMMA prefill (merged 2026-05-08; phase C devlog establishes ship gates that this eval *informs* but does not replace).
-- `docs/plans/mq-sub4bit-prd.md` Section 3 — quality validation requirement.
-- `docs/plans/mq-sub4bit-research-queue.md` Q1 — Lloyd-Max codebook research item.
-- `benchmarks/results/lloyd_max_findings_20260501.md` — empirical Lloyd writeup. **Note: corpus referenced (`dev/bench/data/wikitext2-test.txt`) is not committed; PPL numbers are not reproducible.**
-- CLAUDE.md "Prompt-structure τ sensitivity" — byte-identical prompt rule for the DFlash τ column.
+---
+
+## 11. Pivot (2026-05-11)
+
+Two scope changes from rev-3.3:
+
+1. **Prefill canonical for hipfire scoring.** V1 measured a ~7% systematic kernel-path bias between prefill and per-token (gfx1100 9B-MQ4 full slice; Pearson 0.949; CIs do not overlap). Prefill is both ~7× faster AND ~7% closer to BF16. The four pre-existing per-token gfx1100 kldseqs are renamed `*__per-token.kldseq` and retained as historical-only rows.
+2. **MQ matrix is paused; HFP4G32 / MFP4G32 are the canonical hipfire focus.** Partial Pareto data is conclusive: hipfire MQ4 KLD 0.876 vs vanilla Q4_K_M 0.125 at near-equivalent size on the 9B slice — the MQ family's coarse single-fp32-scale-per-256 grouping is structurally noisier than community K-quants. PR #224 / #225 introduced HFP4 / MFP4 — RDNA-optimal successors with two-level scaling (UE8M0 g32 + FP16 row). Once 9B .hfq files exist for those formats, they slot in as the canonical hipfire-side rows.
+
+---
+
+## 12. Storage & Cost
+
+| line item | wall-clock | storage |
+|---|---|---|
+| Slice text | — | ~10 MB in git |
+| BF16 reference dumps (gfx1151, one-time per model) | 2 models × ~1.5–2 h | ~2.48 GB/ref × 2 = 4.96 GB on HF |
+| Reference-build transient (FIFO, never disk) | — | ~318 GB streamed |
+| Per-quant per-sequence KLDs | — | ~28 KB/run (1175 × 24 B) |
+| GGUF anchors (7 × 9B, gfx1151) | ~50 min/run × 7 = ~6 GPU-h | done; committed |
+| Hipfire 9B per-token (5 variants × 2 archs) | ~7 h/run × 10 = ~70 GPU-h | historical, partial committed |
+| Hipfire 9B prefill (5 variants × 2 archs) | ~1 h/run × 10 = ~10 GPU-h | partial (MQ4 gfx1100 committed) |
+| Hipfire 27B (5 variants × 2 archs) | ~14–18 h per-token / ~2–5 h prefill | deferred per Pivot |
+
+---
+
+## 13. Current State
+
+**Done:**
+- Harness skeleton: slice fixture (md5 `83b0205a304bf4e52172ecdb05f2e895`), `kldref_format.py`, `kld_reduce.py` (Mode column), `kld_diff.py`, `tokenizer_parity.py`, `make_slice.sh`, `canary.md` skeleton.
+- Runtime binaries: `build_kld_ref` (FIFO + top-K reduce + auto-`--no-mmap`), `eval_hipfire` (`--scoring-mode prefill` default + `--max-chunks N` + auto-mkdir), `eval_gguf` (FIFO + ref-token-equality check + residual cross-term), `prefill_microbench` (Step 0 gate), `tokenize_slice` (used by tokenizer_parity.py).
+- BF16 references: 9B (gfx1151, 53 min, 375 reduced tok/s) + 27B (gfx1151, 2h 3m, 162 reduced tok/s). Uploaded to `hipfire-models/qwen-kldref` (dataset); manifest wired; fetch script smoke-tested end-to-end.
+- Hipfire data: 4 historical per-token kldseqs (MQ3, MQ4, MQ3-Lloyd, MQ6 on gfx1100); 1 canonical prefill kldseq (MQ4 on gfx1100 full slice = 0.817).
+- GGUF anchors: all 7 9B anchors on gfx1151 (Q8_0/Q6_K/Q4_K_M + UD-Q3/Q4/Q5/Q6_K_XL). Q8_0 establishes the near-lossless floor (KLD 0.0163); UD-Q4_K_XL beats vanilla Q4_K_M by ~1.9× (0.067 vs 0.125).
+- Scoring-mode A/B: V1 gfx1100 MQ4 full slice + gfx1151 MQ3/MQ4 partial (50 chunks). Kernel-path divergence confirmed cross-arch.
+
+**Deferred (post-Pivot, not blocking PR):**
+- 27B hipfire matrix (~150 GPU-h).
+- 9B-Q8 + 9B-MQ4-Lloyd hipfire rows on gfx1100.
+- gfx1151 hipfire full-slice pass.
+- DFlash τ column (Step 8) — editorial signal mooted by Pivot.
+- Pareto writeup (Step 9) — wait until HFP4/MFP4 .hfq files exist.
+- HFP4G32 / MFP4G32 .hfq files for 9B (depends on `hipfire-quantize --format hfp4`; eval-side is wired through auto-fallback).
+
+---
+
+## 14. References
+
+### Issues / PRs
+
+- #113 — uniform MQ3 quality (this PRD supersedes the PPL-only / 5%-gate scoping).
+- #116 — Lloyd-MQ3 ship gates (this PRD adds *positioning*, not a third gate).
+- #182 / PR #197 — MQ4-Lloyd WMMA prefill.
+- PR #195 — MQ3-Lloyd WMMA prefill (merged 2026-05-08).
+- PR #201 — O(N²) → O(N log N) BPE encoder (cherry-picked into this branch; made `tokenize_slice` tractable).
+- PR #224 — HFP4G32 quant family (RDNA-optimal FP4 + UE8M0 g32 + FP16 row scale).
+- PR #225 — MFP4G32 (HFP4G32 + offline FWHT, drop-in MQ4 replacement).
+
+### Repo docs
+
+- `docs/quant-formats/hfp4.md` — HFP4G32 binary format spec.
+- `docs/plans/mq-sub4bit-prd.md` — MQ family research PRD.
+- `benchmarks/results/lloyd_max_findings_20260501.md` — historical Lloyd writeup (corpus not committed; PPL numbers not reproducible).
+- CLAUDE.md — "Prompt-structure τ sensitivity" rule.
+
+### External
+
 - llama.cpp `llama-perplexity` `--kl-divergence` / `--kl-divergence-base` modes.
-- Unsloth Qwen3.6 GGUF Pareto plot (https://unsloth.ai/docs/models/qwen3.6).
+- llama.cpp pinned commit: `9dcf83552887bb898b4a98a5761361e504e31fc3`.
+- Unsloth Qwen3.6 GGUF Pareto plot: https://unsloth.ai/docs/models/qwen3.6.
+- HF dataset: https://huggingface.co/datasets/hipfire-models/qwen-kldref.
