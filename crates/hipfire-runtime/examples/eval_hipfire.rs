@@ -15,7 +15,7 @@
 //!                [--kv-mode <mode>=asym3] \
 //!                [--scoring-mode <per-token|prefill>=per-token]
 //!
-//! Scoring modes (per docs/plans/eval_hipfire_speedup.md):
+//! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5):
 //!   prefill:   (default, canonical since 2026-05-11) forward_prefill_batch
 //!              (transformer stack batched, lm_head fan-out per scored
 //!              position). ~7× wall-clock vs per-token on gfx1100/gfx1151
@@ -146,7 +146,7 @@ fn main() {
     );
 
     // -------- ref sha256 sanity (M1) --------
-    verify_ref_sha256(&args.ref_path);
+    hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
     // -------- load model --------
     let mut hfq = HfqFile::open(&args.model).expect("open model");
@@ -243,9 +243,9 @@ fn main() {
     // with per_token_hidden_out=Some(buf) writes one row per scored token
     // (post-output-norm hidden state); we then loop weight_gemv per row to
     // recover logits — the "option C / per-token GPU lm_head fan-out"
-    // resolution from the rev-2 plan (§"lm_head fan-out options").
+    // resolution from PRD §5 lm_head fan-out options.
     // Shape: [scored_per_chunk, dim]; ~16 MB at scored_per_chunk=1023, dim=4096.
-    let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
+    // `scored_per_chunk` already bound above at line ~188.
     let hidden_buf = if args.scoring_mode == "prefill" {
         Some(
             gpu.alloc_tensor(&[scored_per_chunk, config.dim], DType::F32)
@@ -321,7 +321,14 @@ fn main() {
             kld_token += sum_p_residual_ref
                 * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
         }
-        if kld_token < 0.0 && kld_token > -1e-6 { kld_token = 0.0; }
+        // KLD ≥ 0 by Gibbs' inequality. Tiny negatives are fp64 roundoff on
+        // ~257-term sums; >1e-9 magnitudes indicate a math bug. debug_assert
+        // surfaces the latter in dev builds; release runs clamp at 0.
+        debug_assert!(
+            kld_token >= -1e-9,
+            "negative KLD beyond fp roundoff: {kld_token}"
+        );
+        let kld_token = kld_token.max(0.0);
 
         let nll = if actual_next < cand_logits.len() {
             Some(-((cand_logits[actual_next] as f64) - log_z))
@@ -369,7 +376,7 @@ fn main() {
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
                     eprint!(
                         "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        c + 1, n_chunk, total_scored_done, total_scored, pct, rate
+                        c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
                     );
                 }
             }
@@ -426,7 +433,7 @@ fn main() {
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
                     eprint!(
                         "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        c + 1, n_chunk, total_scored_done, total_scored, pct, rate
+                        c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
                     );
                 }
             }
@@ -495,61 +502,5 @@ fn main() {
     eprintln!("eval_hipfire: wrote {}", args.output.display());
 }
 
-/// Verify the reference file's sha256 against
-/// `<repo>/benchmarks/quality-baselines/harness/manifest.json`.
-///
-/// Layout assumption: ref lives at `.../refs/<name>.kldref.bin`,
-/// manifest at `.../harness/manifest.json` (sibling to refs/).
-///
-/// If the manifest entry is absent, warn and continue (developer
-/// pre-upload state). If sha256 disagrees, abort.
-#[cfg(feature = "deltanet")]
-fn verify_ref_sha256(ref_path: &std::path::Path) {
-    use std::process::Command;
-    let manifest_path = match ref_path.parent().and_then(|p| p.parent()) {
-        Some(p) => p.join("harness").join("manifest.json"),
-        None => {
-            eprintln!("warning: cannot locate harness/manifest.json; skipping ref sha256 check");
-            return;
-        }
-    };
-    if !manifest_path.exists() {
-        eprintln!("warning: {} missing; skipping ref sha256 check", manifest_path.display());
-        return;
-    }
-    let manifest_file = std::fs::File::open(&manifest_path)
-        .expect("open manifest.json");
-    let manifest: serde_json::Value = serde_json::from_reader(manifest_file)
-        .expect("parse manifest.json");
-    let ref_name = ref_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let expected = manifest
-        .get("references")
-        .and_then(|r| r.get(ref_name))
-        .and_then(|r| r.get("sha256"))
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    let expected = match expected {
-        Some(s) => s,
-        None => {
-            eprintln!("warning: no manifest entry / sha256 for {ref_name}; skipping check");
-            return;
-        }
-    };
-    eprintln!("eval_hipfire: computing sha256 of {} ...", ref_path.display());
-    let out = Command::new("sha256sum")
-        .arg(ref_path)
-        .output()
-        .expect("invoke sha256sum");
-    let actual = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(String::from)
-        .expect("empty sha256sum output");
-    if actual != expected {
-        eprintln!("ERROR: ref sha256 mismatch for {}", ref_path.display());
-        eprintln!("  expected: {expected}");
-        eprintln!("  actual:   {actual}");
-        std::process::exit(2);
-    }
-    eprintln!("eval_hipfire: verified ref sha256 = {actual}");
-}
+// (verify_ref_sha256 now lives in hipfire_runtime::eval_common — see
+// crates/hipfire-runtime/src/eval_common.rs)

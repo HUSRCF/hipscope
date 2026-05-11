@@ -110,10 +110,38 @@ def reduce_one(path: Path) -> Row:
 
 
 def render_markdown_table(rows: list[Row]) -> str:
+    """Render rows grouped by scoring_mode so historical per-token rows are
+    visually separated from canonical prefill rows. Mixed-mode tables emit a
+    prominent warning at the top — see PRD §5.3 ("modes are separate
+    measurement classes; do not cross-compare").
+    """
     out = []
+
+    # Detect mode-collision: same (variant, arch) with multiple scoring modes.
+    by_key: dict[tuple[str, str], set[str]] = {}
+    for r in rows:
+        by_key.setdefault((r.variant, r.arch), set()).add(r.scoring_mode)
+    mixed = {k: v for k, v in by_key.items() if len(v) > 1}
+
+    if mixed:
+        out.append(
+            "> ⚠️  **Mixed-mode rows detected.** The following (variant, arch) "
+            "pairs have rows in more than one scoring mode. KLDs from "
+            "different modes are NOT directly comparable (kernel-path "
+            "numerical effect, ~7% mean shift on hipfire MQ; see PRD §5.3)."
+        )
+        out.append(">")
+        for (v, a), modes in sorted(mixed.items()):
+            out.append(f">  - `{v}` @ `{a}` → {sorted(modes)}")
+        out.append("")
+
     out.append("| Variant | Arch | Mode | n_chunks | Mean KLD ± 95% CI | p99 KLD | PPL | Notes |")
     out.append("|---|---|---|---:|---|---:|---:|---|")
-    for r in sorted(rows, key=lambda r: (r.variant, r.arch, r.scoring_mode)):
+
+    # Group by mode: prefill (canonical) first, then per-token (historical),
+    # then gguf (anchors). Within each group, sort by (variant, arch).
+    mode_order = {"prefill": 0, "per-token": 1, "gguf": 2}
+    for r in sorted(rows, key=lambda r: (mode_order.get(r.scoring_mode, 99), r.variant, r.arch)):
         ci = f"{r.mean_kld:.4f} (CI {r.mean_kld_ci_lo:.4f}–{r.mean_kld_ci_hi:.4f})"
         ppl = f"{r.ppl:.3f}" if r.ppl is not None else "—"
         out.append(f"| {r.variant} | {r.arch} | {r.scoring_mode} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |")
