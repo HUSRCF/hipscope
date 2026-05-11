@@ -359,20 +359,33 @@ HIPFIRE_NORMALIZE_PROMPT=0     # raw byte-stream-through; eval is byte-determini
 HIPFIRE_GRAPH=0                # capture-mode adds capture-illegal paths; eval doesn't need it
 HIPFIRE_KV_MODE=asym3          # canonical KV-mode for ship benches (M6)
 HIPFIRE_LLOYD_GFX12=1          # if running on gfx1200/1201 — see PR #195 hardening commit
+HIPFIRE_PREFILL_REUSE_PBS=1    # caller-owned PrefillBatchScratch; set automatically by
+                               # --scoring-mode prefill so the 1175 chunk calls don't
+                               # each pay ~25-tensor alloc/free overhead
 ```
 
-All four recorded per-row in the result table so future replays match.
+Also (canonical from 2026-05-11):
+
+```
+--scoring-mode prefill         # forward_prefill_batch + per-token GPU weight_gemv
+                               # lm_head fan-out. ~7× wall-clock vs per-token. See
+                               # docs/plans/eval_hipfire_speedup.md §"V1 result".
+```
+
+All recorded per-row in the result table so future replays match.
+
+**On the scoring-mode flip (2026-05-11):** `eval_hipfire` originally only had a per-token scoring path (forward_scratch × n_ctx). The eval_hipfire_speedup plan landed `--scoring-mode prefill` and V1 measured a ~7% systematic mean-KLD shift between modes on hipfire MQ formats (prefill lower because GEMM's multi-accumulator reductions average fp16/fp32 partial-sum noise that per-token GEMV doesn't). The two modes are separate measurement classes, not equivalent. **Prefill is canonical going forward**; the four existing committed per-token gfx1100 kldseqs (`qwen3.5-9b.{mq3,mq4,mq3-lloyd,mq6}__gfx1100__per-token.kldseq` in `results/2026-05-08/per-seq/`) are retained as `scoring_mode=per-token` historical rows in the result table preamble. Re-running them in prefill mode is on the path to producing the canonical Pareto.
 
 **On NORMALIZE_PROMPT off (m2):** Gemini's adversarial review argued raw-byte-stream might push the model into garbage-in-garbage-out logit regions. We disagree — wikitext-2 is well-formed text without weird whitespace runs; normalize OFF doesn't push the model into a degenerate input regime. As a hedge, **the canary fixture runs with both `NORMALIZE_PROMPT=0` and `=1`**. If KLD diverges meaningfully between the two, that's a finding (and we revisit the choice). If they're identical, confirms eval-mode-OFF is a safe choice for the bulk run.
 
 **Historical-baseline drift caveat (M4 + M5):** `HIPFIRE_NORMALIZE_PROMPT` was flipped to ON by default on 2026-04-26. The Lloyd findings doc (`lloyd_max_findings_20260501.md`) is from after that date, so its baselines were likely run with normalize ON. The new eval forces OFF. **PPLs in the new table will not reproduce historical baselines on the same corpus** — and that mismatch will look like a regression unless flagged. Same caveat applies to `HIPFIRE_GRAPH`. Document in §"Result table format" below.
 
-## Result table format (rev-3 schema)
+## Result table format (rev-3 schema; rev-3.4 adds `Mode` column)
 
 ```markdown
-| Model     | Variant       | Arch    | Size GB | Mean KLD ± 95% CI | p99 KLD | PPL    | DFlash τ | Notes |
-|-----------|---------------|---------|---------|--------------------|---------|--------|----------|-------|
-| 9B        | Q8-uniform    | gfx1100 | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | reference proxy |
+| Model     | Variant       | Arch    | Mode      | Size GB | Mean KLD ± 95% CI | p99 KLD | PPL    | DFlash τ | Notes |
+|-----------|---------------|---------|-----------|---------|--------------------|---------|--------|----------|-------|
+| 9B        | Q8-uniform    | gfx1100 | prefill   | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | reference proxy |
 | 9B        | Q8-uniform    | gfx1151 | 9.4     | 0.0008 ± 0.0001    | 0.012   | 9.81   | n/a      | within canary tol |
 | 9B        | MQ4-uniform   | gfx1100 | 5.2     | 0.014 ± 0.002      | 0.18    | 10.34  | 8.05     | |
 | 9B        | MQ4-uniform   | gfx1151 | 5.2     | 0.014 ± 0.002      | 0.18    | 10.34  | 8.10     | |
@@ -405,6 +418,14 @@ Numbers above are illustrative — real numbers come from the eval runs.
   single contiguous window, not multi-sequence. Cross-PR PPL
   reproduction is not attempted.
 - Both archs use HIPFIRE_KV_MODE=asym3.
+- `Mode` column indicates eval_hipfire scoring mode for hipfire MQ rows
+  (canonical: prefill, since 2026-05-11) or "gguf" for llama.cpp GGUF
+  anchors. Rows with mode="per-token" are historical (the four
+  qwen3.5-9b.{mq3,mq4,mq3-lloyd,mq6}__gfx1100__per-token.kldseq files
+  from 2026-05-08); they measure a ~7% higher mean-KLD than the prefill
+  re-run will, on the same model + slice. See
+  docs/plans/eval_hipfire_speedup.md §"V1 result" for the kernel-path
+  numerical analysis. **Do not cross-compare rows of different mode.**
 ```
 
 ## Storage and cost (rewritten with realistic numbers, S3)

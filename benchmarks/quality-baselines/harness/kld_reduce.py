@@ -7,8 +7,15 @@ as markdown + a JSON sidecar for plotting.
 
 Inputs:
   --result-dir <dir>     directory of per-sequence-KLD files (HFKSEQ format)
-                         filename convention: <variant>__<arch>.kldseq
-                         e.g., qwen3.5-9b-mq3-uniform__gfx1100.kldseq
+                         filename convention:
+                           <variant>__<arch>__<scoring_mode>.kldseq   (preferred)
+                           <variant>__<arch>.kldseq                   (legacy: auto-tagged
+                                                                       scoring_mode="gguf"
+                                                                       if variant contains
+                                                                       "gguf-", else
+                                                                       "per-token")
+                         e.g., qwen3.5-9b.mq3__gfx1100__prefill.kldseq
+                               qwen3.5-9b.gguf-q4_k_m__gfx1151.kldseq
 
 Output:
   result-table.md        markdown table with mean ± CI, p99, etc.
@@ -39,6 +46,10 @@ from kldref_format import read_per_seq_kld  # noqa: E402
 class Row:
     variant: str
     arch: str
+    scoring_mode: str       # "prefill" (canonical hipfire), "per-token" (legacy hipfire),
+                            # "gguf" (eval_gguf anchors). See docs/plans/eval_hipfire_speedup.md
+                            # §"V1 result" for why per-token and prefill are separate
+                            # measurement classes for hipfire variants.
     n_chunks: int
     mean_kld: float
     mean_kld_ci_lo: float    # 95% bootstrap lower
@@ -58,18 +69,32 @@ def bootstrap_mean_ci(values: np.ndarray, n_boot: int = 10_000, seed: int = 0) -
     return float(values.mean()), float(np.percentile(boot_means, 2.5)), float(np.percentile(boot_means, 97.5))
 
 
-def parse_filename(name: str) -> tuple[str, str]:
-    """qwen3.5-9b.mq3-uniform__gfx1100.kldseq → ('qwen3.5-9b.mq3-uniform', 'gfx1100')"""
+def parse_filename(name: str) -> tuple[str, str, str]:
+    """Returns (variant, arch, scoring_mode).
+
+    Preferred form (3 fields): <variant>__<arch>__<scoring_mode>.kldseq
+      e.g. qwen3.5-9b.mq3__gfx1100__prefill.kldseq
+
+    Legacy form (2 fields): <variant>__<arch>.kldseq
+      Auto-tagged: scoring_mode="gguf" if "gguf" in variant else "per-token".
+      (The legacy hipfire kldseqs in 2026-05-08 were all per-token.)
+    """
     stem = Path(name).stem  # strip .kldseq
-    if "__" not in stem:
-        raise ValueError(f"filename {name!r} doesn't match <variant>__<arch>.kldseq convention")
-    variant, arch = stem.rsplit("__", 1)
-    return variant, arch
+    parts = stem.split("__")
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        variant, arch = parts
+        scoring_mode = "gguf" if "gguf" in variant else "per-token"
+        return variant, arch, scoring_mode
+    raise ValueError(
+        f"filename {name!r} doesn't match <variant>__<arch>[__<scoring_mode>].kldseq"
+    )
 
 
 def reduce_one(path: Path) -> Row:
     means, p99s, nlls = read_per_seq_kld(path)
-    variant, arch = parse_filename(path.name)
+    variant, arch, scoring_mode = parse_filename(path.name)
     means_arr = np.asarray(means, dtype=np.float64)
     p99s_arr = np.asarray(p99s, dtype=np.float64)
     nlls_arr = np.asarray(nlls, dtype=np.float64)
@@ -78,7 +103,7 @@ def reduce_one(path: Path) -> Row:
     finite_nll = nlls_arr[np.isfinite(nlls_arr)]
     ppl: float | None = float(np.exp(finite_nll.mean())) if finite_nll.size else None
     return Row(
-        variant=variant, arch=arch, n_chunks=len(means),
+        variant=variant, arch=arch, scoring_mode=scoring_mode, n_chunks=len(means),
         mean_kld=mean, mean_kld_ci_lo=ci_lo, mean_kld_ci_hi=ci_hi,
         p99_kld=p99, ppl=ppl,
     )
@@ -86,12 +111,12 @@ def reduce_one(path: Path) -> Row:
 
 def render_markdown_table(rows: list[Row]) -> str:
     out = []
-    out.append("| Variant | Arch | n_chunks | Mean KLD ± 95% CI | p99 KLD | PPL | Notes |")
-    out.append("|---|---|---:|---|---:|---:|---|")
-    for r in sorted(rows, key=lambda r: (r.variant, r.arch)):
+    out.append("| Variant | Arch | Mode | n_chunks | Mean KLD ± 95% CI | p99 KLD | PPL | Notes |")
+    out.append("|---|---|---|---:|---|---:|---:|---|")
+    for r in sorted(rows, key=lambda r: (r.variant, r.arch, r.scoring_mode)):
         ci = f"{r.mean_kld:.4f} (CI {r.mean_kld_ci_lo:.4f}–{r.mean_kld_ci_hi:.4f})"
         ppl = f"{r.ppl:.3f}" if r.ppl is not None else "—"
-        out.append(f"| {r.variant} | {r.arch} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |")
+        out.append(f"| {r.variant} | {r.arch} | {r.scoring_mode} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |")
     return "\n".join(out)
 
 
