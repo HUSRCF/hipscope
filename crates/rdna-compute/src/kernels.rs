@@ -53,15 +53,23 @@ pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../..
 pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma.hip");
 /// gfx12 (RDNA4) sibling — code-complete but runtime-unvalidated locally per Phase B1 plan.
 pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma.gfx12.hip");
+/// MQ3-Lloyd batch-fanout (mb4) family — 16×64 output tile per WG, 4 batch
+/// sub-tiles share A_reg decode. Same multi-batch-tile pattern as the
+/// MQ4-Lloyd mb4 family. gfx11 only (gfx12 sibling deferred).
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma_mb4.hip");
+
 /// MQ3G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
 pub const GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd_wmma.hip");
 pub const GEMM_QKVZA_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ3G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd_wmma_mb4.hip");
 /// MQ3G256Lloyd WMMA fused QKV (FA preamble: q + k + v, 3-way).
 pub const GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd_wmma.hip");
 pub const GEMM_QKV_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ3G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd_wmma_mb4.hip");
 /// MQ3G256Lloyd WMMA fused gate+up (FFN, 2-way).
 pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma.hip");
 pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma_mb4.hip");
 
 /// Returns the MQ3G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch. Mirrors `gemm_hfq3g256_residual_wmma_for_arch`'s arch matrix.
@@ -74,6 +82,15 @@ pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
         _ => (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq3g256_lloyd_residual_wmma"),
     }
 }
+/// MQ3-Lloyd mb4 residual selector. gfx11 only — gfx12 sibling deferred.
+pub fn gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_MB4_SRC, "gemm_mq3g256_lloyd_residual_wmma_mb4_rdna3"),
+        _ => panic!("MQ3-Lloyd WMMA mb4 residual: unsupported arch {arch}. gfx11-only."),
+    }
+}
+
 pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
         "gfx1200" | "gfx1201" =>
@@ -99,6 +116,29 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna3"),
         _ => (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma"),
+    }
+}
+
+/// MQ3-Lloyd fused mb4 selectors (gfx11 only).
+pub fn gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!("MQ3-Lloyd WMMA mb4 qkvza: unsupported arch {arch}. gfx11-only."),
+    }
+}
+pub fn gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKV_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq3g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!("MQ3-Lloyd WMMA mb4 qkv: unsupported arch {arch}. gfx11-only."),
+    }
+}
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_mb4_rdna3"),
+        _ => panic!("MQ3-Lloyd WMMA mb4 gate_up: unsupported arch {arch}. gfx11-only."),
     }
 }
 /// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
@@ -492,6 +532,12 @@ pub const GEMM_QKVZA_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/sr
 pub const GEMM_GATE_UP_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.hip");
 pub const GEMM_HFQ3G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.hip");
 pub const GEMM_QKV_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.hip");
+/// HFQ3 mb4 sources: 16×64 output tile per WG, 4 batch sub-tiles share
+/// A_reg decode. gfx11 only. No LDS, no syncs (HFQ3 has no codebook).
+pub const GEMM_HFQ3G256_RESIDUAL_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma_mb4.hip");
+pub const GEMM_QKVZA_HFQ3G256_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma_mb4.hip");
+pub const GEMM_QKV_HFQ3G256_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma_mb4.hip");
+pub const GEMM_GATE_UP_HFQ3G256_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma_mb4.hip");
 pub const GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.gfx12.hip");
