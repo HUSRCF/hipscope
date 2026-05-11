@@ -115,24 +115,22 @@ invocations; nothing in this directory needs to know their paths.
    bootstraps 95% CIs, emits the result table (markdown + JSON) with
    columns: variant, arch, n_chunks, mean KLD ± CI, p99 KLD, PPL.
 
-## Status (2026-05-08)
+## Status (2026-05-11)
 
-- Plan: `docs/plans/issue-113-quant-quality-eval.md` (rev-3.3).
-- Step 0 (read llama.cpp perplexity.cpp): **done**.
-- Step 1 (skeleton + format readers + reducer): **done**.
-- Step 1.5 (tokenizer parity): **done** — verdict: parity fails
-  structurally but doesn't block (consumer reads token IDs from
-  ref, not from re-tokenization). See plan §"Step 1.5 verdict".
-- Step 1.6 (top-K residual sanity): **done** — top-K=256 confirmed.
-- Step 2 (`build_kld_ref.rs`): **done**.
-- Step 3 (`eval_hipfire.rs`): **done**.
-- Step 4 (9B BF16 ref dump): **done** (2.48 GB, gfx1151, 53 min).
-- Step 5 (first canary candidate, 9B mq4 vs 9B BF16 ref):
-  **running on gfx1100**.
-- Step 6 (27B BF16 ref dump): **running on gfx1151**.
+- Plan: `docs/plans/issue-113-quant-quality-eval.md` (rev-3.4).
+- Sibling plan: `docs/plans/eval_hipfire_speedup.md` (rev-2).
+- Steps 0–4 (harness skeleton, format readers, BF16 ref dumps): **done**.
+- Step 5 (hipfire candidate scoring): **per-token done** for 9B MQ3/MQ4/
+  MQ3-Lloyd/MQ6 on gfx1100. **Prefill canonical** since 2026-05-11
+  (MQ4 gfx1100 prefill committed; per-token rows retained as historical).
+- Step 6 part-A (27B BF16 ref): **done** + uploaded to HF.
+- Step 6 part-B (27B hipfire matrix): **deferred** per the 2026-05-11
+  Pivot (MQ format is structurally noisier than community K-quants;
+  focus shifts to HFP4G32 / MFP4G32 once .hfq files exist).
 - Step 7.A (`eval_gguf.rs`): **done**.
-- Step 7.B (GGUF anchor candidate runs): **pending** Step 6 output.
-- Steps 8 (DFlash τ) and 9 (write-up): **pending**.
+- Step 7.B (9B GGUF anchor candidate runs on gfx1151): **done** —
+  all 7 anchors (Q8_0, Q6_K, Q4_K_M, UD-Q3/Q4/Q5/Q6_K_XL).
+- Steps 8 (DFlash τ) and 9 (write-up): **deferred** per Pivot.
 
 ## References
 

@@ -512,7 +512,14 @@ entirely. Approximation:
 27B dump still to come) produce the correct ref artifact for both
 tracks. eval_gguf is the only missing piece.
 
-## Sequencing (rev-3.3; status snapshot 2026-05-09 ~20:30)
+## Pivot (2026-05-11)
+
+Two scope changes since rev-3.3:
+
+1. **Scoring mode for hipfire MQ is now prefill (canonical), not per-token.** Decided after V1 measured a ~7% kernel-path bias between modes on MQ4 (gfx1100 full slice, 1175 chunks; Pearson 0.949, CIs do not overlap). Prefill is both ~7× faster and ~7% closer to BF16. See `docs/plans/eval_hipfire_speedup.md` §"V1 result". The four committed per-token gfx1100 kldseqs (mq3, mq4, mq3-lloyd, mq6) are renamed to `*__per-token.kldseq` and retained as historical-only rows in the result table preamble. Re-running the MQ matrix in prefill mode is on the menu but **deferred** — see point 2.
+2. **MQ matrix is paused; focus shifts to HFP4G32 / MFP4G32.** The MQ format's coarse single-fp32-scale-per-256 grouping is structurally noisier than community K-quants by a wide margin (see partial Pareto in `results/2026-05-10/per-seq/`: hipfire MQ4 KLD 0.876 vs vanilla Q4_K_M 0.125 at near-equivalent size). HFP4/MFP4 (PR #224, PR #225) are the RDNA-optimal successors. Once 9B-HFP4G32.hfq and 9B-MFP4G32.hfq exist, the eval matrix slots them in alongside the GGUF anchors. The HFP4/MFP4 batched-prefill kernel from PR #224 v2 is deferred upstream; until it lands, those variants auto-fallback to per-token scoring (correct, ~7× slower than batchable MQ — still tolerable).
+
+## Sequencing (rev-3.4; status snapshot 2026-05-11 ~14:30)
 
 Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
@@ -528,23 +535,25 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 
 **✓ Step 3 (DONE):** wrote `crates/hipfire-runtime/examples/eval_hipfire.rs` — reads hipfire β reference, runs hipfire variants chunk-by-chunk via `forward_scratch`, computes per-token KLD via top-K-of-ref + residual cross-term (rev-3.3 enhancement), bins per-sequence, writes HFKSEQ. Builds clean (`cargo build --release --features deltanet`). Commits d4adac8 (initial) + f9dd19e (residual cross-term). Not yet run end-to-end; queued for Step 5.
 
-**✓ Step 4-9b (DONE 2026-05-08):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. sha256 `06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7`; manifest.json populated (commit `0214e8c`). **Pending sub-steps:** upload to `hipfire-models/hipfire-eval-refs`, verify canary on both NORMALIZE_PROMPT settings.
+**✓ Step 4-9b (DONE 2026-05-08; HF upload 2026-05-11):** dumped 9B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin`, **2.48 GB**, 53 min wall-time, 375 reduced tokens/sec. Header: n_ctx=2048, n_vocab=248320, n_chunk=1175, top_k=256, total scored = 1,202,025 blocks. sha256 `06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7`. **Uploaded** to dataset repo `hipfire-models/qwen-kldref` (note: not the originally-named `hipfire-eval-refs`); manifest.json wired with `hf_repo` + `hf_repo_type=dataset`; `scripts/fetch-eval-refs.sh` smoke-tested end-to-end. **Canary verification (both NORMALIZE_PROMPT settings) deferred — not blocking PR.**
 
-**⏳ Step 5 (in progress on gfx1100):** running hipfire track on 9B × {gfx1100, gfx1151} (5 variants × 2 archs = 10 runs). First canary candidate (qwen3.5-9b.mq4 vs 9B BF16 ref) launched 2026-05-08 on gfx1100; throughput ~47.5 tok/s, total run ~7 hours (slower than the plan's 75 min estimate — gfx1100 is power-capped at the kernel-throughput ceiling per the rocm-smi snapshot). The first run doubles as the canary-expected-KLD source — its per-sequence KLDs become the committed `canary.md` expected-values when complete. Pre-Step-5 review-hardening fix bundle landed (commits `e407128` + `0214e8c` + `e7898f4` + `fd06646` + `3dee758` + `41b5977` + `dec913e`): C1 scoring window off-by-one, H1 commit-pin enforcement, H2 eval-mode env vars, H3 stale dead code, M1 sha256 ref validation, M3 PPL accumulator + HFKSEQ v2, M4 slice md5 enforcement, M5 fetch-eval-refs.sh, H7 cand-vs-ref token compare.
+**✓ Step 5 part-A (DONE 2026-05-08; partial — 4/5 variants, gfx1100 only):** ran hipfire per-token track for 9B-MQ3, MQ4, MQ3-Lloyd, MQ6 on gfx1100. ~7 h/run × 4 = ~28 GPU-h. Outputs at `results/2026-05-08/per-seq/*__per-token.kldseq` (renamed 2026-05-11 to the `__<mode>` 3-segment convention). Per-token mq4 slice-mean 0.876; mq3 2.62; mq3-lloyd 1.69; mq6 0.625. The MQ4 row is the canary-expected source. **9B-Q8 + 9B-MQ4-Lloyd per-token runs not done; gfx1151 hipfire pass not done; deferred per Pivot.**
 
-**✓ Step 6 part-A (DONE 2026-05-09):** dumped 27B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin`, **2.48 GB**, 2h 3m wall-time, 162 reduced tokens/sec. Same shape as 9B (per-token block size depends on top_k, not n_vocab). sha256 `8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446`; manifest.json populated (commit `52879fe`). **Required `--no-mmap`** (now passed automatically by build_kld_ref): demand-paging on 50 GB BF16 weights caused eviction-cycle stall on the 124 GB UMA host until enabled. GGUF copied locally to `~/models-local/Qwen3.6-27B/` from NFS to reduce per-page-fault read latency. VM `enertree` shut down to free working-set RAM. **Pending Step 6 part-B:** run 5 hipfire variants × 2 archs = 10 runs on the 27B ref.
+**✓ Step 5 part-B (DONE 2026-05-11):** implemented `eval_hipfire --scoring-mode prefill` (see `docs/plans/eval_hipfire_speedup.md`). Canonical V1 result on gfx1100 MQ4 prefill (full slice, 1175 chunks): KLD 0.817, PPL 14.89 — committed at `results/2026-05-11/per-seq/qwen3.5-9b.mq4__gfx1100__prefill.kldseq`. Prefill is now the canonical hipfire scoring mode going forward. The 4 per-token kldseqs above are retained as historical-only.
 
-**✓ Step 7.A (DONE 2026-05-08):** wrote `crates/hipfire-runtime/examples/eval_gguf.rs` — mirrors eval_hipfire.rs's KLD math but uses FIFO-streamed llama-perplexity as the candidate-logit source. Same residual cross-term as eval_hipfire. Builds clean. Not yet run end-to-end. Commit f9dd19e.
+**✓ Step 6 part-A (DONE 2026-05-09; HF upload 2026-05-11):** dumped 27B BF16 reference on gfx1151. Output: `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin`, **2.48 GB**, 2h 3m wall-time, 162 reduced tokens/sec. Same shape as 9B (per-token block size depends on top_k, not n_vocab). sha256 `8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446`. **Required `--no-mmap`** (now passed automatically by build_kld_ref): demand-paging on 50 GB BF16 weights caused eviction-cycle stall on the 124 GB UMA host until enabled. **Uploaded** to dataset repo `hipfire-models/qwen-kldref`. **Step 6 part-B (27B hipfire matrix) deferred per Pivot.**
 
-**⏸ Step 7.B:** run all 7 GGUF candidates (Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q3_K_M, Q3_K_S) on the qwen3.6-27B BF16 ref (cached from Step 6). Each ~1.5 hr on gfx1151.
+**✓ Step 7.A (DONE 2026-05-08):** wrote `crates/hipfire-runtime/examples/eval_gguf.rs` — mirrors eval_hipfire.rs's KLD math but uses FIFO-streamed llama-perplexity as the candidate-logit source. Same residual cross-term as eval_hipfire. Builds clean.
 
-**— Step 8:** measure DFlash τ (canonical merge_sort prompt, md5-pinned) for each variant where a draft model exists. Adds the `DFlash τ` column to the result table.
+**✓ Step 7.B (DONE 2026-05-10):** ran 7 GGUF anchor candidates on the 9B BF16 ref on gfx1151: Q8_0, Q6_K, Q4_K_M, UD-Q3_K_XL, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL. ~50 min/run × 7 = ~6 GPU-h. All under `results/2026-05-10/per-seq/qwen3.5-9b.gguf-*__gfx1151.kldseq`. Q8_0 KLD 0.0163 (near-lossless floor); UD-Q4_K_XL 0.0670 (unsloth's dynamic 4-bit beats vanilla Q4_K_M 0.1249 by ~1.9×). Commit `6c00a55`. **27B anchor runs deferred per Pivot.**
 
-**— Step 9:** write up `results/2026-05-XX-quant-pareto.md` with the full table + Pareto plot + caveats preamble. Post comments on #113 (positioning), #116 (positioning + recalibration input), #197 (MQ4-Lloyd promotion-or-not editorial recommendation).
+**⏸ Step 8 (DFlash τ):** deferred per Pivot. Plan was to measure τ for each variant where a draft model exists; the editorial usefulness ("MQ4-Lloyd has lower mean-KLD than MQ4-uniform but lower τ — don't promote") is moot since the MQ family is no longer the active focus.
 
-**— Step 10 (optional):** Unsloth corroboration plot if same-model dense data exists.
+**⏸ Step 9 (writeup):** deferred per Pivot. The Pareto plot that would land in `results/2026-05-XX-quant-pareto.md` should wait until HFP4/MFP4 candidates exist — without them the hipfire side of the plot is just "MQ is much worse than community Q-quants," which is already conclusively shown by the partial data and doesn't need a writeup of its own.
 
-**— Step 11 (follow-up, not this PR):** p99-gate calibration once mean-KLD CI variance is understood empirically. GEMV single-acc port (universal multi-acc drift fix) if the gfx1100-vs-gfx1151 KLD delta is >10%.
+**— Step 10 (optional, deferred):** Unsloth corroboration plot.
+
+**— Step 11 (follow-up, not this PR):** HFP4G32 / MFP4G32 eval slots once .hfq files exist for 9B (auto-fallback path is wired). p99-gate calibration. GEMV single-acc port if cross-arch KLD delta is >10%.
 
 ### Code-state snapshot
 
@@ -553,16 +562,18 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 | `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt` | ✓ committed (10.5 MB, md5 `83b0205a304bf4e52172ecdb05f2e895`) |
 | `benchmarks/quality-baselines/slice/slice.md5` | ✓ committed |
 | `benchmarks/quality-baselines/slice/make_slice.sh` | ✓ committed (uses .venv/bin/python3) |
-| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; both 9B and 27B refs registered with sha256 + producer_cmd; `hf_url` null pending HF upload |
+| `benchmarks/quality-baselines/harness/manifest.json` | ✓ committed; both 9B and 27B refs registered with sha256 + producer_cmd + `hf_repo: hipfire-models/qwen-kldref` + `hf_repo_type: dataset` (uploaded 2026-05-11) |
 | `benchmarks/quality-baselines/harness/kldref_format.py` | ✓ committed (β format reader/writer) |
 | `benchmarks/quality-baselines/harness/kld_reduce.py` | ✓ committed (bootstrap CI + table emitter) |
 | `benchmarks/quality-baselines/harness/tokenizer_parity.py` | ✓ committed (full impl, tested 2026-05-08) |
 | `benchmarks/quality-baselines/harness/canary.md` | ✓ committed (11 sequences populated; expected KLDs TBD) |
 | `benchmarks/quality-baselines/harness/eval_gguf.sh` | deleted (was stub); superseded by `crates/hipfire-runtime/examples/eval_gguf.rs` |
 | `crates/hipfire-runtime/examples/build_kld_ref.rs` | ✓ committed; end-to-end validated on both 9B + 27B; auto-passes `--no-mmap` to llama-perplexity (commit `52879fe`) |
-| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed (with residual cross-term, NLL accumulator, env-var forcing, sha256 verify); first end-to-end run on gfx1100 in progress |
-| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed (with residual cross-term, NLL accumulator, cand-vs-ref token compare, commit-pin verify); not yet run end-to-end |
+| `crates/hipfire-runtime/examples/eval_hipfire.rs` | ✓ committed; `--scoring-mode prefill` (default) + `--max-chunks N` + auto-mkdir output. End-to-end-validated 2026-05-11 on gfx1100 MQ4 (1175 chunks, slice-mean 0.817). |
+| `crates/hipfire-runtime/examples/eval_gguf.rs` | ✓ committed; end-to-end-validated 2026-05-10 on all 7 9B GGUF anchors on gfx1151. |
+| `crates/hipfire-runtime/examples/prefill_microbench.rs` | ✓ committed; Step 0 gate. 9B-MQ4 19-20× speedup on both gfx1100 and gfx1151. |
 | `crates/hipfire-runtime/examples/tokenize_slice.rs` | ✓ committed (used by tokenizer_parity.py) |
+| `benchmarks/quality-baselines/harness/kld_diff.py` | ✓ committed; V1/V2 four-metric A/B (mean delta, Pearson per-seq, p99 \|Δ\|, bootstrap CI overlap). |
 | `scripts/fetch-eval-refs.sh` | ✓ committed (M5; uses `.venv/bin/python3` + huggingface_hub) |
 | `benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 53 min wall, 2026-05-08); local only (gitignored) |
 | `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin` | ✓ produced (2.48 GB, gfx1151, 2h 3m wall, 2026-05-09); local only (gitignored) |
@@ -573,14 +584,23 @@ Legend: ✓ done · ⏳ in-progress · ⏸ blocked / queued · — pending
 - **llama.cpp `build-strix` rebuilt** against ROCm 7.12 + gfx1151 with all targets (50+ binaries: llama-perplexity, llama-tokenize, llama-cli, etc.). Local path: `/home/kread/git/llm/llama.cpp/build-strix/bin/`. Required because the existing build was linked against `libamdhip64.so.6` (rocm-7.1) which doesn't exist on the system; rocm-7.12 ships `.so.7`.
 - **Project venv at `.venv/`**: holds `numpy`, `datasets`, `huggingface_hub`, etc. for the harness's Python scripts. Per the repo-preference memory: Python deps go in venv, not pip --user.
 
-### What's NOT yet done (blocking summary)
+### What's done since rev-3.3 (2026-05-11 PR scope)
 
-1. **9B BF16 ref upload to HF** — file ready, sha256 in manifest; needs `hf upload hipfire-models/hipfire-eval-refs ...` + setting the manifest's `hf_repo` field.
-2. **27B BF16 ref upload to HF** — same as 9B; both refs were produced on the same gfx1151 host.
-3. **Canary candidate run completion** (qwen3.5-9b.mq4 vs 9B BF16 ref) — running on gfx1100 since 2026-05-08; ETA was ~7 hours from launch. Output populates canary.md's expected-values.
-4. **Bulk hipfire-track runs** (5 variants × 2 archs × 2 models = 20 runs minus the canary). At 47.5 tok/s on gfx1100 ≈ 7h/run × 19 ≈ ~5–6 days of wall-clock if serialized; gfx1151 is the parallel slot. The plan's original "~25 GPU-hours" estimate was at 9B-on-gfx1151 throughput; revised upward by the gfx1100 power-cap finding.
-5. **GGUF anchor runs** (7 variants × 1 model on gfx1151) — currently ~1.5 hr × 7 = ~10 GPU-hours. Not yet end-to-end-validated.
-6. **DFlash τ + write-up** — Step 8 + 9.
+1. **9B BF16 ref uploaded to HF** at `hipfire-models/qwen-kldref` (dataset repo). Manifest wired; `scripts/fetch-eval-refs.sh` smoke-tested end-to-end.
+2. **27B BF16 ref uploaded to HF** at the same dataset repo.
+3. **9B-MQ4 canary completed** on gfx1100; slice-mean KLD 0.876 (per-token mode). canary.md still TBD-populated, but the kldseq is the reference data.
+4. **Partial hipfire matrix on gfx1100** (4 of 5 variants in per-token mode: MQ3, MQ4, MQ3-Lloyd, MQ6) — committed at `results/2026-05-08/per-seq/`. MQ4-Lloyd and Q8 not done; deferred.
+5. **7 GGUF anchor runs on gfx1151** complete and committed at `results/2026-05-10/per-seq/`.
+6. **eval_hipfire prefill mode** shipped (sibling plan: `docs/plans/eval_hipfire_speedup.md`); V1 result confirms ~7% kernel-path bias between modes, prefill is canonical going forward.
+
+### What's deferred (not blocking PR; mostly post-Pivot)
+
+1. **27B hipfire matrix** (Step 6 part-B, would be ~150 GPU-h; deferred per Pivot — MQ pivot supersedes).
+2. **9B-Q8 + 9B-MQ4-Lloyd per-token rows** on gfx1100 (not strictly needed under the Pivot).
+3. **DFlash τ column** (Step 8) — editorial signal moot under the Pivot.
+4. **Pareto writeup** (Step 9) — wait until HFP4/MFP4 candidates exist.
+5. **gfx1151 hipfire pass** (V3 cross-arch sanity) — partial 9B-MQ3 + 9B-MQ4 50-chunk data lives in `/tmp/smoke/` from validation but not committed; the 50-chunk partials show ~7-8% prefill-vs-per-token bias consistent with the gfx1100 full-slice result.
+6. **HFP4G32 / MFP4G32 .hfq files for 9B** — depend on `hipfire-quantize --format hfp4` runs (separate work; eval-side support is already wired through auto-fallback).
 
 ## References
 

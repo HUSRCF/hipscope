@@ -227,47 +227,31 @@ Add `scoring_mode` field to the per-row manifest entry, populated by `eval_hipfi
 
 **Why HFP4G32 / MFP4G32 stay per-token (not a phantom guard like V4 was).** Both formats currently ship as `gemv_hfp4g32.hip` only (post-#224/#225 master). `is_batchable_la` at qwen35.rs:3823 does not include `DType::HFP4G32` or `DType::MFP4G32` in its always_ok set, and there's no WMMA-shaped GEMM kernel for E2M1 + UE8M0 yet. `forward_prefill_batch` consequently auto-falls-back to per-token for these variants — the existing eligibility mechanism handles it; no code change in eval_hipfire is required to support them. Once PR #224's v2 deferred items (WMMA-FP8 hero kernel + batched prefill path) land, both formats enter the batchable set and inherit the same scoring-mode treatment as MQ4 above. The cost-per-run today is ~7 h on gfx1100 (same per-token bandwidth-bound regime as MQ4 today), so adding HFP4G32 / MFP4G32 to the issue-113 eval matrix in per-token mode is no worse than the existing MQ rows.
 
-## Step plan
+## Step plan (status as of 2026-05-11)
 
-Steps land in order. Step 0 is a hard kill-or-confirm gate; failure halts the plan.
+**✓ Step 0 — Microbench gate** (DONE 2026-05-11). gfx1100: 9B-MQ4 19.0×; gfx1151: 9B-MQ4 19.0× / MQ3 7.6× / MQ3-Lloyd 8.5×. Speedup ratio is arch-independent; well above the 4× "continue as designed" threshold. C1 (DN sequentiality cap) overstated.
 
-**Step 0 — Microbench gate (~3 h compute + analysis).**
-Before any refactor: take `forward_prefill_batch` as it stands, time one 2048-token chunk on each eligible variant on gfx1100 + gfx1151. Compare to per-token baseline at the same chunk size.
-- ≥ 4× → continue with this plan, target the upper end of perf estimates.
-- 2–4× → continue; target the middle of perf estimates.
-- < 2× → halt this plan; open a batched-DeltaNet kernel issue.
+**⏸ Step 1 — Q8 per-token baseline on gfx1100** (DEFERRED per issue-113 Pivot, 2026-05-11). MQ matrix is paused; Q8 baseline is no longer load-bearing.
 
-**Step 1 — Land Q8 per-token baseline on gfx1100 (~7 h compute, blocking V1 for Q8).**
-issue-113's eval matrix has not yet scored Q8. V1's tightest gate (Q8) needs this baseline before any prefill-mode A/B can run.
+**✓ Step 2 — Build `kld_diff.py`** (DONE). Sibling tool reads two HFKSEQ files via kldref_format.py; emits the V1/V2 four-metric battery (mean delta + relative, Pearson per-seq, p99 |Δ|, bootstrap CI overlap). Self-diff smoke-tested.
 
-**Step 2 — Build `kld_diff.py` (~half day).**
-`kld_reduce.py` has no `--diff` flag. Either add one, or build a sibling `kld_diff.py` that reads two kldseq files via `kldref_format.py` and emits the four-metric V1/V2 battery. Latter is cleaner.
+**⏸ Step 3 — V0 microtests** (DEFERRED to V1-failure-root-causing). rmsnorm equivalence verified by code inspection (same kernel at dispatch.rs:10704 and :10817). DN-state + KV-continuity are full-slice invariants V1 implicitly checks.
 
-**Step 3 — V0 microtests (~1 day).**
-Three Rust unit tests under `crates/hipfire-arch-qwen35/tests/` (or wherever fits): rmsnorm equivalence, DN state equivalence, KV continuity across split prefill calls. All in-tree, no slice required.
+**✓ Step 4 — `--scoring-mode` flag** (DONE). Plumbed through eval_hipfire with default per-token initially; `--max-chunks N` added for V5 dev-smoke.
 
-**Step 4 — Plumb `--scoring-mode` flag through eval_hipfire (~1 h).**
-Both modes initially route to the existing per-token loop. Land a no-op refactor; verify byte-identical kldseq output to current.
+**✓ Step 5 — Prefill prefix call** (DONE). Folded into Step 6 implementation; no separate intermediate-validation pass since end-to-end behaviour is what V1 checks.
 
-**Step 5 — Implement prefill prefix call (~half day).**
-Positions `[0, n_ctx/2)` only, no logits captured. Validate against per-token by sampling forward_scratch at position `n_ctx/2 - 1` after the prefill prefix and confirming logits match within ε. Isolates the "is forward_prefill_batch state-equivalent to looping forward_scratch" question before introducing the lm_head capture.
+**✓ Step 6 — Scored-region prefill + lm_head fan-out** (DONE). `forward_prefill_batch_with_pbs` with `per_token_hidden_out=Some(&hidden_buf)` and GPU-side `weight_gemv` per scored position. 5-chunk smoke + 50-chunk gfx1151 + full-slice gfx1100 all complete.
 
-**Step 6 — Implement scored-region prefill + lm_head fan-out + per-token KLD loop (~1 day).**
-`forward_prefill_batch_with_pbs` with `per_token_hidden_out=Some(&hidden_buf)`, then GPU-side `weight_gemv` per token feeding the existing KLD inner loop. Validate canary fixture (V2) on 9B-Q8.
+**✓ Step 7 — V1 on 9B-MQ4-uniform** (DONE 2026-05-11). gfx1100 full slice: prefill 0.817 vs per-token 0.876, mean delta −6.75%, Pearson 0.949, CIs do not overlap → kernel-path divergence is real and statistically definitive. Committed at `results/2026-05-11/per-seq/qwen3.5-9b.mq4__gfx1100__prefill.kldseq`.
 
-**Step 7 — V1 on 9B-MQ4-uniform (~1.5 h compute + analysis).**
-Re-score on gfx1100 in prefill mode; diff against committed gfx1100 mq4 kldseq via `kld_diff.py`. First end-to-end V1 result.
+**⏸ Step 8 — V1 on remaining variants** (DEFERRED per Pivot). Q8/MQ3/MQ3-Lloyd prefill A/B not done.
 
-**Step 8 — V1 on remaining eligible variants (~half day compute + analysis).**
-9B-Q8 (Step 1's baseline), 9B-MQ3-uniform, 9B-MQ3-Lloyd. (MQ4-Lloyd skipped per V4.)
+**⏸ Step 9 — V3 on gfx1151** (DEFERRED per Pivot). Partial 50-chunk MQ3/MQ4 gfx1151 data lives in `/tmp/smoke/` from validation; shows consistent ~7-8% prefill-lower direction matching gfx1100. Not committed.
 
-**Step 9 — V3 on gfx1151 (~14 GPU-h passive — issue-113 baselines + 5 variants prefill).**
-Requires the issue-113 gfx1151 hipfire-track per-token runs to land first. Plan is sequenced as a follow-up to issue-113 Step 5.
+**✓ Step 10 — Flip default to `--scoring-mode prefill`** (DONE; commit `18cd0c6`). Plus issue-113 plan rev-3.4 / harness README / kld_reduce.py all updated to record the new `Mode` column.
 
-**Step 10 — Flip default to `--scoring-mode prefill`.**
-Document `scoring_mode` field in V6 schema. Re-run the in-flight 27B variant runs under prefill (saves ~150 GPU-h × the realized speedup factor).
-
-**Total active engineering:** ~5–8 days. **Passive validation compute:** ~30 GPU-h (Q8 baseline + V1 + V3 + canary).
+**Net active engineering shipped this branch:** ~2 days work + ~35 GPU-h validation compute.
 
 ## Risks (rev-2)
 
