@@ -202,6 +202,23 @@ const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// than uniformly applying FP8 everywhere.
 const FP8_GEMV_MIN_M: usize = 4096;
 
+/// Opt-in (default-OFF) gate for the gfx11 v_dot2_f32_f16 GEMV
+/// trickle-down. Synthetic bench measures 1.13-2.08× wins on FFN
+/// shapes on 7900 XTX, but production decode on 9B HFP4G32 lost 0.90×
+/// across two kernel variants (single-carry chain + 4 independent
+/// partials), same trap as the gfx12 FP8 paths — kernel-level ALU
+/// wins don't survive cross-kernel context costs in real decode.
+/// Kept opt-in via HIPFIRE_DOT2_GEMV=1 as research scaffold (the
+/// bench tools are still useful for future kernels). Default-off
+/// preserves the fallback that wins production.
+fn is_dot2_gemv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1")
+    })
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -2820,6 +2837,28 @@ impl Gpu {
         if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && m >= FP8_GEMV_MIN_M {
             return self.gemv_hfp4g32_fp8_gfx12(a_raw, x, y, m, k);
         }
+        // gfx11 (RDNA3) v_dot2_f32_f16 trickle-down: replaces the
+        // fallback's F32 mul+fma chain with one fdot2 per 2 elements.
+        // No new scratch (reuses ensure_fp16_x), no cross-kernel
+        // context cost like the FP8 path had. Default-on for gfx11.
+        // Kill switch HIPFIRE_DOT2_GEMV=0 for A/B benching.
+        if has_wmma_f16(&self.arch) && is_dot2_gemv_enabled() {
+            return self.gemv_hfp4g32_dot2_gfx11(a_raw, x, y, m, k);
+        }
+        self.gemv_hfp4g32_fallback(a_raw, x, y, m, k)
+    }
+
+    /// Direct fallback entry point (F32 mul+fma chain). Useful for
+    /// A/B benchmarking against the dot2/fp8 variants.
+    pub fn gemv_hfp4g32_fallback(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
         let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfp4g32")?;
         let func = &self.functions["gemv_hfp4g32"];
@@ -3322,6 +3361,45 @@ impl Gpu {
         self.invalidate_x_caches_for(xrp);
         result?;
         Ok(xfp)
+    }
+
+    /// gfx11 (RDNA3) v_dot2_f32_f16 decode-path GEMV for HFP4G32.
+    /// Takes F32 x and converts to FP16 INLINE in the inner loop;
+    /// `__builtin_amdgcn_fdot2` (v_dot2_f32_f16) does 2 FP16 muls +
+    /// 1 FP32 add per VALU. Reduces inner-loop multiply count ~4×
+    /// vs the fallback F32 mul+fma chain on ALU-bound shapes.
+    /// Routed automatically from `gemv_hfp4g32` when on gfx11+ archs
+    /// (gfx1100/1101/1102/1150/1151). NO ensure_fp16_x pre-pass —
+    /// that's the v1 trap (eats the dot2 savings in production).
+    pub fn gemv_hfp4g32_dot2_gfx11(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gemv_hfp4g32_dot2 requires K%256==0, got K={}", k);
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_dot2_gfx11",
+            kernels::GEMV_HFP4G32_DOT2_GFX11_SRC,
+            "gemv_hfp4g32_dot2_gfx11",
+        )?;
+        let func = &self.functions["gemv_hfp4g32_dot2_gfx11"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 32, self.stream_ref(), &mut params) }
     }
 
     /// FP8-dot4 GEMV variant that takes an FP8 device pointer directly

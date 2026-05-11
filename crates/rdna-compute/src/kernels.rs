@@ -275,6 +275,13 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/sr
 /// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
 pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
+// gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.
+// Inner loop uses 4 fdot2 ops per K-block (8 K-elts), replacing the
+// fallback's 8 F32 mul + 8 F32 fma chain. Activation X consumed as
+// FP16 via ensure_fp16_x. Wins biggest on ALU-bound shapes (FFN
+// M=11008 measured 40% peak BW on 7900 XTX with fallback — headroom
+// to ~2×). Reaches gfx11/RDNA3.5 archs (gfx1100/1101/1102/1150/1151).
+pub const GEMV_HFP4G32_DOT2_GFX11_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32_dot2.gfx11.hip");
 // gfx12 (RDNA4) FP8-dot4 decode-path variant. dot4_f32_fp8_fp8 cuts inner-loop
 // ALU ~2-2.4× vs the fallback dequant/FMA chain; biggest win on ALU-bound
 // small-M attention shapes (k_proj/v_proj at ~16-20% peak BW on R9700).
