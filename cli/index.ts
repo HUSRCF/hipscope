@@ -641,6 +641,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
+function hfHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": "hipfire",
+  };
+  const token = process.env.HF_TOKEN;
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -863,14 +872,18 @@ async function runViaHttp(
   port: number, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+  system?: string,
 ): Promise<boolean> {
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper doesn't expose — fall back to local spawn.
   if (image) return false;
 
+  const messages: any[] = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
   const body: any = {
     model, stream: true,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
@@ -1110,7 +1123,7 @@ async function pull(tag: string): Promise<string> {
   console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
   console.error(`  ${url}`);
 
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hfHeaders() });
   if (!res.ok) {
     console.error(`Download failed: ${res.status} ${res.statusText}`);
     console.error(`URL: ${url}`);
@@ -1158,7 +1171,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-        const sres = await fetch(sidecarUrl);
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
@@ -1182,7 +1195,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1206,7 +1219,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
   if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1232,14 +1245,20 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  // thinking=off: hard-suppress by capping thinking to 1 token (model still
-  // emits <think> but is immediately force-closed). This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path.
+  // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
+  // a closed `<think></think>` block via assistant_prefix=closed_think, so
+  // the model never starts a thinking turn at all. This mirrors the
+  // enable_thinking=false semantics from the OpenAI API path
+  // (cli/index.ts ~1668-1680). The Jinja path keys off max_think_tokens==1
+  // for `enable_thinking=false`; the legacy ChatFrame path keys off
+  // assistant_prefix=closed_think. Setting both makes either daemon path
+  // do the right thing.
   // Previous attempts to inject prose directives with <think>/<no_think>
   // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
   // reliably because it operates at the daemon level, not in the prompt.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
+    genMsg.assistant_prefix = "closed_think";
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
@@ -1247,6 +1266,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
+  if (system) genMsg.system = system;
 
   let inThink = false;
   let stripNextLeadingNl = false;
@@ -1656,16 +1676,20 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
-        // thinking=off is currently a no-op at the CLI layer. Earlier
-        // versions injected a prose system directive ("Respond directly
-        // without using <think>...</think> reasoning blocks") here, but
-        // the literal special tokens in that string caused Qwen3.5 to
-        // halt at 3-4 tokens — coherence-gate (which hits the daemon
-        // direct, no system injection) consistently passes on the same
-        // models, while CLI-routed requests with this directive break.
-        // Pass through whatever system prompt the client sent, no
-        // augmentation. The downstream <think>...</think> filter still
-        // strips visible reasoning so users get clean answers.
+        // Wire thinking control for both legacy assistant_prefix
+        // (ChatFrame::ClosedThink) and the new Jinja template path.
+        // The Jinja path uses max_think_tokens==1 as the signal for
+        // enable_thinking=false (daemon.rs line 3099). For the legacy
+        // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        if (effective.thinking === "off") {
+          genParams.assistant_prefix = "closed_think";
+        } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1; // Jinja path signal
+        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1;
+        }
         if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
@@ -2002,12 +2026,20 @@ async function serve(port: number) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
+        const strippedContent = content;
         if (preserveThinking) {
           content = content.replace(/<\|im_end\|>/g, "").trim();
         } else {
           content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
             .replace(/<think>[\s\S]*$/, "") // unclosed think block
             .replace(/<\|im_end\|>/g, "").trim();
+        }
+
+        // Diagnostic: detect empty-after-unclosed-think-strip.
+        let thinkWarning: string | null = null;
+        if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
+          thinkWarning = "empty after unclosed think strip";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
         // Check for tool calls in response
@@ -2020,11 +2052,15 @@ async function serve(port: number) {
         }
 
         safeRelease();
-        return Response.json({
+        const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
-        });
+        };
+        if (thinkWarning) {
+          responseBody.x_hipfire_warning = thinkWarning;
+        }
+        return Response.json(responseBody);
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
@@ -3970,13 +4006,15 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
       "--max-tokens": { default: 512 },
+      "--system": { default: undefined },
     };
+    const stringFlags = new Set(["--image", "--system"]);
     const flags: Record<string, string> = {};
     const flagIndices = new Set<number>();
     for (const key of Object.keys(flagDefs)) {
@@ -3986,7 +4024,7 @@ switch (cmd) {
         // Reject flag values that look like other flags
         if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
         // Validate numeric flags
-        if (key !== "--image" && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
+        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
         flags[key] = val;
         flagIndices.add(idx); flagIndices.add(idx + 1);
       } else if (idx >= 0) {
@@ -3994,6 +4032,7 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
+    const system = flags["--system"];
     const runCfg = resolveModelConfig(model);
     const temp = Number(flags["--temp"] ?? runCfg.temperature);
     const topP = Number(flags["--top-p"] ?? runCfg.top_p);
@@ -4005,7 +4044,7 @@ switch (cmd) {
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     break;
   }
   case "chat": {

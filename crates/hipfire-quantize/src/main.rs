@@ -639,6 +639,345 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+// ─── HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale) ────────────────
+//
+// Spec: docs/quant-formats/hfp4.md
+//
+// Per-row layout: 16-B header (row_scale_a:f16, row_scale_b:f16, block_count:u16, flags:u8, ...)
+//                 followed by (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
+// Per element:    value = row_scale_a * 2^(block_e - 127) * E2M1_LUT[nibble]
+
+/// OCP E2M1 magnitude lattice (signed 4-bit FP). 16 codes: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
+/// Order: positive 0..7, then negative 0..7 (mirrors hardware-canonical sign-magnitude packing).
+const E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// E2M1 round-to-nearest in the 16-code lattice. Returns the nibble (0..15).
+/// Ties broken away from zero (consistent with FP rounding).
+fn e2m1_round(x: f32) -> u8 {
+    let mut best_idx = 0u8;
+    let mut best_err = f32::INFINITY;
+    for (i, &code) in E2M1_LUT.iter().enumerate() {
+        let err = (code - x).abs();
+        // Strict < ensures consistent tie-breaking by code-table order.
+        // The lattice has +0 at index 0 and -0 at index 8; +0 wins ties at zero.
+        if err < best_err {
+            best_err = err;
+            best_idx = i as u8;
+        }
+    }
+    best_idx
+}
+
+/// Quantize one row of K FP32 weights to HFP4G32 byte format.
+///
+/// K must be a multiple of 32 (hipfire model dims always satisfy this).
+/// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
+fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+
+    // Per-row FP16 second-level scale: row_scale_a = max_abs(row) / 6.0  (E2M1 max = 6.0).
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+
+    // Header.
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());           // row_scale_b unused in v1
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes()); // block_count
+    out[6] = 0u8;                                              // format_flags = 0 (no rotation)
+    out[7] = 0u8;                                              // reserved
+    // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
+
+    // Per-block payload.
+    for b in 0..n_blocks {
+        let block_start = b * 32;
+        let block = &row[block_start..block_start + 32];
+
+        // Normalize block by row scale.
+        // block_max_normalized in units of [-6.0, +6.0] (because row_scale_a = max_abs/6.0).
+        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, +6].
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+
+        // Choose smallest UE8M0 exponent that covers block_max_normalized without clipping:
+        //   6 * 2^(e - 127) ≥ block_max_normalized   →   e ≥ ceil(log2(block_max_normalized / 6)) + 127
+        // ceil (not round) prevents clipping; the precision cost is bounded by 1 bit at the top
+        // of the block. Clamp to UE8M0 range [0, 254] (255 = NaN, reserved per OCP spec).
+        let block_e: u8 = if block_max_normalized > 0.0 {
+            let log_ratio = (block_max_normalized / 6.0).log2();
+            let e_signed = log_ratio.ceil() as i32 + 127;
+            e_signed.clamp(0, 254) as u8
+        } else {
+            0u8 // empty block — smallest scale, all nibbles round to 0
+        };
+
+        let block_scale = (block_e as i32 - 127) as f32;
+        let block_scale_factor = block_scale.exp2(); // 2^(block_e - 127)
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+
+        // Block payload offset in the row buffer.
+        let payload_off = 16 + b * 17;
+        out[payload_off] = block_e;
+
+        // Pack 32 elements as 16 bytes, low nibble = even index, high nibble = odd index.
+        for i in 0..16 {
+            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
+            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
+            let lo_nibble = e2m1_round(lo);
+            let hi_nibble = e2m1_round(hi);
+            out[payload_off + 1 + i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
+        }
+    }
+
+    out
+}
+
+/// Quantize a row-major 2D weight tensor of shape `[m, k]` to HFP4G32.
+/// Returns `m * (16 + 17 * (k/32))` bytes — 16-B row header + per-block payloads, repeated per row.
+///
+/// K%256 — not K%32 — because the v1 GEMV kernel
+/// (`crates/rdna-compute/src/dispatch.rs::gemv_hfp4g32`) iterates 256 elements
+/// per work-item and panics on K%256!=0. The byte format itself is K%32-aligned;
+/// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
+/// makes the failure mode "quantize rejects bad input" rather than "runtime
+/// panics on first dispatch with a tensor a previous step already accepted."
+fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    for r in 0..m {
+        let row = &f32_data[r * k..(r + 1) * k];
+        out.extend_from_slice(&quantize_hfp4g32_row(row));
+    }
+    out
+}
+
+/// MFP4G32 = HFP4G32 + offline FWHT rotation. Drop-in MQ4 replacement.
+///
+/// Applies the same per-256-element FWHT as `cpu_fwht_256` (used by MQ4) to the
+/// weight matrix before HFP4G32 quantization. Runtime path applies the same
+/// FWHT to activations via `mq_rotate_x`, so `dot(rot(W), rot(x)) == dot(W, x)`
+/// (the FWHT is orthogonal). K must be a multiple of LCM(32, 256) = 256.
+///
+/// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
+/// = offline FWHT). This is metadata only — the kernel can still consume the
+/// row as plain HFP4G32 because the rotation is baked into the codes.
+fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert!(k % 256 == 0, "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+
+    // Rotate one row's worth of weights in-place per 256-element segment, then
+    // quantize as HFP4G32 and stamp the rotation flag. Reuses signs1/signs2
+    // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
+    // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        // Apply 256-element FWHT to each segment of the row.
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        let mut row_packed = quantize_hfp4g32_row(&row_buf);
+        // Stamp format_flags = 0x05 (bit 0 set + bits 2-3 = 01 = offline FWHT).
+        row_packed[6] = 0x05;
+        out.extend_from_slice(&row_packed);
+    }
+    out
+}
+
+/// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
+/// Returns the K reconstructed FP32 weights for one row.
+#[allow(dead_code)] // used by tests + future round-trip diagnostics
+fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
+    assert!(k % 32 == 0, "HFP4G32 requires K%32 == 0");
+    let n_blocks = k / 32;
+    assert_eq!(packed.len(), 16 + n_blocks * 17, "HFP4G32 row size mismatch");
+
+    let row_scale_a_bits = u16::from_le_bytes([packed[0], packed[1]]);
+    let row_scale_a = f16_to_f32(row_scale_a_bits);
+
+    let mut out = vec![0.0f32; k];
+    for b in 0..n_blocks {
+        let payload_off = 16 + b * 17;
+        let block_e = packed[payload_off] as i32;
+        let block_scale = (block_e - 127) as f32;
+        let block_scale_factor = block_scale.exp2();
+        let scale = row_scale_a * block_scale_factor;
+
+        for i in 0..16 {
+            let byte = packed[payload_off + 1 + i];
+            let lo_nibble = (byte & 0x0F) as usize;
+            let hi_nibble = ((byte >> 4) & 0x0F) as usize;
+            out[b * 32 + 2 * i]     = scale * E2M1_LUT[lo_nibble];
+            out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi_nibble];
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod hfp4_tests {
+    use super::*;
+
+    #[test]
+    fn e2m1_round_matches_lattice() {
+        // Each lattice value should round to its own code.
+        for (i, &val) in E2M1_LUT.iter().enumerate() {
+            let nibble = e2m1_round(val);
+            // +0 and -0 are both at value 0.0; either nibble is acceptable.
+            if val.abs() < 1e-6 {
+                assert!(nibble == 0 || nibble == 8, "zero rounds to nibble {}", nibble);
+            } else {
+                assert_eq!(nibble, i as u8, "code {} rounded to nibble {} not {}", i, nibble, i);
+            }
+        }
+    }
+
+    #[test]
+    fn e2m1_round_midpoint() {
+        // Halfway between +1.0 and +1.5 → either is acceptable (tie).
+        let n = e2m1_round(1.25);
+        assert!(n == 2 || n == 3, "midpoint rounded to {}", n);
+        // Halfway between +4.0 and +6.0 (= 5.0) → either is acceptable.
+        let n = e2m1_round(5.0);
+        assert!(n == 6 || n == 7, "5.0 rounded to {}", n);
+    }
+
+    #[test]
+    fn round_trip_constant_row() {
+        // All-1.0 row: row_scale_a = 1/6, every block_e ≈ 127 + log2(1) = 127, every nibble = 2 (=1.0).
+        let row = vec![1.0f32; 64];
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, 64);
+        for (i, &v) in recovered.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-2, "elem {} recovered to {}", i, v);
+        }
+    }
+
+    #[test]
+    fn round_trip_mixed_magnitudes() {
+        // Row with mixed positive/negative E2M1 magnitudes — should round-trip exactly.
+        let row: Vec<f32> = (0..64).map(|i| {
+            let v = E2M1_LUT[i % 16];
+            v * 6.0 // scale up so row_scale_a sees max abs at 6 * 6 = 36, brings code lattice back to [-6, 6]
+        }).collect();
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, 64);
+        // Bound: |recovered - input| ≤ row_scale * 2^(block_e - 127) * 0.5 (half min E2M1 step).
+        // With row_scale_a = 36/6 = 6, and block_max_normalized = 6, block_e = 127 → step ≈ 0.5 → tol = 3.0.
+        // Actual tolerance should be much tighter for exact lattice values; allow some headroom.
+        for (i, (&got, &want)) in recovered.iter().zip(row.iter()).enumerate() {
+            let rel_err = (got - want).abs() / want.abs().max(1.0);
+            assert!(rel_err < 0.1, "elem {}: got {} want {} rel_err {}", i, got, want, rel_err);
+        }
+    }
+
+    #[test]
+    fn round_trip_per_block_error_bound() {
+        // Mathematical guarantee: for every element, |recovered - original| must be ≤
+        //   row_scale_a * 2^(block_e - 127) * (max_E2M1_step / 2)
+        // = effective_block_scale * 1.0  (max E2M1 step is 2.0, half = 1.0)
+        //
+        // This is the format's correctness contract; if this fails we have a real bug.
+        // NRMSE quality on raw weights is a downstream concern (MXFP4 family is documented
+        // as needing rotation+smoothing for production accuracy — that's MFP4G32 in v1.5).
+        let mut rng_state: u64 = 0xdead_beef_dead_beef;
+        let mut next_uniform = || -> f32 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            ((rng_state & 0x00FF_FFFF) as f32 / 0x0100_0000 as f32).max(1e-7)
+        };
+        // Box-Muller Gaussian std=0.5.
+        let row: Vec<f32> = (0..512).flat_map(|_| {
+            let u1 = next_uniform();
+            let u2 = next_uniform();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let t = 2.0 * std::f32::consts::PI * u2;
+            [r * t.cos() * 0.5, r * t.sin() * 0.5]
+        }).collect();
+
+        let k = row.len();
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, k);
+
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[0], packed[1]]));
+
+        // Per-block half-max-step bound. Allow 1% slack for FP16 row-scale rounding.
+        for b in 0..(k / 32) {
+            let payload_off = 16 + b * 17;
+            let block_e = packed[payload_off] as i32;
+            let block_scale = ((block_e - 127) as f32).exp2();
+            // Max E2M1 step is 2.0 (between 4 and 6); half = 1.0. Round-trip element error must
+            // be ≤ effective block scale × 1.0 × (1 + slack). Slack absorbs FP16 row-scale rounding.
+            let bound = row_scale_a * block_scale * 1.0 * 1.01 + 1e-5;
+            for i in 0..32 {
+                let idx = b * 32 + i;
+                let err = (recovered[idx] - row[idx]).abs();
+                assert!(err <= bound,
+                        "block {} elem {} err {} exceeds bound {} (block_e={}, row_scale_a={}, block_scale={})",
+                        b, i, err, bound, block_e, row_scale_a, block_scale);
+            }
+        }
+    }
+
+    #[test]
+    fn header_layout_matches_spec() {
+        // 64 elements = 2 blocks. Row size: 16 + 2*17 = 50 bytes.
+        let row = vec![3.0f32; 64];
+        let packed = quantize_hfp4g32_row(&row);
+        assert_eq!(packed.len(), 50);
+        // Block count == 2.
+        let bc = u16::from_le_bytes([packed[4], packed[5]]);
+        assert_eq!(bc, 2);
+        // Format flags: rotation off, no row_scale_b.
+        assert_eq!(packed[6] & 0x0F, 0);
+        // First block UE8M0 byte at offset 16.
+        // Last block payload ends at 16 + 2*17 = 50 (= total).
+        // Sanity: row_scale_a > 0 (FP16 bits non-zero).
+        let rs_bits = u16::from_le_bytes([packed[0], packed[1]]);
+        assert_ne!(rs_bits, 0);
+    }
+
+    #[test]
+    fn mfp4_stamps_rotation_flag() {
+        // MFP4G32 must stamp format_flags = 0x05 (bit 0 + bits 2-3 = 01) in every row
+        // header so loaders/tooling can detect the offline-FWHT variant. Byte length must
+        // match HFP4G32 (only the flag byte and the rotated weight content differ).
+        let m = 3;
+        let k = 256;
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let f32_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let packed = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+        let row_bytes = 16 + 17 * (k / 32);
+        assert_eq!(packed.len(), m * row_bytes, "MFP4G32 byte length mismatch");
+        for r in 0..m {
+            let off = r * row_bytes;
+            assert_eq!(packed[off + 6], 0x05, "row {} format_flags expected 0x05, got {:#x}", r, packed[off + 6]);
+            // block_count must equal k/32.
+            let bc = u16::from_le_bytes([packed[off + 4], packed[off + 5]]);
+            assert_eq!(bc as usize, k / 32);
+        }
+    }
+
+    // Orthogonality of the FWHT (`dot(R(W), R(x)) ≈ dot(W, x)`) is the load-bearing
+    // correctness property and is empirically validated by `examples/test_gemv_mfp4g32.rs`
+    // across K = {512, 1024, 1280, 1536, 1792, 2048} on real GPU hardware (max-abs error
+    // ≤ 1.14e-5 vs 5e-3 tolerance — three orders of magnitude under). A CPU-only unit test
+    // can't tighten that further without duplicating the GPU's CPU-reference path.
+}
+
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
@@ -1310,6 +1649,22 @@ enum QuantType {
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
     MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
+    // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
+    // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
+    HFP4G32 = 21,      // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
+    // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
+    // signals "rotation present, offline FWHT" for future interop/detection.
+    MFP4G32 = 24,      // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
+    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
+    // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
+    // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
+    // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
+    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    // HFP8E5M2G32 = 28, // v2  — HFP8 E5M2 family
+    // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -1352,12 +1707,35 @@ fn parse_layer_idx(name: &str) -> Option<usize> {
     None
 }
 
+/// Stride for alternating-mode promotion: edge layers always promoted,
+/// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
+/// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
+/// On MoE 3.6-35B-A3B: stride=3 gives PPL 8K=19.96 at 21.8 GB vs full
+/// K-map PPL 8K=20.07 at 27.7 GB.
+const ALTERNATING_STRIDE: usize = 3;
+
+/// llama.cpp-style alternating promotion: edge layers always promoted,
+/// middle layers promoted every `stride` layers.
+fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
+    if n_layers == 0 || stride == 0 { return false; }
+    if idx < 2 || idx >= n_layers.saturating_sub(2) { return true; }
+    (idx - 2) % stride == 0
+}
+
 /// Resolve the quantization level for a tensor based on its name, the model's
-/// layer count, and whether the model is MoE. See spec for rule ordering.
+/// layer count, whether the model is MoE, and the K-map mode.
+///
+/// `kmap_mode`: 0 = full (all candidates promoted), 1 = alternating
+/// (experts + ffn_down every 3rd middle layer, edge layers always),
+/// 2 = typed (ffn_down + attn_v everywhere).
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    kmap_resolve_mode(name, n_layers, is_moe, 0)
+}
+
+fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -1380,14 +1758,78 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
 
     // Rule 4: MoE expert FFN weights
     if is_moe && name.contains("mlp.experts.") {
+        if kmap_mode == 1 {
+            // Alternating: promote expert groups only in positional layers
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                return QuantLevel::Base;
+            }
+        }
         return QuantLevel::Promote6;
     }
 
-    // Rule 5: edge layers (first 2 + last 2)
+    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    if kmap_mode == 2 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 1 (alternating): ffn_down in edge + every 3rd middle layer.
+    // Edge-layer rule mirrors mode 0 below: attn+FFN for MoE (full promotion
+    // gives -19.8% PPL on 3.6-35B-A3B), FFN only for dense (attn promotion
+    // regresses PPL +3.1% on 27B). Bench: asym4 KV, ctx=8192, wikitext-2-test.
+    // See ppl_kmap_20260508.md.
+    if kmap_mode == 1 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                // Edge layers: attn+FFN for MoE, FFN only for dense.
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    if is_moe {
+                        return QuantLevel::Promote6;
+                    }
+                    let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                    if is_ffn {
+                        return QuantLevel::Promote6;
+                    }
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Rule 5 (full mode 0): edge layers (first 2 + last 2).
+    // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
+    // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
+    // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
     if n_layers > 0 {
         if let Some(idx) = parse_layer_idx(name) {
             if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                return QuantLevel::Promote6;
+                if is_moe {
+                    // MoE: promote all tensors in edge layers (attn + FFN)
+                    return QuantLevel::Promote6;
+                }
+                // Dense: promote FFN only — attn stays at Base
+                let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                if is_ffn {
+                    return QuantLevel::Promote6;
+                }
             }
         }
     }
@@ -1913,6 +2355,8 @@ enum GgufFormat {
     Mq2,
     Mq2Lloyd,
     Mq3Lloyd,
+    Hfp4,  // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
+    Mfp4,  // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
 }
 
 impl GgufFormat {
@@ -1926,6 +2370,8 @@ impl GgufFormat {
             "mq2" | "mq2g256" => Some(Self::Mq2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
+            "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
+            "mfp4" | "mfp4g32" | "mf4p" => Some(Self::Mfp4),
             _ => None,
         }
     }
@@ -1940,6 +2386,8 @@ impl GgufFormat {
             Self::Mq2 => "MQ2G256",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
+            Self::Hfp4 => "HFP4G32",
+            Self::Mfp4 => "MFP4G32",
         }
     }
 }
@@ -1949,7 +2397,7 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool) -> std::io::Result<()> {
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool, kmap_mode: u8) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -1990,7 +2438,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(format,
         GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd);
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mfp4);
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
@@ -2018,7 +2466,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
         for info in &gguf.tensors {
             let out_name = gguf_to_safetensors_name(&info.name)
                 .unwrap_or_else(|| info.name.clone());
-            let level = kmap_resolve(&out_name, n_layers, is_moe);
+            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2028,7 +2476,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
             map.insert(out_name, level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors", counts[0]);
@@ -2095,6 +2544,20 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
+                GgufFormat::Hfp4 => {
+                    // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                }
+                GgufFormat::Mfp4 => {
+                    // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -2132,6 +2595,18 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Hfp4 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                }
+                GgufFormat::Mfp4 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
         } else {
@@ -2248,6 +2723,11 @@ fn main() {
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
+    // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
+    let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
+    // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
+    // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
+    let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
     // K-map gate: applies to MoE models by default. Dense models opt in
@@ -2256,6 +2736,18 @@ fn main() {
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
+    // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
+    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
+    // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
+    let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| match v.as_str() {
+            "full" | "0" => 0,
+            "alternating" | "alt" | "1" => 1,
+            "typed" | "2" => 2,
+            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using alternating"); 1 }
+        })
+        .unwrap_or(1);
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -2347,7 +2839,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -2460,7 +2952,7 @@ fn main() {
         let mut map = HashMap::new();
         let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
         for (name, _fi) in &all_tensors {
-            let level = kmap_resolve(name, n_layers, is_moe);
+            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2470,7 +2962,8 @@ fn main() {
             map.insert(name.to_string(), level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({format} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({format} base, {n_layers} layers{}, mode={mode_label}):",
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
             eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
@@ -2802,6 +3295,40 @@ fn main() {
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 } else {
                     // Fallback to standard HFQ4-G128 for non-256-aligned
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_hfp4 && is_embed {
+                // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
+                // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_hfp4 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 32 == 0 && meta.shape.len() == 2 {
+                    let m = meta.shape[0];
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                } else {
+                    // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_mfp4 && is_embed {
+                // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mfp4 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let m = meta.shape[0];
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                } else {
+                    // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
+                    // requires 256-element segments). Matches MQ4's ragged fallback.
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }
@@ -3196,13 +3723,25 @@ mod tests {
     }
 
     #[test]
-    fn kmap_edge_layers_promote6() {
-        // First 2 layers
-        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
-        // Last 2 layers
-        assert_eq!(kmap_resolve("model.layers.62.self_attn.v_proj.weight", 64, false), QuantLevel::Promote6);
+    fn kmap_edge_layers_dense_ffn_only() {
+        // Dense: FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote6);
         assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        // Dense: attn in edge layers — NOT promoted
+        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.0.linear_attn.in_proj_qkv.weight", 64, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_moe_attn_and_ffn() {
+        // MoE: both attn and FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote6);
     }
 
     #[test]
@@ -3246,8 +3785,120 @@ mod tests {
 
     #[test]
     fn kmap_gguf_names() {
-        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Promote6);
+        // GGUF edge-layer FFN (dense) — promoted
+        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote6);
         assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        // GGUF edge-layer attn (dense) — NOT promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Base);
+        // GGUF edge-layer attn (MoE) — promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote6);
+        // GGUF middle-layer — base
         assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
+    }
+
+    // ── Alternating mode tests ───────────────────────────────────────────
+
+    #[test]
+    fn positional_promote_edges() {
+        assert!(is_positional_promote(0, 40, 3));
+        assert!(is_positional_promote(1, 40, 3));
+        assert!(is_positional_promote(38, 40, 3));
+        assert!(is_positional_promote(39, 40, 3));
+    }
+
+    #[test]
+    fn positional_promote_stride3() {
+        // Middle layers: every 3rd starting from idx 2
+        assert!(is_positional_promote(2, 40, 3));  // edge
+        assert!(!is_positional_promote(3, 40, 3));
+        assert!(!is_positional_promote(4, 40, 3));
+        assert!(is_positional_promote(5, 40, 3));
+        assert!(!is_positional_promote(6, 40, 3));
+        assert!(!is_positional_promote(7, 40, 3));
+        assert!(is_positional_promote(8, 40, 3));
+    }
+
+    #[test]
+    fn kmap_alternating_moe_experts() {
+        // MoE experts: promoted in positional layers, base in others
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Promote6 // edge layer
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Promote6 // stride hit (5-2=3, 3%3==0)
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            QuantLevel::Base // not on stride
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_ffn_down() {
+        // ffn_down promoted in positional layers, base in others
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Promote6 // edge
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.5.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Promote6 // stride
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.3.mlp.down_proj.weight", 40, false, 1),
+            QuantLevel::Base // not on stride
+        );
+        // gate_proj NOT promoted in middle layers
+        assert_eq!(
+            kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_n_layers_zero() {
+        // With n_layers=0, alternating mode should return Base for everything
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_gguf_names() {
+        // GGUF ffn_down in edge layer
+        assert_eq!(
+            kmap_resolve_mode("blk.0.ffn_down.weight", 40, false, 1),
+            QuantLevel::Promote6
+        );
+        // GGUF ffn_down in middle non-stride layer
+        assert_eq!(
+            kmap_resolve_mode("blk.3.ffn_down.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+        // GGUF ffn_gate stays base in middle
+        assert_eq!(
+            kmap_resolve_mode("blk.5.ffn_gate.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_typed_promotes_down_and_v() {
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 2),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 2),
+            QuantLevel::Promote6
+        );
+        // gate_proj stays base
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
+            QuantLevel::Base
+        );
     }
 }

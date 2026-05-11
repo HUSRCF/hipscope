@@ -774,6 +774,20 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
         }
+        21 => { // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale. See docs/quant-formats/hfp4.md.
+                // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs); refuse here so a
+                // stale or externally-quantized file fails at load instead of panicking on
+                // first dispatch.
+            assert!(k % 256 == 0, "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0 })
+        }
+        24 => { // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
+                // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
+            assert!(k % 256 == 0, "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -1849,20 +1863,25 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
 }
 
-/// Detect any MQ3G256 weight inside a MoE FFN block (router, shared expert
-/// gate/up/down, shared_expert_gate router-mix scalar, or any routed
-/// expert's gate_up/down). The MoE batched FFN kernels assume HFQ4-layout
-/// (136 B/group); an MQ3 weight (104 B/group) would dispatch with the wrong
-/// stride. Used by the captured-prefill defense-in-depth check.
+/// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
+/// shared expert gate/up/down, shared_expert_gate router-mix scalar, or any
+/// routed expert's gate_up/down). The MoE batched FFN kernels assume HFQ4
+/// layout (136 B/group); an MQ3 weight (104 B/group) or Lloyd-MQ3 weight
+/// (112 B/group) would dispatch with the wrong stride. Used by the
+/// captured-prefill and non-captured-prefill defense-in-depth checks.
+///
+/// Mirrors `is_mq3_any` in `forward_prefill_batch_single_chunk_captured`
+/// (line 3325) so both cross-checks treat plain and Lloyd-MQ3 identically.
 fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
-    ffn.router.gpu_dtype == DType::MQ3G256
-        || ffn.shared_expert_gate.gpu_dtype == DType::MQ3G256
-        || ffn.shared_expert.gate.gpu_dtype == DType::MQ3G256
-        || ffn.shared_expert.up.gpu_dtype == DType::MQ3G256
-        || ffn.shared_expert.down.gpu_dtype == DType::MQ3G256
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    is_mq3_any(ffn.router.gpu_dtype)
+        || is_mq3_any(ffn.shared_expert_gate.gpu_dtype)
+        || is_mq3_any(ffn.shared_expert.gate.gpu_dtype)
+        || is_mq3_any(ffn.shared_expert.up.gpu_dtype)
+        || is_mq3_any(ffn.shared_expert.down.gpu_dtype)
         || ffn.experts.iter().any(|e|
-            e.gate_up.gpu_dtype == DType::MQ3G256
-            || e.down.gpu_dtype == DType::MQ3G256)
+            is_mq3_any(e.gate_up.gpu_dtype)
+            || is_mq3_any(e.down.gpu_dtype))
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -3420,12 +3439,12 @@ pub fn forward_prefill_batch_single_chunk_captured(
     );
     if mq3_in_moe {
         return Err(hip_bridge::HipError::new(0,
-            "forward_prefill_batch_single_chunk_captured: model has MQ3G256 \
-             weights inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The \
-             MoE batched prefill branches dispatch through HFQ4-layout kernels \
-             and would memory-fault on the 104-vs-136 byte stride. Use an MQ4 \
-             quantization for MoE/A3B targets, or wait for the MQ3 MoE \
-             branches to land."
+            "forward_prefill_batch_single_chunk_captured: model has MQ3G256 / \
+             MQ3G256Lloyd weights inside a MoE/A3B layer (DeltaNetMoe or \
+             FullAttnMoe). The MoE batched prefill branches dispatch through \
+             HFQ4-layout kernels and would memory-fault on the 104/112-vs-136 \
+             byte stride. Use an MQ4 quantization for MoE/A3B targets, or wait \
+             for the MQ3 MoE branches to land."
         ));
     }
     if mq3_in_dense && !arch_has_wmma {
@@ -3563,6 +3582,49 @@ pub fn forward_prefill_batch_with_pbs(
     let n = tokens.len();
     if n == 0 {
         return Ok(());
+    }
+
+    // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
+    // layer (attention OR FFN), mirroring the captured-path guard at
+    // `forward_prefill_batch_single_chunk_captured` (line 3367+). Without
+    // this, the eligibility check below would admit a hybrid model with
+    // (e.g.) MQ3 attention + MQ4 MoE FFN onto the batched path, where the
+    // MoE-batched LA/FA bodies would misroute: the QKV matcher drops MQ3
+    // and the wo path is hardcoded to `gemm_hfq4g256_residual` regardless
+    // of `layer.wo.gpu_dtype`. The result is a 104/112 vs 136 byte stride
+    // mismatch and silent-corruption fluent-looking output. Issue #179
+    // documents the matcher half of this; the wo half was uncovered in
+    // review. Wiring both correctly (plus Lloyd) is tracked separately
+    // (see followup issue) — until then we hard-error here so all three
+    // entry points (daemon-DFlash setup, captured prefill, non-captured
+    // prefill) reject MQ3+MoE consistently.
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    let mq3_in_moe = weights.layers.iter().any(|lw| match lw {
+        LayerWeights::DeltaNetMoe(l) =>
+            is_mq3_any(l.wqkv.gpu_dtype)
+                || is_mq3_any(l.wz.gpu_dtype)
+                || is_mq3_any(l.w_beta.gpu_dtype)
+                || is_mq3_any(l.w_alpha.gpu_dtype)
+                || is_mq3_any(l.wo.gpu_dtype)
+                || moe_ffn_has_mq3(&l.ffn),
+        LayerWeights::FullAttnMoe(l) =>
+            is_mq3_any(l.wq.gpu_dtype)
+                || is_mq3_any(l.wk.gpu_dtype)
+                || is_mq3_any(l.wv.gpu_dtype)
+                || is_mq3_any(l.wo.gpu_dtype)
+                || moe_ffn_has_mq3(&l.ffn),
+        _ => false,
+    });
+    if mq3_in_moe {
+        return Err(hip_bridge::HipError::new(0,
+            "forward_prefill_batch: model has MQ3G256 / MQ3G256Lloyd weights \
+             inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The MoE \
+             batched prefill branches dispatch through HFQ4-layout kernels \
+             (QKV matcher drops MQ3; wo path is hardcoded MQ4) and would \
+             produce silent corruption from the 104/112-vs-136 byte stride \
+             mismatch. Use an MQ4 quantization for MoE/A3B targets, or wait \
+             for the MQ3 MoE branches to land (see followup issue)."
+        ));
     }
 
     // Tree-verify mode sanity checks — the downstream path can't silently
@@ -4962,12 +5024,16 @@ fn forward_prefill_chunk(
                 // only the FFN differs. Duplicated inline for now — can
                 // be factored into a `prefill_la_body_batched` helper
                 // when dense and MoE LA paths are proven byte-exact.
-                // GAP NOTE: this matcher is missing plain DType::MQ3G256 (upstream
-                // issue #179) and DType::MQ3G256Lloyd / MQ2G256Lloyd. Currently
-                // dead code — moe_ffn_all_mq4 (line 3707) keeps non-MQ4 MoE
-                // layers off the batched path. Re-evaluate this comment when
-                // touching is_batchable_la or moe_ffn_all_mq4. See
-                // docs/plans/mq-lloyd-batched-prefill-followup.md.
+                // This body is unreachable for MQ3 / MQ3-Lloyd weights —
+                // the upstream `mq3_in_moe` guard at the top of
+                // `forward_prefill_batch_with_pbs` rejects any MoE layer
+                // with MQ3/Lloyd-MQ3 weights anywhere (attention OR FFN),
+                // mirroring the captured-path guard at line 3367+. So
+                // `layer.wqkv.gpu_dtype` is restricted to MQ4G256 / HFQ4G256
+                // / MQ6G256 / HFQ6G256 here. Adding MQ3 to the matcher AND
+                // the QKV dispatch is insufficient — the wo path below
+                // (line 5072) is hardcoded MQ4 too — so the all-or-nothing
+                // wiring lives in a separate PR (see followup issue).
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
@@ -5119,10 +5185,16 @@ fn forward_prefill_chunk(
                 // MoE path is proven byte-exact.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
-                // GAP NOTE: this matcher is missing plain DType::MQ3G256 (upstream
-                // issue #179) and DType::MQ3G256Lloyd / MQ2G256Lloyd. Currently
-                // dead code — moe_ffn_all_mq4 keeps non-MQ4 MoE off the batched
-                // path. See docs/plans/mq-lloyd-batched-prefill-followup.md.
+                // This body is unreachable for MQ3 / MQ3-Lloyd weights —
+                // the upstream `mq3_in_moe` guard at the top of
+                // `forward_prefill_batch_with_pbs` rejects any MoE layer
+                // with MQ3/Lloyd-MQ3 weights anywhere (attention OR FFN),
+                // mirroring the captured-path guard at line 3367+. So
+                // `layer.wq.gpu_dtype` is restricted to MQ4G256 / HFQ4G256
+                // / MQ6G256 / HFQ6G256 here. Adding MQ3 to the matcher AND
+                // the QKV dispatch is insufficient — the wo path below
+                // (line 5320) is hardcoded MQ4 too — so the all-or-nothing
+                // wiring lives in a separate PR (see followup issue).
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
@@ -5412,6 +5484,10 @@ fn run_fa_layer_body(
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+    let fused_fa3_hfq6 = fa3_same_dtype
+        && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
     if fused_fa3_mq4 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_qkv_hfq4g256(
@@ -5424,6 +5500,15 @@ fn run_fa_layer_body(
     } else if fused_fa3_lloyd_mq3 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_qkv_mq3g256_lloyd(
+            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+            eff_x,
+            &s.fa_q_full, &s.fa_k, &s.fa_v,
+            layer.wq.m, layer.wk.m, layer.wv.m,
+            layer.wq.k,
+        )?;
+    } else if fused_fa3_hfq6 {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_qkv_hfq6g256_dp4a(
             &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
             eff_x,
             &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -5545,6 +5630,10 @@ fn run_fa_layer_body(
     let same_dtype = layer.w_up.gpu_dtype == dt_g;
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+    let fused_gu_hfq6 = same_dtype
+        && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
+        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
     if fused_gu_mq4 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_hfq4g256(
@@ -5557,6 +5646,15 @@ fn run_fa_layer_body(
     } else if fused_gu_lloyd_mq3 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_mq3g256_lloyd(
+            &layer.w_gate.buf, &layer.w_up.buf,
+            eff_x,
+            &s.gate_ffn, &s.up,
+            layer.w_gate.m, layer.w_up.m,
+            layer.w_gate.k,
+        )?;
+    } else if fused_gu_hfq6 {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_gate_up_hfq6g256_dp4a(
             &layer.w_gate.buf, &layer.w_up.buf,
             eff_x,
             &s.gate_ffn, &s.up,
@@ -5677,6 +5775,10 @@ fn forward_scratch_layers(
                     && layer.w_alpha.gpu_dtype == dt;
                 let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+                let fused_la4_hfq6 = la4_same_dtype
+                    && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                 if fused_la4_mq4 {
                     // MQ4: x_rot is Some(rotated x); HF4: x_rot is None and
                     // s.tmp holds the plain rmsnormed x from the fallback path.
@@ -5697,6 +5799,18 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkvza_mq3g256_lloyd(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        eff_x,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                } else if fused_la4_hfq6 {
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
+                    gpu.fused_qkvza_hfq6g256_dp4a(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         eff_x,
                         &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
@@ -5792,6 +5906,10 @@ fn forward_scratch_layers(
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+                let fused_gu_hfq6 = same_dtype
+                    && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
+                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                 if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -5810,6 +5928,15 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_mq3g256_lloyd(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        eff_x,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;
+                } else if fused_gu_hfq6 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_gate_up_hfq6g256_dp4a(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
@@ -5847,6 +5974,10 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+                let fused_fa3_hfq6 = fa3_same_dtype
+                    && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                 if fused_fa3_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -5865,6 +5996,15 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_mq3g256_lloyd(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        eff_x,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else if fused_fa3_hfq6 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_qkv_hfq6g256_dp4a(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -6003,6 +6143,10 @@ fn forward_scratch_layers(
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+                let fused_gu_hfq6 = same_dtype
+                    && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
+                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                 if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -6021,6 +6165,15 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_mq3g256_lloyd(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        eff_x,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;
+                } else if fused_gu_hfq6 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_gate_up_hfq6g256_dp4a(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
@@ -6178,6 +6331,10 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
+                let fused_fa3_hfq6 = fa3_same_dtype
+                    && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                 if fused_fa3_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -6196,6 +6353,15 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_mq3g256_lloyd(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        eff_x,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else if fused_fa3_hfq6 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_qkv_hfq6g256_dp4a(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
