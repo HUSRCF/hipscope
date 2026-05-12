@@ -489,6 +489,18 @@ pub struct WeightTensor {
     pub m: usize,         // output dim (rows)
     pub k: usize,         // input dim (cols)
     pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
+    ///
+    /// Populated by the loader when the .hfq carries a sibling sidecar tensor
+    /// named `<weight>.awq_scale.weight`. The forward path (specifically the
+    /// fused-rmsnorm-rotate call upstream of this linear) must apply
+    /// `x[i] /= awq_scale[i]` before the rotation, completing the AWQ
+    /// math `(W·s) · (x/s) = W·x`. The pre-scaling of W·s was done at
+    /// quantize time (see `compute_awq_scales` in hipfire-quantize/main.rs).
+    ///
+    /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
+    /// with all existing .hfq files.
+    pub awq_scale: Option<GpuTensor>,
 }
 
 /// How the embedding table is stored on GPU.
@@ -1876,19 +1888,19 @@ pub fn load_weights(
         match info.dtype {
             GgmlType::Q4K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0, awq_scale: None })
             }
             GgmlType::Q6K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0, awq_scale: None })
             }
             GgmlType::Q8_0 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
             }
             GgmlType::F32 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
             }
             _ => {
                 // Unsupported: dequant to F32 on CPU, upload as raw bytes
@@ -1897,7 +1909,7 @@ pub fn load_weights(
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
             }
         }
     }
@@ -1924,7 +1936,7 @@ pub fn load_weights(
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
