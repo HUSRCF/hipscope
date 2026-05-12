@@ -3382,6 +3382,73 @@ impl Gpu {
     /// N tokens' [N × K] x into [N × K] x_rot in a single launch. Byte-exact
     /// against calling `fused_rmsnorm_rotate_mq` N times on separate x/x_rot
     /// buffers. Weight/signs are shared across the batch.
+    /// Phase A Stage A — batched AWQ variant. Mirrors
+    /// fused_rmsnorm_rotate_mq_batched but takes an additional
+    /// `awq_scale: &GpuTensor` (length K, FP32) and dispatches the
+    /// AWQ kernel. Caller selects based on the upcoming linear
+    /// layer's WeightTensor.awq_scale being Some.
+    pub fn fused_rmsnorm_rotate_mq_awq_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_awq",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
+            "fused_rmsnorm_mq_rotate_awq",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_awq_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_awq",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp); b.push_ptr(awp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     pub fn fused_rmsnorm_rotate_mq_batched(
         &mut self,
         x: &GpuTensor,

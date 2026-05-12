@@ -2556,6 +2556,43 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+/// AWQ pre-scaling is mathematically valid only for weights whose runtime
+/// path applies the inverse divide-by-scale. Those are the weights fed via
+/// `fused_rmsnorm_rotate_mq` / `fused_rmsnorm_rotate_mq_awq` (the AWQ-aware
+/// variant dispatches when `awq_scale.is_some()`): the post-RMSNorm linear
+/// projections.
+///
+/// Weights NOT on this whitelist — `o_proj` / `wo` (full-attn output),
+/// `out_proj` (linear-attn output), `down_proj` / `w_down` (MLP output)
+/// — are fed by `rotate_x_mq` or `fused_silu_mul_rotate_mq`, neither of
+/// which has AWQ awareness. Pre-scaling those weights without a runtime
+/// compensating divide produces `(W·s) · x ≠ W · x` — catastrophic logits
+/// (measured: 0.8B Qwen3.5 KLD blowup 0.6721 → 13.4893, see
+/// `docs/plans/awq_fix_claude.md`).
+///
+/// Whitelist (vs blacklist) is the safe default: a new tensor name in a
+/// future arch fails closed (no AWQ) until someone confirms its runtime
+/// path is AWQ-aware. A blacklist would silently corrupt new weights.
+fn awq_eligible(name: &str) -> bool {
+    // Full-attention pre-RMSNorm projections (HF naming + fused variants).
+    name.ends_with("q_proj.weight")
+        || name.ends_with("k_proj.weight")
+        || name.ends_with("v_proj.weight")
+        || name.ends_with("qkv_proj.weight")
+        || name.ends_with("wqkv.weight")
+        // MLP pre-RMSNorm projections (HF + hipfire-internal naming).
+        || name.ends_with("gate_proj.weight")
+        || name.ends_with("up_proj.weight")
+        || name.ends_with("w_gate.weight")
+        || name.ends_with("w_up.weight")
+        // Linear-attention input projections (Qwen3.5 Gated-DeltaNet).
+        // Suffix varies (in_proj_qkv / _z / _a / _b); the substring is
+        // anchored enough that no non-linear-attn tensor name should match.
+        || name.contains(".in_proj_")
+        // MoE router (post-RMSNorm gating logits).
+        || name.ends_with("router.weight")
+}
+
 /// True if the tensor is the token embedding. We Q8 these (matches the
 /// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
 fn gguf_is_embed_tensor(name: &str) -> bool {
@@ -3751,26 +3788,42 @@ fn main() {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
                     // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
-                    // AND we have imatrix data for this tensor. Mutates a
-                    // local copy of the weights so the original
-                    // f32_data slice/Vec returned by to_f32() is left intact
-                    // for downstream consumers (we don't currently have any
-                    // here, but this is hygienic).
+                    // AND we have imatrix data for this tensor AND the tensor
+                    // is on the AWQ whitelist (see `awq_eligible`). Mutates a
+                    // local copy of the weights so the original f32_data
+                    // returned by to_f32() is left intact for downstream
+                    // consumers (we don't currently have any here, but this
+                    // is hygienic).
+                    //
+                    // The `awq_eligible(name)` guard is critical: pre-scaling
+                    // weights whose runtime path lacks the inverse divide
+                    // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
+                    // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
+                    // this guard landed). See `docs/plans/awq_fix_claude.md`.
                     let q = if let (Some(alpha), Some(im_weights))
                         = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                     {
-                        debug_assert_eq!(im_weights.len(), k_dim,
-                            "imatrix length ({}) != K dim ({}) for {}",
-                            im_weights.len(), k_dim, name);
-                        let scales = compute_awq_scales(im_weights, alpha);
-                        // Stash for sidecar emission after the main tensor push.
-                        awq_sidecar_scales = Some(scales.clone());
-                        let m_dim = meta.shape[0];
-                        // Copy weights so we don't mutate to_f32's buffer
-                        // (might be shared/borrowed depending on dtype path).
-                        let mut scaled = f32_data.clone();
-                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                        quantize_mq4g256(&scaled, &signs1, &signs2)
+                        if awq_eligible(name) {
+                            debug_assert_eq!(im_weights.len(), k_dim,
+                                "imatrix length ({}) != K dim ({}) for {}",
+                                im_weights.len(), k_dim, name);
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            // Stash for sidecar emission after the main tensor push.
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            // Copy weights so we don't mutate to_f32's buffer
+                            // (might be shared/borrowed depending on dtype path).
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            quantize_mq4g256(&scaled, &signs1, &signs2)
+                        } else {
+                            // Runtime path for this weight has no AWQ inverse
+                            // (rotate_x_mq for o_proj/out_proj/wo, or
+                            // fused_silu_mul_rotate_mq for down_proj/w_down).
+                            // Skip AWQ for this tensor — emit plain MQ4 and
+                            // no sidecar.
+                            quantize_mq4g256(&f32_data, &signs1, &signs2)
+                        }
                     } else {
                         quantize_mq4g256(&f32_data, &signs1, &signs2)
                     };
