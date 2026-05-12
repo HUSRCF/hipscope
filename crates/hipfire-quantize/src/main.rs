@@ -2585,11 +2585,28 @@ fn awq_eligible(name: &str) -> bool {
         || name.ends_with("up_proj.weight")
         || name.ends_with("w_gate.weight")
         || name.ends_with("w_up.weight")
+        // MoE fused expert gate+up projection (Qwen3-MoE convention —
+        // experts.gate_up_proj is [num_experts, 2*intermediate, hidden]
+        // with rows split between gate and up halves). Same input-side
+        // semantics as gate_proj/up_proj: post-RMSNorm hidden state
+        // routed via the MoE dispatch. Counterpart `experts.down_proj`
+        // is intentionally NOT on the whitelist — its input is
+        // silu(gate)*up and the runtime uses fused_silu_mul_rotate_mq
+        // (no AWQ inverse), same as the dense `down_proj` case.
+        || name.ends_with("gate_up_proj.weight")
         // Linear-attention input projections (Qwen3.5 Gated-DeltaNet).
         // Suffix varies (in_proj_qkv / _z / _a / _b); the substring is
         // anchored enough that no non-linear-attn tensor name should match.
         || name.contains(".in_proj_")
-        // MoE router (post-RMSNorm gating logits).
+        // MoE router (HF naming for Qwen3-MoE / DeepSeek family — single
+        // linear projecting post-RMSNorm hidden state to num_experts
+        // logits). The quantizer's q8_router rule (set when is_moe)
+        // promotes this to Q8 before reaching the MQ4G256 branch, so
+        // this match is effectively dead code today. Kept for intent:
+        // if Q8 auto-promotion is ever disabled, this preserves
+        // correctness. `router.weight` would be a non-HF naming an
+        // arch might choose; kept for safety.
+        || name.ends_with("mlp.gate.weight")
         || name.ends_with("router.weight")
 }
 
