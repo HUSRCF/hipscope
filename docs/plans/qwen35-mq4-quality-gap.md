@@ -875,13 +875,17 @@ Per-layer drift comparison (Q3.5-0.8B chunk 0, both runs with kv-q8):
 
 Mean cosine at FA layers jumped from 0.93–0.95 to 0.98–0.99.
 
-End-to-end KLD probe (single chunk 0, --max-chunks 1, per-token kv-q8):
+End-to-end KLD probe — single chunk first, then matched 20-chunk slice (Q3.5-0.8B, per-token kv-q8):
 
-| Variant | slice-mean KLD on chunk 0 |
-|---|---:|
-| baseline (interleaved RoPE) | 0.4794 |
-| **halfsplit RoPE (this fix)** | **0.0835** |
-| reduction | **-83%** |
+| Variant | n chunks | slice-mean KLD | PPL |
+|---|---:|---:|---:|
+| baseline (interleaved RoPE)   | chunk 0 only | 0.4794   | —     |
+| **halfsplit RoPE (this fix)** | chunk 0 only | **0.0835** | —   |
+| baseline (interleaved RoPE)   | 20           | 0.4945   | 33.20 |
+| **halfsplit RoPE (this fix)** | 20           | **0.0806** | **18.56** |
+| reduction (20-chunk)          |              | **-83.7%** | -44%  |
+
+PPL dropped from 33.20 → 18.56, very close to plain Qwen3-0.6B's 19.5 (i.e., near the model's true intrinsic PPL on this slice).
 
 The ~0.4 nat engine-drift floor on Qwen3.5 family models is **largely an interleaved-vs-halfsplit RoPE convention mismatch in hipfire-arch-qwen35**, fixed by swapping kernels with no weight-permutation required. The remaining ~0.08 KLD is consistent with the per-layer ~0.06 DeltaNet drift seen across LA layers and is the next investigation target (likely Q8 weight quant noise compounded through the DeltaNet recurrent state).
 
