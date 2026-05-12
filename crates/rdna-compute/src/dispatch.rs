@@ -13589,29 +13589,29 @@ impl Gpu {
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // 2026-05-12 probe: HF Qwen3.5 (transformers/models/qwen3_5/
-        // modeling_qwen3_5.py:573) uses rotate_half — pairs are (i, i+n_rot/2),
-        // NOT (2i, 2i+1). Hipfire-quantize does NOT permute Q/K weights, so
-        // applying the interleaved kernel below to half-split-stored weights
-        // produces the wrong rotation pairing in every FA layer. Env-gate
-        // HIPFIRE_ROPE_HALFSPLIT=1 swaps to the half-split kernel so the
-        // mismatch can be measured against an HF oracle. See
-        // docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention probe".
-        let halfsplit = std::env::var("HIPFIRE_ROPE_HALFSPLIT").ok().as_deref() == Some("1");
-        // Probe-only: log on first call so we can verify the env-gate fires.
-        static ROPE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !ROPE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("rope_partial_interleaved_f32: HIPFIRE_ROPE_HALFSPLIT={} -> entry={}",
-                if halfsplit { "1" } else { "(unset/0)" },
-                if halfsplit { "rope_partial_halfsplit_f32" } else { "rope_partial_interleaved_f32" }
-            );
-        }
-        let (src, entry) = if halfsplit {
-            (kernels::ROPE_PARTIAL_HALFSPLIT_SRC, "rope_partial_halfsplit_f32")
-        } else {
+        // RoPE convention for Qwen3.5 partial rotary: HF
+        // `transformers/models/qwen3_5/modeling_qwen3_5.py:573-579` uses
+        // `rotate_half` — pairs are (i, i + n_rot/2), NOT (2i, 2i+1).
+        // hipfire-quantize does NOT permute Q/K weights at quantize time, so
+        // the half-split kernel below is the mathematically-correct match for
+        // HF-converted weights and is the DEFAULT since 2026-05-12. The legacy
+        // interleaved kernel produced a ~0.4 nat engine-drift floor on Qwen3.5
+        // models (docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention
+        // probe / halfsplit fix") and is retained behind
+        // HIPFIRE_ROPE_INTERLEAVED_LEGACY=1 for any caller that needs
+        // bit-for-bit reproduction of pre-flip outputs (legacy regression
+        // probes, comparisons to historical benches).
+        //
+        // Function name kept as `rope_partial_interleaved_f32` to avoid a
+        // workspace-wide rename in this commit; the dispatched kernel is now
+        // `rope_partial_halfsplit_f32` by default.
+        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let (src, entry) = if legacy {
             (kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")
+        } else {
+            (kernels::ROPE_PARTIAL_HALFSPLIT_SRC, "rope_partial_halfsplit_f32")
         };
-        let cache_key = if halfsplit { "rope_partial_halfsplit" } else { "rope_partial_interleaved" };
+        let cache_key = if legacy { "rope_partial_interleaved" } else { "rope_partial_halfsplit" };
         self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
@@ -13654,9 +13654,22 @@ impl Gpu {
         freq_base: f32, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_partial_interleaved_batched",
-            kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
-            "rope_partial_interleaved_batched_f32")?;
+        // Halfsplit is the default since 2026-05-12; HIPFIRE_ROPE_INTERLEAVED_LEGACY=1
+        // restores the pre-flip interleaved kernel for legacy reproducibility.
+        // Function name retained for source-tree stability; the dispatched
+        // kernel is halfsplit by default. See sibling
+        // `rope_partial_interleaved_f32` for the rationale.
+        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let (cache_key, src, entry) = if legacy {
+            ("rope_partial_interleaved_batched",
+             kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
+             "rope_partial_interleaved_batched_f32")
+        } else {
+            ("rope_partial_halfsplit_batched",
+             kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC,
+             "rope_partial_halfsplit_batched_f32")
+        };
+        self.ensure_kernel(cache_key, src, entry)?;
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut pp = positions.buf.as_ptr();
@@ -13681,9 +13694,9 @@ impl Gpu {
         let block = 32u32.min(n_pairs);
         let grid_x = (n_pairs + block - 1) / block;
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_batched_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let result = self.launch_maybe_blob(
-            "rope_partial_interleaved_batched_f32",
+            entry,
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
             0,

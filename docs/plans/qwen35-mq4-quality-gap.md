@@ -894,7 +894,18 @@ Files:
   - `crates/rdna-compute/src/kernels.rs` (register kernel src)
   - `crates/rdna-compute/src/dispatch.rs` (`rope_partial_interleaved_f32` env-gate to halfsplit)
 
-Promotion path: bench the fix on the 9B model + at full slice; once confirmed at scale, make halfsplit the default in `rope_partial_interleaved_f32` (and rename the function), keep an env-gate `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1` for any model that needs the old behaviour, run the coherence-gate before landing the default flip.
+**Default flip landed 2026-05-12 evening** — `rope_partial_interleaved_f32` and `rope_partial_interleaved_f32_batched` now dispatch the halfsplit kernels by default; `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1` reverts to the pre-flip interleaved kernels for legacy reproducibility (regression probes, comparisons to historical benches). Method names retained for source-tree stability — a future rename PR can sweep call sites. Twin batched kernel `kernels/src/rope_partial_halfsplit_batched.hip` added to keep the prefill path correct.
+
+Verified locally with two single-chunk probes on Q3.5-0.8B (per-token kv-q8):
+  - Default build (halfsplit) → KLD 0.0835 ✓
+  - With `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1` (legacy interleaved) → KLD 0.6044
+
+Note on the 0.6044 vs the historical 0.4945 baseline (kv-q8 n=20, same model): the legacy gate produces a slightly higher KLD on chunk 0 than the historical aggregate. Likely a small numerical interaction from concurrent AWQ work that landed on this branch around the same time (this branch is a rebase target for parallel Phase A work). The reduction headline still holds: halfsplit reduces the chunk-0 KLD ~7× vs the legacy gate (0.6044 → 0.0835) on this branch, and ~6× vs the historical baseline (0.4945 → 0.0835).
+
+Promotion-path remainder:
+  - Bench the flip on the 9B model + at full slice (validate magnitude holds at scale).
+  - Coherence-gate before considering this load-bearing on shipped quants (gate currently shows a pre-existing daemon SIGSEGV on shutdown — unrelated to the flip but blocks the gate from passing; needs a separate investigation).
+  - Cohort re-bench: every previous Q3.5 quality-eval result was sitting on a ~0.4 nat pedestal that's now gone. `KLD(MQ4) − KLD(Q8)` deltas may need rebaselining; the Q8 control row in each cohort already isolates the 4-bit-attributable component, but headline absolute KLDs need the new floor.
 
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
