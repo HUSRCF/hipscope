@@ -807,25 +807,88 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
     }
 }
 
+/// Phase A Stage A — AWQ sidecar loader for the Qwen3.5 forward path.
+///
+/// The .hfq quantizer emits `<weight>.awq_scale.weight` (1D F16, length K)
+/// alongside MQ4G256 weights that were AWQ pre-scaled. The dispatcher in
+/// `fused_rmsnorm_rotate_for_mq` / `fused_rmsnorm_rotate_mq_batched_for`
+/// looks at `WeightTensor.awq_scale.is_some()` to pick the AWQ-aware
+/// kernel variant. WITHOUT this loader populating the field, every MQ4
+/// weight ends up with `awq_scale: None`, the dispatcher falls through
+/// to the non-AWQ kernel, and the math `(W·s) · (x/s) = W·x` breaks
+/// because the runtime never divides by `s` — observed KLD blowup
+/// 0.6721 → 13.4893 on 0.8B Qwen3.5 before this landed.
+///
+/// Lookup pattern matches `hipfire_runtime::hfq::load_awq_scale`:
+/// strip trailing `.weight`, append `.awq_scale.weight`. Try both the
+/// `model.language_model.`-prefixed name and the bare name (the qwen35
+/// crate uses prefixed names; older sidecars or tests may use either).
+fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let sidecar_name = match name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{name}.awq_scale.weight"),
+    };
+    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
+    // Must be 1D F16, length K. quant_type 1 = F16.
+    if sc_info.quant_type != 1 {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+            sc_info.quant_type
+        );
+        return None;
+    }
+    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape, k
+        );
+        return None;
+    }
+    // F16 → F32 on host so the kernel takes a plain `const float*`.
+    let f32_data: Vec<f32> = sc_data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+}
+
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
     // Use pread path to avoid page cache buildup on unified-memory APUs.
     #[cfg(unix)]
     {
-        if let Some((info, buf)) = hfq.tensor_data_pread(&full_name)
-            .or_else(|| hfq.tensor_data_pread(name))
-        {
+        let mut wt = if let Some((info, buf)) = hfq.tensor_data_pread(&full_name) {
             let qt = info.quant_type;
-            return load_weight_tensor_raw(gpu, qt, &buf, m, k);
+            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
+        } else if let Some((info, buf)) = hfq.tensor_data_pread(name) {
+            let qt = info.quant_type;
+            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
+        } else {
+            panic!("tensor not found: {name} or {full_name}");
+        };
+        // Phase A Stage A — populate awq_scale for MQ4G256 weights when
+        // a sidecar is present. The pread call invalidates the prior
+        // pread_buf borrow, but the weight bytes have already been
+        // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
+        // matters.
+        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
-        panic!("tensor not found: {name} or {full_name}");
+        return Ok(wt);
     }
     #[cfg(not(unix))]
     {
         let (info, data) = hfq.tensor_data(&full_name)
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-        load_weight_tensor_raw(gpu, info.quant_type, data, m, k)
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+        }
+        Ok(wt)
     }
 }
 
