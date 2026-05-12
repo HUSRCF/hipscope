@@ -669,6 +669,37 @@ pub fn weight_gemv(
 ///   share LDS with rmsnorm the same way). Returns `None` — MQ8 consumes the
 ///   internal `mq_x_q8` buffer inside `weight_gemv_prerotated`.
 /// - Any other dtype: plain `rmsnorm_f32` into `tmp`, returns `None`.
+/// Phase A Stage A — batched AWQ-aware dispatch helper.
+///
+/// Wraps `Gpu::fused_rmsnorm_rotate_mq_batched` with AWQ-aware kernel
+/// selection: if the upcoming linear (`next_linear`) carries an AWQ
+/// scale sidecar, dispatch the `_awq_batched` kernel which divides
+/// activations by `awq_scale[i]` before the FWHT. Otherwise use the
+/// standard non-AWQ kernel.
+///
+/// Callers in qwen35.rs forward path pass the WeightTensor of the
+/// FIRST linear after the rotation (e.g. `layer.wqkv` for LinearAttention,
+/// `layer.wq` for FullAttention with separate Q/K/V, `ffn.router` for
+/// MoE preamble). For fused QKV: Q/K/V share the same input tensor and
+/// hence the same imatrix → byte-identical AWQ scales; picking any
+/// of them is mathematically correct.
+pub fn fused_rmsnorm_rotate_mq_batched_for(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    next_linear: &WeightTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    eps: f32,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.fused_rmsnorm_rotate_mq_awq_batched(x, norm_weight, awq, x_rot, k, eps, batch_size)
+    } else {
+        gpu.fused_rmsnorm_rotate_mq_batched(x, norm_weight, x_rot, k, eps, batch_size)
+    }
+}
+
 pub fn fused_rmsnorm_rotate_for_mq<'a>(
     gpu: &mut Gpu,
     sample_weight: &WeightTensor,
@@ -681,7 +712,18 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
         | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
-            gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
+            // Phase A Stage A — AWQ-aware dispatch. When the upcoming linear
+            // carries an AWQ scale sidecar, use the AWQ variant of the fused
+            // kernel which divides activations by `awq_scale[i]` before the
+            // FWHT rotation, completing the math `(W·s) · (x/s) = W·x`.
+            // For Stage A specifically, only MQ4G256 actually emits AWQ
+            // sidecars from the quantizer (`--awq` flag), but routing all
+            // MQ-family dtypes through the AWQ check is correct + cheap.
+            if let Some(awq) = sample_weight.awq_scale.as_ref() {
+                gpu.fused_rmsnorm_rotate_mq_awq(x, norm_weight, awq, x_rot_scratch, sample_weight.k, eps)?;
+            } else {
+                gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
+            }
             Ok(Some(x_rot_scratch))
         }
         DType::MQ8G256 => {
