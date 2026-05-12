@@ -13589,7 +13589,30 @@ impl Gpu {
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")?;
+        // 2026-05-12 probe: HF Qwen3.5 (transformers/models/qwen3_5/
+        // modeling_qwen3_5.py:573) uses rotate_half — pairs are (i, i+n_rot/2),
+        // NOT (2i, 2i+1). Hipfire-quantize does NOT permute Q/K weights, so
+        // applying the interleaved kernel below to half-split-stored weights
+        // produces the wrong rotation pairing in every FA layer. Env-gate
+        // HIPFIRE_ROPE_HALFSPLIT=1 swaps to the half-split kernel so the
+        // mismatch can be measured against an HF oracle. See
+        // docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention probe".
+        let halfsplit = std::env::var("HIPFIRE_ROPE_HALFSPLIT").ok().as_deref() == Some("1");
+        // Probe-only: log on first call so we can verify the env-gate fires.
+        static ROPE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ROPE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("rope_partial_interleaved_f32: HIPFIRE_ROPE_HALFSPLIT={} -> entry={}",
+                if halfsplit { "1" } else { "(unset/0)" },
+                if halfsplit { "rope_partial_halfsplit_f32" } else { "rope_partial_interleaved_f32" }
+            );
+        }
+        let (src, entry) = if halfsplit {
+            (kernels::ROPE_PARTIAL_HALFSPLIT_SRC, "rope_partial_halfsplit_f32")
+        } else {
+            (kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")
+        };
+        let cache_key = if halfsplit { "rope_partial_halfsplit" } else { "rope_partial_interleaved" };
+        self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
         let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
@@ -13598,7 +13621,7 @@ impl Gpu {
         let block = 32u32.min(n_pairs);
         let grid = [(n_pairs + block - 1) / block, 1, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
@@ -13606,7 +13629,7 @@ impl Gpu {
             &nr as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "rope_partial_interleaved_f32", grid, [block, 1, 1], 0, &mut params,
+            entry, grid, [block, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);

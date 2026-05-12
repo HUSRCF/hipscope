@@ -1066,6 +1066,13 @@ pub const TOPK_LOGSUMEXP_BATCHED_SRC: &str = include_str!("../../../kernels/src/
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/rope_partial_interleaved.hip");
 
+/// Half-split-pair partial RoPE, matching HF `rotate_half` convention used by
+/// Qwen2 / Qwen3 / Qwen3.5 `apply_rotary_pos_emb`. Wired in via env-gate
+/// `HIPFIRE_ROPE_HALFSPLIT=1` from `rope_partial_interleaved_f32`. See
+/// docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention probe".
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
