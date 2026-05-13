@@ -16260,7 +16260,30 @@ impl Gpu {
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")?;
+        // RoPE convention for Qwen3.5 partial rotary: HF
+        // `transformers/models/qwen3_5/modeling_qwen3_5.py:573-579` uses
+        // `rotate_half` — pairs are (i, i + n_rot/2), NOT (2i, 2i+1).
+        // hipfire-quantize does NOT permute Q/K weights at quantize time, so
+        // the half-split kernel below is the mathematically-correct match for
+        // HF-converted weights and is the DEFAULT since 2026-05-12. The legacy
+        // interleaved kernel produced a ~0.4 nat engine-drift floor on Qwen3.5
+        // models (docs/plans/qwen35-mq4-quality-gap.md §"RoPE convention
+        // probe / halfsplit fix") and is retained behind
+        // HIPFIRE_ROPE_INTERLEAVED_LEGACY=1 for any caller that needs
+        // bit-for-bit reproduction of pre-flip outputs (legacy regression
+        // probes, comparisons to historical benches).
+        //
+        // Function name kept as `rope_partial_interleaved_f32` to avoid a
+        // workspace-wide rename in this commit; the dispatched kernel is now
+        // `rope_partial_halfsplit_f32` by default.
+        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let (src, entry) = if legacy {
+            (kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")
+        } else {
+            (kernels::ROPE_PARTIAL_HALFSPLIT_SRC, "rope_partial_halfsplit_f32")
+        };
+        let cache_key = if legacy { "rope_partial_interleaved" } else { "rope_partial_halfsplit" };
+        self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
         let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
@@ -16269,7 +16292,7 @@ impl Gpu {
         let block = 32u32.min(n_pairs);
         let grid = [(n_pairs + block - 1) / block, 1, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
@@ -16277,7 +16300,7 @@ impl Gpu {
             &nr as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "rope_partial_interleaved_f32", grid, [block, 1, 1], 0, &mut params,
+            entry, grid, [block, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
@@ -16302,9 +16325,22 @@ impl Gpu {
         freq_base: f32, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_partial_interleaved_batched",
-            kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
-            "rope_partial_interleaved_batched_f32")?;
+        // Halfsplit is the default since 2026-05-12; HIPFIRE_ROPE_INTERLEAVED_LEGACY=1
+        // restores the pre-flip interleaved kernel for legacy reproducibility.
+        // Function name retained for source-tree stability; the dispatched
+        // kernel is halfsplit by default. See sibling
+        // `rope_partial_interleaved_f32` for the rationale.
+        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let (cache_key, src, entry) = if legacy {
+            ("rope_partial_interleaved_batched",
+             kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
+             "rope_partial_interleaved_batched_f32")
+        } else {
+            ("rope_partial_halfsplit_batched",
+             kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC,
+             "rope_partial_halfsplit_batched_f32")
+        };
+        self.ensure_kernel(cache_key, src, entry)?;
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut pp = positions.buf.as_ptr();
@@ -16329,9 +16365,9 @@ impl Gpu {
         let block = 32u32.min(n_pairs);
         let grid_x = (n_pairs + block - 1) / block;
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_batched_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let result = self.launch_maybe_blob(
-            "rope_partial_interleaved_batched_f32",
+            entry,
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
             0,
@@ -17955,6 +17991,21 @@ impl Gpu {
         self.ensure_kernel("attention_dflash_f32", kernels::ATTENTION_DFLASH_SRC, "attention_dflash_f32")?;
         let func = &self.functions["attention_dflash_f32"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Tiled online-softmax (FlashAttention-style). LDS layout:
+        //   tile_scores[tile_size] + ws[block_size] + out_run[head_dim]
+        //
+        // tile_size is chosen to keep LDS ≤ 56 KB (8 KB margin under gfx1100's
+        // 64 KB hard limit for kernel launch overhead). Single-tile case
+        // (l ≤ tile_size) is mathematically equivalent to the prior
+        // single-pass softmax up to FP order; multi-tile carries (max, sum,
+        // out) running state across tiles. Replaces the prior `scores[L]`
+        // allocation that overflowed LDS at l > ~16128.
+        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        const LDS_BUDGET_F32: usize = 14_336; // 56 KB / 4 bytes
+        let fixed = block_size as usize + head_dim;
+        let max_tile_room = LDS_BUDGET_F32.saturating_sub(fixed);
+        let tile_size = std::cmp::min(l.max(1), max_tile_room.max(1));
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut vp = v.buf.as_ptr();
@@ -17965,6 +18016,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let mut ts = tile_size as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -17976,11 +18028,9 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
         ];
-        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
-        let block_size = block_size.next_power_of_two();
-        // Shared: scores[L] + workspace[block_size]
-        let shared_mem = ((l + block_size as usize) * 4) as u32;
+        let shared_mem = ((tile_size + block_size as usize + head_dim) * 4) as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
