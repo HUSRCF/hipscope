@@ -1182,6 +1182,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
         | DType::MQ6G256 | DType::HFQ6G256
+        | DType::Q8_0
     );
     if always_ok {
         return true;
@@ -1539,6 +1540,8 @@ fn forward_prefill_chunk(
             )?;
         }
 
+        let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+
         // 3-way fused QKV projection.
         if qkv_is_6bit {
             gpu.gemm_qkv_hfq6g256(
@@ -1548,6 +1551,10 @@ fn forward_prefill_chunk(
                 layer.wq.m, layer.wk.m, layer.wv.m,
                 layer.wq.k, n,
             )?;
+        } else if qkv_is_q8 {
+            gpu.gemm_q8_0_batched_chunked(&layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_batch, layer.wq.m, layer.wq.k, n)?;
+            gpu.gemm_q8_0_batched_chunked(&layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch, layer.wk.m, layer.wk.k, n)?;
+            gpu.gemm_q8_0_batched_chunked(&layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch, layer.wv.m, layer.wv.k, n)?;
         } else if qkv_is_mq3 {
             gpu.gemm_qkv_hfq3g256_wmma(
                 &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
@@ -1707,6 +1714,7 @@ fn forward_prefill_chunk(
         let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
         let wo_input = if wo_is_mq {
             gpu.rotate_x_mq_batched(
                 &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
@@ -1717,6 +1725,11 @@ fn forward_prefill_chunk(
         };
         if wo_is_6bit {
             gpu.gemm_hfq6g256_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+        } else if wo_is_q8 {
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
+            gpu.gemm_q8_0_batched_chunked(&layer.wo.buf, wo_input, &scratch, layer.wo.m, layer.wo.k, n)?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
         } else if wo_is_mq3 {
             gpu.gemm_hfq3g256_residual_wmma(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
         } else if wo_is_fp4 {
@@ -1731,6 +1744,7 @@ fn forward_prefill_chunk(
         let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
         if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
@@ -1748,6 +1762,9 @@ fn forward_prefill_chunk(
                 &pbs.gate_ffn_batch, &pbs.up_batch,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
             )?;
+        } else if ffn_is_q8 {
+            gpu.gemm_q8_0_batched_chunked(&layer.w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+            gpu.gemm_q8_0_batched_chunked(&layer.w_up.buf,   &pbs.x_rot_batch, &pbs.up_batch,       layer.w_up.m,   layer.w_up.k,   n)?;
         } else if ffn_is_mq3 {
             gpu.gemm_gate_up_hfq3g256_wmma(
                 &layer.w_gate.buf, &layer.w_up.buf,
@@ -1774,6 +1791,7 @@ fn forward_prefill_chunk(
         let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
         if w_down_is_mq {
             gpu.fused_silu_mul_rotate_mq_batched(
                 &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
@@ -1784,6 +1802,11 @@ fn forward_prefill_chunk(
         }
         if w_down_is_6bit {
             gpu.gemm_hfq6g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        } else if w_down_is_q8 {
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.gemm_q8_0_batched_chunked(&layer.w_down.buf, &pbs.ffn_hidden_batch, &scratch, layer.w_down.m, layer.w_down.k, n)?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
         } else if w_down_is_mq3 {
             gpu.gemm_hfq3g256_residual_wmma(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
         } else if w_down_is_fp4 {
@@ -4076,12 +4099,21 @@ mod tests {
 
     #[test]
     fn is_batchable_la_unsupported_dtypes() {
-        // Q4K / Q6K / Q8_0 / F32 stay on per-token forward_scratch.
+        // Q4K / Q6K / F32 stay on per-token forward_scratch.
         for arch in ["gfx1100", "gfx1200"] {
             assert!(!is_batchable_la(DType::Q4K, arch));
             assert!(!is_batchable_la(DType::Q6K, arch));
-            assert!(!is_batchable_la(DType::Q8_0, arch));
             assert!(!is_batchable_la(DType::F32, arch));
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_q8_0_always_ok() {
+        // Q8_0 is batchable on every arch via gemm_q8_0_batched_chunked
+        // (unfused, sub-batched at MAX_BATCH=16). Eval-mode noise-floor path —
+        // see docs/plans/q8_batchable.md.
+        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx942"] {
+            assert!(is_batchable_la(DType::Q8_0, arch));
         }
     }
 }

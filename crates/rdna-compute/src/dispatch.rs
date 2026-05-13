@@ -12107,6 +12107,29 @@ impl Gpu {
         )
     }
 
+    /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
+    /// kernel's MAX_BATCH=16. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
+    pub fn gemm_q8_0_batched_chunked(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const MAX_BATCH: usize = 16;
+        let mut off = 0;
+        while off < n {
+            let take = (n - off).min(MAX_BATCH);
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            self.gemm_q8_0_batched(a_raw, &x_sub, &y_sub, m, k, take)?;
+            off += take;
+        }
+        Ok(())
+    }
+
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
         &mut self,
