@@ -858,6 +858,11 @@ pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip
 /// serial-GEMV loop for DFlash lm_heads.
 pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_batched.hip");
 
+/// WMMA-accelerated 3-way fused QKV GEMM for Q8_0 weights. gfx1100+ wave32.
+/// Recipe-selected per docs/plans/q8-fused-prefill-kernels.md T3-1a microbench
+/// (FP16-WMMA, register-redundant dequant, no LDS).
+pub const GEMM_QKV_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.hip");
+
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
 /// Q6_K block: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes per 256 elements.
