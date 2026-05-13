@@ -4246,6 +4246,13 @@ fn forward_prefill_chunk(
     // or givens KV cache. If the check fails, FA layers fall back to
     // per-token gather/scatter via run_fa_layer_body.
     let fa_arch = gpu.arch.as_str();
+    // Q8 WMMA gate: the fused Q8 WMMA family (gemm_qkv/qkvza/gate_up/residual
+    // _q8_0_wmma) lives on RDNA3+ (gfx11/gfx12). On non-WMMA archs we keep
+    // the Tier 2 chunked-substrate path.
+    let q8_wmma_arch = matches!(fa_arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        | "gfx1200" | "gfx1201"
+    );
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
@@ -4331,6 +4338,14 @@ fn forward_prefill_chunk(
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k, n,
+                    )?;
+                } else if is_q8 && q8_wmma_arch {
+                    gpu.gemm_qkvza_q8_0_wmma(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
@@ -4526,9 +4541,13 @@ fn forward_prefill_chunk(
                         &layer.wo.buf, wo_input, &pbs.x_batch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
+                } else if wo_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(&layer.wo.buf, wo_input, &x_n, layer.wo.m, layer.wo.k, n)?;
                 } else if wo_is_q8 {
-                    // Unfused: GEMM into x_rot_batch as scratch (safe — next consumer
-                    // is the FFN rmsnorm that re-writes it), then add into residual.
+                    // Tier 2 fallback (non-WMMA archs): GEMM into x_rot_batch as
+                    // scratch (safe — next consumer is the FFN rmsnorm), then
+                    // add into residual.
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_batched_chunked(&layer.wo.buf, wo_input, &scratch, layer.wo.m, layer.wo.k, n)?;
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
@@ -4581,6 +4600,13 @@ fn forward_prefill_chunk(
                         &pbs.gate_ffn_batch, &pbs.up_batch,
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k, n,
+                    )?;
+                } else if ffn_is_q8 && q8_wmma_arch {
+                    gpu.gemm_gate_up_q8_0_wmma(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
                     )?;
                 } else if ffn_is_q8 {
                     gpu.gemm_q8_0_batched_chunked(&layer.w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, layer.w_gate.m, layer.w_gate.k, n)?;
@@ -4648,6 +4674,9 @@ fn forward_prefill_chunk(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
+                } else if w_down_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+                    gpu.gemm_q8_0_residual_wmma(&layer.w_down.buf, &pbs.ffn_hidden_batch, &x_n, layer.w_down.m, layer.w_down.k, n)?;
                 } else if w_down_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
                     gpu.gemm_q8_0_batched_chunked(&layer.w_down.buf, &pbs.ffn_hidden_batch, &scratch, layer.w_down.m, layer.w_down.k, n)?;
@@ -4748,6 +4777,13 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
+                    )?;
+                } else if qkv_is_q8 && q8_wmma_arch {
+                    gpu.gemm_qkv_q8_0_wmma(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                        layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k, n,
                     )?;
                 } else if qkv_is_q8 {
                     gpu.gemm_q8_0_batched_chunked(&layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch, layer.wq.m, layer.wq.k, n)?;
@@ -5002,6 +5038,9 @@ fn forward_prefill_chunk(
                         &layer.wo.buf, fa_wo_input, &pbs.x_batch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
+                } else if fa_wo_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(&layer.wo.buf, fa_wo_input, &x_n, layer.wo.m, layer.wo.k, n)?;
                 } else if fa_wo_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_batched_chunked(&layer.wo.buf, fa_wo_input, &scratch, layer.wo.m, layer.wo.k, n)?;
@@ -5054,6 +5093,13 @@ fn forward_prefill_chunk(
                         &pbs.gate_ffn_batch, &pbs.up_batch,
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k, n,
+                    )?;
+                } else if fa_ffn_is_q8 && q8_wmma_arch {
+                    gpu.gemm_gate_up_q8_0_wmma(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
                     )?;
                 } else if fa_ffn_is_q8 {
                     gpu.gemm_q8_0_batched_chunked(&layer.w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, layer.w_gate.m, layer.w_gate.k, n)?;
@@ -5112,6 +5158,9 @@ fn forward_prefill_chunk(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
+                } else if fa_w_down_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+                    gpu.gemm_q8_0_residual_wmma(&layer.w_down.buf, &pbs.ffn_hidden_batch, &x_n, layer.w_down.m, layer.w_down.k, n)?;
                 } else if fa_w_down_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
                     gpu.gemm_q8_0_batched_chunked(&layer.w_down.buf, &pbs.ffn_hidden_batch, &scratch, layer.w_down.m, layer.w_down.k, n)?;
