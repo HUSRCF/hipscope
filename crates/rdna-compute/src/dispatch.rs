@@ -153,7 +153,7 @@ fn has_dot2_f32_f16(arch: &str) -> bool {
 /// %llvm.amdgcn.wmma.f32.16x16x16.f16` at codegen time. The gfx12 sister
 /// path uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and is
 /// gated by `has_wmma_f16_gfx12` below.
-fn has_wmma_f16(arch: &str) -> bool {
+pub fn has_wmma_f16(arch: &str) -> bool {
     arch.starts_with("gfx11")
 }
 
@@ -12141,6 +12141,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Q8_0 packs 32 elements per block (34 bytes); the kernel iterates
+        // `K/32` blocks per row and silently drops any tail if K is not a
+        // multiple of 32. All current production shapes satisfy this; guard
+        // here to catch future shape regressions before they corrupt output.
+        debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_q8_0_wmma",
@@ -12221,6 +12226,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_q8_0_wmma",
@@ -12290,6 +12296,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_q8_0_residual_wmma",
@@ -12349,6 +12356,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_q8_0_wmma",

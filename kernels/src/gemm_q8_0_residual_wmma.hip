@@ -2,15 +2,35 @@
 #include <hip/hip_fp16.h>
 
 // WMMA-accelerated batched Q8_0 GEMM with fused residual add.
-// gfx1100+ only (RDNA3 wave32 WMMA).
+// gfx1100+ only (RDNA3 wave32 WMMA, gfx11 only — the `_w32` builtin is
+// not selectable on gfx12; that arch needs a `.gfx12.hip` sibling).
 //
 // Y[N, M] += X[N, K] @ A_q8[M, K]^T
 //
 // Same recipe as gemm_qkv_q8_0_wmma — register-redundant FP16-WMMA, no LDS.
 // Output write uses += semantics so the caller's Y supplies the residual.
 //
-// Grid:  [ceil(M/16), ceil(N/16)]
-// Block: [32] (wave32).  LDS: 0.
+// === Non-overlapping-write invariant (DO NOT BREAK) ===
+// The `Y[i] += acc[j]` at the end of this kernel is **NOT atomic**. It is
+// only race-free because each (out_row, out_col) cell is written by exactly
+// one lane in exactly one block, under this kernel's grid:
+//   Grid:  [ceil(M/16), ceil(N/16)]
+//   Block: [32] (wave32),  LDS: 0.
+// WMMA output mapping: acc[j] → C[row=2*j + (tid>>4)][col=tid & 15].
+// Tiles are 16×16, non-overlapping by construction.
+//
+// If anyone adds a K-split variant (the HFQ4 family has `_ksplit` for
+// register-pressure relief; the Q8 plan §Risks calls it out as a possible
+// mitigation), this `+=` becomes a data race across blocks for the same
+// (out_row, out_col). Switch to `atomicAdd((float*)&Y[...], acc[j])` in
+// any K-split sibling, OR split into a scratch + reduce path.
+//
+// === Output-mapping divergence from HFQ4 residual (note for maintainers) ===
+// `gemm_hfq4g256_residual_wmma.hip` uses a different output-row convention
+// (its tile maps acc[j] to C[j + (tid>>4)*8][tid & 15]). The Q8 family here
+// uses the qkv-style mapping (acc[j] → C[2*j + (tid>>4)][tid & 15]) instead,
+// unit-tested against the substrate. Do not assume the two residual kernels
+// are interchangeable templates.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
@@ -41,6 +61,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
+    // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
     for (int bi = 0; bi < blocks_per_row; bi++) {
         const char* bp = row_base + bi * 34;
 

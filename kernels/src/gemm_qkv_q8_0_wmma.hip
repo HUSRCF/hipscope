@@ -66,6 +66,14 @@ extern "C" __global__ void gemm_qkv_q8_0_wmma(
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
+    // TODO(perf, BW-bound): the HFQ4 sibling at
+    // `kernels/src/gemm_qkv_hfq4g256_wmma.hip:78` runs the K-loop with
+    // `kt += 2` and prefetches both X tiles before issuing the WMMA pair —
+    // overlaps weight load with compute and avoids `s_waitcnt` stalls. Q8
+    // is 2× the BW pressure of HFQ4, so this optimization is more likely
+    // to matter here. Not done yet — gfx1100 hit 1069.5 tok/s on the
+    // current single-tile-at-a-time form, but profile if/when prefill
+    // becomes the bottleneck after lm_head batching lands.
     for (int bi = 0; bi < blocks_per_row; bi++) {
         const char* bp = row_base + bi * 34;
 

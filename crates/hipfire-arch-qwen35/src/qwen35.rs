@@ -4247,12 +4247,13 @@ fn forward_prefill_chunk(
     // per-token gather/scatter via run_fa_layer_body.
     let fa_arch = gpu.arch.as_str();
     // Q8 WMMA gate: the fused Q8 WMMA family (gemm_qkv/qkvza/gate_up/residual
-    // _q8_0_wmma) lives on RDNA3+ (gfx11/gfx12). On non-WMMA archs we keep
-    // the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = matches!(fa_arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-        | "gfx1200" | "gfx1201"
-    );
+    // _q8_0_wmma) uses the `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+    // builtin, which only pattern-matches on gfx11 (see dispatch.rs:155 —
+    // gfx12 errors with "Cannot select: intrinsic" at codegen time and needs
+    // the `_w32_gfx12` builtin variant in a `*.gfx12.hip` sibling kernel,
+    // which we have not authored yet). Routing gfx12 here would crash at JIT.
+    // On non-WMMA archs we keep the Tier 2 chunked-substrate path.
+    let q8_wmma_arch = rdna_compute::has_wmma_f16(fa_arch);
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
@@ -4345,6 +4346,16 @@ fn forward_prefill_chunk(
                         layer.wqkv.k, n,
                     )?;
                 } else if is_q8 && q8_wmma_arch {
+                    // `is_q8` only inspects `wqkv` (the routing anchor). The fused
+                    // kernel assumes ALL four weights share the Q8_0 stride; a
+                    // mixed-dtype layer would silently re-introduce the Tier-1
+                    // kernel-vs-stride corruption mode.
+                    debug_assert!(
+                        matches!(layer.wz.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
+                        "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
+                    );
                     gpu.gemm_qkvza_q8_0_wmma(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
@@ -4602,6 +4613,10 @@ fn forward_prefill_chunk(
                         layer.w_gate.k, n,
                     )?;
                 } else if ffn_is_q8 && q8_wmma_arch {
+                    debug_assert!(
+                        matches!(layer.w_up.gpu_dtype, DType::Q8_0),
+                        "LA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
+                    );
                     gpu.gemm_gate_up_q8_0_wmma(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -4779,6 +4794,11 @@ fn forward_prefill_chunk(
                         layer.wq.k, n,
                     )?;
                 } else if qkv_is_q8 && q8_wmma_arch {
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.wv.gpu_dtype, DType::Q8_0),
+                        "FA qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
+                    );
                     gpu.gemm_qkv_q8_0_wmma(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -5095,6 +5115,10 @@ fn forward_prefill_chunk(
                         layer.w_gate.k, n,
                     )?;
                 } else if fa_ffn_is_q8 && q8_wmma_arch {
+                    debug_assert!(
+                        matches!(layer.w_up.gpu_dtype, DType::Q8_0),
+                        "FA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
+                    );
                     gpu.gemm_gate_up_q8_0_wmma(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         &pbs.x_rot_batch,

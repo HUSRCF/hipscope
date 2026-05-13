@@ -62,6 +62,7 @@ extern "C" __global__ void gemm_qkvza_q8_0_wmma(
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
+    // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
     for (int bi = 0; bi < blocks_per_row; bi++) {
         const char* bp = row_base + bi * 34;
 

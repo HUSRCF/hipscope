@@ -1477,11 +1477,10 @@ fn forward_prefill_chunk(
     let hidden_dim = config.hidden_dim;
     let kv_dim = config.n_kv_heads * config.head_dim;
     let dim_row_bytes = dim * 4;
-    // Q8 WMMA arch gate — see qwen35.rs q8_wmma_arch for the matching capture.
-    let q8_wmma_arch = matches!(gpu.arch.as_str(),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-        | "gfx1200" | "gfx1201"
-    );
+    // Q8 WMMA arch gate — see qwen35.rs q8_wmma_arch for the matching capture
+    // and rationale (gfx11-only; gfx12 needs a `_w32_gfx12` builtin variant
+    // that has not been authored yet, so routing gfx12 here would crash at JIT).
+    let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str());
 
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
@@ -1557,6 +1556,11 @@ fn forward_prefill_chunk(
                 layer.wq.k, n,
             )?;
         } else if qkv_is_q8 && q8_wmma_arch {
+            debug_assert!(
+                matches!(layer.wk.gpu_dtype, DType::Q8_0)
+                && matches!(layer.wv.gpu_dtype, DType::Q8_0),
+                "llama qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
+            );
             gpu.gemm_qkv_q8_0_wmma(
                 &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                 &pbs.x_rot_batch,
@@ -1778,6 +1782,10 @@ fn forward_prefill_chunk(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
             )?;
         } else if ffn_is_q8 && q8_wmma_arch {
+            debug_assert!(
+                matches!(layer.w_up.gpu_dtype, DType::Q8_0),
+                "llama FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
+            );
             gpu.gemm_gate_up_q8_0_wmma(
                 &layer.w_gate.buf, &layer.w_up.buf,
                 &pbs.x_rot_batch,

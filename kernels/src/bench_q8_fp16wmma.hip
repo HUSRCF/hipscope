@@ -1,12 +1,15 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// EXPERIMENTAL — Q8_0 batched GEMM via FP16 WMMA (RDNA3+).
+// EXPERIMENTAL / REGRESSION PROBE — Q8_0 batched GEMM via FP16 WMMA (RDNA3+).
 //
 // Microbench for the Tier 3 recipe pick (see docs/plans/q8-fused-prefill-kernels.md
 // §Element format choice — FP16 vs INT8 WMMA). NOT a production kernel — this
-// is the candidate variant for the production family. INT8-WMMA sibling lives
-// in bench_q8_int8wmma.hip.
+// is the source template the 4 production fused kernels were derived from
+// (gemm_qkv/qkvza/gate_up/q8_0_residual_wmma). Kept in tree as a regression
+// probe: re-run via `bench_q8_wmma_variants.rs` if anyone touches the dequant
+// prologue or WMMA inner loop, to confirm the 11–30× substrate speedup
+// hasn't eroded. INT8-WMMA sibling lives in bench_q8_int8wmma.hip (deferred).
 //
 // Y[N, M] = X[N, K] @ A_q8[M, K]^T
 //   A: Q8_0 packed weights. Per K=32 block: [2B fp16 scale | 32B int8 weights],

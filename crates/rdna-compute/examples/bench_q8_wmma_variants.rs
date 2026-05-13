@@ -1,5 +1,12 @@
 //! T3-1a microbench — Q8_0 batched GEMM via FP16 WMMA vs the Tier 2 substrate.
 //!
+//! **Status (2026-05-13):** T3-1a recipe pick is LOCKED to FP16-WMMA — the
+//! bench in this file delivered 11–30× speedup over the Tier-2 substrate
+//! and the 4 production fused kernels (`gemm_qkv/qkvza/gate_up/q8_0_residual
+//! _wmma`) all derive from the same template. This harness is retained as
+//! a regression probe: re-run if anyone touches the dequant prologue or the
+//! WMMA inner-loop layout to confirm the speedup hasn't eroded.
+//!
 //! Picks the recipe for Tier 3 (see docs/plans/q8-fused-prefill-kernels.md
 //! §Element format choice). This pass benches the FP16-WMMA variant against
 //! the existing `gemm_q8_0_batched_chunked` substrate at production
