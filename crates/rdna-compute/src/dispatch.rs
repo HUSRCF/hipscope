@@ -12067,8 +12067,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            batch_size <= 16,
-            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=16"
+            batch_size <= 64,
+            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
         self.ensure_kernel(
             "gemm_q8_0_batched",
@@ -12108,7 +12108,7 @@ impl Gpu {
     }
 
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
-    /// kernel's MAX_BATCH=16. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
+    /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     pub fn gemm_q8_0_batched_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -12118,7 +12118,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        const MAX_BATCH: usize = 16;
+        const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
             let take = (n - off).min(MAX_BATCH);

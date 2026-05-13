@@ -2092,12 +2092,12 @@ fn verify_dflash_block_inner(
 
     if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
-        // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
+        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=64 in the kernel, so
+        // tree-verify blocks exceeding 64 (budget + 1 > 64) need chunking.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no such cap — they take the single-shot path.
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                const Q8_LM_MAX: usize = 16;
+                const Q8_LM_MAX: usize = 64;
                 let mut chunk_start = 0usize;
                 while chunk_start < b {
                     let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
