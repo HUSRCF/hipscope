@@ -12130,6 +12130,213 @@ impl Gpu {
         Ok(())
     }
 
+    /// WMMA 4-way fused Q8_0 GEMM (wqkv + wz + w_beta + w_alpha).
+    /// DeltaNet LA preamble. gfx1100+ only.
+    pub fn gemm_qkvza_q8_0_wmma(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qkvza_q8_0_wmma",
+            kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
+            "gemm_qkvza_q8_0_wmma",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_qkv_p = a_qkv.buf.as_ptr();
+        let mut a_z_p = a_z.buf.as_ptr();
+        let mut a_beta_p = a_beta.buf.as_ptr();
+        let mut a_alpha_p = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_qkv_p = y_qkv.buf.as_ptr();
+        let mut y_z_p = y_z.buf.as_ptr();
+        let mut y_beta_p = y_beta.buf.as_ptr();
+        let mut y_alpha_p = y_alpha.buf.as_ptr();
+        let mut qkv_m_val = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut beta_m_val = beta_m as i32;
+        let mut alpha_m_val = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_qkv_p as *mut _ as *mut c_void,
+            &mut a_z_p as *mut _ as *mut c_void,
+            &mut a_beta_p as *mut _ as *mut c_void,
+            &mut a_alpha_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_qkv_p as *mut _ as *mut c_void,
+            &mut y_z_p as *mut _ as *mut c_void,
+            &mut y_beta_p as *mut _ as *mut c_void,
+            &mut y_alpha_p as *mut _ as *mut c_void,
+            &mut qkv_m_val as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut beta_m_val as *mut _ as *mut c_void,
+            &mut alpha_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes = q8_bytes(qkv_m) + q8_bytes(z_m) + q8_bytes(beta_m) + q8_bytes(alpha_m)
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_q8_0_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_q8_0_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_qkv_p); b.push_ptr(a_z_p); b.push_ptr(a_beta_p); b.push_ptr(a_alpha_p);
+                b.push_ptr(xp);
+                b.push_ptr(y_qkv_p); b.push_ptr(y_z_p); b.push_ptr(y_beta_p); b.push_ptr(y_alpha_p);
+                b.push_i32(qkv_m_val); b.push_i32(z_m_val); b.push_i32(beta_m_val); b.push_i32(alpha_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// WMMA 2-way fused Q8_0 GEMM (w_gate + w_up). FFN preamble.
+    pub fn gemm_gate_up_q8_0_wmma(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_gate_up_q8_0_wmma",
+            kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
+            "gemm_gate_up_q8_0_wmma",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_g = a_gate.buf.as_ptr();
+        let mut a_u = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_g = y_gate.buf.as_ptr();
+        let mut y_u = y_up.buf.as_ptr();
+        let mut gate_m_val = gate_m as i32;
+        let mut up_m_val = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_g as *mut _ as *mut c_void,
+            &mut a_u as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_g as *mut _ as *mut c_void,
+            &mut y_u as *mut _ as *mut c_void,
+            &mut gate_m_val as *mut _ as *mut c_void,
+            &mut up_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes = q8_bytes(gate_m) + q8_bytes(up_m)
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_q8_0_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_q8_0_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_g); b.push_ptr(a_u);
+                b.push_ptr(xp);
+                b.push_ptr(y_g); b.push_ptr(y_u);
+                b.push_i32(gate_m_val); b.push_i32(up_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// WMMA Q8_0 GEMM with fused residual add (Y += X @ A^T).
+    /// Caller seeds Y with the residual. gfx1100+ only.
+    pub fn gemm_q8_0_residual_wmma(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_q8_0_residual_wmma",
+            kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
+            "gemm_q8_0_residual_wmma",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_p = a.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4 * 2; // residual read + write
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_residual_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_residual_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// WMMA-accelerated batched 3-way fused Q8_0 GEMM (Q + K + V projections).
     /// gfx1100+ only (RDNA3 wave32 WMMA). Mirrors `gemm_qkv_hfq4g256_wmma`.
     /// X is converted from F32 to FP16 on entry (via `ensure_fp16_x`).

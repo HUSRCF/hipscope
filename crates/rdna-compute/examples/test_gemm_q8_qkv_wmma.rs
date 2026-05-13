@@ -98,7 +98,9 @@ fn main() {
             let stats_k = compare(&yk_w_host, &yk_r_host);
             let stats_v = compare(&yv_w_host, &yv_r_host);
 
-            let pass = stats_q.mean_rel < 1e-3 && stats_k.mean_rel < 1e-3 && stats_v.mean_rel < 1e-3;
+            // Gate: mean_rel < 2e-3 AND max_rel < 5e-2 — fp16 WMMA precision.
+            let pass = stats_q.mean_rel < 2e-3 && stats_k.mean_rel < 2e-3 && stats_v.mean_rel < 2e-3
+                   && stats_q.max_rel  < 5e-2 && stats_k.max_rel  < 5e-2 && stats_v.max_rel  < 5e-2;
             let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
             eprintln!(
                 "  N={n:4}  {mark}   \
@@ -154,7 +156,7 @@ fn main() {
     let yq = gpu.download_f32(&d_yq).unwrap();
     let yq_ref = gpu.download_f32(&d_yq_ref).unwrap();
     let stats = compare(&yq, &yq_ref);
-    let pass = stats.mean_rel < 1e-3;
+    let pass = stats.mean_rel < 2e-3 && stats.max_rel < 5e-2;
     let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
     eprintln!(
         "  N={n}  {mark}   Q: mean_rel={:.3e} max_rel={:.3e}  |ref|_max={:.2}",

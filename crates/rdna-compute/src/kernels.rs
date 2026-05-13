@@ -863,6 +863,15 @@ pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_
 /// (FP16-WMMA, register-redundant dequant, no LDS).
 pub const GEMM_QKV_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.hip");
 
+/// WMMA 4-way fused qkv+z+beta+alpha GEMM for Q8_0 (DeltaNet LA preamble).
+pub const GEMM_QKVZA_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.hip");
+
+/// WMMA 2-way fused gate+up GEMM for Q8_0 (FFN preamble).
+pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_q8_0_wmma.hip");
+
+/// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
+pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
+
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
 /// Q6_K block: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes per 256 elements.
