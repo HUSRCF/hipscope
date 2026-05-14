@@ -12131,7 +12131,7 @@ impl Gpu {
     }
 
     /// WMMA 4-way fused Q8_0 GEMM (wqkv + wz + w_beta + w_alpha).
-    /// DeltaNet LA preamble. gfx1100+ only.
+    /// DeltaNet LA preamble. Auto-routes to gfx12 sibling on RDNA4.
     pub fn gemm_qkvza_q8_0_wmma(
         &mut self,
         a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
@@ -12141,6 +12141,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch.starts_with("gfx12") {
+            return self.gemm_qkvza_q8_0_wmma_gfx12(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            );
+        }
         // Q8_0 packs 32 elements per block (34 bytes); the kernel iterates
         // `K/32` blocks per row and silently drops any tail if K is not a
         // multiple of 32. All current production shapes satisfy this; guard
@@ -12217,6 +12223,7 @@ impl Gpu {
     }
 
     /// WMMA 2-way fused Q8_0 GEMM (w_gate + w_up). FFN preamble.
+    /// Auto-routes to gfx12 sibling on RDNA4.
     pub fn gemm_gate_up_q8_0_wmma(
         &mut self,
         a_gate: &GpuTensor, a_up: &GpuTensor,
@@ -12226,6 +12233,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch.starts_with("gfx12") {
+            return self.gemm_gate_up_q8_0_wmma_gfx12(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -12286,7 +12298,8 @@ impl Gpu {
     }
 
     /// WMMA Q8_0 GEMM with fused residual add (Y += X @ A^T).
-    /// Caller seeds Y with the residual. gfx1100+ only.
+    /// Caller seeds Y with the residual. Auto-routes to gfx12 sibling
+    /// on RDNA4.
     pub fn gemm_q8_0_residual_wmma(
         &mut self,
         a: &GpuTensor,
@@ -12296,6 +12309,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch.starts_with("gfx12") {
+            return self.gemm_q8_0_residual_wmma_gfx12(a, x, y, m, k, batch_size);
+        }
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -12345,8 +12361,9 @@ impl Gpu {
     }
 
     /// WMMA-accelerated batched 3-way fused Q8_0 GEMM (Q + K + V projections).
-    /// gfx1100+ only (RDNA3 wave32 WMMA). Mirrors `gemm_qkv_hfq4g256_wmma`.
-    /// X is converted from F32 to FP16 on entry (via `ensure_fp16_x`).
+    /// Auto-routes to the gfx12 sibling on RDNA4 archs; gfx11 path is the
+    /// canonical implementation (X is converted from F32 to FP16 via
+    /// `ensure_fp16_x`). Mirrors `gemm_qkv_hfq4g256_wmma`.
     pub fn gemm_qkv_q8_0_wmma(
         &mut self,
         a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
@@ -12356,6 +12373,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch.starts_with("gfx12") {
+            return self.gemm_qkv_q8_0_wmma_gfx12(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
