@@ -154,6 +154,9 @@ fn main() {
         }
     }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
+    // Captured outside `do_profile` so SUMMARY can split kernel vs wall.
+    // None when profiling is disabled (HIPFIRE_PROFILE != 1).
+    let mut prefill_kernel_ms: Option<f64> = None;
     if do_profile {
         if let Some(entries) = rdna_compute::profile::stop() {
             let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> = Default::default();
@@ -177,6 +180,7 @@ fn main() {
                     us / 1000.0, us / *n as f64, us / total_us * 100.0, gib_s);
             }
             eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
+            prefill_kernel_ms = Some(total_us / 1000.0);
         }
     }
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
@@ -189,6 +193,12 @@ fn main() {
     eprintln!("  total: {prefill_ms:.1}ms");
     eprintln!("  tok/s: {prefill_tok_s:.1}");
     eprintln!("  NOTE: first prefill run includes kernel JIT compile cost");
+
+    // Emit prefill-only SUMMARY right here so prefill metrics survive any
+    // failure in the gen phase that follows (the existing argmax-on-NaN
+    // panic in graph-captured gen warmup blocks the end-of-run SUMMARY).
+    eprintln!("PREFILL_SUMMARY  prefill_tok_s={prefill_tok_s:.1}  prefill_wall_ms={prefill_ms:.2}{}",
+        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
 
     // (deferred-conversion mode removed with givens — asym modes are natively
     //  batched so there's no prefill/decode cache swap to measure.)
@@ -280,7 +290,8 @@ fn main() {
         eprintln!("  total: {gen_total_ms:.1}ms over 0 tokens");
         eprintln!("  tok/s (gen): 0.0");
         eprintln!();
-        eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00");
+        eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00{}",
+            split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
         return;
     }
     let sum: f64 = sorted.iter().sum();
@@ -303,5 +314,29 @@ fn main() {
     eprintln!("  effective BW: {bw_gbps:.1} GiB/s (model {:.2} GiB × {gen_tok_s:.1} tok/s)",
         model_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     eprintln!();
-    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}");
+    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}{}",
+        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+}
+
+/// Emit the latency-class split for prefill when profiling captured the
+/// per-kernel time. `prefill_tok_s` in the main SUMMARY is the wall-clock
+/// figure (includes first-process JIT compile + graph capture). The
+/// `*_kernel` figures here are steady-state kernel throughput — what every
+/// call after the first one converges to once JIT amortizes. The gap is
+/// `startup_overhead_ms`. AOT-shipped HSACOs should drop that gap to ~0.
+///
+/// Returns an empty string if profiling was disabled so the SUMMARY line
+/// stays parseable by older tooling.
+#[cfg(feature = "deltanet")]
+fn split_prefill_summary(prefill_len: usize, prefill_ms: f64, prefill_kernel_ms: Option<f64>) -> String {
+    if let Some(kernel_ms) = prefill_kernel_ms {
+        let prefill_tok_s_kernel = prefill_len as f64 / (kernel_ms / 1000.0);
+        let startup_overhead_ms = prefill_ms - kernel_ms;
+        let cold_pct = if prefill_ms > 0.0 { (startup_overhead_ms / prefill_ms) * 100.0 } else { 0.0 };
+        format!(
+            "  prefill_tok_s_kernel={prefill_tok_s_kernel:.1}  prefill_kernel_ms={kernel_ms:.2}  startup_overhead_ms={startup_overhead_ms:.2}  cold_overhead_pct={cold_pct:.1}"
+        )
+    } else {
+        String::new()
+    }
 }
