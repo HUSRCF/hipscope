@@ -83,6 +83,7 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-detect = { path = "../hipfire-detect" }
+hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents

@@ -19,7 +19,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N]");
+        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -29,6 +29,10 @@ fn main() {
     let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
+    // Optional kernel-atlas emission: when set, write one typed AtlasRow
+    // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
+    // stdout-scraping by external collectors like scripts/kernel_atlas.py.
+    let mut atlas_out: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -36,6 +40,7 @@ fn main() {
             "--prefill-runs" => { prefill_runs = args[i + 1].parse::<usize>().unwrap().max(1); i += 2; }
             "--gen"     => { gen_len     = args[i + 1].parse().unwrap(); i += 2; }
             "--warmup"  => { warmup_len  = args[i + 1].parse().unwrap(); i += 2; }
+            "--emit-atlas" => { atlas_out = Some(args[i + 1].clone()); i += 2; }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
         }
     }
@@ -200,6 +205,39 @@ fn main() {
     eprintln!("PREFILL_SUMMARY  prefill_tok_s={prefill_tok_s:.1}  prefill_wall_ms={prefill_ms:.2}{}",
         split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
 
+    // Atlas row: typed prefill measurement. Emitted right here so it
+    // survives any panic in the gen phase. Eliminates the stdout-scrape
+    // round-trip the Python harness would otherwise do.
+    if let Some(ref atlas_path) = atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("prefill", "bench_qwen35_mq4");
+        row.set_metric_f64("prefill_tok_s", prefill_tok_s)
+            .set_metric_f64("prefill_wall_ms", prefill_ms)
+            .set_metric_u64("prefill_tokens", prefill_len as u64)
+            .set_metric_u64("prefill_runs", prefill_runs as u64)
+            .set_metric_str("kv_mode", &kv_mode)
+            .set_metric_str("arch", &gpu.arch)
+            .set_metric_str("model_path", model_path)
+            .set_metric_u64("model_bytes", model_bytes)
+            .set_extra("captured_at_unix_s", serde_json::Value::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ));
+        if let Some(kernel_ms) = prefill_kernel_ms {
+            let prefill_tok_s_kernel = prefill_len as f64 / (kernel_ms / 1000.0);
+            row.set_metric_f64("prefill_kernel_ms", kernel_ms);
+            row.set_metric_f64("prefill_tok_s_kernel", prefill_tok_s_kernel);
+            row.set_metric_f64("startup_overhead_ms", prefill_ms - kernel_ms);
+            if prefill_ms > 0.0 {
+                row.set_metric_f64("cold_overhead_pct", (prefill_ms - kernel_ms) / prefill_ms * 100.0);
+            }
+        }
+        if let Err(e) = row.append_to_jsonl(atlas_path) {
+            eprintln!("WARN: failed to append atlas row to {atlas_path}: {e}");
+        }
+    }
+
     // (deferred-conversion mode removed with givens — asym modes are natively
     //  batched so there's no prefill/decode cache swap to measure.)
 
@@ -316,6 +354,28 @@ fn main() {
     eprintln!();
     eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}{}",
         split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+
+    // Decode atlas row (gen phase). Pairs with the prefill row emitted
+    // earlier so a single bench invocation produces two phase-tagged rows.
+    if let Some(ref atlas_path) = atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("decode_ar", "bench_qwen35_mq4");
+        row.set_metric_f64("gen_tok_s", gen_tok_s)
+            .set_metric_f64("bw_gib_s", bw_gbps)
+            .set_metric_f64("avg_ms", avg_ms)
+            .set_metric_f64("p50_ms", p50_ms)
+            .set_metric_f64("p90_ms", p90_ms)
+            .set_metric_f64("p99_ms", p99_ms)
+            .set_metric_f64("min_ms", min_ms)
+            .set_metric_f64("max_ms", max_ms)
+            .set_metric_u64("gen_tokens", n as u64)
+            .set_metric_str("kv_mode", &kv_mode)
+            .set_metric_str("arch", &gpu.arch)
+            .set_metric_str("model_path", model_path)
+            .set_metric_u64("model_bytes", model_bytes);
+        if let Err(e) = row.append_to_jsonl(atlas_path) {
+            eprintln!("WARN: failed to append atlas row to {atlas_path}: {e}");
+        }
+    }
 }
 
 /// Emit the latency-class split for prefill when profiling captured the
