@@ -47,7 +47,11 @@ fn main() {
 
             // Test path: seed Y with residual, run fused kernel.
             let d_y_test = gpu.upload_f32(&r_host[..n * m], &[n * m]).unwrap();
-            gpu.gemm_q8_0_residual_wmma(&d_a, &x_n, &d_y_test, m, k, n).unwrap();
+            if arch.starts_with("gfx12") {
+                gpu.gemm_q8_0_residual_wmma_gfx12(&d_a, &x_n, &d_y_test, m, k, n).unwrap();
+            } else {
+                gpu.gemm_q8_0_residual_wmma(&d_a, &x_n, &d_y_test, m, k, n).unwrap();
+            }
 
             // Ref path: substrate into tmp, add_inplace into separately-seeded Y_ref.
             let d_tmp = gpu.zeros(&[n * m], DType::F32).unwrap();
