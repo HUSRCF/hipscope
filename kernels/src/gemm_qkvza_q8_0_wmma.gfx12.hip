@@ -9,7 +9,8 @@
 // up-front, 4 dequant+WMMA pairs back-to-back. Validated numerically
 // identical to the single-block port via test_gemm_q8_qkvza_wmma.
 //
-// Block-pair invariant: blocks_per_row = K/32 must be EVEN.
+// Block-pair plus tail: 2 Q8 blocks per K4-unrolled body, plus a single-
+// block tail for odd blocks_per_row (correctness on small/odd K).
 
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
@@ -73,7 +74,8 @@ extern "C" __global__ void gemm_qkvza_q8_0_wmma_gfx12(
         a_reg[6] = (sc) * (_Float16)(float)(signed char)(((pk) >> 48) & 0xFFu); \
         a_reg[7] = (sc) * (_Float16)(float)(signed char)(((pk) >> 56) & 0xFFu)
 
-    for (int bi = 0; bi < blocks_per_row; bi += 2) {
+    int bi = 0;
+    for (; bi + 1 < blocks_per_row; bi += 2) {
         const char* bp_a = row_base + bi * 34;
         const char* bp_b = row_base + (bi + 1) * 34;
 
@@ -107,6 +109,32 @@ extern "C" __global__ void gemm_qkvza_q8_0_wmma_gfx12(
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b0b, acc);
         DQ8_Q(pk1b, sc_b);
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b1b, acc);
+    }
+
+    // Tail: one unpaired block if blocks_per_row is odd.
+    if (bi < blocks_per_row) {
+        const char* bp = row_base + bi * 34;
+        _Float16 sc;
+        {
+            unsigned short s_bits;
+            __builtin_memcpy(&s_bits, bp, 2);
+            __builtin_memcpy(&sc, &s_bits, 2);
+        }
+
+        const _Float16* x_base = X + (long long)safe_batch * K + bi * 32;
+
+        unsigned long long pk0, pk1;
+        __builtin_memcpy(&pk0, bp + 2 +  0 + k_grp * 8, 8);
+        __builtin_memcpy(&pk1, bp + 2 + 16 + k_grp * 8, 8);
+
+        half8_t b0 = *(const half8_t*)(x_base +  0 + k_grp * 8);
+        half8_t b1 = *(const half8_t*)(x_base + 16 + k_grp * 8);
+
+        half8_t a_reg;
+        DQ8_Q(pk0, sc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b0, acc);
+        DQ8_Q(pk1, sc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b1, acc);
     }
     #undef DQ8_Q
 
