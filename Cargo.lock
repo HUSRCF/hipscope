@@ -165,6 +165,7 @@ dependencies = [
 name = "hipfire-atlas"
 version = "0.1.20"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
