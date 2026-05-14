@@ -1,18 +1,24 @@
-//! Kernel Atlas: typed schema + JSONL writer for hipfire bench corpus.
+//! Kernel Atlas: typed schema + JSONL writer + analysis helpers for the
+//! hipfire bench corpus.
 //!
-//! This crate is the **Rust collection layer** of the three-layer Atlas
-//! architecture (see `docs/methodology/kernel-atlas-architecture.md`):
+//! See `docs/methodology/kernel-atlas-architecture.md` for the
+//! three-layer split:
 //!
-//! 1. **Collection (this crate)** — bench tools emit typed `AtlasRow`
-//!    values directly. No stdout-scraping, no regex.
+//! 1. **Collection (this crate)** — bench/inference binaries emit typed
+//!    [`AtlasRow`] values via `--emit-atlas <path>`. No stdout-scraping.
 //! 2. **Analysis** — `scripts/kernel_atlas.py` (on the HIPa branch)
-//!    handles ranking, render, suggest, task-bundle generation.
+//!    handles ranking and pandas-style iteration.
 //! 3. **Advisor** — future autotuner / advisor model consumes the corpus.
 //!
-//! The on-disk JSONL shape matches the Python harness so both layers
-//! share a corpus.
+//! The legacy stdout parsers in [`parse`] remain as a migration bridge
+//! for captures from binaries not yet wired with `--emit-atlas`.
 
+pub mod eval;
+pub mod parse;
+pub mod render;
 pub mod schema;
+pub mod suggest;
+pub mod task;
 
 pub use schema::{
     load_row, load_rows, truncate_jsonl, value_object, AtlasRow, ATLAS_SCHEMA,
