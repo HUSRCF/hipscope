@@ -78,13 +78,23 @@ fn main() {
             let yk_r = d_yk_ref.sub_offset(0, n * k_m);
             let yv_r = d_yv_ref.sub_offset(0, n * v_m);
 
-            // Production fused call.
-            gpu.gemm_qkv_q8_0_wmma(
-                &d_aq, &d_ak, &d_av,
-                &x_n,
-                &yq_w, &yk_w, &yv_w,
-                q_m, k_m, v_m, k, n,
-            ).unwrap();
+            // Production fused call — gfx11 uses the canonical _w32 kernel;
+            // gfx12 routes to the _w32_gfx12 sibling (half8_t lane-grp split).
+            if arch.starts_with("gfx12") {
+                gpu.gemm_qkv_q8_0_wmma_gfx12(
+                    &d_aq, &d_ak, &d_av,
+                    &x_n,
+                    &yq_w, &yk_w, &yv_w,
+                    q_m, k_m, v_m, k, n,
+                ).unwrap();
+            } else {
+                gpu.gemm_qkv_q8_0_wmma(
+                    &d_aq, &d_ak, &d_av,
+                    &x_n,
+                    &yq_w, &yk_w, &yv_w,
+                    q_m, k_m, v_m, k, n,
+                ).unwrap();
+            }
 
             // Reference: 3 separate substrate calls (single-output each).
             gpu.gemm_q8_0_batched_chunked(&d_aq, &x_n, &yq_r, q_m, k, n).unwrap();
@@ -155,8 +165,13 @@ fn main() {
     let d_yv = gpu.zeros(&[n * v_m], DType::F32).unwrap();
     let d_yq_ref = gpu.zeros(&[n * q_m], DType::F32).unwrap();
 
-    gpu.gemm_qkv_q8_0_wmma(&d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv,
-                           q_m, k_m, v_m, k, n).unwrap();
+    if arch.starts_with("gfx12") {
+        gpu.gemm_qkv_q8_0_wmma_gfx12(&d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv,
+                                     q_m, k_m, v_m, k, n).unwrap();
+    } else {
+        gpu.gemm_qkv_q8_0_wmma(&d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv,
+                               q_m, k_m, v_m, k, n).unwrap();
+    }
     gpu.gemm_q8_0_batched_chunked(&d_aq, &d_x, &d_yq_ref, q_m, k, n).unwrap();
 
     let yq = gpu.download_f32(&d_yq).unwrap();

@@ -49,7 +49,11 @@ fn main() {
             let gr = d_yg_r.sub_offset(0, n * gate_m);
             let ur = d_yu_r.sub_offset(0, n * up_m);
 
-            gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n).unwrap();
+            if arch.starts_with("gfx12") {
+                gpu.gemm_gate_up_q8_0_wmma_gfx12(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n).unwrap();
+            } else {
+                gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n).unwrap();
+            }
             gpu.gemm_q8_0_batched_chunked(&d_g, &x_n, &gr, gate_m, k, n).unwrap();
             gpu.gemm_q8_0_batched_chunked(&d_u, &x_n, &ur, up_m, k, n).unwrap();
 

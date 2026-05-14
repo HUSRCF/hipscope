@@ -61,12 +61,21 @@ fn main() {
             let br = d_y_beta_r.sub_offset(0, n * beta_m);
             let ar = d_y_alpha_r.sub_offset(0, n * alpha_m);
 
-            gpu.gemm_qkvza_q8_0_wmma(
-                &d_qkv, &d_z, &d_beta, &d_alpha,
-                &x_n,
-                &qw, &zw, &bw, &aw,
-                qkv_m, z_m, beta_m, alpha_m, k, n,
-            ).unwrap();
+            if arch.starts_with("gfx12") {
+                gpu.gemm_qkvza_q8_0_wmma_gfx12(
+                    &d_qkv, &d_z, &d_beta, &d_alpha,
+                    &x_n,
+                    &qw, &zw, &bw, &aw,
+                    qkv_m, z_m, beta_m, alpha_m, k, n,
+                ).unwrap();
+            } else {
+                gpu.gemm_qkvza_q8_0_wmma(
+                    &d_qkv, &d_z, &d_beta, &d_alpha,
+                    &x_n,
+                    &qw, &zw, &bw, &aw,
+                    qkv_m, z_m, beta_m, alpha_m, k, n,
+                ).unwrap();
+            }
             gpu.gemm_q8_0_batched_chunked(&d_qkv, &x_n, &qr, qkv_m, k, n).unwrap();
             gpu.gemm_q8_0_batched_chunked(&d_z, &x_n, &zr, z_m, k, n).unwrap();
             gpu.gemm_q8_0_batched_chunked(&d_beta, &x_n, &br, beta_m, k, n).unwrap();

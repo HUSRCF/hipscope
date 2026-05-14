@@ -4247,13 +4247,12 @@ fn forward_prefill_chunk(
     // per-token gather/scatter via run_fa_layer_body.
     let fa_arch = gpu.arch.as_str();
     // Q8 WMMA gate: the fused Q8 WMMA family (gemm_qkv/qkvza/gate_up/residual
-    // _q8_0_wmma) uses the `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
-    // builtin, which only pattern-matches on gfx11 (see dispatch.rs:155 —
-    // gfx12 errors with "Cannot select: intrinsic" at codegen time and needs
-    // the `_w32_gfx12` builtin variant in a `*.gfx12.hip` sibling kernel,
-    // which we have not authored yet). Routing gfx12 here would crash at JIT.
-    // On non-WMMA archs we keep the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = rdna_compute::has_wmma_f16(fa_arch);
+    // _q8_0_wmma) uses the gfx11 `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+    // builtin; the sibling `*.gfx12.hip` kernels use the `_w32_gfx12` variant
+    // (silicon-validated on R9700, 2026-05-14, 4/4 unit tests PASS). Each
+    // call site below selects the right variant via an `arch.starts_with`
+    // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
+    let q8_wmma_arch = rdna_compute::has_wmma_f16(fa_arch) || fa_arch.starts_with("gfx12");
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
