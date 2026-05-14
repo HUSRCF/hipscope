@@ -1,170 +1,221 @@
-# Kernel Atlas — three-layer architecture
+# Kernel Atlas - Python-first architecture
 
-The Kernel Atlas is hipfire's **measurement corpus for kernel performance
-data**. It's separate from Astrea, which is the **measurement corpus for
-quantization quality**. Astrea's PR explicitly documents an "Atlas
-handoff" — once a quant passes Astrea's KLD/MSE quality gates, Atlas
-takes over to measure how fast its kernels actually run.
+Kernel Atlas is hipfire's measurement corpus for kernel and runtime
+performance. Astrea is the matching corpus for quantization quality.
+The two tools should compose around a shared experiment key:
 
-This doc captures the three-layer split that survived discovery, why
-each layer ends up in the language it does, and the migration path
-from "stdout-scrape" collection to typed in-process emission.
-
-## The three layers
-
-### Layer 1 — Collection (Rust, in-process)
-
-**Job:** Capture per-row measurements from running bench/inference
-binaries. One row per (workload × phase × variant). Each row is a typed
-`AtlasRow` struct serialized to JSONL.
-
-**Why Rust:** The data comes from the bench binaries themselves
-(`bench_qwen35_mq4`, `dflash_spec_demo`, …). Having those binaries emit
-typed `AtlasRow` values directly — via the `hipfire-atlas` crate — is
-strictly safer than the legacy approach of:
-
-1. Bench binary prints `SUMMARY  prefill_tok_s=1432 …` to stderr
-2. Python wrapper regexes the line into a dict
-3. Python wrapper writes JSONL
-
-The regex contract is silently fragile: a new metric requires changes
-in both places, and a format drift breaks Python collection without
-the bench noticing. Today's `PREFILL_SUMMARY` addition is a recent
-example — adding a new field worked by *luck* (the regex
-`[A-Za-z0-9_]+=[0-9.]+` happened to match it). Typed in-process
-emission eliminates that whole class of breakage.
-
-**API surface:**
-
-```rust
-use hipfire_atlas::AtlasRow;
-
-let mut row = AtlasRow::new("prefill", "bench_qwen35_mq4");
-row.set_metric_f64("prefill_tok_s", 1432.5)
-   .set_metric_f64("prefill_kernel_ms", 88.4)
-   .set_metric_str("arch", "gfx1100")
-   .set_metric_u64("prefill_tokens", 128);
-row.append_to_jsonl(atlas_path)?;
+```text
+git_sha + model_hash + workload + quant_variant + runtime_variant
 ```
 
-**Wired today:**
-- `bench_qwen35_mq4 --emit-atlas <path.jsonl>` writes a `prefill` row
-  after the prefill phase and a `decode_ar` row after the gen phase.
+Astrea answers "is this quant worth running?" Atlas answers "what did
+it cost or buy on the target hardware?"
 
-**Wired tomorrow (deferred):**
-- `dflash_spec_demo --emit-atlas <path.jsonl>` writes a `decode_dflash`
-  row including τ, accepted tokens, cycle count.
-- Per-kernel profile capture inside the binary — instead of grepping
-  the `=== PROFILE ===` stdout block, the binary writes
-  `artifacts.profile_kernels` directly from `rdna_compute::profile::stop()`.
-- ISA manifest capture via in-process `clang-offload-bundler` +
-  `llvm-readelf` invocations — replaces the current Python subprocess
-  chain in `scripts/kernel_atlas.py`.
+## Rust Atlas status
 
-### Layer 2 — Analysis (Python, out-of-process)
+`origin/master` currently contains `crates/hipfire-atlas`. Treat that
+crate and CLI as transitional and revert-bound. Do not expand the Rust
+Atlas port into the long-term user or agent surface.
 
-**Job:** Rank rows, render ASCII fit tables, suggest tuning targets,
-generate optimization-task JSON bundles for an agent or human.
+The useful concepts from the Rust crate should survive the revert:
 
-**Why Python:** Ad-hoc analysis iterates faster in Python. The pandas
-ecosystem, matplotlib for plotting, jupyter for poking — these are
-*much* nicer than equivalent Rust setups for the
-"load 1000 rows, group by quant × arch × shape, show the median"
-workflow that dominates Atlas analysis.
+- stable JSONL rows
+- task/eval bundles
+- schema validation
+- render/suggest commands
+- in-process bench emission when a Rust binary already owns the metric
 
-**Tool:** `scripts/kernel_atlas.py` on the HIPa branch. Keep it.
+The long-term Atlas tool should be Python-first because the dominant
+workflow is analysis: loading many rows, grouping by quant/runtime/arch,
+rendering Pareto tables, and rapidly changing ranking heuristics. Rust
+is still appropriate inside hipfire binaries when they emit metrics they
+already know, but the Atlas CLI, analyzer, agent workflow, and notebook
+surface should live in Python.
 
-**The migration:** Once Layer 1 is wired everywhere, the Python tool
-stops being a *collector* (no more subprocess `bench && grep`) and
-becomes purely an *analyzer* (`load_rows(path)` + ranking + render).
-That removes ~200 lines of subprocess plumbing from the Python script
-and makes it a much smaller surface.
+## Layers
 
-### Layer 3 — Advisor (future, language TBD)
+### Layer 1 - Measurement emission
 
-**Job:** Consume the corpus and *suggest* tuning changes — register-
-budget retunes, K-unroll factors, dispatch heuristics — either via a
-hand-coded ranker or an autotuner / LLM advisor pipeline.
+Bench and inference binaries may emit Atlas JSONL directly through
+`--emit-atlas <path>`. The binary that owns a metric should write that
+metric rather than relying on a stdout parser. This is especially
+important for route information that is not visible from a summary line.
 
-**Why not committed yet:** We don't have enough corpus volume to make
-this worth building. When we do, it'll likely live in Rust for the
-embed-in-engine case (advisor runs alongside inference) and Python for
-the offline-research case (advisor runs in a notebook).
+Required row fields for new measurements:
 
-## Concrete migration steps
+- `schema`: `hipfire.kernel_atlas.v0`
+- `phase`: `prefill`, `decode_ar`, or `decode_dflash`
+- `workload_kind`: binary or workload class
+- `git_sha`, `hostname`, `arch`, `rocm_version`, `hipcc_version`
+- `model_path`, `model_hash`, `model_bytes`
+- `quant_variant`: flat MQ4, KMD2-lite, KMD2-full, etc.
+- `runtime_variant`: graph/KV/flash/config tuple
 
-| Step | Change | Status |
-|---|---|---|
-| 1 | `crates/hipfire-atlas/` crate with typed `AtlasRow` + JSONL writer | ✓ this PR |
-| 2 | `bench_qwen35_mq4 --emit-atlas <path>` writes prefill + decode_ar rows | ✓ this PR |
-| 3 | `dflash_spec_demo --emit-atlas <path>` writes decode_dflash rows | TODO |
-| 4 | Profile capture in-process (no `=== PROFILE ===` stdout grepping) | TODO |
-| 5 | `scripts/kernel_atlas.py` switches from subprocess+grep to `subprocess hipfire-atlas` for collection orchestration; analysis stays Python | TODO |
-| 6 | ISA manifest capture in-process via Rust wrappers around `clang-offload-bundler` | TODO |
+The row should also include enough run hygiene to keep small wins honest:
 
-## On-disk schema invariants
+- `pass_index`
+- `discard_first_pass`
+- `warmup_tokens`
+- `gen_tokens`
+- `prefill_tokens`
+- `dpm_warmup_secs`
+- `binary_md5`
+- `prompt_md5` when a prompt is involved
 
-- One row per line (JSONL)
-- `schema` field always reads `"hipfire.kernel_atlas.v0"` (semver later)
-- `phase` is one of: `"prefill"`, `"decode_ar"`, `"decode_dflash"`
-- `workload_kind` identifies the binary or workload class
-  (`"bench_qwen35_mq4"`, `"dflash_spec_demo"`, etc.)
-- `metrics` holds numeric measurements (canonical types: `f64` for
-  throughput/latency/bandwidth, `u64` for counts, `String` for
-  categorical labels like `arch` or `kv_mode`)
-- `artifacts` holds nested-structure data (per-kernel profile tables,
-  ISA manifests, lineage refs)
-- Extra fields flatten into the row object — useful for
-  `captured_at_unix_s`, `git_sha`, `hostname` etc. without polluting
-  `metrics`
+### Layer 2 - Python Atlas CLI and analyzer
 
-Compatible with the JSONL emitted by `scripts/kernel_atlas.py` so a
-mixed corpus from both layers is parseable by either tool.
+The Python Atlas surface owns orchestration and analysis:
 
-## Why not pick one language?
+- run bench matrices
+- discard pass 1 by default for JIT control
+- join candidate rows to baseline rows
+- render flat text tables for agents and humans
+- emit constrained tuning tasks
+- record eval results, diffs, correctness status, and lineage
 
-Because the layers have genuinely different workloads:
+The graph/KV investigation added one hard requirement: Atlas must record
+the actual dispatch route, not just the requested environment.
 
-- **Collection needs trust.** A regex-fragile Python parser that
-  silently drops a new field is worse than no collection. The bench
-  binary that knows the metric should write it directly.
-- **Analysis needs iteration speed.** Re-running a Rust analyzer to
-  change one ranking heuristic is friction; Python is a notebook away.
-- **Advisor needs both.** When we get there, the in-engine variant
-  goes in Rust (no Python in the inference hot path, per the
-  project rule), and the offline variant stays Python.
+Route manifest fields:
+
+- `kv_mode`: `q8`, `asym2`, `asym3`, `asym4`, etc.
+- `graph_enabled`
+- `graph_blob_count`
+- `attention_impl`: `q8_nonflash`, `q8_flash`, `asym2_flash`,
+  `asym3_flash`, `asym4_flash`, etc.
+- `flash_requested`: `never`, `auto`, or `always`
+- `flash_active`
+- `kernel_names`
+- `grid`, `block`, and `shared_mem` for hot kernels when available
+- `capture_safe`: true/false/unknown
+
+This would have surfaced the Q8 graph failure directly: capture was
+forcing Q8 flash attention at short context, and forced Q8 flash
+reproduced NaN logits even with graph disabled. Atlas should flag any
+case where graph capture changes the attention route.
+
+### Layer 3 - Advisor
+
+The advisor consumes the corpus and suggests bounded experiments:
+
+- launch-bound retunes
+- K-unroll changes
+- graph capture enablement
+- flash/non-flash dispatch thresholds
+- KV policy choices
+- candidate vs baseline regressions
+
+Build this after the corpus has enough rows. Keep the first version as a
+Python ranker plus task emitter. Do not jump to autonomous mutation until
+`atlas task` and `atlas eval` contracts are boring and reliable.
+
+## Required Atlas eval modes
+
+### Graph A/B
+
+Atlas should provide a first-class graph comparison that runs:
+
+```text
+HIPFIRE_GRAPH=0 pass 1
+HIPFIRE_GRAPH=0 pass 2
+HIPFIRE_GRAPH=1 pass 1
+HIPFIRE_GRAPH=1 pass 2
+```
+
+Pass 1 is recorded but not used for the headline. Pass 2 is the
+JIT-controlled row. The report must show:
+
+- graph-off tok/s
+- graph-on tok/s
+- graph lift
+- p50/p99 delta
+- prefill delta
+- route changes between graph off and graph on
+- correctness status for graph-on
+
+### Baseline/candidate compare
+
+Atlas should make "perf lost vs flat MQ4" automatic. A candidate report
+must accept a baseline row and print:
+
+- candidate tok/s delta
+- candidate p50/p99 delta
+- candidate prefill delta
+- candidate model-size delta
+- quality row link from Astrea
+- correctness/coherence status
+
+For example, the KMD2 investigation should be one Atlas comparison:
+
+```text
+baseline = flat MQ4 + q8conv1d
+candidate = full KMD2 + q8conv1d
+runtime matrix = q8/asym3 x graph off/on
+```
+
+### Correctness join
+
+A performance row without a correctness row is incomplete. Atlas should
+join to:
+
+- `coherence_probe`
+- `coherence-gate-dflash.sh` for DFlash claims
+- KLD/PPL/MSE rows from Astrea when the experiment changes quantization
+
+The report should mark rows as `perf_only` when correctness is missing.
 
 ## Relationship to Astrea
 
-Astrea (`scripts/astrea.py`, agent skill at `.agents/skills/astrea/`)
-covers the **quality** axis: KLD vs BF16 reference, per-layer error
-attribution, PyTorch oracle replay, calibration recipes.
+Astrea owns quality evidence:
 
-Atlas covers the **performance** axis: tok/s, GiB/s, per-kernel timing,
-ISA manifests.
+- KLD vs BF16 reference
+- PPL
+- per-tensor and per-layer attribution
+- MSE and reconstruction stats
+- calibration method inputs: none, imatrix, AWQ, GPTQ, stacked methods
+- promotion maps and bpw
+- PyTorch oracle traces when available
 
-The two are designed to compose:
+Astrea hands candidates to Atlas only after producing a candidate
+manifest. Minimum manifest fields:
 
-1. Astrea picks a candidate quant variant, verifies its KLD floor.
-2. Astrea hands off to Atlas via a workflow contract documented in the
-   skill (`Atlas handoff` section).
-3. Atlas measures the kernels for that variant, writes rows.
-4. Both corpora indexed by `git_sha` + workload, so a single experiment
-   joins to one Astrea row + N Atlas rows.
+- `candidate_id`
+- `model_path`
+- `model_hash`
+- `source_model`
+- `quant_format`
+- `calibration_methods`
+- `promotion_map`
+- `bpw`
+- `size_bytes`
+- `kld_mean`
+- `ppl`
+- `mse_summary`
+- `reference_id`
+- `quality_artifacts`
 
-Neither tool duplicates the other; merging them would force a single
-language choice that hurts both axes.
+Atlas appends runtime rows under the same `candidate_id`. The final
+decision surface is a quality/performance Pareto table, not separate
+quality and speed reports.
 
-## Open follow-ups
+## Migration plan
 
-- **AOT-shipped HSACOs per gfx ID.** The Atlas
-  `startup_overhead_ms` and `cold_overhead_pct` fields will collapse
-  to ~0 when bench tools no longer pay JIT compile cost on first call.
-  See PR #253 description for the perf gap this would close (~50% on
-  both gfx1100 and gfx1201 today).
-- **`bench_qwen35_mq4` argmax-NaN panic at `llama.rs:3549`** during
-  graph-captured gen warmup blocks the decode_ar atlas row from
-  emitting. Prefill row still writes (emitted before the panic).
-  Filing as its own bug.
-- **`dflash_spec_demo --emit-atlas`** and **profile-capture-in-process**
-  are the next concrete deliverables for Layer 1.
+| Step | Change | Status |
+|---|---|---|
+| 1 | Stop expanding `crates/hipfire-atlas`; mark it transitional/revert-bound | active |
+| 2 | Recreate the Atlas CLI surface in Python | TODO |
+| 3 | Port useful Rust CLI commands to Python: `read`, `head`, `render-fit`, `suggest`, `task`, `eval` | TODO |
+| 4 | Add route manifests and graph A/B to Python Atlas | TODO |
+| 5 | Add baseline/candidate comparison and correctness join | TODO |
+| 6 | Add Astrea candidate manifests and Atlas handoff rows | TODO |
+| 7 | Remove the Rust Atlas crate once Python has parity | TODO |
+
+## Open follow-ups from gfx1100 KMD2 work
+
+- Add route-manifest capture so graph cannot silently change attention
+  implementation.
+- Add graph A/B as a one-command Atlas eval.
+- Add pass-2/JIT-controlled headline reporting.
+- Add KMD2-vs-flat comparison as a built-in report.
+- Keep `asym3 + graph` and `q8 + graph` as the first runtime variants
+  to track for Qwen3.5 0.8B KMD2 on gfx1100.

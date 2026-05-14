@@ -6,6 +6,12 @@
 //! collection: reading corpora, parsing legacy bench captures into rows,
 //! ranking, rendering, and generating task bundles.
 //!
+//! Status: transitional. `origin/master` currently carries this Rust
+//! Atlas crate, but the project direction is Python-first for the Atlas
+//! CLI/analyzer. Keep this binary as a compatibility bridge while the
+//! useful schema/task/eval behavior is moved back to Python; do not grow
+//! the Rust port as the long-term agent or user surface.
+//!
 //! For ad-hoc analysis at scale, use `scripts/kernel_atlas.py` on the
 //! HIPa branch instead — pandas/notebook iteration is faster there for
 //! large rankings.
