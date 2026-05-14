@@ -872,6 +872,14 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
 
+// gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
+// and half8_t operands (vs half16_t). Lane-grp K split (tid>>4 selects
+// K-half) and `acc[j] = C[8*(tid>>4) + j][tid & 15]` C-output mapping —
+// pattern mirrors gemm_qkv_hfq4g256_wmma.gfx12. SCAFFOLD until validated
+// on R9700.
+pub const GEMM_QKV_Q8_0_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.gfx12.hip");
+
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
 /// Q6_K block: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes per 256 elements.
