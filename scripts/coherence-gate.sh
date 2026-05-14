@@ -106,6 +106,15 @@ SHORT_TESTS=(
     #   md5(coherence_lloyd_long.txt) = f20bbc4f5b88ab5f7b44fe7c7da0e2e3
     "qwen3.5-4b.mq3-lloyd|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
     "qwen3.5-9b.mq3-lloyd|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
+    # Q8_0 batched-prefill coverage (companion to docs/plans/q8-fused-prefill-kernels.md
+    # T3-0 prerequisite). Exercises the Tier 2 dispatch arms
+    # (gemm_q8_0_batched_chunked at qkv/qkvza/gate_up/wo+residual/w_down+residual)
+    # via the daemon's prefill path on a 9B Q8 model. Tier 3 will replace
+    # those arms with fused WMMA kernels — this row is the regression detector.
+    # Same long prompt as the MQ3-Lloyd rows so output drift across quant
+    # formats is comparable. Single-chunk because the prompt fits comfortably
+    # inside one PrefillBatchScratch chunk (PREFILL_MAX_BATCH=256).
+    "qwen3.5-9b.q8f16|long-prefill-q8-9b|@coherence_lloyd_long.txt|220"
     # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
     # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
     # defaults don't disturb the mq6 dispatch routing. Skipped if model

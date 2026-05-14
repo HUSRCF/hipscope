@@ -2092,18 +2092,28 @@ fn verify_dflash_block_inner(
 
     if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
-        // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
+        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=64 in the kernel, so
+        // tree-verify blocks exceeding 64 (budget + 1 > 64) need chunking.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no such cap — they take the single-shot path.
+        //
+        // INVARIANT: this path MUST stay on `gemm_q8_0_batched` (the substrate),
+        // NOT the Tier 3 `gemm_qkv_q8_0_wmma` family. The substrate matches
+        // `gemv_q8_0`'s single-accumulator reduction order, preserving byte-exact
+        // greedy parity with decode — required for DFlash+Q8 spec-verify to ever
+        // be a valid eval target (see docs/plans/q8-fused-prefill-kernels.md
+        // §Constraints — "greedy-parity invariant"). The WMMA family uses a
+        // hardware-determined reduction order and will not match.
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                const Q8_LM_MAX: usize = 16;
+                const Q8_LM_MAX: usize = 64;
                 let mut chunk_start = 0usize;
                 while chunk_start < b {
                     let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
                     let chunk_n = chunk_end - chunk_start;
                     let x_chunk = final_hidden.sub_offset(chunk_start * dim, chunk_n * dim);
                     let y_chunk = logits_batch.sub_offset(chunk_start * vocab, chunk_n * vocab);
+                    // DO NOT route this through the Q8 WMMA dispatcher — see
+                    // greedy-parity invariant above.
                     gpu.gemm_q8_0_batched(
                         &w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n,
                     )?;
@@ -2658,6 +2668,9 @@ pub fn spec_step_dflash(
 
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
+                // INVARIANT: substrate-only (greedy-parity with decode); see the
+                // earlier Q8_0 spec-verify path in this file for the full rationale.
+                // Do not route through the Q8 WMMA dispatcher.
                 gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             rdna_compute::DType::HFQ4G256 => {
