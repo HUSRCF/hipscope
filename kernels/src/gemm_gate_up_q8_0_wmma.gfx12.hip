@@ -4,10 +4,37 @@
 // WMMA-accelerated batched 2-way fused Q8_0 GEMM for the Qwen3.5 FFN
 // preamble (w_gate + w_up projections from the same normed X).
 //
-// **gfx12 (RDNA4) variant** — sister of gemm_gate_up_q8_0_wmma.hip.
-// SCAFFOLD STATUS (2026-05-14): mirrors gemm_qkv_q8_0_wmma.gfx12 pattern
-// (silicon-validated for the QKV sibling on R9700). See that file for
-// the gfx11 → gfx12 port summary.
+// **gfx12 (RDNA4) variant — K4 unroll**. Mirrors the HFQ4 sibling
+// `gemm_gate_up_hfq4g256_wmma.gfx12.hip` (issue #65 lever 2), which
+// measured 2.0× on R9700 9B pp=128 gate_up (1842 → 922 µs/call,
+// 39 → 80 GiB/s effective). The same pattern should help Q8: the
+// kernel_atlas profile on R9700 (2026-05-14, single-block loop)
+// showed only 191 GiB/s effective (30% of peak) and 51.7% of total
+// prefill time — deep-pipelining the loads above the WMMA chain is
+// the obvious next lever.
+//
+// Pattern (same shape as the HFQ4 K4 unroll):
+//   1. Outer loop iterates 2 Q8 blocks (= 4 WMMA-K-tiles) per body
+//   2. All 4 X reads + all 4 weight reads issued up-front
+//   3. Weight bytes are loaded as uint64 packs (8 int8 per pack) so
+//      each WMMA tile = 1 VMEM op instead of 8 byte loads
+//   4. 4 dequant + WMMA pairs follow back-to-back; s_waitcnt vmcnt(>0)
+//      lets the compiler overlap VMEM with WMMA
+//
+// Block-pair semantics:
+//   - blocks_per_row = K/32 must be EVEN for the clean K2-block unroll.
+//     For Qwen3.5 9B production shapes K ∈ {4096, 11008}, blocks_per_row
+//     ∈ {128, 344}, both even. A debug_assert in the dispatch wrapper
+//     enforces this; if a future shape is odd we'd need a tail handler.
+//
+// gfx12 vs gfx11 differences (carried over from the single-block port):
+//   1. WMMA builtin: __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12
+//   2. half8_t A/B operands instead of half16_t
+//   3. K dim split across 2 lane-groups (k_grp = tid >> 4)
+//   4. C-output mapping: acc[j] = C[8*(tid>>4) + j][tid & 15]
+//      (silicon-validated on R9700, 2026-05-14)
+//
+// Grid: [ceil((gate_m + up_m)/16), ceil(N/16)]. Block: [32]. LDS: 0.
 
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
@@ -53,40 +80,61 @@ extern "C" __global__ void gemm_gate_up_q8_0_wmma_gfx12(
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int bi = 0; bi < blocks_per_row; bi++) {
-        const char* bp = row_base + bi * 34;
+    // Dequant macro: unpack one uint64 of 8 int8 weights, multiply by scale.
+    // Cast through `signed char` so the high bit is sign-extended (Q8_0 is
+    // signed [-128, 127]).
+    #define DQ8_Q(pk, sc) \
+        a_reg[0] = (sc) * (_Float16)(float)(signed char)(((pk) >>  0) & 0xFFu); \
+        a_reg[1] = (sc) * (_Float16)(float)(signed char)(((pk) >>  8) & 0xFFu); \
+        a_reg[2] = (sc) * (_Float16)(float)(signed char)(((pk) >> 16) & 0xFFu); \
+        a_reg[3] = (sc) * (_Float16)(float)(signed char)(((pk) >> 24) & 0xFFu); \
+        a_reg[4] = (sc) * (_Float16)(float)(signed char)(((pk) >> 32) & 0xFFu); \
+        a_reg[5] = (sc) * (_Float16)(float)(signed char)(((pk) >> 40) & 0xFFu); \
+        a_reg[6] = (sc) * (_Float16)(float)(signed char)(((pk) >> 48) & 0xFFu); \
+        a_reg[7] = (sc) * (_Float16)(float)(signed char)(((pk) >> 56) & 0xFFu)
 
-        _Float16 sc;
+    for (int bi = 0; bi < blocks_per_row; bi += 2) {
+        const char* bp_a = row_base + bi * 34;
+        const char* bp_b = row_base + (bi + 1) * 34;
+
+        _Float16 sc_a, sc_b;
         {
             unsigned short s_bits;
-            __builtin_memcpy(&s_bits, bp, 2);
-            __builtin_memcpy(&sc, &s_bits, 2);
+            __builtin_memcpy(&s_bits, bp_a, 2); __builtin_memcpy(&sc_a, &s_bits, 2);
+            __builtin_memcpy(&s_bits, bp_b, 2); __builtin_memcpy(&sc_b, &s_bits, 2);
         }
 
-        const _Float16* x_base = X + (long long)safe_batch * K + bi * 32;
+        const _Float16* x_a = X + (long long)safe_batch * K + bi * 32;
+        const _Float16* x_b = X + (long long)safe_batch * K + (bi + 1) * 32;
 
-        // Tile 0
-        const signed char* w0 = (const signed char*)(bp + 2 + k_grp * 8);
-        half8_t a0;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            a0[i] = sc * (_Float16)(float)(int)w0[i];
-        }
-        half8_t b0 = *(const half8_t*)(x_base + k_grp * 8);
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc);
+        // 4 weight packs (one uint64 = 8 int8 weights per WMMA tile), all up-front.
+        unsigned long long pk0a, pk1a, pk0b, pk1b;
+        __builtin_memcpy(&pk0a, bp_a + 2 +  0 + k_grp * 8, 8);
+        __builtin_memcpy(&pk1a, bp_a + 2 + 16 + k_grp * 8, 8);
+        __builtin_memcpy(&pk0b, bp_b + 2 +  0 + k_grp * 8, 8);
+        __builtin_memcpy(&pk1b, bp_b + 2 + 16 + k_grp * 8, 8);
 
-        // Tile 1
-        const signed char* w1 = (const signed char*)(bp + 2 + 16 + k_grp * 8);
-        half8_t a1;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            a1[i] = sc * (_Float16)(float)(int)w1[i];
-        }
-        half8_t b1 = *(const half8_t*)(x_base + 16 + k_grp * 8);
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc);
+        // 4 X tiles, all up-front.
+        half8_t b0a = *(const half8_t*)(x_a +  0 + k_grp * 8);
+        half8_t b1a = *(const half8_t*)(x_a + 16 + k_grp * 8);
+        half8_t b0b = *(const half8_t*)(x_b +  0 + k_grp * 8);
+        half8_t b1b = *(const half8_t*)(x_b + 16 + k_grp * 8);
+
+        // 4 dequant + WMMA pairs, back-to-back.
+        half8_t a_reg;
+        DQ8_Q(pk0a, sc_a);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b0a, acc);
+        DQ8_Q(pk1a, sc_a);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b1a, acc);
+        DQ8_Q(pk0b, sc_b);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b0b, acc);
+        DQ8_Q(pk1b, sc_b);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b1b, acc);
     }
+    #undef DQ8_Q
 
-    // gfx12 C-output mapping: acc[j] = C[8*(tid>>4) + j][tid & 15]
+    // gfx12 C-output mapping (silicon-validated 2026-05-14):
+    //   acc[j] = C[8*(tid>>4) + j][tid & 15]
     const int out_col = batch_start + m_lane;
     if (out_col >= N) return;
 
