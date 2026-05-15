@@ -2800,8 +2800,17 @@ pub struct KvCache {
     pub quant_asym3: bool,       // true = K at givens3 (rotated 3-bit Lloyd-Max), V at Q8_0 — best-quality rotated K per RotorQuant
     pub quant_asym2: bool,       // true = K at givens2 (rotated 2-bit), V at Q8_0 (normal space)
     pub boundary_layers: u8,     // number of boundary layers at each end (default 2)
-    pub givens_cos: Option<GpuTensor>,  // Givens rotation cos table (n_blocks × f32)
-    pub givens_sin: Option<GpuTensor>,  // Givens rotation sin table (n_blocks × f32)
+    // KV rotation parameter buffers. Field names are historical — in the
+    // Givens-rotated asym{2,3,4} modes (`quant_fwht == false`) these hold the
+    // per-block cos/sin tables. In the signed-FWHT-rotated fwht{2,3,4} modes
+    // (`quant_fwht == true`) the SAME slots hold signs1/signs2 ±1 vectors.
+    // Both are [n_blocks × f32] in shape, so the storage is fungible; the
+    // dispatcher reads `quant_fwht` to know which kernel signature to use.
+    pub givens_cos: Option<GpuTensor>,
+    pub givens_sin: Option<GpuTensor>,
+    /// True when the rotation primitive is signed-FWHT (matches Fwht{2,3,4}
+    /// KvMode values). False when Givens (matches Asym{2,3,4}).
+    pub quant_fwht: bool,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
     pub layer_is_boundary: Vec<bool>,
     /// TriAttention compaction bookkeeping. After each eviction we leave the
@@ -2837,7 +2846,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -2861,7 +2870,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
@@ -2891,7 +2900,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Helper: allocate K/V Vecs, skipping layers where is_kv_layer[i] is false
@@ -2975,7 +2984,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
@@ -2993,7 +3002,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
@@ -3013,7 +3022,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
@@ -3035,7 +3044,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     /// Generate deterministic Givens rotation angles from a seed.
@@ -3140,8 +3149,68 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: true, quant_asym3: false, quant_asym2: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false, quant_fwht: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
+    /// Create fwht4 KV cache: K at 4-bit signed-FWHT-rotated (Lloyd-Max
+    /// post-FWHT N(0, 1/128)), V at Q8_0 in normal space. Byte-identical
+    /// storage to asym4 — only the rotation primitive differs.
+    /// Back-compat wrapper: `physical_cap == max_seq_len`.
+    pub fn new_gpu_fwht4(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht4_capped(gpu, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    /// Same as [`new_gpu_fwht4`] with an explicit physical_cap. Eviction-aware.
+    pub fn new_gpu_fwht4_capped(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "fwht4 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        }
+        // fwht_shfl_forward operates on 128 elements regardless of head_dim
+        // (hd=256 is processed as 2 halves with the same signs reused).
+        // Seeds (42, 1042) match the established MQ4 weight-FWHT convention
+        // (see crates/hipfire-quantize/src/bin/dflash_convert.rs:600 and
+        // crates/hipfire-arch-qwen35/src/qwen35.rs:872 — same PRNG family).
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!("KV cache: fwht4 (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false, quant_fwht: true,
+            boundary_layers: 0, givens_cos: Some(s1), givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3251,7 +3320,7 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: false, quant_asym3: true, quant_asym2: false,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false, quant_fwht: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
             compact_offset: 0,
@@ -3345,7 +3414,7 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: false, quant_asym3: false, quant_asym2: true,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true, quant_fwht: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
             layer_is_boundary: vec![],
             compact_offset: 0,
@@ -3440,7 +3509,7 @@ impl KvCache {
         let kv_dim = n_kv_heads * head_dim;
         let cache_size = max_seq_len * kv_dim;
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_size, cache_size)?;
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_q4_multi(
@@ -3456,7 +3525,7 @@ impl KvCache {
         let cache_bytes = max_seq_len * bytes_per_pos;
         let cache_elems = (cache_bytes + 3) / 4;
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_q8_multi(
@@ -3484,7 +3553,7 @@ impl KvCache {
         let cache_bytes = physical_cap * total_blocks * 34;
         let cache_elems = (cache_bytes + 3) / 4;
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_int8c_multi(
@@ -3500,7 +3569,7 @@ impl KvCache {
         let cache_bytes = max_seq_len * bpp;
         let cache_elems = (cache_bytes + 3) / 4;
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_hfq4kv_multi(
@@ -3516,7 +3585,7 @@ impl KvCache {
         let cache_bytes = max_seq_len * bytes_per_pos;
         let cache_elems = (cache_bytes + 3) / 4;
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_hfq8_multi(
@@ -3531,7 +3600,7 @@ impl KvCache {
         let scale_elems = max_seq_len * n_kv_heads * 2;
         let (k_gpu, v_gpu, k_scales, v_scales) =
             alloc_kv_with_scales_per_layer_multi(gpus, n_layers, val_elems, val_elems, scale_elems, scale_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_int8_multi(
@@ -3546,7 +3615,7 @@ impl KvCache {
         let scale_elems = max_seq_len * n_kv_heads;
         let (k_gpu, v_gpu, k_scales, v_scales) =
             alloc_kv_with_scales_per_layer_multi(gpus, n_layers, val_elems, val_elems, scale_elems, scale_elems)?;
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, quant_fwht: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
     }
 
     pub fn new_gpu_asym4_multi(
@@ -3582,7 +3651,7 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: true, quant_asym3: false, quant_asym2: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false, quant_fwht: false,
             boundary_layers: 0, givens_cos: None, givens_sin: None,
             layer_is_boundary: vec![], compact_offset: 0,
         })
@@ -3621,7 +3690,7 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: false, quant_asym3: true, quant_asym2: false,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false, quant_fwht: false,
             boundary_layers: 0, givens_cos: None, givens_sin: None,
             layer_is_boundary: vec![], compact_offset: 0,
         })
@@ -3660,7 +3729,7 @@ impl KvCache {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
-            quant_asym4: false, quant_asym3: false, quant_asym2: true,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true, quant_fwht: false,
             boundary_layers: 0, givens_cos: None, givens_sin: None,
             layer_is_boundary: vec![], compact_offset: 0,
         })

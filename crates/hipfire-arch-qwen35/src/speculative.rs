@@ -145,6 +145,12 @@ pub enum KvMode {
     Asym3,
     /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
     Asym2,
+    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V. Byte-identical storage to
+    /// Asym4 but with a Hadamard rotation (matches MQ4's weight-quant trick).
+    /// Centroid LUTs were always Lloyd-Max-fit for post-FWHT N(0, 1/128) per
+    /// turbo_common.h:13 — Fwht4 finally uses them on the distribution they
+    /// were calibrated for. Opt-in via `--kv-mode fwht4`.
+    Fwht4,
 }
 
 impl Default for KvMode {
@@ -249,6 +255,13 @@ impl ModelSlot {
             KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
                 &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht4 => KvCache::new_gpu_fwht4(
+                gpu,
+                config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
