@@ -280,6 +280,17 @@ required-features = []
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
 
+# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
+# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
+# eval_hipfire, but the forward path goes through
+# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
+# the qwen35 arch. Per-token scoring only — llama-arch
+# `forward_prefill_batch` doesn't expose the hidden-state capture hook
+# that eval_hipfire's prefill mode relies on.
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]
