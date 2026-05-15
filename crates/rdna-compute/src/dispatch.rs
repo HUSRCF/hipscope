@@ -3638,6 +3638,128 @@ impl Gpu {
         result
     }
 
+    /// Phase A Stage A — F2 AWQ-aware variant of `fused_silu_mul_rotate_mq`.
+    ///
+    /// After computing silu(gate)*up, divides element-wise by `awq_scale[i]`
+    /// BEFORE the FWHT rotation. Completes the AWQ math
+    /// `(W·s) · (silu(g)*u / s) = W·silu(g)*u` where W·s is baked at
+    /// quantize time for the down_proj / w_down weights.
+    ///
+    /// Use when the down_proj `WeightTensor` carries `awq_scale = Some(...)`;
+    /// otherwise call the non-AWQ variant.
+    ///
+    /// awq_scale: 1D FP32 GpuTensor of length K (host-side F16 → F32
+    /// conversion happens in the loader; see hfq.rs::load_awq_scale).
+    pub fn fused_silu_mul_rotate_mq_awq(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate_awq",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
+            "fused_silu_mul_mq_rotate_awq",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let awp = awq_scale.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &awp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        // Bandwidth: read gate + up + awq_scale, 2x256 signs, write x_rot.
+        let bytes = k * 4 * 4 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate_awq", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_silu_mul_mq_rotate_awq", [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p); b.push_ptr(awp);
+                b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// Phase A Stage A — F2 batched AWQ variant of `fused_silu_mul_rotate_mq`.
+    /// Grid.y is the batch dim — processes [N × K] gate/up/x_rot.
+    pub fn fused_silu_mul_rotate_mq_awq_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate_awq",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
+            "fused_silu_mul_mq_rotate_awq",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate_awq_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_silu_mul_mq_rotate_awq",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p); b.push_ptr(awp);
+                b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Invalidate any `ensure_*_x` caches whose source pointer matches
     /// `dst_ptr`. Must be called by any kernel that overwrites data at
     /// `dst_ptr` since the caches key on raw pointer equality and have
@@ -3734,6 +3856,118 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(xp); b.push_ptr(xrp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
+    ///
+    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT,
+    /// completing the AWQ math `(W·s) · (x/s) = W·x` for the
+    /// post-projection input-rotate path (o_proj / out_proj). Use when
+    /// the upcoming linear carries `awq_scale = Some(...)`; otherwise call
+    /// the non-AWQ `rotate_x_mq`.
+    ///
+    /// awq_scale: 1D FP32 GpuTensor of length K.
+    pub fn rotate_x_mq_awq(
+        &mut self,
+        x: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rotate_x_mq_awq",
+            kernels::ROTATE_X_MQ_AWQ_SRC,
+            "rotate_x_mq_awq",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let xp = x.buf.as_ptr();
+        let awp = awq_scale.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &awp as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        // Bandwidth: read x + awq_scale, 2x256 signs, write x_rot.
+        let bytes = k * 4 * 3 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_mq_awq", bytes);
+        let result = self.launch_maybe_blob(
+            "rotate_x_mq_awq",
+            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(awp);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// Phase A Stage A — F2 batched AWQ variant of `rotate_x_mq`.
+    /// Grid.y is the batch dim — processes [N × K] x/x_rot.
+    pub fn rotate_x_mq_awq_batched(
+        &mut self,
+        x: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rotate_x_mq_awq",
+            kernels::ROTATE_X_MQ_AWQ_SRC,
+            "rotate_x_mq_awq",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut xp = x.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_mq_awq_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "rotate_x_mq_awq",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(awp);
                 b.push_ptr(s1); b.push_ptr(s2);
                 b.push_i32(kv);
                 b
