@@ -3053,13 +3053,19 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    if use_graph && gpu.graph_exec.is_some() {
+    // Compact offset (TriAttention eviction) breaks graph capture/replay:
+    // during replay, stream_write_value32 updates pos_buf but the captured
+    // H2D copy of (pos + compact_offset) inside FA layers overwrites it,
+    // causing RoPE to read stale positions. Fall back to direct execution.
+    let no_compact = kv_cache.compact_offset == 0;
+
+    if use_graph && gpu.graph_exec.is_some() && no_compact {
         // ── Graph replay path ──
         // Update pos_buf on the device via stream write (no host→device copy).
         let stream = gpu.active_stream.as_ref().unwrap();
         gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
         gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() {
+    } else if use_graph && gpu.graph_exec.is_none() && no_compact {
         let pos_i32 = pos as i32;
         if !gpu.ar_forward_warmed_up {
             // ── Warmup: run direct so kernel JIT and lazy scratch
@@ -5342,7 +5348,7 @@ fn forward_prefill_chunk(
                     let pos = start_pos + i;
                     gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, i * dim_row_bytes, dim_row_bytes)?;
                     let pos_i32 = pos as i32;
-                    gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
                     run_fa_layer_body(gpu, weights, config, layer_idx, kv_layer_idx, pos, kv_cache, s)?;
                     gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
                 }
@@ -5960,14 +5966,14 @@ fn run_fa_layer_body(
     // for kv_cache_write + flash attention (which both want the write slot).
     if kv_cache.compact_offset > 0 {
         let abs = (pos + kv_cache.compact_offset) as i32;
-        gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
     }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
         config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
     if kv_cache.compact_offset > 0 {
         let phys = pos as i32;
-        gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+        gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
 
     if kv_cache.quant_asym4 {
@@ -6526,14 +6532,14 @@ fn forward_scratch_layers(
 
                 if kv_cache.compact_offset > 0 {
                     let abs = (pos + kv_cache.compact_offset) as i32;
-                    gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
-                    gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
                 if kv_cache.quant_asym4 {
@@ -6917,14 +6923,14 @@ fn forward_scratch_layers(
 
                 if kv_cache.compact_offset > 0 {
                     let abs = (pos + kv_cache.compact_offset) as i32;
-                    gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
-                    gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
                 if kv_cache.quant_asym4 {
@@ -7289,14 +7295,14 @@ fn forward_scratch_layers_multi(
 
                     if kv_cache.compact_offset > 0 {
                         let abs = (pos + kv_cache.compact_offset) as i32;
-                        gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                     }
                     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                     gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                         config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                     if kv_cache.compact_offset > 0 {
                         let phys = pos as i32;
-                        gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                        gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                     }
 
                     if kv_cache.quant_asym4 {
@@ -7570,14 +7576,14 @@ fn forward_scratch_layers_multi(
 
                     if kv_cache.compact_offset > 0 {
                         let abs = (pos + kv_cache.compact_offset) as i32;
-                        gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
+                        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                     }
                     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                     gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                         config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                     if kv_cache.compact_offset > 0 {
                         let phys = pos as i32;
-                        gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                        gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                     }
 
                     if kv_cache.quant_asym4 {
