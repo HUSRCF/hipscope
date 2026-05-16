@@ -856,7 +856,18 @@ fn main() {
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
-                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
+                // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
+                // and HF transformers `generate(repetition_penalty=1.0)`
+                // defaults. The prior 1.3 default suppressed legitimately
+                // repeated formatting tokens (e.g. `' **'` for bullets,
+                // indentation patterns) on multi-step reasoning prompts,
+                // pushing structured chain-of-thought trajectories off the
+                // model's well-trained path into a self-doubt / number-
+                // hallucination attractor on 9B Qwen3.5 at greedy decode.
+                // Root cause writeup: issue #258 comment "Bug B root cause"
+                // and docs/investigations/2026-05-15-9b-reasoning-loop/.
+                // Clients can still opt in to a non-1.0 value per request.
+                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
