@@ -3053,13 +3053,19 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    if use_graph && gpu.graph_exec.is_some() {
+    // Compact offset (TriAttention eviction) breaks graph capture/replay:
+    // during replay, stream_write_value32 updates pos_buf but the captured
+    // H2D copy of (pos + compact_offset) inside FA layers overwrites it,
+    // causing RoPE to read stale positions. Fall back to direct execution.
+    let no_compact = kv_cache.compact_offset == 0;
+
+    if use_graph && gpu.graph_exec.is_some() && no_compact {
         // ── Graph replay path ──
         // Update pos_buf on the device via stream write (no host→device copy).
         let stream = gpu.active_stream.as_ref().unwrap();
         gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
         gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() {
+    } else if use_graph && gpu.graph_exec.is_none() && no_compact {
         let pos_i32 = pos as i32;
         if !gpu.ar_forward_warmed_up {
             // ── Warmup: run direct so kernel JIT and lazy scratch
