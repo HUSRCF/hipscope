@@ -3328,6 +3328,51 @@ impl KvCache {
         })
     }
 
+    /// Filtered variant of fwht3 — signed-FWHT-256 K-rotation, 3-bit centroid,
+    /// V at Q8_0. Same byte layout as asym3_filtered; rotation primitive swapped
+    /// to fwht_shfl_forward_256 which expects 256-element signs1/signs2.
+    pub fn new_gpu_fwht3_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 256, "fwht3 currently requires head_dim=256 (Qwen 3.5)");
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
+        let n_signs = 256;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht3 filtered ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false, quant_fwht: true,
+            boundary_layers: 0, givens_cos: Some(s1), givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
     /// Same as [`new_gpu_asym3`] but with an explicit physical capacity. When
     /// `physical_cap < max_seq_len`, the cache is sized for `physical_cap`
     /// tokens along the time axis; the caller is responsible for triggering
@@ -3421,6 +3466,49 @@ impl KvCache {
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
             quant_asym4: false, quant_asym3: false, quant_asym2: true, quant_fwht: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
+    /// Filtered variant of fwht2 — signed-FWHT-128 K-rotation, 2-bit centroid,
+    /// V at Q8_0. Same 2-pass-over-128 structure as fwht4, signs are 128 floats.
+    pub fn new_gpu_fwht2_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "fwht2 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht2 filtered ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true, quant_fwht: true,
+            boundary_layers: 0, givens_cos: Some(s1), givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
         })

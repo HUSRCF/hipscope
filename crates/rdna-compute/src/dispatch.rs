@@ -14437,6 +14437,49 @@ impl Gpu {
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
 
+    /// Fused K+V write for fwht3: K at signed-FWHT-256 rotated 3-bit, V at Q8_0.
+    /// Byte-identical storage to asym3 — only the K-write kernel differs.
+    pub fn kv_cache_write_fwht3_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht3",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_SRC,
+            "kv_cache_write_asym_k_fwht3",
+        )?;
+        {
+            let func = &self.functions["kv_cache_write_asym_k_fwht3"];
+            let mut kdp = k_dst.buf.as_ptr();
+            let mut ksp = k_src.buf.as_ptr();
+            let mut pp = pos_buf.as_ptr();
+            let mut s1p = signs1.buf.as_ptr();
+            let mut s2p = signs2.buf.as_ptr();
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut kdp as *mut _ as *mut c_void,
+                &mut ksp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut s1p as *mut _ as *mut c_void,
+                &mut s2p as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+            ];
+            let shared_mem = ((head_dim + 32) * 4) as u32;
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        }
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+    }
+
     /// Shared helper: launch a batched K-only rotated write kernel.
     fn launch_asym_k_batched(
         &mut self, kernel_key: &str, src_const: &'static str, func_name: &'static str,
@@ -14681,6 +14724,25 @@ impl Gpu {
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
+    /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
+    pub fn kv_cache_write_fwht2_batched(
+        &mut self,
+        k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_k_batched(
+            "kv_cache_write_asym_k_fwht2_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht2_batched",
+            k_dst, k_src, positions, signs1, signs2,
+            n_kv_heads, head_dim, batch_size,
+        )?;
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+    }
+
     /// Batched flash attention for asym4 (K 4-bit rotated + V Q8_0).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_batched(
@@ -14792,6 +14854,27 @@ impl Gpu {
         )
     }
 
+    /// Batched flash attention for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht2_batched(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fwht2_tile_batched",
+            kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC,
+            "attention_flash_fwht2_tile_batched",
+            q, k_cache, v_cache, out, positions, signs1, signs2,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
+        )
+    }
+
     /// Batched K+V write for asym3 — processes N positions in one launch.
     /// K-only givens3 write (batched) + Q8_0 V write (batched).
     pub fn kv_cache_write_asym3_batched(
@@ -14847,6 +14930,58 @@ impl Gpu {
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
+    /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
+    pub fn kv_cache_write_fwht3_batched(
+        &mut self,
+        k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht3_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht3_batched",
+        )?;
+        {
+            let mut kdp = k_dst.buf.as_ptr();
+            let mut ksp = k_src.buf.as_ptr();
+            let mut pp = positions.buf.as_ptr();
+            let mut s1p = signs1.buf.as_ptr();
+            let mut s2p = signs2.buf.as_ptr();
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut bs = batch_size as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut kdp as *mut _ as *mut c_void,
+                &mut ksp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut s1p as *mut _ as *mut c_void,
+                &mut s2p as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut bs as *mut _ as *mut c_void,
+            ];
+            let shared_mem = ((head_dim + 32) * 4) as u32;
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_fwht3_batched",
+                [n_kv_heads as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
+                    b.push_ptr(s1p); b.push_ptr(s2p);
+                    b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                    b
+                },
+            )?;
+        }
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+    }
+
     /// Batched flash attention for asym3 KV.
     /// Grid: [n_heads, max_tiles, sub_batch] tile + [n_heads, sub_batch] reduce,
     /// chunked by partials buffer capacity.
@@ -14893,8 +15028,144 @@ impl Gpu {
         )
     }
 
+    /// Batched flash attention for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht3_batched(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.attention_flash_fwht3_batched_masked(
+            q, k_cache, v_cache, out, positions, signs1, signs2,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
+        )
+    }
+
+    /// Tree-mask variant of `attention_flash_fwht3_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht3_batched_masked(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fwht3_tile_batched",
+            kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
+            "attention_flash_fwht3_tile_batched",
+            q, k_cache, v_cache, out, positions, signs1, signs2,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols,
+        )
+    }
+
     /// Flash attention for asym3 KV (K at 3-bit rotated, V at Q8_0).
     /// Reuses Q8_0 flash reduce (output in normal space — V was un-rotated).
+    /// Flash attention for fwht3 KV (K FWHT-rotated 3-bit, V at Q8_0).
+    pub fn attention_flash_fwht3(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+
+        self.ensure_givens4_kernel(
+            "attention_flash_fwht3_tile",
+            kernels::ATTENTION_FLASH_FWHT3_TILE_SRC,
+            "attention_flash_fwht3_tile",
+        )?;
+        {
+            let func = &self.functions["attention_flash_fwht3_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, launch_tiles as u32, 1],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        self.ensure_kernel(
+            "attention_flash_q8_0_reduce",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+            "attention_flash_q8_0_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn attention_flash_asym3(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,
@@ -15016,6 +15287,48 @@ impl Gpu {
                 &mut pp as *mut _ as *mut c_void,
                 &mut ctp as *mut _ as *mut c_void,
                 &mut stp as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+            ];
+            let shared_mem = ((head_dim + 32) * 4) as u32;
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        }
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+    }
+
+    /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.
+    pub fn kv_cache_write_fwht2_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht2",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC,
+            "kv_cache_write_asym_k_fwht2",
+        )?;
+        {
+            let func = &self.functions["kv_cache_write_asym_k_fwht2"];
+            let mut kdp = k_dst.buf.as_ptr();
+            let mut ksp = k_src.buf.as_ptr();
+            let mut pp = pos_buf.as_ptr();
+            let mut s1p = signs1.buf.as_ptr();
+            let mut s2p = signs2.buf.as_ptr();
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut kdp as *mut _ as *mut c_void,
+                &mut ksp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut s1p as *mut _ as *mut c_void,
+                &mut s2p as *mut _ as *mut c_void,
                 &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void,
             ];
@@ -15224,6 +15537,100 @@ impl Gpu {
     }
 
     /// Flash attention for asym2 KV (K at rotated 2-bit, V at Q8_0 normal space).
+    /// Flash attention for fwht2 KV (K FWHT-rotated 2-bit, V at Q8_0).
+    pub fn attention_flash_fwht2(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+
+        self.ensure_givens4_kernel(
+            "attention_flash_fwht2_tile",
+            kernels::ATTENTION_FLASH_FWHT2_TILE_SRC,
+            "attention_flash_fwht2_tile",
+        )?;
+        {
+            let func = &self.functions["attention_flash_fwht2_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, launch_tiles as u32, 1],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        self.ensure_kernel(
+            "attention_flash_q8_0_reduce",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+            "attention_flash_q8_0_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn attention_flash_asym2(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,
@@ -18116,6 +18523,32 @@ impl Gpu {
                             assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_SRC)));
                 specs.push(("attention_flash_fwht4_tile_batched",
                             assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC)));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+            }
+            "fwht3" => {
+                // Same byte layout as asym3 (single-pass 256-element), FWHT rotation.
+                specs.push(("kv_cache_write_asym_k_fwht3",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_SRC)));
+                specs.push(("kv_cache_write_asym_k_fwht3_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC)));
+                specs.push(("attention_flash_fwht3_tile",
+                            assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_SRC)));
+                specs.push(("attention_flash_fwht3_tile_batched",
+                            assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC)));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+            }
+            "fwht2" => {
+                // Same byte layout as asym2, FWHT rotation. 2-pass over 128.
+                specs.push(("kv_cache_write_asym_k_fwht2",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC)));
+                specs.push(("kv_cache_write_asym_k_fwht2_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC)));
+                specs.push(("attention_flash_fwht2_tile",
+                            assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_SRC)));
+                specs.push(("attention_flash_fwht2_tile_batched",
+                            assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC)));
                 specs.push(("attention_flash_asym_reduce_batched",
                             kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
             }
