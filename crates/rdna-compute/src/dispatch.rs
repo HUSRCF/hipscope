@@ -1153,6 +1153,28 @@ impl Gpu {
         self.memcpy_dtod_at_auto(dst, 0, src, 0, size)
     }
 
+    /// H→D copy that picks async on the active stream when capturing.
+    ///
+    /// During hipGraph capture (`capture_mode == true`), operations on the
+    /// legacy/null stream are forbidden because they would create a blocking
+    /// dependency with the capturing stream. This method routes to
+    /// `memcpy_htod_async` on the active (capturing) stream when in capture
+    /// mode, falling back to sync `memcpy_htod` otherwise.
+    pub fn memcpy_htod_auto(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.capture_mode {
+            let stream = self.active_stream.as_ref()
+                .expect("capture mode requires an active stream");
+            self.hip.memcpy_htod_async(dst, src, stream)
+        } else {
+            self.hip.memcpy_htod(dst, src)
+        }
+    }
+
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.
