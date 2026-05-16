@@ -3112,6 +3112,55 @@ impl KvCache {
         })
     }
 
+    /// Filtered variant of [`new_gpu_fwht4`]: skips KV alloc for non-KV layers.
+    /// Mirrors `new_gpu_asym4_filtered` byte-for-byte except the rotation
+    /// parameter buffers hold signs1/signs2 (FWHT) instead of cos/sin (Givens)
+    /// and `quant_fwht` is set true. K-cache byte layout is identical to
+    /// asym4 so scoring kernels are shared.
+    pub fn new_gpu_fwht4_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "fwht4 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        // fwht_shfl_forward operates on 128 elements regardless of head_dim;
+        // signs are shared across the hd=256 two-half rotation. Seeds (42,
+        // 1042) match the MQ4 weight-FWHT convention.
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht4 filtered ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false, quant_fwht: true,
+            boundary_layers: 0, givens_cos: Some(s1), givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
     /// Same as [`new_gpu_asym4`] with an explicit physical_cap. Eviction-aware.
     pub fn new_gpu_asym4_capped(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize,

@@ -259,9 +259,9 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Fwht4 => KvCache::new_gpu_fwht4(
+            KvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
