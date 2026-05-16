@@ -3871,6 +3871,132 @@ impl KvCache {
             layer_is_boundary: vec![], compact_offset: 0,
         })
     }
+
+    // ── fwht multi-GPU constructors ──────────────────────────────────
+    // Mirror the asym{4,3,2}_multi shape. Per-device signs1/signs2
+    // replicated via replicate_fwht_signs_to_all_devices. The KvCache
+    // struct keeps givens_cos/sin = None in multi mode (per-device slots
+    // live on the Gpus struct); `quant_fwht: true` tells the dispatcher
+    // to read from gpus.givens_cos_per_dev / .givens_sin_per_dev as
+    // signs1/signs2 instead of cos/sin.
+
+    pub fn new_gpu_fwht4_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht4_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_fwht4_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "fwht4 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        replicate_fwht_signs_to_all_devices(gpus, 128)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false, quant_fwht: true,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
+
+    pub fn new_gpu_fwht3_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht3_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_fwht3_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 256, "fwht3 currently requires head_dim=256 (Qwen 3.5)");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        // fwht_shfl_forward_256 needs 256-element signs1/signs2.
+        replicate_fwht_signs_to_all_devices(gpus, 256)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false, quant_fwht: true,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
+
+    pub fn new_gpu_fwht2_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht2_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_fwht2_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "fwht2 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        replicate_fwht_signs_to_all_devices(gpus, 128)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true, quant_fwht: true,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
 }
 
 // ── Stage 5 helpers: per-device KV alloc + givens replication ────────
@@ -3944,6 +4070,42 @@ fn replicate_givens_to_all_devices(
         g.hip.memcpy_htod(&st.buf, &sb)?;
         gpus.givens_cos_per_dev.push(ct);
         gpus.givens_sin_per_dev.push(st);
+    }
+    Ok(())
+}
+
+/// Multi-device replication of signed-FWHT sign vectors. Mirrors
+/// `replicate_givens_to_all_devices` but uses gen_fwht_signs (seeds
+/// 42/1042, matching the single-GPU `new_gpu_fwht*_filtered` ctors and
+/// the MQ4 weight-FWHT convention). signs1/signs2 occupy the same
+/// per-device slots as cos/sin — dispatcher branches on `quant_fwht`
+/// to pick the kernel signature.
+fn replicate_fwht_signs_to_all_devices(
+    gpus: &mut Gpus,
+    n_signs: usize,
+) -> HipResult<()> {
+    let s1_vals = KvCache::gen_fwht_signs(42, n_signs);
+    let s2_vals = KvCache::gen_fwht_signs(1042, n_signs);
+    let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+    let prev_cos = std::mem::take(&mut gpus.givens_cos_per_dev);
+    let prev_sin = std::mem::take(&mut gpus.givens_sin_per_dev);
+    for (i, t) in prev_cos.into_iter().enumerate() {
+        if i < gpus.devices.len() { let _ = gpus.devices[i].free_tensor(t); }
+    }
+    for (i, t) in prev_sin.into_iter().enumerate() {
+        if i < gpus.devices.len() { let _ = gpus.devices[i].free_tensor(t); }
+    }
+
+    for dev_idx in 0..gpus.devices.len() {
+        let g = &mut gpus.devices[dev_idx];
+        let s1 = g.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = g.alloc_tensor(&[n_signs], DType::F32)?;
+        g.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        g.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        gpus.givens_cos_per_dev.push(s1);
+        gpus.givens_sin_per_dev.push(s2);
     }
     Ok(())
 }

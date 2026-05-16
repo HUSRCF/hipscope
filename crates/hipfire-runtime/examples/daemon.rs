@@ -1705,13 +1705,16 @@ fn load_model_pp(
 
     let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).map_err(|e| format!("{e}"))?;
 
-    // KV cache (asym3 default, q8/asym4/asym2 selectable). physical_cap ==
-    // max_seq on this path — eviction is refused at load.
+    // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
+    // physical_cap == max_seq on this path — eviction is refused at load.
     let kv = match kv_mode.as_str() {
         "q8" => llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
             llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
