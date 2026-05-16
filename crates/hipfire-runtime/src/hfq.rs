@@ -396,6 +396,14 @@ impl HfqFile {
             .find(|t| t.quant_type == qt)
             .map(|t| t.name.as_str())
     }
+
+    /// All tensors in index order. For tools that scan the file (e.g.
+    /// dump_norms, quant_quality_mse, compare_hfq) — the engine itself
+    /// looks tensors up by name via `find_tensor_info` /
+    /// `tensor_data_vec`.
+    pub fn tensors(&self) -> &[HfqTensorInfo] {
+        &self.tensors
+    }
 }
 
 // ─── Config from HFQ metadata ───────────────────────────────────────────────

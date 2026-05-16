@@ -302,3 +302,10 @@ required-features = []
 [[example]]
 name = "eval_gguf"
 required-features = []
+
+# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
+# llama-imatrix for the activation-weighted-LS calibration pipeline.
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "imatrix_collect"
+required-features = []
