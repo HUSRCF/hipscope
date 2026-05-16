@@ -205,40 +205,50 @@ impl ModelSlot {
         })?;
         let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
 
-        let n_kv_layers = config
+        // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
+        // FullAttention out of 64 total), only the FullAttention layers need
+        // a KV cache slot. The LinearAttention layers carry their own state
+        // via DeltaNetState (`new_with_quant` below) and never write to
+        // kv_cache.k_gpu / .v_gpu. Pre-2026-05-15 the KV constructor
+        // allocated full K/V slots for ALL layers regardless of type — at
+        // ctx=64K that's ~5 GB of dead allocation on 27B. The `_filtered`
+        // constructors take a `is_kv_layer` slice and substitute a
+        // 1-element placeholder for non-KV layers. Indexing by absolute
+        // layer_idx is preserved.
+        let is_kv_layer: Vec<bool> = config
             .layer_types
             .iter()
-            .filter(|t| **t == qwen35::LayerType::FullAttention)
-            .count();
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
 
         // Honor the caller's requested KV cache mode. Default is Q8 for
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
         // longer contexts — asym3/asym4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
-            KvMode::Q8 => KvCache::new_gpu_q8(
+            KvMode::Q8 => KvCache::new_gpu_q8_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym4 => KvCache::new_gpu_asym4(
+            KvMode::Asym4 => KvCache::new_gpu_asym4_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym3 => KvCache::new_gpu_asym3(
+            KvMode::Asym3 => KvCache::new_gpu_asym3_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym2 => KvCache::new_gpu_asym2(
+            KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
@@ -2478,7 +2488,10 @@ pub fn spec_step_dflash(
     // ACTUAL GPU completion (not CPU enqueue of async work). Perf-heavy —
     // use only for diagnostics. When disabled, zero cost beyond a handful
     // of Instant::now() calls.
-    let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
+    static PHASE_ON_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let phase_on = *PHASE_ON_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1")
+    });
     if phase_on {
         gpu.hip.device_synchronize()?;
     }
@@ -2506,8 +2519,11 @@ pub fn spec_step_dflash(
     // production-path defense in daemon/run/infer for the AR sampler.
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
-    let ngram_block_active = !use_temp_sampling
-        && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
+    static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ngram_block_env = *NGRAM_BLOCK_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1")
+    });
+    let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
 
     if let Some(pld) = pld_spine {
