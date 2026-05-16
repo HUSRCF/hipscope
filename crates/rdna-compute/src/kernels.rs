@@ -1099,6 +1099,23 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
+// Signed-FWHT K-write + FA tile variants — same byte layout as asym family,
+// rotation primitive swapped from Givens (per-quad cos/sin) to signed-FWHT
+// (128-wide butterfly via ds_swizzle_b32). Q is forward-rotated by the same
+// signed-FWHT in the FA path; K cache is byte-identical to asym4.
+pub const KV_CACHE_WRITE_ASYM_K_FWHT4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4_batched.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht4_tile.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht4_tile_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT3_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht3.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht3_batched.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht2.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht2_batched.hip");
+pub const ATTENTION_FLASH_FWHT2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht2_tile.hip");
+pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht2_tile_batched.hip");
+
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
 

@@ -19,6 +19,24 @@ pub enum LayerType {
     FullAttention,    // Standard MHA with gated output
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum F16LmHeadMode {
+    Native,
+    F32,
+}
+
+fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => F16LmHeadMode::F32,
+        _ => F16LmHeadMode::Native,
+    }
+}
+
+fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
+    let value = std::env::var("HIPFIRE_LM_HEAD_F16").ok();
+    parse_f16_lm_head_mode(value.as_deref())
+}
+
 /// Optional tree-attention context for `forward_prefill_batch` — activates
 /// DDTree batched verify when `Some`.
 ///
@@ -793,16 +811,27 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
         }
-        1 => {
-            let f32_data: Vec<f32> = data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
-        }
+        1 => match f16_lm_head_mode_from_env() {
+            F16LmHeadMode::Native => {
+                // qt=1 is F16. Keep raw F16 on GPU (previously decompressed
+                // host-side to F32). Native F16 storage halves the lm_head
+                // bandwidth and lets the dispatch path hit the WMMA-backed
+                // `gemm_f16_batched_lmhead` kernel on gfx11. Set
+                // HIPFIRE_LM_HEAD_F16=f32 to force the legacy F32 expansion.
+                let buf = gpu.upload_raw(data, &[data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
+            }
+            F16LmHeadMode::F32 => {
+                let f32_data: Vec<f32> = data.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
+            }
+        },
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -5009,27 +5038,51 @@ fn forward_prefill_chunk(
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym4_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht4_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym4_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym3_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht3_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym3_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym2_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht2_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym2_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
@@ -5059,23 +5112,43 @@ fn forward_prefill_chunk(
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym4_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht4_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym4_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym3_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht3_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym3_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     assert!(
                         tree_verify.is_none(),
@@ -5083,12 +5156,21 @@ fn forward_prefill_chunk(
                     );
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym2_batched(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht2_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym2_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        )?;
+                    }
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),
@@ -5631,27 +5713,51 @@ fn forward_prefill_chunk(
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym4_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht4_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym4_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym3_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht3_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym3_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.kv_cache_write_asym2_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht2_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym2_batched(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                            ct, st, config.n_kv_heads, config.head_dim, n,
+                        )?;
+                    }
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
@@ -5671,23 +5777,43 @@ fn forward_prefill_chunk(
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym4_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht4_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym4_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym3_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht3_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym3_batched_masked(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                            tree_bias, block_start, block_cols,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     assert!(
                         tree_verify.is_none(),
@@ -5695,12 +5821,21 @@ fn forward_prefill_chunk(
                     );
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
-                    gpu.attention_flash_asym2_batched(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.attention_flash_fwht2_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.attention_flash_asym2_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        )?;
+                    }
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),
@@ -5924,27 +6059,51 @@ fn run_fa_layer_body(
     } else if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-        gpu.attention_flash_asym3(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-            &s.flash_partials,
-        )?;
+        if kv_cache.quant_fwht {
+            gpu.kv_cache_write_fwht3_fused(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            gpu.attention_flash_fwht3(
+                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        } else {
+            gpu.kv_cache_write_asym3_fused(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            gpu.attention_flash_asym3(
+                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        }
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym2_fused(
-            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-        gpu.attention_flash_asym2(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-            &s.flash_partials,
-        )?;
+        if kv_cache.quant_fwht {
+            gpu.kv_cache_write_fwht2_fused(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            gpu.attention_flash_fwht2(
+                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        } else {
+            gpu.kv_cache_write_asym2_fused(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            gpu.attention_flash_asym2(
+                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        }
     } else if kv_cache.quant_q8 {
         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -6454,39 +6613,75 @@ fn forward_scratch_layers(
                 if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym4(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht4_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht4(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym4_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym4(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym3(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht3_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht3(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym3_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym3(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym2(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht2_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht2(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym2_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym2(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -6809,39 +7004,75 @@ fn forward_scratch_layers(
                 if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym4(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht4_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht4(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym4_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym4(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym3(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht3_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht3(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym3_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym3(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                    gpu.attention_flash_asym2(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                        &s.flash_partials,
-                    )?;
+                    if kv_cache.quant_fwht {
+                        gpu.kv_cache_write_fwht2_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_fwht2(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    } else {
+                        gpu.kv_cache_write_asym2_fused(
+                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        gpu.attention_flash_asym2(
+                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.flash_partials,
+                        )?;
+                    }
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -7144,37 +7375,73 @@ fn forward_scratch_layers_multi(
 
                     if kv_cache.quant_asym4 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym4_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym4(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht4_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht4(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym4_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym4(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym3_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym3(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht3_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht3(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym3_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym3(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym2_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym2(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht2_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht2(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym2_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym2(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -7389,37 +7656,73 @@ fn forward_scratch_layers_multi(
 
                     if kv_cache.quant_asym4 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym4_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym4(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht4_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht4(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym4_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym4(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym3_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym3(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht3_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht3(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym3_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym3(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!(); let st = st!();
-                        gpu.kv_cache_write_asym2_fused(
-                            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
-                        gpu.attention_flash_asym2(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
+                        if kv_cache.quant_fwht {
+                            gpu.kv_cache_write_fwht2_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_fwht2(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        } else {
+                            gpu.kv_cache_write_asym2_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_flash_asym2(
+                                &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                                config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -7792,4 +8095,31 @@ pub fn forward_with_embedding(
 ) -> HipResult<Vec<f32>> {
     let x = gpu.upload_f32(embedding_data, &[config.dim])?;
     forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_lm_head_mode_defaults_to_native() {
+        assert_eq!(parse_f16_lm_head_mode(None), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("auto")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("1")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("native")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("f16")), F16LmHeadMode::Native);
+    }
+
+    #[test]
+    fn f16_lm_head_mode_allows_legacy_f32() {
+        assert_eq!(parse_f16_lm_head_mode(Some("0")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("f32")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("fp32")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("legacy")), F16LmHeadMode::F32);
+    }
+
+    #[test]
+    fn f16_lm_head_mode_unknown_falls_back_to_native() {
+        assert_eq!(parse_f16_lm_head_mode(Some("surprise")), F16LmHeadMode::Native);
+    }
 }

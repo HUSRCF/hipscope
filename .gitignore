@@ -36,6 +36,10 @@ kernels/compiled/
 .serena/
 .remember/
 .codex
+
+# Local secrets (lmx api key, etc.) — never commit
+.env
+.env.*
 docs/superpowers/
 .worktrees/
 .dflash-reference/

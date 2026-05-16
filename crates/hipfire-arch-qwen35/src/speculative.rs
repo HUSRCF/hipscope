@@ -145,6 +145,23 @@ pub enum KvMode {
     Asym3,
     /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
     Asym2,
+    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V. Byte-identical storage to
+    /// Asym4 but with a Hadamard rotation (matches MQ4's weight-quant trick).
+    /// Centroid LUTs were always Lloyd-Max-fit for post-FWHT N(0, 1/128) per
+    /// turbo_common.h:13 — Fwht4 finally uses them on the distribution they
+    /// were calibrated for. Opt-in via `--kv-mode fwht4`.
+    Fwht4,
+    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Byte-identical storage to
+    /// Asym3 (the canonical default). Single-pass 256-element FWHT — the
+    /// natural fit for asym3's existing layout (8 dims/thread). Empirical
+    /// prose-τ win on 3.5-27b at the 4-bit tier suggests the 3-bit tier
+    /// should benefit even more from rotation. Opt-in via `--kv-mode fwht3`.
+    Fwht3,
+    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. Byte-identical storage
+    /// to Asym2. 2-pass-over-128 structure matches fwht4. Highest theoretical
+    /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
+    /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
+    Fwht2,
 }
 
 impl Default for KvMode {
@@ -247,6 +264,27 @@ impl ModelSlot {
                 slot_config.max_seq,
             )?,
             KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
