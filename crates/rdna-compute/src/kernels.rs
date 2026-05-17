@@ -331,6 +331,16 @@ pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g2
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
+/// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
+/// when the upcoming linear carries an `awq_scale` sidecar. Math:
+/// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
+pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
+/// for the down_proj / w_down input stage. Dispatched when down_proj
+/// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE
+/// signs1 gather and FWHT.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
