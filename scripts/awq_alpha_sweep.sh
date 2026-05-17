@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# awq_alpha_sweep.sh — F1 AWQ alpha grid-search for Qwen3.5-9B MQ4 on gfx906.
+# awq_alpha_sweep.sh — AWQ alpha grid-search for Qwen3.5-9B MQ4 on gfx906.
 #
 # Per docs/plans/qwen35-mq4-quality-gap.md §F1. For each alpha:
 #   1. Delete prior AWQ quant (space-bounded — single slot)
@@ -30,18 +30,18 @@ QUANT_BIN=target/release/hipfire-quantize
 EVAL_BIN=target/release/examples/eval_hipfire
 
 QUANT_SLOT=/local/hipfire/qwen3.5-9b.mq4-awq-current
-RESULTS_DIR=benchmarks/quality-baselines/results/$RESULTS_LABEL
-mkdir -p "$RESULTS_DIR/per-variant"
-SUMMARY="$RESULTS_DIR/summary.tsv"
-if [ ! -f "$SUMMARY" ]; then
-    printf "alpha\tquantize_sec\teval_sec\tkldseq_path\n" > "$SUMMARY"
-fi
 
 # ── sweep params ──────────────────────────────────────────────────────
 MAX_CHUNKS=${MAX_CHUNKS:-50}
 KV_MODE=${KV_MODE:-asym3}
 SCORING=${SCORING:-prefill}
 RESULTS_LABEL=${RESULTS_LABEL:-2026-05-14-awq-alpha-sweep-9b-gfx906}
+RESULTS_DIR=benchmarks/quality-baselines/results/$RESULTS_LABEL
+mkdir -p "$RESULTS_DIR/per-variant"
+SUMMARY="$RESULTS_DIR/summary.tsv"
+if [ ! -f "$SUMMARY" ]; then
+    printf "alpha\tquantize_sec\teval_sec\tkldseq_path\n" > "$SUMMARY"
+fi
 
 # ── pre-flight ────────────────────────────────────────────────────────
 for f in "$BF16_DIR" "$IMATRIX" "$KLDREF" "$QUANT_BIN" "$EVAL_BIN"; do
@@ -107,7 +107,7 @@ for ALPHA in "$@"; do
         exit 1
     fi
     AWQ_SIDECAR_COUNT=$(grep -c "^    AWQ:    " "$QUANT_LOG")
-    echo "  self-check OK: AWQ sidecars=$AWQ_SIDECAR_COUNT (expect 184 for 9B), conv1d=Q8, imatrix loaded"
+    echo "  self-check OK: AWQ sidecars=$AWQ_SIDECAR_COUNT (expect 248 for 9B F2; 184 with HIPFIRE_AWQ_F1_ONLY=1), conv1d=Q8, imatrix loaded"
 
     # 3. Eval
     echo "  eval (n=$MAX_CHUNKS, kv=$KV_MODE, $SCORING)"

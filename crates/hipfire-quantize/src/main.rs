@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
-// 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.5]), each linear-layer
+// 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
 // weight gets per-input-channel pre-scaling applied BEFORE the standard
 // quantize+rotation path:
 //
@@ -52,8 +52,8 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 //     (g=16 NVFP4, g=32 MXFP4), "outlier mitigation is provably neutralized".
 //     This applies to MFP4G32 but NOT to MQ4G256 — AWQ should work on MQ4.
 //
-// Default alpha = 0.5 (AWQ paper's grid-search center). --awq alone enables
-// AWQ at alpha=0.5; --awq <value> sets explicit alpha. Alpha=0 disables;
+// Default alpha = 0.55 (hipfire F2 sweep winner). --awq alone enables
+// AWQ at alpha=0.55; --awq <value> sets explicit alpha. Alpha=0 disables;
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
@@ -3230,7 +3230,7 @@ fn main() {
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
-    // --awq           → enable AWQ at default alpha=0.5
+    // --awq           → enable AWQ at default alpha=0.55
     // --awq-alpha <f> → enable AWQ at explicit alpha (overrides default)
     // Requires --imatrix (we derive RMS_act from imatrix's in_sum2 values).
     // Per-channel scaling: W' = W · diag(s) at quantize time, sidecar
@@ -3250,7 +3250,7 @@ fn main() {
     let awq_alpha = args.iter().position(|a| a == "--awq-alpha")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(0.5);
+        .unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
             eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");

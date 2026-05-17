@@ -9,7 +9,7 @@
 #   (1) 9B  α=0.5  — anchor (AWQ-paper default)
 #   (2) 9B  α=0.6  — top KLD candidate from screening
 #   (3) 0.8B α=0.0 — mq4-base baseline (AWQ identity)
-#   (4) 0.8B α=0.5 — same alpha shipped
+#   (4) 0.8B α=0.55 — same alpha shipped
 #
 # (3) vs (4) discriminates size/bpw floor (both incoherent) from
 # AWQ-specific corruption at small models (only (4) incoherent).
@@ -133,9 +133,9 @@ echo "(3) 0.8B α=0.0 — mq4-base baseline (no AWQ)"
 quantize_08b 0.0
 run_variant "0.8b-a0_0-mq4base" "$QUANT_SLOT_08B"
 
-echo "(4) 0.8B α=0.5 — AWQ shipped default"
-quantize_08b 0.5
-run_variant "0.8b-a0_5-awq" "$QUANT_SLOT_08B"
+echo "(4) 0.8B α=0.55 — AWQ shipped default"
+quantize_08b 0.55
+run_variant "0.8b-a0_55-awq" "$QUANT_SLOT_08B"
 
 echo ""
 echo "==== DONE ===="

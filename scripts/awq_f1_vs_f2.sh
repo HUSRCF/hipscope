@@ -20,7 +20,7 @@ QUANT_BIN=target/release/hipfire-quantize
 EVAL_BIN=target/release/examples/eval_hipfire
 QUANT_SLOT=/local/hipfire/qwen3.5-9b.mq4-awq-current
 
-ALPHA=${ALPHA:-0.5}
+ALPHA=${ALPHA:-0.55}
 MAX_CHUNKS=${MAX_CHUNKS:-256}
 KV_MODE=${KV_MODE:-q8}
 SCORING=${SCORING:-prefill}
