@@ -4,6 +4,7 @@
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                               weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
+                              fused_rmsnorm_rotate_mq_batched_for,
                               weight_gemv_residual, weight_gemv_swiglu_residual};
 use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
@@ -746,51 +747,51 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
     match quant_type {
         6 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, awq_scale: None })
         }
         7 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, awq_scale: None })
         }
         8 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0, awq_scale: None })
         }
         11 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0, awq_scale: None })
         }
         12 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0, awq_scale: None })
         }
         13 => { // MQ4-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, awq_scale: None })
         }
         14 => { // MQ8-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0, awq_scale: None })
         }
         15 => { // MQ6-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0, awq_scale: None })
         }
         17 => { // MQ3-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, awq_scale: None })
         }
         18 => { // MQ2-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0, awq_scale: None })
         }
         19 => { // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook (72 bytes/group)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256Lloyd, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256Lloyd, m, k, row_stride: 0, awq_scale: None })
         }
         20 => { // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook (112 bytes/group)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0, awq_scale: None })
         }
         21 => { // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale. See docs/quant-formats/hfp4.md.
                 // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs); refuse here so a
@@ -798,17 +799,17 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
                 // first dispatch.
             assert!(k % 256 == 0, "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0");
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0, awq_scale: None })
         }
         24 => { // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
                 // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
             assert!(k % 256 == 0, "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0");
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0, awq_scale: None })
         }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
         }
         1 => match f16_lm_head_mode_from_env() {
             F16LmHeadMode::Native => {
@@ -818,7 +819,7 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
                 // `gemm_f16_batched_lmhead` kernel on gfx11. Set
                 // HIPFIRE_LM_HEAD_F16=f32 to force the legacy F32 expansion.
                 let buf = gpu.upload_raw(data, &[data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
             }
             F16LmHeadMode::F32 => {
                 let f32_data: Vec<f32> = data.chunks_exact(2)
@@ -828,11 +829,57 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[m, k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
             }
         },
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
+}
+
+/// Phase A Stage A — AWQ sidecar loader for the Qwen3.5 forward path.
+///
+/// The .hfq quantizer emits `<weight>.awq_scale.weight` (1D F16, length K)
+/// alongside MQ4G256 weights that were AWQ pre-scaled. The dispatcher in
+/// `fused_rmsnorm_rotate_for_mq` / `fused_rmsnorm_rotate_mq_batched_for`
+/// looks at `WeightTensor.awq_scale.is_some()` to pick the AWQ-aware
+/// kernel variant. WITHOUT this loader populating the field, every MQ4
+/// weight ends up with `awq_scale: None`, the dispatcher falls through
+/// to the non-AWQ kernel, and the math `(W·s) · (x/s) = W·x` breaks
+/// because the runtime never divides by `s` — observed KLD blowup
+/// 0.6721 → 13.4893 on 0.8B Qwen3.5 before this landed.
+///
+/// Lookup pattern matches `hipfire_runtime::hfq::load_awq_scale`:
+/// strip trailing `.weight`, append `.awq_scale.weight`. Try both the
+/// `model.language_model.`-prefixed name and the bare name (the qwen35
+/// crate uses prefixed names; older sidecars or tests may use either).
+fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let sidecar_name = match name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{name}.awq_scale.weight"),
+    };
+    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
+    // Must be 1D F16, length K. quant_type 1 = F16.
+    if sc_info.quant_type != 1 {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+            sc_info.quant_type
+        );
+        return None;
+    }
+    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape, k
+        );
+        return None;
+    }
+    // F16 → F32 on host so the kernel takes a plain `const float*`.
+    let f32_data: Vec<f32> = sc_data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
@@ -840,20 +887,37 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
     // Use pread path to avoid page cache buildup on unified-memory APUs.
     #[cfg(unix)]
     {
-        if let Some((info, buf)) = hfq.tensor_data_pread(&full_name)
-            .or_else(|| hfq.tensor_data_pread(name))
-        {
+        let mut wt = if let Some((info, buf)) = hfq.tensor_data_pread(&full_name) {
             let qt = info.quant_type;
-            return load_weight_tensor_raw(gpu, qt, &buf, m, k);
+            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
+        } else if let Some((info, buf)) = hfq.tensor_data_pread(name) {
+            let qt = info.quant_type;
+            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
+        } else {
+            panic!("tensor not found: {name} or {full_name}");
+        };
+        // Phase A Stage A — populate awq_scale for MQ4G256 weights when
+        // a sidecar is present. The pread call invalidates the prior
+        // pread_buf borrow, but the weight bytes have already been
+        // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
+        // matters.
+        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
-        panic!("tensor not found: {name} or {full_name}");
+        return Ok(wt);
     }
     #[cfg(not(unix))]
     {
         let (info, data) = hfq.tensor_data(&full_name)
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-        load_weight_tensor_raw(gpu, info.quant_type, data, m, k)
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+        }
+        Ok(wt)
     }
 }
 
@@ -1321,16 +1385,16 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
             let dtype = match embd_qt {
                 6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256, _ => unreachable!()
             };
-            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_qt == 13 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_qt == 14 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_qt == 3 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else {
             let f32_data: Vec<f32> = tied_data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -1339,7 +1403,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
 
@@ -1556,16 +1620,16 @@ fn load_output_into(
                 8 => DType::HFQ6G256,
                 _ => unreachable!(),
             };
-            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_info.0.quant_type == 13 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_info.0.quant_type == 14 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else if embd_info.0.quant_type == 3 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         } else {
             let f32_data: Vec<f32> = embd_data
                 .chunks_exact(2)
@@ -1575,7 +1639,7 @@ fn load_output_into(
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
     Ok((output_norm, output))
@@ -4038,8 +4102,12 @@ fn prefill_moe_ffn_body_batched(
     let rot_batch     = pbs.moe_rot_batch.as_ref().expect("moe scratch");
 
     // ── 1. rmsnorm + FWHT pre-rotate for MQ4 inputs ──
-    gpu.fused_rmsnorm_rotate_mq_batched(
-        &pbs.x_batch, ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+    // AWQ-aware: dispatches the _awq_batched kernel if ffn.router carries
+    // an awq_scale sidecar (Phase A Stage A — Q/router/shared all share
+    // the same input rmsnorm output, so any of their AWQ scales is
+    // mathematically equivalent; pick router as canonical).
+    fused_rmsnorm_rotate_mq_batched_for(
+        gpu, &pbs.x_batch, ffn_norm, &ffn.router, &pbs.x_rot_batch, dim, config.norm_eps, n,
     )?;
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
@@ -4370,8 +4438,9 @@ fn forward_prefill_chunk(
                 // we reuse x_rot_batch as the "normed, unrotated" output
                 // so the subsequent GEMM can read it the same way.
                 if is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is LA's fused wqkv.
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -4637,8 +4706,9 @@ fn forward_prefill_chunk(
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 if ffn_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -4800,8 +4870,9 @@ fn forward_prefill_chunk(
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5213,8 +5284,9 @@ fn forward_prefill_chunk(
                 let fa_ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 if fa_ffn_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5387,8 +5459,9 @@ fn forward_prefill_chunk(
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
                 if is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is LA's fused wqkv.
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5552,8 +5625,9 @@ fn forward_prefill_chunk(
                                   && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
                 if qkv_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
