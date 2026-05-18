@@ -52,10 +52,36 @@ faithfulness metric here.
 
 ## 9B (qwen3.5-9b)
 
-See [`qwen35-mq4-quality-gap.md`](qwen35-mq4-quality-gap.md) — that doc holds
-the live 9B catalog (kv-mode ablations, lm_head variants, MQ3-Lloyd, MFP4G32,
-etc.). It pre-dates this master and is the canonical 9B reference for now;
-fold here when convenient.
+BF16 ref: `qwen3.5-9b-bf16.kldref.bin` (sha256 `06948cd3…`, produced on
+gfx1151 2026-05-08, uploaded to `hipfire-models/qwen-kldref`).
+
+### MQ3 cohort (gfx1151)
+
+| Variant | Arch | Mode | n_chunks | Mean KLD ± 95% CI | p99 KLD | PPL | Notes |
+|---|---|---|---:|---|---:|---:|---|
+| mq3-rtn-kvq8-c256 | gfx1151 | prefill | 256 | 0.5449 (CI 0.532–0.559) | 16.927 | 13.45 | 2026-05-18; **no AWQ, no GPTQ** — naked MQ3 RTN baseline |
+| mq3-awq-gptq-kvq8-c256 | gfx1151 | prefill | 256 | 0.1967 (CI 0.189–0.205) | 9.705 | 11.65 | 2026-05-18; AWQ + GPTQ at 3-bit |
+
+**AWQ+GPTQ Δ at 3-bit (identical kv-q8, body otherwise matched):**
+mean KLD **−64% / 2.77×** (0.5449 → 0.1967). CIs nowhere near overlap
+(rtn lower bound 0.532 vs awq-gptq upper 0.205). p99 KLD −43%
+(16.927 → 9.705) — AWQ's outlier-preserving design pays off in the tail
+at low bit-widths. PPL −13% (13.45 → 11.65); unlike the 27B MQ4 cohort,
+AWQ+GPTQ wins on both KLD and PPL here. 3-bit is far enough into the
+lossy regime that AWQ+GPTQ helps even the next-token-loss metric.
+
+**Tightening vs prior n=20 asym3 smoke** (from `2026-05-15-mq3-awq-uplift/`):
+CIs shrank ≈3.6× as expected from √(256/20). mq3-awq-gptq centre moved
+from 0.189 → 0.197 (+4%, within original CI); rtn from 0.569 → 0.545
+(−4%, within original CI). The qualitative gap held; n=20 wasn't lying
+about the direction, only about the precision.
+
+### Other 9B variants
+
+See [`qwen35-mq4-quality-gap.md`](qwen35-mq4-quality-gap.md) for the
+pre-existing 9B catalog (MQ4 kv-mode ablations, Q8 lm_head variants,
+MQ3-Lloyd, MFP4G32, etc.). That doc pre-dates this master and is still
+the canonical reference for non-MQ3 9B rows; fold here when convenient.
 
 ---
 
