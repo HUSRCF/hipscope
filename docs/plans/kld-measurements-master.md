@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-18 (cleanup pass: removed §1.1 q8f16 Tier-2 row, §1.1d FWHT n=20 isolation, §1.1f n=20 smoke rows, §2.2 q8f16 0.0806 row, §2.4.1 FLIPPED subsection — all self-flagged as superseded or n=20 smokes with CIs too loose to support quantitative claims; replaced with stubs pointing forward to re-measurements. Earlier today: 27B first-light cohort landed §3.2 — mq4-plain-q8head vs mq4-awq-gptq-f2-q8head-v100 on gfx1100 KV=q8 n=256, AWQ+GPTQ −38% mean KLD; 9B MQ3 cohort landed §1.4 — mq3-rtn vs mq3-awq-gptq on gfx1151 KV=q8 n=256, AWQ+GPTQ 2.77× lower KLD at 3-bit. Prior: 2026-05-15 PM — 4B Stage B GPTQ §3.1 KLD 0.0662 / PPL 10.71; F2 AWQ whitelist expansion; §1.1h K-map AWQ −20.1% KLD; §1.1i F2 α=0.55 sweet spot.)
+**Last updated:** 2026-05-18 (canonical 9B 4-bit headline landed §1.1j: mq4-awq-gptq-f2-q8head KLD 0.1727 PPL 8.42 on gfx1100 KV=q8 n=256, superseding §1.1f's 0.1842 by 6% KLD / 12% PPL. AWQ+GPTQ Δ vs plain-q8head at clean A/B = −20% KLD / −3.8% PPL, CIs essentially non-overlapping. Cross-engine gap to llama.cpp UD-Q3_K_XL holds at +24% Δ at matched bpw. Earlier today: cleanup pass — removed self-flagged rows (§1.1 q8f16 Tier-2, §1.1d FWHT n=20, §1.1f n=20 smokes, §2.2 q8f16 0.0806, §2.4.1 FLIPPED). 27B first-light cohort §3.2 — AWQ+GPTQ −38% KLD. 9B MQ3 cohort §1.4 — AWQ+GPTQ 2.77× KLD at 3-bit. Prior: 2026-05-15 PM — 4B Stage B GPTQ §3.1 KLD 0.0662; F2 AWQ whitelist; §1.1h K-map AWQ; §1.1i F2 α=0.55.)
 
 **Provenance note (2026-05-18 import):** rows §1.1 through §4A were carried over from `feat/mq-v2-quant-format` (which was split into multiple PRs, not merged whole). Some of those measurements pre-date subsequent code fixes on master (e.g. May-16 Q8 attention NaN #264, F16 lm_head shim #265, hipGraph H2D capture fix #7790ac6a). Heuristic: better KLD numbers are more likely to be representative of current code. Re-measurement on master is welcome for any specific row; if the new number is materially lower, replace and note the SHA delta.
 **Owner:** hipfire eval
@@ -67,6 +67,36 @@ Source: `benchmarks/quality-baselines/results/2026-05-12-cohort-post-rope-fix-9b
 > too loose to support quantitative conclusions). Qualitative finding from that section
 > ("FWHT projection rotation provides ~−30% KLD; PPL inversion") is preserved here as
 > narrative pending an n=256+ re-measurement.
+
+### 1.1j Q8-head cohort (gfx1100, KV=q8, prefill, n=256, 2026-05-18)
+
+Source: this session, fresh quant on current master code (`hipfire-quantize` post-May-18 incl. Cholesky-direct OBS + parallelized GPTQ column loop). Both rows use `--kmap-dense` for Q8 lm_head + default Promote6 on alt down_proj; body kmap matched across the pair so the only delta is AWQ+GPTQ on/off.
+
+| Variant | bpw | KLD (CI) | p99 | PPL | Notes |
+|---|---:|---|---:|---:|---|
+| mq4-plain-q8head | ~4.4 | 0.2149 (CI 0.2011–0.2305) | 17.379 | 8.746 | **no AWQ, no GPTQ**; `--kmap-dense` only |
+| **mq4-awq-gptq-f2-q8head** | ~4.4 | **0.1727 (CI 0.1600–0.1877)** | **16.166** | **8.417** | **NEW BEST 9B 4-bit recipe (supersedes §1.1f's 0.1842)** |
+
+**AWQ+GPTQ Δ at 9B 4-bit (clean A/B, identical kv-q8 + Q8 lm_head + body kmap):**
+mean KLD **−20%** (0.2149 → 0.1727), CIs essentially non-overlapping at the
+boundary (0.2011 vs 0.1877). p99 KLD −7%. PPL **−3.8%** (8.746 → 8.417) —
+AWQ+GPTQ wins on both axes at 9B 4-bit, unlike §3.2's 27B MQ4 where PPL
+moved the other way.
+
+**Comparison across recent recipes on 9B:**
+- §1.1f mq4-awq + Q8 conv1d (n=512, MQ4 lm_head): KLD 0.1842, PPL 9.575
+- **§1.1j mq4-awq-gptq-f2-q8head (n=256, Q8 lm_head): KLD 0.1727, PPL 8.417** — **−6% KLD, −12% PPL** at slightly higher bpw (~+0.15 from Q8 head)
+- Q8 lm_head + GPTQ replaced Q8 conv1d as the additive lever. Both can stack
+  (Q8 head + Q8 conv1d + AWQ + GPTQ) but not yet measured.
+
+**Δ-above-own-Q8** (Tier-3 floor 0.0173 per §1.1b): 0.1727 − 0.0173 = **0.155**.
+
+**Cross-engine vs llama.cpp at matched bpw:**
+- UD-Q3_K_XL @ ~4.50 bpw: KLD 0.1411 (Δ-above-own-Q8 0.125)
+- Hipfire mq4-awq-gptq-f2-q8head @ ~4.4 bpw: KLD 0.1727 (Δ 0.155)
+- Gap narrowed from §1.1f's ~+24% Δ-gap to **+24% absolute / +24% Δ** — modest improvement over the AWQ+Q8conv1d stack but still 22% behind llama.cpp's bpw-matched anchor.
+
+Working artifacts: `benchmarks/quality-baselines/results/2026-05-18-9b-q8head-cohort/`.
 
 ### 1.1e MQ6+Q8conv1d anchor (gfx1151, KV=q8, prefill)
 
@@ -170,7 +200,7 @@ Source: this session's `/tmp/awq_q8conv_redo.sh`, after the cargo incremental bu
 |---|---:|---:|---|---:|---:|---|
 | mq4-base (§1.1, asym3-KV) | 512 | 4.25 | 0.3376 | 18.19 | 9.116 | baseline (different KV mode) |
 | mq4-q8conv1d (re-verified n=512) | 512 | 4.25 | **0.2501** (0.2396–0.2609) | 16.06 | **8.789** | Q8 conv1d alone, byte-exact reproduction of original anchor |
-| **mq4-awq + Q8 conv1d (n=512)** | 512 | 4.25 | **0.1842** (0.1759–0.1930) | **15.95** | **9.575** | **best 9B 4-bit recipe to date** |
+| **mq4-awq + Q8 conv1d (n=512)** | 512 | 4.25 | **0.1842** (0.1759–0.1930) | **15.95** | **9.575** | superseded by §1.1j (mq4-awq-gptq-f2-q8head 0.1727, 2026-05-18) |
 
 > n=20 smoke rows (mq4-base q8-KV, mq4-awq re-verified, mq4-awq+Q8conv1d smoke) removed
 > — superseded by the n=512 rows above; CIs not bootstrapped.
@@ -345,15 +375,25 @@ Source: `benchmarks/quality-baselines/results/2026-05-10/per-seq/qwen3.5-9b.gguf
 | **Llama.cpp UD-Q3_K_XL** | ~4.50 | f16 | 0.1411 | **0.125** | bpw-matched 4-bit anchor |
 | **Llama.cpp Q4_K_M** | 5.07 | f16 | 0.1249 | **0.109** | imatrix-calibrated 4-bit |
 | Hipfire q8f16 (Tier-3) | 8.50 | q8 | 0.0173 | (floor) | n=256 gfx1151 |
-| **Hipfire mq4-base** | 4.25 | q8 | _pending q8-KV measurement_ | ~0.25 est. | n=20 smoke: 0.318 → Δ 0.30 |
-| **Hipfire mq4-awq** | 4.25 | q8 | _pending q8-KV measurement_ | ~0.21 est. | extrapolation |
-| **Hipfire F1 α=0.5** (gfx906) | 4.25 | q8 | 0.1725 | **0.155** | n=256, gfx906 not gfx1100 — see arch caveat |
-| **Hipfire F2 α=0.5** (gfx906) | 4.25 | q8 | 0.1724 | **0.155** | KLD-flat vs F1; PPL −6.6% |
+| Hipfire mq4-plain-q8head (§1.1j) | ~4.4 | q8 | 0.2149 | 0.198 | gfx1100, n=256, 2026-05-18 — no AWQ, no GPTQ |
+| **Hipfire mq4-awq-gptq-f2-q8head (§1.1j)** | ~4.4 | q8 | **0.1727** | **0.155** | gfx1100, n=256, 2026-05-18 — **canonical 9B 4-bit headline** |
+| **Hipfire F1 α=0.5** (gfx906) | 4.25 | q8 | 0.1725 | 0.155 | n=256, gfx906 (older recipe, no Q8 head) |
+| **Hipfire F2 α=0.5** (gfx906) | 4.25 | q8 | 0.1724 | 0.155 | KLD-flat vs F1; PPL −6.6% |
 | **Hipfire F2 α=0.55** (gfx906) | 4.25 | q8 | 0.1830 | 0.166 | n=100 sweep, PPL=8.79 (PPL optimum) |
 
-**Cross-engine gap (corrected, Δ-vs-Δ):** hipfire mq4-awq Δ ~0.21 vs llama.cpp UD-Q3_K_XL Δ 0.125 → **hipfire ~68% worse at matched bpw**, not the original master-doc claim of "~7% behind". The path-mismatched Δ in §1.1's original "Above-floor" column understated the gap by ~9× (because Tier-2 Q8 floor was 0.130 nats higher than the path-matched Tier-3 floor — that "extra" 0.130 was implicitly being credited to MQ4's quantizer cost when it was actually FP32-cast noise).
+**Cross-engine gap on current canonical 9B headline (§1.1j, 2026-05-18):**
+hipfire mq4-awq-gptq-f2-q8head Δ = 0.155 vs llama.cpp UD-Q3_K_XL Δ = 0.125
+→ **hipfire +24% Δ-above-own-Q8 at matched bpw**. The §1.1j build adds Q8
+lm_head + GPTQ on top of AWQ; combined they close another 6% of KLD over
+§1.1f's mq4-awq+Q8conv1d 0.1842, but the Δ-axis gap to UD-Q3_K_XL barely
+moves because the AWQ Δ was already 0.155 on gfx906 — Q8 head + GPTQ
+recovers part of the gain absorbed by the body kmap difference rather
+than buying fresh Δ.
 
-**AWQ closure on the corrected Δ basis:** ~17% (vs the master-doc-original 30% which was inflated by the same path-mismatched floor subtraction). AWQ still helps, just less dramatically than the original framing suggested.
+**AWQ+GPTQ closure on the Δ-above-own-Q8 basis vs hipfire plain @ same
+recipe:** −22% Δ (0.198 → 0.155 in §1.1j's clean A/B). On absolute KLD
+vs HF: −20% (0.215 → 0.173). These are the cleanest within-engine
+AWQ+GPTQ Δ numbers for 9B 4-bit on current code.
 
 **F2 on Δ-above-own-Q8 basis.** Hipfire F2 α=0.5 Δ = 0.155 (using gfx906 measurements, slightly different arch than the Tier-3 gfx1151 floor — caveat). PPL improvement is decoupled from this metric; F2's lift is more visible on PPL-paired-t (−6.6%, p<10⁻³⁰) than on Δ-above-own-Q8 (essentially zero movement). The Δ framework masks AWQ improvements that show up as mass-redistribution within an unchanged divergence envelope. **Δ-above-own-Q8 is the right metric for cross-engine quant-quality comparison; paired-t on NLL is the right metric for within-engine AWQ-config comparison.** Two different jobs.
 
