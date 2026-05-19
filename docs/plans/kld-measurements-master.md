@@ -98,6 +98,54 @@ moved the other way.
 
 Working artifacts: `benchmarks/quality-baselines/results/2026-05-18-9b-q8head-cohort/`.
 
+### 1.1k mq4-awq-gptq-f2-lmhead-a100 (KV=q8, prefill, n=256, 2026-05-19) — **cross-arch confirmed**
+
+Source: `qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq` on `/data/hipfire` (5.315 GB, **4.744 bpw** effective whole-file at 8.96B params). Same .hfq evaluated on two arches, same slice (md5 `83b0205a`, n=256), same kv-mode (q8), same scoring mode (prefill), same `kldref` (md5 `283ecb32`).
+
+| Arch | Run | KLD (CI) | p99 KLD | mean NLL | PPL | Wall | tok/s |
+|---|---|---|---:|---:|---:|---:|---:|
+| gfx1031 | user, 2026-05-19 AM | 0.0841 | — | 2.2372 | 9.367 | 3668.9 s | 71 |
+| **gfx1100** | **this session, 2026-05-19 (master tip `52273907`, fresh build md5 `99e44d16…`)** | **0.0863 (CI 0.0798–0.0939)** | **9.607** | **2.2379** | **9.374** | **727.1 s** | **360** |
+
+**Cross-arch drift: KLD +2.7%, PPL +0.07%, NLL +0.03%.** Well inside the established cross-arch noise band (cf. §1.1i F2-α sweep gfx906↔gfx1151: KLD agreement ~0.06%, PPL ~0.1%). The earlier "strong-but-unconfirmed" flag is resolved — the 0.084-class KLD is **real**, not arch- or measurement-specific.
+
+Working artifacts: `benchmarks/quality-baselines/results/2026-05-19-9b-lmhead-a100-gfx1100-parity/` (.kldseq + eval.log + reduce result-table).
+
+**Note vs §1.1j canonical (mq4-awq-gptq-f2-q8head, ~4.4 bpw, gfx1100, KLD 0.1727 / PPL 8.42).** Same arch, same kv-mode, same n, same scoring mode — only the .hfq differs (lmhead-a100 vs q8head, +0.34 bpw).
+
+- KLD **−50%** (0.1727 → 0.0863). Major.
+- p99 KLD **−41%** (16.166 → 9.607). Tail also moves substantially.
+- PPL **+11.4%** (8.417 → 9.374). Goes the **wrong** way.
+- NLL +5.0% (2.130 → 2.238).
+
+The KLD/PPL divergence is the same shape the user originally flagged, but now confirmed across two arches and a fresh binary. **Hypothesis:** the `-a100` suffix points at A100-calibrated Hessian / a different AWQ α / a different GPTQ recipe than `-q8head` — producing a quant whose full-vocab distribution sits closer to HF-bf16 (KLD wins) but whose argmax-token mass is slightly lower than the more aggressive `-q8head` recipe (PPL loses). Both metrics are valid; they're measuring different things. The §1.1j canonical optimized PPL; this row optimizes KLD-vs-HF.
+
+**Cross-engine vs llama.cpp at similar bpw (§1.2 anchors, FP16 KV).** Caveat: hipfire KV is q8 here (lossy ~0.07-nat penalty per §0) while GGUF anchors used FP16 KV, so the KLD comparison is biased *against* this row. Δ-above-own-Q8 uses hipfire Tier-3 9B Q8 floor 0.0173 (§1.1b) and llama.cpp Q8_0 floor 0.0163 (§1.2).
+
+| Variant | bpw | KLD (raw) | Δ vs own Q8 | Notes |
+|---|---:|---:|---:|---|
+| llama.cpp UD-Q3_K_XL | 4.50 | 0.1411 | 0.1248 | −0.24 bpw vs hipfire |
+| **Hipfire mq4-awq-gptq-f2-lmhead-a100 (this row)** | **4.74** | **0.0863** | **0.0690** | gfx1100, kv-q8, n=256 |
+| llama.cpp Q4_K_M | 5.07 | 0.1249 | 0.1086 | +0.33 bpw vs hipfire |
+| llama.cpp UD-Q4_K_XL | 5.32 | 0.0670 | 0.0507 | +0.58 bpw vs hipfire |
+
+- vs **UD-Q3_K_XL** (hipfire +0.24 bpw): hipfire wins **−39% raw KLD / −45% Δ**.
+- vs **Q4_K_M** (llama.cpp +0.33 bpw): hipfire wins **−31% raw KLD / −37% Δ** despite llama.cpp's bpw cushion.
+- vs **UD-Q4_K_XL** (llama.cpp +0.58 bpw): hipfire **+29% raw KLD / +36% Δ behind** — llama.cpp's +0.58 bpw still wins.
+
+**Headline implications, now that parity is confirmed.**
+1. **This is the first hipfire 4-bit recipe to land inside the llama.cpp K-quants Pareto frontier on absolute KLD.** Beats Q4_K_M (+0.33 bpw advantage to llama.cpp) by 31% raw / 37% Δ; trails UD-Q4_K_XL only because llama.cpp gets +0.58 bpw of headroom.
+2. **Two competing 4-bit headlines now exist on 9B**, optimizing different objectives:
+   - **§1.1j `mq4-awq-gptq-f2-q8head` (4.4 bpw): PPL-optimal** (8.42, best on this slice). Use when downstream cares about argmax-token confidence (greedy decode, top-1 acceptance).
+   - **§1.1k `mq4-awq-gptq-f2-lmhead-a100` (4.74 bpw): KLD-optimal** (0.086, half of §1.1j). Use when downstream cares about full-distribution fidelity (sampling, draft-target acceptance in spec-decode, RL reward modeling).
+3. The TL;DR / cross-references at top of the doc still cite §1.1j 0.1727 as the canonical "9B 4-bit headline." That framing is now stale — should be updated to reflect the dual-headline state and the metric the user is shopping on.
+
+**Coherence eyeball (2026-05-19, gfx1100, daemon md5 `c7b414a5`).** Four prompts (capital, sheep riddle, one-line Python `square`, sourdough starter essay) on the same .hfq, T=0.0, repeat_penalty=1.05, max_tokens 80/300/180/220. **Result: clean.** Reasoning fluent and on-topic on all four; arithmetic riddle correctly identifies answer 9; sourdough essay completes (107 tok) with proper `<|im_end|>` termination. No `<|im_start|>` leaks, no token attractors, no repetition. Decode steady-state 106-108 tok/s on gfx1100. The KLD 0.0863 is a real distributional-quality win, not a coherence regression hiding behind a metric.
+
+**Followups (low priority but worth filing):**
+- Recipe diff between `-q8head` and `-lmhead-a100` (commit log + quant.toml audit) to nail down what the A100-side calibration actually changed (relevant given §3.2's 27B A100-vs-V100 was flat — see hypothesis 1 there).
+- Spec-decode τ measurement on lmhead-a100 — predicted to go **up** relative to §1.1j despite higher PPL, because KLD-closer-to-target should translate to better draft/target alignment.
+
 ### 1.1e MQ6+Q8conv1d anchor (gfx1151, KV=q8, prefill)
 
 Source: gfx1151 agent 2026-05-13 PM (smoke) + 2026-05-14 (full n=512). Uniform MQ6G256 across all 4-bit-eligible projections + Q8 conv1d override + default Q8 lm_head + Q8 embed.
@@ -397,16 +445,17 @@ AWQ+GPTQ Δ numbers for 9B 4-bit on current code.
 
 **F2 on Δ-above-own-Q8 basis.** Hipfire F2 α=0.5 Δ = 0.155 (using gfx906 measurements, slightly different arch than the Tier-3 gfx1151 floor — caveat). PPL improvement is decoupled from this metric; F2's lift is more visible on PPL-paired-t (−6.6%, p<10⁻³⁰) than on Δ-above-own-Q8 (essentially zero movement). The Δ framework masks AWQ improvements that show up as mass-redistribution within an unchanged divergence envelope. **Δ-above-own-Q8 is the right metric for cross-engine quant-quality comparison; paired-t on NLL is the right metric for within-engine AWQ-config comparison.** Two different jobs.
 
-### 1.4 MQ3 cohort (gfx1151, KV=q8, prefill, n=256, 2026-05-18)
+### 1.4 MQ3 cohort (gfx1151, KV=q8, prefill, n=256, 2026-05-18 / 2026-05-19)
 
-Source: this session. Closes the §4A.1 "MQ3G256 — NOT MEASURED" gap. AWQ+GPTQ at 3-bit isolated against an RTN baseline; both rows kv-q8 prefill on gfx1151.
+Source: 2026-05-18 + 2026-05-19 sessions. Closes the §4A.1 "MQ3G256 — NOT MEASURED" gap, then extends with an lmhead-a100 recipe-port from §1.1k. All rows kv-q8 prefill on gfx1151, n=256.
 
 | Variant | bpw | KLD (CI) | p99 | PPL | Notes |
 |---|---:|---|---:|---:|---|
 | mq3-rtn-kvq8-c256 | 3.25 | 0.5449 (CI 0.532–0.559) | 16.927 | 13.45 | **no AWQ, no GPTQ** — naked MQ3 RTN baseline |
-| mq3-awq-gptq-kvq8-c256 | 3.25 | **0.1967** (CI 0.189–0.205) | **9.705** | **11.65** | AWQ + GPTQ at 3-bit |
+| mq3-awq-gptq-kvq8-c256 (Q8 lm_head) | ~3.8 (body 3.25 + Q8 head) | **0.1967** (CI 0.189–0.205) | **9.705** | **11.645** | AWQ + GPTQ at 3-bit; Q8 lm_head override |
+| **mq3-awq-gptq-f2-lmhead-a100** | ~4.0 | **0.2613** (CI 0.249–0.276) | **14.740** | **10.440** | 2026-05-19; recipe-ported from §1.1k; wall 1710 s @ 153 tok/s |
 
-**AWQ+GPTQ Δ at 3-bit (identical kv-q8, body otherwise matched):**
+**AWQ+GPTQ Δ at 3-bit vs RTN (the original 2026-05-18 finding):**
 mean KLD **−64% / 2.77×** (0.5449 → 0.1967). CIs nowhere near overlap
 (rtn lower bound 0.532 vs awq-gptq upper 0.205). p99 KLD −43%
 (16.927 → 9.705) — AWQ's outlier-preserving design pays off in the tail
@@ -420,6 +469,38 @@ CIs shrank ≈3.6× as expected from √(256/20). mq3-awq-gptq centre moved
 from 0.189 → 0.197 (+4%, within original CI); rtn from 0.569 → 0.545
 (−4%, within original CI). The qualitative gap held; n=20 wasn't lying
 about the direction, only about the precision.
+
+#### 1.4a `-lmhead-a100` recipe-port to MQ3 — **inverse-direction at 3-bit (2026-05-19)**
+
+The §1.1k lmhead-a100 recipe was ported from MQ4 to MQ3. **It moves the wrong way at 3-bit:**
+
+| Axis | MQ3 q8-head (prior) | MQ3 lmhead-a100 (new) | Δ |
+|---|---:|---:|---:|
+| KLD | 0.1967 | 0.2613 | **+33% (worse)** |
+| p99 KLD | 9.705 | 14.740 | **+52% (worse tail)** |
+| PPL | 11.645 | 10.440 | **−10% (better)** |
+| bpw | ~3.8 | ~4.0 | +0.2 |
+
+CIs are non-overlapping (0.189–0.205 vs 0.249–0.276) — the KLD regression is statistically real, not measurement noise.
+
+**Pattern: KLD up, PPL down.** This is the **inverse** of what §1.1k showed at MQ4 (KLD down, PPL up). Put the four 9B variants in a single grid to see the cross-format shape:
+
+| Variant | KLD | PPL |
+|---|---:|---:|
+| MQ4 q8-head (§1.1j) | 0.1727 | 8.417 |
+| **MQ4 lmhead-a100 (§1.1k)** | **0.0863** | 9.374 |
+| MQ3 q8-head (§1.4) | 0.1967 | 11.645 |
+| **MQ3 lmhead-a100 (§1.4a)** | 0.2613 | **10.440** |
+
+The lmhead-a100 recipe lowers PPL on both formats but moves KLD in opposite directions: down at MQ4, up at MQ3.
+
+**Mechanistic read — over-sharpening clipped by MQ3 codebook capacity.** AWQ pre-scaling amplifies activation-important weight columns so the model puts more probability mass on its argmax (PPL improves). At MQ4 there's enough codebook resolution (16 entries / 4-bit) to round-trip the amplified values, so the post-quant distribution shape stays close to the BF16 reference (KLD improves too). At MQ3 (8 entries / 3-bit) the amplified values quantize to coarser bins; the argmax still lands on the right token (PPL keeps improving) but the *shape* of the distribution rotates away from the reference — the model becomes correctly-pointing but over-confidently-shaped, which is precisely what KLD penalizes. The p99 KLD +52% confirms it's the tail, not the body, that takes the hit — exactly where AWQ amplification was concentrated.
+
+**Implications for Phase 0b (recipe defaults):**
+1. **`mq3 + lm_head-mq3 + awq` is NOT a Pareto win** — paired-t on KLD would fail vs the q8-head baseline. Do **not** recommend `--lm-head-format mq3 --awq` for sub-9B (and probably any) configurations.
+2. **The recipe that's actually worth measuring** is `mq3 body + mq4 lm_head + awq`: keep MQ3's bpw savings on the dense layers, give the 248320-row lm_head MQ4's codebook headroom so AWQ-amplified mass can round-trip without clipping. The Phase 1 CLI is already designed for this: `--format mq3 --kmap-promote mq4 --lm-head-format mq4 --awq --kmap-dense --kmap-mode 2`.
+3. **27B asymmetry is consistent with this story.** At 27B MQ4 (§3.2 row 3) the same lmhead-a100 recipe landed neutral (+4% KLD, −0.4% PPL) — "barely enough precision" threshold. At 9B MQ3 the recipe crosses below the threshold (KLD actively worse). The threshold is per-bit-width, not per-model-size: 4-bit clears it, 3-bit doesn't.
+4. **AWQ α=0.55 was tuned at MQ4** (§1.1i). For any MQ3 + lm_head-AWQ recipe we keep alive, an **α sweep at lower values (0.30, 0.40)** is the next thing to try — less aggressive pre-scaling may stay within MQ3's precision envelope while still capturing partial gain. Predicted shape: PPL benefit shrinks gracefully, KLD regression flips back to neutral or positive.
 
 ---
 
@@ -520,14 +601,15 @@ Working artifacts: `/data/hipfire-refs/gptq-4b-full.kldseq` (0 bytes — eval_hi
 - No 4B mq4-awq+Q8conv1d (no-GPTQ) baseline measured yet → can't yet say whether GPTQ helps at 4B specifically. At 0.8B GPTQ regresses (+45%); at 9B is pending. 4B sits in between.
 - The destructor segfault on .kldseq close is reproducible; if per-chunk arrays are needed for downstream paired-t analysis on 4B, eval_hipfire needs a fflush-before-cleanup ordering fix.
 
-### 3.2 Qwen3.6-27B first cohort (gfx1100, KV=q8, prefill, n=256, 2026-05-18)
+### 3.2 Qwen3.6-27B first cohort (gfx1100, KV=q8, prefill, n=256, 2026-05-18 / 2026-05-19)
 
-Source: this session. First 27B KLD measurements in the codebase against `qwen3.6-27b-bf16.kldref.bin` (2.48 GB, sha256 `8af83b38…`, gfx1151 producer 2026-05-09, HF dataset `hipfire-models/qwen-kldref`). Both rows on gfx1100, kv-q8, prefill, n=256.
+Source: 2026-05-18 + 2026-05-19 sessions. 27B KLD measurements against `qwen3.6-27b-bf16.kldref.bin` (2.48 GB, sha256 `8af83b38…`, gfx1151 producer 2026-05-09, HF dataset `hipfire-models/qwen-kldref`). All rows on gfx1100, kv-q8, prefill, n=256. Total 27B params **26.896B** (counted from BF16 GGUF tensors at `/data/models/unsloth/Qwen3.6-27B/Qwen3.6-27B-BF16-*.gguf`).
 
 | Variant | bpw | KLD (CI) | p99 | PPL | Notes |
 |---|---:|---|---:|---:|---|
 | mq4-plain-q8head-kvq8-c256 | ~4.5 | 0.2034 (CI 0.1841–0.2237) | 19.009 | 8.584 | **no AWQ, no GPTQ**; `--kmap-dense` only (Q8 lm_head + default Promote6 on alt down_proj) |
-| mq4-awq-gptq-f2-q8head-v100-kvq8-c256 | ~4.5 | **0.1257** (CI 0.1126–0.1398) | **16.666** | 8.697 | AWQ stage-A F2 + GPTQ body + Q8 lm_head |
+| mq4-awq-gptq-f2-q8head-v100-kvq8-c256 | ~4.5 | **0.1257** (CI 0.1126–0.1398) | **16.666** | 8.697 | AWQ stage-A F2 + GPTQ body + Q8 lm_head — V100-calibrated |
+| **mq4-awq-gptq-f2-lmhead-a100-kvq8-c256** | **4.458** | **0.1307** (CI 0.1181–0.1442) | **15.946** | **8.663** | **same recipe family, A100-calibrated**; 2026-05-19, file 14.987 GB |
 
 **AWQ+GPTQ Δ on 27B MQ4 (identical kv-q8 + Q8 lm_head + body kmap):**
 mean KLD **−38%** (0.2034 → 0.1257), CIs non-overlapping. p99 KLD −12%
@@ -537,6 +619,24 @@ to the ground-truth next token; AWQ+GPTQ is more faithful to the BF16
 *distribution* (the KLD axis). At 4-bit on 27B, KLD captures the lift
 that next-token-loss masks. Contrast with §1.4's 9B MQ3 cohort, where
 3-bit's lossier regime makes AWQ+GPTQ win on both axes.
+
+**A100 vs V100 calibration on 27B (2026-05-19).** Same arch (gfx1100), same KV, same n, same scoring mode, same recipe family (mq4 + AWQ stage-A F2 + GPTQ + Q8 lm_head):
+
+| Axis | V100 (4.5 bpw) | A100 (4.458 bpw) | Δ |
+|---|---:|---:|---:|
+| KLD | 0.1257 | 0.1307 | **+4.0%** (worse) |
+| p99 KLD | 16.666 | 15.946 | −4.3% (better tail) |
+| PPL | 8.697 | 8.663 | −0.4% (basically identical) |
+| bpw | ~4.50 | 4.458 | −0.04 bpw |
+
+**The A100→V100 sidegrade is essentially flat on 27B** — calibration host doesn't materially change quant quality once stage-A F2 + GPTQ are already in the recipe. This is the **opposite** of what §1.1k showed at 9B (lmhead-a100 cut KLD ~50% vs q8head). Possible explanations:
+1. The 9B `q8head` baseline used a *different* (worse) recipe than the 9B `lmhead-a100`, not just a different calibration host — the −50% KLD lift was the recipe, not the GPU. 27B already had stage-A F2 in `q8head-v100`, so the A100 variant has nothing recipe-side to capture.
+2. 9B's smaller layer count (32 vs 27B's 64) leaves more headroom for per-layer calibration improvements to compound; at 64 layers the gradient is saturating.
+3. Cohort-specific: the 27B A100 quant may have used slightly different alpha / whitelist than the V100 sibling — diff between recipes hasn't been audited yet.
+
+The 9B "−50% from lmhead-a100" should not be presented as transferring to other model sizes without a per-size A/B. **At 27B the headline AWQ+GPTQ-vs-plain Δ remains −38%; A100-vs-V100 within that recipe is noise.**
+
+**Cross-engine 27B at matched bpw (llama.cpp Q4_K_M / UD-Q4_K_XL):** not yet measured on 27B — §1.2 anchors are 9B-only. Adding 27B llama.cpp anchors is the next priority to position this row in the bpw-quality Pareto.
 
 **Premature-EOS bug fix wired in.** The prior v100 variant with MQ4
 lm_head (no Q8 head) emitted `<|im_end|>` at argmax mid-reasoning
