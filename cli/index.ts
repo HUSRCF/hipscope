@@ -2427,14 +2427,27 @@ async function serve(port: number, host: string) {
         // The Jinja path uses max_think_tokens==1 as the signal for
         // enable_thinking=false (daemon.rs line 3099). For the legacy
         // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        // `assistant_prefix` drives the legacy ChatFrame path (Qwen et al.);
+        // `think_mode` drives arch_id=9 (DeepSeek V4), whose generate path
+        // ignores assistant_prefix/max_think_tokens and selects framing +
+        // reasoning-parse from think_mode alone:
+        //   chat     → `<｜Assistant｜></think>` (no reasoning, content only)
+        //   thinking → `<｜Assistant｜><think>`  (emits <think>…</think> reasoning)
+        //   max      → thinking + the "Absolute maximum" reasoning preamble
+        // Both are set so each arch reads the right one. (V4 modes per the HF
+        // encoding/README.md: thinking_mode=chat|thinking, reasoning_effort=max.)
+        const rEffort = (body as any).reasoning?.effort;
         if (effective.thinking === "off") {
           genParams.assistant_prefix = "closed_think";
+          genParams.thinking_mode = "chat";
         } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1; // Jinja path signal
-        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.thinking_mode = "chat";
+        } else if (rEffort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+          genParams.thinking_mode = "chat";
         } else {
           // Thinking is ON (config default, or explicit enable_thinking=true /
           // reasoning.effort>=minimal). OPEN the <think> block so the model
@@ -2445,6 +2458,8 @@ async function serve(port: number, host: string) {
           // thinking models: the daemon's prompt frame falls back to Plain
           // when the tokenizer has no `<think>` special token.
           genParams.assistant_prefix = "open_think";
+          // reasoning_effort max / xhigh → deepest reasoning; otherwise standard.
+          genParams.thinking_mode = (rEffort === "max" || rEffort === "xhigh") ? "max" : "thinking";
         }
         if (systemPrompt) genParams.system = systemPrompt;
 
