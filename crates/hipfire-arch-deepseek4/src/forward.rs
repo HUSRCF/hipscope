@@ -6721,23 +6721,55 @@ fn attention_block_batched_mixed(
             .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
         }
     } else {
-        gpu.deepseek4_attn_swa_topk_batched_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch,
-            &pbs.swa_staged_batch, // K=V tied
-            &pbs.topk_staged_batch,
-            &pbs.topk_staged_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr,
-            &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32,
-            head_dim as i32,
-            win as i32,
-            topk_max as i32,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+        // Head-batched f16-WMMA gathered DSA attention; f32 fallback on
+        // disable / non-tiling shapes / LDS > 64 KB.
+        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+            && gpu.arch_caps.has_wmma()
+            && n_heads % 16 == 0
+            && head_dim % 16 == 0;
+        let max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
+        let mut done = false;
+        if use_dsa_wmma {
+            if gpu
+                .deepseek4_attn_swa_topk_batched_wmma(
+                    &pbs.q_batch,
+                    &pbs.swa_staged_batch,  // K=V tied
+                    &pbs.topk_staged_batch, // K=V tied
+                    attn_sink,
+                    &pbs.n_valid_swa_arr,
+                    &pbs.n_active_topk_arr,
+                    &pbs.attn_out_raw_batch,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                    max_n_total,
+                )
+                .is_ok()
+            {
+                done = true;
+            }
+        }
+        if !done {
+            gpu.deepseek4_attn_swa_topk_batched_f32(
+                &pbs.q_batch,
+                &pbs.swa_staged_batch,
+                &pbs.swa_staged_batch, // K=V tied
+                &pbs.topk_staged_batch,
+                &pbs.topk_staged_batch,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.n_active_topk_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                win as i32,
+                topk_max as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+        }
     }
 
     // 5. Inverse RoPE.
