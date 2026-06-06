@@ -10626,18 +10626,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // emission; EOS-first yields an empty turn (loop then no-ops).
         if spec_last_token != eos_tok && generated_count < max_tokens {
             let frag = tokenizer.decode(&[spec_last_token]);
-            if grammar_active {
-                for ev in parser.feed(&frag) {
-                    absorb_event(&ev);
-                    emit_stream_event(stdout, id, ev);
-                }
-            } else {
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
+            for ev in parser.feed(&frag) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
             }
             emit_committed_event(
                 stdout,
@@ -10698,21 +10689,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     break 'outer;
                 }
                 let frag = tokenizer.decode(&[t]);
-                if grammar_active {
-                    for ev in parser.feed(&frag) {
-                        absorb_event(&ev);
-                        emit_stream_event(stdout, id, ev);
-                    }
-                } else {
-                    // Build through serde_json so `id` (user-supplied) and
-                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
-                    // can't corrupt the JSONL line.
-                    let envelope = serde_json::json!({
-                        "type": "token",
-                        "id": id,
-                        "text": frag,
-                    });
-                    let _ = writeln!(stdout, "{}", envelope);
+                // Always route through the DSML StreamParser (new_in_think in
+                // thinking modes) so `<think>…</think>` is split into reasoning
+                // vs content server-side and emitted as structured events. The
+                // old non-grammar branch emitted raw tokens, leaving the CLI to
+                // client-side-parse a stream that (for V4 thinking mode) starts
+                // INSIDE the think block with no `<think>` opener in the output.
+                for ev in parser.feed(&frag) {
+                    absorb_event(&ev);
+                    emit_stream_event(stdout, id, ev);
                 }
                 emit_committed_event(
                     stdout,
@@ -10731,15 +10716,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             }
             last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
         }
-        if grammar_active {
-            for ev in parser.finish() {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
-            }
-            let _ = stdout.flush();
-            drop(absorb_event);
-            tool_calls_parsed_count = emit_tool_calls_buf.len();
+        // Flush buffered partial markers / unclosed think — always, not only
+        // when tools are present. A thinking turn that fills max_tokens without
+        // closing </think> must still surface its buffered reasoning.
+        for ev in parser.finish() {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
         }
+        let _ = stdout.flush();
+        drop(absorb_event);
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
     } else {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
