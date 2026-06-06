@@ -323,9 +323,24 @@ impl StreamParser {
                 }
             }
             State::InThink => {
-                // Unclosed think block — emit what we have as reasoning.
-                if !self.buf.is_empty() {
-                    events.push(StreamEvent::Reasoning(std::mem::take(&mut self.buf)));
+                // Unclosed think block — flush as reasoning. Defensive: if a
+                // `</think>` is sitting unconsumed in the buffer at EOS (e.g. it
+                // arrived in the final feed and the holdback never got a chance
+                // to re-scan), split on it so the marker never leaks into
+                // reasoning_content and the tail is surfaced as content.
+                let buf = std::mem::take(&mut self.buf);
+                match buf.find(THINK_CLOSE) {
+                    Some(idx) => {
+                        if idx > 0 {
+                            events.push(StreamEvent::Reasoning(buf[..idx].to_string()));
+                        }
+                        let tail = &buf[idx + THINK_CLOSE.len()..];
+                        if !tail.is_empty() {
+                            events.push(StreamEvent::Token(tail.to_string()));
+                        }
+                    }
+                    None if !buf.is_empty() => events.push(StreamEvent::Reasoning(buf)),
+                    None => {}
                 }
             }
             State::InToolCalls => {
