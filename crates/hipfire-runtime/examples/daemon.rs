@@ -10618,6 +10618,38 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        // Emit the FIRST generated token (the prefill argmax). The loop below
+        // consumes `spec_last_token` as the decode-FROM token and only emits
+        // the drafted continuation (`r.accepted_tokens`), so without this the
+        // first token is dropped from every spec-decode response — a regression
+        // vs the non-spec path (e.g. "Here's…" → "'s…"). Mirrors the in-loop
+        // emission; EOS-first yields an empty turn (loop then no-ops).
+        if spec_last_token != eos_tok && generated_count < max_tokens {
+            let frag = tokenizer.decode(&[spec_last_token]);
+            if grammar_active {
+                for ev in parser.feed(&frag) {
+                    absorb_event(&ev);
+                    emit_stream_event(stdout, id, ev);
+                }
+            } else {
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+            }
+            emit_committed_event(
+                stdout,
+                id,
+                spec_last_token,
+                generated_count,
+                decode_t0.elapsed().as_millis() as u64,
+            );
+            let _ = stdout.flush();
+            m.conversation_tokens.push(spec_last_token);
+            generated_count += 1;
+        }
         'outer: while generated_count < max_tokens {
             let lh: Option<&rdna_compute::GpuTensor> = unsafe {
                 last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
