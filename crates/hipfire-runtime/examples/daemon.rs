@@ -10256,6 +10256,23 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                         }
                     }
 
+                    // If the replayed turn body opened a `<think>` block but
+                    // the model premature-stopped without closing it (EOS inside
+                    // the think, no tool call), close it here with a `</think>`.
+                    // Otherwise the dangling `<think>…<EOS>` drifts the next turn
+                    // (more premature stops, a leaked `</think>`). This is a
+                    // deterministic surround token — a pure function of
+                    // msg.content, NOT part of the cached turn body or the
+                    // asst_turn_fingerprint (which strips think anyway) — so it
+                    // is emitted identically on hit and miss paths and the
+                    // prefix-cache LCP + asst_turn_cache stay effective.
+                    if msg.tool_calls.is_empty()
+                        && msg.content.starts_with("<think>")
+                        && !msg.content.contains("</think>")
+                    {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
+
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
