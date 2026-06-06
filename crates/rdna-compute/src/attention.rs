@@ -9559,6 +9559,89 @@ impl Gpu {
             )
         }
     }
+    /// Head-batched f16-WMMA DSA attention (direct top-K) — faster sibling of
+    /// `deepseek4_attn_swa_topk_direct_batched_f32`. K=V tied (single `swa_kv`);
+    /// `max_n_total` (= max over batches of n_valid_swa + n_active_topk) sizes
+    /// the per-block score LDS. Returns Err if the LDS would exceed 64 KB (the
+    /// caller falls back to the f32 kernel). Requires n_heads%16==0, head_dim%16==0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_attn_swa_topk_direct_wmma(
+        &mut self,
+        q: &GpuTensor,
+        swa_kv: &GpuTensor,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        swa_window: i32,
+        topk_window: i32,
+        n_compressed: i32,
+        batch_size: i32,
+        max_n_total: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(n_heads % 16, 0, "direct_wmma: n_heads must be %16 (got {n_heads})");
+        debug_assert_eq!(head_dim % 16, 0, "direct_wmma: head_dim must be %16 (got {head_dim})");
+        let n_pad = ((max_n_total + 15) / 16) * 16;
+        let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4; // q f16 + s f32
+        if lds_bytes > 64 * 1024 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("direct_wmma: LDS {lds_bytes} > 64KB (max_n_total={max_n_total})"),
+            ));
+        }
+        self.ensure_kernel(
+            "deepseek4_attn_swa_topk_direct_wmma",
+            kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC,
+            "deepseek4_attn_swa_topk_direct_wmma",
+        )?;
+        let func = &self.functions["deepseek4_attn_swa_topk_direct_wmma"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_kv.buf.as_ptr();
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut nc = n_compressed;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(n_heads / 16) as u32, batch_size as u32, 1],
+                [256, 1, 1], // 8 warps split the score n-tiles / output d-tiles
+                lds_bytes as u32,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn deepseek4_attn_swa_topk_f32_buf(
         &mut self,
         q: &GpuTensor,

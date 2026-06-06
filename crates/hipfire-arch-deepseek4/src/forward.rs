@@ -6667,24 +6667,59 @@ fn attention_block_batched_mixed(
             .main_kv_cache
             .as_ref()
             .ok_or_else(|| "main_kv_cache missing".to_string())?;
-        gpu.deepseek4_attn_swa_topk_direct_batched_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch,
-            &pbs.swa_staged_batch, // K=V tied
-            main_kv_cache,
-            &pbs.idx_topk_indices_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr,
-            &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32,
-            head_dim as i32,
-            win as i32,
-            topk_max as i32,
-            topk_direct_n_compressed as i32,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+        // Head-batched f16-WMMA DSA attention (~4.4× the f32 kernel at prefill
+        // batch); falls back to f32 if disabled, shapes don't tile, or the
+        // score LDS would exceed 64 KB. max_n_total bounds the LDS (n_valid ≤ win).
+        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+            && gpu.arch_caps.has_wmma()
+            && n_heads % 16 == 0
+            && head_dim % 16 == 0;
+        let max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
+        let mut done = false;
+        if use_dsa_wmma {
+            if gpu
+                .deepseek4_attn_swa_topk_direct_wmma(
+                    &pbs.q_batch,
+                    &pbs.swa_staged_batch, // K=V tied
+                    main_kv_cache,
+                    &pbs.idx_topk_indices_batch,
+                    attn_sink,
+                    &pbs.n_valid_swa_arr,
+                    &pbs.n_active_topk_arr,
+                    &pbs.attn_out_raw_batch,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    topk_direct_n_compressed as i32,
+                    batch_size as i32,
+                    max_n_total,
+                )
+                .is_ok()
+            {
+                done = true;
+            }
+        }
+        if !done {
+            gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+                &pbs.q_batch,
+                &pbs.swa_staged_batch,
+                &pbs.swa_staged_batch, // K=V tied
+                main_kv_cache,
+                &pbs.idx_topk_indices_batch,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.n_active_topk_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                win as i32,
+                topk_max as i32,
+                topk_direct_n_compressed as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+        }
     } else {
         gpu.deepseek4_attn_swa_topk_batched_f32(
             &pbs.q_batch,

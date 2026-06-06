@@ -3636,6 +3636,12 @@ pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
 pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
 
+/// Head-batched f16-WMMA port of the direct-batched DSA attention (gfx1151).
+/// Same joint-softmax math; 16 heads/block so the score/output GEMVs become
+/// WMMA GEMMs reading the shared K/V once. See deepseek4_attn_swa_topk_direct_wmma.hip.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip");
+
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
 /// path. Same launch shape and byte-equality contract at batch=1.
