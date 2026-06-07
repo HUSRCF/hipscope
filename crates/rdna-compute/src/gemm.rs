@@ -16848,16 +16848,23 @@ impl Gpu {
             "gemm_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
         debug_assert!(
-            self.arch_caps.is_rdna4(),
-            "gemm_q8_0_wmma: gfx12 only (got arch {})",
+            self.arch_caps.has_wmma(),
+            "gemm_q8_0_wmma: requires wave32 WMMA (gfx11+); got arch {}",
             self.arch
         );
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_q8_0_wmma_gfx12",
-            kernels::GEMM_Q8_0_WMMA_GFX12_SRC,
-            "gemm_q8_0_wmma_gfx12",
-        )?;
+        // RDNA3/RDNA3.5 and RDNA4 wave32 WMMA use different f32-accumulator
+        // output layouts, so select the matching kernel source. The RDNA3
+        // source (gfx1151-tuned) is the single-warp Q8_0 drop-in on gfx11 /
+        // RDNA3.5; `_gfx12` is its RDNA4 sibling. Launch is identical.
+        let (kname, ksrc): (&str, &str) = if self.arch_caps.is_rdna4() {
+            ("gemm_q8_0_wmma_gfx12", kernels::GEMM_Q8_0_WMMA_GFX12_SRC)
+        } else {
+            ("gemm_q8_0_wmma", kernels::GEMM_Q8_0_WMMA_SRC)
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
+        // Honor a pre-converted F16 activation (forward.rs pre-converts into
+        // scratch); avoid the double-convert that masked the gfx1151 path.
         let x_f16_ptr = if matches!(x.dtype, DType::F16) {
             x.buf.as_ptr()
         } else {

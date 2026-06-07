@@ -230,6 +230,7 @@ fn gemv_auto_batched_wmma(
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on && gpu.arch_caps.is_rdna4() {
+                // RDNA4 (gfx12): upstream-tuned gating (unchanged).
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
@@ -243,6 +244,27 @@ fn gemv_auto_batched_wmma(
                         && k % 32 == 0
                         && batch_size % 64 == 0;
                     if use_4w {
+                        return gpu
+                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
+                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
+                    }
+                    return gpu
+                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
+                }
+            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+                // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation
+                // is pre-converted to F16 in `scratch`; the kernels honor the
+                // F16 dtype (no re-convert). 4-warp 64×64-tile kernel for
+                // batch%64==0 (~12% over single-warp 16×16; weight-bandwidth-
+                // bound); HIPFIRE_DEEPSEEK4_Q8_4W=0 forces single-warp.
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
+                    let opt_out_4w =
+                        std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
+                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
                             .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
