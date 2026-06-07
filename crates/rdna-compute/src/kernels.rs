@@ -2746,6 +2746,13 @@ pub const ATTENTION_DFLASH_WMMA_GFX12_SRC: &str =
 pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma_m32.hip");
 
+/// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_M32_SRC` (`_w32_gfx12`
+/// WMMA, K split across wave-halves). Routed via `has_wmma_w32_gfx12()`
+/// in `attention_dflash_wmma_m32_f32`. See
+/// `kernels/src/attention_dflash_wmma_m32.gfx12.hip`.
+pub const ATTENTION_DFLASH_WMMA_M32_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_m32.gfx12.hip");
+
 /// N=64 K-tile variant — M=32 queries per block, **64 keys per outer
 /// loop iteration** (vs 16 in M32_SRC). Q lives in registers across all
 /// K-tiles; phase C fuses the alpha-scale and SV epilogue. Designed to

@@ -5869,12 +5869,23 @@ impl Gpu {
             n_heads % n_kv_heads == 0,
             "attention_dflash_wmma_m32_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
-        self.ensure_kernel(
-            "attention_dflash_wmma_m32_f32",
-            kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
-            "attention_dflash_wmma_m32_f32",
-        )?;
-        let func = &self.functions["attention_dflash_wmma_m32_f32"];
+        // gfx12/RDNA4 uses the `_w32_gfx12` WMMA lowering; the gfx11 kernel
+        // does not compile on gfx12. Base kernel on RDNA3/RDNA3.5.
+        let (m32_name, m32_src, m32_sym) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "attention_dflash_wmma_m32_f32_gfx12",
+                kernels::ATTENTION_DFLASH_WMMA_M32_GFX12_SRC,
+                "attention_dflash_wmma_m32_f32_gfx12",
+            )
+        } else {
+            (
+                "attention_dflash_wmma_m32_f32",
+                kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
+                "attention_dflash_wmma_m32_f32",
+            )
+        };
+        self.ensure_kernel(m32_name, m32_src, m32_sym)?;
+        let func = &self.functions[m32_name];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         // LDS layout (in f32 slots):
         //   Q_lds[32 * head_dim] + V_lds[16 * head_dim] + O_lds[32 * head_dim]
