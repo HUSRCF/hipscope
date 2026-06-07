@@ -39,6 +39,8 @@
 use crate::context::DispatchCtx;
 use crate::types::{KernelKey, PipelineOp};
 use super::steps::{match_fused_prefix, step_op_kind, Step};
+use crate::types::DispatchError;
+use rdna_compute::Gpu;
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
 /// for the model's lifetime). The executor maps this to the live `&GpuTensor`.
@@ -258,6 +260,58 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
         },
         |i| match_fused_prefix(&steps[i..], ctx),
     )
+}
+
+// ── Step 1c: the LayerProgram executor ─────────────────────────────────────
+
+/// Per-kind handlers the executor calls, implemented ARCH-SIDE (where the live
+/// weight/scratch/state tensors live). This keeps `run_layer_program` itself
+/// arch-agnostic: it sequences + matches `SuperOpKind`, the arch's impl does the
+/// actual family dispatch (e.g. `GemmFamily::run_key(op.key.unwrap(), …)` with
+/// the tensors resolved from `op.weights`/`op.scratch` against its own tables).
+///
+/// A kind the arch hasn't migrated yet routes to its OWN hand-path fragment
+/// inside the impl (the "Fallback") — so there is NO `UnsupportedVariant`
+/// catch-all on the executor; the match is total over `SuperOpKind`.
+pub trait ForwardBindings {
+    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_norm(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_attend(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_moe(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_recurrent(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_conv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
+    fn run_escape(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding, kind: EscapeKind) -> Result<(), DispatchError>;
+}
+
+/// Execute one lowered layer program: a tight, branch-predictable loop over the
+/// pre-resolved super-ops (no `resolve()`, no `FUSED_TABLE` walk, no per-call
+/// `WeightRef` construction — that was all frozen at lower time). Total match
+/// over `SuperOpKind`; each arm calls the arch-supplied [`ForwardBindings`].
+///
+/// This is the forward-as-pipeline hot path. It is NOT on any live path until an
+/// arch's forward (qwen35 first) builds a `LoweredForward` at load and calls this
+/// behind `HIPFIRE_FORWARD_LOWERED` (default off), oracle-validated byte-identical
+/// vs the hand `execute_steps` path before the default is flipped per arch.
+pub fn run_layer_program<B: ForwardBindings>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    program: &LayerProgram,
+    bindings: &mut B,
+) -> Result<(), DispatchError> {
+    for op in program {
+        match op.kind {
+            SuperOpKind::Proj => bindings.run_proj(gpu, ctx, &op.binding)?,
+            SuperOpKind::ResidualGemv => bindings.run_residual_gemv(gpu, ctx, &op.binding)?,
+            SuperOpKind::Norm => bindings.run_norm(gpu, ctx, &op.binding)?,
+            SuperOpKind::Attend => bindings.run_attend(gpu, ctx, &op.binding)?,
+            SuperOpKind::Moe => bindings.run_moe(gpu, ctx, &op.binding)?,
+            SuperOpKind::Recurrent => bindings.run_recurrent(gpu, ctx, &op.binding)?,
+            SuperOpKind::Conv => bindings.run_conv(gpu, ctx, &op.binding)?,
+            SuperOpKind::Escape(k) => bindings.run_escape(gpu, ctx, &op.binding, k)?,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
