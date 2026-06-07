@@ -3256,6 +3256,15 @@ fn ffn_routed(
                     .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?,
             );
         }
+        // [k_top × hidden] per-expert down outputs for the deterministic
+        // (atomic-free) combine in run_moe_decode_bias_aware (default on;
+        // HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0 uses the atomic path).
+        if state.moe_down_expert_outputs.is_none() {
+            state.moe_down_expert_outputs = Some(
+                gpu.alloc_tensor(&[k_top, cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc moe_down_expert_outputs: {e:?}"))?,
+            );
+        }
         let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
         let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
         // GPU top-K: bias-aware select + normalize + route_scale in one
@@ -3270,6 +3279,7 @@ fn ffn_routed(
         let gate_batch = state.moe_gate_batch.as_ref().unwrap();
         let up_batch = state.moe_up_batch.as_ref().unwrap();
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
+        let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
 
         // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
         // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
@@ -3304,6 +3314,7 @@ fn ffn_routed(
             gate_batch,
             up_batch,
             rot_batch,
+            down_expanded,
         };
         hipfire_runtime::llama::moe_family()
             .run_bias_aware(gpu, &moe_params)
