@@ -2729,6 +2729,14 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str =
 pub const ATTENTION_DFLASH_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.hip");
 
+/// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_SRC`. Same algorithm; the
+/// WMMA fragments use `half8_t` operands + the `_w32_gfx12` intrinsic (the
+/// gfx11 `_w32` builtin does not lower on gfx12 — "Cannot select intrinsic").
+/// Routed via `has_wmma_w32_gfx12()` in `attention_dflash_wmma_f32`. See
+/// `kernels/src/attention_dflash_wmma.gfx12.hip`.
+pub const ATTENTION_DFLASH_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma.gfx12.hip");
+
 /// M=32 variant of `ATTENTION_DFLASH_WMMA_SRC` — two-wave block (64
 /// threads), processes 32 queries per block instead of 16. Halves the
 /// number of query-tile blocks at large B, which halves global K-tile
