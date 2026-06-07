@@ -36,7 +36,9 @@
 //! (default off) in later steps, validated byte-identical via the
 //! `HIPFIRE_FORWARD_ORACLE` dual-run.
 
-use crate::types::KernelKey;
+use crate::context::DispatchCtx;
+use crate::types::{KernelKey, PipelineOp};
+use super::steps::{match_fused_prefix, step_op_kind, Step};
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
 /// for the model's lifetime). The executor maps this to the live `&GpuTensor`.
@@ -134,6 +136,10 @@ pub enum SuperOpKind {
     Proj,
     /// Output/down projection with fused residual add (o_proj, down_proj).
     ResidualGemv,
+    /// Standalone rmsnorm(+optional rotate) producer, emitted when its
+    /// projection cluster did NOT fuse — mirrors execute_steps' unfused
+    /// per-step launch_op path (rmsnorm, then individual Proj gemvs).
+    Norm,
     /// Attention block (flavor in `OpFlavor::Attn`).
     Attend,
     /// MoE FFN block (routes to MoeFamily / run_moe_decode).
@@ -179,5 +185,126 @@ pub struct LoweredForward {
 impl LoweredForward {
     pub fn new(weight_gen: u64) -> Self {
         Self { layers: Vec::new(), weight_gen }
+    }
+}
+
+// ── Step 1b: load-time lowering ────────────────────────────────────────────
+
+/// Pure greedy lowering walk (no `Step`/GpuTensor dependency → unit-testable).
+/// Mirrors `execute_steps` exactly: a fused window collapses to one `Proj`
+/// super-op carrying the frozen `KernelKey`; an unfused position becomes a
+/// single super-op (the `launch_op` equivalent). `try_fuse(pos)` returns the
+/// fused `(key, span)` at `pos` (from `match_fused_prefix`); `single_kind(pos)`
+/// gives the kind for an unfused step. A `span == 0` defensively falls through
+/// to the single-step branch so the walk always advances.
+fn lower_walk(
+    n: usize,
+    single_kind: impl Fn(usize) -> SuperOpKind,
+    try_fuse: impl Fn(usize) -> Option<(KernelKey, usize)>,
+) -> LayerProgram {
+    let mut prog: LayerProgram = Vec::new();
+    let mut pos = 0usize;
+    while pos < n {
+        match try_fuse(pos) {
+            Some((key, span)) if span >= 1 => {
+                prog.push(SuperOp {
+                    kind: SuperOpKind::Proj,
+                    binding: OpBinding {
+                        key: Some(key),
+                        weights: Vec::new(),
+                        scratch: Vec::new(),
+                        flavor: OpFlavor::None,
+                    },
+                });
+                pos += span;
+            }
+            _ => {
+                prog.push(SuperOp {
+                    kind: single_kind(pos),
+                    binding: OpBinding {
+                        key: None,
+                        weights: Vec::new(),
+                        scratch: Vec::new(),
+                        flavor: OpFlavor::None,
+                    },
+                });
+                pos += 1;
+            }
+        }
+    }
+    prog
+}
+
+/// Lower one layer's live `Step` sequence into a POD [`LayerProgram`] at MODEL
+/// LOAD. Reuses `match_fused_prefix` (the canonical `FUSED_TABLE` + guards) so
+/// the frozen `KernelKey`s match `execute_steps` byte-for-byte — no fusion drift.
+///
+/// TODO(arch-migration, Step 3+): populate `WeightSlot`/`ScratchSlot` bindings
+/// and `AttnFlavor`/`ActFlavor` from the arch's weight/scratch tables + config.
+/// This step freezes the FUSION STRUCTURE + kernel keys; the per-arch migration
+/// supplies the operand slots + flavor data (and the executor binds them).
+pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
+    lower_walk(
+        steps.len(),
+        |i| match step_op_kind(&steps[i]) {
+            PipelineOp::Gemv => SuperOpKind::Proj,
+            PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
+            PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
+            PipelineOp::Attend => SuperOpKind::Attend,
+            // Current Step has only the 4 variants above; other PipelineOp
+            // values are not producible from a Step, so this is unreachable
+            // in practice (kept total).
+            _ => SuperOpKind::Norm,
+        },
+        |i| match_fused_prefix(&steps[i..], ctx),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fk() -> KernelKey { KernelKey::FusedQkvHfq4G256 }
+
+    #[test]
+    fn lower_walk_collapses_fused_and_passes_through_unfused() {
+        // 6 steps: [0..4) fuse (span 4) to one Proj; step 4 unfused Gemv→Proj;
+        // step 5 unfused GemvResidual→ResidualGemv.
+        let prog = lower_walk(
+            6,
+            |i| if i == 5 { SuperOpKind::ResidualGemv } else { SuperOpKind::Proj },
+            |pos| if pos == 0 { Some((fk(), 4)) } else { None },
+        );
+        assert_eq!(prog.len(), 3);
+        assert_eq!(prog[0].kind, SuperOpKind::Proj);
+        assert_eq!(prog[0].binding.key, Some(fk())); // fused → frozen key
+        assert_eq!(prog[1].kind, SuperOpKind::Proj);
+        assert_eq!(prog[1].binding.key, None); // unfused single
+        assert_eq!(prog[2].kind, SuperOpKind::ResidualGemv);
+        assert_eq!(prog[2].binding.key, None);
+    }
+
+    #[test]
+    fn lower_walk_all_unfused_keeps_each_step() {
+        let prog = lower_walk(3, |_| SuperOpKind::Norm, |_| None);
+        assert_eq!(prog.len(), 3);
+        assert!(prog.iter().all(|op| op.binding.key.is_none()));
+    }
+
+    #[test]
+    fn lower_walk_single_cluster_spans_to_end() {
+        let prog = lower_walk(4, |_| SuperOpKind::Proj, |pos| {
+            if pos == 0 { Some((fk(), 4)) } else { None }
+        });
+        assert_eq!(prog.len(), 1);
+        assert_eq!(prog[0].binding.key, Some(fk()));
+    }
+
+    #[test]
+    fn lower_walk_zero_span_does_not_stall() {
+        // A defensive (key, 0) must not infinite-loop: falls to single-step.
+        let prog = lower_walk(2, |_| SuperOpKind::Proj, |_| Some((fk(), 0)));
+        assert_eq!(prog.len(), 2);
+        assert!(prog.iter().all(|op| op.binding.key.is_none()));
     }
 }
