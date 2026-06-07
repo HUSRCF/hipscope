@@ -193,4 +193,75 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+
+    // ── #397 Ship 5.2 FINAL: residual-fused GEMM catalog ────────────
+    // All entries below take the residual signature `(a, x, y, m, k, batch_size)`
+    // and compute `y += a·x` (the residual add is INTERNAL to each kernel — the
+    // caller passes the residual stream as `y` and the kernel never reuses `y` as
+    // GEMV scratch, so the migration cannot reintroduce the a9e8dfda aliasing
+    // bug). Dispatched through GemmFamily::run_key against the explicit key, so
+    // each method's own internal arch routing is preserved byte-for-byte.
+    //
+    // HFQ6 residual: `gpu.gemm_hfq6g256_residual` is the dispatcher entry — it
+    // auto-routes WMMA(gfx12/gfx11) → dp4a(gfx906) → FP16 → scalar fallback, so
+    // it runs on EVERY arch. `Always` mirrors the plain HFQ6 availability.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq6G256Residual,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    // HFQ4 residual: `gpu.gemm_hfq4g256_residual` is the dispatcher entry — full
+    // cross-arch ladder (CDNA MFMA/rocBLAS → MMQ → dp4a → FP16 → WMMA → scalar).
+    // Runs on every arch → `Always` (mirrors the plain GemmHfq4G256 row).
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq4G256Residual,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    // HFQ3 residual: the qwen35 site picks `gpu.gemm_hfq3g256_residual_wmma` on
+    // has_wmma() archs (incl. gfx12, routed inside) else the base
+    // `gpu.gemm_hfq3g256_residual`, whose own ladder is MMQ → dot2 → FP16 →
+    // scalar. So the dtype runs on EVERY arch; the run-arm replicates the
+    // call-site WMMA-vs-base arch split internally (mirrors FusedQkvHfq3G256).
+    // `Always`, NOT HasWmma (the base has a non-WMMA scalar body).
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq3G256Residual,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    // HFP4 residual: `gpu.gemm_hfp4g32_residual` dispatches ONLY to WMMA kernels
+    // (`_wmma_gfx12` on has_wmma_w32_gfx12() RDNA4 else `_wmma` gfx11 RDNA3) —
+    // NO scalar/dp4a fallback. Real support is WMMA-only. HasWmma (= has_wmma(),
+    // includes gfx12) is correct; the gfx12 sibling is reached inside the method,
+    // so HasWmmaW32 (gfx12-excluding) would be wrong. Mirrors FusedGateUpHfp4G32.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfp4G32Residual,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    // MQ3-Lloyd residual: `gpu.gemm_mq3g256_lloyd_residual_wmma` is WMMA-only —
+    // `_for_arch` routes the gfx12 (RDNA4) sibling else the gfx11 (RDNA3) kernel
+    // and PANICS on any other arch (the is_batchable_la upstream gate guarantees
+    // only RDNA3/RDNA4 reach it). Real support is WMMA-only → HasWmma (includes
+    // gfx12). Mirrors FusedQkvMq3G256Lloyd / FusedGateUpMq3G256Lloyd.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256LloydResidual,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
 }

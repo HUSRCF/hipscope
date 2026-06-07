@@ -37,6 +37,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         // WMMA vs base by arch, mirroring the call site). Mirrors the
         // FusedGateUpHfq3G256 row; NOT HasWmma (the base has a non-WMMA body).
         (KernelKey::FusedQkvHfq3G256,     ArchPredicate::Always),
+        // HFP4G32 fused QKV (#397 Ship 5.2 FINAL). WMMA-only: the run-arm calls
+        // `gpu.gemm_qkv_hfp4g32`, which dispatches ONLY to WMMA kernels (gfx12 FP8/
+        // WMMA siblings on has_wmma_w32_gfx12() RDNA4 else the gfx11 `_wmma`
+        // kernel) — there is NO scalar/dp4a fallback. HasWmma (= has_wmma(),
+        // includes gfx12) is correct; the gfx12 sibling is reached INSIDE the
+        // method, so HasWmmaW32 (gfx12-excluding) would be wrong. Mirrors the
+        // FusedGateUpHfp4G32 row.
+        (KernelKey::FusedQkvHfp4G32,      ArchPredicate::HasWmma),
     ];
     for &(key, arch) in qkv_variants {
         registry.register(KernelVariant {
@@ -71,6 +79,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         // (MMQ → dot2 → fp16 → scalar); the run-arm picks `_wmma` vs base by arch.
         // Mirrors FusedQkvHfq3G256 / FusedGateUpHfq3G256.
         (KernelKey::FusedQkvzaHfq3G256,     ArchPredicate::Always),
+        // HFP4G32 fused QKVZA (#397 Ship 5.2 FINAL). WMMA-only — the run-arm calls
+        // `gpu.gemm_qkvza_hfp4g32` (gfx12 WMMA sibling on RDNA4 else gfx11 `_wmma`),
+        // NO scalar/dp4a fallback. Mirrors the FusedQkvHfp4G32 row above.
+        // HasWmma (includes gfx12).
+        (KernelKey::FusedQkvzaHfp4G32,      ArchPredicate::HasWmma),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {

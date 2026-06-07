@@ -163,6 +163,28 @@ impl GemmFamily {
             K::GemmQ8_0ResidualWmmaGfx12 => hip!(gpu.gemm_q8_0_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256Dp4a => hip!(gpu.gemm_hfq4g256_dp4a(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256MmqSet => hip!(gpu.gemm_hfq4g256_mmq_set(w.buf, x, y, m, k, batch_size)),
+            // #397 Ship 5.2 FINAL: residual-fused GEMM catalog. Each arm computes
+            // `y += a·x` IN-PLACE (the add is internal to the kernel; `y` carries
+            // the residual stream and is never reused as GEMV scratch). The
+            // operand order `(w.buf, x, y, m, k, batch_size)` is byte-identical to
+            // the prior direct `gpu.gemm_*_residual(&w.buf, x, y, m, k, n)` call,
+            // so each kernel's internal arch routing is preserved exactly.
+            K::GemmHfq6G256Residual => hip!(gpu.gemm_hfq6g256_residual(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256Residual => hip!(gpu.gemm_hfq4g256_residual(w.buf, x, y, m, k, batch_size)),
+            // HFQ3 residual mirrors the qwen35 call site's WMMA-vs-base arch split
+            // (`if arch_has_wmma { _wmma } else { base }`); has_wmma() includes
+            // gfx12, and the _wmma method routes the gfx12 sibling internally.
+            K::GemmHfq3G256Residual => {
+                if gpu.arch_caps.has_wmma() {
+                    hip!(gpu.gemm_hfq3g256_residual_wmma(w.buf, x, y, m, k, batch_size))
+                } else {
+                    hip!(gpu.gemm_hfq3g256_residual(w.buf, x, y, m, k, batch_size))
+                }
+            }
+            // HFP4 / MQ3-Lloyd residual are WMMA-only dispatcher entries; each
+            // routes its own gfx12-vs-gfx11 WMMA sibling internally.
+            K::GemmHfp4G32Residual => hip!(gpu.gemm_hfp4g32_residual(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq3G256LloydResidual => hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }

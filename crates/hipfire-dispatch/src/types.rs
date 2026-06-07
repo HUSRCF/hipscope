@@ -145,15 +145,17 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
-        // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3 prefill, and the Paro 4G128T QKV synthesis)
+        // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
         FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd
         | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0 | FusedQkvHfq3G256
+        | FusedQkvHfp4G32
         | FusedQkvParo4G128T => {
             Some(FusedQkvVariant::Qkv)
         }
-        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3 prefill and Paro 4G128T)
+        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256 | FusedQkvzaMq3G256Lloyd | FusedQkvzaMq4G256Lloyd
         | FusedQkvzaHfq6G256 | FusedQkvzaQ8_0 | FusedQkvzaHfq3G256
+        | FusedQkvzaHfp4G32
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         // 2-way Fused Gate+Up (FFN, incl. Q8_0, HFQ3, HFP4 and Paro 4G128T)
         FusedGateUpHfq4G256 | FusedGateUpMq3G256Lloyd | FusedGateUpMq4G256Lloyd
@@ -250,6 +252,16 @@ pub enum KernelKey {
     GemmQ8_0ResidualWmmaGfx12,
     GemmHfq4G256Dp4a,
     GemmHfq4G256MmqSet,
+    // GEMM — residual-fused catalog (#397 Ship 5.2 slice "5.2 FINAL").
+    // These take the residual signature `(a, x, y, m, k, batch_size)` and
+    // compute `y += a·x` (the add is internal to each kernel — the caller
+    // passes the residual stream as `y` and the kernel never reuses it as
+    // GEMV scratch). Dispatched through GemmFamily::run_key, NOT resolve().
+    GemmHfq6G256Residual,
+    GemmHfq4G256Residual,
+    GemmHfq3G256Residual,
+    GemmHfp4G32Residual,
+    GemmMq3G256LloydResidual,
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq3G256Lloyd,
@@ -259,6 +271,7 @@ pub enum KernelKey {
     // Fused QKV — prefill dtypes (#397 Ship 5.2 slice 3)
     FusedQkvQ8_0,
     FusedQkvHfq3G256,
+    FusedQkvHfp4G32,
     // Fused QKVZA (linear attention)
     FusedQkvzaHfq4G256,
     FusedQkvzaMq3G256Lloyd,
@@ -267,6 +280,7 @@ pub enum KernelKey {
     // Fused QKVZA — prefill dtypes (#397 Ship 5.2 slice 3)
     FusedQkvzaQ8_0,
     FusedQkvzaHfq3G256,
+    FusedQkvzaHfp4G32,
     // Fused Gate+Up
     FusedGateUpHfq4G256,
     FusedGateUpMq3G256Lloyd,

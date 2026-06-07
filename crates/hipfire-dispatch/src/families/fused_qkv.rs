@@ -170,6 +170,20 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 hip!(gpu.gemm_qkv_hfq3g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
             }
         }
+        // ── HFP4G32 fused QKV — prefill-only key (#397 Ship 5.2 FINAL) ──
+        // WMMA-only (entry gated HasWmma); no decode `fused_qkv_hfp4g32` exists.
+        // `gpu.gemm_qkv_hfp4g32` routes the gfx12 FP8/WMMA siblings on RDNA4 else
+        // the gfx11 `_wmma` kernel internally; no scalar fallback. Mirrors the
+        // FusedGateUpHfp4G32 arm.
+        KernelKey::FusedQkvHfp4G32 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkv", arch: "", quant: "hfp4g32 (prefill-only)",
+            })?;
+            hip!(gpu.gemm_qkv_hfp4g32(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+        }
 
         // ── 4-way Fused QKVZA (DeltaNet linear attention) ────
         //
@@ -239,6 +253,19 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             } else {
                 hip!(gpu.gemm_qkvza_hfq3g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
             }
+        }
+        // ── HFP4G32 fused QKVZA — prefill-only key (#397 Ship 5.2 FINAL) ──
+        // WMMA-only (entry gated HasWmma); no decode `fused_qkvza_hfp4g32` exists.
+        // `gpu.gemm_qkvza_hfp4g32` routes the gfx12 WMMA sibling on RDNA4 else the
+        // gfx11 `_wmma` kernel internally; no scalar fallback. Mirrors FusedQkvHfp4G32.
+        KernelKey::FusedQkvzaHfp4G32 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkvza", arch: "", quant: "hfp4g32 (prefill-only)",
+            })?;
+            hip!(gpu.gemm_qkvza_hfp4g32(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
         }
 
         // ── 2-way Fused Gate+Up (FFN) ────────────────────────
