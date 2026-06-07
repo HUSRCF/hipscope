@@ -8549,16 +8549,16 @@ impl Gpu {
             &mut kf as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let smem = n_iter as u32;
-        // Block sized to parallelise the fast-path identity write of
-        // up to k_stride indices across threads (each thread writes
-        // k_stride/128 slots via stride). Slow path serialises on
-        // thread 0 — extra threads early-return.
+        // Both paths are block-parallel now: the fast path identity-writes
+        // k_stride slots across threads; the slow path runs a parallel
+        // threshold top-K (block min/max + binary search + compact) over
+        // all 256 threads, using only static LDS — so no dynamic smem.
+        let smem = 0u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [n_idx_heads as u32, batch_size as u32, 1],
-                [128, 1, 1],
+                [256, 1, 1],
                 smem,
                 self.stream_ref(),
                 &mut params,
