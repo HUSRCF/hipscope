@@ -12586,11 +12586,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     }
 }
 
-/// Cached `HIPFIRE_FORWARD_LOWERED` toggle (default off). When on, the
-/// single-GPU decode forward routes through `run_layer_program`.
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. #397 Ship 6: the qwen35 single-GPU
+/// decode lowered path is **DEFAULT ON** as of 2026-06-07 — validated byte-
+/// identical to the hand path via fleet decode byte-parity (RDNA3 k9lin / RDNA4
+/// hiptrx / RDNA3.5 hipx, dense + MoE) and the full coherence battery (13 cases,
+/// k9lin). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0` forces the legacy hand arms
+/// (still present in forward_scratch_layers); any other value (or unset) → lowered.
 fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1"))
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent
