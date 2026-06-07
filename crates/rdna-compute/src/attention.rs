@@ -9599,7 +9599,6 @@ impl Gpu {
             kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC,
             "deepseek4_attn_swa_topk_direct_wmma",
         )?;
-        let func = &self.functions["deepseek4_attn_swa_topk_direct_wmma"];
         let qp = q.buf.as_ptr();
         let kp = swa_kv.buf.as_ptr();
         let cp = kv_cache.buf.as_ptr();
@@ -9630,16 +9629,32 @@ impl Gpu {
             &mut nc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(n_heads / 16) as u32, batch_size as u32, 1],
-                [256, 1, 1], // 8 warps split the score n-tiles / output d-tiles
-                lds_bytes as u32,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // Capture-safe launch (blob path under the new base's prefill capture).
+        self.launch_maybe_blob(
+            "deepseek4_attn_swa_topk_direct_wmma",
+            [(n_heads / 16) as u32, batch_size as u32, 1],
+            [256, 1, 1], // 8 warps split the score n-tiles / output d-tiles
+            lds_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(sp);
+                b.push_ptr(nvp);
+                b.push_ptr(nap);
+                b.push_ptr(op);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(sw);
+                b.push_i32(tw);
+                b.push_i32(nc);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
 
     /// Head-batched f16-WMMA DSA attention (gathered top-K) — faster sibling of
@@ -9679,7 +9694,6 @@ impl Gpu {
             kernels::V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC,
             "deepseek4_attn_swa_topk_batched_wmma",
         )?;
-        let func = &self.functions["deepseek4_attn_swa_topk_batched_wmma"];
         let qp = q.buf.as_ptr();
         let kp = swa_kv.buf.as_ptr();
         let tp = topk_kv.buf.as_ptr();
@@ -9706,16 +9720,32 @@ impl Gpu {
             &mut tw as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(n_heads / 16) as u32, batch_size as u32, 1],
-                [256, 1, 1],
-                lds_bytes as u32,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // Capture-safe launch: the new base graph-captures the prefill, and
+        // the void**-kernarg path records dangling stack pointers that break
+        // on replay. launch_maybe_blob uses the blob path under capture.
+        self.launch_maybe_blob(
+            "deepseek4_attn_swa_topk_batched_wmma",
+            [(n_heads / 16) as u32, batch_size as u32, 1],
+            [256, 1, 1],
+            lds_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(nvp);
+                b.push_ptr(nap);
+                b.push_ptr(op);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(sw);
+                b.push_i32(tw);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
 
     pub fn deepseek4_attn_swa_topk_f32_buf(
