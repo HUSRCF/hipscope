@@ -16890,9 +16890,9 @@ impl Gpu {
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
         let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_wmma_gfx12", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_q8_0_wmma_gfx12",
+            kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
