@@ -10436,6 +10436,13 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
+        // reset() only rewinds n_tokens; the position-indexed decode caches
+        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
+        // turn's residue, which bleeds into this fresh conversation's forward
+        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
+        // unreliable" symptom). Zero them so a fresh conversation reproduces a
+        // freshly-launched daemon's clean, deterministic state.
+        state.zero_decode_caches(gpu);
         m.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
