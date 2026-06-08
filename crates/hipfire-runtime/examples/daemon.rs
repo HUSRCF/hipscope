@@ -2194,12 +2194,14 @@ fn main() {
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
                 let (default_temp, default_top_p) = if m.arch_id == 11 {
-                    // LFM2.5-MoE (11): Liquid's model card recommends specific
-                    // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
-                    // 1.05, set below). Use those exact values, not the generic
-                    // MoE-instruct default — they're tuned for this model and
-                    // keep it on-distribution.
-                    (0.2_f64, 0.80_f64)
+                    // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
+                    // top_k=50, repetition_penalty=1.05. The daemon sampler is
+                    // temp + top_p + repeat_penalty (no user-facing top_k — the
+                    // sample_top_p kernel's top-K is a fixed candidate gather), so
+                    // we apply temp=0.1 + rep=1.05 (set below) and keep a tight
+                    // top_p=0.80; at temp 0.1 the top_k-vs-top_p choice is near
+                    // moot (the distribution is already peaked).
+                    (0.1_f64, 0.80_f64)
                 } else if m.arch_id == 9 || m.arch_id == 10 {
                     // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
                     // models that fall into block-level attractors at lower
@@ -5509,7 +5511,12 @@ fn generate_dflash(
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -6779,7 +6786,12 @@ fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -8122,7 +8134,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -11070,7 +11087,12 @@ fn generate_lfm2moe(
     // ── Prompt build (same two-path branch as the minimax AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -11304,7 +11326,12 @@ fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();

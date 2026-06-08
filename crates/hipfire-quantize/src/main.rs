@@ -5391,6 +5391,38 @@ fn main() {
         None
     };
 
+    // Some checkpoints (e.g. LFM2.5) ship the Jinja chat template in a separate
+    // `chat_template.jinja` file rather than inside tokenizer_config.json. The
+    // daemon extracts its template from `tokenizer_config.chat_template` (then
+    // renders via minijinja); fold the sidecar in when tokenizer_config lacks
+    // one, else the daemon falls back to Plain framing and a chat-tuned model
+    // produces garbage (LFM2.5-350M bring-up, 2026-06-07).
+    let tokenizer_config = {
+        let mut tc = tokenizer_config;
+        let jinja_path = input_dir.join("chat_template.jinja");
+        if jinja_path.exists() {
+            let has_template = tc
+                .as_ref()
+                .and_then(|v| v.get("chat_template"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !has_template {
+                if let Ok(jinja) = std::fs::read_to_string(&jinja_path) {
+                    let n = jinja.len();
+                    let obj = tc.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = obj.as_object_mut() {
+                        map.insert(
+                            "chat_template".to_string(),
+                            serde_json::Value::String(jinja),
+                        );
+                        eprintln!("  embedded chat_template.jinja into tokenizer_config ({n} bytes)");
+                    }
+                }
+            }
+        }
+        tc
+    };
+
     // Read generation_config.json. HF stores some sampler-side defaults
     // here (eos_token_id, pad_token_id, bos_token_id, do_sample, etc.)
     // separately from config.json. For most checkpoints these duplicate
