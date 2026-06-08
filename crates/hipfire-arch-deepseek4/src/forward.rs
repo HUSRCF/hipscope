@@ -4901,10 +4901,18 @@ pub(crate) fn precompute_positions_batched(
             let base = stripe + layer_idx * POS_SLOTS_PER_LAYER;
             host[base] = pos as i32;
             if ratio > 0 {
+                // Default MUST be "start" — `(pos/ratio)*ratio` — to match the
+                // decode path (`fill_pos_array_host`) and the reference ds4
+                // (comp_pos = start of the just-closed window). This previously
+                // defaulted to "mid" (+ ratio/2) while decode defaults to
+                // "start", so the compressed KV was BUILT here with a different
+                // compressor-RoPE phase than it is READ with at decode → far-
+                // context (compressed) recall lost the tail of the prompt.
+                // Keep the named modes identical to `fill_pos_array_host`.
                 let main_rope_pos: i32 = match comp_rope_mode {
                     Some("end") => pos as i32,
-                    Some("start") => ((pos / ratio) * ratio) as i32,
-                    _ => (((pos / ratio) * ratio) + ratio / 2) as i32,
+                    Some("mid") => (((pos / ratio) * ratio) + ratio / 2) as i32,
+                    _ => ((pos / ratio) * ratio) as i32,
                 };
                 let indexer_rope_pos = ((pos / ratio) * ratio) as i32;
                 host[base + 1] = main_rope_pos;
