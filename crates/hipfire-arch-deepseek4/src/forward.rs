@@ -1800,9 +1800,9 @@ pub fn decode_step_body(
         if !skip_ffn {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
             if layer_idx < cfg.num_hash_layers {
-                ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
+                ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, None)?;
             } else {
-                ffn_routed(cfg, weights, state, gpu, layer_idx)?;
+                ffn_routed(cfg, weights, state, gpu, layer_idx, None)?;
             }
         } else {
             // Diagnostic: zero ffn_out to isolate attn contribution to growth.
@@ -1888,13 +1888,38 @@ fn ds4_moe_block(
     cfg: &DeepseekV4Config, weights: &DeepseekV4Weights, state: &mut DeepseekV4State,
     gpu: &mut Gpu, layer_idx: usize, token_id: u32, skip_ffn: bool,
 ) -> Result<(), String> {
+    // Non-EP: routed experts combine into `state.ffn_out` (alongside the
+    // shared expert seeded by `ffn_stub`), and the HC mix folds ffn_out into
+    // `residual_streams` in the same call.
+    ds4_moe_block_core(
+        cfg, weights, state, gpu, layer_idx, token_id, skip_ffn, None, /*do_mix=*/ true,
+    )
+}
+
+/// MoE block core, parameterized for expert-parallel (EP).
+///
+/// - `routed_out = Some(partial)` redirects the routed-expert combine into a
+///   zeroed per-rank partial (`partial = Σ_owned w_k · expert_k`), while the
+///   SHARED expert (`ffn_stub`) still writes `state.ffn_out` replicated on
+///   every rank. The cross-rank all-reduce of `partial` (in the EP executor)
+///   then sums the routed contributions; `ds4_ep_add_into_residual` does
+///   `ffn_out += all_reduced_partial` so each rank ends with `shared + routed`.
+/// - `do_mix = false` defers `hc_ffn_mix` to AFTER the all-reduce (the mix
+///   can't run until the full FFN output is assembled).
+///
+/// `routed_out = None, do_mix = true` is the byte-identical single-GPU path.
+fn ds4_moe_block_core(
+    cfg: &DeepseekV4Config, weights: &DeepseekV4Weights, state: &mut DeepseekV4State,
+    gpu: &mut Gpu, layer_idx: usize, token_id: u32, skip_ffn: bool,
+    routed_out: Option<&GpuTensor>, do_mix: bool,
+) -> Result<(), String> {
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
     if !skip_ffn {
         ffn_stub(cfg, weights, state, gpu, layer_idx)?;
         if layer_idx < cfg.num_hash_layers {
-            ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
+            ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, routed_out)?;
         } else {
-            ffn_routed(cfg, weights, state, gpu, layer_idx)?;
+            ffn_routed(cfg, weights, state, gpu, layer_idx, routed_out)?;
         }
     } else {
         if state.ffn_out.is_none() {
@@ -1908,7 +1933,10 @@ fn ds4_moe_block(
             .memset(&ffn_out.buf, 0, ffn_out.byte_size())
             .map_err(|e| format!("memset ffn_out: {e:?}"))?;
     }
-    hc_ffn_mix(cfg, weights, state, gpu, layer_idx)
+    if do_mix {
+        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+    }
+    Ok(())
 }
 
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
@@ -1929,6 +1957,50 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
     }
     fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
         ds4_moe_block(self.cfg, self.weights, self.state, gpu, self.layer_idx, self.token_id, self.skip_ffn)
+            .map_err(DispatchError::Hip)
+    }
+    fn run_moe_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        routed_out: &GpuTensor,
+        _skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        // EP: run mhc_pre + the SHARED expert (ffn_stub, replicated into
+        // state.ffn_out on every rank) + the ROUTED experts redirected into the
+        // zeroed `routed_out` partial. `hc_ffn_mix` is DEFERRED (do_mix=false)
+        // to `ep_add_into_residual`, which runs after the cross-rank all-reduce
+        // assembles the full routed output. `skip_shared` is intentionally
+        // ignored: DeepSeek's shared expert lives in ffn_out (outside the
+        // all-reduced partial), so replicating it per rank is correct — it is
+        // never summed across ranks.
+        ds4_moe_block_core(
+            self.cfg,
+            self.weights,
+            self.state,
+            gpu,
+            self.layer_idx,
+            self.token_id,
+            self.skip_ffn,
+            Some(routed_out),
+            /*do_mix=*/ false,
+        )
+        .map_err(DispatchError::Hip)
+    }
+    fn ep_add_into_residual(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError> {
+        // ffn_out (shared, replicated) += all-reduced routed partial → full FFN
+        // output, then run the deferred HC mix to fold it into residual_streams.
+        {
+            let ffn_out = self
+                .state
+                .ffn_out
+                .as_ref()
+                .ok_or_else(|| DispatchError::Hip("ep_add_into_residual: ffn_out unset".into()))?;
+            gpu.add_inplace_f32(ffn_out, partial)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
+        hc_ffn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
             .map_err(DispatchError::Hip)
     }
     fn run_proj(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
@@ -2286,7 +2358,7 @@ pub fn mtp_forward(
         /*is_attn=*/ false,
     )?;
     ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
-    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
+    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx, None)?;
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
 
     // ── 7. Capture FULL [hc_mult, hidden] residual stream for chaining ─
@@ -2831,6 +2903,7 @@ fn ffn_routed(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
+    routed_out: Option<&GpuTensor>,
 ) -> Result<(), String> {
     if !env_cache::moe_on() {
         return Ok(());
@@ -2928,6 +3001,13 @@ fn ffn_routed(
         // GEMV + sqrt_softplus (moe_route, above) and the shared expert
         // (ffn_stub) stay model-owned; ffn_stub must have seeded ffn_out before
         // this accumulates into it.
+        //
+        // EP: `routed_out = Some(partial)` redirects the route-scaled
+        // accumulation into a zeroed per-rank partial (so partial holds ONLY
+        // this rank's owned-expert routed contribution); the shared expert
+        // stays in `state.ffn_out` (replicated). The accumulation kernel does
+        // `out += ...`, so a zeroed partial yields exactly the routed sum.
+        let out_target = routed_out.unwrap_or(ffn_out);
         let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
             hidden: cfg.hidden_size,
             mi: im,
@@ -2937,7 +3017,7 @@ fn ffn_routed(
             swiglu_limit: cfg.swiglu_limit,
             batch_size: 1,
             x_rot: ffn_x_rot,
-            ffn_out,
+            ffn_out: out_target,
             scores: scores_dev,
             gate_bias: bias_dev,
             expert_gate_up_ptrs: gate_up_ptrs,
@@ -2986,6 +3066,7 @@ fn ffn_hash_routed(
     gpu: &mut Gpu,
     layer_idx: usize,
     token_id: u32,
+    routed_out: Option<&GpuTensor>,
 ) -> Result<(), String> {
     if !env_cache::moe_on() {
         return Ok(());
@@ -3146,12 +3227,17 @@ fn ffn_hash_routed(
     gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
         .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
 
+    // EP: redirect the route-scaled accumulation into the zeroed partial
+    // (routed-only) instead of state.ffn_out (shared+routed). The down kernel
+    // accumulates `out += w_k · down_k`, so a zeroed partial yields exactly
+    // this rank's owned routed contribution.
+    let out_target = routed_out.unwrap_or(ffn_out);
     gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         w2_ptrs,
         topk_idx_dev,
         topk_w_dev,
         rot_batch,
-        ffn_out,
+        out_target,
         cfg.hidden_size,
         im,
         k_top,
