@@ -1,0 +1,132 @@
+# Ship 6 — Substrate Expert-Parallel (EP) for big MoE on hiptrx
+
+**Goal:** run the two 80 GB MoE models — **MiniMax-M2** (arch 10) and
+**DeepSeek-V4-Flash** (arch 9) — across **hiptrx (4× gfx1201, 32 GB each)**.
+Neither fits one 32 GB card; both are MoE so their VRAM is *expert-weight
+dominated* → sharding experts (EP) is what makes them fit.
+
+This is an **extension of Ship 6** (the forward-as-pipeline lowering), not a new
+ship. It builds directly on the fact that minimax + deepseek4 decode are
+**already lowered** onto the super-op pipeline (the `Moe` super-op is the single
+hook EP needs).
+
+---
+
+## The load-bearing decision: ALL-REDUCE EP (not dispatch/all-to-all EP)
+
+Two ways to do expert parallelism:
+
+| | **All-reduce EP** (chosen) | Dispatch EP (deferred) |
+|---|---|---|
+| Routing | **replicated** on every rank (all ranks compute the same top-k) | replicated top-k, then route tokens to owning rank |
+| Expert compute | each rank runs its **owned** experts; non-owned slots read a **shared zero buffer** → contribute 0 | each rank runs only the tokens routed to it |
+| Comms | **1 dense `all_reduce_sum_f32` of `[dim]`** per MoE layer | all-to-all dispatch + all-to-all combine |
+| Determinism | **byte-deterministic** (fixed-order dense sum) | harder (variable token counts per rank) |
+| Compute waste | each rank evaluates all *k* selected slots, most zeroed (decode: *k*=6–8 tiny GEMVs → negligible) | none |
+| Complexity | **low** — proven in the prototype (Stage 3e, qwen3.5-A3B, validated TP=2≡TP=1) | high — new all-to-all kernels + token bookkeeping |
+| VRAM | experts/N per card (non-owned freed; shared zero buffer ~1 expert) | same |
+
+For the **decode** path (memory-bound, 1 token, tiny expert GEMVs) the
+all-reduce design's compute waste is irrelevant and it is dramatically simpler
+and already proven. Dispatch EP is the eventual perf play for prefill/throughput
+— **deferred**. This dissolves Agent C's "needs all-to-all" wrinkles: minimax's
+sigmoid+bias and deepseek4's hash-routing run **replicated**, no dispatch.
+
+### Replicated attention + KV (v1)
+Attention/dense/norm/recurrent/conv super-ops run **replicated** on every rank
+(full weights, full KV, identical input → bit-identical output). This **skips
+the entire dense-TP attention-sharding effort** (FaPhase seam, wo col-gather,
+AWQ replicate-vs-slice, DeltaNet head sharding — Stages 3a/3b/3c/3f of
+`ship6-tp-port.md`, the "HIGHEST risk" work). Cost: KV is replicated N× (no KV
+savings) and attention compute is replicated N× (wasteful but correct; fine for
+decode). Sharding attention/KV is a later perf/long-context follow-on.
+
+---
+
+## Why it's a thin wrapper, not a rewrite
+
+`run_layer_program` (`crates/hipfire-dispatch/src/pipeline/superop.rs:296`)
+dispatches each super-op to `ForwardBindings`. **EP only diverges at the `Moe`
+op.** Each arch's `run_moe` already implements its routing correctly
+single-GPU:
+- qwen35 `Qwen35Bindings::run_moe` (qwen35.rs:12546) → `run_moe_decode`
+  (pipeline/mod.rs:207): softmax top-k, shared + routed both accumulate into
+  `x_residual`.
+- minimax `MinimaxBindings::run_moe` (minimax/forward.rs:664) →
+  `minimax_moe_block`: sigmoid+bias top-k, routed combine into `state.h`,
+  **no shared expert**.
+- deepseek4 `Deepseek4Bindings::run_moe` (deepseek4/forward.rs:1930) →
+  `ds4_moe_block`: shared expert seeds a **separate `ffn_out`**, routed
+  (score-routed L≥`num_hash_layers`, or hash-routed L<that) accumulate into
+  `ffn_out`, then `hc_ffn_mix` into the residual.
+
+EP = (1) **load-time**: keep only `shard.owns_expert(rank,e)` experts, point
+non-owned expert pointers at a shared zero buffer (prototype `shard_moe_experts`
+generalizes — it just rewrites the `[2·n_exp]` device pointer table); (2)
+**forward**: redirect the routed combine into a **zeroed `[dim]` partial**
+(not the residual), `all_reduce_sum_f32` the partial, add it into the residual
+once; (3) **shared expert** (if any) computed on **rank 0 only** (`skip_shared`
+on rank>0) so it isn't summed N×; attention residual stays in the residual
+buffer (replicated, never in the all-reduced partial → no double-count).
+
+---
+
+## Parallelism matrix (TP / PP / EP) per model
+
+VRAM measured by tensor-byte summing on hipx; EP fit = experts/4 (sharded) +
+shared + non-expert + KV (all replicated) per card, 4× gfx1201 32 GB.
+
+| Model | On-disk | MoE shape | Routing | Per-card under EP/4 | Fits 4×32? | Needs | Notes |
+|---|---|---|---|---|---|---|---|
+| **qwen3.6-35B-A3B** (arch 6) | 17.4 GB | 256 exp, top-8, ~0 shared (tiny gate) | softmax + norm_topk | ~7 GB | n/a (fits **1 card**) | EP **optional** | Prototype-proven EP arch. Use as the **plumbing validation** (TP=2 on 2 cards, reference exists). |
+| **MiniMax-M2** (arch 10) | 80.3 GB | 256 exp, top-8, **0 shared** | **sigmoid + per-expert bias[256]** | experts 76.3/4≈19 + non-exp 4.0 + KV ~4.4 ≈ **~28 GB** | **YES** | EP **required** | Cleanest EP shape (no shared → no skip_shared). Heaviest KV (62 full-attn layers, ~4.4 GB@32k, replicated). |
+| **DeepSeek-V4-Flash** (arch 9) | 80.3 GB | 256 exp, top-6, **1 shared** | sqrtsoftplus + noaux bias; **L0-2 hash-routed** | experts 72.6/4≈18 + shared 1.1 + MLA/non-exp 6.6 ≈ **~26 GB** | **YES** | EP **required** | Hash layers trivial under all-reduce EP (replicated lookup). Shared+MLA replicated. MLA+SWA-128 → small KV. `routed_scaling_factor`. |
+
+**Strategy summary:**
+- **EP** = the primary lever for the two 80 GB models (expert-dominated VRAM). All-reduce variant.
+- **PP** (layer split) already exists but is **qwen3.5-only** (daemon allowlist arch 5/6; minimax hard-rejected at daemon.rs:3786). An alternative/complement to EP (e.g. EP-within + PP-across) and the fallback if all-reduce bandwidth bites; generalizing PP = same "lower onto substrate" pattern (assign layer-bands to devices + boundary-copy between super-ops). Lower priority than EP for the goal.
+- **TP (dense weight shard)** = the qwen35 `ship6-tp-port.md` Stages 3a–3f (FaPhase, weight slicing). **Not needed to fit these models.** Deferred to a perf/latency track.
+
+---
+
+## Concrete substrate-EP change list
+
+Builds on Stage 1+2 (DONE, committed cf6ad952): `tp_shard.rs` (ExpertAssign /
+owns_expert / experts_on_rank), `rccl.rs`, `Gpus::{init_tp, ensure_rccl,
+all_reduce_sum_f32}`, `Stream::raw_ptr`, `config.tp_use_rccl`.
+
+| # | Change | File(s) | Effort |
+|---|--------|---------|--------|
+| E1 | Multi-rank EP executor: `run_layer_program_ep(ranks, gpus, program, ...)` — step all ranks through each op; at `Moe` call each rank's EP partial, then `all_reduce_sum_f32`, then add-into-residual; all other ops run replicated per rank. `RankCtx { bindings, routed_partial, ctx }`. | `crates/hipfire-dispatch/src/pipeline/superop.rs` (+ runtime glue) | M |
+| E2 | Per-rank zeroed routed-partial scratch (`[dim]` decode; `[N×dim]` later for batched). | per-arch State/Scratch | S |
+| E3 | EP `run_moe` per arch: redirect routed combine → partial; `skip_shared` on rank>0; (deepseek4) skip all-reduce on hash-only-but-shared-only? no — hash layers still route experts, keep all-reduce; only pure-shared layers skip. | qwen35 `run_moe_decode`(+`MoeParams.routed_out`), minimax `minimax_moe_block`, deepseek4 `ds4_moe_block`/`ffn_routed` | M each |
+| E4 | Load-time expert sharding (generalize prototype `shard_moe_experts`): keep owned experts, zero-buffer the rest, rebuild pointer tables, free non-owned (+AWQ sidecar). | runtime + per-arch weight load | M |
+| E5 | Replicated full-model load across N ranks (`init_tp` + per-rank `load_weights` then E4 shard). | runtime weight-load path | M |
+| E6 | Prefill for the MVP = run the EP **decode** path token-by-token to populate KV on all ranks (correct, slow). Batched-prefill EP (`forward_prefill_chunk` EP, all-reduce `[N×dim]`) is a **perf follow-on** (ties into the prefill-lowering track). | runtime driver | S (MVP) / L (batched) |
+| E7 | Parity gate: TP=N decode ≡ TP=1 (argmax + max-abs-diff, gold 7.5e-7) on hiptrx devices 0+1; coherence-gate on the EP output. | examples / gate scripts | M |
+
+**Explicitly NOT needed (vs dense-TP plan):** FaPhase seam, `run_fa_layer_body`
+re-seam, wo col-gather, AWQ replicate-vs-slice, attention/DeltaNet weight
+slicing, all-to-all dispatch kernels.
+
+---
+
+## Sequencing (de-risk plumbing → generalize → complexity)
+
+1. **qwen3.6-A3B EP** — port the prototype's all-reduce EP onto the *current*
+   substrate. Validates E1/E2/E4/E5/E7 (executor + RCCL + load-shard + parity)
+   on the arch that **has a reference** and **fits one card** (so TP=2 is pure
+   validation). The one new bit is redirecting current `run_moe_decode`'s
+   shared+routed-in-`x_residual` to a partial (E3 qwen35).
+2. **MiniMax EP** — cleanest MoE shape (no shared expert). First *goal* model
+   on hiptrx. Generalizes E3 to a non-prototype arch (sigmoid+bias routing
+   already in `minimax_moe_block`).
+3. **DeepSeek-V4 EP** — most moving parts (shared + hash + score + MLA +
+   `routed_scaling_factor`), but hash is trivial under all-reduce EP and routed
+   is already isolated in `ffn_out`. Second goal model.
+
+Each step gates on TP=N≡TP=1 parity + coherence on hiptrx 0+1 before the next.
+
+**Validation boxes:** hiptrx devices 0+1 (gfx1201) for TP=2 parity; scale to
+0,1,2,3 for the full 4-way fit of the 80 GB models. hipx cannot do TP=2
+(single usable big-VRAM device). k9lin = single-GPU (TP=1 reference only).
