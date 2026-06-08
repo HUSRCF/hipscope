@@ -2078,6 +2078,115 @@ fn decode_step_body_lowered(
     Ok(Vec::new())
 }
 
+// ───────────────────────── Ship 6 substrate-EP (DeepSeek-V4) ─────────────────
+//
+// Mirror of the qwen35 / MiniMax EP wiring. DeepSeek packs all routed experts
+// into ONE blob per projection (too big to load-then-free on a 32 GB card), so
+// sharding is done at LOAD time: `DeepseekV4::load_weights_sharded(.., shard,
+// rank)` uploads only the rank-owned experts (non-owned → zeroed gate_up dummy).
+// UNLIKE MiniMax, DeepSeek has a SHARED expert (ffn_stub) and the HC FFN mix:
+//   - the shared expert stays replicated in `state.ffn_out` (every rank),
+//   - only the ROUTED combine crosses ranks (redirected into the per-rank
+//     partial, all-reduced), and
+//   - `hc_ffn_mix` is DEFERRED to `ep_add_into_residual` (runs after the
+//     all-reduce assembles `ffn_out = shared + routed`).
+// See `Deepseek4Bindings::run_moe_ep` / `ep_add_into_residual` + `ds4_moe_block_core`.
+// MLA attention (latent KV) is replicated per rank → no attention-sharding seam.
+
+/// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
+///
+/// Mirror of `decode_step` + `decode_step_body_lowered`, fanned across
+/// `gpus.devices.len()` ranks: every rank replicates embed / positions /
+/// token-id / residual-stream init and the per-layer `[Attend, Moe]` program
+/// (Attend replicated, Moe all-reduce-EP'd) via
+/// [`hipfire_runtime::ep::run_layer_program_ep`], then final norm + head run on
+/// rank 0 → `state_per_rank[0].logits` (caller downloads). Every device must
+/// have an `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]); peer
+/// access enabled for the fast peer-direct all-reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_ep(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n, "ds4 forward_ep: weights_per_rank len");
+    assert_eq!(state_per_rank.len(), n, "ds4 forward_ep: state_per_rank len");
+    assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
+    let hidden = cfg.hidden_size;
+    let skip_ffn = env_cache::skip_ffn();
+
+    // 1. Per-rank embed + position + token-id staging + residual-stream init
+    //    (replicated, deterministic functions of the token → bit-identical
+    //    across ranks). Mirrors `decode_step`'s preamble.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_ep bind {r}: {e:?}"))?;
+        precompute_positions(cfg, &mut state_per_rank[r], &mut gpus.devices[r], position)?;
+        precompute_token_id(&mut state_per_rank[r], &mut gpus.devices[r], token)?;
+        init_residual_streams(cfg, &weights_per_rank[r], &mut state_per_rank[r], &mut gpus.devices[r], token)?;
+    }
+
+    // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd). Rebuild
+    //    the N per-rank bindings each layer (disjoint `iter_mut` mutable state
+    //    borrows), exactly like the single-GPU lowered loop advances per layer.
+    let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    let t_layers = std::time::Instant::now();
+    let program = ds4_lower_program();
+    for l in 0..cfg.num_hidden_layers {
+        let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
+        for (r, st) in state_per_rank.iter_mut().enumerate() {
+            binds.push(Deepseek4Bindings {
+                cfg,
+                weights: &weights_per_rank[r],
+                state: st,
+                layer_idx: l,
+                position,
+                token_id: token,
+                skip_ffn,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+            .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
+    }
+
+    // 3. Final norm + head on rank 0 → state_per_rank[0].logits.
+    {
+        gpus.devices[0]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_ep bind0: {e:?}"))?;
+        final_norm_and_head(cfg, &weights_per_rank[0], &mut state_per_rank[0], &mut gpus.devices[0])?;
+    }
+
+    let layers_ms = t_layers.elapsed().as_secs_f64() * 1000.0;
+    // 4. Sync every rank (work ran on active_streams; host logits read races otherwise).
+    let t_sync = std::time::Instant::now();
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_ep sync bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("ds4 forward_ep sync {r}: {e:?}"))?;
+    }
+    if timing {
+        eprintln!(
+            "EP-DECODE-TIMING: layers(host)={layers_ms:.2} ms  final-sync(gpu)={:.2} ms",
+            t_sync.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    for s in state_per_rank.iter_mut() {
+        s.n_tokens += 1;
+    }
+    Ok(())
+}
+
 /// DeepSeek V4 Multi-Token Prediction (MTP) forward step — DeepSeek V3 §4.
 ///
 /// Predicts the **next-next** token given:
