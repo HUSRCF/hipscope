@@ -110,15 +110,19 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 )?;
             }
 
-            // 3. All-reduce-sum the partials across ranks. Peer-direct (P2P
-            //    copy + add) by DEFAULT: RCCL's per-collective latency dominates
-            //    deep decode (e.g. MiniMax's 62 layers = 62 all-reduces/token),
-            //    while peer-direct is ~free. Opt back to RCCL with
-            //    HIPFIRE_EP_PEER_ALLREDUCE=0 (cached — no per-layer getenv).
+            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
+            //    Decode stays on RCCL: its tiny per-token reduce is already fast
+            //    (NOT the bottleneck — measured 51.4 RCCL vs 48.0 peer-direct on
+            //    MiniMax 62-layer decode), peer-direct's per-layer wait_boundary
+            //    host-sync only adds overhead, and RCCL preserves qwen35's
+            //    validated byte-identical decode. Peer-direct is the win for
+            //    PREFILL (large batched reduce), where RCCL is ~40 ms/call —
+            //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
+            //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_peer = *PEER_DECODE
-                .get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0"));
+                .get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"));
             if use_peer {
                 gpus.all_reduce_sum_f32_peer(&refs, residual_dim).map_err(hip_err)?;
             } else {
