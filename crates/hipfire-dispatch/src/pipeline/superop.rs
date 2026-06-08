@@ -40,7 +40,7 @@ use crate::context::DispatchCtx;
 use crate::types::{KernelKey, PipelineOp};
 use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::types::DispatchError;
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
 /// for the model's lifetime). The executor maps this to the live `&GpuTensor`.
@@ -282,6 +282,73 @@ pub trait ForwardBindings {
     fn run_recurrent(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
     fn run_conv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
     fn run_escape(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding, kind: EscapeKind) -> Result<(), DispatchError>;
+
+    // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
+    // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
+    // DeepSeek-V4) override these. Non-MoE arches and the single-GPU path never
+    // call them, so the defaults keep every existing `ForwardBindings` impl
+    // compiling unchanged.
+
+    /// EP variant of [`run_moe`](Self::run_moe): the routed combine + shared
+    /// down accumulate into `routed_out` (a **zeroed** per-rank partial the EP
+    /// executor all-reduces across ranks), and `skip_shared` gates the
+    /// shared-expert down to rank 0 (so the replicated shared expert is summed
+    /// once). The router/top-k still run replicated; non-owned experts read the
+    /// load-time zero-dummy weights → contribute 0 to the partial.
+    fn run_moe_ep(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _routed_out: &GpuTensor,
+        _skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_moe_ep-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// EP: add the all-reduced routed partial into this rank's residual stream
+    /// (the arch-specific buffer that holds the post-attention residual). Called
+    /// by the EP executor once, after the MoE all-reduce.
+    fn ep_add_into_residual(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_add_into_residual-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+}
+
+/// Dispatch a SINGLE super-op to its [`ForwardBindings`] method. Extracted from
+/// [`run_layer_program`] so the EP executor (`hipfire_runtime::ep`) can drive
+/// the same per-op dispatch for the replicated (non-MoE) ops while special-
+/// casing `Moe` with an all-reduce. Total match over `SuperOpKind`.
+pub fn dispatch_super_op<B: ForwardBindings>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &SuperOp,
+    bindings: &mut B,
+) -> Result<(), DispatchError> {
+    match op.kind {
+        SuperOpKind::Proj => bindings.run_proj(gpu, ctx, &op.binding)?,
+        SuperOpKind::ResidualGemv => bindings.run_residual_gemv(gpu, ctx, &op.binding)?,
+        SuperOpKind::Norm => bindings.run_norm(gpu, ctx, &op.binding)?,
+        SuperOpKind::Attend => bindings.run_attend(gpu, ctx, &op.binding)?,
+        SuperOpKind::Moe => bindings.run_moe(gpu, ctx, &op.binding)?,
+        SuperOpKind::Recurrent => bindings.run_recurrent(gpu, ctx, &op.binding)?,
+        SuperOpKind::Conv => bindings.run_conv(gpu, ctx, &op.binding)?,
+        SuperOpKind::Escape(k) => bindings.run_escape(gpu, ctx, &op.binding, k)?,
+    }
+    Ok(())
 }
 
 /// Execute one lowered layer program: a tight, branch-predictable loop over the
@@ -300,16 +367,7 @@ pub fn run_layer_program<B: ForwardBindings>(
     bindings: &mut B,
 ) -> Result<(), DispatchError> {
     for op in program {
-        match op.kind {
-            SuperOpKind::Proj => bindings.run_proj(gpu, ctx, &op.binding)?,
-            SuperOpKind::ResidualGemv => bindings.run_residual_gemv(gpu, ctx, &op.binding)?,
-            SuperOpKind::Norm => bindings.run_norm(gpu, ctx, &op.binding)?,
-            SuperOpKind::Attend => bindings.run_attend(gpu, ctx, &op.binding)?,
-            SuperOpKind::Moe => bindings.run_moe(gpu, ctx, &op.binding)?,
-            SuperOpKind::Recurrent => bindings.run_recurrent(gpu, ctx, &op.binding)?,
-            SuperOpKind::Conv => bindings.run_conv(gpu, ctx, &op.binding)?,
-            SuperOpKind::Escape(k) => bindings.run_escape(gpu, ctx, &op.binding, k)?,
-        }
+        dispatch_super_op(gpu, ctx, op, bindings)?;
     }
     Ok(())
 }
