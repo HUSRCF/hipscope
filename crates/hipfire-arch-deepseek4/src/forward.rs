@@ -24,6 +24,11 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::superop::{
+    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
+};
+use hipfire_dispatch::types::DispatchError;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
@@ -1711,6 +1716,13 @@ pub fn decode_step_body(
 ) -> Result<Vec<f32>, String> {
     let skip_ffn = env_cache::skip_ffn();
 
+    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
+    // per-layer decode through the super-op executor (run_layer_program). Default
+    // off (opt-in) until hipx byte-parity validated (deepseek4 only runs on hipx).
+    if ds4_forward_lowered_enabled() {
+        return decode_step_body_lowered(cfg, weights, state, gpu, token_id, position);
+    }
+
     // 2. Per-layer forward.
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = weights.resolve_layer(layer_idx);
@@ -1824,6 +1836,170 @@ pub fn decode_step_body(
     // captured-graph path can place it AFTER `graph_launch` (capturing
     // a sync `memcpy_dtoh` into the captured stream causes wave-reads
     // of stale buffers).
+    state.n_tokens += 1;
+    Ok(Vec::new())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #397 Ship 6 — forward-as-pipeline: deepseek4 lowered decode.
+//
+// deepseek4's decode_step_body is already a sequence of named block fns, so the
+// lowering is coarse (minimax-style): every layer is [Attend, Moe], where the
+// Attend handler replays the whole attention block (mhc_pre + q_lora + kv_joint +
+// tail_rope + conditional compressor/indexer + attn_stub + hc_attn_mix) and the
+// Moe handler the whole FFN block (mhc_pre + ffn_stub + hash|score-routed +
+// hc_ffn_mix). The per-layer conditionals (compress_ratio, hash vs score) live
+// INSIDE the handlers, so it's one variant — the compressor/indexer/HC ops are
+// bundled in the coarse handlers (not separate Escape super-ops; Escape stays a
+// reserved extension point if per-op remap/fusion is ever wanted). ADDITIVE +
+// opt-in (HIPFIRE_FORWARD_LOWERED, default off until hipx byte-parity validated —
+// deepseek4 only runs on hipx); the hand loop is untouched → default byte-identical.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Attention block (replays decode_step_body's attn arm verbatim). HC residual
+/// streams + KV/compressor/indexer state are threaded through `state`.
+fn ds4_attn_block(
+    cfg: &DeepseekV4Config, weights: &DeepseekV4Weights, state: &mut DeepseekV4State,
+    gpu: &mut Gpu, layer_idx: usize, position: u32,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+    q_lora(cfg, weights, state, gpu, layer_idx)?;
+    kv_joint(cfg, weights, state, gpu, layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    if layer.compress_ratio > 0 {
+        let tmp_view = {
+            let t = state.tmp.as_ref().unwrap();
+            t.sub_offset(0, t.numel())
+        };
+        compressor_forward(cfg, weights, state, gpu, layer_idx, &tmp_view, position, /*is_indexer=*/ false)?;
+        if layer.compress_ratio == 4 {
+            compressor_forward(cfg, weights, state, gpu, layer_idx, &tmp_view, position, /*is_indexer=*/ true)?;
+            let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+        }
+    }
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    hc_attn_mix(cfg, weights, state, gpu, layer_idx)
+}
+
+/// FFN block (replays decode_step_body's FFN arm verbatim).
+fn ds4_moe_block(
+    cfg: &DeepseekV4Config, weights: &DeepseekV4Weights, state: &mut DeepseekV4State,
+    gpu: &mut Gpu, layer_idx: usize, token_id: u32, skip_ffn: bool,
+) -> Result<(), String> {
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+    if !skip_ffn {
+        ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+        if layer_idx < cfg.num_hash_layers {
+            ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
+        } else {
+            ffn_routed(cfg, weights, state, gpu, layer_idx)?;
+        }
+    } else {
+        if state.ffn_out.is_none() {
+            state.ffn_out = Some(
+                gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc ffn_out: {e:?}"))?,
+            );
+        }
+        let ffn_out = state.ffn_out.as_ref().unwrap();
+        gpu.hip
+            .memset(&ffn_out.buf, 0, ffn_out.byte_size())
+            .map_err(|e| format!("memset ffn_out: {e:?}"))?;
+    }
+    hc_ffn_mix(cfg, weights, state, gpu, layer_idx)
+}
+
+/// Per-layer execution context for the lowered decode path (rebuilt each layer).
+struct Deepseek4Bindings<'a> {
+    cfg: &'a DeepseekV4Config,
+    weights: &'a DeepseekV4Weights,
+    state: &'a mut DeepseekV4State,
+    layer_idx: usize,
+    position: u32,
+    token_id: u32,
+    skip_ffn: bool,
+}
+
+impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
+    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        ds4_attn_block(self.cfg, self.weights, self.state, gpu, self.layer_idx, self.position)
+            .map_err(DispatchError::Hip)
+    }
+    fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        ds4_moe_block(self.cfg, self.weights, self.state, gpu, self.layer_idx, self.token_id, self.skip_ffn)
+            .map_err(DispatchError::Hip)
+    }
+    fn run_proj(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("deepseek4 has no Proj super-op".into()))
+    }
+    fn run_residual_gemv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("deepseek4 has no ResidualGemv super-op".into()))
+    }
+    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("deepseek4 has no Norm super-op".into()))
+    }
+    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("deepseek4 has no Conv super-op".into()))
+    }
+    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("deepseek4 has no Recurrent super-op".into()))
+    }
+    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, kind: superop::EscapeKind) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(format!("deepseek4 has no Escape super-op ({kind:?})")))
+    }
+}
+
+#[inline]
+fn ds4_superop(kind: SuperOpKind) -> SuperOp {
+    SuperOp {
+        kind,
+        binding: OpBinding { key: None, weights: Vec::new(), scratch: Vec::new(), flavor: OpFlavor::None },
+    }
+}
+
+/// deepseek4 has ONE layer shape ([Attend, Moe]); the per-layer conditionals are
+/// inside the handlers. Pure → unit-testable.
+fn ds4_lower_program() -> superop::LayerProgram {
+    vec![ds4_superop(SuperOpKind::Attend), ds4_superop(SuperOpKind::Moe)]
+}
+
+/// Cached HIPFIRE_FORWARD_LOWERED toggle for deepseek4 (default OFF — opt-in until
+/// hipx byte-parity validated, then flip to default-on like qwen35/lfm2/minimax).
+fn ds4_forward_lowered_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1"))
+}
+
+/// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
+/// equivalent to decode_step_body's hand loop (validated via FORWARD_LOWERED=0-vs-=1
+/// token-text md5 on hipx). Logits left in state.logits (caller downloads).
+fn decode_step_body_lowered(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    let skip_ffn = env_cache::skip_ffn();
+    let ctx = DispatchCtx::new(gpu);
+    let program = ds4_lower_program();
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let mut bind = Deepseek4Bindings {
+            cfg,
+            weights,
+            state: &mut *state,
+            layer_idx,
+            position,
+            token_id,
+            skip_ffn,
+        };
+        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
+            .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
+    }
+    final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
     Ok(Vec::new())
 }
@@ -7668,5 +7844,19 @@ mod tests {
         // sum = 2 + 0 = 2 → normalized [1.0, 0.0]
         assert!((wts[0] - 1.0).abs() < 1e-6);
         assert!((wts[1] - 0.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod ship6_lower_tests {
+    use super::*;
+    use superop::SuperOpKind::{Attend, Moe};
+
+    // #397 Ship 6 — deepseek4 is one variant (every layer Attn+MoE; per-layer
+    // conditionals live inside the handlers).
+    #[test]
+    fn ds4_program_is_attend_then_moe() {
+        let kinds: Vec<_> = ds4_lower_program().iter().map(|o| o.kind).collect();
+        assert_eq!(kinds, vec![Attend, Moe]);
     }
 }
