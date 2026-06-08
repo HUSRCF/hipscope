@@ -16858,7 +16858,11 @@ impl Gpu {
             kernels::GEMM_Q8_0_WMMA_GFX12_SRC,
             "gemm_q8_0_wmma_gfx12",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_f16_ptr = if matches!(x.dtype, DType::F16) {
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut a_p = a.buf.as_ptr();
         let mut xp = x_f16_ptr;
