@@ -16,6 +16,7 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
@@ -12210,6 +12211,81 @@ fn moe_ffn_dispatch_ep(
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         moe_ffn_decode_impl(gpu, ffn, &s.tmp, x, config, &refs, false, Some(routed_out), skip_shared)
     }
+}
+
+/// EP (Ship 6 substrate-EP, ported from tp-mtp-prototype Stage 3e): shard a MoE
+/// layer's routed experts to `rank`. Frees the non-owned experts (the memory
+/// win), compacts owned to the front of `ffn.experts` (so `experts[0]` stays a
+/// valid shared-AWQ representative for the batched silu/rotate helpers), and
+/// rebuilds the `[2·n_exp]` device pointer tables: owned global id → its
+/// (compacted) buffer ptr; **non-owned → a shared ZEROED gate_up buffer**.
+/// Zeroed quant bytes dequant to +0.0 → the non-owned expert's gate_up output
+/// is 0 → silu·mul = 0 → rot = 0 → down output 0, so it contributes nothing
+/// through `moe_down_combine` WITHOUT any masking kernel. (The non-owned down
+/// ptr is irrelevant — its input rot is already 0 — so it reuses
+/// `experts[0].down`.) Router / shared expert / attention stay full (replicated
+/// in EP v1). The zero buffer is leaked for v1 (lives until teardown) to avoid
+/// threading a lifetime field through `Qwen35Weights`.
+pub fn shard_moe_experts(
+    gpu: &mut Gpu,
+    ffn: &mut MoeFfnWeights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(
+        ffn.experts.len(), n_exp,
+        "shard_moe_experts expects a full-loaded expert Vec (paged EP is unsupported in v1)",
+    );
+    // Free non-owned experts; compact owned to the front, recording global→local.
+    let old = std::mem::take(&mut ffn.experts);
+    let mut compacted: Vec<ExpertWeights> = Vec::with_capacity(shard.experts_per_rank(n_exp));
+    let mut local_of_global = vec![usize::MAX; n_exp];
+    for (e, ew) in old.into_iter().enumerate() {
+        if shard.owns_expert(rank, e) {
+            local_of_global[e] = compacted.len();
+            compacted.push(ew);
+        } else {
+            let _ = gpu.free_tensor(ew.gate_up.buf);
+            if let Some(s) = ew.gate_up.awq_scale { let _ = gpu.free_tensor(s); }
+            let _ = gpu.free_tensor(ew.down.buf);
+            if let Some(s) = ew.down.awq_scale { let _ = gpu.free_tensor(s); }
+        }
+    }
+    assert!(
+        !compacted.is_empty(),
+        "shard_moe_experts: rank {rank} owns no experts (n_exp={n_exp}, tp={})",
+        shard.tp_size,
+    );
+
+    // Shared zeroed gate_up buffer for non-owned slots (same byte size as a real
+    // expert's gate_up). LEAKED (mem::forget) so the ptr stays valid for the
+    // model's lifetime without a Qwen35Weights field — v1 TODO: own it properly.
+    let gu_bytes = compacted[0].gate_up.buf.buf.size();
+    let zero_gu = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
+    let dummy_gu = zero_gu.buf.as_ptr() as u64;
+    let dummy_dn = compacted[0].down.buf.buf.as_ptr() as u64; // rot=0 ⇒ output 0 regardless
+    std::mem::forget(zero_gu);
+
+    // Rebuild the [2·n_exp] u64 pointer tables (8 B/ptr = 2 F32 slots).
+    let mut gu = vec![0u64; n_exp];
+    let mut dn = vec![0u64; n_exp];
+    for e in 0..n_exp {
+        if shard.owns_expert(rank, e) {
+            let li = local_of_global[e];
+            gu[e] = compacted[li].gate_up.buf.buf.as_ptr() as u64;
+            dn[e] = compacted[li].down.buf.buf.as_ptr() as u64;
+        } else {
+            gu[e] = dummy_gu;
+            dn[e] = dummy_dn;
+        }
+    }
+    let gu_b: Vec<u8> = gu.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
+    gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+    ffn.experts = compacted;
+    Ok(())
 }
 
 /// TriAttention tap helper (inline from original forward).
