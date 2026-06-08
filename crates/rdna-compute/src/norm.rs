@@ -1369,6 +1369,9 @@ impl Gpu {
         gate: &GpuTensor, beta: &GpuTensor,
         s_q8: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
         n_tokens: usize, n_heads: usize, head_dim: usize,
+        // Optional f16 error-feedback residual (sigma-delta). Some ⇒ deterministic
+        // requant carrying the quant error; None ⇒ legacy stochastic rounding.
+        ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
@@ -1386,6 +1389,7 @@ impl Gpu {
         // Per-launch monotonic frame for the Q8 state stochastic-rounding
         // dither (data-INDEPENDENT entropy; see GATED_DELTA_NET_Q8 kernel).
         let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
@@ -1393,6 +1397,7 @@ impl Gpu {
             &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1405,6 +1410,7 @@ impl Gpu {
                 b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
                 b.push_ptr(scp); b.push_ptr(op);
                 b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                b.push_ptr(efp);
                 b
             },
         );
@@ -1443,6 +1449,10 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        // Optional f16 error-feedback residual; see gated_delta_net_q8. The
+        // batched path requants per token in-launch, so EF carries token-to-token
+        // (and chunk-boundary) error — consistent with the per-token decode/replay.
+        ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
@@ -1465,6 +1475,7 @@ impl Gpu {
         // seed it would have gotten from n_tokens sequential per-token
         // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
         let mut fr = GDN_REQUANT_FRAME.fetch_add(n_tokens as u32, std::sync::atomic::Ordering::Relaxed) as i32;
+        let mut efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -1478,6 +1489,7 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut fr as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
         ];
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1494,6 +1506,7 @@ impl Gpu {
                 b.push_ptr(gp); b.push_ptr(bp);
                 b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
                 b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                b.push_ptr(efp);
                 b
             },
         );
