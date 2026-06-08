@@ -13054,19 +13054,28 @@ pub fn forward_prefill_batch_ep(
 
     let ep_timing = std::env::var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
     let ep_skip_ar = std::env::var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
-    // Peer-direct all-reduce (bypass RCCL): for 2 ranks, sum partials via direct
-    // P2P copy + local add instead of ncclAllReduce, which costs ~40 ms/call here
-    // regardless of proto/channel/socket config. Requires peer access (enabled).
-    let ep_peer_ar = std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").is_ok() && n_rank == 2;
-    // Per-rank temp buffers for the peer-direct reduce (read the peer's ORIGINAL
-    // partial before any local write, avoiding a cross-device R/W race).
-    let peer_tmp: Vec<GpuTensor> = if ep_peer_ar {
-        let mut v = Vec::with_capacity(n_rank);
+    // Peer-direct all-reduce (bypass RCCL): sum the routed partials via direct
+    // P2P copy + local add instead of ncclAllReduce, which costs ~40 ms/call on
+    // hiptrx (gfx1201, PCIe) regardless of proto/channel/socket config — vs ~1 ms
+    // total for the peer path. Requires peer access (the EP load path enables it).
+    // DEFAULT ON; opt back to RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0.
+    let ep_peer_ar = std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
+    // Per-rank peer temps: peer_tmp[r] holds (n_rank-1) buffers, one per OTHER
+    // rank, so phase 1 can copy every peer's ORIGINAL partial before any phase-2
+    // local write (avoids a cross-device read/write race). Sized to the full
+    // partial allocation; the reduce uses the [n·dim] prefix.
+    let partial_elems = partials[0].shape.iter().product::<usize>();
+    let peer_tmp: Vec<Vec<GpuTensor>> = if ep_peer_ar && n_rank > 1 {
+        let mut all = Vec::with_capacity(n_rank);
         for r in 0..n_rank {
             gpus.devices[r].bind_thread()?;
-            v.push(gpus.devices[r].zeros(&[partials[0].shape.iter().product::<usize>()], DType::F32)?);
+            let mut row = Vec::with_capacity(n_rank - 1);
+            for _ in 0..(n_rank - 1) {
+                row.push(gpus.devices[r].zeros(&[partial_elems], DType::F32)?);
+            }
+            all.push(row);
         }
-        v
+        all
     } else {
         Vec::new()
     };
@@ -13143,21 +13152,36 @@ pub fn forward_prefill_batch_ep(
         if is_moe && !ep_skip_ar {
             let t_a = std::time::Instant::now();
             if ep_peer_ar {
-                // Peer-direct 2-rank reduce: copy each rank's ORIGINAL partial to
-                // the other rank's temp (P2P), barrier, then local add. Avoids
-                // RCCL's ~40 ms/call collective overhead.
+                // Peer-direct N-rank reduce (bypass RCCL): phase 1 copies every
+                // OTHER rank's ORIGINAL partial into a local temp (all reads, no
+                // writes yet); barrier; phase 2 adds the peer temps into the local
+                // partial. All-reads-before-writes ⇒ no cross-device R/W race.
+                // ~1 ms total vs RCCL's ~40 ms/call. n_rank==1 ⇒ no-op (identity).
                 let bytes = n * dim * 4;
-                let evt_a = gpus.boundary_copy(1, 0, &partials[1].buf, &peer_tmp[0].buf, bytes)
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
-                let evt_b = gpus.boundary_copy(0, 1, &partials[0].buf, &peer_tmp[1].buf, bytes)
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
-                gpus.wait_boundary(evt_a).map_err(|e| HipError::new(0, &e.to_string()))?;
-                gpus.wait_boundary(evt_b).map_err(|e| HipError::new(0, &e.to_string()))?;
+                let mut evts = Vec::with_capacity(n_rank * (n_rank - 1));
+                for r in 0..n_rank {
+                    let mut slot = 0usize;
+                    for j in 0..n_rank {
+                        if j == r {
+                            continue;
+                        }
+                        let evt = gpus
+                            .boundary_copy(j, r, &partials[j].buf, &peer_tmp[r][slot].buf, bytes)
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
+                        evts.push(evt);
+                        slot += 1;
+                    }
+                }
+                for evt in evts {
+                    gpus.wait_boundary(evt).map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
                 for r in 0..n_rank {
                     gpus.devices[r].bind_thread()?;
                     let pr = partials[r].sub_offset(0, n * dim);
-                    let tr = peer_tmp[r].sub_offset(0, n * dim);
-                    gpus.devices[r].add_inplace_f32(&pr, &tr)?;
+                    for slot in 0..(n_rank - 1) {
+                        let tr = peer_tmp[r][slot].sub_offset(0, n * dim);
+                        gpus.devices[r].add_inplace_f32(&pr, &tr)?;
+                    }
                 }
             } else {
                 let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
