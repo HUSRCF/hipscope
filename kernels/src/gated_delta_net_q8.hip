@@ -33,6 +33,13 @@ __global__ void gated_delta_net_q8(
                          // stochastic rounding. DeltaNet's contractive decay damps
                          // the shaped error → ~FP32 state at Q8's byte container
                          // (CPU sweep: 5.7× lower L2 than stochastic at α=0.99).
+    ,
+    // Requant cadence gate (host-supplied). 0 = single-end: requant S→Q8 ONCE at
+    // the last token (MQ4-fast path; intermediate tokens keep FP32 state in LDS).
+    // 1 = per-token: Q8 roundtrip after every token (PARO drift-echo correctness,
+    // ~1.8× slower in batched). MQ4/HFQ4 weights pass 0; PARO passes 1. For
+    // n_tokens==1 (AR decode / DFlash draft) both modes are identical.
+    int requant_per_token
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -101,19 +108,19 @@ __global__ void gated_delta_net_q8(
                 output[t * stride + h * HD + row] = out_v;
         }
 
-        // Per-token Q8 requant roundtrip — restores the per-token decode
-        // cadence (gated_delta_net_q8 with n_tokens=1 requants S after every
-        // token) inside this single batched launch. Quantize S → Q8 and dequant
-        // back into LDS so the next token reads the Q8-roundtripped state; the
-        // global Q8 store happens only on the last token. The old batched path
-        // requantised ONCE at the end, collapsing N rounding steps → drifted the
-        // recurrent state → PARO prompt echo. Not byte-identical to decode (the
-        // dither frame trajectories differ), but distributionally equivalent.
-        //
+        // Q8 requant. Cadence gated by `requant_per_token`:
+        //   per_token=1 (PARO): requant S→Q8 after EVERY token and dequant back into
+        //     LDS so the next token reads the Q8-roundtripped state (matches decode
+        //     cadence; prevents recurrent-state drift → PARO prompt echo).
+        //   per_token=0 (MQ4-fast, DEFAULT): requant ONCE at the last token;
+        //     intermediate tokens keep FP32 state in LDS. ~1.8× faster in batched
+        //     (no n_tokens× requant, VGPR pressure lower). MQ4 stays coherent with
+        //     this (the drift echo is PARO-specific; prototype cceb07c0 = 254 tok/s
+        //     coherent). For n_tokens==1 both modes are identical.
         // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
-        // Deterministic roundf systematically crushes small values to 0, causing
-        // cumulative state corruption over many tokens.
-        bool last_tok = (t == n_tokens - 1);
+        const bool per_token = (requant_per_token != 0);
+        const bool last_tok = (t == n_tokens - 1);
+        if (!per_token && !last_tok) continue;
         const bool use_ef = (s_ef_residual != nullptr);
         for (int r = 0; r < TILE_ROWS; r++) {
             int rr = row_start + r;
@@ -151,10 +158,9 @@ __global__ void gated_delta_net_q8(
                 q2 = EF_ROUND(s2, tid+64); q3 = EF_ROUND(s3, tid+96);
                 #undef EF_ROUND
             } else {
-                // Stochastic rounding (legacy): floor(x + uniform), unbiased in
-                // expectation. Seed = spatial (h, row, tid) + (frame + t) so every
-                // per-token requant in this batched launch gets fresh, data-
-                // independent entropy (decode n_tokens=1,t=0 reduces to plain frame).
+                // Stochastic rounding: seed = spatial (h, row, tid) + (frame + t)
+                // for fresh per-token entropy (data-independent; the old
+                // my_max-derived seed was correlated/biased over the recurrence).
                 unsigned int rng = (unsigned int)(h * 1664525u + rr * 1013904223u
                                  + tid * 214013u + (frame + (unsigned int)t) * 2531011u);
                 #define STOCH_ROUND(val) ({ \
@@ -167,9 +173,12 @@ __global__ void gated_delta_net_q8(
                 #undef STOCH_ROUND
             }
 
-            // Dequant back into LDS so the next token reads the Q8 state.
-            sr[tid] = q0 * scale; sr[tid+32] = q1 * scale;
-            sr[tid+64] = q2 * scale; sr[tid+96] = q3 * scale;
+            // per_token mode: dequant back into LDS so the next token reads the Q8
+            // state. fast mode reaches here only on last_tok, so skip (we're done).
+            if (per_token && !last_tok) {
+                sr[tid] = q0 * scale; sr[tid+32] = q1 * scale;
+                sr[tid+64] = q2 * scale; sr[tid+96] = q3 * scale;
+            }
 
             if (last_tok) {
                 signed char* dst = sq_base + r * HD;

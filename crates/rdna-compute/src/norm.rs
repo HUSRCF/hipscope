@@ -19,6 +19,24 @@ use hip_bridge::{DeviceBuffer, HipResult};
 /// systematic bias that drifted the recurrent state on long generations.
 static GDN_REQUANT_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Q8 DeltaNet-state requant cadence for batched (n_tokens>1) launches.
+/// `false` (DEFAULT) = single-end requant at the last token only (MQ4-fast path,
+/// recovers the per-token-requant DFlash regression). `true` = per-token Q8
+/// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
+/// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
+/// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
+fn dn_requant_per_token() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_DN_REQUANT_PER_TOKEN")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -1390,6 +1408,7 @@ impl Gpu {
         // dither (data-INDEPENDENT entropy; see GATED_DELTA_NET_Q8 kernel).
         let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let rpt = dn_requant_per_token() as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
@@ -1398,6 +1417,7 @@ impl Gpu {
             &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
             &efp as *const _ as *mut c_void,
+            &rpt as *const _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1411,6 +1431,7 @@ impl Gpu {
                 b.push_ptr(scp); b.push_ptr(op);
                 b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
                 b.push_ptr(efp);
+                b.push_i32(rpt);
                 b
             },
         );
@@ -1476,6 +1497,7 @@ impl Gpu {
         // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
         let mut fr = GDN_REQUANT_FRAME.fetch_add(n_tokens as u32, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut rpt = dn_requant_per_token() as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -1490,6 +1512,7 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut fr as *mut _ as *mut c_void,
             &mut efp as *mut _ as *mut c_void,
+            &mut rpt as *mut _ as *mut c_void,
         ];
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1507,6 +1530,7 @@ impl Gpu {
                 b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
                 b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
                 b.push_ptr(efp);
+                b.push_i32(rpt);
                 b
             },
         );
