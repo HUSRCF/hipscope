@@ -10433,6 +10433,29 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     };
 
+    // DSA compressor-ring safety on a PARTIAL prefix-cache hit.
+    //
+    // The DSA decode caches (SWA ring, compressor/indexer ring state, full +
+    // compressed KV) are *position-indexed* and were left by the prior turn at
+    // ITS end position. A FULL hit (`lcp == prior length`) resumes exactly where
+    // the prior turn left those rings, so the incremental prefill is correct —
+    // this is the normal "growing conversation" path and stays fast.
+    //
+    // A PARTIAL hit (`0 < lcp < prior length`) resumes the suffix prefill from
+    // `start_pos = lcp`, but the compressor ring still holds the prior turn's
+    // *end* window, not `lcp`'s. The first compressed block committed after the
+    // resume point then pools a STALE overlap window — and with ratio-4 overlap
+    // that window reaches back over the just-cached tail, corrupting far-context
+    // recall (the cwd/tool-path "lossiness" symptom). The ring can't be cheaply
+    // repopulated (a position's hidden state depends on its SWA window, which
+    // chains all the way back to token 0), so the correct, robust fix is to fall
+    // back to a cold rebuild for partial hits only. Full hits are unaffected.
+    let lcp = if lcp > 0 && lcp < m.conversation_tokens.len() {
+        0
+    } else {
+        lcp
+    };
+
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
