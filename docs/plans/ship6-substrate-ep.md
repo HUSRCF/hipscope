@@ -322,3 +322,36 @@ small per-token all-reduce is ~0.3 ms, fine).
 - Open curiosity: why is RCCL fast for decode's 8 KB all-reduce but 40 ms for
   prefill's 32 KB? Unresolved; peer-direct sidesteps it. Worth a standalone RCCL
   size-sweep microbench if RCCL is ever needed (e.g. N>4 / cross-node).
+
+---
+
+## VALIDATED — MiniMax-M2 EP on hiptrx (#15), 2026-06-08
+
+The 86 GB `minimax-m2.mq2lloyd` tier (does NOT fit one 32 GB card) runs COHERENT
+across **4× gfx1201** via EP:
+
+```
+prompt: "The capital of France is"
+gen (tp=4 EP): " Paris. The capital of Germany is Berlin. The capital of Italy
+is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon..."
+decode 51.7 tok/s  |  shard-load ~18 s/rank (~24 GB/card)  |  peer-direct all-reduce
+```
+
+Port (`hipfire-arch-minimax`, commit a651f373; mirrors qwen35 EP):
+- `minimax_moe_block(.., routed_out)` — no shared expert, so the whole MoE output
+  (incl the MQ2/MQ3-Lloyd `*_residual_scaled_indexed` down) redirects to the partial.
+- `MinimaxBindings::run_moe_ep` + `ep_add_into_residual` (adds the all-reduced
+  partial into `state.h`).
+- **`MiniMaxWeights::load(.., Some((shard, rank)))` — shard-aware load.** KEY
+  difference from qwen35: MiniMax packs all experts into ONE blob per projection,
+  so load-then-free is impossible on 32 GB. Each rank reads all experts but
+  uploads ONLY its owned experts into a compact blob; non-owned ptrs → a zeroed
+  gate_up dummy (Lloyd codebook centroids are zero inline ⇒ 0 output — validated
+  coherent, no per-rank weight mask needed).
+- `forward::forward_ep` N-rank decode driver; `examples/ep_minimax.rs`.
+
+Model transfer: `hiptrx` can `ssh hipx`, so the 86 GB file was rsync-pulled
+directly from hipx local disk (no HF re-download).
+
+**Remaining for MiniMax:** batched WMMA prefill EP (E6b-equivalent; prefill is
+currently per-token sequential — fine for short prompts). Then DeepSeek-V4 EP (#16).
