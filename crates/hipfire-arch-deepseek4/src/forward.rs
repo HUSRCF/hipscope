@@ -1716,9 +1716,10 @@ pub fn decode_step_body(
 ) -> Result<Vec<f32>, String> {
     let skip_ffn = env_cache::skip_ffn();
 
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Default
-    // off (opt-in) until hipx byte-parity validated (deepseek4 only runs on hipx).
+    // #397 Ship 6 — forward-as-pipeline. The per-layer decode routes through the
+    // super-op executor (run_layer_program) by DEFAULT; HIPFIRE_FORWARD_LOWERED=0
+    // opts back to the hand loop. Validated byte-identical on hipx (the only box
+    // deepseek4 fits) in both plain AR and MTP spec-decode modes.
     if ds4_forward_lowered_enabled() {
         return decode_step_body_lowered(cfg, weights, state, gpu, token_id, position);
     }
@@ -1851,9 +1852,9 @@ pub fn decode_step_body(
 // hc_ffn_mix). The per-layer conditionals (compress_ratio, hash vs score) live
 // INSIDE the handlers, so it's one variant — the compressor/indexer/HC ops are
 // bundled in the coarse handlers (not separate Escape super-ops; Escape stays a
-// reserved extension point if per-op remap/fusion is ever wanted). ADDITIVE +
-// opt-in (HIPFIRE_FORWARD_LOWERED, default off until hipx byte-parity validated —
-// deepseek4 only runs on hipx); the hand loop is untouched → default byte-identical.
+// reserved extension point if per-op remap/fusion is ever wanted). ADDITIVE: the
+// hand loop is untouched and reachable via HIPFIRE_FORWARD_LOWERED=0; the lowered
+// path is DEFAULT-ON after hipx byte-parity (plain AR + MTP spec-decode).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Attention block (replays decode_step_body's attn arm verbatim). HC residual
@@ -1964,8 +1965,9 @@ fn ds4_lower_program() -> superop::LayerProgram {
     vec![ds4_superop(SuperOpKind::Attend), ds4_superop(SuperOpKind::Moe)]
 }
 
-/// Cached HIPFIRE_FORWARD_LOWERED toggle for deepseek4 (default OFF — opt-in until
-/// hipx byte-parity validated, then flip to default-on like qwen35/lfm2/minimax).
+/// Cached HIPFIRE_FORWARD_LOWERED toggle for deepseek4 (default ON, matching
+/// qwen35/lfm2/minimax; set =0 to fall back to the hand loop). Flipped on after
+/// hipx byte-parity in both plain AR and MTP spec-decode modes.
 fn ds4_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
