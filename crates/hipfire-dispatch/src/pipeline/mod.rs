@@ -972,6 +972,16 @@ pub fn run_moe_prefill(
     let (down_m, down_k, gate_up_k) = (p.down_m, p.down_k, p.gate_up_k);
     let total_slots = n * k_top;
 
+    // EP (Ship 6 substrate-EP prefill): the routed combine accumulates into
+    // `out_target` — the zeroed `[batch × dim]` partial when `routed_out` is set
+    // (each rank holds only its owned experts; the EP driver all-reduce-sums the
+    // partials and adds into `x_batch`), else `x_batch` directly (byte-identical
+    // default). The shared expert already accumulated into `x_batch` upstream and
+    // is NOT redirected (replicated per rank). Under EP the non-owned experts
+    // read load-time zero-dummy weights → contribute 0, so the all-reduced sum of
+    // partials equals the full single-GPU routed combine.
+    let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_batch);
+
     // ── Path 2 scatter pipeline ───────────────────────────────────────
     let mut path2_m_total: usize = 0;
     if res.use_path2 {
@@ -1094,7 +1104,7 @@ pub fn run_moe_prefill(
             res.use_paro_i8, res.use_paro_i8_k8,
         )?;
         hip!(gpu.moe_down_combine_grouped_k8(
-            p.y_down_grouped, p.inverse_perm, p.topk_weights, p.x_batch,
+            p.y_down_grouped, p.inverse_perm, p.topk_weights, out_target,
             down_m, k_top, n,
         ))?;
     } else if res.down_path0 {
@@ -1102,7 +1112,7 @@ pub fn run_moe_prefill(
         // MQ6/Paro never reach here — their admit predicates require WMMA).
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
-                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, p.x_batch,
+                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, out_target,
                 down_m, down_k, k_top, n,
             )),
             _other => return Err(DispatchError::UnsupportedVariant {
@@ -1135,7 +1145,7 @@ pub fn run_moe_prefill(
         };
         down_result?;
         hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded, p.topk_weights, p.x_batch, down_m, k_top, n,
+            p.down_expanded, p.topk_weights, out_target, down_m, k_top, n,
         ))?;
     }
 

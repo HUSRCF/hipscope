@@ -349,6 +349,14 @@ pub struct MoePrefillParams<'a> {
     /// Used by the AWQ-aware silu+rotate step. `None` when the routed
     /// experts are non-AWQ (the common case for A3B).
     pub down_awq_scale: Option<&'a GpuTensor>,
+    /// EP (Ship 6 substrate-EP prefill): when `Some`, the **routed** combine
+    /// accumulates into this **zeroed** `[batch × dim]` partial instead of
+    /// `x_batch`; the EP prefill driver then all-reduce-sums the partial across
+    /// ranks and adds it into each rank's `x_batch`. The **shared** expert stays
+    /// in `x_batch` (replicated per rank — added once to each rank's own copy,
+    /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
+    /// byte-identical to pre-EP behavior.
+    pub routed_out: Option<&'a GpuTensor>,
 }
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.

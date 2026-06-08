@@ -6162,6 +6162,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
         needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
+        None, // routed_out: non-EP single-GPU path
     )
 }
 
@@ -6538,6 +6539,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 mo_for_chunk,
                 needs_last_token_logits,
                 max_layer,
+                None, // routed_out: non-EP single-GPU path
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -7189,6 +7191,7 @@ fn run_fused_qkvza_key(
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
 /// except for atomicAdd nondeterminism in the routed-down accumulation
 /// (same as the single-token indexed kernel it replaces).
+#[allow(clippy::too_many_arguments)]
 fn prefill_moe_ffn_body_batched(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -7197,6 +7200,12 @@ fn prefill_moe_ffn_body_batched(
     pbs: &PrefillBatchScratch,
     n: usize,
     ctx: &DispatchCtx,
+    // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
+    // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
+    // driver all-reduce-sums it across ranks and adds into x_batch). The shared
+    // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
+    // redirected. `None` = byte-identical single-GPU behavior.
+    routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
@@ -7629,6 +7638,7 @@ fn prefill_moe_ffn_body_batched(
         paro_gate_up,
         paro_down,
         down_awq_scale,
+        routed_out,
     };
     hipfire_runtime::llama::moe_family()
         .run_prefill(ctx, gpu, &moe_prefill_params)
@@ -7746,10 +7756,21 @@ fn forward_prefill_chunk(
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
+    // EP (Ship 6 substrate-EP prefill): per-MoE-layer routed partial. ONLY set
+    // by the EP driver, which calls this with a SINGLE-layer band so the routed
+    // combine of that one MoE layer lands in the zeroed partial (all-reduced by
+    // the driver after the call). Always `None` for multi-layer bands (PP /
+    // single-GPU full stack) — a shared partial across >1 MoE layer would be wrong.
+    routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    debug_assert!(
+        routed_out.is_none()
+            || band.map(|b| b.layer_end - b.layer_start <= 1).unwrap_or(false),
+        "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
+    );
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -10432,7 +10453,7 @@ fn forward_prefill_chunk(
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
                 // accumulates the FFN output residual back into it via the
                 // batched indexed down kernel's atomicAdd path.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -10959,7 +10980,7 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched MoE FFN.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -12962,6 +12983,182 @@ pub fn forward_ep(
     Ok(())
 }
 
+/// EP (Ship 6 substrate-EP) **WMMA batched prefill** for qwen3.x-A3B (E6b).
+///
+/// The batched analog of [`forward_ep`]: processes all `tokens` as one batch
+/// through the WMMA/grouped-GEMM prefill kernels (NOT token-by-token), replicated
+/// across `gpus.devices.len()` EP ranks, with MoE experts sharded per rank.
+///
+/// Driven **layer-granularly** by calling [`forward_prefill_chunk`] with a
+/// single-layer band per rank, because EP needs a per-MoE-layer all-reduce: the
+/// next layer's replicated attention must read the FULL (cross-rank-summed)
+/// residual. For each layer:
+///   1. (MoE only) zero each rank's `[n × dim]` routed partial,
+///   2. run the layer's batched chunk on every rank — the **shared** expert
+///      accumulates into `pbs.x_batch` (replicated, added once per rank), the
+///      **routed** combine into the zeroed partial (owned experts only; non-owned
+///      read load-time zero-dummy → 0),
+///   3. (MoE only) `all_reduce_sum_f32` the `[n × dim]` partials across ranks and
+///      add into each rank's `pbs.x_batch`.
+/// Non-MoE (dense DeltaNet / FullAttn) layers run replicated, no partial, no
+/// all-reduce. Final norm + lm_head (last token) run on rank 0 → `scratch_per_rank[0].logits`.
+///
+/// **v1 constraints:** the whole prompt must fit one batch (`tokens.len() <=
+/// pbs.max_batch`; no chunk loop yet) and KV must be a non-asym mode (q8/q4/…)
+/// so no per-rank Givens replicas are needed (asym EP prefill = future work). The
+/// per-layer chunk dispatch trades some launch overhead for the per-layer
+/// all-reduce seam; a fused EP prefill layer loop is a later perf refinement.
+///
+/// Slices (`weights_per_rank`, `kv_per_rank`, `dn_per_rank`, `scratch_per_rank`,
+/// `pbs_per_rank`, `partials`) must have length `gpus.devices.len()`; element `r`
+/// lives on `gpus.devices[r]`. Each `partials[r]` must hold >= `n × dim` f32.
+/// Every device must have an `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_per_rank: &mut [llama::KvCache],
+    dn_per_rank: &mut [DeltaNetState],
+    scratch_per_rank: &[Qwen35Scratch],
+    pbs_per_rank: &[PrefillBatchScratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    let n_rank = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n_rank, "forward_prefill_batch_ep: weights_per_rank len");
+    assert_eq!(kv_per_rank.len(), n_rank, "forward_prefill_batch_ep: kv_per_rank len");
+    assert_eq!(dn_per_rank.len(), n_rank, "forward_prefill_batch_ep: dn_per_rank len");
+    assert_eq!(scratch_per_rank.len(), n_rank, "forward_prefill_batch_ep: scratch_per_rank len");
+    assert_eq!(pbs_per_rank.len(), n_rank, "forward_prefill_batch_ep: pbs_per_rank len");
+    assert_eq!(partials.len(), n_rank, "forward_prefill_batch_ep: partials len");
+
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let dim = config.dim;
+    assert!(
+        n <= pbs_per_rank[0].max_batch,
+        "forward_prefill_batch_ep v1: prompt ({n} toks) must fit one batch (max_batch={}); \
+         chunked EP prefill is future work",
+        pbs_per_rank[0].max_batch,
+    );
+
+    // Per-layer cumulative LA / FA counters (replicated → identical across ranks;
+    // they index dn_state.s_matrices / kv_cache.k_gpu exactly like the band
+    // offsets the PP driver threads). kv_layer_offset == fa_layer_offset.
+    let mut delta_off = 0usize;
+    let mut fa_off = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        let is_moe = matches!(
+            &weights_per_rank[0].layers[layer_idx],
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+        );
+
+        // 1. Zero each rank's routed partial (on its active_stream, so it's
+        //    ordered before the chunk's routed combine that writes into it).
+        if is_moe {
+            for r in 0..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let stream = gpus.devices[r]
+                    .active_stream
+                    .as_ref()
+                    .ok_or_else(|| HipError::new(0, "forward_prefill_batch_ep: no active_stream (call ensure_rank_streams)"))?;
+                gpus.devices[r]
+                    .hip
+                    .memset_async(&partials[r].buf, 0, n * dim * 4, stream)?;
+            }
+        }
+
+        // 2. Run the layer's batched chunk on every rank (single-layer band).
+        for r in 0..n_rank {
+            gpus.devices[r].bind_thread()?;
+            let band = PrefillBandCtx {
+                layer_start: layer_idx,
+                layer_end: layer_idx + 1,
+                delta_layer_offset: delta_off,
+                kv_layer_offset: fa_off,
+                fa_layer_offset: fa_off,
+                is_first_band: layer_idx == 0,
+                is_last_band: false, // final norm + lm_head done explicitly below
+                // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
+                givens_cos: None,
+                givens_sin: None,
+            };
+            let routed_out = if is_moe { Some(&partials[r]) } else { None };
+            forward_prefill_chunk(
+                &mut gpus.devices[r],
+                &weights_per_rank[r],
+                config,
+                tokens,
+                start_pos,
+                &mut kv_per_rank[r],
+                &mut dn_per_rank[r],
+                &scratch_per_rank[r],
+                &pbs_per_rank[r],
+                None,  // hidden_rb
+                None,  // per_token_hidden_out
+                None,  // gdn_tape
+                0,     // tape_offset
+                None,  // tree_verify
+                false, // pre_uploaded
+                Some(&band),
+                None,  // mask_override
+                false, // needs_last_token_logits (no lm_head in band)
+                None,  // max_layer
+                routed_out,
+            )?;
+        }
+
+        // 3. All-reduce the routed partials, add into each rank's residual.
+        if is_moe {
+            let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            gpus.all_reduce_sum_f32(&refs, n * dim)
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            for r in 0..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let x_n = pbs_per_rank[r].x_batch.sub_offset(0, n * dim);
+                let p_n = partials[r].sub_offset(0, n * dim);
+                gpus.devices[r].add_inplace_f32(&x_n, &p_n)?;
+            }
+        }
+
+        match config.layer_types[layer_idx] {
+            LayerType::LinearAttention => delta_off += 1,
+            LayerType::FullAttention => fa_off += 1,
+        }
+    }
+
+    // Final norm + lm_head on rank 0 (last token) → scratch_per_rank[0].logits.
+    // Done explicitly (not via the chunk) so it runs AFTER the last layer's
+    // all-reduce — the last MoE layer's routed output is only in x_batch after
+    // step 3, so an in-chunk lm_head would read an incomplete residual.
+    {
+        gpus.devices[0].bind_thread()?;
+        let gpu = &mut gpus.devices[0];
+        let w = &weights_per_rank[0];
+        let s = &scratch_per_rank[0];
+        let pbs = &pbs_per_rank[0];
+        let last_x = pbs.x_batch.sub_offset((n - 1) * dim, dim);
+        gpu.rmsnorm_f32(&last_x, &w.output_norm, &s.tmp, config.norm_eps)?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = w.output.dispatch_ref();
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+
+    // Sync every rank — work ran on active_streams; the host logits read on rank
+    // 0 (null stream) would otherwise race.
+    for r in 0..n_rank {
+        gpus.devices[r].bind_thread()?;
+        gpus.devices[r].hip.device_synchronize()?;
+    }
+    Ok(())
+}
+
 /// Multi-GPU layer-loop dispatcher (Stage 5 of multi-GPU pp migration #58).
 /// Mirrors `forward_scratch_layers` but routes per-layer work to
 /// `gpus.devices[gpus.device_for_layer(i)]` and copies the residual
@@ -14567,6 +14764,7 @@ pub fn forward_prefill_batch_multi(
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                         true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
+                        None, // routed_out: PP bands are multi-layer, not EP
                     )?;
                 }
 

@@ -84,7 +84,20 @@ fn main() {
         config.n_layers, config.dim, config.num_experts, config.num_experts_per_tok,
         config.n_kv_heads, config.head_dim,
     );
-    eprintln!("EP: tp_size={tp} steps={steps} kv_seq={kv_seq} prompt={prompt:?}");
+    // Prefill mode: HIPFIRE_EP_PREFILL=batched → WMMA batched prefill EP (E6b)
+    // via forward_prefill_batch_ep; default (sequential) → token-by-token via
+    // forward_ep (E6a). Validation: both must yield the SAME gen FNV.
+    let batched_prefill = std::env::var("HIPFIRE_EP_PREFILL").as_deref() == Ok("batched");
+    eprintln!(
+        "EP: tp_size={tp} steps={steps} kv_seq={kv_seq} prefill={} prompt={prompt:?}",
+        if batched_prefill { "batched-WMMA" } else { "sequential" },
+    );
+
+    // ── tokenize (early — sizes the prefill batch + routed partials) ─────────
+    let prompt_tokens: Vec<u32> = tokenizer.encode(&prompt);
+    assert!(!prompt_tokens.is_empty(), "empty prompt tokenization");
+    let max_batch = prompt_tokens.len().max(2);
+    eprintln!("prompt tokenizes to {} tokens (max_batch={max_batch})", prompt_tokens.len());
 
     // ── bring up N ranks ────────────────────────────────────────────────────
     let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
@@ -109,10 +122,12 @@ fn main() {
     }
     eprintln!("  all ranks loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");
 
-    // ── per-rank state + routed partials ────────────────────────────────────
+    // ── per-rank state + routed partials (+ prefill scratch when batched) ────
+    use hipfire_arch_qwen35::qwen35::PrefillBatchScratch;
     let mut kv_per_rank: Vec<KvCache> = Vec::with_capacity(n);
     let mut dn_per_rank: Vec<DeltaNetState> = Vec::with_capacity(n);
     let mut scratch_per_rank: Vec<Qwen35Scratch> = Vec::with_capacity(n);
+    let mut pbs_per_rank: Vec<PrefillBatchScratch> = Vec::with_capacity(n);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
@@ -123,7 +138,12 @@ fn main() {
         );
         dn_per_rank.push(DeltaNetState::new(g, &config).expect("dn"));
         scratch_per_rank.push(Qwen35Scratch::new(g, &config, 64).expect("scratch"));
-        partials.push(g.zeros(&[config.dim], DType::F32).expect("partial"));
+        if batched_prefill {
+            pbs_per_rank.push(PrefillBatchScratch::new(g, &config, max_batch).expect("pbs"));
+        }
+        // Routed partial: [max_batch × dim] f32 — covers both decode (uses the
+        // first `dim`) and batched prefill (uses `n_prompt × dim`).
+        partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("partial"));
     }
     if n > 1 {
         let peer = gpus.enable_peer_all().expect("enable_peer_all");
@@ -131,19 +151,22 @@ fn main() {
     }
     hipfire_runtime::ep::ensure_rank_streams(&mut gpus).expect("ensure_rank_streams");
 
-    // ── tokenize ────────────────────────────────────────────────────────────
-    let prompt_tokens: Vec<u32> = tokenizer.encode(&prompt);
-    assert!(!prompt_tokens.is_empty(), "empty prompt tokenization");
-    eprintln!("\nprompt tokenizes to {} tokens", prompt_tokens.len());
-
-    // ── EP greedy decode ────────────────────────────────────────────────────
+    // ── EP prefill (batched-WMMA or sequential) ──────────────────────────────
     eprintln!("\n=== EP forward (prefill {} toks → decode {steps}) ===", prompt_tokens.len());
-    for (pos, &tok) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_ep(
-            &mut gpus, &weights_per_rank, &config, tok, pos,
-            &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+    if batched_prefill {
+        qwen35::forward_prefill_batch_ep(
+            &mut gpus, &weights_per_rank, &config, &prompt_tokens, 0,
+            &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &partials,
         )
-        .expect("forward_ep prefill");
+        .expect("forward_prefill_batch_ep");
+    } else {
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            qwen35::forward_ep(
+                &mut gpus, &weights_per_rank, &config, tok, pos,
+                &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+            )
+            .expect("forward_ep prefill");
+        }
     }
     gpus.devices[0].bind_thread().expect("bind 0");
     let mut logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
@@ -169,10 +192,12 @@ fn main() {
     eprintln!("EP gen text: {:?}", text_ep);
     eprintln!("EP gen FNV : 0x{:016x}", fnv1a(&gen_ep));
 
-    // ── In-process anchor: tp=1 → production forward_scratch on the unsharded
-    //    rank-0 replica. (At tp≥2 rank 0 is sharded, so production is invalid;
-    //    the cross-process tp1-vs-tpN hash diff carries the gate there.) ──────
-    if n == 1 {
+    // ── In-process anchor: tp=1 + sequential → production forward_scratch on the
+    //    unsharded rank-0 replica. (At tp≥2 rank 0 is sharded → production invalid;
+    //    the cross-process tp1-vs-tpN hash diff carries that gate. For batched
+    //    prefill the gate is the cross-MODE FNV match vs the sequential run, since
+    //    production prefill is itself token-by-token.) ──────
+    if n == 1 && !batched_prefill {
         eprintln!("\n=== tp=1 anchor: production forward_scratch (unsharded rank 0) ===");
         let mut kv_ref = KvCache::new_gpu_q8(
             &mut gpus.devices[0], config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
