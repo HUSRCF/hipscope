@@ -4471,7 +4471,7 @@ fn moe_ffn_decode(
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, None, false);
 
     for t in [
         router_logits,
@@ -4542,7 +4542,7 @@ pub(crate) fn moe_ffn_decode_with_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, None, false)
 }
 
 /// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
@@ -4559,7 +4559,7 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, None, false)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -4572,6 +4572,13 @@ fn moe_ffn_decode_impl(
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
+    // EP (Ship 6 substrate-EP). `ep_routed_out = Some(partial)` redirects the
+    // routed combine + shared-down into a zeroed partial (the EP executor
+    // all-reduces it and adds into x_residual once); `None` = single-GPU into
+    // x_residual (byte-identical). `ep_skip_shared` skips the shared-expert
+    // down on rank>0 so the replicated shared expert is summed once.
+    ep_routed_out: Option<&GpuTensor>,
+    ep_skip_shared: bool,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -4627,10 +4634,11 @@ fn moe_ffn_decode_impl(
         x_rot_prerotated,
         x_norm,
         x_residual,
-        // EP (Ship 6 substrate-EP): None/false = single-GPU byte-identical.
-        // The EP executor threads Some(partial)/skip_shared in later.
-        routed_out: None,
-        skip_shared: false,
+        // EP (Ship 6 substrate-EP): threaded from moe_ffn_decode_impl params.
+        // None/false (single-GPU) = byte-identical; Some(partial)/skip_shared
+        // come from moe_ffn_dispatch_ep via run_layer_program_ep.
+        routed_out: ep_routed_out,
+        skip_shared: ep_skip_shared,
         router: ffn.router.dispatch_ref(),
         shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
         shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
@@ -12174,6 +12182,36 @@ fn moe_ffn_dispatch(
     Ok(())
 }
 
+/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: same rmsnorm/rotate +
+/// MoE decode, but the routed combine + shared-down accumulate into `routed_out`
+/// (a zeroed per-rank partial the EP executor all-reduces), and `skip_shared`
+/// gates the shared-expert down to rank 0. Calls `moe_ffn_decode_impl` directly
+/// (the `with_scratch` wrappers don't carry EP params). The residual `x` is left
+/// untouched — the executor adds the all-reduced partial into it afterward.
+fn moe_ffn_dispatch_ep(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    routed_out: &GpuTensor,
+    skip_shared: bool,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(s);
+    if ffn_all_mq4_for_moe(ffn) {
+        gpu.fused_rmsnorm_rotate_mq(
+            x, ffn_norm,
+            s.moe_x_rot.as_ref().expect("MoE scratch"),
+            config.dim, config.norm_eps,
+        )?;
+        moe_ffn_decode_impl(gpu, ffn, x, x, config, &refs, true, Some(routed_out), skip_shared)
+    } else {
+        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
+        moe_ffn_decode_impl(gpu, ffn, &s.tmp, x, config, &refs, false, Some(routed_out), skip_shared)
+    }
+}
+
 /// TriAttention tap helper (inline from original forward).
 fn triattn_tap(
     gpu: &mut Gpu,
@@ -12556,6 +12594,36 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
         moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_moe_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        routed_out: &GpuTensor,
+        skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        // Routed combine + shared-down (rank 0 only) accumulate into `routed_out`
+        // (zeroed by the EP executor); s.x (the replicated attention residual) is
+        // untouched until ep_add_into_residual after the all-reduce.
+        moe_ffn_dispatch_ep(gpu, ffn, &s.x, ffn_norm, config, s, routed_out, skip_shared)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn ep_add_into_residual(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError> {
+        // s.x += the all-reduced routed partial (the EP MoE output summed across
+        // ranks). Mirrors the prototype's `tp_allreduce_add` residual step.
+        let s = self.s;
+        gpu.add_inplace_f32(&s.x, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
