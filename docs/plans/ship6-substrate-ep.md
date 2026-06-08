@@ -165,3 +165,41 @@ Each step gates on TP=N≡TP=1 parity + coherence on hiptrx 0+1 before the next.
 **Validation boxes:** hiptrx devices 0+1 (gfx1201) for TP=2 parity; scale to
 0,1,2,3 for the full 4-way fit of the 80 GB models. hipx cannot do TP=2
 (single usable big-VRAM device). k9lin = single-GPU (TP=1 reference only).
+
+---
+
+## VALIDATED — qwen3.6-A3B EP plumbing (E1/E2/E3/E4/E5/E7), 2026-06-07
+
+Step 1 of the sequencing above is **DONE and validated on RDNA4**. The generic
+EP substrate (E1 `dispatch_super_op` + `run_layer_program_ep`, E2 routed-partial
+param, E3 `MoeParams.routed_out`/`skip_shared` redirect, E4 `shard_moe_experts`,
+E5 `forward_ep` N-rank driver + `shard_all_moe_layers`) is wired end-to-end and
+proven byte-/argmax-exact.
+
+**Harness:** `crates/hipfire-runtime/examples/ep_decode_parity.rs`
+(`forward_ep` greedy decode; prints gen token-ids + FNV-1a hash; at tp=1 also
+runs production `forward_scratch` on the unsharded rank-0 replica as an
+in-process anchor).
+
+**Results** (`qwen3.6-35b-a3b.mq4`, prompt "The capital of France is", 16 steps):
+
+| box / arch | run | experts/rank | all-reduce | gen FNV | output |
+|---|---|---|---|---|---|
+| k9lin gfx1100 | tp=1 (anchor) | all (256) | identity | `0x6eb6f119212f3f68` | "…is Paris." (≡ production) |
+| hiptrx gfx1201 | tp=1 (anchor) | all (256) | identity | `0xdf98c087d3de9725` | "…is Paris." (≡ production) |
+| hiptrx gfx1201 ×2 | **tp=2** | 128 each (e%2==r), rest freed | **RCCL** | `0xdf98c087d3de9725` | "…is Paris." |
+
+- **tp=1 anchor (both boxes):** EP argmax stream == production `forward_scratch`,
+  byte-identical FNV. The EP machinery reproduces production on one rank.
+- **tp=2 == tp=1 (hiptrx):** identical FNV with experts genuinely sharded across
+  two gfx1201 (each rank frees its non-owned half) and summed via RCCL
+  all-reduce (`peer_access_enabled=true`). The all-reduce-EP design (replicated
+  attention/KV/DeltaNet, all-reduce only at MoE) is argmax-exact on RDNA4.
+
+(FNV differs k9lin vs hiptrx — different arch/kernels — but tp=1≡tp=2 *within*
+hiptrx is the sharding proof; tp=1≡production *within each box* is the
+correctness anchor.)
+
+**Next:** E6a sequential prefill (works already — `ep_decode_parity` prefills
+token-by-token via `forward_ep`) → E6b WMMA batched prefill (genuine
+expert-skip, not zero-dummy). Then MiniMax EP (step 2), DeepSeek-V4 EP (step 3).
