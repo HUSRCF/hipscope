@@ -698,12 +698,15 @@ fn minimax_lower_program() -> superop::LayerProgram {
     vec![mm_superop(SuperOpKind::Attend), mm_superop(SuperOpKind::Moe)]
 }
 
-/// Cached HIPFIRE_FORWARD_LOWERED toggle for minimax (default OFF — opt-in until
-/// hipx byte-parity validated, then flip to default-on like qwen35/lfm2).
+/// Cached HIPFIRE_FORWARD_LOWERED toggle for minimax. #397 Ship 6: the minimax
+/// lowered decode is **DEFAULT ON** as of 2026-06-07 — hipx/gfx1151 byte-parity
+/// validated (lowered == hand token-text md5 2a46c35e… on the mq2-lloyd tier,
+/// "Paris is the capital of France."). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0`
+/// forces the legacy hand loop (still present in decode_step_body).
 fn minimax_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1"))
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is
