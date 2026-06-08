@@ -282,3 +282,43 @@ than 40 standalone chunk calls). Plus genuine expert-skip (1/N compute) and
 chunked prompts. Until then EP prefill is usable-but-slow — which still ENABLES
 the goal models (MiniMax/DeepSeek don't fit one card, so there is no single-card
 prefill to beat — a correct slow prefill is strictly better than "cannot run").
+
+---
+
+## FIXED — EP prefill perf via peer-direct all-reduce (bypass RCCL), 2026-06-07
+
+Root cause of the ~17–90× prefill slowdown: **`ncclAllReduce` costs ~40 ms/call**
+on hiptrx (2× gfx1201, PCIe, no xGMI) for the routed-partial sum — *regardless*
+of NCCL_PROTO / NCCL_MAX_NCHANNELS / NCCL_BUFFSIZE / NCCL_SOCKET_IFNAME=lo /
+NCCL_PROXY_DISABLE (all tested, no change). The data path is already P2P/direct;
+the cost is inside RCCL's collective machinery. Confirmed by isolation:
+`HIPFIRE_EP_SKIP_ALLREDUCE` → prefill 1662 ms → 32 ms; `HIPFIRE_EP_PREFILL_TIMING`
+→ `all_reduce=1637 ms, chunk=49 ms`. NOT DPM (clocks pinned high = no change).
+
+**Fix:** `HIPFIRE_EP_PEER_ALLREDUCE` (DEFAULT ON) — N-rank peer-direct all-reduce
+bypassing RCCL: phase 1 P2P-copies every other rank's ORIGINAL routed partial
+into a local temp (`boundary_copy` = `hipMemcpyPeerAsync`); barrier; phase 2 adds
+the peer temps into the local partial. All-reads-before-writes ⇒ race-free.
+
+| metric (B=288, tp=2 gfx1201) | RCCL | peer-direct | single-card |
+|---|---|---|---|
+| all-reduce host time | 1637 ms | **1.0 ms** | — |
+| prefill | 164 tok/s | **2355 tok/s** | 2750 tok/s |
+| TTFT | 1756 ms | **122 ms** | 93 ms |
+
+EP prefill is now **86% of single-card** + correct (FNV `0xdf98c087d3de9725`) +
+coherent. EP decode = 85 tok/s (95% of single-card; still uses RCCL — decode's
+small per-token all-reduce is ~0.3 ms, fine).
+
+**Scope / generalization (answers "does this apply to TP/PP?"):**
+- It is NOT a UDS/socket fix — `NCCL_SOCKET_IFNAME=lo` (UDS-class loopback) did
+  nothing; the socket is bootstrap-only, the per-collective cost is in RCCL.
+- **TP** uses the same cross-rank residual all-reduce → would hit the identical
+  RCCL slowness → should use peer-direct too. Clean home = move peer-direct into
+  the shared `multi_gpu::all_reduce_sum_f32` so EP-decode + EP-prefill + TP all
+  get it (FOLLOW-UP; needs Gpus-owned peer temps + DeviceBuffer add wrapper).
+- **PP** is already immune — it uses `boundary_copy` (the same P2P primitive),
+  not RCCL all-reduce.
+- Open curiosity: why is RCCL fast for decode's 8 KB all-reduce but 40 ms for
+  prefill's 32 KB? Unresolved; peer-direct sidesteps it. Worth a standalone RCCL
+  size-sweep microbench if RCCL is ever needed (e.g. N>4 / cross-node).
