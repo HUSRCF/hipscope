@@ -254,7 +254,7 @@ Measured on hiptrx gfx1201, qwen3.6-35b-a3b.mq4, q8 KV:
 |---|---|---|---|
 | decode | 89.5 tok/s | 82.8 tok/s | **93%** ✓ |
 | batched prefill @ B=14 | 749 tok/s (18.7 ms) | 8.3 tok/s (1677 ms) | **~1.1%** ✗ |
-| batched prefill @ B=256 | ~2750 tok/s (93 ms) | — | — |
+| batched prefill @ B=256 | ~2750 tok/s (93 ms) | 164 tok/s @ B=288 (1756 ms) | **~6%** ✗ |
 | coherence | — | correct recursive fib() ✓ | — |
 
 **Decode EP is production-quality** (7% all-reduce overhead). **Prefill EP is
@@ -267,6 +267,13 @@ the per-MoE-layer all-reduce. That fragments the fused full-stack batched prefil
 calls + 40 RCCL all-reduces with no cross-layer pipelining → ~42 ms/layer vs
 ~0.47 ms/layer fused. The per-layer-chunk dispatch overhead dominates at the
 small batch.
+
+**Diagnostic:** EP prefill wall time is ~CONSTANT vs batch — 1677 ms @ B=14 vs
+1756 ms @ B=288 (only +79 ms for +274 tokens). So it is ~42 ms/layer of FIXED
+per-layer overhead (40 standalone chunk calls + 40 all-reduce barriers, no
+cross-layer pipelining), not token compute. Throughput just scales B against a
+~1.7 s floor (8.3 tok/s @ B=14 → 164 tok/s @ B=288). The fused EP prefill below
+removes that floor.
 
 **Fix (next perf step):** a FUSED EP prefill — one prefill pass per rank that
 runs all layers pipelined, with the cross-rank all-reduce interleaved INSIDE the
