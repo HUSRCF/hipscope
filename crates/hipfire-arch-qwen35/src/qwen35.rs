@@ -13052,6 +13052,10 @@ pub fn forward_prefill_batch_ep(
     let mut delta_off = 0usize;
     let mut fa_off = 0usize;
 
+    let ep_timing = std::env::var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
+    let mut t_chunk = 0.0f64;
+    let mut t_ar = 0.0f64;
+    let mut t_add = 0.0f64;
     for layer_idx in 0..config.n_layers {
         let is_moe = matches!(
             &weights_per_rank[0].layers[layer_idx],
@@ -13074,6 +13078,7 @@ pub fn forward_prefill_batch_ep(
         }
 
         // 2. Run the layer's batched chunk on every rank (single-layer band).
+        let t_c = std::time::Instant::now();
         for r in 0..n_rank {
             gpus.devices[r].bind_thread()?;
             let band = PrefillBandCtx {
@@ -13113,16 +13118,28 @@ pub fn forward_prefill_batch_ep(
             )?;
         }
 
+        if ep_timing {
+            t_chunk += t_c.elapsed().as_secs_f64() * 1000.0;
+        }
+
         // 3. All-reduce the routed partials, add into each rank's residual.
         if is_moe {
+            let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             gpus.all_reduce_sum_f32(&refs, n * dim)
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
+            if ep_timing {
+                t_ar += t_a.elapsed().as_secs_f64() * 1000.0;
+            }
+            let t_d = std::time::Instant::now();
             for r in 0..n_rank {
                 gpus.devices[r].bind_thread()?;
                 let x_n = pbs_per_rank[r].x_batch.sub_offset(0, n * dim);
                 let p_n = partials[r].sub_offset(0, n * dim);
                 gpus.devices[r].add_inplace_f32(&x_n, &p_n)?;
+            }
+            if ep_timing {
+                t_add += t_d.elapsed().as_secs_f64() * 1000.0;
             }
         }
 
@@ -13152,9 +13169,16 @@ pub fn forward_prefill_batch_ep(
 
     // Sync every rank — work ran on active_streams; the host logits read on rank
     // 0 (null stream) would otherwise race.
+    let t_s = std::time::Instant::now();
     for r in 0..n_rank {
         gpus.devices[r].bind_thread()?;
         gpus.devices[r].hip.device_synchronize()?;
+    }
+    if ep_timing {
+        let t_sync = t_s.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "EP-PREFILL-TIMING (host ms): chunk-loop={t_chunk:.1} all_reduce={t_ar:.1} add={t_add:.1} final-sync={t_sync:.1}",
+        );
     }
     Ok(())
 }
