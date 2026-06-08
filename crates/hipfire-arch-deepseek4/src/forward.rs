@@ -256,6 +256,16 @@ fn gemv_auto_batched_wmma(
                 .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
         }
         DType::F16 => {
+            // gfx12/RDNA4: route through the VALIDATED gfx12 f16 WMMA kernel
+            // `gemm_f16_wmma_mb8` (takes F32 X directly, has a known-good
+            // `_gfx12` port) rather than `gemm_f16_x_f16_wmma`'s gfx12 port.
+            // Same math (Y[b,m]=Σ_k W[m,k]·X[b,k], f16 WMMA). On gfx11 keep the
+            // original f16×f16 path (caller-converted X scratch).
+            if gpu.arch_caps.has_wmma_w32_gfx12() {
+                return gpu
+                    .gemm_f16_wmma_mb8(weight, x_plain_batch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm_f16_wmma_mb8 (gfx12 f16): {e:?}"));
+            }
             if let Some(scratch) = x_f16_scratch {
                 let n = (batch_size * k) as i64;
                 gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
