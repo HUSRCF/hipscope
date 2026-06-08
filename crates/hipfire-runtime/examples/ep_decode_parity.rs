@@ -157,8 +157,10 @@ fn main() {
     }
     hipfire_runtime::ep::ensure_rank_streams(&mut gpus).expect("ensure_rank_streams");
 
-    // ── EP prefill (batched-WMMA or sequential) ──────────────────────────────
+    // ── EP prefill (batched-WMMA or sequential) — timed (TTFT ≈ prefill wall) ─
+    use std::time::Instant;
     eprintln!("\n=== EP forward (prefill {} toks → decode {steps}) ===", prompt_tokens.len());
+    let t_prefill = Instant::now();
     if batched_prefill {
         qwen35::forward_prefill_batch_ep(
             &mut gpus, &weights_per_rank, &config, &prompt_tokens, 0,
@@ -174,14 +176,17 @@ fn main() {
             .expect("forward_ep prefill");
         }
     }
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     gpus.devices[0].bind_thread().expect("bind 0");
     let mut logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
     assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf in EP prefill logits");
     let mut gen_ep: Vec<u32> = Vec::with_capacity(steps);
+    let mut step_ms: Vec<f64> = Vec::with_capacity(steps);
     let mut next = llama::argmax(&logits);
     gen_ep.push(next);
     let base = prompt_tokens.len();
     for step in 1..steps {
+        let t = Instant::now();
         qwen35::forward_ep(
             &mut gpus, &weights_per_rank, &config, next, base + step - 1,
             &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
@@ -189,6 +194,7 @@ fn main() {
         .expect("forward_ep decode");
         gpus.devices[0].bind_thread().expect("bind 0");
         logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
+        step_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf at EP step {step}");
         next = llama::argmax(&logits);
         gen_ep.push(next);
@@ -197,6 +203,23 @@ fn main() {
     eprintln!("EP gen ids : {gen_ep:?}");
     eprintln!("EP gen text: {:?}", text_ep);
     eprintln!("EP gen FNV : 0x{:016x}", fnv1a(&gen_ep));
+
+    // ── perf summary (steady-state decode skips first 3 steps: JIT/cache/DPM warm) ─
+    let pf_toks = prompt_tokens.len() as f64;
+    let pf_tok_s = pf_toks * 1000.0 / prefill_ms;
+    let settled: Vec<f64> = step_ms.iter().skip(3).copied().collect();
+    let (dec_tok_s, dec_avg_ms, n_settled) = if settled.is_empty() {
+        (f64::NAN, f64::NAN, 0usize)
+    } else {
+        let avg = settled.iter().sum::<f64>() / settled.len() as f64;
+        (1000.0 / avg, avg, settled.len())
+    };
+    eprintln!(
+        "\nPERF tp={tp} prefill={}({} tok): TTFT≈{:.1} ms, prefill {:.1} tok/s | decode {:.1} tok/s ({:.2} ms/tok, steady n={})",
+        if batched_prefill { "batched-WMMA" } else { "sequential" },
+        prompt_tokens.len(),
+        prefill_ms, pf_tok_s, dec_tok_s, dec_avg_ms, n_settled,
+    );
 
     // ── In-process anchor: tp=1 + sequential → production forward_scratch on the
     //    unsharded rank-0 replica. (At tp≥2 rank 0 is sharded → production invalid;
