@@ -110,9 +110,20 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 )?;
             }
 
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
+            // 3. All-reduce-sum the partials across ranks. Peer-direct (P2P
+            //    copy + add) by DEFAULT: RCCL's per-collective latency dominates
+            //    deep decode (e.g. MiniMax's 62 layers = 62 all-reduces/token),
+            //    while peer-direct is ~free. Opt back to RCCL with
+            //    HIPFIRE_EP_PEER_ALLREDUCE=0 (cached — no per-layer getenv).
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            gpus.all_reduce_sum_f32(&refs, residual_dim).map_err(hip_err)?;
+            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_peer = *PEER_DECODE
+                .get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0"));
+            if use_peer {
+                gpus.all_reduce_sum_f32_peer(&refs, residual_dim).map_err(hip_err)?;
+            } else {
+                gpus.all_reduce_sum_f32(&refs, residual_dim).map_err(hip_err)?;
+            }
 
             // 4. Each rank adds the reduced partial into its residual stream.
             for r in 0..n {
