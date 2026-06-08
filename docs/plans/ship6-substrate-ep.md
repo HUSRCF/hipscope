@@ -32,10 +32,15 @@ and already proven. Dispatch EP is the eventual perf play for prefill/throughput
 — **deferred**. This dissolves Agent C's "needs all-to-all" wrinkles: minimax's
 sigmoid+bias and deepseek4's hash-routing run **replicated**, no dispatch.
 
-### Prefill performance bar (hard requirement)
-Prefill must be **≥ the current single-card daemon batched prefill** for that
-model (WMMA/MMQ, non-sequential) — NOT a token-by-token decode loop. The bar is
-met by the arithmetic only if experts are **genuinely sharded /4**:
+### Prefill staging + performance target (relaxed 2026-06-07)
+Two phases: **(E6a) sequential token-by-token prefill first** for plumbing
+/ correctness (run the EP decode path over the prompt to populate KV on all
+ranks), then **(E6b) WMMA batched prefill EP immediately after** sequential is
+validated. WMMA batched is required (token-by-token is NOT the end state) but
+the **≥ single-card bar is a target, not a hard gate** — replicated attention
+may keep EP prefill from beating single-card, which is acceptable. The
+arithmetic for when batched EP *does* beat single-card (experts genuinely
+sharded /4):
 
 - EP prefill wall-clock ≈ `full_attn (replicated, runs in parallel → same
   wall-clock as 1 card) + experts/4 + small all-reduce`.
@@ -131,7 +136,8 @@ all_reduce_sum_f32}`, `Stream::raw_ptr`, `config.tp_use_rccl`.
 | E3 | EP `run_moe` per arch: redirect routed combine → partial; `skip_shared` on rank>0; (deepseek4) skip all-reduce on hash-only-but-shared-only? no — hash layers still route experts, keep all-reduce; only pure-shared layers skip. | qwen35 `run_moe_decode`(+`MoeParams.routed_out`), minimax `minimax_moe_block`, deepseek4 `ds4_moe_block`/`ffn_routed` | M each |
 | E4 | Load-time expert sharding (generalize prototype `shard_moe_experts`): keep owned experts, zero-buffer the rest, rebuild pointer tables, free non-owned (+AWQ sidecar). | runtime + per-arch weight load | M |
 | E5 | Replicated full-model load across N ranks (`init_tp` + per-rank `load_weights` then E4 shard). | runtime weight-load path | M |
-| E6 | **Batched-prefill EP (NOT token-by-token).** Prefill must use the real batched WMMA/MMQ path (`forward_prefill_chunk` / `prefill_moe_ffn_body_batched`) made EP-aware: each rank computes **only its owned experts** (genuine skip, NOT decode's zero-dummy — see perf bar below), routed combine → `[N×dim]` partial, `tp_allreduce_add_batched`. Reference: prototype `forward_prefill_chunk_tp` (Stage 3d) + `tp_allreduce_add_batched`. | runtime driver + per-arch batched MoE | L |
+| E6a | **Sequential prefill EP (first, for plumbing/correctness).** Populate KV on all ranks by running the EP **decode** path token-by-token over the prompt. Slow, but proves the whole EP pipeline end-to-end (decode + KV + all-reduce) and unblocks a full working model on hiptrx. Validate, then E6b. | runtime driver | S |
+| E6b | **WMMA batched prefill EP (immediately after E6a is validated).** Make the real batched WMMA/MMQ path (`forward_prefill_chunk` / `prefill_moe_ffn_body_batched`) EP-aware: each rank computes **only its owned experts** (genuine expert-skip, NOT decode's zero-dummy), routed combine → `[N×dim]` partial, `tp_allreduce_add_batched`. Reference: prototype `forward_prefill_chunk_tp` (Stage 3d). Perf target ≥ single-card where achievable (qwen3.6-A3B A/B); MM/DS vs hipx gfx1151. **Note (2026-06-07): the strict ≥single-card bar is relaxed — replicated attention may keep EP prefill from beating single-card; WMMA batched is still required (not token-by-token) but is the perf track, not a hard gate.** | runtime driver + per-arch batched MoE | L |
 | E7 | Parity gate: TP=N decode ≡ TP=1 (argmax + max-abs-diff, gold 7.5e-7) on hiptrx devices 0+1; coherence-gate on the EP output. | examples / gate scripts | M |
 
 **Explicitly NOT needed (vs dense-TP plan):** FaPhase seam, `run_fa_layer_body`
