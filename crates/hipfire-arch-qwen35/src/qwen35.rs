@@ -906,11 +906,16 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
-        // Error-feedback (sigma-delta) requant for Q8 state — opt-in via
-        // HIPFIRE_DN_STATE_EF (any value != "0"). Only meaningful for Q8 (FP32 has
-        // no requant; Q4 EF is future work). Residual is f16 per-element.
+        // Error-feedback (sigma-delta) requant for Q8 state — DEFAULT ON as of
+        // 2026-06-08. q8_ef ≈ FP32 coherence at −0.7% decode vs FP32's −4.5% (best
+        // spec-decode τ too), and far better than stochastic Q8 — DFlash 27b-prose
+        // unique_ratio 0.625 vs 0.555, max_freq 0.055 vs 0.078. Also makes the DN
+        // state DETERMINISTIC (no stochastic dither). Opt OUT with
+        // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
+        // work; the multi-GPU band split is still stochastic — new_with_quant_multi
+        // leaves s_ef_residual empty). Residual is f16 per-element.
         let ef_enabled = quant == StateQuant::Q8
-            && std::env::var("HIPFIRE_DN_STATE_EF").map(|v| v != "0").unwrap_or(false);
+            && std::env::var("HIPFIRE_DN_STATE_EF").map(|v| v != "0").unwrap_or(true);
 
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
