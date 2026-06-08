@@ -1172,6 +1172,8 @@ pub fn forward_ep(
     }
 
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd).
+    let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    let t_layers = std::time::Instant::now();
     let program = minimax_lower_program();
     let n_layers = weights_per_rank[0].layers.len();
     for l in 0..n_layers {
@@ -1200,10 +1202,21 @@ pub fn forward_ep(
             .map_err(|e| format!("forward_ep lm_head: {e}"))?;
     }
 
+    let layers_ms = t_layers.elapsed().as_secs_f64() * 1000.0;
     // 4. Sync every rank (work ran on active_streams; host logits read races otherwise).
+    let t_sync = std::time::Instant::now();
     for r in 0..n {
         gpus.devices[r].bind_thread().map_err(|e| format!("forward_ep sync bind {r}: {e:?}"))?;
         gpus.devices[r].hip.device_synchronize().map_err(|e| format!("forward_ep sync {r}: {e:?}"))?;
+    }
+    if timing {
+        // layers_ms = host enqueue + any blocking (RCCL/backpressure); sync_ms =
+        // GPU drain remaining at the barrier. host-launch-bound ⇒ layers_ms is
+        // the bulk and sync_ms is small; GPU-bound ⇒ sync_ms is the bulk.
+        eprintln!(
+            "EP-DECODE-TIMING: layers(host)={layers_ms:.2} ms  final-sync(gpu)={:.2} ms",
+            t_sync.elapsed().as_secs_f64() * 1000.0,
+        );
     }
     for s in state_per_rank.iter_mut() {
         s.n_tokens = position as usize + 1;
