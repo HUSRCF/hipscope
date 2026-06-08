@@ -558,14 +558,21 @@ fn minimax_attn_block(
 }
 
 /// MoE block (ffn-norm folded in). Mirrors the hand-loop MoE arm (8-arm dtype dispatch).
+#[allow(clippy::too_many_arguments)]
 fn minimax_moe_block(
     gpu: &mut Gpu, cfg: &MiniMaxConfig, layer: &MiniMaxLayerWeights, state: &MiniMaxState, l: usize,
+    // EP (Ship 6 substrate-EP): when `Some`, the routed combine/down accumulates
+    // into this zeroed partial instead of `state.h` (the EP driver all-reduces it
+    // and adds into each rank's `state.h`). MiniMax has NO shared expert, so the
+    // entire MoE output is routed → the whole block redirects. `None` = normal.
+    routed_out: Option<&GpuTensor>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
     let inter = cfg.intermediate_size;
     let n_exp = cfg.num_local_experts;
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
+    let out_target: &GpuTensor = routed_out.unwrap_or(&state.h);
     gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
         .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
     rotate_x_mq_for(gpu, &layer.experts[0].gate_up, &state.ffn_tmp, &state.ffn_x_rot, hidden)
@@ -618,7 +625,7 @@ fn minimax_moe_block(
                 hidden, inter, k_top, 1,
             )
             .map_err(|e| format!("minimax L{l}: down hfq4: {e:?}"))?;
-            gpu.moe_down_combine_k8_batched(&state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1)
+            gpu.moe_down_combine_k8_batched(&state.down_expanded, &state.topk_weights, out_target, hidden, k_top, 1)
                 .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
         }
         DType::MQ6G256 | DType::HFQ6G256 => {
@@ -627,20 +634,20 @@ fn minimax_moe_block(
                 hidden, inter, k_top, 1,
             )
             .map_err(|e| format!("minimax L{l}: down hfq6: {e:?}"))?;
-            gpu.moe_down_combine_k8_batched(&state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1)
+            gpu.moe_down_combine_k8_batched(&state.down_expanded, &state.topk_weights, out_target, hidden, k_top, 1)
                 .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
         }
         DType::MQ2G256Lloyd => {
             gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
                 &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights, &state.rot_batch,
-                &state.h, hidden, inter, k_top,
+                out_target, hidden, inter, k_top,
             )
             .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
         }
         DType::MQ3G256Lloyd => {
             gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
                 &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights, &state.rot_batch,
-                &state.h, hidden, inter, k_top,
+                out_target, hidden, inter, k_top,
             )
             .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
         }
@@ -662,7 +669,26 @@ impl<'a> ForwardBindings for MinimaxBindings<'a> {
         minimax_attn_block(gpu, self.cfg, self.layer, self.state, self.l).map_err(DispatchError::Hip)
     }
     fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        minimax_moe_block(gpu, self.cfg, self.layer, self.state, self.l).map_err(DispatchError::Hip)
+        minimax_moe_block(gpu, self.cfg, self.layer, self.state, self.l, None).map_err(DispatchError::Hip)
+    }
+    fn run_moe_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        routed_out: &GpuTensor,
+        _skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        // MiniMax has no shared expert → the entire MoE output is routed, so the
+        // whole block redirects into `routed_out` (zeroed by the EP executor);
+        // `state.h` (the replicated attention residual) is added after all-reduce
+        // via ep_add_into_residual. `skip_shared` is irrelevant (no shared expert).
+        minimax_moe_block(gpu, self.cfg, self.layer, self.state, self.l, Some(routed_out))
+            .map_err(DispatchError::Hip)
+    }
+    fn ep_add_into_residual(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError> {
+        gpu.add_inplace_f32(&self.state.h, partial)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
     }
     fn run_proj(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("minimax has no Proj super-op".into()))
@@ -1094,6 +1120,95 @@ pub fn forward_batch(
         gpu.free_tensor(t).ok();
     }
     Ok(logits)
+}
+
+// ───────────────────────── Ship 6 substrate-EP (MiniMax) ─────────────────────
+//
+// Mirror of the qwen35 EP wiring. MiniMax packs all experts into ONE blob per
+// projection (too big to load-then-free on a 32 GB card), so sharding is done at
+// LOAD time: `MiniMaxWeights::load(.., Some((shard, rank)))` uploads only the
+// rank-owned experts (non-owned → zeroed gate_up dummy). MiniMax has NO shared
+// expert, so the entire MoE output is routed → the whole MoE block redirects
+// into the per-rank partial. Attention (Q8 KV) is replicated; only the MoE
+// routed sum crosses ranks (peer-direct all-reduce).
+
+/// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
+/// Mirror of qwen35::forward_ep: every rank holds full replicated weights /
+/// state / KV EXCEPT MoE experts (sharded at load). Embeds + stages pos per
+/// rank, runs each layer's 2-op program (Attend replicated, Moe all-reduce-EP'd)
+/// via [`hipfire_runtime::ep::run_layer_program_ep`], then final norm + lm_head
+/// on rank 0 → `state_per_rank[0].logits`. Every device must have an
+/// `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]); peer access
+/// enabled for the fast peer-direct all-reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_ep(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    state_per_rank: &mut [MiniMaxState],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n, "forward_ep: weights_per_rank len");
+    assert_eq!(state_per_rank.len(), n, "forward_ep: state_per_rank len");
+    assert_eq!(partials.len(), n, "forward_ep: partials len");
+    let hidden = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps;
+
+    // 1. Embed + stage pos per rank (replicated, deterministic).
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("forward_ep bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .embedding_lookup_q8(&weights_per_rank[r].embed, &state_per_rank[r].h, token, hidden)
+            .map_err(|e| format!("forward_ep embed {r}: {e:?}"))?;
+        state_per_rank[r].pos_host[0] = position as i32;
+        let pos_bytes =
+            unsafe { std::slice::from_raw_parts(state_per_rank[r].pos_host.as_ptr() as *const u8, 4) };
+        gpus.devices[r]
+            .memcpy_htod_auto(&state_per_rank[r].pos_buf, pos_bytes)
+            .map_err(|e| format!("forward_ep pos {r}: {e:?}"))?;
+    }
+
+    // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd).
+    let program = minimax_lower_program();
+    let n_layers = weights_per_rank[0].layers.len();
+    for l in 0..n_layers {
+        let mut binds: Vec<MinimaxBindings> = Vec::with_capacity(n);
+        for r in 0..n {
+            binds.push(MinimaxBindings {
+                cfg,
+                layer: &weights_per_rank[r].layers[l],
+                state: &state_per_rank[r],
+                l,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+            .map_err(|e| format!("forward_ep run_layer_program_ep L{l}: {e}"))?;
+    }
+
+    // 3. Final norm + lm_head on rank 0 → state_per_rank[0].logits.
+    {
+        gpus.devices[0].bind_thread().map_err(|e| format!("forward_ep bind0: {e:?}"))?;
+        let w = &weights_per_rank[0];
+        let s = &state_per_rank[0];
+        let gpu = &mut gpus.devices[0];
+        gpu.rmsnorm_f32(&s.h, &w.final_norm, &s.final_norm_buf, eps)
+            .map_err(|e| format!("forward_ep final norm: {e:?}"))?;
+        weight_gemv(gpu, &w.lm_head, &s.final_norm_buf, &s.logits)
+            .map_err(|e| format!("forward_ep lm_head: {e}"))?;
+    }
+
+    // 4. Sync every rank (work ran on active_streams; host logits read races otherwise).
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("forward_ep sync bind {r}: {e:?}"))?;
+        gpus.devices[r].hip.device_synchronize().map_err(|e| format!("forward_ep sync {r}: {e:?}"))?;
+    }
+    for s in state_per_rank.iter_mut() {
+        s.n_tokens = position as usize + 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
