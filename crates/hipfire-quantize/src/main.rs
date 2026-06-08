@@ -5712,6 +5712,42 @@ fn main() {
                 st_files[*file_idx].drop_tensor_pages(name);
                 continue;
             }
+            // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
+            // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
+            // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
+            // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
+            // (model.embed_tokens.weight), the router gate, norms, and the depthwise
+            // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
+            // format) keeps the full-precision Q8 bring-up recipe.
+            if use_mq4g256
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && !name.ends_with("embed_tokens.weight")
+                && (name.ends_with("_proj.weight")
+                    || name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM", name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
             // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
             // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
