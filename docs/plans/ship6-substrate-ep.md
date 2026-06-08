@@ -243,3 +243,35 @@ a hang); it self-recovers once the process is killed (no reset needed).
 (per-card expert compute still full); genuine expert-skip (1/N compute) +
 chunked prompts (>max_batch) are follow-on perf work. Next ship-blocking step:
 MiniMax-M2 EP (#15) then DeepSeek-V4 EP (#16).
+
+---
+
+## PERF REALITY CHECK — E6b prefill is CORRECT but SLOW (2026-06-07)
+
+Measured on hiptrx gfx1201, qwen3.6-35b-a3b.mq4, q8 KV:
+
+| metric | normal single-card | EP tp=2 | ratio |
+|---|---|---|---|
+| decode | 89.5 tok/s | 82.8 tok/s | **93%** ✓ |
+| batched prefill @ B=14 | 749 tok/s (18.7 ms) | 8.3 tok/s (1677 ms) | **~1.1%** ✗ |
+| batched prefill @ B=256 | ~2750 tok/s (93 ms) | — | — |
+| coherence | — | correct recursive fib() ✓ | — |
+
+**Decode EP is production-quality** (7% all-reduce overhead). **Prefill EP is
+correct but ~90× too slow** and does NOT meet the ≥single-card bar.
+
+Root cause: `forward_prefill_batch_ep` drives prefill by calling
+`forward_prefill_chunk` **once per layer** (single-layer band) so it can insert
+the per-MoE-layer all-reduce. That fragments the fused full-stack batched prefill
+(one call, ~40 layers pipelined, 18.7 ms) into 40 separate single-layer chunk
+calls + 40 RCCL all-reduces with no cross-layer pipelining → ~42 ms/layer vs
+~0.47 ms/layer fused. The per-layer-chunk dispatch overhead dominates at the
+small batch.
+
+**Fix (next perf step):** a FUSED EP prefill — one prefill pass per rank that
+runs all layers pipelined, with the cross-rank all-reduce interleaved INSIDE the
+layer loop after each MoE layer (make the prefill layer loop EP-aware, rather
+than 40 standalone chunk calls). Plus genuine expert-skip (1/N compute) and
+chunked prompts. Until then EP prefill is usable-but-slow — which still ENABLES
+the goal models (MiniMax/DeepSeek don't fit one card, so there is no single-card
+prefill to beat — a correct slow prefill is strictly better than "cannot run").
