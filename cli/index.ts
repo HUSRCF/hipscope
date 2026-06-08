@@ -2380,8 +2380,19 @@ async function serve(port: number, host: string) {
         const effortMap: Record<string, number> = {
           none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
         };
-        const reasoningEffort: number | null = reasoning && typeof reasoning.effort === "string"
-          && reasoning.effort in effortMap ? effortMap[reasoning.effort] : null;
+        // Accept the reasoning effort from BOTH OpenAI shapes: the Chat
+        // Completions top-level `reasoning_effort` (what most clients + the
+        // OpenAI SDK send) AND the Responses-API nested `reasoning.effort`.
+        // Previously only the nested form was read here, so a top-level
+        // `reasoning_effort:"none"` silently no-op'd and the turn stayed in
+        // thinking mode — even though the daemon itself accepts both at
+        // generate-time (it's this HTTP layer that rewrites effort →
+        // thinking_mode). Top-level wins when both are present.
+        const effortStr: string | null =
+          (typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : null)
+          ?? (reasoning && typeof reasoning.effort === "string" ? reasoning.effort : null);
+        const reasoningEffort: number | null =
+          effortStr && effortStr in effortMap ? effortMap[effortStr] : null;
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
@@ -2436,7 +2447,7 @@ async function serve(port: number, host: string) {
         //   max      → thinking + the "Absolute maximum" reasoning preamble
         // Both are set so each arch reads the right one. (V4 modes per the HF
         // encoding/README.md: thinking_mode=chat|thinking, reasoning_effort=max.)
-        const rEffort = (body as any).reasoning?.effort;
+        const rEffort = effortStr;
         if (effective.thinking === "off") {
           genParams.assistant_prefix = "closed_think";
           genParams.thinking_mode = "chat";
