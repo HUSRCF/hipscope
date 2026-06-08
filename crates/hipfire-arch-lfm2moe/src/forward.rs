@@ -665,12 +665,15 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
     }
 }
 
-/// Cached HIPFIRE_FORWARD_LOWERED toggle for lfm2 (default OFF — opt-in until
-/// fleet byte-parity validated, then flip to default-on like qwen35).
+/// Cached HIPFIRE_FORWARD_LOWERED toggle for lfm2. #397 Ship 6: the lfm2 lowered
+/// decode is **DEFAULT ON** as of 2026-06-07 — fleet byte-parity validated
+/// (k9lin gfx1100 / hiptrx gfx1201 / hipx gfx1151, lowered == hand token-text md5
+/// 754a38b5…). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0` forces the legacy hand
+/// loop (still present in decode_step_layers_and_head); any other value / unset → lowered.
 fn lfm2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1"))
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
