@@ -2233,6 +2233,40 @@ pub fn mtp_forward(
     next_token: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    let mtp_layer_idx = cfg.num_hidden_layers;
+    // Steps 0–6: validate MTP weights + embed/norm/HC plumbing + attention.
+    mtp_pre_ffn(cfg, weights, state, gpu, h_n, next_token, position)?;
+    // FFN block (== ds4_moe_block_core at the MTP layer: mhc_pre(ffn) + shared
+    // ffn_stub + routed ffn_routed + hc_ffn_mix). Single-GPU: routed combines
+    // into ffn_out alongside the shared expert; the mix folds it.
+    mhc_pre(cfg, weights, state, gpu, mtp_layer_idx, /*is_attn=*/ false)?;
+    ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx, None)?;
+    hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
+    // Step 7: capture full HC residual → mtp_last_hidden (chaining input).
+    mtp_capture_hidden(cfg, state, gpu)?;
+    // SKIP_HEAD short-circuit (prefill MTP-fill: only the SWA write matters).
+    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD").ok().as_deref() == Some("1") {
+        return Ok(Vec::new());
+    }
+    // Steps 8–9: final norm + lm_head + download.
+    mtp_head(cfg, weights, state, gpu)
+}
+
+/// Steps 0–6 of the MTP forward: validate MTP weights, embed `next_token`,
+/// rmsnorm both inputs, populate the `[hc_mult, hidden]` residual streams via
+/// the HC plumbing, and run the MTP-layer attention block (up to `hc_attn_mix`).
+/// Shared by [`mtp_forward`] (single-GPU) and [`mtp_forward_ep`] (per rank,
+/// replicated — only the FFN routed experts are sharded under EP).
+fn mtp_pre_ffn(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    h_n: &GpuTensor,
+    next_token: u32,
+    position: u32,
+) -> Result<(), String> {
     // ── 0. Validate MTP weights are present ────────────────────────────
     let mtp = weights.mtp_layer.as_ref().ok_or_else(|| {
         "mtp_forward: weights.mtp_layer is None — \
@@ -2257,10 +2291,6 @@ pub fn mtp_forward(
         .mtp_h_proj
         .as_ref()
         .ok_or("mtp_forward: mtp_h_proj missing")?;
-    let mtp_final = mtp
-        .mtp_final_norm
-        .as_ref()
-        .ok_or("mtp_forward: mtp_final_norm missing")?;
 
     // Defensive: step 4 below passes `dummy_rotated` aliasing the OTHER
     // norm scratch (not a real FWHT rotation). That's safe for Q8_0 /
@@ -2355,10 +2385,6 @@ pub fn mtp_forward(
         .token_embd
         .as_ref()
         .ok_or("mtp_forward: token_embd not uploaded")?;
-    let head = weights
-        .head
-        .as_ref()
-        .ok_or("mtp_forward: head not uploaded")?;
 
     // ── 2. Embed next_token → embed_scratch [hidden] ───────────────────
     {
@@ -2458,18 +2484,19 @@ pub fn mtp_forward(
     // (No compressor / indexer for MTP — compress_ratio == 0.)
     attn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
-    mhc_pre(
-        cfg,
-        weights,
-        state,
-        gpu,
-        mtp_layer_idx,
-        /*is_attn=*/ false,
-    )?;
-    ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
-    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx, None)?;
-    hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
+    Ok(())
+}
 
+/// Step 7 of the MTP forward: capture the full `[hc_mult, hidden]` residual
+/// stream into `state.mtp_last_hidden` (the chaining input to the next MTP
+/// iteration). Shared by [`mtp_forward`] and [`mtp_forward_ep`].
+fn mtp_capture_hidden(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
     // ── 7. Capture FULL [hc_mult, hidden] residual stream for chaining ─
     // Subsequent MTP iterations consume this as their h_n input. The
     // full-HC capture matches the antirez/ds4 reference pattern; legacy
@@ -2492,29 +2519,36 @@ pub fn mtp_forward(
         gpu.memcpy_dtod_auto(&dst.buf, &streams.buf, stream_len * 4)
             .map_err(|e| format!("capture full HC → mtp_last_hidden: {e:?}"))?;
     }
+    Ok(())
+}
 
+/// Step 8 of the MTP forward: final norm (stream-0 or head-HC mix) + lm_head →
+/// `state.logits` (NO download). Mirrors the main-model `final_norm_and_head`.
+/// Shared by [`mtp_head`] (single-GPU, adds the download) and [`mtp_forward_ep`]
+/// (rank 0 only, downloads after an all-ranks sync). The `MTP_SKIP_HEAD`
+/// short-circuit lives in the callers (it must skip this entirely).
+fn mtp_head_compute(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    let mtp = weights
+        .mtp_layer
+        .as_ref()
+        .ok_or("mtp_head: weights.mtp_layer is None")?;
+    let mtp_final = mtp
+        .mtp_final_norm
+        .as_ref()
+        .ok_or("mtp_head: mtp_final_norm missing")?;
+    let head = weights.head.as_ref().ok_or("mtp_head: head not uploaded")?;
     // ── 8. final_norm + lm_head → logits ──────────────────────────────
     // Two paths (mirrors the main-model `final_norm_and_head`):
-    //   - default (legacy): stream 0 → mtp_final_norm → lm_head. Reads
-    //     only 1 of 4 HC streams; discards 75% of head signal.
+    //   - default (legacy): stream 0 → mtp_final_norm → lm_head.
     //   - HIPFIRE_DEEPSEEK4_MTP_HEAD_HC=1: head-HC mix(streams, mtp.0.hc_head_*)
-    //     → mtp_final_norm → lm_head. Uses the MTP's own head-HC weights
-    //     to reduce [hc_mult, hidden] → [hidden] before norm.
-    //
-    // The legacy path was the original choice because an earlier head-HC
-    // experiment measured WORSE acceptance — but that was BEFORE 82224ad
-    // fixed the input-side full-HC plumbing. With distinct HC streams
-    // entering the MTP block, the output head-HC mix becomes meaningful;
-    // gated opt-in until validated end-to-end.
-    //
-    // HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD=1 short-circuits steps 8+9 (return empty
-    // Vec immediately). Use during prefill MTP fill: the loop's only
-    // purpose there is to write the MTP layer's SWA ring, the logits
-    // are never read. Skipping saves the lm_head GEMV + the d2h+sync
-    // (line 1991-92 below) that otherwise stalls the stream per call.
-    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD").ok().as_deref() == Some("1") {
-        return Ok(Vec::new());
-    }
+    //     → mtp_final_norm → lm_head (reduces [hc_mult, hidden] → [hidden]).
     if state.final_norm.is_none() {
         state.final_norm = Some(
             gpu.alloc_tensor(&[hidden], DType::F32)
@@ -2594,12 +2628,136 @@ pub fn mtp_forward(
         )?;
     }
 
-    // ── 9. Download logits ─────────────────────────────────────────────
+    Ok(())
+}
+
+/// Single-GPU MTP head: [`mtp_head_compute`] + download logits → host `Vec`.
+/// EP (`mtp_forward_ep`) uses `mtp_head_compute` directly + an all-ranks sync
+/// before the caller downloads, to avoid racing the head GEMV on `active_stream`.
+fn mtp_head(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<Vec<f32>, String> {
+    mtp_head_compute(cfg, weights, state, gpu)?;
     let logits = state.logits.as_ref().unwrap();
-    let logits_host = gpu
+    gpu.download_f32(logits)
+        .map_err(|e| format!("mtp download logits: {e:?}"))
+}
+
+/// EP (Ship 6 substrate-EP) MTP **draft** forward across N ranks for ONE
+/// next-next prediction — the spec-decode drafter under expert parallelism.
+///
+/// Mirror of [`mtp_forward`], fanned across `gpus.devices`: the MTP-specific
+/// pre-FFN (embed / norm / HC plumbing + attention) runs replicated per rank,
+/// the MTP-layer FFN runs through the SAME EP executor as the main layers
+/// (shared `ffn_stub` replicated in `state.ffn_out`; the 256 routed experts
+/// sharded → all-reduced partial; `hc_ffn_mix` deferred to
+/// `ep_add_into_residual`), the residual capture runs per rank, and the head
+/// runs on rank 0. Returns rank 0's downloaded logits (over the next-next
+/// vocab). `mtp_last_hidden` is updated per rank (replicated) for chaining.
+///
+/// `h_n_per_rank[r]` is rank r's previous-position full `[hc_mult, hidden]`
+/// residual stream (replicated; the chaining input) — it MUST be a buffer
+/// DISTINCT from `state_per_rank[r].residual_streams` (pre-FFN reads `h_n` then
+/// overwrites `residual_streams`). Every device needs an `active_stream`
+/// ([`hipfire_runtime::ep::ensure_rank_streams`]) + peer access for the
+/// all-reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_forward_ep(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    h_n_per_rank: &[GpuTensor],
+    next_token: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    let n = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n, "mtp_forward_ep: weights_per_rank len");
+    assert_eq!(state_per_rank.len(), n, "mtp_forward_ep: state_per_rank len");
+    assert_eq!(partials.len(), n, "mtp_forward_ep: partials len");
+    assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
+    let hidden = cfg.hidden_size;
+    let mtp_layer_idx = cfg.num_hidden_layers;
+
+    // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated. attn_stub
+    //    reads state.n_tokens for the MTP-layer SWA ring slot → set it to
+    //    `position` per rank (matches spec_decode's bookkeeping).
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_ep bind {r}: {e:?}"))?;
+        state_per_rank[r].n_tokens = position as u64;
+        mtp_pre_ffn(
+            cfg,
+            &weights_per_rank[r],
+            &mut state_per_rank[r],
+            &mut gpus.devices[r],
+            &h_n_per_rank[r],
+            next_token,
+            position,
+        )?;
+    }
+
+    // 2. MTP-layer FFN via the EP executor: a single [Moe] program at
+    //    layer_idx = mtp_layer_idx. run_moe_ep = mhc_pre(ffn) + shared ffn_stub
+    //    + routed ffn_routed→partial; the executor all-reduces the partial;
+    //    ep_add_into_residual = ffn_out += partial, then hc_ffn_mix.
+    {
+        let program = vec![ds4_superop(SuperOpKind::Moe)];
+        let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
+        for (r, st) in state_per_rank.iter_mut().enumerate() {
+            binds.push(Deepseek4Bindings {
+                cfg,
+                weights: &weights_per_rank[r],
+                state: st,
+                layer_idx: mtp_layer_idx,
+                position,
+                token_id: next_token,
+                skip_ffn: false,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+            .map_err(|e| format!("mtp_forward_ep run_layer_program_ep: {e}"))?;
+    }
+
+    // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_ep cap bind {r}: {e:?}"))?;
+        mtp_capture_hidden(cfg, &mut state_per_rank[r], &mut gpus.devices[r])?;
+    }
+
+    // 4. Head COMPUTE on rank 0 (no download — drained by the all-ranks sync).
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|e| format!("mtp_forward_ep head bind0: {e:?}"))?;
+    mtp_head_compute(cfg, &weights_per_rank[0], &mut state_per_rank[0], &mut gpus.devices[0])?;
+
+    // 5. Sync every rank, then download rank 0's logits.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_ep sync bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("mtp_forward_ep sync {r}: {e:?}"))?;
+    }
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|e| format!("mtp_forward_ep dl bind0: {e:?}"))?;
+    let logits = state_per_rank[0]
+        .logits
+        .as_ref()
+        .ok_or("mtp_forward_ep: rank0 logits unset")?;
+    gpus.devices[0]
         .download_f32(logits)
-        .map_err(|e| format!("mtp download logits: {e:?}"))?;
-    Ok(logits_host)
+        .map_err(|e| format!("mtp_forward_ep download logits: {e:?}"))
 }
 
 /// Batched twin of `mtp_forward` — processes `batch_size` MTP positions

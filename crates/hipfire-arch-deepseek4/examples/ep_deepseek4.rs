@@ -44,6 +44,7 @@ fn main() {
     let mut max: usize = 48;
     let mut tp: usize = 4;
     let mut no_bos = false;
+    let mut mtp = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -52,6 +53,7 @@ fn main() {
             "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
             "--tp" => { tp = argv[i + 1].parse().expect("--tp"); i += 2; }
             "--no-bos" => { no_bos = true; i += 1; }
+            "--mtp" => { mtp = true; i += 1; }
             other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
         }
     }
@@ -140,6 +142,44 @@ fn main() {
     let mut logits = dl_logits(&mut gpus, &state_per_rank[0]);
     eprintln!("prefill {} tok in {:.2}s", prompt_ids.len(), t0.elapsed().as_secs_f64());
 
+    // ── MTP EP draft (spec-decode drafter under expert parallelism) ─────────
+    // After prefill, `logits` predicts t0. Capture h_n (the last-position full
+    // HC residual stream) per rank into a DISTINCT buffer (mtp_pre_ffn reads
+    // h_n then overwrites residual_streams), then run mtp_forward_ep to draft
+    // the token AFTER t0. Compared below to the decode loop's gen[1] (= the
+    // true next-next token): a match is a spec-decode "accept" — proof the
+    // sharded MTP-layer experts + EP FFN produce the correct draft. (Runs
+    // before the decode loop; forward_ep re-inits residual_streams so this
+    // doesn't disturb the main path.)
+    let mut mtp_draft: Option<u32> = None;
+    if mtp {
+        let t0 = argmax(&logits);
+        let mut h_n_per_rank: Vec<GpuTensor> = Vec::with_capacity(n);
+        for r in 0..n {
+            gpus.devices[r].bind_thread().expect("bind");
+            let streams = state_per_rank[r].residual_streams.as_ref().expect("residual_streams");
+            let h = gpus.devices[r]
+                .alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], DType::F32)
+                .expect("alloc h_n");
+            gpus.devices[r]
+                .memcpy_dtod_auto(&h.buf, &streams.buf, cfg.hc_mult * cfg.hidden_size * 4)
+                .expect("copy h_n");
+            h_n_per_rank.push(h);
+        }
+        let tm = std::time::Instant::now();
+        let mtp_logits = forward::mtp_forward_ep(
+            &mut gpus, &weights_per_rank, &cfg, &mut state_per_rank, &partials,
+            &h_n_per_rank, t0, prompt_ids.len() as u32,
+        ).expect("mtp_forward_ep");
+        let finite = mtp_logits.iter().all(|x| x.is_finite());
+        let d = argmax(&mtp_logits);
+        mtp_draft = Some(d);
+        eprintln!(
+            "MTP-EP draft: next_token(t0)={t0} → draft next-next={d} ({:?}) finite={finite} in {:.0}ms",
+            tok.decode(&[d]), tm.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
     let mut gen = Vec::new();
     let mut pos = prompt_ids.len();
     let t1 = std::time::Instant::now();
@@ -165,4 +205,18 @@ fn main() {
     println!("=== PROMPT ===\n{prompt}\n=== GENERATION (tp={tp} EP) ===\n{}", tok.decode(&gen));
     eprintln!("gen ids: {:?}", &gen[..gen.len().min(40)]);
     eprintln!("gen FNV: 0x{:016x}", fnv1a(&gen));
+
+    // MTP-EP accept check: the draft predicted the token AFTER t0; the decode
+    // loop's gen[1] IS that true token. A match = spec-decode accept.
+    if let Some(draft) = mtp_draft {
+        let true_next = gen.get(1).copied();
+        let accept = Some(draft) == true_next;
+        eprintln!(
+            "MTP-EP accept check: draft={draft} ({:?}) vs true gen[1]={:?} ({:?}) → {}",
+            tok.decode(&[draft]),
+            true_next,
+            true_next.map(|t| tok.decode(&[t])).unwrap_or_default(),
+            if accept { "ACCEPT ✓" } else { "reject (draft≠target; MTP path ran coherently regardless)" },
+        );
+    }
 }
