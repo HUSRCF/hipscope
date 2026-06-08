@@ -203,3 +203,43 @@ correctness anchor.)
 **Next:** E6a sequential prefill (works already — `ep_decode_parity` prefills
 token-by-token via `forward_ep`) → E6b WMMA batched prefill (genuine
 expert-skip, not zero-dummy). Then MiniMax EP (step 2), DeepSeek-V4 EP (step 3).
+
+---
+
+## VALIDATED — E6b WMMA batched prefill EP (qwen3.6-A3B), 2026-06-07
+
+Step "E6b" done: a genuine WMMA/grouped-GEMM batched prefill EP path
+(`forward_prefill_batch_ep`), not token-by-token. Driven layer-granularly via
+single-layer `forward_prefill_chunk` bands so each MoE layer gets its per-layer
+all-reduce; routed combine → zeroed `[n×dim]` partial (owned experts only, Path
+0/1/2 redirect via `MoePrefillParams.routed_out`), shared expert stays in
+`x_batch` replicated, then `all_reduce_sum_f32([n×dim])` + add into each rank's
+residual. `HIPFIRE_EP_PREFILL=batched` in `ep_decode_parity`.
+
+**Results** (`qwen3.6-35b-a3b.mq4`, "The capital of France is", 16 steps):
+
+| box / arch | run | gen FNV |
+|---|---|---|
+| k9lin gfx1100 | tp=1 sequential / batched | `0x6eb6f119212f3f68` (both, == production) |
+| hiptrx gfx1201 ×2 | tp=2 sequential | `0xdf98c087d3de9725` |
+| hiptrx gfx1201 ×2 | **tp=2 batched-WMMA** | `0xdf98c087d3de9725` (== sequential) |
+
+Batched-WMMA prefill is argmax-identical to sequential at tp=2 → the prefill EP
+path is correct with experts genuinely sharded across two gfx1201 + per-layer
+RCCL all-reduce.
+
+**BUG FOUND + FIXED (the slow part):** sharing ONE `[max_batch·dim]` routed
+partial between the decode executor and prefill made decode's all-reduce a
+`count=dim` in-place RCCL reduction over a `[max_batch·dim]` buffer (count <
+buffer). On tp≥2 that **page-faults** (gfxhub ring fault, confirmed in dmesg);
+tp=1 was immune because the `n==1` all-reduce short-circuits RCCL. Fix: separate
+partials — decode `[dim]` (count==buffer, the validated decode config), prefill
+`[max_batch·dim]` (count = n·dim == buffer). **Lesson: keep RCCL in-place
+all-reduce count == allocated buffer size; a count<buffer in-place reduce faults
+on multi-rank.** A faulting run can transiently stall the gfx12 ring (looks like
+a hang); it self-recovers once the process is killed (no reset needed).
+
+**Remaining for prefill EP (perf, not correctness):** v1 uses zero-dummy experts
+(per-card expert compute still full); genuine expert-skip (1/N compute) +
+chunked prompts (>max_batch) are follow-on perf work. Next ship-blocking step:
+MiniMax-M2 EP (#15) then DeepSeek-V4 EP (#16).
