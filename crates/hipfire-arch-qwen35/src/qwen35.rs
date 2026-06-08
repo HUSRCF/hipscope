@@ -13053,6 +13053,7 @@ pub fn forward_prefill_batch_ep(
     let mut fa_off = 0usize;
 
     let ep_timing = std::env::var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
+    let ep_skip_ar = std::env::var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;
     let mut t_add = 0.0f64;
@@ -13123,7 +13124,7 @@ pub fn forward_prefill_batch_ep(
         }
 
         // 3. All-reduce the routed partials, add into each rank's residual.
-        if is_moe {
+        if is_moe && !ep_skip_ar {
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             gpus.all_reduce_sum_f32(&refs, n * dim)
