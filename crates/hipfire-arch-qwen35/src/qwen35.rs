@@ -12288,6 +12288,29 @@ pub fn shard_moe_experts(
     Ok(())
 }
 
+/// Shard every MoE layer of a replicated `Qwen35Weights` to `rank`, calling
+/// [`shard_moe_experts`] on each `DeltaNetMoe` / `FullAttnMoe` layer's FFN.
+/// Dense / attention-only layers are untouched. Convenience wrapper for the EP
+/// load path so callers (the `forward_ep` driver / examples) never reach into
+/// `LayerWeights` internals. `n_exp` is the model's routed expert count
+/// (`config.num_experts`).
+pub fn shard_all_moe_layers(
+    gpu: &mut Gpu,
+    weights: &mut Qwen35Weights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+) -> HipResult<()> {
+    for layer in weights.layers.iter_mut() {
+        match layer {
+            LayerWeights::DeltaNetMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
+            LayerWeights::FullAttnMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// TriAttention tap helper (inline from original forward).
 fn triattn_tap(
     gpu: &mut Gpu,
@@ -12805,6 +12828,139 @@ fn forward_scratch_layers_lowered(
     Ok(())
 }
 
+
+/// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
+///
+/// Every rank holds **full replicated** weights / scratch / KV / DeltaNet
+/// state EXCEPT the MoE routed experts, which were sharded per rank at load by
+/// [`shard_moe_experts`]. Behaviorally this mirrors the single-GPU
+/// [`forward_scratch`] → [`forward_scratch_layers_lowered`] pipeline (embed →
+/// per-layer `LayerProgram` → final norm + lm_head), but runs each layer's
+/// program through the EP executor ([`hipfire_runtime::ep::run_layer_program_ep`]):
+/// the `Moe` super-op is all-reduce-EP'd across ranks (each rank computes only
+/// its owned experts into a zeroed routed partial, the partials are
+/// all-reduce-summed, then added into each rank's residual); every other
+/// super-op runs **replicated** and stays bit-identical across ranks.
+///
+/// Logits land in `scratch_per_rank[0].logits` (rank 0 = `output_device`); the
+/// caller reads them with `gpu.download_f32` after this returns (this fn
+/// device-synchronizes every rank before returning, so the read is safe even
+/// though work ran on each rank's `active_stream`).
+///
+/// All parallel slices (`weights_per_rank`, `kv_per_rank`, `dn_per_rank`,
+/// `scratch_per_rank`, `partials`) must have length `gpus.devices.len()`, with
+/// element `r` allocated on `gpus.devices[r]`. Every device must have an
+/// `active_stream` set ([`hipfire_runtime::ep::ensure_rank_streams`]).
+///
+/// TP=1 is the degenerate reference: one rank owns all experts (no zero-dummy),
+/// the all-reduce short-circuits to identity, and the result is the same as the
+/// single-GPU lowered decode (validated byte-/argmax-identical on the fleet).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_per_rank: &mut [llama::KvCache],
+    dn_per_rank: &[DeltaNetState],
+    scratch_per_rank: &[Qwen35Scratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    let n = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n, "forward_ep: weights_per_rank.len() != n_ranks");
+    assert_eq!(kv_per_rank.len(), n, "forward_ep: kv_per_rank.len() != n_ranks");
+    assert_eq!(dn_per_rank.len(), n, "forward_ep: dn_per_rank.len() != n_ranks");
+    assert_eq!(scratch_per_rank.len(), n, "forward_ep: scratch_per_rank.len() != n_ranks");
+    assert_eq!(partials.len(), n, "forward_ep: partials.len() != n_ranks");
+
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let pos_i32 = pos as i32;
+
+    // 1. Embed token + write pos on each rank (replicated; deterministic, since
+    //    weights are byte-identical replicas → s.x is bit-identical per rank).
+    for r in 0..n {
+        gpus.devices[r].bind_thread()?;
+        let w = &weights_per_rank[r];
+        let s = &scratch_per_rank[r];
+        let gpu = &mut gpus.devices[r];
+        match w.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup(&w.token_embd, &s.x, token, dim)?,
+            other => return Err(HipError::new(0, &format!("forward_ep: unsupported embedding format {other:?}"))),
+        }
+        gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+    }
+
+    // 2. Per-layer EP program. Variant + delta-layer counter are replicated
+    //    (sharding frees experts but never changes the layer variant), so rank 0
+    //    is authoritative for both.
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..config.n_layers {
+        let program = lower_variant(variant_of(&weights_per_rank[0].layers[layer_idx]));
+        // Build the N per-rank bindings. `kv_per_rank.iter_mut()` yields the
+        // disjoint `&mut KvCache` each binding needs; weights/scratch/dn are
+        // shared `&`. This Vec is dropped at the end of the iteration, releasing
+        // the mutable KV borrows before the next layer's `iter_mut`.
+        let mut binds: Vec<Qwen35Bindings> = Vec::with_capacity(n);
+        for (((w, s), kv), dn) in weights_per_rank
+            .iter()
+            .zip(scratch_per_rank.iter())
+            .zip(kv_per_rank.iter_mut())
+            .zip(dn_per_rank.iter())
+        {
+            binds.push(Qwen35Bindings {
+                layer: &w.layers[layer_idx],
+                s,
+                config,
+                kv_cache: kv,
+                dn_state: dn,
+                pos,
+                layer_idx,
+                delta_layer_idx,
+                k_dim,
+                v_dim,
+                n_v_heads,
+                hd,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, dim)
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+        if matches!(
+            &weights_per_rank[0].layers[layer_idx],
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
+        ) {
+            delta_layer_idx += 1;
+        }
+    }
+
+    // 3. Final norm + lm_head on rank 0 (output_device). Logits → rank0 scratch.
+    {
+        gpus.devices[0].bind_thread()?;
+        let w = &weights_per_rank[0];
+        let s = &scratch_per_rank[0];
+        let gpu = &mut gpus.devices[0];
+        gpu.rmsnorm_f32(&s.x, &w.output_norm, &s.tmp, config.norm_eps)?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = w.output.dispatch_ref();
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+
+    // 4. Sync every rank — work ran on each device's active_stream, so a host
+    //    download of rank 0's logits (on the null stream) would otherwise race.
+    for r in 0..n {
+        gpus.devices[r].bind_thread()?;
+        gpus.devices[r].hip.device_synchronize()?;
+    }
+    Ok(())
+}
 
 /// Multi-GPU layer-loop dispatcher (Stage 5 of multi-GPU pp migration #58).
 /// Mirrors `forward_scratch_layers` but routes per-layer work to

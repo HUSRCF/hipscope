@@ -467,6 +467,15 @@ impl Gpus {
                 ),
             ));
         }
+        // Single-rank (TP=1) degenerate case: the all-reduce-sum over one
+        // buffer is the identity — the buffer already holds the only rank's
+        // partial. Short-circuit so the TP=1 EP path is a pure single-GPU
+        // reference that exercises the full EP executor WITHOUT requiring
+        // librccl (a 1-rank communicator would also work, but skipping it
+        // keeps TP=1 dependency-free and the parity baseline trivially exact).
+        if self.devices.len() == 1 {
+            return Ok(());
+        }
         self.ensure_rccl()?;
 
         // Borrow-check note: `self.rccl_comms.as_ref()` projects through
