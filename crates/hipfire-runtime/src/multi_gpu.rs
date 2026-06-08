@@ -24,7 +24,7 @@ use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{Gpu, GpuTensor, DType};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -76,6 +76,12 @@ pub struct Gpus {
     /// the KV cache constructor (Stage 5) populates them.
     pub givens_cos_per_dev: Vec<GpuTensor>,
     pub givens_sin_per_dev: Vec<GpuTensor>,
+    /// Peer-direct all-reduce scratch: `peer_ar_tmp[r][slot]` is a buffer on
+    /// device `r` holding one OTHER rank's partial during
+    /// [`Gpus::all_reduce_sum_f32_peer`]. Lazily allocated / grown to the largest
+    /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
+    peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
+    peer_ar_tmp_bytes: usize,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -151,6 +157,8 @@ impl Gpus {
             output_device: 0,
             givens_cos_per_dev: Vec::new(),
             givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
         }
     }
 
@@ -198,6 +206,8 @@ impl Gpus {
             output_device: 0,
             givens_cos_per_dev: Vec::new(),
             givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
         })
     }
 
@@ -397,6 +407,8 @@ impl Gpus {
             output_device: n_devices - 1,
             givens_cos_per_dev: Vec::new(),
             givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
         })
     }
 
@@ -508,6 +520,112 @@ impl Gpus {
         }
         rccl.group_end()
             .map_err(|e| HipError::new(0, &format!("ncclGroupEnd: {e}")))?;
+        Ok(())
+    }
+
+    /// Ensure `peer_ar_tmp[r]` holds `n-1` buffers of at least `bytes` on each
+    /// device. Lazily allocates; grows (freeing the old set) if `bytes` exceeds
+    /// the current size. No-op for `n <= 1`.
+    fn ensure_peer_ar_tmp(&mut self, bytes: usize) -> HipResult<()> {
+        let n = self.devices.len();
+        if n <= 1 {
+            return Ok(());
+        }
+        if !self.peer_ar_tmp.is_empty() && self.peer_ar_tmp_bytes >= bytes {
+            return Ok(());
+        }
+        // Free the old (too-small) set on its owning devices before regrowing.
+        if !self.peer_ar_tmp.is_empty() {
+            for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+                let _ = self.devices[r].bind_thread();
+                for buf in row {
+                    let _ = self.devices[r].hip.free(buf);
+                }
+            }
+        }
+        let mut all = Vec::with_capacity(n);
+        for r in 0..n {
+            self.devices[r].bind_thread()?;
+            let mut row = Vec::with_capacity(n - 1);
+            for _ in 0..(n - 1) {
+                row.push(self.devices[r].hip.malloc(bytes)?);
+            }
+            all.push(row);
+        }
+        self.peer_ar_tmp = all;
+        self.peer_ar_tmp_bytes = bytes;
+        Ok(())
+    }
+
+    /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
+    /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
+    /// e.g. hiptrx 4× gfx1201), `ncclAllReduce` costs ~40 ms/call for these
+    /// small/medium messages regardless of NCCL_PROTO/CHANNELS/BUFFSIZE/
+    /// SOCKET_IFNAME, while this path is ~1 ms. Used by EP prefill and TP; EP
+    /// decode's tiny per-token reduce stays on RCCL (already fast). PP never
+    /// all-reduces (it uses `boundary_copy` point-to-point).
+    ///
+    /// Algorithm (N-rank, race-free): **phase 1** copies every OTHER rank's
+    /// ORIGINAL buffer into a local temp (all reads, no writes); a barrier
+    /// (`wait_boundary`); **phase 2** adds the peer temps into the local buffer.
+    /// All-reads-before-writes ⇒ no cross-device read/write race. `n==1` is the
+    /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
+    /// the fast P2P path; without it `boundary_copy` host-stages (slower but
+    /// correct). In-place: `buffers[r]` is both input and output.
+    pub fn all_reduce_sum_f32_peer(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!("all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}", buffers.len()),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count * 4;
+        self.ensure_peer_ar_tmp(bytes)?;
+
+        // Phase 1: read every peer's ORIGINAL buffer into a local temp.
+        let mut evts = Vec::with_capacity(n * (n - 1));
+        for r in 0..n {
+            let mut slot = 0usize;
+            for j in 0..n {
+                if j == r {
+                    continue;
+                }
+                let evt = self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                evts.push(evt);
+                slot += 1;
+            }
+        }
+        for evt in evts {
+            self.wait_boundary(evt)?;
+        }
+
+        // Phase 2: add the peer temps into each rank's buffer.
+        for r in 0..n {
+            let dst = GpuTensor {
+                buf: unsafe { buffers[r].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let srcs: Vec<GpuTensor> = (0..n - 1)
+                .map(|slot| GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                })
+                .collect();
+            self.devices[r].bind_thread()?;
+            for src in &srcs {
+                self.devices[r].add_inplace_f32(&dst, src)?;
+            }
+        }
         Ok(())
     }
 }
