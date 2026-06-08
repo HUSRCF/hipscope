@@ -1096,13 +1096,23 @@ impl DeepseekV4State {
                 let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
             }
         }
+        // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
+        // the reference `torch.full(-inf)`): a fresh conversation's first
+        // compressed block has no overlap prev-window, and those unfilled slots
+        // must get zero softmax weight in the pooling. Reset to 0 would instead
+        // pool the prior turn's stale window (or dilute block 0 with zeros).
+        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t {
+                let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
+            }
+        }
         for l in &self._indexer {
             z(gpu, &l.main_kv_cache);
             z(gpu, &l.main_kv_state);
-            z(gpu, &l.main_score_state);
+            zinf(gpu, &l.main_score_state);
             z(gpu, &l.indexer_kv_cache);
             z(gpu, &l.indexer_kv_state);
-            z(gpu, &l.indexer_score_state);
+            zinf(gpu, &l.indexer_score_state);
             z(gpu, &l.comp_kv_buf);
             z(gpu, &l.comp_score_buf);
             z(gpu, &l.comp_concat_kv);

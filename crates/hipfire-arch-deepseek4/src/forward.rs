@@ -489,7 +489,10 @@ fn compressor_forward_impl(
             }
             if l_state.indexer_score_state.is_none() {
                 l_state.indexer_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init: unfilled pool slots (e.g. block 0's missing
+                    // overlap prev-window) must get zero softmax weight, per the
+                    // reference `score_state = torch.full(-inf)`.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -508,7 +511,9 @@ fn compressor_forward_impl(
             }
             if l_state.main_score_state.is_none() {
                 l_state.main_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init (reference `score_state = torch.full(-inf)`):
+                    // unfilled overlap slots get zero softmax weight.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -921,7 +926,10 @@ fn compressor_forward_batched(
             }
             if l_state.indexer_score_state.is_none() {
                 l_state.indexer_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init: unfilled pool slots (e.g. block 0's missing
+                    // overlap prev-window) must get zero softmax weight, per the
+                    // reference `score_state = torch.full(-inf)`.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -940,7 +948,9 @@ fn compressor_forward_batched(
             }
             if l_state.main_score_state.is_none() {
                 l_state.main_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init (reference `score_state = torch.full(-inf)`):
+                    // unfilled overlap slots get zero softmax weight.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?,
                 );
             }
