@@ -878,8 +878,7 @@ pub struct DeepseekV4State {
     pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
     pub moe_up_batch: Option<rdna_compute::GpuTensor>,
     pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
-    /// Per-expert down outputs `[k_top × hidden]` for the deterministic
-    /// (atomic-free) single-token MoE combine (run_moe_decode_bias_aware).
+    /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
     pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
@@ -1084,16 +1083,10 @@ impl DeepseekV4State {
     /// KV, indexer/compressor scratch) so a fresh conversation starts from the
     /// same clean state as a freshly-launched daemon.
     ///
-    /// `reset()` only rewinds `n_tokens`; it deliberately leaves these caches
-    /// intact (the old comment assumed "written before read"). That holds for
-    /// per-step scratch but NOT for these position-indexed caches: a short new
-    /// conversation does not overwrite every slot the forward reads (the SWA
-    /// ring window, the compressor's block-staging buffers, indexer score
-    /// rows), so the prior turn's residue bleeds in. The forward itself is
-    /// bit-deterministic (a first request after restart reproduces exactly,
-    /// because GPU init zeroed these buffers) — the bleed is what makes a
-    /// second fresh conversation drift. Greedy argmax then flips on the
-    /// marginal MQ2-Lloyd logits → "recall/tool-calls unreliable".
+    /// `reset()` only rewinds `n_tokens` and leaves these position-indexed
+    /// caches intact; a short new conversation doesn't overwrite every slot the
+    /// forward reads, so the prior turn's residue bleeds in and drifts greedy
+    /// decode.
     ///
     /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
     /// conversation handler), not from `reset()` (no gpu there).
