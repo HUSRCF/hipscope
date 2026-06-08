@@ -198,6 +198,13 @@ impl DeepseekV4 {
 
             let mut blob = Vec::with_capacity(stride * n_owned);
             for e in 0..n_exp {
+                // EP shard: read+pack ONLY owned experts (each rank reads just
+                // its 1/N of the file → faster load, less page-cache churn).
+                // Non-owned experts are never touched — their pointer-table
+                // slot reuses the compact base (rotate input 0 ⇒ output 0).
+                if !owns(e) {
+                    continue;
+                }
                 let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
                 let (info, bytes) = hfq
                     .tensor_data_pread(&name)
@@ -208,9 +215,7 @@ impl DeepseekV4 {
                         info.data_size, stride
                     ));
                 }
-                if owns(e) {
-                    blob.extend_from_slice(&bytes);
-                }
+                blob.extend_from_slice(&bytes);
             }
             let mut blob_shape = vec![n_owned];
             blob_shape.extend_from_slice(&shape0);
@@ -265,16 +270,25 @@ impl DeepseekV4 {
             let combined_stride = stride_w1 + stride_w3;
             let mut combined = Vec::with_capacity(combined_stride * n_owned);
             for e in 0..n_exp {
+                // EP shard: pack ONLY owned experts. Each read's `Ref` on the
+                // shared pread buffer MUST be dropped before the next pread
+                // (the buffer is reused; holding two `Ref`s panics with
+                // "RefCell already borrowed").
+                if !owns(e) {
+                    continue;
+                }
                 let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
-                let (_, w1_bytes) = hfq
-                    .tensor_data_pread(&w1_name)
-                    .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
-                let (_, w3_bytes) = hfq
-                    .tensor_data_pread(&w3_name)
-                    .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                if owns(e) {
+                {
+                    let (_, w1_bytes) = hfq
+                        .tensor_data_pread(&w1_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
                     combined.extend_from_slice(&w1_bytes);
+                }
+                let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
+                {
+                    let (_, w3_bytes) = hfq
+                        .tensor_data_pread(&w3_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
                     combined.extend_from_slice(&w3_bytes);
                 }
             }
