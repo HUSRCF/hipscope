@@ -4627,6 +4627,10 @@ fn moe_ffn_decode_impl(
         x_rot_prerotated,
         x_norm,
         x_residual,
+        // EP (Ship 6 substrate-EP): None/false = single-GPU byte-identical.
+        // The EP executor threads Some(partial)/skip_shared in later.
+        routed_out: None,
+        skip_shared: false,
         router: ffn.router.dispatch_ref(),
         shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
         shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
