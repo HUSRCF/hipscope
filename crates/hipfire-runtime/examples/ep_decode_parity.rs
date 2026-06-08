@@ -128,7 +128,14 @@ fn main() {
     let mut dn_per_rank: Vec<DeltaNetState> = Vec::with_capacity(n);
     let mut scratch_per_rank: Vec<Qwen35Scratch> = Vec::with_capacity(n);
     let mut pbs_per_rank: Vec<PrefillBatchScratch> = Vec::with_capacity(n);
-    let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
+    // SEPARATE routed partials for decode vs prefill so each all-reduce's count
+    // matches its buffer size exactly: decode partial is [dim] (count=dim), the
+    // prefill partial is [max_batch·dim] (count=n·dim). Sharing one [max_batch·dim]
+    // buffer for both made decode's all-reduce a count<buffer in-place RCCL
+    // reduction, which page-faults on multi-rank (tp≥2). Keeping count==buffer
+    // matches the validated decode-EP config.
+    let mut partials: Vec<GpuTensor> = Vec::with_capacity(n); // decode: [dim]
+    let mut prefill_partials: Vec<GpuTensor> = Vec::with_capacity(n); // prefill: [max_batch·dim]
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
         let g = &mut gpus.devices[r];
@@ -138,12 +145,11 @@ fn main() {
         );
         dn_per_rank.push(DeltaNetState::new(g, &config).expect("dn"));
         scratch_per_rank.push(Qwen35Scratch::new(g, &config, 64).expect("scratch"));
+        partials.push(g.zeros(&[config.dim], DType::F32).expect("partial"));
         if batched_prefill {
             pbs_per_rank.push(PrefillBatchScratch::new(g, &config, max_batch).expect("pbs"));
+            prefill_partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("prefill partial"));
         }
-        // Routed partial: [max_batch × dim] f32 — covers both decode (uses the
-        // first `dim`) and batched prefill (uses `n_prompt × dim`).
-        partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("partial"));
     }
     if n > 1 {
         let peer = gpus.enable_peer_all().expect("enable_peer_all");
@@ -156,7 +162,7 @@ fn main() {
     if batched_prefill {
         qwen35::forward_prefill_batch_ep(
             &mut gpus, &weights_per_rank, &config, &prompt_tokens, 0,
-            &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &partials,
+            &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
         )
         .expect("forward_prefill_batch_ep");
     } else {
