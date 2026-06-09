@@ -83,21 +83,31 @@ VL, prefill-checkpoints. Full sampler (temp/top-p/penalties) supported — NOT
 greedy-only. (MTP-EP spec-decode = later, folds in #26's original scope via
 mtp_forward_ep.)
 
-## Increments (build + fleet-verify each)
+## Increments (build + verify each)
 1. **ds4** (motivating, proven harness): config + struct + ds4 load arm +
    generate_ep + route. VERIFY: daemon serve ds4 on hiptrx `--tp 4`, coherent
    (the recall gate now works on gfx1201!). ← establishes the pattern.
 2. **qwen35** (A3B EP): replicate load arm + generate_ep arch branch. VERIFY
-   qwen3.5-A3B served `--tp 2` (k9lin? needs 2 GPUs — use hiptrx/hipx).
-3. **minimax**: replicate. VERIFY on hipx/gfx1151 or hiptrx.
+   qwen3.5-A3B served on hiptrx `--tp 2`/`--tp 4`.
+3. **minimax**: replicate. VERIFY on hiptrx `--tp 4` (minimax needs EP to fit
+   across the 32GB cards).
 
-## Test / gates
-- Per arch: daemon `--tp N` serve → coherent output (the daemon coherence gates
-  now cover ds4 on gfx1201). Determinism: EP byte-parity vs the harness
-  (`ep_deepseek4` FNV) for the same prompt.
-- Cross-arch (#397): gfx1201 (hiptrx) blocking. gfx1151 (hipx) for minimax.
-- No single-GPU regression: EP fields None when `ep_tp<=1` → existing paths
-  byte-identical.
+## Test / gates — **EP IS hiptrx-ONLY**
+EP needs ≥2 HOMOGENEOUS GPUs; the ONLY such box is **hiptrx (4× gfx1201/RDNA4)**.
+- k9lin = single gfx1100 → no EP at all.
+- hipx = gfx1010 5700XT (RDNA1) + gfx1151 Strix Halo (RDNA3.5) → heterogeneous,
+  EP expert-offload across them is FRUITLESS (mismatched ISA, RDNA1 tiny/slow).
+- ⇒ the #397 cross-arch mandate does NOT extend to EP (no RDNA3/3.5 multi-
+  homogeneous-GPU box exists). daemon-EP validation = hiptrx/RDNA4 only.
+- That's sufficient: `forward_ep` is already byte-validated on hiptrx
+  ([[project_ship6_ep_substrate_validated_2026_06_07]]); the daemon wiring is
+  arch-general (single-GPU paths untouched → compiles+runs unchanged on all
+  arches). So this is a hiptrx serve-routing smoke test, NOT a re-validation of
+  EP correctness.
+- Per arch on hiptrx: daemon `--tp N` serve → coherent output; determinism =
+  EP byte-parity vs the `ep_deepseek4` FNV (same prompt, fixed seed).
+- No single-GPU regression: `ep` None when `tp<=1` → existing paths byte-identical
+  (verify on k9lin/gfx1100 + the standard coherence gate).
 
 ## Gotchas
 - `init_tp` uniform-VRAM preflight over-strict on near-full cards →
