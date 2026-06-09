@@ -5462,6 +5462,15 @@ fn generate_ep(
             ids
         }
     };
+    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT").ok().as_deref() == Some("1") {
+        let tk = m.tokenizer.as_ref().unwrap();
+        eprintln!(
+            "[ep prompt dump] arch={} {} tokens, decoded:\n>>>\n{}\n<<<",
+            m.arch_id,
+            prompt_ids.len(),
+            tk.decode(&prompt_ids)
+        );
+    }
     if prompt_ids.is_empty() {
         let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP: empty prompt after render"}}"#, id);
         let _ = stdout.flush();
