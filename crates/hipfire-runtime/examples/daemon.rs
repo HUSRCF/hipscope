@@ -3111,6 +3111,15 @@ fn main() {
 /// not load-time resolution. It belongs in Stage 5 alongside the CLI
 /// passthrough refactor; this resolver only handles the load-time
 /// sources.
+/// Bundled production chat templates (defaults flipped ON 2026-06-09).
+/// Qwen3.5/3.6 (arch 5/6) render through froggeric (HF-byte-exact, agentic
+/// fixes); LFM2.5 (arch 11) renders through LiquidAI's template, bundled here so
+/// the A1B export (which ships no embedded chat_template) still gets correct
+/// jinja framing instead of the hand-rolled ChatML fallback.
+const FROGGERIC_QWEN35_TEMPLATE: &str =
+    include_str!("../templates/eval/qwen35-froggeric-v20.jinja");
+const LFM2_TEMPLATE: &str = include_str!("../templates/eval/lfm2-liquidai.jinja");
+
 fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) -> Option<String> {
     // 1. Env-var override.
     if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
@@ -3156,7 +3165,22 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
         }
     }
 
-    // 3. HFQ-embedded.
+    // 3. Arch-default bundled templates (production defaults, flipped ON
+    //    2026-06-09): Qwen3.5/3.6 (arch 5/6) → froggeric; LFM2.5 (arch 11) →
+    //    LiquidAI (embedded if present — the 350M carries one — else the bundled
+    //    copy, which is what the A1B export needs). Env / per-model overrides
+    //    (steps 1–2) still win.
+    match hfq.arch_id {
+        5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
+        11 => {
+            if let Some(t) = hfq.chat_template() {
+                return Some(t);
+            }
+            return Some(LFM2_TEMPLATE.to_string());
+        }
+        _ => {}
+    }
+    // 4. HFQ-embedded (all other arches).
     hfq.chat_template()
 }
 
@@ -6104,8 +6128,11 @@ fn generate_dflash(
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
     // the .hfq carries no template, e.g. an older A1B convert).
+    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
+    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
+    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -7379,8 +7406,11 @@ fn generate_multi(
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
     // the .hfq carries no template, e.g. an older A1B convert).
+    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
+    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
+    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -8737,8 +8767,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
     // the .hfq carries no template, e.g. an older A1B convert).
+    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
+    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
+    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -8854,7 +8887,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // so the operator gets consistent rendering across all turns.
     // Cache-with-Jinja is a future project (would require Jinja-side
     // assistant-turn replay).
-    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
         && m.chat_template.is_some();
     // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
     // When jinja is active the prompt-build below routes through
@@ -11821,8 +11854,11 @@ fn generate_lfm2moe(
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
     // the .hfq carries no template, e.g. an older A1B convert).
+    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
+    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
+    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -12065,9 +12101,8 @@ fn generate_minimax(
     // (b) never matches across turns so the LCP prompt-cache is dead. Force
     // jinja on for both (falls back to Plain only when the .hfq carries no
     // template).
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
-        || m.arch_id == 11
-        || m.arch_id == 10;
+    // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
