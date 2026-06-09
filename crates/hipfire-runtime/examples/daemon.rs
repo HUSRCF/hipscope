@@ -7941,6 +7941,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // Expert-parallel (task #26): route to generate_ep BEFORE any arch
+    // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
+    // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
+    // would unwrap-panic / error on the missing config.
+    if m.ep.is_some() {
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, stop);
+        return;
+    }
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -8080,10 +8088,6 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     }
     // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
     // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
-    if m.ep.is_some() {
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, stop);
-        return;
-    }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
