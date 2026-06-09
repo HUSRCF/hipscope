@@ -5376,6 +5376,7 @@ fn generate_ep(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
@@ -5389,7 +5390,21 @@ fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = {
+    let prompt_ids: Vec<u32> = if m.arch_id == 9 {
+        primed_think = false;
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let eos_tok = m.deepseek4_eos_tok;
+        build_deepseek4_dsml_prompt(
+            tokenizer,
+            system_prompt,
+            tools,
+            messages_history,
+            prompt,
+            think_mode,
+            eos_tok,
+            &mut m.asst_turn_cache,
+        )
+    } else {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         if let Some(template) = m.chat_template.as_ref() {
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -5455,7 +5470,7 @@ fn generate_ep(
     let eos_tok = if m.arch_id == 10 { m.minimax_eos_tok } else { m.deepseek4_eos_tok };
     match m.arch_id {
         10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think),
-        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop),
+        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop),
     }
 }
 
@@ -5485,41 +5500,156 @@ fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt
 }
 
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String]) {
+fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String]) {
     use std::time::Instant;
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
+
     let prompt_n = prompt_ids.len();
-    let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-    let EpArch::Ds4 { config, weights, state, partials } = inner else {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
-        let _ = stdout.flush();
-        return;
+
+    let mut parser = match think_mode {
+        ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+        ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
     };
+    let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    let func = t.get("function").unwrap_or(t);
+                    let name = func
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parameters = func.get("parameters");
+                    let params: Vec<String> = parameters
+                        .and_then(|p| p.get("properties"))
+                        .and_then(|p| p.as_object())
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let required: Vec<String> = parameters
+                        .and_then(|p| p.get("required"))
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    deepseek4::grammar::ToolSchema {
+                        name,
+                        params,
+                        required,
+                    }
+                })
+                .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let grammar_active = !tool_schemas.is_empty();
+    let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+    let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+        if m.decoded_vocab.is_none() {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            let n = tokenizer.vocab_size();
+            let v: Vec<String> = (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+            m.decoded_vocab = Some(std::sync::Arc::new(v));
+        }
+        m.decoded_vocab.clone()
+    } else {
+        None
+    };
+    let empty_vocab: Vec<String> = Vec::new();
+    let decoded_vocab: &[String] = decoded_vocab_arc
+        .as_deref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&empty_vocab);
+    let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+    let mut emit_text_buf = String::new();
+    let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut absorb_event = |ev: &StreamEvent| {
+        match ev {
+            StreamEvent::Token(t) => emit_text_buf.push_str(t),
+            StreamEvent::Reasoning(_) => {}
+            StreamEvent::ToolCalls(calls) => {
+                for c in calls {
+                    emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                    });
+                }
+            }
+        }
+    };
+
     let t_prefill = Instant::now();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+    {
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Ds4 { config, weights, state, partials } = inner else {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
             let _ = stdout.flush();
             return;
+        };
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
         }
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    let _ = gpus.devices[0].bind_thread();
-    let mut logits = match state[0].logits.as_ref() {
-        Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
-        None => { let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id); return; }
+    let mut logits = {
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Ds4 { state, .. } = inner else {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        };
+        let _ = gpus.devices[0].bind_thread();
+        match state[0].logits.as_ref() {
+            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            None => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id);
+                let _ = stdout.flush();
+                return;
+            }
+        }
     };
+
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
     let mut text_acc = String::new();
+    let mut local_emitted_ids: Vec<u32> = Vec::new();
     while generated < max_tokens {
+        if grammar_active && !matcher.is_free() {
+            matcher.token_mask(decoded_vocab, &mut grammar_mask);
+            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
+        }
         let mut next = 0u32;
         let mut best = f32::NEG_INFINITY;
         for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
         if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        for ev in parser.feed(&piece) {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
+        }
+        emit_committed_event(
+            stdout,
+            id,
+            next,
+            generated,
+            t_decode.elapsed().as_millis() as u64,
+        );
+        let _ = stdout.flush();
+        if grammar_active {
+            matcher.advance(&piece);
+        }
+        local_emitted_ids.push(next);
+        text_acc.push_str(&piece);
         generated += 1;
-        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) { break; }
+        if stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s)) { break; }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 { config, weights, state, partials } = inner else { break; };
         if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
@@ -5529,7 +5659,58 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         let _ = gpus.devices[0].bind_thread();
         logits = match state[0].logits.as_ref() { Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(), None => break };
     }
-    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
+    for ev in parser.finish() {
+        absorb_event(&ev);
+        emit_stream_event(stdout, id, ev);
+    }
+    let _ = stdout.flush();
+    drop(absorb_event);
+
+    let finish_reason: &'static str = if !emit_tool_calls_buf.is_empty() {
+        "tool_calls"
+    } else if generated >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
+    let have_replayable_payload =
+        !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
+    if have_replayable_payload && generated > 0 && !local_emitted_ids.is_empty() {
+        let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+        if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[asst-cache store] fp={:#018x} content.len={} tool_calls={} tokens={}",
+                fp,
+                emit_text_buf.len(),
+                emit_tool_calls_buf.len(),
+                local_emitted_ids.len(),
+            );
+        }
+        m.asst_turn_cache.insert(fp, local_emitted_ids);
+    }
+
+    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+    let decode_tok_s = if decode_ms > 0.0 { generated as f64 / (decode_ms / 1000.0) } else { 0.0 };
+    let prefill_tok_s = if prefill_ms > 0.0 { prompt_n as f64 / (prefill_ms / 1000.0) } else { 0.0 };
+    eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
+    let done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated,
+        "tok_s": decode_tok_s,
+        "prefill_tokens": prompt_n,
+        "prefill_ms": prefill_ms,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "ttft_ms": prefill_ms,
+        "finish_reason": finish_reason,
+    });
+    let _ = writeln!(stdout, "{}", done);
+    let _ = stdout.flush();
 }
 
 /// MiniMax-M2 EP prefill + greedy decode (mirror of ep_serve_ds4, MiniMax types).
@@ -8259,7 +8440,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
     if m.ep.is_some() {
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, tools, messages_history, stop);
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop);
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -10711,58 +10892,16 @@ impl ThinkMode {
     }
 }
 
-fn generate_deepseek4(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
+fn build_deepseek4_dsml_prompt(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let cfg = match m.deepseek4_config.as_ref() {
-        Some(c) => c,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let weights = m
-        .deepseek4_weights
-        .as_ref()
-        .expect("deepseek4_weights missing on arch_id=9 generate");
-    let pbs = m
-        .deepseek4_pbs
-        .as_ref()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
-    let state = m
-        .deepseek4_state
-        .as_mut()
-        .expect("deepseek4_state missing on arch_id=9 generate");
-    let eos_tok = m.deepseek4_eos_tok;
-
+    live_prompt: &str,
+    think_mode: ThinkMode,
+    deepseek4_eos_tok: u32,
+    asst_turn_cache: &mut AsstTurnCache,
+) -> Vec<u32> {
     // DeepSeek V4 non-thinking chat template (per HF encoding/README.md):
     //   <｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>
     //
@@ -10928,10 +11067,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                             "[asst-cache lookup] fp={:#018x} content.len={}/stripped.len={} tool_calls={} hit={}",
                             fp, msg.content.len(), normalized.len(),
                             msg.tool_calls.len(),
-                            m.asst_turn_cache.contains_key(&fp),
+                            asst_turn_cache.contains_key(&fp),
                         );
                     }
-                    if let Some(cached) = m.asst_turn_cache.get(&fp) {
+                    if let Some(cached) = asst_turn_cache.get(&fp) {
                         prompt_ids.extend_from_slice(cached);
                     } else {
                         // Cache miss — render the turn the long way.
@@ -10973,7 +11112,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
-                    prompt_ids.push(m.deepseek4_eos_tok);
+                    prompt_ids.push(deepseek4_eos_tok);
                     pending_tool_result = false;
                 }
             }
@@ -10988,11 +11127,11 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // because the empty-user turn is off-distribution and the V4F MQ2-
     // Lloyd checkpoint drifts into invented paths / repeated wrong tool
     // calls when fed one.
-    if !prompt.is_empty() {
+    if !live_prompt.is_empty() {
         if let Some(u) = user_tok {
             prompt_ids.push(u);
         }
-        prompt_ids.extend(tokenizer.encode(prompt));
+        prompt_ids.extend(tokenizer.encode(live_prompt));
     }
     if let Some(a) = asst_tok {
         prompt_ids.push(a);
@@ -11004,6 +11143,72 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
         ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
     }
+
+    prompt_ids
+}
+
+fn generate_deepseek4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.deepseek4_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m
+        .deepseek4_weights
+        .as_ref()
+        .expect("deepseek4_weights missing on arch_id=9 generate");
+    let pbs = m
+        .deepseek4_pbs
+        .as_ref()
+        .expect("deepseek4_pbs missing on arch_id=9 generate");
+    let state = m
+        .deepseek4_state
+        .as_mut()
+        .expect("deepseek4_state missing on arch_id=9 generate");
+    let eos_tok = m.deepseek4_eos_tok;
+
+    let prompt_ids = build_deepseek4_dsml_prompt(
+        tokenizer,
+        system_prompt,
+        tools,
+        messages_history,
+        prompt,
+        think_mode,
+        eos_tok,
+        &mut m.asst_turn_cache,
+    );
 
     if prompt_ids.is_empty() {
         let _ = writeln!(
