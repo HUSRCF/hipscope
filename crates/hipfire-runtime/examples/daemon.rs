@@ -5057,6 +5057,126 @@ fn screen_weights_qwen35(
     (n_safe, n_unsafe)
 }
 
+/// Expert-parallel (EP) model load — shards the routed experts across `tp`
+/// ranks (`Gpus::init_tp` + `DeepseekV4::load_weights_sharded`). ds4-first
+/// (task #26; docs/plans/daemon-ep-wiring.md). The single-GPU arch fields stay
+/// `None`; the model serves through `generate_ep`. DFlash/CASK/PFlash/VL
+/// refusals are enforced upstream in the "load" handler before we get here.
+#[allow(dead_code)] // wired by the load_model `tp > 1` dispatch (next increment)
+fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let arch_id = hfq.arch_id;
+    if arch_id != 9 {
+        return Err(format!(
+            "EP serving (tp={tp}) supports DeepSeek-V4 (arch_id 9) only for now; got arch_id {arch_id}"
+        ));
+    }
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    let n_exp = config.n_routed_experts;
+
+    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    eprintln!("[daemon] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let mut weights = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, &mut gpus.devices[r], &shard, r)
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        weights.push(w);
+    }
+    let mut state = Vec::with_capacity(n);
+    let mut partials = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        state.push(deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?);
+        partials.push(
+            gpus.devices[r]
+                .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+                .map_err(|e| format!("partial {r}: {e:?}"))?,
+        );
+    }
+    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
+
+    let eos_tok: u32 = {
+        let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+        if ids.len() == 1 { ids[0] } else { 1 }
+    };
+    let chat_template = resolve_chat_template(&hfq, path);
+
+    Ok(LoadedModel {
+        arch_id,
+        pp: 1,
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Ds4 { config, weights, state, partials },
+        }),
+        pp_gpus: None,
+        pp_scratch_set: None,
+        pp_dn_la_to_device: None,
+        q35_config: None,
+        q35_weights: None,
+        q35_scratch: None,
+        kv_cache: None,
+        dn_state: None,
+        llama_config: None,
+        llama_weights: None,
+        llama_scratch: None,
+        llama_kv: None,
+        qwen2_config: None,
+        qwen2_weights: None,
+        qwen2_state: None,
+        deepseek4_config: None,
+        deepseek4_weights: None,
+        deepseek4_state: None,
+        deepseek4_pbs: None,
+        deepseek4_eos_tok: eos_tok,
+        lfm2moe_config: None,
+        lfm2moe_weights: None,
+        lfm2moe_state: None,
+        lfm2moe_eos_tok: 0,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: 0,
+        mtp_mode: "auto".to_string(),
+        mtp_k: 3,
+        mtp_weights_present: false,
+        dots_ocr_config: None,
+        dots_ocr_weights: None,
+        vision_config: None,
+        vision_weights: None,
+        tokenizer: Some(tokenizer),
+        seq_pos: 0,
+        max_seq,
+        physical_cap: max_seq,
+        eviction: None,
+        kv_adaptive: None,
+        conversation_tokens: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(),
+        prefill_checkpoints: Vec::new(),
+        dflash_checkpoints: Vec::new(),
+        decoded_vocab: None,
+        model_path: path.to_string(),
+        dflash: None,
+        chat_template,
+    })
+}
+
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
