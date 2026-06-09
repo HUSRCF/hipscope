@@ -11895,12 +11895,18 @@ fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-    // the .hfq carries no template, e.g. an older A1B convert).
-    let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
+        // MiniMax-M2 (arch 10) and LFM2.5 (arch 11) REQUIRE their embedded Jinja
+    // chat_template — their structural tokens are NOT ChatML. MiniMax frames
+    // turns with `]~b]ai` / `[e~[` and primes the assistant with `<think>\n`;
+    // LFM2 needs its `<|startoftext|>` BOS. The hand-rolled Plain ChatML frame
+    // emits `<|im_start|>`/`<|im_end|>` which these models never trained on,
+    // producing an off-distribution prompt that (a) decodes incoherently and
+    // (b) never matches across turns so the LCP prompt-cache is dead. Force
+    // jinja on for both (falls back to Plain only when the .hfq carries no
+    // template).
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+        || m.arch_id == 11
+        || m.arch_id == 10;
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -11997,14 +12003,21 @@ fn generate_minimax(
         m.conversation_tokens.clear();
     }
 
-    // ── Prefix cache (LCP). `prompt_ids` is the full Jinja-rendered conversation
-    // (the trained chat template). Reuse the warm KV for the longest common
-    // prefix with the prior turn's token stream and prefill only the new suffix.
-    // A pure-extension HIT keeps the cache; a divergent render resets the KV and
-    // cold-prefills. MiniMax is standard attention (no compound recurrent/
-    // compressed state) so a miss is a plain `MiniMaxState::reset()`. On a HIT
-    // `state.n_tokens == lcp` already (prior turn left prompt+gen in the KV), so
-    // the prefill below resumes at `state.n_tokens`.
+    // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
+    // Jinja-rendered conversation (the trained chat template). MiniMax-M2 is an
+    // INTERLEAVED-THINKING model: its chat_template renders a prior turn's
+    // `<think>…</think>` reasoning into history ONLY while no newer user message
+    // follows (`loop.index0 > last_user_index`). Once the next user turn
+    // arrives the canonical render DROPS that reasoning, so every position after
+    // the most-recent assistant opener shifts and turn N+1 diverges from turn
+    // N's KV at that opener — i.e. `lcp < prior_len`, never a pure forward
+    // extension. We therefore support PARTIAL reuse: rewind `n_tokens` to `lcp`
+    // and re-prefill the (reasoning-free, hence shorter) suffix. MiniMax is
+    // standard attention with no compound recurrent/compressed state, so KV
+    // positions ≥ lcp are simply overwritten by the new prefill and the stale
+    // tail is never attended. The reused prefix GROWS with the conversation
+    // (all older turns, reasoning already stripped, stay matched), so
+    // steady-state per-turn prefill is just {last visible answer} + {new user}.
     let prefill_ids: Vec<u32> = {
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(prompt_ids.len());
@@ -12012,15 +12025,29 @@ fn generate_minimax(
         while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
             lcp += 1;
         }
-        let cache_hit = lcp == prior_len && lcp < prompt_ids.len() && lcp > 0;
+        // A usable common prefix that leaves at least one fresh token to prefill
+        // (the render always appends a new `]~b]ai\n<think>\n` primer, so
+        // lcp == rendered_len cannot occur on a normal turn). `partial` is the
+        // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
+        // the degenerate pure-extension case (rewind is then a no-op).
+        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        let partial = lcp < prior_len;
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
-                "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit,
+                "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
+                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
                 m.minimax_state.as_ref().unwrap().n_tokens,
             );
         }
         if cache_hit {
+            // Rewind KV + token history to the common prefix. When lcp ==
+            // prior_len this is a no-op; when lcp < prior_len it discards the
+            // stale reasoning+answer tail. The prefill loop below reads
+            // `state.n_tokens` as its base position, so n_tokens is the only
+            // KV state the rewind must touch (plus the mirror token history).
+            m.minimax_state.as_mut().unwrap().n_tokens = lcp;
+            m.conversation_tokens.truncate(lcp);
+            m.seq_pos = lcp;
             prompt_ids[lcp..].to_vec()
         } else {
             if prior_len > 0 {
