@@ -1084,6 +1084,31 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+/// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
+/// Present only when the load message requested `tp > 1`. Mirrors the PP path
+/// (`pp_gpus`) but routes the forward through `forward_ep` (replicated attention
+/// + sharded experts + all-reduce) instead of pipeline layer-split. When
+/// `Some`, the single-GPU arch fields stay `None` and generate routes through
+/// `generate_ep`.
+#[allow(dead_code)] // gpus/inner consumed by load_model_ep + generate_ep (next increment)
+struct EpState {
+    gpus: Gpus,
+    inner: EpArch,
+}
+
+/// Per-arch EP rank state. One `Vec` entry per rank (rank r owns experts
+/// `e % tp == r`). Add `Qwen35`/`Minimax` variants with their increments.
+#[allow(dead_code)] // populated by load_model_ep (next increment)
+enum EpArch {
+    Ds4 {
+        config: hipfire_arch_deepseek4::DeepseekV4Config,
+        weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
+        state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
+        /// Per-rank `[hidden]` F32 all-reduce partial.
+        partials: Vec<rdna_compute::GpuTensor>,
+    },
+}
+
 struct LoadedModel {
     arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
@@ -1102,6 +1127,11 @@ struct LoadedModel {
     /// kept so `unload_model` and the reset handler can route per-layer
     /// memsets to the correct device.
     pp_dn_la_to_device: Option<Vec<u8>>,
+    /// Expert-parallel serving (task #26). `Some` only when the load message
+    /// requested `tp > 1`. When `Some`, the single-GPU arch fields stay `None`
+    /// and generate routes through `generate_ep`. See docs/plans/daemon-ep-wiring.md.
+    #[allow(dead_code)] // consumed by load_model_ep + generate_ep (next increment)
+    ep: Option<EpState>,
     // Qwen3.5 state
     q35_config: Option<qwen35::Qwen35Config>,
     q35_weights: Option<qwen35::Qwen35Weights>,
@@ -3422,6 +3452,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3506,6 +3537,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3611,6 +3643,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3709,6 +3742,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3822,6 +3856,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4281,6 +4316,7 @@ fn load_model(
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4355,6 +4391,7 @@ fn load_model(
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4515,6 +4552,7 @@ fn load_model_safetensors(
         return Ok(LoadedModel {
             arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4657,6 +4695,7 @@ fn load_model_safetensors(
     Ok(LoadedModel {
         arch_id,
         pp: 1,
+        ep: None,
         pp_gpus: None,
         pp_scratch_set: None,
         pp_dn_la_to_device: None,
@@ -4898,6 +4937,7 @@ fn load_model_pp(
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
         pp,
+        ep: None,
         pp_gpus: Some(gpus),
         pp_scratch_set: Some(scratch_set),
         pp_dn_la_to_device: Some(la_to_device),
