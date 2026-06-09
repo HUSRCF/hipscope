@@ -10975,11 +10975,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // The CURRENT user prompt is appended last (outside this loop).
     if let Some(history) = messages_history {
         // Skip the leading system message (if any) — already handled.
-        // Skip the trailing user prompt — we add it explicitly after.
-        // Heuristic: if last message is role=user, treat its content as
-        // the live prompt and drop it here.
+        // Skip the trailing user prompt — we add it explicitly after, BUT only
+        // when a non-empty `live_prompt` actually carries it. The OpenAI
+        // messages API (no separate `prompt` field) puts the live user turn as
+        // the LAST history message with `live_prompt == ""`; trimming it then
+        // drops the user's question entirely (model greets instead of answering
+        // — observed on ds4 EP tp4). So only trim when live_prompt is non-empty.
         use hipfire_runtime::prompt_frame::Role;
-        let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) {
+        let trim_end = if !live_prompt.is_empty()
+            && matches!(history.last().map(|m| m.role), Some(Role::User))
+        {
             1
         } else {
             0
