@@ -11977,12 +11977,12 @@ fn generate_minimax(
 
     let eos_tok = m.minimax_eos_tok;
 
-    // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when
-    // the requested run would overflow the budget. (max_seq + n_tokens live
-    // on the state.)
+    // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when the
+    // FULL rendered conversation + generation would overflow. `prompt_ids` is
+    // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
     let overflow = {
         let state = m.minimax_state.as_ref().unwrap();
-        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+        prompt_ids.len() + max_tokens > state.max_seq
     };
     if overflow {
         let (n, cap) = {
@@ -11996,6 +11996,41 @@ fn generate_minimax(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
+
+    // ── Prefix cache (LCP). `prompt_ids` is the full Jinja-rendered conversation
+    // (the trained chat template). Reuse the warm KV for the longest common
+    // prefix with the prior turn's token stream and prefill only the new suffix.
+    // A pure-extension HIT keeps the cache; a divergent render resets the KV and
+    // cold-prefills. MiniMax is standard attention (no compound recurrent/
+    // compressed state) so a miss is a plain `MiniMaxState::reset()`. On a HIT
+    // `state.n_tokens == lcp` already (prior turn left prompt+gen in the KV), so
+    // the prefill below resumes at `state.n_tokens`.
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        let cache_hit = lcp == prior_len && lcp < prompt_ids.len() && lcp > 0;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} n_tokens={}",
+                prior_len, prompt_ids.len(), lcp, cache_hit,
+                m.minimax_state.as_ref().unwrap().n_tokens,
+            );
+        }
+        if cache_hit {
+            prompt_ids[lcp..].to_vec()
+        } else {
+            if prior_len > 0 {
+                m.minimax_state.as_mut().unwrap().reset();
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+            }
+            prompt_ids.clone()
+        }
+    };
 
     let t0 = Instant::now();
 
@@ -12018,9 +12053,9 @@ fn generate_minimax(
         let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
             .map_or(true, |v| v != "0")
             && minimax::forward::forward_batch_supported(weights);
-        if batch_prefill && !prompt_ids.is_empty() {
+        if batch_prefill && !prefill_ids.is_empty() {
             let mut pos = state.n_tokens;
-            for chunk in prompt_ids.chunks(64) {
+            for chunk in prefill_ids.chunks(64) {
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
@@ -12032,7 +12067,7 @@ fn generate_minimax(
             }
         } else {
             let mut position = state.n_tokens as u32;
-            for &tok in &prompt_ids {
+            for &tok in &prefill_ids {
                 match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
@@ -12044,7 +12079,7 @@ fn generate_minimax(
             }
         }
     }
-    for &tok in &prompt_ids {
+    for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
