@@ -8856,17 +8856,21 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // assistant-turn replay).
     let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
         && m.chat_template.is_some();
+    // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
+    // When jinja is active the prompt-build below routes through
+    // `build_cached_history_jinja` (verbatim assistant-turn splice through the
+    // model's trained template) instead of the ChatScaffold `build_cached_history`,
+    // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
-        && !jinja_active
         && !m.conversation_tokens.is_empty();
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
-            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} !jinja={} conv_tok={}",
+            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
             cache_eligible, cache_kill_switch, messages_history.is_some(),
-            m.eviction.is_none(), !pflash_active, !jinja_active, m.conversation_tokens.len(),
+            m.eviction.is_none(), !pflash_active, jinja_active, m.conversation_tokens.len(),
         );
     }
     let mut cached_tokens_count: usize = 0;
@@ -8876,7 +8880,67 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // Build the canonical full-conversation token stream, replaying
         // any historical assistant turn whose fingerprint matches a
         // cached emission (BPE-bijective replacement).
-        let rendered = {
+        let rendered = if jinja_active {
+            // Jinja cache (item #37): render the full conversation through the
+            // model's trained template, splicing each cached assistant turn's
+            // VERBATIM tokens in place of its content (sentinel substitution).
+            // The store side (`asst_turn_cache`) holds the GENERATED body only
+            // (post-primer); the template renders a history assistant turn as
+            // `<|im_start|>assistant\n{content}` with NO generation primer, so
+            // we prepend the assistant-opener primer (e.g. `<think>\n`) that
+            // THIS turn's cold render emitted — making the spliced stream
+            // byte-match `conversation_tokens` for a clean forward extension.
+            let primer: Vec<u32> = {
+                let im_start = tokenizer.special_token_id("<|im_start|>");
+                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
+                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
+                    Some(q) if q + opener_len <= new_tokens.len() => {
+                        new_tokens[q + opener_len..].to_vec()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let cache_ref = &mut m.asst_turn_cache;
+            let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                &frame,
+                history,
+                tools,
+                |msg| {
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized =
+                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let hit = cache_ref.get(&fp).map(|cached| {
+                        let mut v = primer.clone();
+                        v.extend_from_slice(cached);
+                        v
+                    });
+                    if trace_cache {
+                        eprintln!(
+                            "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
+                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
+                        );
+                    }
+                    hit
+                },
+            );
+            match built {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[qwen-cache] jinja cached-history build failed ({e}) — cold render");
+                    new_tokens.clone()
+                }
+            }
+        } else {
             let cache_ref = &mut m.asst_turn_cache;
             hipfire_runtime::prompt_frame::build_cached_history(
                 tokenizer,
@@ -9159,16 +9223,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         new_tokens
     };
 
-    // Jinja path renders the full conversation each turn (the LCP cache is
-    // disabled when `jinja_active`, above). On turn 2+ (`seq_pos > 0`) cold-reset
-    // BEFORE the budget guard + prefill so the full render writes from position 0
-    // — otherwise it would append to the prior turn's dirty DeltaNet/KV/checkpoint
-    // state (stale recurrent state → drift; the reset that the non-Jinja LCP-miss
-    // path does below was being skipped, and the system prompt was dropped). This
-    // mirrors the unconditional cold reset generate_dflash already does under
-    // Jinja. Uses `free_checkpoints` (NOT a bare `.clear()`) so the checkpoint GPU
-    // buffers are actually freed rather than leaked.
-    if jinja_active && m.seq_pos > 0 {
+    // Jinja path renders the full conversation each turn. When the LCP cache
+    // ran this turn (`cache_eligible`), it already managed seq_pos — set it to
+    // the LCP on a forward-extension HIT, or full-reset on a MISS — so we must
+    // NOT blanket-reset here (that would discard a valid cache hit and force a
+    // cold re-prefill every turn). Only cold-reset when the cache did NOT run
+    // (item #37): first turn (empty conversation), kill switch
+    // (HIPFIRE_QWEN_PROMPT_CACHE=0), eviction/PFlash active. On turn 2+ in those
+    // cases, reset BEFORE the budget guard + prefill so the full render writes
+    // from position 0 rather than appending to the prior turn's dirty
+    // DeltaNet/KV/checkpoint state. Uses `free_checkpoints` (NOT a bare
+    // `.clear()`) so the checkpoint GPU buffers are freed rather than leaked.
+    if jinja_active && !cache_eligible && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
