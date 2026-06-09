@@ -167,7 +167,23 @@ impl DeepseekV4 {
         n_exp: usize,
         layer: &mut DeepseekV4LayerWeights,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        keep: Option<&[u32]>,
     ) -> Result<(), String> {
+        // REAP keep-map: compact slot `e` loads ORIGINAL expert `src(e)`.
+        // `keep = None` ⇒ identity (slot == original index), byte-identical
+        // to the full load. `n_exp` is the COMPACT count (kept) when active.
+        if keep.is_some() && shard.is_some() {
+            return Err("deepseek4: REAP keep-map + EP sharding are mutually exclusive".into());
+        }
+        if let Some(k) = keep {
+            if k.len() != n_exp {
+                return Err(format!(
+                    "deepseek4: {prefix} keep slice len {} != n_exp {n_exp}",
+                    k.len()
+                ));
+            }
+        }
+        let src = |slot: usize| -> usize { keep.map(|k| k[slot] as usize).unwrap_or(slot) };
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
@@ -188,7 +204,7 @@ impl DeepseekV4 {
         // Vec, then one upload. Non-owned experts are read for stride
         // validation, then dropped (never uploaded — the EP memory win).
         {
-            let name0 = format!("{prefix}.ffn.experts.0.w2.weight");
+            let name0 = format!("{prefix}.ffn.experts.{}.w2.weight", src(0));
             let (info0, _b0) = hfq
                 .tensor_data_pread(&name0)
                 .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
@@ -205,7 +221,7 @@ impl DeepseekV4 {
                 if !owns(e) {
                     continue;
                 }
-                let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
+                let name = format!("{prefix}.ffn.experts.{}.w2.weight", src(e));
                 let (info, bytes) = hfq
                     .tensor_data_pread(&name)
                     .ok_or_else(|| format!("deepseek4: missing {name}"))?;
@@ -249,8 +265,8 @@ impl DeepseekV4 {
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
         // upload. Non-owned ptr → a shared ZEROED dummy gate_up buffer.
         {
-            let w1_0 = format!("{prefix}.ffn.experts.0.w1.weight");
-            let w3_0 = format!("{prefix}.ffn.experts.0.w3.weight");
+            let w1_0 = format!("{prefix}.ffn.experts.{}.w1.weight", src(0));
+            let w3_0 = format!("{prefix}.ffn.experts.{}.w3.weight", src(0));
             let (w1_info0, _b1) = hfq
                 .tensor_data_pread(&w1_0)
                 .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
@@ -277,14 +293,14 @@ impl DeepseekV4 {
                 if !owns(e) {
                     continue;
                 }
-                let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
+                let w1_name = format!("{prefix}.ffn.experts.{}.w1.weight", src(e));
                 {
                     let (_, w1_bytes) = hfq
                         .tensor_data_pread(&w1_name)
                         .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
                     combined.extend_from_slice(&w1_bytes);
                 }
-                let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
+                let w3_name = format!("{prefix}.ffn.experts.{}.w3.weight", src(e));
                 {
                     let (_, w3_bytes) = hfq
                         .tensor_data_pread(&w3_name)
@@ -363,6 +379,86 @@ impl DeepseekV4 {
             .collect();
         gpu.upload_f32(&f32_vals, &shape)
             .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
+    }
+
+    /// REAP keep-map variant of `upload_quant_or_f16`: byte row-gather only
+    /// the kept output rows (experts) before upload. Exact for row-major,
+    /// row-independent quant (F16 / Q8 / MQ*-G256) — each row's quant blocks
+    /// are self-contained, so a byte gather preserves the original encoding.
+    fn upload_quant_or_f16_keep(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+        keep: &[u32],
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data_pread(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
+        if orig_rows == 0 || bytes.len() % orig_rows != 0 {
+            return Err(format!(
+                "deepseek4: '{name}' row-gather: {orig_rows} rows don't divide {} bytes",
+                bytes.len()
+            ));
+        }
+        let rowstride = bytes.len() / orig_rows;
+        let mut sub = Vec::with_capacity(rowstride * keep.len());
+        for &oe in keep {
+            let oe = oe as usize;
+            if oe >= orig_rows {
+                return Err(format!("deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"));
+            }
+            sub.extend_from_slice(&bytes[oe * rowstride..(oe + 1) * rowstride]);
+        }
+        let mut shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        shape[0] = keep.len();
+        let mut t = gpu
+            .upload_raw(&sub, &shape)
+            .map_err(|e| format!("deepseek4: upload keep-subset '{name}' failed: {e:?}"))?;
+        match info.quant_type {
+            1 => t.dtype = rdna_compute::DType::F16,
+            3 => t.dtype = rdna_compute::DType::Q8_0,
+            _ => {}
+        }
+        Ok(t)
+    }
+
+    /// REAP keep-map variant of `upload_global_f16_as_f32`: gather kept rows
+    /// of an F16 `[n_orig, ..]` (or `[n_orig]`) tensor, then decode to F32.
+    fn upload_global_f16_as_f32_keep(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+        keep: &[u32],
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data_pread(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
+        if orig_rows == 0 || bytes.len() % (orig_rows * 2) != 0 {
+            return Err(format!(
+                "deepseek4: '{name}' f16 keep-gather: {orig_rows} rows × 2B don't divide {} bytes",
+                bytes.len()
+            ));
+        }
+        let per_row = bytes.len() / (orig_rows * 2); // f16 elems per row
+        let mut f32_vals: Vec<f32> = Vec::with_capacity(per_row * keep.len());
+        for &oe in keep {
+            let oe = oe as usize;
+            if oe >= orig_rows {
+                return Err(format!("deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"));
+            }
+            let base = oe * per_row * 2;
+            for j in 0..per_row {
+                let lo = bytes[base + j * 2];
+                let hi = bytes[base + j * 2 + 1];
+                f32_vals.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi])));
+            }
+        }
+        let mut shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        shape[0] = keep.len();
+        gpu.upload_f32(&f32_vals, &shape)
+            .map_err(|e| format!("deepseek4: upload f16→f32 keep '{name}' failed: {e:?}"))
     }
 
     pub fn load_weights_host_only_walk(
@@ -493,12 +589,18 @@ impl DeepseekV4 {
                     return Err(format!("deepseek4: layer {l} missing shared '{suffix}'"));
                 }
             }
-            // Routed experts: 256 × {w1, w2, w3}.
+            // Routed experts: kept × {w1, w2, w3}. `n_routed_experts` is the
+            // kept count under a REAP keep-map; remap slot → original index.
             for e in 0..cfg.n_routed_experts {
+                let e_src = cfg
+                    .reap_keep
+                    .as_ref()
+                    .map(|r| r.keep[l][e] as usize)
+                    .unwrap_or(e);
                 for proj in &["w1", "w2", "w3"] {
-                    let name = format!("layers.{l}.ffn.experts.{e}.{proj}.weight");
+                    let name = format!("layers.{l}.ffn.experts.{e_src}.{proj}.weight");
                     if hfq.find_tensor_info(&name).is_none() {
-                        return Err(format!("deepseek4: layer {l} expert {e} missing '{proj}'"));
+                        return Err(format!("deepseek4: layer {l} expert {e_src} missing '{proj}'"));
                     }
                 }
             }
@@ -902,17 +1004,22 @@ impl DeepseekV4 {
             // of actual quant. For Q8F16 routers (deepseek4-q8-mtp) that meant
             // reading Q8 bytes as MQ4 blocks → NaN logits at layer 3+
             // (the first non-hash layer that runs moe_route).
-            layer.gate_weight = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.ffn.gate.weight"),
-            )?);
+            let gate_name = format!("layers.{l}.ffn.gate.weight");
+            layer.gate_weight = Some(match cfg.reap_keep.as_ref() {
+                Some(rk) => Self::upload_quant_or_f16_keep(hfq, gpu, &gate_name, &rk.keep[l])?,
+                None => Self::upload_quant_or_f16(hfq, gpu, &gate_name)?,
+            });
             if l >= cfg.num_hash_layers {
                 // Store F32 on GPU (was F16 on disk) so the bias can
                 // either be added on-device or downloaded once for CPU
                 // topk. Also cache host-side for the CPU-routing path.
                 let bias_name = format!("layers.{l}.ffn.gate.bias");
-                let bias_gpu = Self::upload_global_f16_as_f32(hfq, gpu, &bias_name)?;
+                let bias_gpu = match cfg.reap_keep.as_ref() {
+                    Some(rk) => {
+                        Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, &rk.keep[l])?
+                    }
+                    None => Self::upload_global_f16_as_f32(hfq, gpu, &bias_name)?,
+                };
                 layer.gate_bias_host = gpu
                     .download_f32(&bias_gpu)
                     .map_err(|e| format!("d2h gate_bias l{l}: {e:?}"))?;
@@ -923,7 +1030,18 @@ impl DeepseekV4 {
                 // at quant time, in which case forward falls back to
                 // shared-only on hash layers (current default behaviour).
                 let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
-                if let Some((info, bytes)) = hfq.tensor_data_pread(&tid_name) {
+                if let Some((info, file_bytes)) = hfq.tensor_data_pread(&tid_name) {
+                    // Under a REAP keep-map the hash table is REMAPPED (pruned
+                    // experts redirected to kept ones, in 0..kept slot space);
+                    // read the sidecar table instead of the file's original.
+                    let bytes: Vec<u8> = match cfg.reap_keep.as_ref() {
+                        Some(rk) => {
+                            let p = rk.tid2eid_path(l);
+                            std::fs::read(&p)
+                                .map_err(|e| format!("deepseek4: REAP tid2eid read {p:?}: {e}"))?
+                        }
+                        None => file_bytes.to_vec(),
+                    };
                     if bytes.len() % 4 == 0 {
                         let vals: Vec<u32> = bytes
                             .chunks_exact(4)
@@ -991,11 +1109,17 @@ impl DeepseekV4 {
         if mtp_present {
             let load_mtp = std::env::var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
                 .map(|s| s != "0")
-                .unwrap_or(true);
+                .unwrap_or(true)
+                && cfg.reap_keep.is_none();
             if !load_mtp {
                 eprintln!(
-                    "deepseek4: HFQ contains MTP layer but \
-                    HIPFIRE_DEEPSEEK4_LOAD_MTP=0 — skipping MTP upload"
+                    "deepseek4: skipping MTP upload ({})",
+                    if cfg.reap_keep.is_some() {
+                        "REAP keep-map active — MTP unused for PPL/KLD and would \
+                         need separate keep handling"
+                    } else {
+                        "HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
+                    }
                 );
             } else {
                 eprintln!(
@@ -1221,6 +1345,7 @@ impl DeepseekV4 {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
+                let keep = cfg.reap_keep.as_ref().map(|r| r.keep[l].as_slice());
                 Self::upload_layer_routed_experts(
                     hfq,
                     gpu,
@@ -1228,6 +1353,7 @@ impl DeepseekV4 {
                     n_exp,
                     layer,
                     shard,
+                    keep,
                 )?;
             }
         }
@@ -1253,6 +1379,7 @@ impl DeepseekV4 {
                     cfg.n_routed_experts,
                     mtp,
                     shard,
+                    None, // MTP not loaded under REAP keep-map (see load_mtp guard)
                 )?;
             }
         }
