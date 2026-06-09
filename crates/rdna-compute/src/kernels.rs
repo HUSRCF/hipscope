@@ -2928,6 +2928,11 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 pub const GATED_DELTA_NET_Q8_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
+/// requant outside the loop. Supports EF residual. Lower VGPR pressure.
+pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
+
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
 /// post-update state rather than the previous sibling's. Required for
