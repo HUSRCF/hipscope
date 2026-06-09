@@ -531,6 +531,62 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
+/// default separators — `", "` between elements and `": "` after keys — the
+/// exact form the model's chat_template was trained on. minijinja's builtin
+/// `tojson` is compact (`,`/`:`); registering [`hf_tojson`] on the render env
+/// makes `{{ x | tojson }}` (tool DEFINITIONS and mapping-valued tool-call
+/// arguments) byte-match `transformers.apply_chat_template`.
+struct HfJsonFormatter;
+impl serde_json::ser::Formatter for HfJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+
+/// HF-compatible `tojson` filter (see [`HfJsonFormatter`]). Serializes the
+/// minijinja value DIRECTLY (not through an intermediate `serde_json::Value`),
+/// so map key order is whatever the value carries — preserved end-to-end when
+/// `serde_json` is built with `preserve_order` (without it, the request-parse
+/// `BTreeMap` has already alphabetized object keys before render). Register with
+/// `env.add_filter("tojson", hf_tojson)` to override minijinja's compact builtin.
+pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
+    use serde::Serialize;
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
+    value.serialize(&mut ser).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"))
+    })?;
+    String::from_utf8(buf).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson utf8: {e}"),
+        )
+    })
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -620,6 +676,10 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        // Override minijinja's compact builtin `tojson` with the HF-spaced form
+        // (`", "` / `": "`) the model trained on, so tool-definition and
+        // mapping-arg rendering byte-matches transformers' apply_chat_template.
+        env.add_filter("tojson", hf_tojson);
 
         env.add_template("chat", self.template)
             .map_err(|e| format!("template parse: {e}"))?;

@@ -77,6 +77,8 @@ fn main() {
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
+    // Mirror render_messages: HF-spaced tojson override.
+    env.add_filter("tojson", hipfire_runtime::prompt_frame::hf_tojson);
     env.add_template("chat", &template).expect("template parse");
     let tmpl = env.get_template("chat").expect("template lookup");
 
