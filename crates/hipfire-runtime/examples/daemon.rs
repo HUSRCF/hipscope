@@ -1990,7 +1990,7 @@ fn main() {
 
                         // `cache_capable`: the daemon implements LCP prompt-cache
                         // reuse for these arches' AR generate path (qwen3.5/3.6
-                        // = 5/6, deepseek4 = 9). The serve layer keys its
+                        // = 5/6, deepseek4 = 9, minimax-m2 = 10). The serve layer keys its
                         // per-request `reset` decision off THIS flag rather than
                         // a hardcoded arch-string allowlist, so a new
                         // cache-capable arch (or an arch-string rename) can't
@@ -1998,7 +1998,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
