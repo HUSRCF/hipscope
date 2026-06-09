@@ -488,6 +488,16 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   }
   const params: any = { max_seq };
 
+  // Expert-parallel degree (EP, task #26). `hipfire serve --tp N` (which sets
+  // HIPFIRE_TP) shards the routed experts across N GPUs via the daemon's
+  // load_model_ep (MiniMax-M2 / DeepSeek-V4). Forwarded only when > 1 so
+  // single-GPU loads stay byte-identical; the daemon refuses tp>1 for
+  // non-EP arches and for DFlash drafters (mutually exclusive with pp).
+  {
+    const tp = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
+    if (Number.isInteger(tp) && tp > 1) params.tp = tp;
+  }
+
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
@@ -5558,8 +5568,23 @@ switch (cmd) {
       }
       host = raw;
     };
+    // Expert-parallel degree for `hipfire serve --tp N` (or `--tp=N`). Sets
+    // HIPFIRE_TP, which buildLoadMessage forwards as params.tp so the daemon
+    // loads via load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
+    let tpPending = false;
+    const setTp = (raw: string) => {
+      const n = parseInt(raw, 10);
+      if (!Number.isInteger(n) || n < 1 || n > 64) {
+        console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
+        process.exit(1);
+      }
+      process.env.HIPFIRE_TP = String(n);
+    };
     for (const a of rest) {
-      if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+      if (tpPending) { setTp(a); tpPending = false; continue; }
+      if (a === "--tp") { tpPending = true; continue; }
+      else if (a.startsWith("--tp=")) setTp(a.slice(5));
+      else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
       else if (/^\d+$/.test(a)) setPort(a);
       else if (/^\[[^\]]+\]:\d+$/.test(a)) {
         const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
@@ -5572,11 +5597,12 @@ switch (cmd) {
         setPort(a.slice(idx + 1));
       }
       else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
+        console.error(`Usage: hipfire serve [host] [port] [-d|--detach] [--tp N]\n\n`
           + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
           + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
-          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
+          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
+          + `  --tp N         Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N visible GPUs)\n\n`
           + `Background daemon:\n`
           + `  hipfire serve -d           # start in background\n`
           + `  hipfire serve 0.0.0.0:11435 -d\n`

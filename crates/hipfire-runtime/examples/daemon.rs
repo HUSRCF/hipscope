@@ -5343,6 +5343,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
 /// think-budget — absent on the EP path). The DeepSeek chat template
 /// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
 /// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
+#[allow(clippy::too_many_arguments)]
 fn generate_ep(
     m: &mut LoadedModel,
     stdout: &mut std::io::Stdout,
@@ -5351,9 +5352,19 @@ fn generate_ep(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
 ) {
-    // ── Generic prompt render via the arch's chat_template (ds4/minimax/qwen35) ──
+    // ── Canonical multi-turn render via the arch's trained chat_template
+    // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
+    // conversation, live user last) → render_messages with `tools` threaded;
+    // falls back to a synthesized [system?, user] turn when no history is
+    // supplied. The trim_blocks/lstrip_blocks env (prompt_frame) keeps the
+    // structural prefix history-invariant so the EP LCP cache below can hit.
+    // `primed_think` records whether the render ended on the MiniMax `<think>`
+    // generation primer (re-emitted display-only in ep_serve_minimax). ──
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         if let Some(template) = m.chat_template.as_ref() {
@@ -5365,8 +5376,39 @@ fn generate_ep(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
-            match frame.render() {
-                Ok(rendered) => tokenizer.encode(&rendered),
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP jinja render: {}"}}"#, id, format!("{e}").replace('"', "'"));
                     let _ = stdout.flush();
@@ -5374,7 +5416,7 @@ fn generate_ep(
                 }
             }
         } else {
-            // No embedded template — minimal ds4-style fallback.
+            // No embedded template — minimal ds4-style fallback (single-turn).
             let mut ids = Vec::new();
             if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") { ids.push(b); }
             ids.extend(tokenizer.encode(&format!("<｜User｜>{prompt}<｜Assistant｜>")));
@@ -5388,7 +5430,7 @@ fn generate_ep(
     }
     let eos_tok = if m.arch_id == 10 { m.minimax_eos_tok } else { m.deepseek4_eos_tok };
     match m.arch_id {
-        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop),
+        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think),
         _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop),
     }
 }
@@ -5467,26 +5509,78 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 }
 
 /// MiniMax-M2 EP prefill + greedy decode (mirror of ep_serve_ds4, MiniMax types).
-fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String]) {
+/// Carries the single-GPU prefix cache to EP: an LCP over the shared
+/// `conversation_tokens` rewinds every rank's KV cursor to the common prefix
+/// and re-prefills only the divergent suffix (interleaved-thinking partial
+/// reuse — see generate_minimax for the full rationale). `primed_think`
+/// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
+#[allow(clippy::too_many_arguments)]
+fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
-    let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-    let EpArch::Minimax { config, weights, state, partials } = inner else {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected minimax)"}}"#, id);
-        let _ = stdout.flush();
-        return;
+
+    // ── LCP partial reuse. The per-rank KV holds [0, prior_total) from last
+    // turn; `conversation_tokens` mirrors it. Rewind n_tokens to the common
+    // prefix and re-prefill the (reasoning-free, shorter) suffix; MiniMax is
+    // standard attention so KV ≥ lcp is overwritten and the stale tail is
+    // never attended. lcp == 0 ⇒ cold prefill. ──
+    let prefill_from: usize = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_n);
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] { lcp += 1; }
+        let cache_hit = lcp > 0 && lcp < prompt_n;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
+                prior_len, prompt_n, lcp, cache_hit, cache_hit && lcp < prior_len,
+            );
+        }
+        if cache_hit { m.conversation_tokens.truncate(lcp); lcp } else { m.conversation_tokens.clear(); 0 }
     };
-    let t_prefill = Instant::now();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
-            let _ = stdout.flush();
-            return;
+    // Rewind every rank's KV cursor to the reuse point.
+    {
+        let EpState { inner, .. } = m.ep.as_mut().unwrap();
+        if let EpArch::Minimax { state, .. } = inner {
+            for s in state.iter_mut() { s.n_tokens = prefill_from; }
         }
     }
+
+    // ── Prefill the suffix [prefill_from, prompt_n) across ranks. ──
+    let t_prefill = Instant::now();
+    {
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Minimax { config, weights, state, partials } = inner else {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected minimax)"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        };
+        for (i, &t) in prompt_ids[prefill_from..].iter().enumerate() {
+            let pos = (prefill_from + i) as u32;
+            if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos) {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+    // Mirror the prefilled suffix into conversation_tokens (the prefix is kept).
+    for &t in &prompt_ids[prefill_from..] { m.conversation_tokens.push(t); }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    let _ = gpus.devices[0].bind_thread();
-    let mut logits = gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default();
+
+    // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
+    // assistant message is a well-formed think block (parity with single-GPU).
+    if primed_think {
+        let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":"<think>\n"}));
+        let _ = stdout.flush();
+    }
+
+    let mut logits = {
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Minimax { state, .. } = inner else { return; };
+        let _ = gpus.devices[0].bind_thread();
+        gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default()
+    };
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
@@ -5498,6 +5592,7 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
+        m.conversation_tokens.push(next);
         if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) { break; }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax { config, weights, state, partials } = inner else { break; };
@@ -8134,7 +8229,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
     if m.ep.is_some() {
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, stop);
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, tools, messages_history, stop);
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
