@@ -1831,6 +1831,30 @@ fn main() {
                     .and_then(|p| p.get("pp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
+                // Expert-parallel degree (EP, task #26). tp>1 shards routed
+                // experts across ranks via load_model_ep. Mutually exclusive
+                // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
+                let tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                if tp > 1 && pp > 1 {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"tp (expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if tp > 1 && draft_path.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"EP serving (tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if pp > 1 {
                     if draft_path.is_some()
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
@@ -1869,17 +1893,22 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                match load_model(
-                    path,
-                    max_seq,
-                    draft_path.as_deref(),
-                    kv_mode_override.as_deref(),
-                    kv_adaptive_override.as_deref(),
-                    state_quant_override.as_deref(),
-                    &cask,
-                    pp,
-                    &mut gpu,
-                ) {
+                let loaded = if tp > 1 {
+                    load_model_ep(path, max_seq, tp)
+                } else {
+                    load_model(
+                        path,
+                        max_seq,
+                        draft_path.as_deref(),
+                        kv_mode_override.as_deref(),
+                        kv_adaptive_override.as_deref(),
+                        state_quant_override.as_deref(),
+                        &cask,
+                        pp,
+                        &mut gpu,
+                    )
+                };
+                match loaded {
                     Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -7929,6 +7958,20 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             max_think_tokens,
             tools,
             messages_history,
+        );
+        return;
+    }
+    // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
+    // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
+    if m.ep.is_some() {
+        // generate_ep pending (next increment). The EP LOAD works (model sharded
+        // across `tp` ranks) — generation is wired separately so serve refuses
+        // cleanly rather than crash on the None single-GPU fields.
+        emit_error_with_id(
+            stdout,
+            id,
+            "EP serving (tp>1) load succeeded but generate_ep is not yet wired (task #26). \
+             The model is sharded across ranks; generation is the next increment.",
         );
         return;
     }
