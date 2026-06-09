@@ -590,6 +590,28 @@ impl MiniMaxState {
         cfg: &MiniMaxConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        // `attention_q8_0_kv` (single-token decode) stages its per-head score
+        // buffer in LDS sized by `max_seq`: `(max_seq + block + head_dim) * 4`
+        // bytes must fit the 64 KB per-block shared-memory limit on every RDNA
+        // arch, so the single-token attention launch is hard-bounded near 16K
+        // context. A larger requested window blows the launch
+        // (`hipModuleLaunchKernel: invalid argument` — observed serving the
+        // 86 GB mq2-lloyd on gfx1151 with the daemon's default window: prefill
+        // via the batched kernel succeeds, then the first decode token dies).
+        // Clamp the served window here so the cache, the geometry hint, and the
+        // flash-partial sizing all stay launch-valid. Proper fix = tile the
+        // scores out of LDS (flash-style); tracked as a follow-up.
+        const MINIMAX_ATTN_LDS_MAX_SEQ: usize = 12288;
+        let max_seq = if max_seq > MINIMAX_ATTN_LDS_MAX_SEQ {
+            eprintln!(
+                "[minimax] requested max_seq {max_seq} exceeds the single-token \
+                 attention LDS bound; clamping to {MINIMAX_ATTN_LDS_MAX_SEQ} \
+                 (decode scores must fit the 64 KB per-block shared-mem limit)"
+            );
+            MINIMAX_ATTN_LDS_MAX_SEQ
+        } else {
+            max_seq
+        };
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
