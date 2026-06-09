@@ -5206,6 +5206,123 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
     })
 }
 
+/// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
+/// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
+/// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
+/// think-budget — absent on the EP path). The DeepSeek chat template
+/// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
+/// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
+fn generate_ep(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    stop: &[String],
+) {
+    use std::time::Instant;
+    let eos_tok = m.deepseek4_eos_tok; // Copy, read before the &mut m.ep borrow
+
+    // ── Build ds4-templated prompt tokens (disjoint immut borrow of m.tokenizer) ──
+    let (prompt_ids, decode_one): (Vec<u32>, ()) = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let mut ids: Vec<u32> = Vec::new();
+        if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") {
+            ids.push(b);
+        }
+        let templated = match system_prompt {
+            Some(sys) if !sys.is_empty() => format!("{sys}<｜User｜>{prompt}<｜Assistant｜>"),
+            _ => format!("<｜User｜>{prompt}<｜Assistant｜>"),
+        };
+        ids.extend(tokenizer.encode(&templated));
+        (ids, ())
+    };
+    let _ = decode_one;
+    let prompt_n = prompt_ids.len();
+
+    // ── Borrow the EP state (disjoint mut borrow of m.ep) ──
+    let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+    let EpArch::Ds4 { config, weights, state, partials } = inner;
+    let n_ranks = gpus.devices.len();
+
+    macro_rules! fail {
+        ($stage:expr, $e:expr) => {{
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"forward_ep {}: {}"}}"#,
+                id, $stage, format!("{}", $e).replace('"', "'")
+            );
+            let _ = stdout.flush();
+            return;
+        }};
+    }
+
+    // ── Prefill: per-token forward_ep over the prompt ──
+    let t_prefill = Instant::now();
+    for (pos, &t) in prompt_ids.iter().enumerate() {
+        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
+            fail!("prefill", e);
+        }
+    }
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+
+    let _ = gpus.devices[0].bind_thread();
+    let mut logits = match state[0].logits.as_ref() {
+        Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+        None => { let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id); let _ = stdout.flush(); return; }
+    };
+
+    // ── Greedy decode loop ──
+    let t_decode = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_n;
+    let mut text_acc = String::new();
+    while generated < max_tokens {
+        // argmax over the rank-0 logits
+        let mut next = 0u32;
+        let mut best = f32::NEG_INFINITY;
+        for (i, &x) in logits.iter().enumerate() {
+            if x > best { best = x; next = i as u32; }
+        }
+        if next == eos_tok { break; }
+        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        text_acc.push_str(&piece);
+        let hit_stop = stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s));
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(&piece).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        let _ = stdout.flush();
+        generated += 1;
+        if hit_stop { break; }
+        // re-borrow EP state (m.tokenizer borrow above is dropped)
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Ds4 { config, weights, state, partials } = inner;
+        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
+            fail!("decode", e);
+        }
+        pos += 1;
+        let _ = gpus.devices[0].bind_thread();
+        logits = match state[0].logits.as_ref() {
+            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            None => break,
+        };
+    }
+    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+    let decode_tok_s = if decode_ms > 0.0 { generated as f64 / (decode_ms / 1000.0) } else { 0.0 };
+    let prefill_tok_s = if prefill_ms > 0.0 { prompt_n as f64 / (prefill_ms / 1000.0) } else { 0.0 };
+    eprintln!("[daemon] EP generate done: {n_ranks} ranks, {generated} tok, {decode_tok_s:.1} tok/s");
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated, decode_tok_s, prompt_n, prefill_ms, prefill_tok_s, decode_tok_s, prefill_ms
+    );
+    let _ = stdout.flush();
+}
+
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
@@ -7964,15 +8081,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
     // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
     if m.ep.is_some() {
-        // generate_ep pending (next increment). The EP LOAD works (model sharded
-        // across `tp` ranks) — generation is wired separately so serve refuses
-        // cleanly rather than crash on the None single-GPU fields.
-        emit_error_with_id(
-            stdout,
-            id,
-            "EP serving (tp>1) load succeeded but generate_ep is not yet wired (task #26). \
-             The model is sharded across ranks; generation is the next increment.",
-        );
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, stop);
         return;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
