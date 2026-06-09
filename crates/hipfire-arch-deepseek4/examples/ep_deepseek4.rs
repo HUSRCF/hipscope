@@ -131,6 +131,18 @@ fn main() {
         let l = s.logits.as_ref().expect("logits unset");
         gpus.devices[0].download_f32(l).expect("dl")
     };
+    // Fork-margin diagnostic: top-8 logits at a position, decoded for eyeballing.
+    let top8 = |v: &[f32], tok: &Tokenizer| -> String {
+        let mut idx: Vec<u32> = (0..v.len() as u32).collect();
+        idx.sort_unstable_by(|&a, &b| {
+            v[b as usize].partial_cmp(&v[a as usize]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx[..8]
+            .iter()
+            .map(|&i| format!("{}={:.4}{:?}", i, v[i as usize], tok.decode(&[i])))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!("\nprompt {:?} → {} tokens (bos-prepended={})", prompt, prompt_ids.len(), !no_bos);
@@ -141,6 +153,7 @@ fn main() {
     }
     let mut logits = dl_logits(&mut gpus, &state_per_rank[0]);
     eprintln!("prefill {} tok in {:.2}s", prompt_ids.len(), t0.elapsed().as_secs_f64());
+    eprintln!("top8 @pos {} (prefill final): {}", prompt_ids.len() - 1, top8(&logits, &tok));
 
     // ── MTP EP draft (spec-decode drafter under expert parallelism) ─────────
     // After prefill, `logits` predicts t0. Capture h_n (the last-position full
@@ -193,6 +206,9 @@ fn main() {
         forward::forward_ep(&mut gpus, &weights_per_rank, &cfg, &mut state_per_rank, &partials, next, pos as u32)
             .expect("forward_ep decode");
         logits = dl_logits(&mut gpus, &state_per_rank[0]);
+        if step < 3 {
+            eprintln!("top8 @pos {} (decode step {}): {}", pos, step + 1, top8(&logits, &tok));
+        }
         if step >= 2 { steady += 1; }
         pos += 1;
     }
