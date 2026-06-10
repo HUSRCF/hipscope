@@ -1487,6 +1487,48 @@ fn load_weight_tensor_raw(
                 })
             }
         },
+        2 => {
+            // F32 — native full-precision oracle weights (qt=2). Raw f32 LE
+            // bytes uploaded as-is; the engine forwards through gemv_f32 /
+            // gemm_f32_batched / attention_f32. Part of the F1 native-bf16
+            // reference path (no quantization).
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        16 => {
+            // BF16 — widen losslessly to F32 on host, then upload as F32.
+            // bf16 is the high 16 bits of an f32 (same sign/exp, 7 mantissa
+            // bits), so `from_bits((bf16 as u32) << 16)` is exact. The engine
+            // has no native bf16 GEMV for the text arch; the gfx942 bf16 MFMA
+            // GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip) is the perf path and
+            // is documented as a deferred gap. F32 compute over bf16-rounded
+            // weights is a superset-precision oracle.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -2652,10 +2694,23 @@ pub fn load_weights(
             EmbeddingFormat::Q8_0,
         )
     } else {
-        let f32_data: Vec<f32> = embd_data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        // F1 native-bf16 oracle: embed_tokens may arrive as qt=2 (F32, 4-byte
+        // LE) or qt=16 (BF16, 2-byte high-half of f32). Decode by quant_type
+        // rather than assuming F16. qt=1 (F16) keeps the historical path.
+        let f32_data: Vec<f32> = match embd_qt {
+            2 => embd_data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            16 => embd_data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            _ => embd_data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        };
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
             EmbeddingFormat::F32,
@@ -6819,6 +6874,103 @@ fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MoePrefillDtypes {
+    router: DType,
+    shared_expert_scalar_gate: DType,
+    shared_expert_gate: DType,
+    shared_expert_up: DType,
+    shared_expert_down: DType,
+    expert_gate_up: DType,
+    expert_down: DType,
+    expert_gate_up_uniform: bool,
+    expert_down_uniform: bool,
+}
+
+impl MoePrefillDtypes {
+    #[cfg(test)]
+    fn uniform(dtype: DType) -> Self {
+        Self {
+            router: dtype,
+            shared_expert_scalar_gate: dtype,
+            shared_expert_gate: dtype,
+            shared_expert_up: dtype,
+            shared_expert_down: dtype,
+            expert_gate_up: dtype,
+            expert_down: dtype,
+            expert_gate_up_uniform: true,
+            expert_down_uniform: true,
+        }
+    }
+
+    fn from_ffn(ffn: &MoeFfnWeights) -> Option<Self> {
+        let first = ffn.experts.first()?;
+        Some(Self {
+            router: ffn.router.gpu_dtype,
+            shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
+            shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+            shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+            shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+            expert_gate_up: first.gate_up.gpu_dtype,
+            expert_down: first.down.gpu_dtype,
+            expert_gate_up_uniform: ffn
+                .experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == first.gate_up.gpu_dtype),
+            expert_down_uniform: ffn
+                .experts
+                .iter()
+                .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+        })
+    }
+}
+
+fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
+    k_top == 8 && num_experts <= 1024
+}
+
+fn moe_ffn_batched_admissible_for_dtypes(
+    dtypes: &MoePrefillDtypes,
+    admit_mq6: bool,
+    admit_paro: bool,
+) -> bool {
+    let router_ok = matches!(dtypes.router, DType::MQ4G256 | DType::Q8_0 | DType::F32);
+    let shared_gate_ok = matches!(
+        dtypes.shared_expert_scalar_gate,
+        DType::MQ4G256 | DType::Q8_0 | DType::F32
+    );
+    if !(router_ok && shared_gate_ok && dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform)
+    {
+        return false;
+    }
+
+    if admit_paro
+        && dtypes.shared_expert_gate == DType::ParoQ4G128
+        && dtypes.shared_expert_up == DType::ParoQ4G128
+        && dtypes.shared_expert_down == DType::ParoQ4G128
+        && dtypes.expert_gate_up == DType::ParoQ4G128
+        && dtypes.expert_down == DType::ParoQ4G128
+    {
+        return true;
+    }
+
+    if admit_mq6 {
+        let shared_gu_dt = dtypes.shared_expert_gate;
+        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
+            && dtypes.shared_expert_up == shared_gu_dt;
+        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ6G256);
+        let experts_ok = matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ6G256)
+            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ6G256);
+        shared_gu_ok && shared_dn_ok && experts_ok
+    } else {
+        dtypes.shared_expert_gate == DType::MQ4G256
+            && dtypes.shared_expert_up == DType::MQ4G256
+            && dtypes.shared_expert_down == DType::MQ4G256
+            && dtypes.expert_gate_up == DType::MQ4G256
+            && dtypes.expert_down == DType::MQ4G256
+    }
+}
+
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
@@ -6847,7 +6999,8 @@ pub fn prefill_batch_pbs_eligible(
     let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
-    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let moe_topk_ok =
+        moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
     let admit_mq6 = mq6_batched_admit_enabled_from_env(
         std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
         arch,
@@ -6911,18 +7064,9 @@ fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
 }
 
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
-    // F32 router/shared_gate admit (PARO checkpoints — router is FP16-dense,
-    // expanded to F32 on GPU; shared_expert_gate likewise. See
-    // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
-    // prefill_moe_ffn_body_batched route F32 through gemm_f32_batched.
-    let router_ok = matches!(
-        ffn.router.gpu_dtype,
-        DType::MQ4G256 | DType::Q8_0 | DType::F32
-    );
-    let shared_gate_ok = matches!(
-        ffn.shared_expert_gate.gpu_dtype,
-        DType::MQ4G256 | DType::Q8_0 | DType::F32
-    );
+    let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
+        return false;
+    };
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
     // fallback path while bisecting or debugging.
@@ -6935,49 +7079,8 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
     let admit_paro = *PARO_ADMIT.get_or_init(|| {
         paro_batched_admit_enabled_from_env(std::env::var("HIPFIRE_PARO_BATCHED").ok().as_deref())
     });
-    if admit_paro {
-        let paro_ok = router_ok
-            && shared_gate_ok
-            && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.up.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.down.gpu_dtype, DType::ParoQ4G128)
-            && ffn.experts.iter().all(|e| {
-                e.gate_up.gpu_dtype == DType::ParoQ4G128 && e.down.gpu_dtype == DType::ParoQ4G128
-            });
-        if paro_ok {
-            return true;
-        }
-    }
 
-    if admit_mq6 {
-        // Per-projection MQ4 OR MQ6 admit.
-        let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
-        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
-            && ffn.shared_expert.up.gpu_dtype == shared_gu_dt;
-        let shared_dn_ok = matches!(
-            ffn.shared_expert.down.gpu_dtype,
-            DType::MQ4G256 | DType::MQ6G256
-        );
-        let experts_gu = ffn.experts[0].gate_up.gpu_dtype;
-        let experts_dn = ffn.experts[0].down.gpu_dtype;
-        let experts_ok = matches!(experts_gu, DType::MQ4G256 | DType::MQ6G256)
-            && matches!(experts_dn, DType::MQ4G256 | DType::MQ6G256)
-            && ffn
-                .experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == experts_gu && e.down.gpu_dtype == experts_dn);
-        router_ok && shared_gate_ok && shared_gu_ok && shared_dn_ok && experts_ok
-    } else {
-        // Strict MQ4 (pre-fan-out behavior).
-        router_ok
-            && shared_gate_ok
-            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
-            && ffn.experts.iter().all(|e| {
-                e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256
-            })
-    }
+    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro)
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -15132,6 +15235,73 @@ mod tests {
         let _batchable_dt = DType::MQ4G256;
         // Use default F32 as fallback
         // MoeFfnWeights requires GPU-backed tensors; predicate is tested at DType level.
+    }
+
+    #[test]
+    fn moe_prefill_topk_shape_requires_k8_and_bounded_experts() {
+        assert!(moe_prefill_topk_shape_supported(8, 256));
+        assert!(moe_prefill_topk_shape_supported(8, 1024));
+        assert!(!moe_prefill_topk_shape_supported(4, 256));
+        assert!(!moe_prefill_topk_shape_supported(8, 1025));
+    }
+
+    #[test]
+    fn moe_prefill_admits_mq4_as_known_good_control() {
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_mq3_before_admission_work() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up = DType::MQ3G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_down = DType::MQ3G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_mq6_requires_explicit_admission() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256;
+        dtypes.shared_expert_up = DType::MQ6G256;
+        dtypes.shared_expert_down = DType::MQ6G256;
+        dtypes.expert_gate_up = DType::MQ6G256;
+        dtypes.expert_down = DType::MQ6G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_nonuniform_expert_projections() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up_uniform = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_down_uniform = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_shared_gate_up_must_be_one_dtype() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_up = DType::MQ6G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_admits_paro_when_enabled() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::ParoQ4G128);
+        dtypes.router = DType::F32;
+        dtypes.shared_expert_scalar_gate = DType::F32;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true));
     }
 
     #[test]
