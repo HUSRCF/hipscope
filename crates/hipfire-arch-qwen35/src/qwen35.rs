@@ -1178,30 +1178,6 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, 1.0)
 }
 
-/// Load norm weight without the +1.0 offset — for standard RMSNorm tensors
-/// (e.g., the final `model.language_model.norm.weight` stored as raw scale,
-/// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
-fn load_norm_weight_raw(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    name: &str,
-    shape: &[usize],
-) -> HipResult<GpuTensor> {
-    let (info, data) =
-        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
-    };
-    gpu.upload_f32(&f32_data, shape)
-}
 
 fn load_weight_tensor_raw(
     gpu: &Gpu,
@@ -1348,31 +1324,9 @@ pub(crate) fn load_weight_tensor(
     }
 }
 
-/// Backward-compat 5-arg wrapper — used by ~50 existing callers inside this file
-/// that will be replaced by the `HfqBackend` layer driver in Task 4.
-fn load_weight_tensor_5(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    load_weight_tensor(hfq, gpu, name, m, k, qwen35_tensor_name_candidates)
-}
 
 // ─── Standard HFQ loading ───────────────────────────────────────────────────
 
-/// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
-fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) =
-        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
-    dequant_f32(gpu, info.quant_type, &data, n)
-}
-
-/// Alias for load_any_as_f32.
-fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    load_any_as_f32(hfq, gpu, name, n)
-}
 
 // TODO(transformer-extraction): the overall `load_weights` orchestration
 // here (drop_mmap → embedding+tied-lm_head → norm → per-layer loop) is
@@ -1638,23 +1592,6 @@ pub fn load_weights(
     })
 }
 
-/// Dispatch weight loading through the registered augmentor chain (PaRo, etc.);
-/// falls back to raw FP16 when no augmentor claims the tensor.
-/// `name` must be the fully-qualified base name (e.g. `"model.layers.0.self_attn.q_proj"`),
-/// without any `.qweight` / `.weight` extension.
-fn load_wt(
-    source: &dyn ModelSource,
-    gpu: &mut Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    try_augmentors(source, name, m, k, gpu, DEFAULT_AUGMENTORS)?
-        .map_or_else(
-            || load_fp16_weight_from_source(source, gpu, &format!("{name}.weight"), m, k),
-            Ok,
-        )
-}
 
 pub fn load_weights_paroquant(
     source: &dyn ModelSource,
@@ -2019,42 +1956,46 @@ pub(crate) fn load_moe_ffn(
     let smi = config.shared_expert_intermediate_size;
 
     // Router: hidden_size → num_experts. Precision-sensitive but small.
-    let router = load_weight_tensor_5(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
+    let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim, qwen35_tensor_name_candidates)?;
 
     // Shared expert (always-on, contributes to every token). Unlike routed
     // experts, gate_proj + up_proj are stored separately in the safetensors
     // (routed experts store them fused as `gate_up_proj`).
     let shared_expert = SharedExpertWeights {
-        gate: load_weight_tensor_5(
+        gate: load_weight_tensor(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.gate_proj.weight"),
             smi,
             config.dim,
+            qwen35_tensor_name_candidates,
         )?,
-        up: load_weight_tensor_5(
+        up: load_weight_tensor(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.up_proj.weight"),
             smi,
             config.dim,
+            qwen35_tensor_name_candidates,
         )?,
-        down: load_weight_tensor_5(
+        down: load_weight_tensor(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.down_proj.weight"),
             config.dim,
             smi,
+            qwen35_tensor_name_candidates,
         )?,
     };
     // Scalar gate on the shared-expert add: sigmoid(shared_expert_gate · x).
     // Stored as a 1×hidden row-vector.
-    let shared_expert_gate = load_weight_tensor_5(
+    let shared_expert_gate = load_weight_tensor(
         hfq,
         gpu,
         &format!("{p}.mlp.shared_expert_gate.weight"),
         1,
         config.dim,
+        qwen35_tensor_name_candidates,
     )?;
 
     // Routed experts — quantizer wrote per-expert tensors named
@@ -2062,19 +2003,21 @@ pub(crate) fn load_moe_ffn(
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_tensor_5(
+        let gate_up = load_weight_tensor(
             hfq,
             gpu,
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi,
             config.dim,
+            qwen35_tensor_name_candidates,
         )?;
-        let down = load_weight_tensor_5(
+        let down = load_weight_tensor(
             hfq,
             gpu,
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
             config.dim,
             mi,
+            qwen35_tensor_name_candidates,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }
@@ -2117,19 +2060,6 @@ pub(crate) fn load_moe_ffn(
 
 /// Construct a non-owning `GpuTensor` view over `[offset_elems,
 /// offset_elems + len_elems)` of `src`. Valid only for F32 (4 bytes/elem).
-/// The view MUST NOT outlive `src` — it shares the same GPU pointer.
-#[inline]
-fn slice_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
-    unsafe {
-        let base = src.buf.as_ptr() as *mut u8;
-        let ptr = base.add(offset_elems * 4);
-        GpuTensor {
-            buf: hip_bridge::DeviceBuffer::from_raw(ptr as *mut _, len_elems * 4),
-            shape: vec![len_elems],
-            dtype: DType::F32,
-        }
-    }
-}
 
 /// One-token MoE FFN: router → top-K → shared expert + top-K routed, added
 /// into `x_residual` in place. `x_norm` is the already-RMSNormed FFN input.
