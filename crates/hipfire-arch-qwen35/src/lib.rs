@@ -40,6 +40,8 @@ pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
+pub(crate) mod paro_moe;
+#[cfg(feature = "deltanet")]
 pub mod speculative;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of

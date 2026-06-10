@@ -333,6 +333,34 @@ pub fn load_fp16_weight_from_source(
     })
 }
 
+// ── MoE per-expert repack ──────────────────────────────────────────────────────
+
+/// Repack a single per-expert AWQ projection (gate, up, or down) into HFQ4G128
+/// byte rows. Returns the row-major byte buffer.
+pub fn paro_repack_moe_projection(
+    source: &dyn ModelSource,
+    full_prefix: &str,
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> HipResult<Vec<u8>> {
+    let qw_name = format!("{full_prefix}.qweight");
+    let qz_name = format!("{full_prefix}.qzeros");
+    let sc_name = format!("{full_prefix}.scales");
+    let (_, qw_data) = source
+        .tensor_data(&qw_name)
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qw_name}")))?;
+    let (_, qz_data) = source
+        .tensor_data(&qz_name)
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qz_name}")))?;
+    let (_, sc_data) = source
+        .tensor_data(&sc_name)
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {sc_name}")))?;
+    Ok(repack_awq_to_hfq4g128(
+        qw_data, qz_data, sc_data, out_dim, in_dim, group_size,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
