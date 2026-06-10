@@ -645,16 +645,19 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja_contrib::pycompat::unknown_method_callback;
 
         let mut env = Environment::new();
-        // SemiStrict undefined: a missing context variable still raises Err on
-        // *render/iteration* (so malformed prompts don't silently propagate —
-        // Codex review on PR #175), BUT undefined is falsy in boolean context
-        // (`{% if maybe_undefined %}`). This matches HuggingFace's jinja2
-        // default and is REQUIRED by Cohere2's template, which does
-        // `{% if developer_preamble %}` against a var only `{% set %}` when a
-        // leading system message exists. Pure `Strict` raised on the no-system
-        // case. SemiStrict is strictly more permissive than Strict, so every
-        // template that already rendered under Strict renders identically.
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::SemiStrict);
+        // Lenient undefined: undefined renders as "", is falsy in boolean
+        // context, and compares false — matching HuggingFace's jinja2 DEFAULT
+        // environment, which is what upstream chat templates are authored
+        // against. REQUIRED by Cohere2's tool_use template, which legitimately
+        // references optional fields the engine doesn't always populate
+        // (`message.tool_plan`, per-tool_call `id`, `{% if developer_preamble %}`,
+        // `{% if enable_citations %}`). Strict/SemiStrict raised on those and
+        // forced a fallback to the hand-rolled ChatML frame mid-conversation —
+        // the agentic multi-turn derail (the model then saw <|im_start|> markers
+        // and hallucinated). Complete templates (qwen, etc.) never hit undefined,
+        // so they render byte-identically; this only changes the
+        // previously-erroring paths, degrading them to HF-equivalent "".
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into

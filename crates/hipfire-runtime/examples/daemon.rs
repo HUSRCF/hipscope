@@ -3244,9 +3244,21 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
                 // state machine then misses → marker leak). Rewrite to the
                 // native token so history tokenizes atomically (255012/255013)
                 // and matches generation.
+                // Also bridge the tool-call shape: the upstream template reads
+                // `message.tool_plan` and OpenAI-nested `tc['function'][...]`,
+                // but the engine's Message/ToolCall are flat {name, arguments}
+                // with no tool_plan. Without this the assistant-with-tool_calls
+                // history (every turn after the first tool call) fails to render
+                // → falls back to the ChatML frame → the model sees <|im_start|>
+                // and derails. (Lenient undefined handles the optional
+                // tool_call `id`; mapped tool_call_id is "" for now — fine for
+                // single-tool turns.)
                 return Some(
                     t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
-                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>"),
+                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
+                        .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
+                        .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
+                        .replace("{{ tc['function']['arguments']|tojson }}", "{{ tc.arguments|tojson }}"),
                 );
             }
         }
