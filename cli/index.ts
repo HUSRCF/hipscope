@@ -44,6 +44,11 @@ export interface HipfireConfig {
   temperature: number;    // default temperature for run
   top_p: number;
   repeat_penalty: number;
+  /// Computed (never persisted): set by resolveModelConfig when the model
+  /// carries a registry `sampling` recipe. Tells the run/serve paths to send
+  /// temperature RAW (skip the global TEMP_CORRECTION) — the recipe value IS
+  /// the intended sampler temperature.
+  sampling_authoritative?: boolean;
   max_tokens: number;     // per-turn generation cap
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
@@ -440,8 +445,22 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
+  // Per-model sampling recipe from the registry: the model's recommended
+  // defaults, enforced ABOVE the global default but BELOW any user per-model
+  // override. `sampling_authoritative` tells the run/serve paths to send these
+  // RAW (the recipe IS the intended sampler value — skip TEMP_CORRECTION).
+  const recipe = REGISTRY[resolved]?.sampling;
+  const recipeCfg = recipe
+    ? {
+        ...(recipe.temperature !== undefined ? { temperature: recipe.temperature } : {}),
+        ...(recipe.top_p !== undefined ? { top_p: recipe.top_p } : {}),
+        ...(recipe.repeat_penalty !== undefined ? { repeat_penalty: recipe.repeat_penalty } : {}),
+        sampling_authoritative: true,
+      }
+    : {};
   return {
     ...base,
+    ...recipeCfg,
     ...(catalogId ? (all[catalogId] ?? {}) : {}),
     ...(all[resolved] ?? {}),
     ...(tag !== resolved ? (all[tag] ?? {}) : {}),
@@ -783,6 +802,12 @@ interface ModelEntry {
   size_gb: number;
   min_vram_gb: number;
   desc: string;
+  /// Per-model sampling recipe — the model's recommended defaults (e.g. the
+  /// HF card's values). Enforced as the default in `resolveModelConfig`: ABOVE
+  /// the global default, BELOW any user per-model override. Sent RAW to the
+  /// sampler (bypasses the global TEMP_CORRECTION). Omit to inherit the global
+  /// default (0.3/0.8 — the qwen-family tune).
+  sampling?: { temperature?: number; top_p?: number; repeat_penalty?: number };
   /// Optional published TriAttention sidecar in the same HF repo. When set,
   /// `hipfire pull` also fetches it next to the weights, and `serve`/`run`
   /// auto-attaches the file at startup if `cask_sidecar` is unset and the
@@ -1541,7 +1566,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const modelCfg = resolveModelConfig(model);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
-    temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
+    temperature: temp * (modelCfg.sampling_authoritative ? 1 : TEMP_CORRECTION), max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
   // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
@@ -2430,7 +2455,7 @@ async function serve(port: number, host: string) {
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
+          temperature: (body.temperature ?? effective.temperature) * (effective.sampling_authoritative ? 1 : TEMP_CORRECTION),
           max_tokens: requestMaxTokens,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
