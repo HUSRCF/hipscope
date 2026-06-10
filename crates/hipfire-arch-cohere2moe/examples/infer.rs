@@ -10,7 +10,7 @@
 
 use hipfire_arch_cohere2moe::config::Cohere2MoeConfig;
 use hipfire_arch_cohere2moe::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights};
-use hipfire_arch_cohere2moe::forward::decode_step;
+use hipfire_arch_cohere2moe::forward::{decode_step, forward_batch, forward_batch_supported};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::PathBuf;
@@ -69,13 +69,30 @@ fn main() {
         bi
     };
 
-    // Prefill (per-token; correctness-first).
+    // Prefill: batched (read each weight once for all prompt tokens, chunked
+    // ≤64) when the tier supports it (MQ4/MQ6); per-token decode_step otherwise.
     let t0 = std::time::Instant::now();
     let mut logits = Vec::new();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
+    let batched = forward_batch_supported(&weights);
+    if batched {
+        let mut i = 0;
+        while i < prompt_ids.len() {
+            let end = (i + 64).min(prompt_ids.len());
+            logits = forward_batch(&cfg, &weights, &mut state, &mut gpu, &prompt_ids[i..end], i)
+                .expect("forward_batch");
+            i = end;
+        }
+    } else {
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
+        }
     }
-    eprintln!("prefill {} tok in {:.2}s", prompt_ids.len(), t0.elapsed().as_secs_f64());
+    eprintln!(
+        "prefill {} tok in {:.2}s [{}]",
+        prompt_ids.len(),
+        t0.elapsed().as_secs_f64(),
+        if batched { "batched" } else { "per-token" }
+    );
 
     // Greedy decode. Cohere2 eos = <|END_OF_TURN_TOKEN|> (255001); bos=2, pad=0.
     let mut gen = Vec::new();

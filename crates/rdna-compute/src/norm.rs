@@ -636,6 +636,68 @@ impl Gpu {
         result
     }
 
+    /// Batched GPT-J **interleaved** RoPE — always dispatches the interleaved
+    /// batched kernel (no legacy flag), the batched twin of `rope_interleaved_f32`.
+    /// For Cohere2 sliding layers in batched prefill; pos_offset = 0 (prefill
+    /// does no KV compaction). arch_id 12.
+    #[cfg(feature = "deltanet")]
+    pub fn rope_interleaved_f32_batched(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize,
+        freq_base: f32, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_partial_interleaved_batched",
+            kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
+            "rope_partial_interleaved_batched_f32",
+        )?;
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut fb = freq_base;
+        let mut bs = batch_size as i32;
+        let mut po = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+        ];
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs);
+        let grid_x = (n_pairs + block - 1) / block;
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_batched_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "rope_partial_interleaved_batched_f32",
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nr);
+                b.push_f32(fb); b.push_i32(bs); b.push_i32(po);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// 2-D spatial RoPE with precomputed per-patch cos/sin tables.
     ///
     /// Used by the dots.ocr (Qwen2-VL family) vision tower. Applies a

@@ -31,9 +31,10 @@
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
+    weight_gemv_residual,
 };
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Decode one token; returns the full logits vector.
 pub fn decode_step(
@@ -330,4 +331,220 @@ fn moe_per_expert(
             .map_err(|e2| format!("cohere2moe L{l}E{e}: down gemv: {e2}"))?;
     }
     Ok(())
+}
+
+/// True iff `forward_batch` supports this model: Q8 attention/dense/router and
+/// indexed (MQ4/MQ6/HFQ4/HFQ6) experts. The bf16 oracle and Q8-expert tiers
+/// fall back to per-token `decode_step` (no indexed-MoE / batched-bf16 path).
+pub fn forward_batch_supported(weights: &Cohere2MoeWeights) -> bool {
+    weights.layers.iter().all(|l| {
+        l.wq.gpu_dtype == DType::Q8_0
+            && match &l.ffn {
+                Ffn::Dense(_) => true,
+                Ffn::Moe(m) => matches!(
+                    m.experts[0].gate_up.gpu_dtype,
+                    DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256
+                ),
+            }
+    })
+}
+
+/// Batched prefill over `B` (≤64) tokens — the parallel-block forward run ONCE
+/// per weight matrix for all B tokens (bandwidth-amortized) instead of B
+/// per-token `decode_step`s. Fills the KV cache for positions
+/// `[start_pos, start_pos+B)` and returns the LAST token's logits. Supports the
+/// MQ4/MQ6 serving tiers (Q8 attention/dense + indexed batched MoE); see
+/// `forward_batch_supported` (caller falls back to per-token otherwise).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch(
+    cfg: &Cohere2MoeConfig,
+    weights: &Cohere2MoeWeights,
+    state: &mut Cohere2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+) -> Result<Vec<f32>, String> {
+    let b = tokens.len();
+    if b == 0 {
+        return Err("cohere2moe forward_batch: empty token slice".to_string());
+    }
+    if b > 64 {
+        return Err(format!("cohere2moe forward_batch: B={b} exceeds kernel cap 64"));
+    }
+    if !forward_batch_supported(weights) {
+        return Err("cohere2moe forward_batch: unsupported tier (needs Q8 attn + indexed experts)".to_string());
+    }
+    let hidden = cfg.hidden_size;
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+    let head_dim = cfg.head_dim;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv = cfg.num_key_value_heads;
+    let moe_inter = cfg.moe_intermediate_size;
+    let dense_inter = cfg.dense_intermediate_size;
+    let n_exp = cfg.num_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let eps = cfg.layer_norm_eps;
+    let max_ctx = start_pos + b;
+    let max_seq = state.kv.physical_cap;
+
+    let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+        g.alloc_tensor(&[n], DType::F32)
+            .map_err(|e| format!("forward_batch alloc {label}: {e:?}"))
+    };
+    let x = alloc(gpu, b * hidden, "x")?;
+    let normed = alloc(gpu, b * hidden, "normed")?;
+    let fq = alloc(gpu, b * q_dim, "fq")?;
+    let fk = alloc(gpu, b * kv_dim, "fk")?;
+    let fv = alloc(gpu, b * kv_dim, "fv")?;
+    let attn_out = alloc(gpu, b * q_dim, "attn_out")?;
+    let o = alloc(gpu, b * hidden, "o")?;
+    let ffn_x_rot = alloc(gpu, b * hidden, "ffn_x_rot")?;
+    let router_logits = alloc(gpu, b * n_exp, "router_logits")?;
+    let topk_idx = alloc(gpu, b * k_top, "topk_idx")?;
+    let topk_w = alloc(gpu, b * k_top, "topk_w")?;
+    let gate = alloc(gpu, b * k_top * moe_inter, "gate")?;
+    let up = alloc(gpu, b * k_top * moe_inter, "up")?;
+    let rot = alloc(gpu, b * k_top * moe_inter, "rot")?;
+    let down_exp = alloc(gpu, b * k_top * hidden, "down_exp")?;
+    let dense_gate = alloc(gpu, b * dense_inter, "dense_gate")?;
+    let dense_up = alloc(gpu, b * dense_inter, "dense_up")?;
+    let dense_act = alloc(gpu, b * dense_inter, "dense_act")?;
+
+    // positions [B] i32 (stored in an f32-sized buffer; kernels read it as i32).
+    let pos_bytes: Vec<u8> = (0..b).flat_map(|i| ((start_pos + i) as i32).to_ne_bytes()).collect();
+    let pos_array = alloc(gpu, b, "pos_array")?;
+    gpu.hip
+        .memcpy_htod(&pos_array.buf, &pos_bytes)
+        .map_err(|e| format!("forward_batch htod pos: {e:?}"))?;
+
+    // Embedding (Q8) per token → x[B, hidden].
+    {
+        let xs = alloc(gpu, hidden, "xs")?;
+        for (i, &tok) in tokens.iter().enumerate() {
+            embed_lookup(gpu, weights, hidden, tok, &xs)?;
+            gpu.hip
+                .memcpy_dtod_at(&x.buf, i * hidden * 4, &xs.buf, 0, hidden * 4)
+                .map_err(|e| format!("forward_batch embed copy: {e:?}"))?;
+        }
+        gpu.free_tensor(xs).ok();
+    }
+
+    for (l, layer) in weights.layers.iter().enumerate() {
+        // Parallel block: normed = mean-centered LN(x), fed to BOTH branches.
+        gpu.layernorm_batched(&x, &layer.input_norm, &state.ln_beta_zero, &normed, b, hidden, eps)
+            .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
+        // Attention from `normed` (Q8 projections).
+        gpu.gemm_q8_0_batched(&layer.wq.buf, &normed, &fq, q_dim, hidden, b)
+            .map_err(|e| format!("cohere2moe L{l} batch q: {e:?}"))?;
+        gpu.gemm_q8_0_batched(&layer.wk.buf, &normed, &fk, kv_dim, hidden, b)
+            .map_err(|e| format!("cohere2moe L{l} batch k: {e:?}"))?;
+        gpu.gemm_q8_0_batched(&layer.wv.buf, &normed, &fv, kv_dim, hidden, b)
+            .map_err(|e| format!("cohere2moe L{l} batch v: {e:?}"))?;
+        // NoPE on full layers; interleaved RoPE on sliding layers.
+        if layer.attn_kind == AttnKind::Sliding {
+            gpu.rope_interleaved_f32_batched(
+                &fq, &fk, &pos_array, n_heads, n_kv, head_dim, head_dim, cfg.rope_theta, b,
+            )
+            .map_err(|e| format!("cohere2moe L{l} batch rope: {e:?}"))?;
+        }
+        gpu.kv_cache_write_q8_0_batched(&state.kv.k_gpu[l], &fk, &pos_array, n_kv, head_dim, b)
+            .map_err(|e| format!("cohere2moe L{l} batch kv k: {e:?}"))?;
+        gpu.kv_cache_write_q8_0_batched(&state.kv.v_gpu[l], &fv, &pos_array, n_kv, head_dim, b)
+            .map_err(|e| format!("cohere2moe L{l} batch kv v: {e:?}"))?;
+        gpu.attention_q8_0_kv_batched(
+            &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
+            n_heads, n_kv, head_dim, max_seq, max_ctx, b,
+        )
+        .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
+        gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
+            .map_err(|e| format!("cohere2moe L{l} batch o: {e:?}"))?;
+        gpu.add_inplace_f32(&x, &o)
+            .map_err(|e| format!("cohere2moe L{l} batch o-resid: {e:?}"))?;
+
+        // FFN from the SAME `normed` (parallel block).
+        match &layer.ffn {
+            Ffn::Dense(d) => {
+                gpu.gemm_q8_0_batched(&d.gate.buf, &normed, &dense_gate, dense_inter, hidden, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch dgate: {e:?}"))?;
+                gpu.gemm_q8_0_batched(&d.up.buf, &normed, &dense_up, dense_inter, hidden, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch dup: {e:?}"))?;
+                gpu.silu_mul_f32(&dense_gate, &dense_up, &dense_act)
+                    .map_err(|e| format!("cohere2moe L{l} batch dsilu: {e:?}"))?;
+                gpu.gemm_q8_0_batched(&d.down.buf, &dense_act, &o, hidden, dense_inter, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch ddown: {e:?}"))?;
+                gpu.add_inplace_f32(&x, &o)
+                    .map_err(|e| format!("cohere2moe L{l} batch ddown-resid: {e:?}"))?;
+            }
+            Ffn::Moe(m) => {
+                gpu.gemm_q8_0_batched(&m.router.buf, &normed, &router_logits, n_exp, hidden, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
+                gpu.sigmoid_f32(&router_logits)
+                    .map_err(|e| format!("cohere2moe L{l} batch sigmoid: {e:?}"))?;
+                gpu.moe_topk_renorm_k8_batched(
+                    &router_logits, &topk_idx, &topk_w, n_exp, cfg.norm_topk_prob, b,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch topk: {e:?}"))?;
+                rotate_x_mq_batched_for(gpu, &m.experts[0].gate_up, &normed, &ffn_x_rot, hidden, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch rot: {e}"))?;
+                let mq6 = matches!(
+                    m.experts[0].gate_up.gpu_dtype,
+                    DType::MQ6G256 | DType::HFQ6G256
+                );
+                if mq6 {
+                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot, &gate, &up,
+                        2 * moe_inter, hidden, k_top, b,
+                    )
+                    .map_err(|e| format!("cohere2moe L{l} batch gu6: {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot, &gate, &up,
+                        2 * moe_inter, hidden, k_top, b,
+                    )
+                    .map_err(|e| format!("cohere2moe L{l} batch gu4: {e:?}"))?;
+                }
+                fused_silu_mul_rotate_mq_batched_for(
+                    gpu, &m.experts[0].down, &gate, &up, &rot, moe_inter, b * k_top,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch smr: {e:?}"))?;
+                if mq6 {
+                    gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, moe_inter, k_top, b,
+                    )
+                    .map_err(|e| format!("cohere2moe L{l} batch d6: {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, moe_inter, k_top, b,
+                    )
+                    .map_err(|e| format!("cohere2moe L{l} batch d4: {e:?}"))?;
+                }
+                gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch combine: {e:?}"))?;
+            }
+        }
+    }
+    state.n_tokens = start_pos + b;
+
+    // Final mean-centered LN + lm_head on the LAST row only (prefill needs the
+    // last position's logits to seed decode).
+    let x_last = alloc(gpu, hidden, "x_last")?;
+    gpu.hip
+        .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * hidden * 4, hidden * 4)
+        .map_err(|e| format!("forward_batch last copy: {e:?}"))?;
+    gpu.layernorm_batched(&x_last, &weights.final_norm, &state.ln_beta_zero, &state.final_norm_buf, 1, hidden, eps)
+        .map_err(|e| format!("forward_batch final ln: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+        .map_err(|e| format!("forward_batch lm_head: {e}"))?;
+    let logits = gpu
+        .download_f32(&state.logits)
+        .map_err(|e| format!("forward_batch download logits: {e:?}"))?;
+
+    for t in [
+        x, normed, fq, fk, fv, attn_out, o, ffn_x_rot, router_logits, topk_idx, topk_w,
+        gate, up, rot, down_exp, dense_gate, dense_up, dense_act, pos_array, x_last,
+    ] {
+        gpu.free_tensor(t).ok();
+    }
+    Ok(logits)
 }
