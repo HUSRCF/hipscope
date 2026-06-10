@@ -5886,6 +5886,54 @@ impl Gpu {
             blob_builder,
         )
     }
+
+    /// BF16-weight × F32-input GEMV (native-bf16 reference / KLD oracle).
+    /// Same shape contract as `gemv_f16_xf32`; the kernel widens bf16→f32
+    /// losslessly (16-bit shift) per element. arch_id 12 (Cohere2-MoE).
+    pub fn gemv_bf16_xf32(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32")?;
+
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(w_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
+
+        self.launch_maybe_blob(
+            "gemv_bf16_xf32",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,

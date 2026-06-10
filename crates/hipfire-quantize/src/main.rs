@@ -4795,9 +4795,11 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
-    // F16 weight passthrough (the cohere2moe BF16-class oracle, 61 GB vs the
-    // 122 GB all-F32 `oracle`/`bf16` passthrough — fits the gfx1151 96 GB
-    // budget). Weights → F16; tied embed → Q8 (lookup constraint); norms → F16.
+    // Native-bf16 reference (the KLD/PPL oracle): cohere2moe stores matmul
+    // weights as the EXACT downloaded bf16 bytes (~61 GB, fits gfx1151's GTT;
+    // the all-F32 `oracle` passthrough is 122 GB and does NOT fit). `f16` is a
+    // lossy-reconvert alternative tier, kept available but not the reference.
+    let use_bf16 = format == "bf16" || format == "bf16-passthrough" || format == "oracle";
     let use_f16 = format == "f16" || format == "f16-passthrough";
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
@@ -5694,7 +5696,7 @@ fn main() {
         // the produced .hfq is a full-precision reference the qwen35 loader
         // reads via its qt=2 arm and the engine forwards through the existing
         // F32 GEMV / attention_f32 path.
-        if use_f32_passthrough {
+        if use_f32_passthrough && !is_cohere2moe {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name, raw_data, meta, &fp8_scale_for, &st_files,
             );
@@ -5862,6 +5864,26 @@ fn main() {
             if meta.shape.len() == 2 && meta.shape[1] % 256 == 0 {
                 let is_expert = name.contains(".mlp.experts.");
                 let is_router = name.ends_with(".mlp.gate.weight");
+                // bf16 oracle tier: matmul weights (attn/dense/experts) → NATIVE
+                // bf16 (verbatim source bytes = the exact downloaded values).
+                // Router stays Q8 (selection-sensitive); embed/norms handled above.
+                if use_bf16 && !is_router && meta.dtype == "BF16" {
+                    eprintln!("  {:>8}: {} {:?} (native bf16)", "BF16-COH", name, meta.shape);
+                    hfq_tensors.push(HfqTensor {
+                        name: name.to_string(),
+                        quant_type: QuantType::BF16,
+                        shape,
+                        group_size: 0,
+                        data: raw_data.to_vec(),
+                        spilled_len: 0,
+                    });
+                    quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                    st_files[*file_idx].drop_tensor_pages(name);
+                    if let Some(ref mut s) = spill {
+                        maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                    }
+                    continue;
+                }
                 let dt = if is_router {
                     QuantType::Q8F16
                 } else if use_f16 {

@@ -82,6 +82,7 @@ fn wt_from_raw(gpu: &mut Gpu, qt: u8, data: &[u8], m: usize, k: usize) -> Result
     let dtype = match qt {
         1 => DType::F16,
         2 => DType::F32,
+        16 => DType::BF16, // native bf16 reference (oracle tier)
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
         8 => DType::HFQ6G256,

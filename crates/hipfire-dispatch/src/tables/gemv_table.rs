@@ -46,6 +46,7 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::ParoQ4G128,
         DType::Q4F16G64,
         DType::Q4F16G32,
+        DType::BF16, // native bf16 reference (KLD oracle); plain gemv, no rotation
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv(dtype, GemvVariant::Plain, false) else {

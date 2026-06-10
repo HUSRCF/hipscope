@@ -250,16 +250,25 @@ fn decode_step_body(
                         )
                         .map_err(|e| format!("cohere2moe L{l}: combine: {e:?}"))?;
                     }
-                    // Per-expert path for the F16 oracle + Q8 tier (no indexed
+                    // Per-expert path for the bf16 oracle + Q8 tier (no indexed
                     // kernel for these dtypes). Reads the 8 selected experts off
-                    // the device topk buffers and runs a plain GEMV each.
-                    DType::Q8_0 | DType::F16 | DType::F32 => {
+                    // the device topk buffers and runs a plain GEMV each
+                    // (weight_gemv → run_auto handles BF16/F16/F32/Q8).
+                    DType::BF16 | DType::Q8_0 | DType::F16 | DType::F32 => {
                         moe_per_expert(gpu, m, state, moe_inter, k_top, l)?;
                     }
                     other => {
                         return Err(format!("cohere2moe L{l}: unsupported expert dtype {other:?}"))
                     }
                 }
+            }
+        }
+        if std::env::var_os("HIPFIRE_COHERE_DEBUG").is_some() {
+            if let Ok(hv) = gpu.download_f32(&state.h) {
+                let l2 = hv.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let mx = hv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let nan = hv.iter().filter(|v| v.is_nan()).count();
+                eprintln!("[dbg] L{l} {:?} h.l2={l2:.2} max={mx:.3} nan={nan}", layer.attn_kind);
             }
         }
     }
