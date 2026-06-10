@@ -835,6 +835,97 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
     gpu.upload_f32(&f32_data[..n], &[n])
 }
 
+// ── WeightBackend trait ─────────────────────────────────────────────────────
+
+use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
+use crate::hfq::HfqFile;
+use crate::model_source::ModelSource;
+use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
+
+/// Pluggable weight-loading backend. `rel` is a layer-relative path: for `proj`
+/// it carries NO file extension (the backend appends `.weight` / tries `.qweight`);
+/// for `norm`/`raw_f32` it carries the on-disk suffix (e.g. `input_layernorm.weight`).
+/// Set the active layer with `set_layer` before each layer's calls.
+pub trait WeightBackend {
+    fn set_layer(&mut self, layer: usize);
+    fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor>;
+    fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor>;
+    fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+}
+
+/// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
+/// `candidates`: layout resolver (`hf_name_candidates` or `flat_name_candidates`).
+/// `read`: the arch's pread+awq weight reader (see `HfqRead`).
+pub struct HfqBackend<'a> {
+    pub hfq: &'a HfqFile,
+    pub gpu: &'a mut Gpu,
+    pub norm_bias: f32,
+    pub candidates: fn(&str) -> Vec<String>,
+    pub read_proj: fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub layer: usize,
+}
+
+impl<'a> WeightBackend for HfqBackend<'a> {
+    fn set_layer(&mut self, layer: usize) { self.layer = layer; }
+
+    fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+        (self.read_proj)(self.hfq, self.gpu, &hfq_proj_name(self.layer, rel), m, k, self.candidates)
+    }
+    fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+        let name = hfq_plain_name(self.layer, rel);
+        let (info, data) = read_first(self.hfq, &name, self.candidates)
+            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        dequant_norm(self.gpu, info.quant_type, &data, shape, self.norm_bias)
+    }
+    fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
+        let name = hfq_plain_name(self.layer, rel);
+        let (info, data) = read_first(self.hfq, &name, self.candidates)
+            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        dequant_f32(self.gpu, info.quant_type, &data, n)
+    }
+}
+
+/// Resolve `name` via `candidates` and return the first tensor's `(info, bytes)`.
+pub fn read_first(
+    hfq: &HfqFile,
+    name: &str,
+    candidates: fn(&str) -> Vec<String>,
+) -> Option<(crate::hfq::HfqTensorInfo, Vec<u8>)> {
+    for c in candidates(name) {
+        if let Some((info, buf)) = hfq.tensor_data_vec(&c) {
+            return Some((info.clone(), buf));
+        }
+    }
+    None
+}
+
+/// PaRo backend (augmentor chain + paro primitives) — fully arch-agnostic.
+/// `mp` is the text-tower prefix from `paro_text_prefix`.
+pub struct ParoBackend<'a> {
+    pub source: &'a dyn ModelSource,
+    pub gpu: &'a mut Gpu,
+    pub mp: &'static str,
+    pub layer: usize,
+}
+
+impl<'a> WeightBackend for ParoBackend<'a> {
+    fn set_layer(&mut self, layer: usize) { self.layer = layer; }
+
+    fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+        let base = paro_proj_name(self.mp, self.layer, rel);
+        match try_augmentors(self.source, &base, m, k, self.gpu, DEFAULT_AUGMENTORS)? {
+            Some(t) => Ok(t),
+            None => load_fp16_weight_from_source(self.source, self.gpu, &format!("{base}.weight"), m, k),
+        }
+    }
+    fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+        paro_load_norm(self.source, self.gpu, &paro_plain_name(self.layer, rel), shape)
+    }
+    fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
+        paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

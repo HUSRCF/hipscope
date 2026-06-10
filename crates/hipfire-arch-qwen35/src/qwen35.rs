@@ -1290,19 +1290,20 @@ fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<
 /// the VL-friendly nested name) where qwen2 uses flat `model.{...}`.
 /// Pull into `hipfire_runtime::transformer::weights` with the prefix
 /// as a parameter during consolidation.
-fn load_weight_tensor(
+pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
     name: &str,
     m: usize,
     k: usize,
+    candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
     // Use pread path to avoid page cache buildup on unified-memory APUs.
     #[cfg(unix)]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
-        for candidate in qwen35_tensor_name_candidates(name) {
+        for candidate in candidates(name) {
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
                 wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
@@ -1330,7 +1331,7 @@ fn load_weight_tensor(
     {
         let (info, data, matched_name) = {
             let mut found = None;
-            for candidate in qwen35_tensor_name_candidates(name) {
+            for candidate in candidates(name) {
                 if let Some((info, data)) = hfq.tensor_data(&candidate) {
                     found = Some((info, data, candidate));
                     break;
@@ -1345,6 +1346,18 @@ fn load_weight_tensor(
         }
         Ok(wt)
     }
+}
+
+/// Backward-compat 5-arg wrapper — used by ~50 existing callers inside this file
+/// that will be replaced by the `HfqBackend` layer driver in Task 4.
+fn load_weight_tensor_5(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    load_weight_tensor(hfq, gpu, name, m, k, qwen35_tensor_name_candidates)
 }
 
 // ─── Standard HFQ loading ───────────────────────────────────────────────────
@@ -1607,28 +1620,28 @@ pub fn load_weights(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wqkv: load_weight_tensor(
+                    wqkv: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_qkv.weight"),
                         qkv_dim,
                         config.dim,
                     )?,
-                    wz: load_weight_tensor(
+                    wz: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_z.weight"),
                         d_inner,
                         config.dim,
                     )?,
-                    w_alpha: load_weight_tensor(
+                    w_alpha: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_a.weight"),
                         config.linear_num_value_heads,
                         config.dim,
                     )?,
-                    w_beta: load_weight_tensor(
+                    w_beta: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_b.weight"),
@@ -1659,7 +1672,7 @@ pub fn load_weights(
                         &format!("{p}.linear_attn.norm.weight"),
                         config.linear_value_head_dim,
                     )?,
-                    wo: load_weight_tensor(
+                    wo: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.out_proj.weight"),
@@ -1672,21 +1685,21 @@ pub fn load_weights(
                         &format!("{p}.post_attention_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    w_gate: load_weight_tensor(
+                    w_gate: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.gate_proj.weight"),
                         config.hidden_dim,
                         config.dim,
                     )?,
-                    w_up: load_weight_tensor(
+                    w_up: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.up_proj.weight"),
                         config.hidden_dim,
                         config.dim,
                     )?,
-                    w_down: load_weight_tensor(
+                    w_down: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.down_proj.weight"),
@@ -1706,28 +1719,28 @@ pub fn load_weights(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wq: load_weight_tensor(
+                    wq: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.q_proj.weight"),
                         q_out_dim,
                         config.dim,
                     )?,
-                    wk: load_weight_tensor(
+                    wk: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.k_proj.weight"),
                         kv_dim,
                         config.dim,
                     )?,
-                    wv: load_weight_tensor(
+                    wv: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.v_proj.weight"),
                         kv_dim,
                         config.dim,
                     )?,
-                    wo: load_weight_tensor(
+                    wo: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.o_proj.weight"),
@@ -1752,21 +1765,21 @@ pub fn load_weights(
                         &format!("{p}.post_attention_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    w_gate: load_weight_tensor(
+                    w_gate: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.gate_proj.weight"),
                         config.hidden_dim,
                         config.dim,
                     )?,
-                    w_up: load_weight_tensor(
+                    w_up: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.up_proj.weight"),
                         config.hidden_dim,
                         config.dim,
                     )?,
-                    w_down: load_weight_tensor(
+                    w_down: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.mlp.down_proj.weight"),
@@ -1787,28 +1800,28 @@ pub fn load_weights(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wqkv: load_weight_tensor(
+                    wqkv: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_qkv.weight"),
                         qkv_dim,
                         config.dim,
                     )?,
-                    wz: load_weight_tensor(
+                    wz: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_z.weight"),
                         d_inner,
                         config.dim,
                     )?,
-                    w_alpha: load_weight_tensor(
+                    w_alpha: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_a.weight"),
                         config.linear_num_value_heads,
                         config.dim,
                     )?,
-                    w_beta: load_weight_tensor(
+                    w_beta: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.in_proj_b.weight"),
@@ -1839,7 +1852,7 @@ pub fn load_weights(
                         &format!("{p}.linear_attn.norm.weight"),
                         config.linear_value_head_dim,
                     )?,
-                    wo: load_weight_tensor(
+                    wo: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.linear_attn.out_proj.weight"),
@@ -1866,28 +1879,28 @@ pub fn load_weights(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wq: load_weight_tensor(
+                    wq: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.q_proj.weight"),
                         q_out_dim,
                         config.dim,
                     )?,
-                    wk: load_weight_tensor(
+                    wk: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.k_proj.weight"),
                         kv_dim,
                         config.dim,
                     )?,
-                    wv: load_weight_tensor(
+                    wv: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.v_proj.weight"),
                         kv_dim,
                         config.dim,
                     )?,
-                    wo: load_weight_tensor(
+                    wo: load_weight_tensor_5(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.o_proj.weight"),
@@ -2477,28 +2490,28 @@ fn load_layer_into(
                     &format!("{p}.input_layernorm.weight"),
                     &[config.dim],
                 )?,
-                wqkv: load_weight_tensor(
+                wqkv: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_qkv.weight"),
                     qkv_dim,
                     config.dim,
                 )?,
-                wz: load_weight_tensor(
+                wz: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_z.weight"),
                     d_inner,
                     config.dim,
                 )?,
-                w_alpha: load_weight_tensor(
+                w_alpha: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_a.weight"),
                     config.linear_num_value_heads,
                     config.dim,
                 )?,
-                w_beta: load_weight_tensor(
+                w_beta: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_b.weight"),
@@ -2529,7 +2542,7 @@ fn load_layer_into(
                     &format!("{p}.linear_attn.norm.weight"),
                     config.linear_value_head_dim,
                 )?,
-                wo: load_weight_tensor(
+                wo: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.out_proj.weight"),
@@ -2542,21 +2555,21 @@ fn load_layer_into(
                     &format!("{p}.post_attention_layernorm.weight"),
                     &[config.dim],
                 )?,
-                w_gate: load_weight_tensor(
+                w_gate: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.gate_proj.weight"),
                     config.hidden_dim,
                     config.dim,
                 )?,
-                w_up: load_weight_tensor(
+                w_up: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.up_proj.weight"),
                     config.hidden_dim,
                     config.dim,
                 )?,
-                w_down: load_weight_tensor(
+                w_down: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.down_proj.weight"),
@@ -2575,28 +2588,28 @@ fn load_layer_into(
                     &format!("{p}.input_layernorm.weight"),
                     &[config.dim],
                 )?,
-                wq: load_weight_tensor(
+                wq: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.q_proj.weight"),
                     q_out_dim,
                     config.dim,
                 )?,
-                wk: load_weight_tensor(
+                wk: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.k_proj.weight"),
                     kv_dim,
                     config.dim,
                 )?,
-                wv: load_weight_tensor(
+                wv: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.v_proj.weight"),
                     kv_dim,
                     config.dim,
                 )?,
-                wo: load_weight_tensor(
+                wo: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.o_proj.weight"),
@@ -2621,21 +2634,21 @@ fn load_layer_into(
                     &format!("{p}.post_attention_layernorm.weight"),
                     &[config.dim],
                 )?,
-                w_gate: load_weight_tensor(
+                w_gate: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.gate_proj.weight"),
                     config.hidden_dim,
                     config.dim,
                 )?,
-                w_up: load_weight_tensor(
+                w_up: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.up_proj.weight"),
                     config.hidden_dim,
                     config.dim,
                 )?,
-                w_down: load_weight_tensor(
+                w_down: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.down_proj.weight"),
@@ -2655,28 +2668,28 @@ fn load_layer_into(
                     &format!("{p}.input_layernorm.weight"),
                     &[config.dim],
                 )?,
-                wqkv: load_weight_tensor(
+                wqkv: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_qkv.weight"),
                     qkv_dim,
                     config.dim,
                 )?,
-                wz: load_weight_tensor(
+                wz: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_z.weight"),
                     d_inner,
                     config.dim,
                 )?,
-                w_alpha: load_weight_tensor(
+                w_alpha: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_a.weight"),
                     config.linear_num_value_heads,
                     config.dim,
                 )?,
-                w_beta: load_weight_tensor(
+                w_beta: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.in_proj_b.weight"),
@@ -2707,7 +2720,7 @@ fn load_layer_into(
                     &format!("{p}.linear_attn.norm.weight"),
                     config.linear_value_head_dim,
                 )?,
-                wo: load_weight_tensor(
+                wo: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.linear_attn.out_proj.weight"),
@@ -2733,28 +2746,28 @@ fn load_layer_into(
                     &format!("{p}.input_layernorm.weight"),
                     &[config.dim],
                 )?,
-                wq: load_weight_tensor(
+                wq: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.q_proj.weight"),
                     q_out_dim,
                     config.dim,
                 )?,
-                wk: load_weight_tensor(
+                wk: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.k_proj.weight"),
                     kv_dim,
                     config.dim,
                 )?,
-                wv: load_weight_tensor(
+                wv: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.v_proj.weight"),
                     kv_dim,
                     config.dim,
                 )?,
-                wo: load_weight_tensor(
+                wo: load_weight_tensor_5(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.o_proj.weight"),
@@ -2801,27 +2814,27 @@ fn load_moe_ffn(
     let smi = config.shared_expert_intermediate_size;
 
     // Router: hidden_size → num_experts. Precision-sensitive but small.
-    let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
+    let router = load_weight_tensor_5(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
 
     // Shared expert (always-on, contributes to every token). Unlike routed
     // experts, gate_proj + up_proj are stored separately in the safetensors
     // (routed experts store them fused as `gate_up_proj`).
     let shared_expert = SharedExpertWeights {
-        gate: load_weight_tensor(
+        gate: load_weight_tensor_5(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.gate_proj.weight"),
             smi,
             config.dim,
         )?,
-        up: load_weight_tensor(
+        up: load_weight_tensor_5(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.up_proj.weight"),
             smi,
             config.dim,
         )?,
-        down: load_weight_tensor(
+        down: load_weight_tensor_5(
             hfq,
             gpu,
             &format!("{p}.mlp.shared_expert.down_proj.weight"),
@@ -2831,7 +2844,7 @@ fn load_moe_ffn(
     };
     // Scalar gate on the shared-expert add: sigmoid(shared_expert_gate · x).
     // Stored as a 1×hidden row-vector.
-    let shared_expert_gate = load_weight_tensor(
+    let shared_expert_gate = load_weight_tensor_5(
         hfq,
         gpu,
         &format!("{p}.mlp.shared_expert_gate.weight"),
@@ -2844,14 +2857,14 @@ fn load_moe_ffn(
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_tensor(
+        let gate_up = load_weight_tensor_5(
             hfq,
             gpu,
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi,
             config.dim,
         )?;
-        let down = load_weight_tensor(
+        let down = load_weight_tensor_5(
             hfq,
             gpu,
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
