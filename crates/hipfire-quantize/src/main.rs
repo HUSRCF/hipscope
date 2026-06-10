@@ -4795,6 +4795,10 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
+    // F16 weight passthrough (the cohere2moe BF16-class oracle, 61 GB vs the
+    // 122 GB all-F32 `oracle`/`bf16` passthrough — fits the gfx1151 96 GB
+    // budget). Weights → F16; tied embed → Q8 (lookup constraint); norms → F16.
+    let use_f16 = format == "f16" || format == "f16-passthrough";
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
@@ -5318,6 +5322,13 @@ fn main() {
         // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
         // num_dense_layers == num_hidden_layers for the dense variant.
         "lfm2_moe" | "lfm2" => 11,
+        // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
+        // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
+        // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,
+        // no shared), dense layer-0 (first_k_dense_replace=1), tied embeddings.
+        // Per-expert pre-split tensors (mlp.experts.{j}.{gate,up,down}_proj) like
+        // lfm2/deepseek. Crate hipfire-arch-cohere2moe (arch_id 12).
+        "cohere2_moe" => 12,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5349,7 +5360,11 @@ fn main() {
     // has no experts so the ingest just Q8s every tensor (the loader's load_f32
     // dequantizes norms / conv-filter back to F32).
     let is_lfm2moe = arch_id == 11;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe;
+    // Cohere2-MoE (arch_id 12): per-expert pre-split tensors; experts carry the
+    // bit-width knob (--format f16|q8|mq6|mq4), attention/dense/router stay Q8
+    // (F16 in the oracle), tied embed stays Q8, norms → F16.
+    let is_cohere2moe = arch_id == 12;
+    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_cohere2moe;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5360,6 +5375,9 @@ fn main() {
     }
     if is_lfm2moe {
         eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8.");
+    }
+    if is_cohere2moe {
+        eprintln!("  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16.");
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -5791,6 +5809,112 @@ fn main() {
                 name, raw_data, meta, &fp8_scale_for, &st_files);
             let q = quantize_q8f16(&f32_data);
             eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(), quant_type: QuantType::Q8F16,
+                shape, group_size: 32, data: q, spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
+        }
+
+        // ── Cohere2-MoE ingest (arch_id 12) ─────────────────────────────────────
+        // North-Mini-Code-1.0. Sweep tiers via --format: f16 (BF16-class oracle)
+        // | q8 | mq6 | mq4. The EXPERTS carry the bit-width knob; attention/dense
+        // stay Q8 (F16 in the oracle); the router (mlp.gate.weight) and the tied
+        // embed_tokens stay Q8 (selection- / lookup-sensitive, held constant
+        // across the sweep so KLD isolates expert/attention precision); all
+        // *norm* tensors → F16. Experts ship per-expert pre-split (gate_proj/
+        // up_proj/down_proj); the loader byte-fuses gate_proj‖up_proj.
+        if is_cohere2moe {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            // norms (input_layernorm, model.norm) → F16.
+            if name.contains("norm") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let f16_bytes: Vec<u8> =
+                    f32_data.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect();
+                eprintln!("  {:>8}: {} {:?} (norm F16)", "F16-COH", name, meta.shape);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::F16,
+                    shape, group_size: 0, data: f16_bytes, spilled_len: 0,
+                });
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // tied embed_tokens → Q8 (the lookup kernel needs Q8; lm_head reuses it).
+            if name.ends_with("embed_tokens.weight") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let q = quantize_q8f16(&f32_data);
+                eprintln!("  {:>8}: {} {:?} (tied embed Q8)", "Q8-COH", name, meta.shape);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::Q8F16,
+                    shape, group_size: 32, data: q, spilled_len: 0,
+                });
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // 2D matmul weights (all Cohere2 matmuls have K = shape[1] %256 == 0):
+            // router → Q8; experts → the --format knob; attn/dense → Q8 (F16 oracle).
+            if meta.shape.len() == 2 && meta.shape[1] % 256 == 0 {
+                let is_expert = name.contains(".mlp.experts.");
+                let is_router = name.ends_with(".mlp.gate.weight");
+                let dt = if is_router {
+                    QuantType::Q8F16
+                } else if use_f16 {
+                    QuantType::F16
+                } else if is_expert {
+                    if use_mq6g256 {
+                        QuantType::MQ6G256
+                    } else if use_mq4g256 {
+                        QuantType::MQ4G256
+                    } else {
+                        QuantType::Q8F16
+                    }
+                } else {
+                    QuantType::Q8F16
+                };
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let (data, gs, tag): (Vec<u8>, u32, &str) = match dt {
+                    QuantType::F16 => (
+                        f32_data.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect(),
+                        0,
+                        "F16-COH",
+                    ),
+                    QuantType::MQ6G256 => {
+                        let s1 = gen_fwht_signs(42, 256);
+                        let s2 = gen_fwht_signs(1042, 256);
+                        (quantize_mq6g256(&f32_data, &s1, &s2), 256, "MQ6-COH")
+                    }
+                    QuantType::MQ4G256 => {
+                        let s1 = gen_fwht_signs(42, 256);
+                        let s2 = gen_fwht_signs(1042, 256);
+                        (quantize_mq4g256(&f32_data, &s1, &s2), 256, "MQ4-COH")
+                    }
+                    _ => (quantize_q8f16(&f32_data), 32, "Q8-COH"),
+                };
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)", tag, name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, data.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: dt,
+                    shape, group_size: gs, data, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            // anything else (1D / odd shapes) → Q8.
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files);
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-COH", name, meta.shape);
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(), quant_type: QuantType::Q8F16,
                 shape, group_size: 32, data: q, spilled_len: 0,
