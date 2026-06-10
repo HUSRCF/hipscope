@@ -645,11 +645,16 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja_contrib::pycompat::unknown_method_callback;
 
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // SemiStrict undefined: a missing context variable still raises Err on
+        // *render/iteration* (so malformed prompts don't silently propagate —
+        // Codex review on PR #175), BUT undefined is falsy in boolean context
+        // (`{% if maybe_undefined %}`). This matches HuggingFace's jinja2
+        // default and is REQUIRED by Cohere2's template, which does
+        // `{% if developer_preamble %}` against a var only `{% set %}` when a
+        // leading system message exists. Pure `Strict` raised on the no-system
+        // case. SemiStrict is strictly more permissive than Strict, so every
+        // template that already rendered under Strict renders identically.
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::SemiStrict);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into

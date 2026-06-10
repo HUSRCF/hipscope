@@ -26,6 +26,7 @@ use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
@@ -1193,6 +1194,17 @@ struct LoadedModel {
     /// its end-of-turn marker is the added token `[e~[`; falls back to common
     /// alternates, then 1.
     minimax_eos_tok: u32,
+    // Cohere2-MoE / North-Mini-Code state (arch_id=12 — hipfire-arch-cohere2moe).
+    // Parallel-block transformer: interleaved NoPE/SWA GQA + sigmoid-no-renorm
+    // 128-expert MoE, no shared expert. KV cache lives inside Cohere2MoeState;
+    // no separate field. None on every other arch path.
+    cohere2moe_config: Option<cohere2moe::Cohere2MoeConfig>,
+    cohere2moe_weights: Option<cohere2moe::Cohere2MoeWeights>,
+    cohere2moe_state: Option<cohere2moe::Cohere2MoeState>,
+    /// EOS token id resolved at load time. Cohere2 ends a turn with
+    /// `<|END_OF_TURN_TOKEN|>` (id 255001), NOT ChatML `<|im_end|>`; falls back
+    /// to common alternates, then 255001.
+    cohere2moe_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
@@ -1924,6 +1936,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            12 => "north_mini_code",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1998,7 +2011,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -2272,6 +2285,10 @@ fn main() {
                     // models that fall into block-level attractors at lower
                     // temperatures — use the card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
+                } else if m.arch_id == 12 {
+                    // Cohere2-MoE / North-Mini-Code (12): the Cohere model card
+                    // recommends temperature=1.0, top_p=0.95.
+                    (1.0_f64, 0.95_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
@@ -2700,6 +2717,12 @@ fn main() {
                     if let Some(ref mut s) = m.minimax_state {
                         s.reset();
                     }
+                    // arch_id=12 (Cohere2-MoE / North-Mini-Code): clear the KV
+                    // cursor between turns. reset() takes no gpu (cursor-only),
+                    // same as MiniMax-M2.
+                    if let Some(ref mut s) = m.cohere2moe_state {
+                        s.reset();
+                    }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
@@ -2757,6 +2780,7 @@ fn main() {
                         9 => "deepseek4",
                         10 => "minimax_m2",
                         11 => "lfm2moe",
+                        12 => "north_mini_code",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -2986,6 +3010,27 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 12 {
+                    // Cohere2-MoE warm-pass: per-token decode_step over the
+                    // synthetic prompt. Saturates the parallel-block GQA +
+                    // NoPE/SWA + sigmoid-no-renorm MoE kernel set before any
+                    // user-facing generate. This IS the production prefill shape
+                    // (the eager per-token path).
+                    let config = m.cohere2moe_config.as_ref().unwrap();
+                    let weights = m.cohere2moe_weights.as_ref().unwrap();
+                    let state = m.cohere2moe_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if cohere2moe::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -3030,6 +3075,11 @@ fn main() {
                 // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
                 // reset its cursor (no gpu) for a cold prefill on the next request.
                 if let Some(ref mut s) = m.minimax_state {
+                    s.reset();
+                }
+                // Cohere2-MoE (arch_id=12): KV cache shares Cohere2MoeState;
+                // reset its cursor (no gpu) for a cold prefill on the next request.
+                if let Some(ref mut s) = m.cohere2moe_state {
                     s.reset();
                 }
 
@@ -3177,6 +3227,15 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
                 return Some(t);
             }
             return Some(LFM2_TEMPLATE.to_string());
+        }
+        12 => {
+            // Cohere2-MoE / North-Mini-Code ships `chat_template` as a LIST of
+            // named templates; `tool_use` is the superset that also handles
+            // plain chat. Falls through to the HFQ-embedded fallback below when
+            // absent.
+            if let Some(t) = hfq.chat_template_named("tool_use") {
+                return Some(t);
+            }
         }
         _ => {}
     }
@@ -3540,6 +3599,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3625,6 +3688,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3731,6 +3798,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3830,6 +3901,124 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 12 {
+        // Cohere2-MoE / North-Mini-Code (hipfire-arch-cohere2moe). Standalone
+        // bring-up — no eviction, no DFlash drafter, no PFlash, no VL, no
+        // spec-decode. The Architecture trait gives us config + weights + state
+        // in three calls; prefill + decode both go through the per-token
+        // `cohere2moe::forward::decode_step` in the generate hot path. There
+        // is NO PrefillBatchScratch (forward_batch is a deliberate follow-up).
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=12 (Cohere2-MoE / North-Mini-Code). \
+                       Reload without a draft."
+                .to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction not supported on arch_id=12 (Cohere2-MoE / North-Mini-Code). \
+                       Reload without --cask-sidecar."
+                    .to_string(),
+            );
+        }
+        if pp > 1 {
+            return Err(
+                "pipeline-parallel (pp>1) not supported on arch_id=12 (Cohere2-MoE / North-Mini-Code)."
+                    .to_string(),
+            );
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <cohere2moe::Cohere2Moe as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        // Size the KV cache to the requested window (the trait's new_state
+        // caps at 8192; honour the caller's max_seq when it's larger/smaller).
+        let state = cohere2moe::Cohere2MoeState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
+        // Resolve EOS via the tokenizer. Cohere2 ends a turn with
+        // `<|END_OF_TURN_TOKEN|>` (id 255001), NOT ChatML `<|im_end|>`. Probe
+        // the real marker first; keep the ChatML/common fallbacks for safety on
+        // any future tokenizer variant, then default to 255001.
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = tokenizer.encode(s);
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            };
+            try_one("<|END_OF_TURN_TOKEN|>")
+                .or_else(|| try_one("<|im_end|>"))
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(255001)
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            cohere2moe_config: Some(config),
+            cohere2moe_weights: Some(weights),
+            cohere2moe_state: Some(state),
+            cohere2moe_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3944,6 +4133,10 @@ fn load_model(
             minimax_weights: Some(weights),
             minimax_state: Some(state),
             minimax_eos_tok: eos_tok,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4404,6 +4597,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4479,6 +4676,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4642,6 +4843,10 @@ fn load_model_safetensors(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            cohere2moe_config: None,
+            cohere2moe_weights: None,
+            cohere2moe_state: None,
+            cohere2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4785,6 +4990,10 @@ fn load_model_safetensors(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        cohere2moe_config: None,
+        cohere2moe_weights: None,
+        cohere2moe_state: None,
+        cohere2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5025,6 +5234,10 @@ fn load_model_pp(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        cohere2moe_config: None,
+        cohere2moe_weights: None,
+        cohere2moe_state: None,
+        cohere2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5215,6 +5428,10 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        cohere2moe_config: None,
+        cohere2moe_weights: None,
+        cohere2moe_state: None,
+        cohere2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5337,6 +5554,10 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: eos_tok,
+        cohere2moe_config: None,
+        cohere2moe_weights: None,
+        cohere2moe_state: None,
+        cohere2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -8542,6 +8763,39 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         let _ = (repeat_penalty, repeat_window);
         generate_lfm2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 12 {
+        // arch_id=12 (Cohere2-MoE / North-Mini-Code). Minimal AR bring-up —
+        // same shape as the minimax / deepseek4 / lfm2moe short-circuits above.
+        // PFlash / DFlash / VL / multi-GPU / sampler-budget / grammar /
+        // tools-execution all bypass. We honour `system_prompt`, `temp`,
+        // `top_p`, and (via JinjaChatFrame) `messages_history` + `tools`
+        // rendering; spec-decode / MTP / grammar are out of scope for the
+        // scaffold.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_cohere2moe(
             m,
             gpu,
             stdout,
@@ -12604,6 +12858,423 @@ fn generate_minimax(
     }
 
     m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Parse a Cohere `<|START_ACTION|>` … `<|END_ACTION|>` body — a JSON array of
+/// `{tool_call_id, tool_name, parameters}` — into the daemon's tool_calls wire
+/// shape `[{name, arguments}]`. Tolerant of surrounding whitespace and trailing
+/// junk (slices from the first `[` to the last `]`); returns empty on any parse
+/// failure so a malformed/truncated action never crashes the stream.
+fn parse_cohere_action(buf: &str) -> Vec<serde_json::Value> {
+    let t = buf.trim();
+    let slice = match (t.find('['), t.rfind(']')) {
+        (Some(s), Some(e)) if e > s => &t[s..=e],
+        _ => return Vec::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(slice) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match parsed.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|tc| {
+            let name = tc.get("tool_name").and_then(|v| v.as_str())?;
+            let args = tc
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(serde_json::json!({"name": name, "arguments": args}))
+        })
+        .collect()
+}
+
+/// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
+/// `generate_minimax`, plus: BATCHED `forward_batch` prefill (≈9×, see the
+/// prefill block) and a Cohere agentic-marker state machine in the decode loop
+/// that suppresses the special markers, routes `<|START_THINKING|>` content to a
+/// reasoning channel, emits `<|START_TEXT|>` content as the visible answer, and
+/// parses `<|START_ACTION|>` blocks into `tool_calls` events. Decode is plain
+/// per-token `decode_step` (no hipGraph variant yet). Out of scope (NOT wired):
+/// spec-decode, MTP, grammar-constrained decoding, tool EXECUTION, repeat
+/// penalty, multi-GPU.
+#[allow(clippy::too_many_arguments)]
+fn generate_cohere2moe(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+    if m.cohere2moe_config.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"cohere2moe_config missing on arch_id=12 generate"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same two-path branch as the minimax / lfm2moe AR path) ──
+    // `primed_think` records whether the rendered prompt actually ended with a
+    // `<think>` generation-primer, so we only re-emit the opener (below) when
+    // the model truly begins inside the reasoning block. A jinja render failure
+    // that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Cohere2-MoE / North-Mini-Code REQUIRES its embedded Jinja chat_template
+        // — its structural tokens are NOT ChatML (turns end with
+        // `<|END_OF_TURN_TOKEN|>`). The hand-rolled Plain ChatML frame emits
+        // `<|im_start|>`/`<|im_end|>` which this model never trained on,
+        // producing an off-distribution prompt that (a) decodes incoherently and
+        // (b) never matches across turns so the LCP prompt-cache is dead. Force
+        // jinja on (falls back to Plain only when the .hfq carries no template).
+        // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in cohere2moe path ({e}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        raw: false,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                raw: false,
+            }
+            .build()
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.cohere2moe_eos_tok;
+
+    // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
+    // FULL rendered conversation + generation would overflow. `prompt_ids` is
+    // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
+    let overflow = {
+        let state = m.cohere2moe_state.as_ref().unwrap();
+        prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.cohere2moe_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!(
+            "[daemon] arch_id=12 context full ({n}/{cap}) — resetting Cohere2MoeState",
+        );
+        m.cohere2moe_state.as_mut().unwrap().reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
+    // Jinja-rendered conversation (the trained chat template). Cohere2-MoE is
+    // standard attention with no compound recurrent/compressed state, so KV
+    // positions ≥ lcp are simply overwritten by the new prefill and the stale
+    // tail is never attended. We rewind `n_tokens` to `lcp` and re-prefill the
+    // suffix; the reused prefix GROWS with the conversation.
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        // A usable common prefix that leaves at least one fresh token to prefill.
+        // `partial` is the divergence case (lcp < prior_len); lcp == prior_len is
+        // the degenerate pure-extension case (rewind is then a no-op).
+        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        let partial = lcp < prior_len;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
+                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                m.cohere2moe_state.as_ref().unwrap().n_tokens,
+            );
+        }
+        if cache_hit {
+            // Rewind KV + token history to the common prefix. When lcp ==
+            // prior_len this is a no-op; when lcp < prior_len it discards the
+            // stale tail. The prefill loop below reads `state.n_tokens` as its
+            // base position, so n_tokens is the only KV state the rewind must
+            // touch (plus the mirror token history).
+            m.cohere2moe_state.as_mut().unwrap().n_tokens = lcp;
+            m.conversation_tokens.truncate(lcp);
+            m.seq_pos = lcp;
+            prompt_ids[lcp..].to_vec()
+        } else {
+            if prior_len > 0 {
+                m.cohere2moe_state.as_mut().unwrap().reset();
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+            }
+            prompt_ids.clone()
+        }
+    };
+
+    let t0 = Instant::now();
+
+    // ── Prefill: BATCHED `forward_batch` (~9× the per-token path) when the
+    // expert tier supports the indexed-MoE GEMV (MQ4/MQ6), chunked at 256 (the
+    // WMMA Q8-projection + grouped-MoE sweet spot). `forward_batch` writes KV at
+    // [start_pos..start_pos+b] and its attention covers the cached prefix
+    // [0..start_pos], so it composes with the prompt cache (start_pos = lcp).
+    // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
+    // The LAST forward's logits predict the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.cohere2moe_config.as_ref().unwrap();
+        let weights = m.cohere2moe_weights.as_ref().unwrap();
+        let state = m.cohere2moe_state.as_mut().unwrap();
+        if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
+            let mut i = 0;
+            while i < prefill_ids.len() {
+                let end = (i + 256).min(prefill_ids.len());
+                let start_pos = state.n_tokens;
+                match cohere2moe::forward::forward_batch(
+                    cfg, weights, state, gpu, &prefill_ids[i..end], start_pos,
+                ) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("cohere2moe batched prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                i = end;
+            }
+        } else {
+            let mut position = state.n_tokens as u32;
+            for &tok in &prefill_ids {
+                match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                position += 1;
+            }
+        }
+    }
+    for &tok in &prefill_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Re-emit a leading `<think>\n` opener into the token stream (display-only,
+    // not pushed to state) when the rendered prompt primed the assistant turn
+    // inside a reasoning block, so downstream `<think>` consumers see a
+    // well-formed block. No-op for templates that don't prime think.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": "<think>\n"}),
+        );
+        let _ = stdout.flush();
+    }
+
+    // ── Decode loop. Sample host-side from the running logits vector.
+    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
+    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
+    // don't lock-step (greedy is still deterministic). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
+    // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
+    // for its response (NOT the template's <|START_RESPONSE|>, which isn't a
+    // real special token here — verified empirically).
+    let (mk_think0, mk_think1, mk_text0, mk_text1, mk_act0, mk_act1) = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        // `encode` SPLITS these added tokens (they round-trip on DECODE only),
+        // so resolve content→id via special_token_id, with North-Mini-Code's
+        // fixed marker ids as the fallback.
+        let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
+        (
+            mark("<|START_THINKING|>", 255010), mark("<|END_THINKING|>", 255011),
+            mark("<|START_TEXT|>", 255012), mark("<|END_TEXT|>", 255013),
+            mark("<|START_ACTION|>", 255014), mark("<|END_ACTION|>", 255015),
+        )
+    };
+    #[derive(PartialEq, Clone, Copy)]
+    enum Sec { Pre, Think, Text, Action }
+    let mut sec = Sec::Pre;
+    let mut action_buf = String::new();
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if next_tok == eos_tok {
+            break;
+        }
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // Agentic-marker state machine — markers themselves are never emitted.
+        if next_tok == mk_think0 {
+            sec = Sec::Think;
+        } else if next_tok == mk_text0 {
+            sec = Sec::Text;
+        } else if next_tok == mk_act0 {
+            sec = Sec::Action;
+            action_buf.clear();
+        } else if next_tok == mk_think1 || next_tok == mk_text1 {
+            sec = Sec::Pre;
+        } else if next_tok == mk_act1 {
+            // End of an action block → parse the JSON array into tool_calls.
+            let calls = parse_cohere_action(&action_buf);
+            if !calls.is_empty() {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({"type": "tool_calls", "id": id, "calls": calls}),
+                );
+                let _ = stdout.flush();
+            }
+            sec = Sec::Pre;
+        } else {
+            // Build the fragment through serde_json so arbitrary UTF-8 can't
+            // corrupt the JSONL line.
+            let frag = {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                tokenizer.decode(&[next_tok])
+            };
+            match sec {
+                Sec::Action => action_buf.push_str(&frag),
+                Sec::Think => {
+                    // Reasoning channel: tagged so clients can fold it; the CLI
+                    // (ignoring unknown fields) shows it inline.
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true}),
+                    );
+                    let _ = stdout.flush();
+                }
+                Sec::Text | Sec::Pre => {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({"type": "token", "id": id, "text": frag}),
+                    );
+                    let _ = stdout.flush();
+                }
+            }
+        }
+
+        // Advance one step on the freshly sampled token (plain eager decode —
+        // no hipGraph variant on this arch yet).
+        let step = {
+            let cfg = m.cohere2moe_config.as_ref().unwrap();
+            let weights = m.cohere2moe_weights.as_ref().unwrap();
+            let state = m.cohere2moe_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            cohere2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.cohere2moe_state.as_ref().unwrap().n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
