@@ -41,6 +41,7 @@ pub mod cpu_router;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 pub mod paro;
+pub mod augmentor;
 pub mod tokenizer;
 pub mod eos_filter;
 pub mod prompt_frame;
