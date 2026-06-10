@@ -14,6 +14,8 @@ use hipfire_runtime::llama::{
     weight_gemv_prerotated, weight_gemv_swiglu_residual,
     EmbeddingFormat, ParoRotation, WeightTensor,
 };
+use hipfire_runtime::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
+use hipfire_runtime::layer_loader::{resolve_candidate, resolve_required, WeightSpec};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::{
     alias_paro_rotation, load_fp16_weight_from_source, load_paro_weight, paro_load_f32,

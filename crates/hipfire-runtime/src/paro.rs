@@ -197,7 +197,7 @@ pub fn load_paro_weight(
 /// (e.g. MoE router, embedding).
 pub fn paro_load_wt(
     source: &dyn ModelSource,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     prefix: &str,
     m: usize,
     k: usize,
@@ -206,6 +206,14 @@ pub fn paro_load_wt(
 ) -> HipResult<WeightTensor> {
     let mp = paro_text_prefix(source)?;
     let fp = format!("{mp}.{prefix}");
+
+    // Try registered augmentors first (e.g. ParoAugmentor).
+    if let Some(t) = crate::augmentor::try_augmentors(
+        source, &fp, m, k, gpu, crate::augmentor::DEFAULT_AUGMENTORS,
+    )? {
+        return Ok(t);
+    }
+
     if source.tensor_info(&format!("{fp}.qweight")).is_some() {
         return load_paro_weight(source, gpu, &fp, m, k, gs, kr);
     }
