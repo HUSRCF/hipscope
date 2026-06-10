@@ -14503,10 +14503,26 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch_caps.has_wmma_w32_gfx12() {
+            // RDNA4 (gfx12): the mw16 WMMA kernel below is gfx11-builtin-only
+            // (has_wmma_w32 = is_rdna3), and the legacy fallback
+            // (gemm_f16_tiled) MISCOMPUTES — overlapping tid*4-stride reads
+            // inflate the output ~10x (see f16_gemv_parity example; this
+            // corrupted the ds4 DSA compressor projections on gfx1201 and
+            // broke EP tool-calling). Route through the validated gfx12 f16
+            // WMMA kernel instead: same contract (F32 X, Y[batch, m]).
+            return self.gemm_f16_wmma_mb8(w_f16, x, y, m, k, batch_size);
+        }
         if !self.arch_caps.has_wmma_w32() {
             // No mw16 WMMA on non-RDNA3. The generic F16 GEMM writes [M,N],
             // while lm_head consumers expect [N,M], so preserve layout by
             // launching one row at a time.
+            //
+            // ⚠ gemm_f16_tiled is known-broken at this call shape (see
+            // f16_gemv_parity: ~10x inflated output from overlapping
+            // tid*4-stride reads). Pre-WMMA arches that reach this fallback
+            // get wrong results — fixing the kernel is tracked separately;
+            // no currently-supported F16-weight model runs on those arches.
             for b in 0..batch_size {
                 let x_row = x.sub_offset(b * k, k);
                 let y_row = y.sub_offset(b * m, m);
