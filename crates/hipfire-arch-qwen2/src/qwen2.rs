@@ -1348,13 +1348,17 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
     }
 }
 
-/// HIPFIRE_FORWARD_LOWERED=1 enables the lowered path. Default OFF until fleet
-/// byte-parity is validated on gfx1100 + gfx1201 — then flip to the
-/// fleet-standard `!= Some("0")` (default ON) in the same commit.
+/// Lowered decode is DEFAULT ON (fleet-standard `!= Some("0")`, same
+/// convention as qwen35/minimax/deepseek4/lfm2moe); opt out with
+/// HIPFIRE_FORWARD_LOWERED=0. Byte-parity validated on gfx1100 (Kevin:
+/// short/GQA_FUSED/long-ctx/perf, all identical) and gfx1201 (2026-06-09:
+/// short 128/128 ids, GQA_FUSED, long-ctx 5550-tok prompt pos>=4096
+/// gqa_warp, default check, perf 266.7 tok/s both paths Δ<=0.2%;
+/// qwen2-1.5b hfq4, temp 0). dots-ocr text decode rides this same path.
 fn qwen2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1"))
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
