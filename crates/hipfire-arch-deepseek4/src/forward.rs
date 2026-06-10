@@ -611,6 +611,36 @@ fn compressor_forward_impl(
     gpu.add_inplace_f32(&score_view, &ape_row)
         .map_err(|e| format!("comp ape add l{layer_idx}: {e:?}"))?;
 
+    // Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
+    // pipeline stage's output fingerprint at that (position, layer) so the
+    // first cross-arch divergent op can be identified. Diagnostic only.
+    let comp_dump_here = std::env::var("HIPFIRE_COMP_DUMP")
+        .ok()
+        .and_then(|s| {
+            let mut it = s.split(',');
+            let p: u32 = it.next()?.trim().parse().ok()?;
+            let l: usize = it.next()?.trim().parse().ok()?;
+            Some((p, l))
+        })
+        .map(|(p, l)| p == position && l == layer_idx)
+        .unwrap_or(false);
+    let comp_dbg = |gpu: &Gpu, name: &str, t: &GpuTensor, n: usize| {
+        if !comp_dump_here {
+            return;
+        }
+        let _ = gpu.hip.device_synchronize();
+        if let Ok(v) = gpu.download_f32(t) {
+            let l2: f64 = v.iter().take(n).map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+            let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:.6e}")).collect();
+            eprintln!(
+                "COMPDUMP l{layer_idx} pos={position} idx={is_indexer} {name}: l2={l2:.9e} head={}",
+                head.join(",")
+            );
+        }
+    };
+    comp_dbg(&*gpu, "kv_buf(gemv)", kv_buf, proj_dim);
+    comp_dbg(&*gpu, "score_buf(gemv+ape)", score_buf, proj_dim);
+
     // Compressor commit + compress pipeline.
     //
     // Two paths share the same dataflow but differ in how slot indices
@@ -792,6 +822,8 @@ fn compressor_forward_impl(
         .map_err(|e| format!("comp ring write kv l{layer_idx}: {e:?}"))?;
     gpu.state_ring_write_f32_buf(score_buf, score_state, &ring_slot_buf, proj_dim as i32)
         .map_err(|e| format!("comp ring write score l{layer_idx}: {e:?}"))?;
+    comp_dbg(&*gpu, "kv_state(ring)", kv_state, state_rows * proj_dim);
+    comp_dbg(&*gpu, "score_state(ring)", score_state, state_rows * proj_dim);
 
     // Compress event — concat (overlap only) is unconditional within graph;
     // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
@@ -802,6 +834,8 @@ fn compressor_forward_impl(
             .map_err(|e| format!("comp concat_kv l{layer_idx}: {e:?}"))?;
         gpu.compressor_overlap_concat_f32(score_state, concat_score, ratio as i32, head_dim as i32)
             .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
+        comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
+        comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
         gpu.compressor_softmax_pool_f32_buf(
             concat_kv,
             concat_score,
@@ -822,6 +856,8 @@ fn compressor_forward_impl(
         )
         .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
     }
+    let commit_row = kv_cache.sub_offset((pos / ratio) * head_dim, head_dim);
+    comp_dbg(&*gpu, "kv_cache(pool)", &commit_row, head_dim);
     gpu.rmsnorm_f32_at_slot_buf(
         kv_cache,
         norm,
@@ -830,6 +866,7 @@ fn compressor_forward_impl(
         cfg.rms_norm_eps,
     )
     .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
+    comp_dbg(&*gpu, "kv_cache(rmsnorm)", &commit_row, head_dim);
     if do_rope {
         gpu.rope_tail_yarn_interleaved_at_slot_buf(
             kv_cache,
@@ -846,6 +883,7 @@ fn compressor_forward_impl(
         )
         .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
     }
+    comp_dbg(&*gpu, "kv_cache(rope)", &commit_row, head_dim);
     if overlap {
         gpu.state_overlap_shift_f32_buf(kv_state, &commit_slot_buf, ratio as i32, proj_dim as i32)
             .map_err(|e| format!("comp kv_state shift buf l{layer_idx}: {e:?}"))?;
