@@ -2178,23 +2178,59 @@ pub fn forward_ep(
     //    the N per-rank bindings each layer (disjoint `iter_mut` mutable state
     //    borrows), exactly like the single-GPU lowered loop advances per layer.
     let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    // Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a
+    // per-(position, layer, rank) fingerprint of the residual streams so EP
+    // forwards can be compared across tp counts / arches. Diagnostic only.
+    let dump_pos_hit = std::env::var("HIPFIRE_EP_DUMP_POS")
+        .ok()
+        .map(|s| s.split(',').any(|x| x.trim().parse::<u32>() == Ok(position)))
+        .unwrap_or(false);
     let t_layers = std::time::Instant::now();
     let program = ds4_lower_program();
     for l in 0..cfg.num_hidden_layers {
-        let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
-        for (r, st) in state_per_rank.iter_mut().enumerate() {
-            binds.push(Deepseek4Bindings {
-                cfg,
-                weights: &weights_per_rank[r],
-                state: st,
-                layer_idx: l,
-                position,
-                token_id: token,
-                skip_ffn,
-            });
+        {
+            let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
+            for (r, st) in state_per_rank.iter_mut().enumerate() {
+                binds.push(Deepseek4Bindings {
+                    cfg,
+                    weights: &weights_per_rank[r],
+                    state: st,
+                    layer_idx: l,
+                    position,
+                    token_id: token,
+                    skip_ffn,
+                });
+            }
+            hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+                .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
         }
-        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
-            .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
+        if dump_pos_hit {
+            for r in 0..n {
+                gpus.devices[r]
+                    .bind_thread()
+                    .map_err(|e| format!("ds4 EPDUMP bind {r}: {e:?}"))?;
+                gpus.devices[r]
+                    .hip
+                    .device_synchronize()
+                    .map_err(|e| format!("ds4 EPDUMP sync {r}: {e:?}"))?;
+                if let Some(t) = state_per_rank[r].residual_streams.as_ref() {
+                    let v = gpus.devices[r].download_f32(t).unwrap_or_default();
+                    let l2: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for &x in &v {
+                        for b in x.to_bits().to_le_bytes() {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    eprintln!(
+                        "EPDUMP pos={position} layer={l} rank={r} l2={l2:.9e} fnv=0x{h:016x} f0={:.6e} f1={:.6e}",
+                        v.first().copied().unwrap_or(0.0),
+                        v.get(1).copied().unwrap_or(0.0),
+                    );
+                }
+            }
+        }
     }
 
     // 3. Final norm + head on rank 0 → state_per_rank[0].logits.
