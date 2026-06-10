@@ -30,6 +30,7 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::weight_backend::{dequant_norm, dequant_weight_raw};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::pipeline::superop::{
@@ -442,27 +443,11 @@ fn load_layer(
 ///   `model.{...}` directly, not the VL-friendly `model.language_model.`
 ///   that qwen35 uses.
 ///
-/// Both deltas would be parameters if this lived in
-/// `hipfire_runtime::transformer::norm`. Pull during the
-/// Transformer-extraction PR.
 fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let (info, data) = hfq.tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        qt => panic!("qwen2: expected F16/F32 for norm {name}, got qt={qt}"),
-    };
-    // Harmonised with `hipfire-arch-dots-ocr::dots_ocr::load_norm_weight_raw`.
-    // Catches a manifest-shape vs caller-arg mismatch (e.g. norm tensor on
-    // disk is `[hidden_size]` but caller passed `head_dim`) at upload
-    // time rather than letting a wrong-shape GpuTensor cascade through
-    // the forward pass.
-    assert_eq!(
-        f32_data.len(), n,
-        "qwen2: norm {name} has {} elements, expected {n}", f32_data.len(),
-    );
-    gpu.upload_f32(&f32_data, &[n])
+    let t = dequant_norm(gpu, info.quant_type, &data, &[n], 0.0)?;
+    Ok(t)
 }
 
 /// Load a bias tensor (Q/K/V projection bias) as F32 on GPU.
@@ -501,34 +486,7 @@ fn load_weight_tensor(
 ) -> HipResult<WeightTensor> {
     let (info, data) = hfq.tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    match info.quant_type {
-        6 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        7 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        3 => {
-            // Q8F16 (= GGML Q8_0 layout): [F16 scale ‖ 32× INT8]. The fused
-            // qkv_hfq4g256 fast path doesn't apply here; forward_step
-            // falls back to three weight_gemv calls per layer (which
-            // dispatches to gpu.gemv_q8_0 for this gpu_dtype). Used by
-            // the high-precision sweep (`--format q8`) to discriminate
-            // forward-pass correctness from HFQ4 quant noise.
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        1 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
-                     This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
-                     Extend load_weight_tensor or wait for the Transformer-extraction PR \
-                     to pick up qwen35's full quant_type matrix."),
-    }
+    dequant_weight_raw(gpu, info.quant_type, &data, m, k)
 }
 
 // ─── State ───────────────────────────────────────────────────────────────
