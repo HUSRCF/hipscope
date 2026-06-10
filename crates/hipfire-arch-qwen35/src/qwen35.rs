@@ -15,10 +15,9 @@ use hipfire_runtime::llama::{
     EmbeddingFormat, ParoRotation, WeightTensor,
 };
 use hipfire_runtime::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
-use hipfire_runtime::layer_loader::{resolve_candidate, resolve_required, WeightSpec};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::{
-    paro_load_f32, paro_load_norm, paro_load_wt, paro_text_prefix,
+    load_fp16_weight_from_source, paro_load_f32, paro_load_norm, paro_text_prefix,
 };
 use crate::paro_moe::paro_load_moe_ffn;
 use hipfire_runtime::multi_gpu::Gpus;
@@ -2752,16 +2751,32 @@ pub fn load_weights(
     })
 }
 
+/// Dispatch weight loading through the registered augmentor chain (PaRo, etc.);
+/// falls back to raw FP16 when no augmentor claims the tensor.
+/// `name` must be the fully-qualified base name (e.g. `"model.layers.0.self_attn.q_proj"`),
+/// without any `.qweight` / `.weight` extension.
+fn load_wt(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    try_augmentors(source, name, m, k, gpu, DEFAULT_AUGMENTORS)?
+        .map_or_else(
+            || load_fp16_weight_from_source(source, gpu, &format!("{name}.weight"), m, k),
+            Ok,
+        )
+}
+
 pub fn load_weights_paroquant(
     source: &dyn ModelSource,
     config: &Qwen35Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen35Weights> {
-    let qc = source
+    source
         .quant_config()
         .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
-    let gs = qc.group_size;
-    let kr = qc.krot;
 
     let mp = paro_text_prefix(source)?;
     eprintln!("  loading token_embd (ParoQuant)...");
@@ -2840,6 +2855,7 @@ pub fn load_weights_paroquant(
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
                     + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                let fp = format!("{mp}.{p}");
                 layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
                     attn_norm: paro_load_norm(
                         source,
@@ -2847,42 +2863,10 @@ pub fn load_weights_paroquant(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wqkv: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_qkv"),
-                        qkv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wz: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_z"),
-                        d_inner,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_alpha: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_a"),
-                        config.linear_num_value_heads,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_beta: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_b"),
-                        config.linear_num_value_heads,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
+                    wqkv: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_qkv"), qkv_dim, config.dim)?,
+                    wz: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_z"), d_inner, config.dim)?,
+                    w_alpha: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_a"), config.linear_num_value_heads, config.dim)?,
+                    w_beta: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_b"), config.linear_num_value_heads, config.dim)?,
                     a_log: paro_load_f32(
                         source,
                         gpu,
@@ -2907,53 +2891,22 @@ pub fn load_weights_paroquant(
                         &format!("{p}.linear_attn.norm.weight"),
                         config.linear_value_head_dim,
                     )?,
-                    wo: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.out_proj"),
-                        config.dim,
-                        d_inner,
-                        gs,
-                        kr,
-                    )?,
+                    wo: load_wt(source, gpu, &format!("{fp}.linear_attn.out_proj"), config.dim, d_inner)?,
                     ffn_norm: paro_load_norm(
                         source,
                         gpu,
                         &format!("{p}.post_attention_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    w_gate: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.gate_proj"),
-                        config.hidden_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_up: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.up_proj"),
-                        config.hidden_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_down: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.down_proj"),
-                        config.dim,
-                        config.hidden_dim,
-                        gs,
-                        kr,
-                    )?,
+                    w_gate: load_wt(source, gpu, &format!("{fp}.mlp.gate_proj"), config.hidden_dim, config.dim)?,
+                    w_up: load_wt(source, gpu, &format!("{fp}.mlp.up_proj"), config.hidden_dim, config.dim)?,
+                    w_down: load_wt(source, gpu, &format!("{fp}.mlp.down_proj"), config.dim, config.hidden_dim)?,
                 }));
             }
             (LayerType::FullAttention, false) => {
                 let q_out_dim = config.n_heads * config.head_dim * 2;
                 let kv_dim = config.n_kv_heads * config.head_dim;
+                let fp = format!("{mp}.{p}");
                 layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
                     attn_norm: paro_load_norm(
                         source,
@@ -2961,42 +2914,10 @@ pub fn load_weights_paroquant(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wq: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.q_proj"),
-                        q_out_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wk: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.k_proj"),
-                        kv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wv: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.v_proj"),
-                        kv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wo: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.o_proj"),
-                        config.dim,
-                        config.n_heads * config.head_dim,
-                        gs,
-                        kr,
-                    )?,
+                    wq: load_wt(source, gpu, &format!("{fp}.self_attn.q_proj"), q_out_dim, config.dim)?,
+                    wk: load_wt(source, gpu, &format!("{fp}.self_attn.k_proj"), kv_dim, config.dim)?,
+                    wv: load_wt(source, gpu, &format!("{fp}.self_attn.v_proj"), kv_dim, config.dim)?,
+                    wo: load_wt(source, gpu, &format!("{fp}.self_attn.o_proj"), config.dim, config.n_heads * config.head_dim)?,
                     q_norm: paro_load_norm(
                         source,
                         gpu,
@@ -3015,39 +2936,16 @@ pub fn load_weights_paroquant(
                         &format!("{p}.post_attention_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    w_gate: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.gate_proj"),
-                        config.hidden_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_up: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.up_proj"),
-                        config.hidden_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_down: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.mlp.down_proj"),
-                        config.dim,
-                        config.hidden_dim,
-                        gs,
-                        kr,
-                    )?,
+                    w_gate: load_wt(source, gpu, &format!("{fp}.mlp.gate_proj"), config.hidden_dim, config.dim)?,
+                    w_up: load_wt(source, gpu, &format!("{fp}.mlp.up_proj"), config.hidden_dim, config.dim)?,
+                    w_down: load_wt(source, gpu, &format!("{fp}.mlp.down_proj"), config.dim, config.hidden_dim)?,
                 }));
             }
             (LayerType::LinearAttention, true) => {
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
                     + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                let fp = format!("{mp}.{p}");
                 layers.push(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
                     attn_norm: paro_load_norm(
                         source,
@@ -3055,44 +2953,12 @@ pub fn load_weights_paroquant(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wqkv: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_qkv"),
-                        qkv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wz: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_z"),
-                        d_inner,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    // in_proj_a / in_proj_b are dense FP16 in PARO checkpoints
-                    // (paro_load_wt auto-falls-back to FP16 when no `.qweight` sibling exists).
-                    w_alpha: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_a"),
-                        config.linear_num_value_heads,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    w_beta: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.in_proj_b"),
-                        config.linear_num_value_heads,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
+                    wqkv: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_qkv"), qkv_dim, config.dim)?,
+                    wz: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_z"), d_inner, config.dim)?,
+                    // in_proj_a / in_proj_b are dense FP16 in PARO checkpoints;
+                    // load_wt falls back to FP16 when no `.qweight` sibling exists.
+                    w_alpha: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_a"), config.linear_num_value_heads, config.dim)?,
+                    w_beta: load_wt(source, gpu, &format!("{fp}.linear_attn.in_proj_b"), config.linear_num_value_heads, config.dim)?,
                     a_log: paro_load_f32(
                         source,
                         gpu,
@@ -3117,15 +2983,7 @@ pub fn load_weights_paroquant(
                         &format!("{p}.linear_attn.norm.weight"),
                         config.linear_value_head_dim,
                     )?,
-                    wo: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.linear_attn.out_proj"),
-                        config.dim,
-                        d_inner,
-                        gs,
-                        kr,
-                    )?,
+                    wo: load_wt(source, gpu, &format!("{fp}.linear_attn.out_proj"), config.dim, d_inner)?,
                     ffn_norm: paro_load_norm(
                         source,
                         gpu,
@@ -3138,6 +2996,7 @@ pub fn load_weights_paroquant(
             (LayerType::FullAttention, true) => {
                 let q_out_dim = config.n_heads * config.head_dim * 2;
                 let kv_dim = config.n_kv_heads * config.head_dim;
+                let fp = format!("{mp}.{p}");
                 layers.push(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
                     attn_norm: paro_load_norm(
                         source,
@@ -3145,42 +3004,10 @@ pub fn load_weights_paroquant(
                         &format!("{p}.input_layernorm.weight"),
                         &[config.dim],
                     )?,
-                    wq: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.q_proj"),
-                        q_out_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wk: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.k_proj"),
-                        kv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wv: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.v_proj"),
-                        kv_dim,
-                        config.dim,
-                        gs,
-                        kr,
-                    )?,
-                    wo: paro_load_wt(
-                        source,
-                        gpu,
-                        &format!("{p}.self_attn.o_proj"),
-                        config.dim,
-                        config.n_heads * config.head_dim,
-                        gs,
-                        kr,
-                    )?,
+                    wq: load_wt(source, gpu, &format!("{fp}.self_attn.q_proj"), q_out_dim, config.dim)?,
+                    wk: load_wt(source, gpu, &format!("{fp}.self_attn.k_proj"), kv_dim, config.dim)?,
+                    wv: load_wt(source, gpu, &format!("{fp}.self_attn.v_proj"), kv_dim, config.dim)?,
+                    wo: load_wt(source, gpu, &format!("{fp}.self_attn.o_proj"), config.dim, config.n_heads * config.head_dim)?,
                     q_norm: paro_load_norm(
                         source,
                         gpu,
