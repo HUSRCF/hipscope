@@ -2229,6 +2229,55 @@ pub fn forward_ep(
                         v.get(1).copied().unwrap_or(0.0),
                     );
                 }
+                // Deeper DSA-path dump (rank 0 only): compressor caches, indexer
+                // scores, and selected top-k indices — discriminates a
+                // systematically-divergent compressor kernel from near-tie
+                // top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable.
+                if r == 0
+                    && std::env::var("HIPFIRE_EP_DUMP_IDX").ok().as_deref() == Some("1")
+                {
+                    let fp = |gpu: &mut rdna_compute::Gpu,
+                              t: &Option<rdna_compute::GpuTensor>|
+                     -> String {
+                        match t {
+                            Some(t) => match gpu.download_f32(t) {
+                                Ok(v) => {
+                                    let l2: f64 =
+                                        v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                                    let mut h: u64 = 0xcbf29ce484222325;
+                                    for &x in &v {
+                                        for b in x.to_bits().to_le_bytes() {
+                                            h ^= b as u64;
+                                            h = h.wrapping_mul(0x100000001b3);
+                                        }
+                                    }
+                                    format!("l2={l2:.9e} fnv=0x{h:016x}")
+                                }
+                                Err(_) => "dl-err".to_string(),
+                            },
+                            None => "none".to_string(),
+                        }
+                    };
+                    let idx = &state_per_rank[0]._indexer[l];
+                    let score_fp = fp(&mut gpus.devices[0], &idx.index_score);
+                    let ikv_fp = fp(&mut gpus.devices[0], &idx.indexer_kv_cache);
+                    let mkv_fp = fp(&mut gpus.devices[0], &idx.main_kv_cache);
+                    let topk_head: String = match idx.topk_idx_indices.as_ref() {
+                        Some(t) => match gpus.devices[0].download_f32(t) {
+                            Ok(v) => v
+                                .iter()
+                                .take(24)
+                                .map(|x| (x.to_bits() as i32).to_string())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            Err(_) => "dl-err".to_string(),
+                        },
+                        None => "none".to_string(),
+                    };
+                    eprintln!(
+                        "EPIDX pos={position} layer={l} score[{score_fp}] ikv[{ikv_fp}] mkv[{mkv_fp}] topk={topk_head}"
+                    );
+                }
             }
         }
     }
