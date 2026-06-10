@@ -130,16 +130,24 @@ fn decode_step_body(
 
         // NoPE: only `sliding_attention` layers apply RoPE. `full_attention`
         // (global) layers use NO positional embedding (Cohere2 sets
-        // sliding_window=None there, gating off rotary). Full rotate_half over
-        // the whole head_dim (rotary_dim == head_dim for Cohere2).
+        // sliding_window=None there, gating off rotary).
+        //
+        // Cohere2 uses the **interleaved (GPT-J)** rotary convention — pairs
+        // adjacent dims (2i, 2i+1) — NOT Llama's half-split. The HF
+        // `rotate_half` is explicitly commented "different from e.g. Llama":
+        // `x1=x[..., ::2]; x2=x[..., 1::2]; rot=stack([-x2,x1]).flatten`. So we
+        // MUST use `rope_partial_interleaved_f32` (pairs 2i/2i+1), NOT
+        // `rope_f32` (pairs i / i+head_dim/2). Rotary covers the FULL head_dim
+        // (no partial_rotary_factor in the config) → n_rot = head_dim.
         if layer.attn_kind == AttnKind::Sliding {
-            gpu.rope_f32(
+            gpu.rope_interleaved_f32(
                 &state.fa_q,
                 &state.fa_k,
                 &state.pos_buf,
                 n_heads,
                 n_kv,
                 head_dim,
+                head_dim, // n_rot = full head_dim (no partial_rotary_factor)
                 cfg.rope_theta,
             )
             .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;

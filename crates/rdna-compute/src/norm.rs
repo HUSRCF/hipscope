@@ -492,6 +492,72 @@ impl Gpu {
         result
     }
 
+    /// Full GPT-J **interleaved** RoPE — rotates pairs (2i, 2i+1) of the first
+    /// `n_rot` dims. Matches HF Cohere2's `rotate_half` (`x1=x[..., ::2]`,
+    /// `x2=x[..., 1::2]`, `rot=cat(-x2, x1)`), which is explicitly *different
+    /// from Llama*. Unlike `rope_partial_interleaved_f32` — which despite its
+    /// name dispatches the HALF-SPLIT kernel by default and only interleaves
+    /// under `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1` — this ALWAYS dispatches the
+    /// interleaved kernel with no global flag, so it is safe alongside
+    /// half-split callers (Qwen3.5) in a shared daemon. Pass `n_rot = head_dim`
+    /// for full rotary (Cohere2 has no partial_rotary_factor). arch_id 12.
+    #[cfg(feature = "deltanet")]
+    pub fn rope_interleaved_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_partial_interleaved",
+            kernels::ROPE_PARTIAL_INTERLEAVED_SRC,
+            "rope_partial_interleaved_f32",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let nr = n_rot as i32;
+        let fb = freq_base;
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs);
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_interleaved_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(nr);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched partial-interleaved RoPE. Each batch row reads its absolute
     /// position from positions[b] and rotates the first n_rot dims of every
     /// Q and K head. Q/K are [batch_size × n_heads × head_dim] row-major.
