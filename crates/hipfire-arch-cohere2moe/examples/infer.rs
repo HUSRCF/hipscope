@@ -22,6 +22,7 @@ fn main() {
     let mut max: usize = 64;
     let mut tokens_path: Option<PathBuf> = None;
     let mut eos_extra: Option<u32> = None;
+    let mut chunk: usize = 256;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -30,6 +31,7 @@ fn main() {
             "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
             "--tokens" => { tokens_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--eos" => { eos_extra = Some(argv[i + 1].parse().expect("--eos")); i += 2; }
+            "--chunk" => { chunk = argv[i + 1].parse().expect("--chunk"); i += 2; }
             other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
         }
     }
@@ -77,7 +79,7 @@ fn main() {
     if batched {
         let mut i = 0;
         while i < prompt_ids.len() {
-            let end = (i + 64).min(prompt_ids.len());
+            let end = (i + chunk).min(prompt_ids.len());
             logits = forward_batch(&cfg, &weights, &mut state, &mut gpu, &prompt_ids[i..end], i)
                 .expect("forward_batch");
             i = end;

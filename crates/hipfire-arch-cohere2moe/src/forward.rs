@@ -30,11 +30,69 @@
 
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
-    weight_gemv_residual,
+    fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
+    weight_gemv, weight_gemv_residual,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Grouped-MoE prefill tiling constant — must match `run_moe_prefill`'s
+/// `MOE_GROUPED_BLOCK_M` (tokens are scattered into per-expert groups padded to
+/// a multiple of this).
+const MOE_GROUPED_BLOCK_M: usize = 16;
+#[inline]
+fn align_up_usize(x: usize, a: usize) -> usize {
+    x.div_ceil(a) * a
+}
+/// Upper bound on the padded total scattered-slot count: every live expert can
+/// waste up to `BLOCK_M-1` pad slots. `total_slots = batch * k_top`.
+#[inline]
+fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
+    let live = total_slots.min(n_exp);
+    align_up_usize(total_slots + live * (MOE_GROUPED_BLOCK_M - 1), MOE_GROUPED_BLOCK_M)
+}
+
+/// Batched Q8_0 projection GEMM for prefill (`Y[b,m] = X[b,k] @ W_q8[m,k]^T`).
+/// On WMMA archs (gfx11+/RDNA3.5/RDNA4) with K%32==0 it routes to the
+/// matrix-core `gemm_q8_0_wmma` (activation widened to F16 internally) — no
+/// MAX_BATCH cap and far faster than the scalar 1-wave-per-row kernel at large
+/// batch (mirrors the deepseek4 gfx11 Q8 prefill path). Falls back to the
+/// scalar-sub-batched chunked driver on CDNA or when K%32≠0.
+/// Opt out of the WMMA Q8 prefill projections (force the scalar sub-batched
+/// chunked driver) via `HIPFIRE_COHERE2MOE_Q8_SCALAR=1` — a debugging /
+/// precision fallback. WMMA is the default: bit-identical to scalar on the
+/// validation prompt and ~9× faster prefill.
+fn q8_wmma_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1"))
+}
+
+#[inline]
+fn q8_proj_raw(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    b: usize,
+    x_f16: &GpuTensor,
+) -> hip_bridge::HipResult<()> {
+    if q8_wmma_enabled() && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+        // Convert THIS activation to F16 fresh into our own buffer, then feed
+        // the F16 tensor to gemm_q8_0_wmma. We must NOT let gemm_q8_0_wmma run
+        // its internal `ensure_fp16_x`: that cache is keyed on the source
+        // POINTER and only reconverts when the pointer changes — but `normed`
+        // and `attn_out` are single buffers reused every layer with NEW
+        // contents, so it would return layer-0's STALE F16 for layers 1..N.
+        gpu.deepseek4_convert_f32_to_f16(x, x_f16, (b * k) as i64)?;
+        gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, b)
+    } else {
+        gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, b)
+    }
+}
 
 /// Decode one token; returns the full logits vector.
 pub fn decode_step(
@@ -368,8 +426,15 @@ pub fn forward_batch(
     if b == 0 {
         return Err("cohere2moe forward_batch: empty token slice".to_string());
     }
-    if b > 64 {
-        return Err(format!("cohere2moe forward_batch: B={b} exceeds kernel cap 64"));
+    // The Q8 projections go through `gemm_q8_0_batched_chunked`, which handles
+    // arbitrary batch (sub-batches the MAX_BATCH=64 scalar kernel, and upgrades
+    // to WMMA on RDNA4). The remaining batched ops (attention, layernorm, topk,
+    // rotate, MoE scatter/grouped) carry no 64-cap. Larger batch is what makes
+    // the grouped-WMMA MoE path pay off: tokens-per-expert = b·k_top/n_exp grows
+    // (≈4 at b=64 → ≈16 at b=256 with n_exp=128), shrinking the BLOCK_M=16
+    // padding waste. 512 is a generous scratch-memory ceiling.
+    if b > 512 {
+        return Err(format!("cohere2moe forward_batch: B={b} exceeds scratch cap 512"));
     }
     if !forward_batch_supported(weights) {
         return Err("cohere2moe forward_batch: unsupported tier (needs Q8 attn + indexed experts)".to_string());
@@ -410,6 +475,28 @@ pub fn forward_batch(
     let dense_gate = alloc(gpu, b * dense_inter, "dense_gate")?;
     let dense_up = alloc(gpu, b * dense_inter, "dense_up")?;
     let dense_act = alloc(gpu, b * dense_inter, "dense_act")?;
+    // Grouped-MoE prefill scratch — scatter-by-expert indices (i32, held in
+    // DType::Raw byte tensors at 4 bytes/elem) + grouped-WMMA output buffers.
+    // Path 1 (indexed) ignores these; Path 2 (grouped) uses them. Always
+    // allocated since MoePrefillParams takes every buffer by reference.
+    let m_total_max = moe_grouped_m_total_bound(b * k_top, n_exp);
+    let raw = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+        g.alloc_tensor(&[n], DType::Raw)
+            .map_err(|e| format!("forward_batch alloc {label}: {e:?}"))
+    };
+    let expert_token_counts = raw(gpu, n_exp * 4, "etc")?;
+    let expert_offsets = raw(gpu, (n_exp + 1) * 4, "eoff")?;
+    let sorted_slot_index = raw(gpu, m_total_max * 4, "ssi")?;
+    let inverse_perm = raw(gpu, b * k_top * 4, "iperm")?;
+    let expert_tile_ids = raw(gpu, (m_total_max / MOE_GROUPED_BLOCK_M) * 4, "etid")?;
+    let y_gate_up_grouped = alloc(gpu, m_total_max * 2 * moe_inter, "ygu")?;
+    let y_down_grouped = alloc(gpu, m_total_max * hidden, "ydn")?;
+    // F16 activation scratch for the WMMA Q8 projections (converted fresh per
+    // q8_proj_raw call). Sized for the widest projection input K.
+    let kmax = hidden.max(q_dim).max(dense_inter);
+    let x_f16 = gpu
+        .alloc_tensor(&[b * kmax], DType::F16)
+        .map_err(|e| format!("forward_batch alloc x_f16: {e:?}"))?;
 
     // positions [B] i32 (stored in an f32-sized buffer; kernels read it as i32).
     let pos_bytes: Vec<u8> = (0..b).flat_map(|i| ((start_pos + i) as i32).to_ne_bytes()).collect();
@@ -435,11 +522,11 @@ pub fn forward_batch(
         gpu.layernorm_batched(&x, &layer.input_norm, &state.ln_beta_zero, &normed, b, hidden, eps)
             .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
         // Attention from `normed` (Q8 projections).
-        gpu.gemm_q8_0_batched(&layer.wq.buf, &normed, &fq, q_dim, hidden, b)
+        q8_proj_raw(gpu,&layer.wq.buf, &normed, &fq, q_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch q: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wk.buf, &normed, &fk, kv_dim, hidden, b)
+        q8_proj_raw(gpu,&layer.wk.buf, &normed, &fk, kv_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch k: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wv.buf, &normed, &fv, kv_dim, hidden, b)
+        q8_proj_raw(gpu,&layer.wv.buf, &normed, &fv, kv_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch v: {e:?}"))?;
         // NoPE on full layers; interleaved RoPE on sliding layers.
         if layer.attn_kind == AttnKind::Sliding {
@@ -457,7 +544,7 @@ pub fn forward_batch(
             n_heads, n_kv, head_dim, max_seq, max_ctx, b,
         )
         .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
+        q8_proj_raw(gpu,&layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch o: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
             .map_err(|e| format!("cohere2moe L{l} batch o-resid: {e:?}"))?;
@@ -465,19 +552,19 @@ pub fn forward_batch(
         // FFN from the SAME `normed` (parallel block).
         match &layer.ffn {
             Ffn::Dense(d) => {
-                gpu.gemm_q8_0_batched(&d.gate.buf, &normed, &dense_gate, dense_inter, hidden, b)
+                q8_proj_raw(gpu,&d.gate.buf, &normed, &dense_gate, dense_inter, hidden, b, &x_f16)
                     .map_err(|e| format!("cohere2moe L{l} batch dgate: {e:?}"))?;
-                gpu.gemm_q8_0_batched(&d.up.buf, &normed, &dense_up, dense_inter, hidden, b)
+                q8_proj_raw(gpu,&d.up.buf, &normed, &dense_up, dense_inter, hidden, b, &x_f16)
                     .map_err(|e| format!("cohere2moe L{l} batch dup: {e:?}"))?;
                 gpu.silu_mul_f32(&dense_gate, &dense_up, &dense_act)
                     .map_err(|e| format!("cohere2moe L{l} batch dsilu: {e:?}"))?;
-                gpu.gemm_q8_0_batched(&d.down.buf, &dense_act, &o, hidden, dense_inter, b)
+                q8_proj_raw(gpu,&d.down.buf, &dense_act, &o, hidden, dense_inter, b, &x_f16)
                     .map_err(|e| format!("cohere2moe L{l} batch ddown: {e:?}"))?;
                 gpu.add_inplace_f32(&x, &o)
                     .map_err(|e| format!("cohere2moe L{l} batch ddown-resid: {e:?}"))?;
             }
             Ffn::Moe(m) => {
-                gpu.gemm_q8_0_batched(&m.router.buf, &normed, &router_logits, n_exp, hidden, b)
+                q8_proj_raw(gpu,&m.router.buf, &normed, &router_logits, n_exp, hidden, b, &x_f16)
                     .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
                 gpu.sigmoid_f32(&router_logits)
                     .map_err(|e| format!("cohere2moe L{l} batch sigmoid: {e:?}"))?;
@@ -485,42 +572,65 @@ pub fn forward_batch(
                     &router_logits, &topk_idx, &topk_w, n_exp, cfg.norm_topk_prob, b,
                 )
                 .map_err(|e| format!("cohere2moe L{l} batch topk: {e:?}"))?;
+                // `ffn_x_rot` ← FWHT(normed): run_moe_prefill's MQ4/MQ6 path
+                // requires the activations pre-rotated by the model (it rotates
+                // only in the paro path). Dropping this was the bug behind the
+                // earlier garbage output on both paths.
                 rotate_x_mq_batched_for(gpu, &m.experts[0].gate_up, &normed, &ffn_x_rot, hidden, b)
                     .map_err(|e| format!("cohere2moe L{l} batch rot: {e}"))?;
-                let mq6 = matches!(
-                    m.experts[0].gate_up.gpu_dtype,
-                    DType::MQ6G256 | DType::HFQ6G256
-                );
-                if mq6 {
-                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                        &m.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot, &gate, &up,
-                        2 * moe_inter, hidden, k_top, b,
-                    )
-                    .map_err(|e| format!("cohere2moe L{l} batch gu6: {e:?}"))?;
-                } else {
-                    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                        &m.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot, &gate, &up,
-                        2 * moe_inter, hidden, k_top, b,
-                    )
-                    .map_err(|e| format!("cohere2moe L{l} batch gu4: {e:?}"))?;
-                }
-                fused_silu_mul_rotate_mq_batched_for(
-                    gpu, &m.experts[0].down, &gate, &up, &rot, moe_inter, b * k_top,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch smr: {e:?}"))?;
-                if mq6 {
-                    gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                        &m.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, moe_inter, k_top, b,
-                    )
-                    .map_err(|e| format!("cohere2moe L{l} batch d6: {e:?}"))?;
-                } else {
-                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                        &m.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, moe_inter, k_top, b,
-                    )
-                    .map_err(|e| format!("cohere2moe L{l} batch d4: {e:?}"))?;
-                }
-                gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
-                    .map_err(|e| format!("cohere2moe L{l} batch combine: {e:?}"))?;
+                // Shared dispatch executor: Path 1 (indexed batched GEMV, the
+                // default — identical to the hand-rolled loop this replaced) or
+                // Path 2 (scatter-by-expert → grouped-WMMA GEMM, under
+                // HIPFIRE_MOE_GROUPED_GEMM=1). Routed expert outputs accumulate
+                // into `x`, which IS the parallel-block residual add. No shared
+                // expert in Cohere2-MoE → shared_* dtypes are inert placeholders.
+                let ctx = DispatchCtx::new(gpu);
+                let edt = m.experts[0].gate_up.gpu_dtype;
+                let params = MoePrefillParams {
+                    dtypes: MoeDtypes {
+                        router: DType::Q8_0,
+                        shared_gate: DType::Q8_0,
+                        shared_expert_gate: DType::Q8_0,
+                        shared_expert_up: DType::Q8_0,
+                        experts_all_gate_up_mq4: edt == DType::MQ4G256,
+                        routed_gate_up: edt,
+                        routed_down: m.experts[0].down.gpu_dtype,
+                        has_paro_shared: false,
+                    },
+                    batch_size: b,
+                    mi: moe_inter,
+                    down_m: hidden,
+                    down_k: moe_inter,
+                    gate_up_k: hidden,
+                    k_top,
+                    n_exp,
+                    m_total_max,
+                    topk_indices: &topk_idx,
+                    topk_weights: &topk_w,
+                    x_batch: &x,
+                    x_norm_batch: &normed,
+                    x_rot_batch: &ffn_x_rot,
+                    expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
+                    expert_down_ptrs: &m.expert_down_ptrs,
+                    gate_batch: &gate,
+                    up_batch: &up,
+                    rot_batch: &rot,
+                    down_expanded: &down_exp,
+                    expert_token_counts: &expert_token_counts,
+                    expert_offsets: &expert_offsets,
+                    sorted_slot_index: &sorted_slot_index,
+                    expert_tile_ids: &expert_tile_ids,
+                    inverse_perm: &inverse_perm,
+                    y_gate_up_grouped: &y_gate_up_grouped,
+                    y_down_grouped: &y_down_grouped,
+                    paro_gate_up: None,
+                    paro_down: None,
+                    down_awq_scale: None,
+                    routed_out: None,
+                };
+                moe_family()
+                    .run_prefill(&ctx, gpu, &params)
+                    .map_err(|e| format!("cohere2moe L{l} run_prefill: {e:?}"))?;
             }
         }
     }
@@ -543,6 +653,8 @@ pub fn forward_batch(
     for t in [
         x, normed, fq, fk, fv, attn_out, o, ffn_x_rot, router_logits, topk_idx, topk_w,
         gate, up, rot, down_exp, dense_gate, dense_up, dense_act, pos_array, x_last,
+        expert_token_counts, expert_offsets, sorted_slot_index, inverse_perm, expert_tile_ids,
+        y_gate_up_grouped, y_down_grouped, x_f16,
     ] {
         gpu.free_tensor(t).ok();
     }
