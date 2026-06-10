@@ -258,6 +258,20 @@
       "size_gb": 4.9,
       "min_vram_gb": 7,
       "desc": "LFM2.5 8B-A1B MoE (MQ4, jinja-validated)"
+    },
+    "lfm2.5:1.2b": {
+      "repo": "hipfire-models/hipfire-LFM2.5-1.2B",
+      "file": "lfm2.5-1.2b-instruct.q8",
+      "size_gb": 1.25,
+      "min_vram_gb": 3,
+      "desc": "LFM2.5 1.2B Instruct dense (Q8, embedded chat template)"
+    },
+    "lfm2.5:1.2b-thinking": {
+      "repo": "hipfire-models/hipfire-LFM2.5-1.2B-Thinking",
+      "file": "lfm2.5-1.2b-thinking.q8",
+      "size_gb": 1.25,
+      "min_vram_gb": 3,
+      "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)"
     }
   },
   "aliases": {
