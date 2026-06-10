@@ -3234,7 +3234,20 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
             // plain chat. Falls through to the HFQ-embedded fallback below when
             // absent.
             if let Some(t) = hfq.chat_template_named("tool_use") {
-                return Some(t);
+                // North-Mini-Code's templates render assistant history with
+                // <|START_RESPONSE|>/<|END_RESPONSE|>, but the model GENERATES
+                // <|START_TEXT|>/<|END_TEXT|> (255012/255013, real special
+                // tokens; START_RESPONSE is NOT a token here). `encode` splits
+                // the non-token START_RESPONSE into subwords, so multi-turn
+                // history disagrees with the model's own convention and primes
+                // it to emit subword markers (which the id-based decode-loop
+                // state machine then misses → marker leak). Rewrite to the
+                // native token so history tokenizes atomically (255012/255013)
+                // and matches generation.
+                return Some(
+                    t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
+                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>"),
+                );
             }
         }
         _ => {}
