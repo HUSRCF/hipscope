@@ -77,7 +77,7 @@ export interface HipfireConfig {
   // produce subtle output drift on certain prompt shapes that hide behind
   // higher peak tok/s — confounded debugging when DFlash was silently
   // on by default (auto). Opt in per-model with
-  // `hipfire config set-model <tag> dflash_mode on` once you've confirmed
+  // `hipfire config <tag> set dflash_mode on` once you've confirmed
   // the model + prompt shape on your hardware.
   //
   // A3B-specific rationale (kept for the `auto` path): A3B DFlash is a
@@ -234,8 +234,8 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mmq_screen_threshold: 0.10,
 
   // PFlash off by default. Operators opt in per target via:
-  //   hipfire config set-model <tag> prefill_compression auto
-  //   hipfire config set-model <tag> prefill_drafter ~/.hipfire/models/<drafter>.hfq
+  //   hipfire config <tag> set prefill_compression auto
+  //   hipfire config <tag> set prefill_drafter ~/.hipfire/models/<drafter>.hfq
   prefill_compression: "off",
   prefill_threshold: 32768,
   prefill_keep_ratio: 0.05,
@@ -564,7 +564,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
   if (!dflashAllowed) {
     if (mode === "auto" && isA3B) {
-      const hint = tag ? `config set-model ${tag} dflash_mode on` : `config set dflash_mode on`;
+      const hint = tag ? `config ${tag} set dflash_mode on` : `config set dflash_mode on`;
       console.error(`[hipfire] DFlash disabled for A3B target (dflash_mode=auto, no sidecar). Override with 'hipfire ${hint}'.`);
     } else if (mode === "off") {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
@@ -5064,7 +5064,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
-      desc: "show a one-line warning on startup when an experimental feature is enabled",
+      desc: "allow the budget_alert_at_tok / budget_alert_text generate params (research-only in-band nudge injected into the model's think stream — can leak into visible output). false = daemon ignores those params",
       options: ["true", "false"],
     },
     dflash_adaptive_b: {
@@ -5118,7 +5118,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prompt_normalize: {
       label: "prompt_normalize",
-      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      desc: "collapse \\n{3,} → \\n\\n before encode (+24% τ on PEP-8 code prompts; on by default — set false to keep raw whitespace)",
       options: ["true", "false"],
     },
     mmq_screen: {
@@ -5926,7 +5926,20 @@ switch (cmd) {
           + `  hipfire ps                 # check if running\n`
           + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
         process.exit(0);
-      } else setHost(a);
+      }
+      // Model-tag-as-host guard: `hipfire serve qwen3.5:9b` used to silently
+      // bind to host "qwen3.5:9b" and fail later. A name:tag shape with a
+      // non-numeric port part (host:port matched above) — or anything that
+      // resolves in the registry — is a model tag, not a bind address.
+      else if (REGISTRY[resolveModelTag(a)] || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
+        console.error(`'${a}' looks like a model tag — \`hipfire serve\` takes [host] [port], not a model.`);
+        console.error(`The server loads models per-request (or pre-warms cfg.default_model). Instead:`);
+        console.error(`  hipfire run ${a} "hello"                # one-shot (uses running serve if any)`);
+        console.error(`  hipfire config set default_model ${a}   # make serve pre-warm this model`);
+        console.error(`  hipfire serve [host] [port]`);
+        process.exit(1);
+      }
+      else setHost(a);
     }
     host = host ?? cfg.host;
     port = port ?? cfg.port;
@@ -6011,12 +6024,12 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 512 },
+      "--max-tokens": { default: 4096 },
       "--system": { default: undefined },
     };
     const stringFlags = new Set(["--image", "--system"]);
@@ -6649,6 +6662,11 @@ Examples:
   }
   case "rm": {
     const tag = rest[0] || "";
+    if (!tag) {
+      console.error("Usage: hipfire rm <model>   (e.g. hipfire rm qwen3.5:9b)");
+      console.error("  See installed models: hipfire list");
+      process.exit(1);
+    }
     const resolved = resolveModelTag(tag);
     const entry = REGISTRY[resolved];
     const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
@@ -6657,6 +6675,8 @@ Examples:
       console.log(`Removed ${path}`);
     } else {
       console.error(`Model not found: ${tag}`);
+      console.error(`  See installed models: hipfire list`);
+      process.exit(1);
     }
     break;
   }
@@ -7217,6 +7237,14 @@ Examples:
     break;
   }
   default: {
+    // Unknown command: error to stderr + nonzero exit so scripts can detect
+    // the typo instead of parsing help text off a 0-exit stdout.
+    // `help`/`-h`/`--help` are explicit help requests, not typos.
+    if (cmd && !["help", "-h", "--help"].includes(cmd)) {
+      console.error(`Unknown command: ${cmd}`);
+      console.error(`Run \`hipfire help\` for the full command list.`);
+      process.exit(1);
+    }
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
     if (!cmd) {
@@ -7230,7 +7258,8 @@ Examples:
         console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
         console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);
         console.log(`  3. Run your first prompt:   \x1b[1mhipfire run qwen3.5:4b "hello"\x1b[0m`);
-        console.log(`  4. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
+        console.log(`  4. Chat interactively:      \x1b[1mhipfire chat qwen3.5:4b\x1b[0m`);
+        console.log(`  5. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
         console.log(`\nFull command list:\n`);
       }
     }
@@ -7238,6 +7267,7 @@ Examples:
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
+  chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
