@@ -42,6 +42,7 @@ pub mod cpu_router;
 pub mod weight_pager;
 pub mod paro;
 pub mod augmentor;
+pub mod weight_backend;
 pub mod layer_loader;
 pub mod tokenizer;
 pub mod eos_filter;

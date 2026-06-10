@@ -30,6 +30,7 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
+#[derive(Clone)]
 pub struct HfqTensorInfo {
     pub name: String,
     pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
