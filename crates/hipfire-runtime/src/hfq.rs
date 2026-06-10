@@ -627,7 +627,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
     let mut wt = match info.quant_type {
         0 => { // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok::<WeightTensor, HipError>(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         3 => { // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -651,16 +651,6 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
         7 => { // HFQ4-G128 — flat 4-bit, 72 bytes per 128 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        28 => { // PARO4-G128 — ParoQuant rotated-activation W4 probe format
-            assert!(k % 128 == 0, "PARO4G128 weight {st_name} has K={k} but kernel requires K%128==0");
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        29 => { // PARO4-G128T — same metadata, qweight retiled as [M/8, K] for GEMV
-            assert!(k % 128 == 0, "PARO4G128T weight {st_name} has K={k} but kernel requires K%128==0");
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128T, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         8 => { // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;

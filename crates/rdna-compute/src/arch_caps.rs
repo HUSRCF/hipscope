@@ -379,15 +379,7 @@ impl ArchCaps {
     }
 }
 
-/// MQ4G128 in-engine encoding of LinearAttention in_proj_a / in_proj_b weights
-/// at model load time.
-///
-/// **Default-off pending fused rotation-GEMV kernel.** Bench on 2026-05-22
-/// (`.scratch/rocprof-2026-05-22-mq4g128-on/`) measured −0.5% decode tok/s vs
-/// baseline on shisa-Qwen3.6-35B-A3B-PARO / gfx1151. Root cause: alpha/beta
-/// have M=16 shape; the existing dispatch chain (`mq_rotate_x_128` +
-/// `gemv_mq4g128_prerotated` → `gemv_hfq4g128`) doubles launch count vs the
-/// single F32 GEMV, and at small M the GPU kernel time (~4 µs) is dwarfed
+
 #[cfg(test)]
 mod tests {
     use super::*;
