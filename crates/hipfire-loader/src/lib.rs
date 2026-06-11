@@ -607,82 +607,70 @@ pub fn load_model(
         return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
     }
 
-    let kv_mode = kv_mode_override
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    if Path::new(path).is_dir() {
-        return load_model_safetensors(path, max_seq, &kv_mode, gpu);
-    }
+    let src = ModelSource::from_path(path)?;
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-
-    // DFlash lm_head quant check
+    // DFlash lm_head quant check — only for HFQ sources
     if draft_path.is_some() {
-        let lm_qt = hfq
-            .tensor_data("lm_head.weight")
-            .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
-            .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
-            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
-            .map(|(info, _)| info.quant_type);
-        let arch_is_gfx11 = matches!(
-            gpu.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-        );
-        let supported = match lm_qt {
-            Some(3 | 6 | 13) => true,
-            Some(17) => arch_is_gfx11,
-            _ => false,
-        };
-        if !supported {
-            let qt_desc = match lm_qt {
-                Some(qt) => format!("quant_type={qt}"),
-                None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
+        if let ModelSource::Hfq(ref hfq) = src {
+            let lm_qt = hfq
+                .tensor_data("lm_head.weight")
+                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+                .map(|(info, _)| info.quant_type);
+            let arch_is_gfx11 = matches!(
+                gpu.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+            );
+            let supported = match lm_qt {
+                Some(3 | 6 | 13) => true,
+                Some(17) => arch_is_gfx11,
+                _ => false,
             };
-            return Err(format!(
-                "DFlash draft requested but target lm_head {} is not \
-                 supported by speculative.rs's batched GEMM paths on this arch \
-                 ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                 always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
-                 (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                 through to a per-row GEMV that hangs verify. Reload without a \
-                 draft, or use an MQ4 / HFQ4 / Q8 target.",
-                qt_desc, gpu.arch
-            ));
-        }
-        let arch_is_dense_qwen35 = hfq.arch_id == 5;
-        let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
-        let mq_unsupported = hfq
-            .first_tensor_with_quant_type(18)
-            .map(|n| ("MQ2 (qt=18)", n));
-        let mq_unsupported = mq_unsupported.or_else(|| {
-            if !mq3_supported {
-                hfq.first_tensor_with_quant_type(17)
-                    .map(|n| ("MQ3 (qt=17)", n))
-            } else {
-                None
+            if !supported {
+                let qt_desc = match lm_qt {
+                    Some(qt) => format!("quant_type={qt}"),
+                    None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
+                };
+                return Err(format!(
+                    "DFlash draft requested but target lm_head {} is not \
+                     supported by speculative.rs's batched GEMM paths on this arch \
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
+                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                     (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
+                     through to a per-row GEMV that hangs verify. Reload without a \
+                     draft, or use an MQ4 / HFQ4 / Q8 target.",
+                    qt_desc, gpu.arch
+                ));
             }
-        });
-        if let Some((qt_label, name)) = mq_unsupported {
-            let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
-                format!(
-                    "arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels",
-                    hfq.arch_id
-                )
-            } else {
-                format!(
-                    "arch={} lacks the corresponding batched WMMA prefill family",
-                    gpu.arch
-                )
-            };
-            return Err(format!(
-                "DFlash draft requested but model contains {qt_label} weight \
-                 `{name}` and {arch_reason}. The prefill fast-path falls back \
-                 to per-token `forward_scratch` for every spec verify cycle \
-                 (or worse, a kernel-stride mismatch on MoE) — defeating \
-                 DFlash's speedup. Reload without a draft, or use an MQ4 / \
-                 HFQ4 / Q8 target.",
-            ));
+            let arch_is_dense_qwen35 = hfq.arch_id == 5;
+            let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
+            let mq_unsupported = hfq
+                .first_tensor_with_quant_type(18)
+                .map(|n| ("MQ2 (qt=18)", n));
+            let mq_unsupported = mq_unsupported.or_else(|| {
+                if !mq3_supported {
+                    hfq.first_tensor_with_quant_type(17)
+                        .map(|n| ("MQ3 (qt=17)", n))
+                } else {
+                    None
+                }
+            });
+            if let Some((qt_label, name)) = mq_unsupported {
+                let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
+                    format!("arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels", hfq.arch_id)
+                } else {
+                    format!("arch={} lacks the corresponding batched WMMA prefill family", gpu.arch)
+                };
+                return Err(format!(
+                    "DFlash draft requested but model contains {qt_label} weight \
+                     `{name}` and {arch_reason}. The prefill fast-path falls back \
+                     to per-token `forward_scratch` for every spec verify cycle \
+                     (or worse, a kernel-stride mismatch on MoE) — defeating \
+                     DFlash's speedup. Reload without a draft, or use an MQ4 / \
+                     HFQ4 / Q8 target.",
+                ));
+            }
         }
     }
 
@@ -692,8 +680,7 @@ pub fn load_model(
         cask, pp, gpu,
     };
 
-    // Carrier registry dispatch — covers HFQ core + non-core arches
-    let src = ModelSource::Hfq(hfq);
+    // Carrier registry dispatch
     let carrier = REGISTRY.iter().find(|c| c.probe(&src))
         .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
     carrier.load(src, &mut ctx)
@@ -797,114 +784,6 @@ fn load_minimax(
         minimax_config: Some(config), minimax_weights: Some(weights),
         minimax_state: Some(state), minimax_eos_tok: eos_tok,
         ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
-    })
-}
-
-// ─── Unsafetensors load path ──────────────────────────────────────────
-
-fn load_model_safetensors(
-    path: &str,
-    max_seq: usize,
-    kv_mode: &str,
-    gpu: &mut rdna_compute::Gpu,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::model_source::ModelSource;
-    use hipfire_runtime::safetensors_source::SafetensorsSource;
-
-    eprintln!("  opening safetensors directory: {path}");
-    let source =
-        SafetensorsSource::open(Path::new(path)).map_err(|e| format!("safetensors open: {e}"))?;
-
-    let arch_id = source.arch_id();
-    let qm = source.quant_config().map(|q| q.method.as_str()).unwrap_or("none");
-    eprintln!("  arch_id={arch_id}, quant_method={qm}");
-
-    let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
-        hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-            .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
-            .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
-    } else {
-        return Err("no tokenizer.json found in model directory".into());
-    };
-
-    let chat_template = source.chat_template();
-
-    if arch_id == 0 || arch_id == 1 {
-        let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-            .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
-        let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, gpu)
-            .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-        let asym3_auto = matches!(kv_mode, "turbo3" | "turbo" | "auto" | "");
-        let kv = match kv_mode {
-            "q8" => llama::KvCache::new_gpu_q8_capped(
-                gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-            ),
-            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
-                gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-            ),
-            "asym3" => llama::KvCache::new_gpu_asym3_capped(
-                gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-            ),
-            _ if asym3_auto && config.head_dim == 256 => llama::KvCache::new_gpu_asym3_capped(
-                gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-            ),
-            _ => llama::KvCache::new_gpu_q8_capped(
-                gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-            ),
-        }.map_err(|e| format!("KvCache: {e}"))?;
-        let scratch = llama::ForwardScratch::new(gpu, &config)
-            .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
-        return Ok(LoadedModel {
-            state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })),
-            ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
-        });
-    }
-
-    if arch_id != 5 && arch_id != 6 {
-        return Err(format!("safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1) and Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
-    }
-
-    let config = qwen35::config_from_safetensors(&source)
-        .ok_or("failed to parse Qwen3.5 config from config.json")?;
-    let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
-        .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
-    let effective_max_seq = max_seq;
-    let is_kv_layer: Vec<bool> = config
-        .layer_types.iter().map(|t| *t == LayerType::FullAttention).collect();
-
-    let kv_cache = match kv_mode {
-        "q8" => llama::KvCache::new_gpu_q8_capped_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-        ),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq,
-        ),
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq,
-        ),
-        "fwht4" => llama::KvCache::new_gpu_fwht4_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq,
-        ),
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-        ),
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-        ),
-        _ => llama::KvCache::new_gpu_asym3_capped_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq,
-        ),
-    }.map_err(|e| format!("KvCache: {e}"))?;
-
-    let dn_state = DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
-    let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
-        .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
-
-    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch, kv_cache, dn_state }));
-
-    Ok(LoadedModel {
-        state,
-        ..LoadedModel::skeleton(arch_id, tokenizer, effective_max_seq, effective_max_seq, path.to_string(), chat_template)
     })
 }
 
