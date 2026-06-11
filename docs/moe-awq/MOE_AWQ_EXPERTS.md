@@ -75,7 +75,19 @@ the correct fused-K scale.
 The runtime must apply `x/s` per-expert before the FWHT. Two projections,
 asymmetric difficulty:
 
-### 3a. down_proj — EASY (≈free)
+### 3a. down_proj — EASY (≈free) — KERNEL WRITTEN
+**DONE:** `kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip` (registered
+`FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC`). Near-exact copy of the dense
+`fused_silu_mul_mq_rotate_awq` + per-expert scale select
+`expert_down_awq_ptrs[topk_indices[krank]]`. Compiles for gfx942.
+REMAINING PLUMBING: (1) loader — extend `hfq.rs::load_awq_scale` to load the
+per-expert `down_proj.awq_scale.weight` sidecars + build an `expert_down_awq_ptrs`
+[n_exp] table (mirror `expert_down_ptrs`, qwen35.rs ~579/2105); (2) ExpertWeights
+field; (3) dispatch in the MoE decode forward (`moe_ffn_decode_impl`): when down
+has awq_scale, call the `_awq_indexed` silu-rotate (pass ptr table + topk_indices)
+instead of the plain `fused_silu_mul_mq_rotate`. Gate behind HIPFIRE_MOE_AWQ.
+
+### 3a-orig. down_proj — design
 Input = per-expert SwiGLU output. The existing per-expert kernel
 **`fused_silu_mul_mq_rotate_awq.hip`** already does silu·mul + AWQ-divide +
 FWHT for the *dense* down path. Make an **indexed/MoE variant** that:

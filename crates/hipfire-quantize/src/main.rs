@@ -6154,9 +6154,15 @@ fn main() {
             // priority over plain MQ4G256; the Lloyd branches above are mutually
             // exclusive (selected by their own flags), so AWQ only fires when
             // none of them claimed this expert.
+            // HIPFIRE_AWQ_EXPERTS=down restricts expert AWQ to down_proj (the
+            // sensitive residual-write projection + the free runtime kernel);
+            // unset/=all does both gate_up and down (default).
+            let awq_down_only =
+                std::env::var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("down");
             let expert_awq_active = AWQ_ALPHA.get().is_some()
                 && imatrix_gguf.is_some()
                 && supports_g256
+                && !(awq_down_only && base_name == "gate_up_proj")
                 && !expert_mq3lloyd_native
                 && !expert_mq2lloyd_native
                 && !expert_mq2lloyd_roundtrip

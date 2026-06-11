@@ -999,6 +999,8 @@ pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_
 /// signs1 gather and FWHT.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
