@@ -131,6 +131,19 @@ impl GpuTensor {
             dtype: self.dtype,
         }
     }
+
+    /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
+    /// The returned tensor shares the source's device pointer; it is a VIEW —
+    /// do NOT pass it to `free_tensor`. `DeviceBuffer::from_raw` has no
+    /// Drop-time free, so the alias and source coexist safely until the OWNER
+    /// is freed exactly once.
+    pub fn shallow_clone(&self) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), self.buf.size()) },
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

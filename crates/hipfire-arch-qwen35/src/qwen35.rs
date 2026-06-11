@@ -16,7 +16,10 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::weight_backend::{dequant_f32, dequant_norm, dequant_weight_raw, HfqBackend, ParoBackend};
+use hipfire_runtime::weight_backend::{
+    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_awq_scale_for,
+    load_embedding, HfqBackend, ParoBackend,
+};
 use hipfire_runtime::paro::{
     load_fp16_weight_from_source, paro_load_f32, paro_load_norm, paro_text_prefix,
 };
@@ -681,6 +684,11 @@ pub struct Qwen35Weights {
     /// `ensure_resident` / `patch_expert_ptr_table`. `None` means the model
     /// is fully resident — no behavior change vs main.
     pub pager: Option<std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
+
+    /// True when the tied lm_head aliases the embedding table buffer
+    /// (single-GPU path). When true, `output.buf` is a non-owning view of
+    /// `token_embd.buf` and must NOT be freed in `free_gpu`.
+    pub lm_head_aliases_embd: bool,
 }
 
 impl Qwen35Weights {
@@ -688,7 +696,9 @@ impl Qwen35Weights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        self.output.free_all(gpu);
+        if !self.lm_head_aliases_embd {
+            self.output.free_all(gpu);
+        }
         for layer in self.layers {
             match layer {
                 LayerWeights::DeltaNet(l) => {
@@ -1229,36 +1239,6 @@ fn load_weight_tensor_raw(
 /// strip trailing `.weight`, append `.awq_scale.weight`. Try both the
 /// `model.language_model.`-prefixed name and the bare name (the qwen35
 /// crate uses prefixed names; older sidecars or tests may use either).
-fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
-    let sidecar_name = match name.strip_suffix(".weight") {
-        Some(stem) => format!("{stem}.awq_scale.weight"),
-        None => format!("{name}.awq_scale.weight"),
-    };
-    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
-    // Must be 1D F16, length K. quant_type 1 = F16.
-    if sc_info.quant_type != 1 {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
-            sc_info.quant_type
-        );
-        return None;
-    }
-    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
-            sc_info.shape, k
-        );
-        return None;
-    }
-    // F16 → F32 on host so the kernel takes a plain `const float*`.
-    let f32_data: Vec<f32> = sc_data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
-}
-
 /// TODO(transformer-extraction): cross-arch duplicate of
 /// `hipfire-arch-qwen2::qwen2::load_weight_tensor` — same name-lookup +
 /// pread + AWQ-sidecar pattern, but qwen35 uses the
@@ -1359,48 +1339,7 @@ pub fn load_weights(
     let (embd_meta, embd_data) =
         qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
     let embd_qt = embd_meta.quant_type;
-    let (token_embd, embd_fmt) = if embd_qt == 6 {
-        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_data.len() / 1_000_000);
-        (
-            gpu.upload_raw(&embd_data, &[embd_data.len()])?,
-            EmbeddingFormat::HFQ4G256,
-        )
-    } else if embd_qt == 7 {
-        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_data.len() / 1_000_000);
-        (
-            gpu.upload_raw(&embd_data, &[embd_data.len()])?,
-            EmbeddingFormat::HFQ4G128,
-        )
-    } else if embd_qt == 3 {
-        // Q8_0: [f16 scale][32 × int8] per block — upload raw, use Q8 embedding lookup
-        eprintln!("    (Q8_0 raw, {} MB)", embd_data.len() / 1_000_000);
-        (
-            gpu.upload_raw(&embd_data, &[embd_data.len()])?,
-            EmbeddingFormat::Q8_0,
-        )
-    } else {
-        // F1 native-bf16 oracle: embed_tokens may arrive as qt=2 (F32, 4-byte
-        // LE) or qt=16 (BF16, 2-byte high-half of f32). Decode by quant_type
-        // rather than assuming F16. qt=1 (F16) keeps the historical path.
-        let f32_data: Vec<f32> = match embd_qt {
-            2 => embd_data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            16 => embd_data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            _ => embd_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-        };
-        (
-            gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
-            EmbeddingFormat::F32,
-        )
-    };
+    let (token_embd, embd_fmt) = load_embedding(gpu, embd_qt, &embd_data, config.vocab_size, config.dim)?;
     drop(embd_data); // free source buffer before loading more tensors
 
     eprintln!("  loading output_norm...");
@@ -1430,6 +1369,7 @@ pub fn load_weights(
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
     let lm_head_info = qwen35_tensor_data_vec(hfq, "lm_head.weight");
+    let lm_head_is_tied = lm_head_info.is_none();
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!(
             "  loading output (separate lm_head, qt={})...",
@@ -1443,76 +1383,18 @@ pub fn load_weights(
             config.dim,
         )?
     } else {
+        // Single-GPU path: alias the embedding buffer instead of re-uploading.
+        // This saves vocab × dim × dtype_bytes of VRAM (the tied-lm_head
+        // double-alloc that the prior code paid on every load).
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
-        let (_, tied_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
-        if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
-            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            let dtype = match embd_qt {
-                6 => DType::HFQ4G256,
-                7 => DType::HFQ4G128,
-                8 => DType::HFQ6G256,
-                _ => unreachable!(),
-            };
-            WeightTensor {
-                buf,
-                gpu_dtype: dtype,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_qt == 13 {
-            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_qt == 14 {
-            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ8G256,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_qt == 3 {
-            let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8_0,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else {
-            let f32_data: Vec<f32> = tied_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
+        WeightTensor {
+            buf: token_embd.shallow_clone(),
+            gpu_dtype: embedding_format_dtype(embd_fmt),
+            m: config.vocab_size,
+            k: config.dim,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
         }
     };
     // AWQ sidecar attachment for lm_head / tied embed_tokens. Safe now
@@ -1589,6 +1471,7 @@ pub fn load_weights(
         // The non-paged `load_weights` always returns `None` so today's
         // callers see no behavior change.
         pager: None,
+        lm_head_aliases_embd: lm_head_is_tied,
     })
 }
 
@@ -1619,7 +1502,7 @@ pub fn load_weights_paroquant(
     let embd_fmt = EmbeddingFormat::F32;
 
     eprintln!("  loading output_norm...");
-    let output_norm = paro_load_norm(source, gpu, "norm.weight", &[config.dim])?;
+    let output_norm = paro_load_norm(source, gpu, "norm.weight", &[config.dim], 1.0)?;
 
     // Prefer separate lm_head when checkpoint provides one (tie_word_embeddings:false);
     // fall back to embed_tokens for tied checkpoints. shisa-ai/Qwen3.6-35B-A3B-PARO
@@ -1674,7 +1557,7 @@ pub fn load_weights_paroquant(
         let p = format!("layers.{i}");
         let is_moe = config.num_experts > 0;
 
-        let mut b = ParoBackend { source, gpu, mp, layer: i };
+        let mut b = ParoBackend { source, gpu, mp, layer: i, norm_bias: 1.0 };
         let moe = |bk: &mut ParoBackend, cfg: &Qwen35Config, li: usize| {
             crate::paro_moe::paro_load_moe_ffn(bk.source, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
         };
@@ -1689,6 +1572,9 @@ pub fn load_weights_paroquant(
         moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
         pager: None,
+        // ParoQuant path loads the lm_head separately (always untied per
+        // current checkpoint convention), so no alias.
+        lm_head_aliases_embd: false,
     })
 }
 
@@ -1738,6 +1624,9 @@ pub fn load_weights_multi(
         moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
         pager: None,
+        // Multi-GPU path never aliases — each output device gets its own
+        // upload (different physical GPU, cross-device alias impossible).
+        lm_head_aliases_embd: false,
     })
 }
 
@@ -1754,35 +1643,7 @@ fn load_token_embd_into(
         );
     }
     let embd_info = qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
-    Ok(if embd_info.0.quant_type == 6 {
-        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G256,
-        )
-    } else if embd_info.0.quant_type == 7 {
-        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G128,
-        )
-    } else if embd_info.0.quant_type == 3 {
-        eprintln!("    (Q8_0 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::Q8_0,
-        )
-    } else {
-        let f32_data: Vec<f32> = embd_info
-            .1
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        (
-            gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
-            EmbeddingFormat::F32,
-        )
-    })
+    load_embedding(gpu, embd_info.0.quant_type, embd_info.1, config.vocab_size, config.dim)
 }
 
 fn load_output_into(
@@ -1809,83 +1670,16 @@ fn load_output_into(
             config.dim,
         )?
     } else {
+        // Cross-device tied path: cannot alias the embedding buffer (it lives
+        // on device 0, the output lives on output_device). Collapse the old
+        // hand-written qt→DType match into one `dequant_weight_raw` call.
         let embd_info =
             qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
         eprintln!(
             "  loading output (tied embeddings, qt={})...",
             embd_info.0.quant_type
         );
-        let embd_data = embd_info.1;
-        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8
-        {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            let dtype = match embd_info.0.quant_type {
-                6 => DType::HFQ4G256,
-                7 => DType::HFQ4G128,
-                8 => DType::HFQ6G256,
-                _ => unreachable!(),
-            };
-            WeightTensor {
-                buf,
-                gpu_dtype: dtype,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_info.0.quant_type == 13 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_info.0.quant_type == 14 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ8G256,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else if embd_info.0.quant_type == 3 {
-            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8_0,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else {
-            let f32_data: Vec<f32> = embd_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        }
+        dequant_weight_raw(gpu, embd_info.0.quant_type, embd_info.1, config.vocab_size, config.dim)?
     };
     // AWQ sidecar attachment — sister of the `load_weights` block.
     // Safe because both `weight_gemv` (decode) and `speculative.rs`

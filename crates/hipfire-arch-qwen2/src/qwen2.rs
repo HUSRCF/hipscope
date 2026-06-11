@@ -30,7 +30,9 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::weight_backend::{dequant_norm, dequant_weight_raw};
+use hipfire_runtime::weight_backend::{
+    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_embedding,
+};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::pipeline::superop::{
@@ -233,7 +235,9 @@ impl Qwen2Weights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
+        if !self.tied_lm_head {
+            let _ = gpu.free_tensor(self.output.buf);
+        }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
             let _ = gpu.free_tensor(l.wq.buf);
@@ -296,32 +300,7 @@ fn load_embed_tokens(
     let name = "model.embed_tokens.weight";
     let (info, data) = hfq.tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    // Quant-type coverage matches `load_lm_head` tied branch above, so a
-    // tied-embeddings model produces consistent embed + lm_head paths.
-    match info.quant_type {
-        6 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok((buf, EmbeddingFormat::HFQ4G256))
-        }
-        7 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok((buf, EmbeddingFormat::HFQ4G128))
-        }
-        3 => {
-            let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok((buf, EmbeddingFormat::Q8_0))
-        }
-        1 => {
-            let f32_data: Vec<f32> = data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
-            Ok((buf, EmbeddingFormat::F32))
-        }
-        qt => panic!("qwen2: unsupported embedding quant_type {qt}; \
-                     handled: 1 (F16→F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
-                     Extend load_embed_tokens to handle this format."),
-    }
+    load_embedding(gpu, info.quant_type, &data, cfg.vocab_size, cfg.hidden_size)
 }
 
 /// Load the lm_head. For tied-embedding configs, re-upload the embedding
@@ -347,42 +326,15 @@ fn load_lm_head(
     hfq: &HfqFile,
     gpu: &Gpu,
     cfg: &Qwen2Config,
-    _embd_token: &GpuTensor,
+    embd_token: &GpuTensor,
     embd_format: EmbeddingFormat,
 ) -> HipResult<(WeightTensor, bool)> {
     if cfg.tie_word_embeddings {
-        let name = "model.embed_tokens.weight";
-        let (info, data) = hfq.tensor_data_vec(name)
-            .unwrap_or_else(|| panic!("qwen2: tensor not found for tied lm_head: {name}"));
-        let dtype = match embd_format {
-            EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
-            EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
-            EmbeddingFormat::Q8_0 => DType::Q8_0,
-            EmbeddingFormat::F32 => DType::F32,
-            EmbeddingFormat::Q4K => panic!("qwen2: tied embeddings with Q4K not supported"),
-        };
-        let buf = match info.quant_type {
-            6 | 7 | 3 => gpu.upload_raw(&data, &[data.len()])?,
-            1 => {
-                // F16 source: load_embed_tokens promoted to F32 on host.
-                // We must do the same so gpu_dtype=F32 matches the actual
-                // buffer contents. Mirror qwen35.rs:1438-1447.
-                let f32_data: Vec<f32> = data.chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        f32_data.as_ptr() as *const u8,
-                        f32_data.len() * 4,
-                    )
-                };
-                gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.hidden_size])?
-            }
-            qt => panic!("qwen2: unsupported tied embedding quant_type {qt}"),
-        };
+        // Single-GPU path: alias the embedding buffer instead of re-uploading.
+        // This saves vocab × hidden_size × dtype_bytes of VRAM.
         let wt = WeightTensor {
-            buf,
-            gpu_dtype: dtype,
+            buf: embd_token.shallow_clone(),
+            gpu_dtype: embedding_format_dtype(embd_format),
             m: cfg.vocab_size,
             k: cfg.hidden_size,
             row_stride: 0,
@@ -461,14 +413,12 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
 fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let (info, data) = hfq.tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        qt => panic!("qwen2: expected F16/F32 for bias {name}, got qt={qt}"),
-    };
-    assert_eq!(f32_data.len(), n,
-        "qwen2: bias {name} has {} elements, expected {n}", f32_data.len());
-    gpu.upload_f32(&f32_data, &[n])
+    let t = dequant_f32(gpu, info.quant_type, &data, n)?;
+    // Length assert as a cheap guard against config/tensor mismatch
+    // (dequant_f32 does not assert n).
+    assert_eq!(t.numel(), n,
+        "qwen2: bias {name} has {} elements, expected {n}", t.numel());
+    Ok(t)
 }
 
 /// TODO(transformer-extraction): duplicates `load_weight_tensor` +

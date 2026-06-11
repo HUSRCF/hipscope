@@ -7,9 +7,18 @@
 //! Per-arch crates build their `load_layer` schema on top of this; the only
 //! arch-varying knobs are the RMSNorm `+bias` and the name-candidate resolver.
 
-use crate::llama::{f16_to_f32, KvCache, WeightTensor};
+use crate::hfq::HfqFile;
+use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
+/// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
+fn widen_bf16(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+        .collect()
+}
 
 // ── HF tensor-name resolution ───────────────────────────────────────────────
 
@@ -70,6 +79,109 @@ pub fn paro_proj_name(mp: &str, layer: usize, rel: &str) -> String {
 /// THEMSELVES — so this is prefix-LESS: `layers.{layer}.{rel}`.
 pub fn paro_plain_name(layer: usize, rel: &str) -> String {
     format!("layers.{layer}.{rel}")
+}
+
+// ── Embedding / tied-lm_head primitives ──────────────────────────────────
+
+/// How an embedding table's on-disk bytes map to the device.
+#[derive(Debug)]
+pub enum EmbedPlan {
+    /// Upload bytes verbatim; the lookup kernel dequantizes on the fly.
+    Raw(EmbeddingFormat),
+    /// Host-decode to f32 (via `dequant_f32`) then upload as F32.
+    HostF32,
+}
+
+/// Pure quant_type → plan. GPU-free, unit-testable.
+///
+/// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
+/// qt 1|2|16 → HostF32, else → panic with the supported-format list.
+pub fn embed_classify(quant_type: u8) -> EmbedPlan {
+    match quant_type {
+        6 => EmbedPlan::Raw(EmbeddingFormat::HFQ4G256),
+        7 => EmbedPlan::Raw(EmbeddingFormat::HFQ4G128),
+        3 => EmbedPlan::Raw(EmbeddingFormat::Q8_0),
+        1 | 2 | 16 => EmbedPlan::HostF32,
+        other => panic!(
+            "unsupported embedding quant_type {other}; \
+             handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
+             Add the format to embed_classify to support it."
+        ),
+    }
+}
+
+/// Load an embedding table to the device. Unifies the qwen35 and qwen2
+/// hand-written matches. Returns the device tensor + its on-GPU format.
+pub fn load_embedding(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
+    vocab: usize,
+    dim: usize,
+) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    match embed_classify(quant_type) {
+        EmbedPlan::Raw(fmt) => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok((buf, fmt))
+        }
+        EmbedPlan::HostF32 => {
+            // dequant_f32 uploads with shape [n] (1D). The embedding-lookup
+            // kernels compute byte offsets from token_id + dim against buf
+            // directly and never read the shape, so the 1D vs 2D difference
+            // is behaviorally identical.
+            let buf = dequant_f32(gpu, quant_type, data, vocab * dim)?;
+            Ok((buf, EmbeddingFormat::F32))
+        }
+    }
+}
+
+/// EmbeddingFormat → the DType tag for a tied lm_head WeightTensor.
+/// Replaces both arches' inline matches. Q4K is not a valid tied format → panic.
+pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
+    match fmt {
+        EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
+        EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
+        EmbeddingFormat::Q8_0 => DType::Q8_0,
+        EmbeddingFormat::F32 => DType::F32,
+        EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
+    }
+}
+
+/// Load an AWQ sidecar tensor from an HFQ file.
+///
+/// Looks up `{stem}.awq_scale.weight` where `name` is `{stem}.weight`.
+/// Returns `None` when no sidecar exists or when the sidecar has an
+/// unexpected quant_type/shape.
+///
+/// Moved from `hipfire-arch-qwen35::qwen35::load_awq_scale_for`.
+pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let sidecar_name = match name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{name}.awq_scale.weight"),
+    };
+    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
+    // Must be 1D F16, length K. quant_type 1 = F16.
+    if sc_info.quant_type != 1 {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+            sc_info.quant_type
+        );
+        return None;
+    }
+    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape, k
+        );
+        return None;
+    }
+    // F16 → F32 on host so the kernel takes a plain `const float*`.
+    let f32_data: Vec<f32> = sc_data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
 // ── Dequant primitives (bodies filled in Task 2) ────────────────────────────
@@ -309,7 +421,12 @@ pub fn dequant_weight_raw(
             })
         }
         16 => {
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            // bf16 is the high 16 bits of an f32, so widening is lossless/exact.
+            let f32_data = widen_bf16(data);
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -345,6 +462,8 @@ pub fn dequant_norm(
             .collect(),
         _ => panic!("expected F16/F32 for norm, got qt={quant_type}"),
     };
+    let expected: usize = shape.iter().product();
+    assert_eq!(f32_data.len(), expected, "dequant_norm: tensor has {} elements, expected {expected} (shape {shape:?})", f32_data.len());
     for v in &mut f32_data {
         *v += bias;
     }
@@ -363,6 +482,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => widen_bf16(data),
         3 => crate::llama::dequantize_q8_0(data, n),
         14 => {
             let group_size: usize = 256;
@@ -838,7 +958,6 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
 // ── WeightBackend trait ─────────────────────────────────────────────────────
 
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
-use crate::hfq::HfqFile;
 use crate::model_source::ModelSource;
 use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
 
@@ -906,6 +1025,8 @@ pub struct ParoBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub mp: &'static str,
     pub layer: usize,
+    /// `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
+    pub norm_bias: f32,
 }
 
 impl<'a> WeightBackend for ParoBackend<'a> {
@@ -919,7 +1040,7 @@ impl<'a> WeightBackend for ParoBackend<'a> {
         }
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-        paro_load_norm(self.source, self.gpu, &paro_plain_name(self.layer, rel), shape)
+        paro_load_norm(self.source, self.gpu, &paro_plain_name(self.layer, rel), shape, self.norm_bias)
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
@@ -956,5 +1077,55 @@ mod tests {
         assert_eq!(paro_proj_name("model.language_model", 0, "linear_attn.in_proj_qkv"),
                    "model.language_model.layers.0.linear_attn.in_proj_qkv");
         assert_eq!(paro_plain_name(0, "input_layernorm.weight"), "layers.0.input_layernorm.weight");
+    }
+
+    // ── Embedding / tied-lm_head tests ──────────────────────────────────────
+
+    #[test]
+    fn embed_classify_raw_hfq4g256() {
+        match embed_classify(6) {
+            EmbedPlan::Raw(EmbeddingFormat::HFQ4G256) => {}
+            other => panic!("expected Raw(HFQ4G256), got {other:?}"),
+        }
+    }
+    #[test]
+    fn embed_classify_raw_hfq4g128() {
+        match embed_classify(7) {
+            EmbedPlan::Raw(EmbeddingFormat::HFQ4G128) => {}
+            other => panic!("expected Raw(HFQ4G128), got {other:?}"),
+        }
+    }
+    #[test]
+    fn embed_classify_raw_q8_0() {
+        match embed_classify(3) {
+            EmbedPlan::Raw(EmbeddingFormat::Q8_0) => {}
+            other => panic!("expected Raw(Q8_0), got {other:?}"),
+        }
+    }
+    #[test]
+    fn embed_classify_host_f32() {
+        for qt in [1, 2, 16] {
+            match embed_classify(qt) {
+                EmbedPlan::HostF32 => {}
+                other => panic!("qt={qt}: expected HostF32, got {other:?}"),
+            }
+        }
+    }
+    #[test]
+    #[should_panic(expected = "unsupported embedding quant_type")]
+    fn embed_classify_panics_on_unknown() {
+        embed_classify(99);
+    }
+    #[test]
+    fn embedding_format_dtype_mapping() {
+        assert_eq!(embedding_format_dtype(EmbeddingFormat::HFQ4G256), DType::HFQ4G256);
+        assert_eq!(embedding_format_dtype(EmbeddingFormat::HFQ4G128), DType::HFQ4G128);
+        assert_eq!(embedding_format_dtype(EmbeddingFormat::Q8_0), DType::Q8_0);
+        assert_eq!(embedding_format_dtype(EmbeddingFormat::F32), DType::F32);
+    }
+    #[test]
+    #[should_panic(expected = "Q4K not valid")]
+    fn embedding_format_dtype_q4k_panics() {
+        embedding_format_dtype(EmbeddingFormat::Q4K);
     }
 }

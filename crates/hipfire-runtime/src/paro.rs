@@ -214,12 +214,14 @@ pub fn paro_load_wt(
 
 // ── Norm loading ───────────────────────────────────────────────────────────────
 
-/// Load an RMSNorm weight and add the +1.0 Qwen3.5 offset.
+/// Load an RMSNorm weight and add `bias` to every element
+/// (`1.0` for qwen3.5/gemma, `0.0` for qwen2/llama).
 pub fn paro_load_norm(
     source: &dyn ModelSource,
     gpu: &mut Gpu,
     name: &str,
     shape: &[usize],
+    bias: f32,
 ) -> HipResult<GpuTensor> {
     let mp = paro_text_prefix(source)?;
     let full = format!("{mp}.{name}");
@@ -236,7 +238,7 @@ pub fn paro_load_norm(
             .collect()
     };
     for x in &mut v {
-        *x += 1.0;
+        *x += bias;
     }
     gpu.upload_f32(&v, shape)
 }
