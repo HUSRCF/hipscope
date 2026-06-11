@@ -51,11 +51,15 @@ Supported `tier`s: `q8`, `hfq4`/`hfq6`, `mq4`/`mq6`, and the Lloyd variants
 emit for that tensor; verified by unit tests). `--reap-arch` is auto-detected from the
 model's arch_id when omitted (minimax must be passed explicitly).
 
-**Consuming the overlay:** the load-time splice (`HIPFIRE_REAP_PLAN=<plan-dir>` with an
-`overlay.hfq` present) is **SP3** (loader prefers overlay tensors over the base). An
-overlay that mixes tiers among experts *within one layer* additionally needs **SP2**
-(GPU bucketed dispatch) to serve; per-layer-uniform overrides serve through existing
-dispatch. The standalone-`.hfq` **bake** is **SP4b** (a follow-on plan).
+**Consuming the overlay — SP3 DONE:** the load-time splice is implemented. Set
+`HIPFIRE_REAP_PLAN=<plan-dir>` with an `overlay.hfq` present in that dir, and
+`HfqFile` resolves overlay-then-base automatically — no arch changes required. The
+auto-attach is guarded: the overlay's `arch_id` must match the base, and every overlay
+tensor name must be a subset of the base's (a foreign tensor rejects the overlay, so a
+mismatched plan can't corrupt a load). A per-layer-uniform overlay serves through the
+existing dispatch unchanged; an overlay that mixes tiers among experts *within one
+layer* still needs **SP2** (GPU bucketed dispatch) to serve. The standalone-`.hfq`
+**bake** is **SP4b** (a follow-on plan).
 
 ## Workflow
 

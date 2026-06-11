@@ -1,30 +1,4 @@
 use crate::plan::ReapPlan;
-use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-
-/// Overlay-then-base tensor resolver. SP1: overlay is always None (base only);
-/// SP3 adds the overlay HfqFile and prefers it when it holds `name`.
-pub struct TensorSource<'a> {
-    pub base: &'a HfqFile,
-    pub overlay: Option<&'a HfqFile>,
-}
-
-impl<'a> TensorSource<'a> {
-    pub fn new(base: &'a HfqFile) -> Self {
-        TensorSource { base, overlay: None }
-    }
-
-    /// Resolve a tensor by name: overlay first (SP3), else base.
-    /// Returns `(&HfqTensorInfo, Vec<u8>)` using `tensor_data_vec` for
-    /// owned bytes (avoids RefCell borrow and works on all platforms).
-    pub fn tensor(&self, name: &str) -> Option<(&'a HfqTensorInfo, Vec<u8>)> {
-        if let Some(ov) = self.overlay {
-            if let Some(hit) = ov.tensor_data_vec(name) {
-                return Some(hit);
-            }
-        }
-        self.base.tensor_data_vec(name)
-    }
-}
 
 /// Per-(layer, role) plan slice the arch loader consumes at its expert loop.
 pub struct ExpertPlan<'a> {

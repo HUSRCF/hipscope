@@ -7,4 +7,4 @@ pub mod plan;
 pub mod source;
 
 pub use hook::ReapArchHook;
-pub use source::{ExpertPlan, TensorSource};
+pub use source::ExpertPlan;
