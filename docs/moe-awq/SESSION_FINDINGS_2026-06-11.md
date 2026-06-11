@@ -184,3 +184,54 @@ merged kernel is already built; the remaining work is (a) wire `expert_dtype_tag
 gate_up in `run_moe_decode`, (b) un-gate the quantizer to grade gate_up, (c) re-quantize the
 ~14.8 GB full-graded file, (d) re-run this KLD/coherence battery. That puts the cold bits on
 the dominant lever and is the real test of the graded-quant thesis.
+
+---
+
+## 9. N-tier graded sweep — T3-2L / T3-3L (commit 45a3c166, workflow ww41rkaie)
+Extended the merged kernel to **4 branches** (tag0=MQ6 200B, tag1=MQ2-Lloyd 72B, tag2=MQ4
+136B, tag3=MQ3-Lloyd 112B; block-uniform, single-acc, expanded write; MQ3L uses an 8-slot
+`cb_lds` codebook + per-group `__syncthreads()`). **Wired gate_up** (was down-only) — one
+shared `[n_exp]` u8 tag table, 4 tags, used by both projections. Quantizer
+`HIPFIRE_MOE_TIER_MAP=<file>` grades BOTH gate_up + down per-expert; `scripts/gen_tier_map.py`
+builds the map from a **union (agentic ∪ wt2, per-layer-normalized sum_contrib)** REAP ranking
+(top-20%→MQ6, next-30%→MQ4, bottom-50%→cold). Both kernels compile gfx942: VGPR=33, zero
+spill, LDS=32B, occupancy 8 waves (BW-bound, fine).
+
+**Results (q8 KV, max-chunks 32, vs f32 oracle; MQ4 anchor 19.7 GB 0.0339/0.163):**
+
+| SKU | size | wt2 KLD | ag KLD | coherent | vs MQ4 |
+|---|---|---|---|---|---|
+| MQ3L-uniform | 16.6 GB | 0.071 | 0.242 | yes | — |
+| **T3-2L** (20%MQ6/30%MQ4/50%MQ2L) | 16.85 GB | 0.0352 | 0.1631 | **✅** | wt2 +3.8% (CI tie), ag tie, −2.85 GB |
+| MQ4-uniform (anchor) | 19.7 GB | 0.0339 | 0.1630 | yes | — |
+| **T3-3L** (…/50%MQ3L) | 19.76 GB | 0.0249 | 0.1332 | **❌ decode-only** | **wt2 −26.5%, ag −18.3%** |
+
+**Verdict:**
+- **T3-2L = shippable ~17 GB "MQ4-lite" SIZE SKU.** Ties MQ4 on quality (within bootstrap CI
+  0.0294–0.0435 on wt2; dead-even on agentic), coherent, −14% size. **Pareto-dominates uniform
+  MQ3L** — half the KLD on both corpora for +0.25 GB. The one genuine frontier point graded
+  earns today.
+- **T3-3L = the real quality win, blocked.** Beats MQ4 on both corpora at iso-size, but is
+  **decode-only**: the MoE batched-**prefill** path hardcodes the MQ4 group stride (136 B/grp)
+  and `is_batchable_la()` excludes MQ3G256Lloyd, so prefill would silently corrupt the 112 B/grp
+  cold tier → it correctly guards with a panic. The KLD comes from per-token scoring mode (valid,
+  routes through the working decode kernels). Not a kernel bug — a parity gap. Unblock = port the
+  MQ3L/MQ2L branches into the MoE batched-prefill GEMM (same per-block `dtype_tag` dispatch as the
+  decode kernels) + add MQ3G256Lloyd to `is_batchable_la()`.
+
+**Two meta-findings:**
+1. **Union ranking held both corpora** — no corpus collapse (T3-3L improved wt2 *and* agentic
+   simultaneously). One shared per-expert union tier table is robust; this is the methodology to
+   keep (contrast §1's corpus-specific down-AWQ wash).
+2. **First-order additive model was optimistic ~20–26%** (T3-2L pred 0.028 → 0.035; T3-3L pred
+   0.021 → 0.025). Consistent sign ⇒ the 50% cold mass contributes **super-additively** (routing
+   puts non-trivial probability through cold experts; error doesn't fully average out). Use the
+   model for *ranking* blends, not absolute targets; ×1.2–1.3 the cold-tier term. This recalibrates
+   the §8 <16 GB estimates up ~25% (the 15.5 GB MQ5/MQ3L/MQ2L blend ≈ 0.045 wt2 — beats uniform
+   MQ3L, not MQ4).
+
+**Recommended next:** (1) ship T3-2L as the 17 GB SKU; (2) **port MQ3L/MQ2L into MoE
+batched-prefill to unlock T3-3L** (highest ROI — turns a measured iso-size win into a shippable
+one + makes both graded SKUs daemon-serveable); (3) tune the 20/30/50 boundary (25/35/40, or cold
+MQ2L→MQ3L) to convert T3-2L's tie into a clean sub-MQ4 win; (4) do NOT add more tiers until the
+prefill port lands.
