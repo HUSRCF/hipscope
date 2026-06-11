@@ -127,6 +127,32 @@ pub fn build_overlay(
     Ok(out)
 }
 
+/// Bake driver: quantize EVERY tensor, applying the plan's per-tensor override
+/// tier where one matches and falling back to `base_fmt` otherwise.
+///
+/// `tensors` yields `(name, shape, f32_data)` for the model's tensors. Unlike
+/// `build_overlay` (subset only), bake emits the whole model. Pruning is Task 2
+/// — this version emits every tensor handed to it.
+///
+/// `main.rs`'s bake path inlines the override hook into the existing whole-model
+/// quantize loop (so non-overridden tensors keep their arch-specific default
+/// quant); this standalone helper is exercised by the in-module bake tests,
+/// hence the allow.
+#[allow(dead_code)]
+pub fn bake_tensors(
+    arch: ReapArch,
+    plan: &ReapPlan,
+    base_fmt: &str,
+    tensors: impl Iterator<Item = (String, Vec<usize>, Vec<f32>)>,
+) -> Result<Vec<HfqTensor>, String> {
+    let mut out = Vec::new();
+    for (name, shape, f32) in tensors {
+        let fmt = reap_override_for(&name, arch, plan).unwrap_or(base_fmt);
+        out.push(quantize_to_format(&name, fmt, &f32, &shape)?);
+    }
+    Ok(out)
+}
+
 /// Resolve a tensor name to its override tier under `plan`, or None.
 /// Matches by (layer, role, [expert]) using the arch's tensor naming.
 pub fn reap_override_for<'a>(name: &str, arch: ReapArch, plan: &'a ReapPlan) -> Option<&'a str> {
@@ -308,6 +334,54 @@ mod resolve_tests {
             reap_override_for("model.layers.40.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod bake_tests {
+    use super::*;
+
+    fn plan_with(json: &str) -> ReapPlan {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("reap_plan.json"), json).unwrap();
+        ReapPlan::load_unchecked(d.path().to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn no_override_bakes_all_at_base_fmt() {
+        // Empty quant_overrides → every tensor falls back to base_fmt (q8).
+        let p = plan_with(
+            r#"{"original_experts":128,"num_layers":48,"quant_overrides":[]}"#,
+        );
+        let data = vec![0.3f32; 256];
+        let tensors = vec![(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            vec![1usize, 256],
+            data.clone(),
+        )];
+        let out = bake_tensors(ReapArch::Qwen35, &p, "q8", tensors.into_iter()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].quant_type, QuantType::Q8F16);
+        // Bytes equal a direct q8 of the same data (anchor: no-override bake == normal quantize).
+        let direct = quantize_to_format("x", "q8", &data, &[1, 256]).unwrap();
+        assert_eq!(out[0].data, direct.data);
+    }
+
+    #[test]
+    fn override_wins_over_base_fmt() {
+        // Layer-0 attention override → hfq6, beating the q8 base_fmt.
+        let p = plan_with(
+            r#"{"original_experts":128,"num_layers":48,
+            "quant_overrides":[{"layer":0,"role":"attention","tier":"hfq6"}]}"#,
+        );
+        let tensors = vec![(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            vec![2usize, 256],
+            vec![0.1f32; 512],
+        )];
+        let out = bake_tensors(ReapArch::Qwen35, &p, "q8", tensors.into_iter()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].quant_type, QuantType::HFQ6G256); // override, not base q8
     }
 }
 

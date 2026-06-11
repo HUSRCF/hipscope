@@ -4738,6 +4738,20 @@ fn main() {
         .iter()
         .position(|a| a == "--reap-arch")
         .and_then(|i| args.get(i + 1).cloned());
+    // SP4b bake mode. `--reap-bake <plan-dir>` runs the NORMAL whole-model
+    // quantize to completion BUT with a per-tensor override hook active: any
+    // tensor the plan's `quant_overrides` name is re-quantized to its override
+    // tier; every other tensor keeps its arch-specific default quant. The whole
+    // model is written via the usual `write_hfq` to `--reap-out` (or the normal
+    // `--format` output path). Mutually exclusive with `--reap-overlay`.
+    let reap_bake_dir: Option<String> = args
+        .iter()
+        .position(|a| a == "--reap-bake")
+        .and_then(|i| args.get(i + 1).cloned());
+    if reap_bake_dir.is_some() && reap_overlay_dir.is_some() {
+        eprintln!("reap: --reap-bake and --reap-overlay are mutually exclusive");
+        std::process::exit(1);
+    }
 
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
@@ -5611,6 +5625,56 @@ fn main() {
         return;
     }
 
+    // ── SP4b: bake-mode setup ────────────────────────────────────────────────
+    // `--reap-bake <plan-dir>` keeps the normal whole-model quantize loop but
+    // activates the per-tensor override hook (at the top of the loop below).
+    // Resolve the plan + arch family up front; the loop reads `reap_bake_plan`
+    // and `reap_arch`. When bake is inactive these are unused / None and the
+    // loop is byte-identical to today. If `--reap-out` is given, the whole
+    // baked model is written there instead of the normal `--output` path.
+    let reap_bake_plan: Option<hipfire_reap::plan::ReapPlan> = match reap_bake_dir.as_deref() {
+        Some(plan_dir) => Some(
+            hipfire_reap::plan::ReapPlan::load_unchecked(plan_dir).unwrap_or_else(|e| {
+                eprintln!("reap bake: failed to load plan from {plan_dir}: {e}");
+                std::process::exit(1);
+            }),
+        ),
+        None => None,
+    };
+    // Arch family for tensor-name matching: explicit --reap-arch overrides the
+    // auto-detection from arch_id (only consulted when bake is active).
+    let reap_arch: reap_overlay::ReapArch = if reap_bake_plan.is_some() {
+        match reap_arch_flag.as_deref() {
+            Some(s) => reap_overlay::ReapArch::from_flag(s).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }),
+            None => reap_overlay::ReapArch::from_arch_id(arch_id).unwrap_or_else(|| {
+                eprintln!(
+                    "reap bake: could not auto-detect arch family from arch_id={arch_id}; \
+                     pass --reap-arch <deepseek4|qwen35|lfm2moe|minimax>"
+                );
+                std::process::exit(1);
+            }),
+        }
+    } else {
+        // Placeholder (never read when reap_bake_plan is None).
+        reap_overlay::ReapArch::Qwen35
+    };
+    // Redirect the whole-model output to --reap-out when baking with that flag.
+    let bake_out_path = reap_bake_plan
+        .as_ref()
+        .and(reap_out.as_deref())
+        .map(Path::new);
+    let output_path: &Path = bake_out_path.unwrap_or(output_path);
+    if let Some(plan) = &reap_bake_plan {
+        eprintln!(
+            "REAP bake mode: arch={reap_arch:?}, {} quant_overrides, out={}",
+            plan.quant_overrides.len(),
+            output_path.display()
+        );
+    }
+
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
     // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
@@ -5786,6 +5850,39 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── SP4b: bake override hook ───────────────────────────────────────────
+        // When `--reap-bake` is active and the plan overrides this tensor,
+        // re-quantize it to the override tier and skip the arch-specific default
+        // branch below. Non-overridden tensors fall through UNCHANGED. The hook
+        // is entirely behind `if let Some(plan) = &reap_bake_plan`, so default
+        // mode (no `--reap-bake`) is byte-identical to before. Bookkeeping
+        // mirrors the arch branches: f32-decode → push → drop_tensor_pages →
+        // quantized_params → maybe_spill → continue.
+        if let Some(plan) = &reap_bake_plan {
+            if let Some(fmt) = reap_overlay::reap_override_for(name, reap_arch, plan) {
+                let f32 = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files,
+                );
+                let shape: Vec<usize> = meta.shape.clone();
+                match reap_overlay::quantize_to_format(name, fmt, &f32, &shape) {
+                    Ok(t) => {
+                        eprintln!("  {:>8}: {} {:?} → {fmt}", "BAKE", name, meta.shape);
+                        hfq_tensors.push(t);
+                    }
+                    Err(e) => {
+                        eprintln!("reap bake: {e}");
+                        std::process::exit(2);
+                    }
+                }
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+        }
 
         // ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
         // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
