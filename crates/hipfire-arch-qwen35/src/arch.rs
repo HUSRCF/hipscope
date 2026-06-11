@@ -62,8 +62,13 @@ impl Architecture for Qwen35 {
     }
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
-        qwen35_config_from_hfq(hfq)
-            .ok_or_else(|| "qwen35: failed to parse config from HFQ metadata".to_string())
+        let mut config = qwen35_config_from_hfq(hfq)
+            .ok_or_else(|| "qwen35: failed to parse config from HFQ metadata".to_string())?;
+        // Optional REAP keep-map (HIPFIRE_REAP_PLAN). Applied AFTER parse so
+        // validation sees the original n_routed_experts; overrides num_experts
+        // to the kept count when active. No env ⇒ no-op (baseline behavior).
+        crate::qwen35::apply_reap_plan(&mut config)?;
+        Ok(config)
     }
 
     fn load_weights(

@@ -193,6 +193,14 @@ pub struct Qwen35Config {
     /// to `u64::MAX` (no eviction — tested when VRAM is unlimited or we just
     /// want to verify the routing path works without eviction pressure).
     pub vram_budget_bytes: u64,
+
+    /// Optional REAP keep-map: emulate a pruned routed-expert pool by
+    /// partial-loading this full quant (load only the kept experts under
+    /// remapped names, gather the router's expert rows to the kept set).
+    /// Populated at config time from `HIPFIRE_REAP_PLAN=<dir>`; `None` ⇒
+    /// no pruning (today's behavior, byte-identical to baseline). Not
+    /// (de)serialized — `Qwen35Config` does not derive serde.
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
@@ -346,7 +354,44 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         // a follow-up commit). When false, no behavior change vs main.
         paged_experts: false,
         vram_budget_bytes: u64::MAX,
+        reap_keep: None,
     })
+}
+
+/// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
+///
+/// Reads `HIPFIRE_REAP_PLAN=<dir>` (qwen35 has no legacy env alias). When
+/// set, loads `<dir>/reap_plan.json` (or the legacy `keep_by_layer.json`)
+/// via `ReapPlan::load_any`, validating against the ORIGINAL routed-expert
+/// count (`config.num_experts`) BEFORE overriding it to the kept count.
+/// This emulates a pruned expert pool by partial-loading the full quant:
+/// only kept experts are loaded (under remapped names) and the router's
+/// expert rows are gathered to the kept set in `load_moe_ffn`.
+///
+/// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
+/// takes the literal original full-load path — byte-identical to baseline.
+/// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map; the
+/// ParoQuant path does not (see `paro_load_moe_ffn`).
+pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
+    let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") else {
+        return Ok(());
+    };
+    // MoE-only feature: a dense (num_experts==0) checkpoint has no routed
+    // experts to prune. Refuse rather than silently divide-by-zero / mislead.
+    if config.num_experts == 0 {
+        return Err(format!(
+            "qwen35: HIPFIRE_REAP_PLAN={dir} set but this is a dense (num_experts==0) checkpoint"
+        ));
+    }
+    let plan = hipfire_reap::plan::ReapPlan::load_any(&dir, config.n_layers, config.num_experts)?;
+    eprintln!(
+        "qwen35: REAP plan ACTIVE — keeping {} of {} routed experts/layer; dir {dir}",
+        plan.kept_per_layer(),
+        config.num_experts
+    );
+    config.num_experts = plan.kept_per_layer();
+    config.reap_keep = Some(std::sync::Arc::new(plan));
+    Ok(())
 }
 
 /// Parse Qwen35Config from a SafetensorsSource (or any ModelSource).
@@ -487,6 +532,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config>
         norm_topk_prob,
         paged_experts: false,
         vram_budget_bytes: u64::MAX,
+        reap_keep: None,
     })
 }
 
@@ -1599,6 +1645,63 @@ fn load_weight_tensor(
         }
         Ok(wt)
     }
+}
+
+/// REAP keep variant of [`load_weight_tensor`]: gather the tensor's first-axis
+/// rows (one row per original expert) down to `keep` BEFORE quant decode, then
+/// build the `WeightTensor` from the gathered bytes with `m = keep.len()`.
+///
+/// Only used for the MoE router (`mlp.gate.weight`, shape `[orig_experts, k]`)
+/// under an active keep-map. `gather_rows` is exact for any row-independent
+/// quant (every per-expert row is self-contained — its own scale/zero/codebook
+/// live in the row), which is true for every quant_type this loader accepts.
+/// `keep` MUST equal the compact slot order, and `m` MUST equal `keep.len()`.
+///
+/// The AWQ sidecar (when present) is indexed by `k` (the input/hidden
+/// dimension), shared across all expert rows, so it is loaded UNCHANGED —
+/// row selection does not touch it.
+fn load_weight_tensor_keep(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    keep: &[u32],
+) -> HipResult<WeightTensor> {
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "load_weight_tensor_keep: m ({m}) must equal keep.len() ({})",
+        keep.len()
+    );
+    // Resolve via the same name-candidate logic as the non-keep path, taking
+    // owned bytes so the gather + AWQ-sidecar reads don't fight a borrow.
+    // `HfqTensorInfo` is not Clone, so pull out the scalars we need (quant
+    // type + on-disk row count) while the borrow is live.
+    let mut matched: Option<String> = None;
+    let mut found: Option<(u8, usize, Vec<u8>)> = None;
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, buf)) = hfq.tensor_data_vec(&candidate) {
+            let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
+            matched = Some(candidate);
+            found = Some((info.quant_type, orig_rows, buf));
+            break;
+        }
+    }
+    let (quant_type, orig_rows, bytes) =
+        found.unwrap_or_else(|| panic!("tensor not found: {name}"));
+    // Row-gather to the kept set. The on-disk row count is the ORIGINAL expert
+    // count (= bytes.len() / rowstride); gather_rows derives it from shape[0].
+    let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig_rows], &bytes, keep)
+        .map_err(|e| HipError::new(0, &format!("qwen35: router row-gather '{name}': {e}")))?;
+    let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        wt.awq_scale = matched
+            .as_deref()
+            .and_then(|mn| load_awq_scale_for(hfq, gpu, mn, k))
+            .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+    }
+    Ok(wt)
 }
 
 // ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
@@ -4284,8 +4387,31 @@ fn load_moe_ffn(
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
 
+    // REAP keep-map for this layer (None ⇒ no pruning / identity). When a
+    // keep is present, `n_exp == config.num_experts` is already the KEPT
+    // count; the router and expert loops below load only the kept rows.
+    let ep = config
+        .reap_keep
+        .as_ref()
+        .map(|r| r.expert_plan(layer_idx as usize));
+
     // Router: hidden_size → num_experts. Precision-sensitive but small.
-    let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
+    // Under a keep, gather the router's expert rows (`[orig_experts, dim]`)
+    // down to the kept set so it emits logits only for kept experts, in
+    // compact slot order. No keep ⇒ the literal original full load.
+    let router = match ep.as_ref().and_then(|e| e.keep()) {
+        Some(keep) => load_weight_tensor_keep(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.gate.weight"),
+            n_exp,
+            config.dim,
+            keep,
+        )?,
+        None => {
+            load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?
+        }
+    };
 
     // Shared expert (always-on, contributes to every token). Unlike routed
     // experts, gate_proj + up_proj are stored separately in the safetensors
@@ -4326,8 +4452,16 @@ fn load_moe_ffn(
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
-    let mut experts = Vec::with_capacity(n_exp);
-    for x in 0..n_exp {
+    //
+    // REAP keep-map: `n_exp` is already the KEPT count (config.num_experts was
+    // overridden in apply_reap_plan). Iterate compact slots and load only the
+    // kept original experts under their remapped names (`ep` computed above).
+    // No keep ⇒ identity (slot==original index, `n_slots == n_exp`) — the
+    // literal original loop.
+    let n_slots = ep.as_ref().map(|e| e.n_slots(n_exp)).unwrap_or(n_exp);
+    let mut experts = Vec::with_capacity(n_slots);
+    for slot in 0..n_slots {
+        let x = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
         let gate_up = load_weight_tensor(
             hfq,
             gpu,
