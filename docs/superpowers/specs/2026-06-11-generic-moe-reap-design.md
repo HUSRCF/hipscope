@@ -16,7 +16,10 @@ via an env-gated keep-map sidecar (`HIPFIRE_DEEPSEEK4_REAP_KEEPMAP`). It validat
 We want two generalizations:
 
 1. **Generic across all MoE archs.** Any user should be able to selectively reap any MoE
-   model — `deepseek4`, `qwen35`, `cohere2moe`, `lfm2moe`, `minimax` — not just ds4.
+   model — not just ds4. Target archs present on the integration base are `deepseek4`,
+   `qwen35`, `lfm2moe`, `minimax`. **`cohere2moe` is currently in-flight on branch
+   `nw_cohere2moe_support` and not yet on master** — it gets the *identical* one-call
+   `ExpertLoaderHook` wiring once it merges; we do not build on that moving branch here.
 2. **Lightweight selective re-quant.** Selectively up- or down-quant specific layers/experts
    *without* re-quantizing the whole model, to iterate and fine-tune a quant config cheaply.
 
