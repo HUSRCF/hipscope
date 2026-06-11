@@ -18,6 +18,7 @@
 use crate::deepseek4::{
     DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights,
 };
+use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -986,12 +987,9 @@ impl DeepseekV4 {
             // reading Q8 bytes as MQ4 blocks → NaN logits at layer 3+
             // (the first non-hash layer that runs moe_route).
             // Per-layer keep slice (None ⇒ keep-all / no plan ⇒ full upload).
-            let keep_l: Option<Vec<u32>> = cfg
-                .reap_keep
-                .as_ref()
-                .and_then(|r| r.expert_plan(l).keep().map(|k| k.to_vec()));
+            let ep = cfg.reap_keep.as_ref().map(|r| r.expert_plan(l));
             let gate_name = format!("layers.{l}.ffn.gate.weight");
-            layer.gate_weight = Some(match keep_l.as_deref() {
+            layer.gate_weight = Some(match ep.as_ref().and_then(|p| p.keep()) {
                 Some(keep) => Self::upload_quant_or_f16_keep(hfq, gpu, &gate_name, keep)?,
                 None => Self::upload_quant_or_f16(hfq, gpu, &gate_name)?,
             });
@@ -1000,7 +998,7 @@ impl DeepseekV4 {
                 // either be added on-device or downloaded once for CPU
                 // topk. Also cache host-side for the CPU-routing path.
                 let bias_name = format!("layers.{l}.ffn.gate.bias");
-                let bias_gpu = match keep_l.as_deref() {
+                let bias_gpu = match ep.as_ref().and_then(|p| p.keep()) {
                     Some(keep) => {
                         Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, keep)?
                     }
@@ -1022,7 +1020,8 @@ impl DeepseekV4 {
                     // read the sidecar table instead of the file's original.
                     let bytes: Vec<u8> = match cfg.reap_keep.as_ref() {
                         Some(plan) => {
-                            let p = crate::deepseek4::Ds4ReapHook::tid2eid_path(plan, l);
+                            let p = crate::deepseek4::Ds4ReapHook
+                                .sidecar_path(plan, &format!("tid2eid_l{l}.i32"));
                             std::fs::read(&p)
                                 .map_err(|e| format!("deepseek4: REAP tid2eid read {p:?}: {e}"))?
                         }

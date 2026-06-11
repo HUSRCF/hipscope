@@ -257,14 +257,6 @@ pub struct Ds4ReapHook;
 
 impl hipfire_reap::hook::ReapArchHook for Ds4ReapHook {}
 
-impl Ds4ReapHook {
-    /// Path to the remapped hash-router `tid2eid` table for a hash layer,
-    /// inside the plan dir. Preserves the legacy `tid2eid_l{layer}.i32` name.
-    pub fn tid2eid_path(plan: &hipfire_reap::plan::ReapPlan, layer: usize) -> std::path::PathBuf {
-        plan.dir.join(format!("tid2eid_l{layer}.i32"))
-    }
-}
-
 /// Per-layer GPU-resident weights. Slots match DeepSeek V4 shipped tensor
 /// inventory; each is `Option<GpuTensor>` so partial-upload paths
 /// (host walk only / minimal upload / full upload) can populate
