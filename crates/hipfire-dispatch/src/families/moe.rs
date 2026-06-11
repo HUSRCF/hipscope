@@ -57,6 +57,13 @@ pub struct MoeResolution {
     pub gate_side_mq4: bool,
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq6: bool,
+    /// Mixed routed experts: gate_up MQ4, down MQ6 (the "mq6-down" lever —
+    /// promote only the sensitive residual-write projection to 6-bit while
+    /// gate_up stays 4-bit). Indexable on the decode GPU-top-K path: gate_up
+    /// uses the MQ4 indexed GEMV, down uses the MQ6 indexed GEMV, silu+rotate
+    /// (optionally AWQ) is weight-agnostic. Decode-only (prefill Path-0 on
+    /// gfx9* has no MQ6 down arm; eval scores per-token = decode).
+    pub routed_indexable_mixed_gu4_dn6: bool,
     pub routed_indexable_paro: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
@@ -77,11 +84,14 @@ impl MoeResolution {
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
+        let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
 
-        let routed_dtype_indexable =
-            routed_indexable_mq4 || routed_indexable_mq6 || routed_indexable_paro;
+        let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq6
+            || routed_indexable_mixed_gu4_dn6
+            || routed_indexable_paro;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
@@ -93,6 +103,7 @@ impl MoeResolution {
             gate_side_mq4,
             routed_indexable_mq4,
             routed_indexable_mq6,
+            routed_indexable_mixed_gu4_dn6,
             routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
@@ -100,7 +111,10 @@ impl MoeResolution {
     }
 
     pub fn routed_indexable(&self) -> bool {
-        self.routed_indexable_mq4 || self.routed_indexable_mq6 || self.routed_indexable_paro
+        self.routed_indexable_mq4
+            || self.routed_indexable_mq6
+            || self.routed_indexable_mixed_gu4_dn6
+            || self.routed_indexable_paro
     }
 }
 

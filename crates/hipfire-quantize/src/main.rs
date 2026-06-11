@@ -6133,6 +6133,13 @@ fn main() {
                 && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
+            // HIPFIRE_MOE_DOWN_MQ6=1: promote ONLY the expert down_proj to MQ6
+            // (gate_up stays MQ4) — the "mq6-down" precision lever, composable
+            // with down-AWQ. Kept OUT of `expert_mq6` so `expert_awq_active` still
+            // fires; the AWQ branch below switches its output format to MQ6.
+            let down_mq6 = std::env::var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
+                && base_name == "down_proj"
+                && supports_g256;
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
             // (overrides any kmap promotion). The intent is to inject MQ2
             // noise specifically on the routed-expert tensors, so even
@@ -6271,11 +6278,11 @@ fn main() {
                     let (quantized, qt, gs) = if let Some(scales) = awq_scales.as_ref() {
                         let mut scaled = f32_slice.clone();
                         awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, scales);
-                        (
-                            quantize_mq4g256(&scaled, &signs1, &signs2),
-                            QuantType::MQ4G256,
-                            256u32,
-                        )
+                        if down_mq6 {
+                            (quantize_mq6g256(&scaled, &signs1, &signs2), QuantType::MQ6G256, 256u32)
+                        } else {
+                            (quantize_mq4g256(&scaled, &signs1, &signs2), QuantType::MQ4G256, 256u32)
+                        }
                     } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
@@ -6316,7 +6323,7 @@ fn main() {
                         );
                         let q = quantize_hfq4g256(&dequant);
                         (q, QuantType::HFQ4G256, 256u32)
-                    } else if expert_mq6 {
+                    } else if expert_mq6 || down_mq6 {
                         let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ6G256, 256u32)
                     } else if expert_hfq6 {
@@ -6363,7 +6370,7 @@ fn main() {
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if expert_awq_active && awq_in_sum2_per_expert.is_some() {
-                "MQ4G256+AWQ"
+                if down_mq6 { "MQ6G256+AWQ" } else { "MQ4G256+AWQ" }
             } else if expert_mq3lloyd_native {
                 "MQ3G256L"
             } else if expert_mq2lloyd_native {
@@ -6374,7 +6381,7 @@ fn main() {
                 }
             } else if expert_mq2lloyd_roundtrip {
                 "MQ2L→HFQ4"
-            } else if expert_mq6 {
+            } else if expert_mq6 || down_mq6 {
                 "MQ6G256"
             } else if expert_hfq6 {
                 "HFQ6G256"

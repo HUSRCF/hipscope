@@ -374,7 +374,9 @@ pub fn run_moe_decode(
     }
 
     // ── Indexed routed experts ────────────────────────────────────────────────
-    if res.routed_indexable_mq4 {
+    // Signs back the FWHT used by every MQ4/MQ6 gate_up rotation + silu-rotate
+    // (idempotent/cached). Only the paro path is sign-free.
+    if !res.routed_indexable_paro {
         hip!(gpu.ensure_mq_signs())?;
     }
     let xr = x_rot_local.expect("use_gpu_topk implies x_rot_local is Some");
@@ -382,19 +384,22 @@ pub fn run_moe_decode(
     let down_m    = p.routed_down_m;
     let down_k    = p.routed_down_k;
 
-    if res.routed_indexable_mq4 {
-        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+    // Select gate_up + down GEMVs by their INDIVIDUAL dtypes, not a coupled
+    // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
+    // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
+    // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
+    if res.routed_indexable_paro {
+        hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
-    } else if res.routed_indexable_mq6 {
+    } else if p.dtypes.routed_gate_up == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
     } else {
-        // routed_indexable_paro
-        hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
+        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
@@ -422,21 +427,20 @@ pub fn run_moe_decode(
         hip!(gpu.fused_silu_mul_rotate_mq_batched(p.gate_batch, p.up_batch, p.rot_batch, p.mi, p.k))?;
     }
 
-    // Expanded write
+    // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-    if res.routed_indexable_mq4 {
-        hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+    if res.routed_indexable_paro {
+        hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
-    } else if res.routed_indexable_mq6 {
+    } else if p.dtypes.routed_down == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
     } else {
-        // paro
-        hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+        hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;

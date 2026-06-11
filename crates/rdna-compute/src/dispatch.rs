@@ -267,6 +267,7 @@ impl DType {
         matches!(
             self,
             DType::MQ4G256
+                | DType::MQ6G256
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
