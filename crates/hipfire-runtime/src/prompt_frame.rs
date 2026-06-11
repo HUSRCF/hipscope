@@ -518,6 +518,15 @@ pub struct Message {
     /// `is defined` against it don't see a misleading null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assistant-turn reasoning that preceded a tool call ("interleaved
+    /// thinking"). Rendered into the Cohere/North chat template's
+    /// `<|START_THINKING|>{{message.tool_plan}}<|END_THINKING|>` slot so a
+    /// multi-turn agentic flow preserves prior reasoning (per the
+    /// North-Mini-Code model card — "pass model-generated thinking to future
+    /// agentic steps/turns"). Empty for plain turns / non-thinking models;
+    /// always serialized (templates that don't reference it ignore the field).
+    #[serde(default)]
+    pub tool_plan: String,
 }
 
 /// One assistant-emitted tool call, attached to an assistant `Message`.
@@ -610,6 +619,7 @@ impl<'a> JinjaChatFrame<'a> {
                 content: sys.to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             });
         }
         messages.push(Message {
@@ -617,6 +627,7 @@ impl<'a> JinjaChatFrame<'a> {
             content: self.user.to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         });
         self.render_messages(&messages, None, None)
     }
@@ -827,6 +838,7 @@ pub fn build_cached_history_jinja(
                     content: sentinel.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    tool_plan: String::new(),
                 });
                 continue;
             }
@@ -1325,6 +1337,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1387,12 +1400,14 @@ mod tests {
                 content: "be brief".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Assistant,
@@ -1402,12 +1417,14 @@ mod tests {
                     arguments: serde_json::json!({"city":"SF"}),
                 }],
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Tool,
                 content: "72F".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
+                tool_plan: String::new(),
             },
         ];
         let out = frame

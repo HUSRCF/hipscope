@@ -43,31 +43,45 @@ fn main() {
 
     // (A) plain multi-turn — known good.
     let plain = vec![
-        Message { role: Role::User, content: "Hi".into(), tool_calls: vec![], tool_call_id: None },
-        Message { role: Role::Assistant, content: "Hello!".into(), tool_calls: vec![], tool_call_id: None },
-        Message { role: Role::User, content: "List files.".into(), tool_calls: vec![], tool_call_id: None },
+        Message { role: Role::User, content: "Hi".into(), tool_calls: vec![], tool_call_id: None, tool_plan: String::new() },
+        Message { role: Role::Assistant, content: "Hello!".into(), tool_calls: vec![], tool_call_id: None, tool_plan: String::new() },
+        Message { role: Role::User, content: "List files.".into(), tool_calls: vec![], tool_call_id: None, tool_plan: String::new() },
     ];
     match frame.render_messages(&plain, Some(tools_arr), None) {
         Ok(_) => println!("(A) plain multi-turn + tools: OK"),
         Err(e) => println!("(A) plain multi-turn + tools: ERR -> {e}"),
     }
 
-    // (B) THE PI CASE: assistant turn WITH tool_calls, then a tool result.
+    // (B) THE PI CASE: assistant turn WITH tool_calls + the reasoning that
+    // preceded it (tool_plan), then a tool result. North "interleaved thinking"
+    // requires that prior reasoning survive into the rendered prompt's
+    // <|START_THINKING|>{{message.tool_plan}}<|END_THINKING|> slot.
+    let reasoning = "I need to inspect the repo layout first, so I will run ls.";
     let agentic = vec![
-        Message { role: Role::User, content: "Implement a Blink-hash tree.".into(), tool_calls: vec![], tool_call_id: None },
+        Message { role: Role::User, content: "Implement a Blink-hash tree.".into(), tool_calls: vec![], tool_call_id: None, tool_plan: String::new() },
         Message {
             role: Role::Assistant,
             content: "".into(),
             tool_calls: vec![ToolCall { name: "bash".into(), arguments: serde_json::json!({"command":"ls -la"}) }],
             tool_call_id: None,
+            tool_plan: reasoning.into(),
         },
-        Message { role: Role::Tool, content: "total 7896\ndrwx... blink_hash.pdf".into(), tool_calls: vec![], tool_call_id: Some("0".into()) },
+        Message { role: Role::Tool, content: "total 7896\ndrwx... blink_hash.pdf".into(), tool_calls: vec![], tool_call_id: Some("0".into()), tool_plan: String::new() },
     ];
     match frame.render_messages(&agentic, Some(tools_arr), None) {
         Ok(r) => {
             println!("(B) agentic (tool_calls in history): OK — {} chars", r.len());
             println!("--- tail ---\n{}", &r[r.len().saturating_sub(400)..]);
+            if r.contains(reasoning) {
+                println!("(B) PASS: assistant tool_plan reasoning preserved in rendered prompt");
+            } else {
+                eprintln!("(B) FAIL: assistant reasoning was DROPPED from the rendered prompt");
+                std::process::exit(1);
+            }
         }
-        Err(e) => println!("(B) agentic (tool_calls in history): ERR -> {e}   <<< this is the bug (falls back to ChatML)"),
+        Err(e) => {
+            eprintln!("(B) agentic (tool_calls in history): ERR -> {e}   <<< render_messages errored");
+            std::process::exit(1);
+        }
     }
 }

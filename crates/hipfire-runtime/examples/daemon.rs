@@ -5674,6 +5674,7 @@ fn generate_ep(
                                 content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                         }
                         v.push(hipfire_runtime::prompt_frame::Message {
@@ -5681,6 +5682,7 @@ fn generate_ep(
                             content: prompt.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                         synthesized = v;
                         &synthesized
@@ -6593,6 +6595,7 @@ fn generate_dflash(
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -6600,6 +6603,7 @@ fn generate_dflash(
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -7877,6 +7881,7 @@ fn generate_multi(
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -7884,6 +7889,7 @@ fn generate_multi(
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -9282,6 +9288,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -9289,6 +9296,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -12381,6 +12389,7 @@ fn generate_lfm2moe(
                                 content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                         }
                         v.push(hipfire_runtime::prompt_frame::Message {
@@ -12388,6 +12397,7 @@ fn generate_lfm2moe(
                             content: prompt.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                         synthesized = v;
                         &synthesized
@@ -12625,6 +12635,7 @@ fn generate_minimax(
                                 content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                         }
                         v.push(hipfire_runtime::prompt_frame::Message {
@@ -12632,6 +12643,7 @@ fn generate_minimax(
                             content: prompt.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                         synthesized = v;
                         &synthesized
@@ -13006,6 +13018,7 @@ fn generate_cohere2moe(
                                 content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                         }
                         v.push(hipfire_runtime::prompt_frame::Message {
@@ -13013,6 +13026,7 @@ fn generate_cohere2moe(
                             content: prompt.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                         synthesized = v;
                         &synthesized

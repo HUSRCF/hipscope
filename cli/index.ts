@@ -2039,7 +2039,20 @@ async function serve(port: number, host: string) {
             }
             const entry: any = { role, content: "" };
             if (role === "assistant") {
-              entry.content = stripThinkingInline(extractText(m.content));
+              const rawContent = extractText(m.content);
+              entry.content = stripThinkingInline(rawContent);
+              // Preserve prior-turn reasoning for Cohere/North "interleaved
+              // thinking": carry it in `tool_plan` (rendered into the template's
+              // <|START_THINKING|>{{message.tool_plan}}<|END_THINKING|> slot on
+              // agentic turns). Content stays stripped — Qwen needs that and
+              // ignores tool_plan; only the Cohere template reads it. Prefer an
+              // explicit reasoning field, else fall back to an inline <think>.
+              const inlineThink = (rawContent.match(/<think>([\s\S]*?)<\/think>/)?.[1] ?? "").trim();
+              const reasoning =
+                (typeof m.reasoning === "string" && m.reasoning) ||
+                (typeof m.reasoning_content === "string" && m.reasoning_content) ||
+                inlineThink || "";
+              if (reasoning) entry.tool_plan = reasoning;
               if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
                 const tcs: any[] = [];
                 for (const tc of m.tool_calls) {
