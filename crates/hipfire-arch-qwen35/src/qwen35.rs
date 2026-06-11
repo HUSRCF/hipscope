@@ -1443,16 +1443,7 @@ pub fn load_weights(
         // Track page range for this layer so we can MADV_DONTNEED after upload.
         let layer_page_start = hfq.layer_data_range(&p);
 
-        let mut b = HfqBackend {
-            hfq, gpu, norm_bias: 1.0,
-            candidates: qwen35_tensor_name_candidates,
-            read_proj: load_weight_tensor,
-            layer: i,
-        };
-        let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
-            load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
-        };
-        layers.push(crate::layer_driver::load_layer(&mut b, config, i, moe)?);
+        layers.push(load_layer_into(hfq, config, i, &p, gpu)?);
         // Drop mmap page cache for this layer (supplements pread-based loading).
         if let Some((start, end)) = layer_page_start {
             hfq.drop_pages_range(start, end - start);
@@ -1578,6 +1569,9 @@ pub fn load_weights_paroquant(
     })
 }
 
+// @todo(unified-loading): multi-GPU is HFQ-only — no ParoBackend/safetensors
+// multi-GPU path (drop_pages_range has no ModelSource equivalent, band-routing
+// is HFQ-mmap-specific). See 2026-06-11-carrier-registry-unified-design.md.
 /// Multi-GPU weight loader. Variant 2 placement: `token_embd` on `gpus.devices[0]`,
 /// `output_norm + output` on `gpus.devices[gpus.output_device]`, each layer on
 /// `gpus.devices[gpus.device_for_layer(i)]`. The single-GPU `load_weights` path is
