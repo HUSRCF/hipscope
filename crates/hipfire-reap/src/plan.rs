@@ -47,6 +47,7 @@ pub struct ReapPlan {
 }
 
 impl ReapPlan {
+    /// Returns 0 if keep is Some with an empty outer vec (cannot arise from load()).
     pub fn kept_per_layer(&self) -> usize {
         match &self.keep {
             Some(k) => k.first().map(|r| r.len()).unwrap_or(0),
@@ -137,10 +138,18 @@ impl ReapPlan {
                 let role = Role::parse(
                     o["role"].as_str().ok_or_else(|| format!("reap: quant_override[{i}] missing role"))?,
                 )?;
-                let experts: Vec<u32> = o["experts"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
-                    .unwrap_or_default();
+                let experts: Vec<u32> = if let Some(a) = o["experts"].as_array() {
+                    a.iter().enumerate().map(|(j, x)| {
+                        let n = x.as_u64()
+                            .ok_or_else(|| format!("reap: quant_override[{i}] experts[{j}] not an integer"))? as u32;
+                        if n as usize >= original_experts {
+                            return Err(format!("reap: quant_override[{i}] expert {n} >= original_experts {original_experts}"));
+                        }
+                        Ok(n)
+                    }).collect::<Result<Vec<_>, String>>()?
+                } else {
+                    Vec::new()
+                };
                 if !experts.is_empty() && role != Role::RoutedExperts {
                     return Err(format!(
                         "reap: quant_override[{i}] lists experts but role is not routed_experts"
@@ -223,5 +232,25 @@ mod tests {
         let d = write_plan(r#"{"original_experts":4,"num_layers":3,"keep":{"per_layer":[[0,1]]}}"#);
         let err = ReapPlan::load(d.path().to_str().unwrap(), 3, 4).unwrap_err();
         assert!(err.contains("keep.per_layer has 1 layers"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_integer_override_expert() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":1,
+                "quant_overrides":[{"layer":0,"role":"routed_experts","experts":[1,"bad"],"tier":"q8"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("not an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_override_expert() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":1,
+                "quant_overrides":[{"layer":0,"role":"routed_experts","experts":[9],"tier":"q8"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains(">= original_experts 4"), "got: {err}");
     }
 }

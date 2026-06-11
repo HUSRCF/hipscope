@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
-rdna-compute = { path = "../rdna-compute" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]

@@ -37,6 +37,7 @@ impl<'a> ExpertPlan<'a> {
         self.keep
     }
     /// Original expert index for a compact slot (identity when no keep map).
+    /// Panics if slot >= n_slots(full); callers must iterate 0..n_slots(full).
     pub fn src(&self, slot: usize) -> usize {
         self.keep.map(|k| k[slot] as usize).unwrap_or(slot)
     }
