@@ -12,6 +12,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod reap_overlay;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -697,7 +698,7 @@ fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q8_0 format (compatible with GGML Q8_0).
 /// Block: f16 scale (2B) + 32 × int8 = 34 bytes per 32 elements (1.0625 bytes/weight).
 /// Symmetric quantization: scale = max(|w|) / 127, q = round(w / scale).
-fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 32;
     let block_bytes = 34;
     let n = f32_data.len();
@@ -799,7 +800,7 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
 }
 
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
     (0..n)
         .map(|_| {
@@ -816,7 +817,7 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
-fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
@@ -859,7 +860,7 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
-fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
@@ -954,7 +955,7 @@ fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
-fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
@@ -1673,7 +1674,7 @@ fn f32_to_fp16_bits(v: f32) -> u16 {
 /// Lloyd's algorithm. 16 B header (8 fp16) + 96 B packed 3-bit indices = 112 B/group
 /// (vs uniform MQ3's 104 B — only +7.7% bandwidth). Direct extension of MQ2-Lloyd
 /// with K=8; targets sub-9B MQ3 collapse rescue (#114) and 9B MQ3 → MQ4 ppl gap.
-fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 112;
@@ -1802,7 +1803,7 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
 /// `benchmarks/results/devlog_20260506_lloyd_mq4_extension.md`) is that the
 /// 16-centroid placement narrows the MQ4 → MQ6 ppl gap at lower bandwidth
 /// than uniform MQ6 (200 B/group).
-fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 160;
@@ -2395,7 +2396,7 @@ fn quantize_mq2g256_lloyd_gptq(
     output
 }
 
-fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 72;
@@ -2915,7 +2916,7 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
 
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
-fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
@@ -3031,8 +3032,8 @@ const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
-enum QuantType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuantType {
     Q4F16G64 = 0,
     F16 = 1,
     F32 = 2,
@@ -3316,15 +3317,16 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     QuantLevel::Base
 }
 
-struct HfqTensor {
-    name: String,
-    quant_type: QuantType,
-    shape: Vec<u32>,
-    group_size: u32,
-    data: Vec<u8>,
+#[derive(Debug)]
+pub(crate) struct HfqTensor {
+    pub(crate) name: String,
+    pub(crate) quant_type: QuantType,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) group_size: u32,
+    pub(crate) data: Vec<u8>,
     /// When data is spilled to disk, this holds the byte count.
     /// `data` is empty and the bytes live in the spill file.
-    spilled_len: u64,
+    pub(crate) spilled_len: u64,
 }
 
 /// Streaming tensor spill file. When the quantizer accumulates more than
