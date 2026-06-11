@@ -162,8 +162,10 @@ fn load_wt(
 /// for any row-independent quant (every per-expert row is self-contained — its
 /// own scale/zero/codebook live in the row), which holds for every quant_type
 /// `wt_from_raw` accepts. `keep` MUST be in compact slot order and `m` MUST
-/// equal `keep.len()`. Reads owned bytes via the same `read_tensor` helper as
-/// the non-keep path (pread-based `tensor_data_vec`), so no fresh-alloc API.
+/// equal `keep.len()`. Reads owned bytes via `hfq.tensor_data_vec` directly
+/// (bypassing the `read_tensor` wrapper) to retain `info.shape` for deriving
+/// the original row count — the non-keep path uses `read_tensor`, which
+/// discards `info`.
 fn load_wt_keep(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -494,7 +496,7 @@ impl Lfm2MoeWeights {
                 // index loaded into slot (slot==e on the no-keep identity path).
                 let mut experts = Vec::with_capacity(n_exp);
                 for slot in 0..n_exp {
-                    let e = reap_ep.as_ref().map(|p| p.src(slot)).unwrap_or(slot);
+                    let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
                     let ep = format!("{p}.feed_forward.experts.{e}");
                     let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                     let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
