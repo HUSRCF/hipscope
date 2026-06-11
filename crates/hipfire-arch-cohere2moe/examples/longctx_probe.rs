@@ -119,14 +119,18 @@ fn main() {
         }
         i = end;
         if i >= cp {
-            let (argmax, pmax, ent, top5) = analyze(&last);
+            let (argmax, pmax, ent, _top5) = analyze(&last);
             let is_pad = Some(argmax) == pad;
             let dec = tok.decode(&[argmax]);
-            let top5s: Vec<String> = top5.iter().map(|(id, p)| format!("{id}:{p:.3}")).collect();
-            let flag = if is_pad { "  <<< PAD COLLAPSE" } else { "" };
+            // The ACTUAL next token of the (tiled) stream. If argmax == this, the
+            // model is just COPYING the repeated doc (correct induction-head
+            // behavior on the 2nd pass) — NOT a degenerate collapse.
+            let actual = toks.get(cp).copied();
+            let actual_dec = actual.map(|t| tok.decode(&[t])).unwrap_or_default();
+            let copying = actual == Some(argmax);
             println!(
-                "  {:>6}  {:>8}  {:.4}  {:>7.3}  {:>6}  {:?}  | {}{flag}",
-                cp, argmax, pmax, ent, is_pad, dec, top5s.join(" ")
+                "  {:>6}  argmax={:>8} {:>10?}  pmax={:.4} ent={:>6.3} is_pad={:<5} | actual_next={:?} COPYING={}",
+                cp, argmax, dec, pmax, ent, is_pad, actual_dec, copying
             );
             cp_idx += 1;
         }
