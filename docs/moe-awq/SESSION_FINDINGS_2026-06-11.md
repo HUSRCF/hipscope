@@ -235,3 +235,37 @@ batched-prefill to unlock T3-3L** (highest ROI — turns a measured iso-size win
 one + makes both graded SKUs daemon-serveable); (3) tune the 20/30/50 boundary (25/35/40, or cold
 MQ2L→MQ3L) to convert T3-2L's tie into a clean sub-MQ4 win; (4) do NOT add more tiers until the
 prefill port lands.
+
+---
+
+## 10. CONSOLIDATED variant table (canonical reference)
+All KLD: per-token, q8 KV, max-chunks 32, vs f32 oracle `q36a3b-f32-oracle.hfq`. Corpora:
+wt2 = wikitext-2 (general), ag = agentic/code. Sorted by size.
+
+| # | Variant | gate_up / down | size GB | wt2 KLD | ag KLD | coherent | verdict |
+|---|---|---|---|---|---|---|---|
+| — | f32 oracle | f32 / f32 | 138 | 0 | 0 | yes | ref (PPL 5.350/5.902) |
+| 1 | MQ2-Lloyd uniform | MQ2L / MQ2L | 11.6 | 0.238 | 0.466 | yes | frontier (floor) |
+| 2 | MQ3-Lloyd uniform | MQ3L / MQ3L | 16.6 | 0.071 | 0.242 | yes | DOMINATED by T3-2L |
+| 3 | **T3-2L graded** | 20/30/50 MQ6/MQ4/MQ2L both | 16.85 | 0.0352 | 0.1631 | yes | **frontier — ship (MQ4-lite, -14% size)** |
+| 4 | down-only binary | MQ4 / hot20%MQ6·cold80%MQ2L | 18.05 | 0.0770 | 0.2536 | yes | DOMINATED (wrong lever) |
+| 5 | MQ4 uniform (anchor) | MQ4 / MQ4 | 19.7 | 0.0339 | 0.1630 | yes | frontier (dense-AWQ baseline) |
+| 6 | down-AWQ | MQ4 / MQ4+AWQ | 19.7 | 0.0350 | 0.1596 | yes | wash vs MQ4 |
+| 7 | **T3-3L graded** | 20/30/50 MQ6/MQ4/MQ3L both | 19.76 | 0.0249 | 0.1332 | NO (decode-only) | beats MQ4 -26%/-18% iso-size; blocked on prefill |
+| 8 | d6 (down-only MQ6) | MQ4 / MQ6 | 22.3 | 0.0274 | 0.1352 | yes | KLD-helps PPL-flat (down=weak lever) |
+| 9 | MQ5 uniform | MQ5 / MQ5 | 23.7 | 0.0191 | 0.1060 | yes | frontier |
+| 10 | +P all-MQ6 | MQ6 / MQ6 | 27.7 | 0.0159 | 0.0868 | yes | frontier (high end) |
+
+**Pareto frontier (coherent only):** MQ2L(1) -> T3-2L(3) -> MQ4(5) -> MQ5(9) -> +P(10).
+T3-2L is the one new point graded ADDS to the frontier. T3-3L(7) would dominate MQ4 at
+19.7GB if serveable (blocked on MoE batched-prefill MQ3L parity).
+
+**Uniform-ladder PPL** (oracle wt2 5.350 / ag 5.902): MQ4 5.433/6.099, MQ5 5.413/6.051,
++P 5.396/5.967. Graded SKUs are KLD-only (PPL not captured).
+
+**Levers learned:** (a) bits win — quant fidelity >> block size; (b) gate_up is the
+DOMINANT lever (down-only MQ6/AWQ = KLD-helps/PPL-flat; the +P PPL win lives in gate_up);
+(c) graded multi-tier beats uniform at iso-size ONLY when the warm 20-50% band stays >=MQ4
+and only the 4%-contribution cold tail drops to MQ2L (binary 80/20 dumps the warm band ->
+loses); (d) union (agentic∪wt2) ranking holds both corpora; (e) first-order additive KLD
+model is optimistic ~20-26% (cold tier super-additive).
