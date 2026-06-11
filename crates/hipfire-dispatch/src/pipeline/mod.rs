@@ -382,6 +382,73 @@ pub fn run_moe_decode(
     let down_m    = p.routed_down_m;
     let down_k    = p.routed_down_k;
 
+    if res.mixed {
+        // ── Intra-layer MIXED-TIER routed dispatch (REAP SP2 Task 3) ──────────
+        //
+        // [GPU-GATE DEFERRED — implemented under embargo, numeric gate owed.]
+        // See the `mixed_dispatch_bucketing_equivalence` test stub below and the
+        // closing NOTE for exactly what a GPU session must verify.
+        //
+        // PROBLEM (the rank-alignment crux). The indexed kernels hardwire the
+        // top-k RANK to `blockIdx.y` (call it `krank`) and use it for BOTH the
+        // weight lookup AND the output address:
+        //   gate_up: expert_id = topk_indices[krank];
+        //            y_gate[krank*mi + row] / y_up[krank*mi + (row-mi)] = acc;
+        //   down   : expert_id = topk_indices[bid*K_TOP + krank];
+        //            expert_outputs[(bid*K_TOP + krank)*M + row] = acc;
+        //   combine: x_residual[token] += Σ_k topk_weights[k] * expert_outputs[k];
+        // `krank` always runs 0..gridDim.y starting at 0 — there is NO output-rank
+        // OFFSET parameter. So we canNOT hand a tier's kernel an arbitrary subset
+        // of ranks: it would write ranks 0,1,… (wrong slots) and the combine would
+        // pair them with the wrong weights.
+        //
+        // APPROACH (A) PERMUTE-TO-CONTIGUOUS — chosen. We reorder the top-k so
+        // every tier's selected experts occupy a CONTIGUOUS rank range [lo, lo+n),
+        // then drive each tier's existing kernel over that range via byte-offset
+        // sub-views (`GpuTensor::sub_offset`) of every per-rank buffer. With the
+        // grid launched as `n` workgroups and the views based at `lo`, the kernel's
+        // internal `krank ∈ 0..n` lands exactly in slots `lo..lo+n` of
+        // gate_batch / up_batch / rot_batch / down_expanded, and reads
+        // topk_indices[lo+krank] — correct by construction. No new kernel arg.
+        //
+        // Why (A) and not (B) compact+scatter: the down kernel writes one row per
+        // (krank) with no scatter map, so a compact temp buffer would still need a
+        // SEPARATE scatter kernel to fan rows back to their real rank slots — a new
+        // kernel. (A) needs zero new kernels: contiguity makes a single sub-view
+        // address the whole bucket. The only cost is a host permute of the (small,
+        // k≤8) top-k arrays + one H2D re-upload.
+        //
+        // BUCKETING-EQUIVALENCE INVARIANT (the deferred GPU gate): for an all-ONE-
+        // tier table the partition yields a single bucket, the permutation is the
+        // IDENTITY (ranks already 0..k in order), lo=0, n=k, and the sub-views are
+        // full-buffer views — so the mixed path executes byte-for-byte the same
+        // kernel calls as the uniform `else` arm. Equivalence therefore holds by
+        // construction; the GPU gate confirms it numerically (bit-identical
+        // down_expanded). NOTE: in practice `resolve()` sets mixed=false for an
+        // all-one-tier table, so the mixed path is only entered with ≥2 tiers; the
+        // identity case is the equivalence proof, not a live decode path.
+        //
+        // PER-TIER STRIDES. A mixed layer's experts differ ONLY in quant tier, not
+        // in logical shape: every expert has the same gate_up M/K and down M/K
+        // (REAP re-quantizes an expert in place; it never reshapes it). The kernel
+        // `m`/`k` args are ELEMENT counts (the per-group BYTE stride — 136 B MQ4 vs
+        // 200 B MQ6 — is hardcoded inside each kernel, never passed). Hence the
+        // uniform `p.routed_gate_up_k` / `routed_down_m` / `routed_down_k` are
+        // tier-INVARIANT and reused verbatim for every bucket. The ONLY per-tier
+        // decision is which kernel symbol to dispatch (selected from the bucket's
+        // `tier`). This assumption is asserted at the dispatch switch (an
+        // unsupported tier returns UnsupportedVariant rather than miscomputing).
+        //
+        // HOST TOP-K SYNC. The top-k indices are produced on-device by
+        // `moe_topk_renorm_k8` above; to bucket them we need them host-side. This
+        // path does a single blocking D2H of `topk_indices` (k≤8 i32) and
+        // `topk_weights` (k≤8 f32) — negligible at decode, and the only
+        // host/device sync the mixed path adds over the uniform path. (The uniform
+        // path keeps the top-k fully on-device; mixing is inherently a
+        // host-routing decision, so one small D2H is unavoidable without a
+        // device-side partition kernel — a possible future optimization.)
+        run_moe_decode_mixed(gpu, p, &res, xr, gate_up_k, down_m, down_k, out_target)?;
+    } else {
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
@@ -433,6 +500,7 @@ pub fn run_moe_decode(
             down_m, down_k, p.k, 1,
         ))?;
     }
+    } // end `else` (uniform path — BYTE-UNCHANGED from pre-SP2)
 
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     // EP: routed combine accumulates into `out_target` (the zeroed partial when
@@ -442,6 +510,247 @@ pub fn run_moe_decode(
     hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
 
     Ok(())
+}
+
+/// Intra-layer MIXED-TIER routed-expert dispatch (REAP SP2 Task 3).
+///
+/// [GPU-GATE DEFERRED] Implemented under embargo; the numeric bucketing-
+/// equivalence gate is owed to a GPU session (see
+/// `mixed_dispatch_bucketing_equivalence` stub + the rationale block at the
+/// `res.mixed` branch in `run_moe_decode`).
+///
+/// Runs the gate_up + fused-activation + down for each quant tier present in
+/// the top-k, reusing the existing single-tier indexed kernels. The crux —
+/// rank alignment — is solved by **permute-to-contiguous (Approach A)**:
+/// the top-k is reordered so each tier owns a contiguous rank range, then each
+/// tier's kernels are driven over that range through `GpuTensor::sub_offset`
+/// byte-offset views (the kernels have no output-rank offset arg, but a base
+/// offset on the per-rank buffers gives the same effect since their internal
+/// `krank` starts at 0).
+///
+/// On return, the per-rank `down_expanded` buffer is fully populated and the
+/// device-side `topk_weights` are PERMUTED to match the new rank order, so the
+/// caller's shared `moe_down_combine_k8_batched` (which sums all k slots with
+/// `topk_weights`) yields the correct, permutation-invariant per-token result.
+///
+/// Does NOT call the combine itself (the caller's shared line does), and does
+/// NOT touch `out_target` directly.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_decode_mixed(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams,
+    _res: &crate::families::moe::MoeResolution,
+    xr: &GpuTensor,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    _out_target: &GpuTensor,
+) -> Result<(), DispatchError> {
+    use crate::families::moe_buckets::bucket_topk_by_tier;
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+
+    let k = p.k;
+    let mi = p.mi;
+
+    // The mixed path is only reachable when per_expert_gate_up is Some AND spans
+    // >1 tier (resolve() guarantees this). per_expert_down is the parallel
+    // table; we bucket by gate_up tier and assert the same expert's down tier
+    // matches (REAP re-quantizes a whole expert to one tier, so gate_up and down
+    // share it — a future split-tier-per-expert model would need separate
+    // gate_up/down bucketing).
+    let tier_of_gate_up = p.dtypes.per_expert_gate_up.as_ref().ok_or(
+        DispatchError::UnsupportedVariant {
+            family: "moe", variant: "mixed-without-per-expert-gate-up-table",
+            arch: "", quant: "",
+        },
+    )?;
+    let tier_of_down = p.dtypes.per_expert_down.as_ref();
+
+    // ── Host top-k sync (single small D2H; see rationale block) ──────────────
+    // topk_indices are i32 stored in an F32-typed scratch tensor (4-byte slots).
+    let mut idx_bytes = vec![0u8; k * 4];
+    hip!(gpu.hip.memcpy_dtoh(&mut idx_bytes, &p.topk_indices.buf))?;
+    let topk_idx: Vec<u32> = idx_bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+        .collect();
+    let mut w_bytes = vec![0u8; k * 4];
+    hip!(gpu.hip.memcpy_dtoh(&mut w_bytes, &p.topk_weights.buf))?;
+    let topk_w: Vec<f32> = w_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // ── Partition by tier, then build the permutation to contiguous ranges ───
+    let buckets = bucket_topk_by_tier(&topk_idx, tier_of_gate_up);
+    let (perm, ranges) = build_contiguous_permutation(&buckets, k);
+
+    // Assert per-expert down tier agrees with the gate_up tier we bucketed on.
+    if let Some(td) = tier_of_down {
+        for b in &buckets {
+            for &e in &b.experts {
+                if td[e as usize] != b.tier {
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "moe",
+                        variant: "mixed-expert-gate_up-down-tier-mismatch",
+                        arch: "", quant: "",
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Re-upload permuted topk_indices + topk_weights to device ─────────────
+    // gate_up/down read topk_indices[rank]; the shared combine reads
+    // topk_weights[rank]. Writing the permuted order into the SAME scratch
+    // buffers keeps every downstream kernel using the contiguous-by-tier rank
+    // order. (Identity permutation ⇒ bytes unchanged ⇒ uniform-equivalent.)
+    let perm_idx: Vec<i32> = perm.iter().map(|&old| topk_idx[old] as i32).collect();
+    let perm_w: Vec<f32> = perm.iter().map(|&old| topk_w[old]).collect();
+    let idx_out: Vec<u8> = perm_idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let w_out: Vec<u8> = perm_w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    hip!(gpu.hip.memcpy_htod(&p.topk_indices.buf, &idx_out))?;
+    hip!(gpu.hip.memcpy_htod(&p.topk_weights.buf, &w_out))?;
+
+    // MQ tiers need the FWHT sign tables resident; ensure once if any bucket is
+    // an MQ tier (cheap idempotent no-op when already loaded).
+    if buckets
+        .iter()
+        .any(|b| matches!(b.tier, DType::MQ4G256 | DType::MQ6G256))
+    {
+        hip!(gpu.ensure_mq_signs())?;
+    }
+
+    // ── Per-tier dispatch over each bucket's contiguous rank range ───────────
+    // Every per-rank buffer is sub-offset to the bucket's [lo, lo+n) range so
+    // the kernel's internal `krank ∈ 0..n` lands in the right global slots:
+    //   topk_indices : i32/F32 slots, stride 1   → offset lo,    len n
+    //   gate_batch   : [k × mi] f32              → offset lo*mi, len n*mi
+    //   up_batch     : [k × mi] f32              → offset lo*mi, len n*mi
+    //   rot_batch    : [k × K]  f32 (K=down_k)   → offset lo*K,  len n*K
+    //   down_expanded: [k × M]  f32 (M=down_m)   → offset lo*M,  len n*M
+    // x (xr) is the shared per-token rotated activation — NOT per-rank — so it
+    // is passed whole to every bucket.
+    for (bi, b) in buckets.iter().enumerate() {
+        let (lo, n) = ranges[bi];
+        if n == 0 {
+            continue;
+        }
+        let idx_view = p.topk_indices.sub_offset(lo, n);
+        let gate_view = p.gate_batch.sub_offset(lo * mi, n * mi);
+        let up_view = p.up_batch.sub_offset(lo * mi, n * mi);
+        let rot_view = p.rot_batch.sub_offset(lo * down_k, n * down_k);
+        let down_view = p.down_expanded.sub_offset(lo * down_m, n * down_m);
+
+        // gate_up GEMV (m = 2*mi, gate and up halves), per tier.
+        match b.tier {
+            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs, &idx_view, xr,
+                &gate_view, &up_view, 2 * mi, gate_up_k,
+            ))?,
+            DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs, &idx_view, xr,
+                &gate_view, &up_view, 2 * mi, gate_up_k,
+            ))?,
+            DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs, &idx_view, xr,
+                &gate_view, &up_view, 2 * mi, gate_up_k,
+            ))?,
+            other => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe", variant: "mixed-gate_up-unsupported-tier",
+                    arch: "", quant: dtype_name(other),
+                })
+            }
+        }
+
+        // Fused silu·mul·rotate over this bucket's n ranks.
+        match b.tier {
+            DType::ParoQ4G128 => {
+                let paro_down = p.routed_down_paro.as_ref().ok_or(
+                    DispatchError::UnsupportedVariant {
+                        family: "moe", variant: "mixed-paro-without-down-sidecar",
+                        arch: "", quant: "",
+                    },
+                )?;
+                hip!(gpu.fused_silu_mul_givens_rotate_f32(
+                    &gate_view, &up_view, &rot_view,
+                    &paro_down.pairs, &paro_down.theta, &paro_down.scales,
+                    n, mi, paro_down.krot,
+                ))?;
+            }
+            // MQ4 / MQ6 share the FWHT activation (no AWQ on expert down for A3B).
+            _ => hip!(gpu.fused_silu_mul_rotate_mq_batched(
+                &gate_view, &up_view, &rot_view, mi, n,
+            ))?,
+        }
+
+        // down GEMV → expanded write into this bucket's rank slots. k_top = n,
+        // batch_size = 1 ⇒ routing_base = 0 ⇒ reads idx_view[krank], writes
+        // down_view[krank*M] for krank ∈ 0..n. FIXME(Step 8): batch_size.
+        match b.tier {
+            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, &idx_view, &rot_view, &down_view,
+                down_m, down_k, n, 1,
+            ))?,
+            DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, &idx_view, &rot_view, &down_view,
+                down_m, down_k, n, 1,
+            ))?,
+            DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                p.expert_down_ptrs, &idx_view, &rot_view, &down_view,
+                down_m, down_k, n, 1,
+            ))?,
+            other => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe", variant: "mixed-down-unsupported-tier",
+                    arch: "", quant: dtype_name(other),
+                })
+            }
+        }
+    }
+
+    // Combine is the caller's shared `moe_down_combine_k8_batched` (it now reads
+    // the permuted topk_weights → permutation-invariant per-token sum).
+    Ok(())
+}
+
+/// Build the permute-to-contiguous mapping for the mixed-tier path (pure; CPU-
+/// unit-tested). Given the per-tier `buckets` (first-seen order) and the top-k
+/// width `k`, returns `(perm, ranges)` where:
+///   - `perm[new_rank] = old_rank` — concatenating each bucket's `ranks` makes
+///     every tier a contiguous block in the new order.
+///   - `ranges[b] = (lo, n)` — bucket `b`'s contiguous `[lo, lo+n)` slice.
+///
+/// EQUIVALENCE INVARIANT (CPU-checkable here): for an all-ONE-tier table there
+/// is exactly one bucket whose `ranks` are already `0..k` in order, so `perm`
+/// is the IDENTITY and `ranges == [(0, k)]`. That is what makes the mixed path
+/// emit the same kernel calls as the uniform path for a uniform table.
+fn build_contiguous_permutation(
+    buckets: &[crate::families::moe_buckets::TierBucket],
+    k: usize,
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut perm: Vec<usize> = Vec::with_capacity(k);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(buckets.len());
+    for b in buckets {
+        let lo = perm.len();
+        perm.extend_from_slice(&b.ranks);
+        ranges.push((lo, b.ranks.len()));
+    }
+    debug_assert_eq!(perm.len(), k, "permutation must cover all k ranks");
+    (perm, ranges)
+}
+
+/// Static name for a DType (for UnsupportedVariant.quant in the mixed path).
+fn dtype_name(d: DType) -> &'static str {
+    match d {
+        DType::MQ4G256 => "MQ4G256",
+        DType::MQ6G256 => "MQ6G256",
+        DType::ParoQ4G128 => "ParoQ4G128",
+        _ => "other",
+    }
 }
 
 /// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393
@@ -1197,5 +1506,86 @@ pub fn dispatch_fused(
             family: "pipeline_fused", variant: "unknown",
             arch: "", quant: "",
         }),
+    }
+}
+
+#[cfg(test)]
+mod mixed_dispatch_tests {
+    use super::build_contiguous_permutation;
+    use crate::families::moe_buckets::bucket_topk_by_tier;
+    use rdna_compute::DType::*;
+
+    /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the
+    /// IDENTITY permutation and a single full-width range. This is the
+    /// host-side proof that the mixed path emits the same per-rank kernel
+    /// addressing as the uniform path for a uniform table — the device half
+    /// (bit-identical `down_expanded`) is the GPU-deferred gate below.
+    #[test]
+    fn all_one_tier_is_identity_permutation() {
+        let topk = [3u32, 7, 1, 5, 0, 2, 6, 4];
+        let tier_of = vec![MQ4G256; 8];
+        let buckets = bucket_topk_by_tier(&topk, &tier_of);
+        assert_eq!(buckets.len(), 1, "uniform table ⇒ one bucket");
+        let (perm, ranges) = build_contiguous_permutation(&buckets, 8);
+        assert_eq!(perm, (0..8).collect::<Vec<_>>(), "identity perm");
+        assert_eq!(ranges, vec![(0, 8)], "single full-width range");
+    }
+
+    /// A mixed table groups each tier into a contiguous range; `perm` is a
+    /// bijection over 0..k and `ranges` tile [0, k) with no gaps/overlap.
+    #[test]
+    fn mixed_table_is_contiguous_partition() {
+        // experts: even→MQ4, odd→MQ6. top-k interleaves tiers.
+        let tier_of = vec![MQ4G256, MQ6G256, MQ4G256, MQ6G256, MQ4G256, MQ6G256];
+        let topk = [1u32, 0, 3, 2, 5, 4]; // ranks 0..5; tiers MQ6,MQ4,MQ6,MQ4,MQ6,MQ4
+        let buckets = bucket_topk_by_tier(&topk, &tier_of);
+        assert_eq!(buckets.len(), 2);
+        let (perm, ranges) = build_contiguous_permutation(&buckets, 6);
+
+        // perm is a bijection over 0..6.
+        let mut seen = perm.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..6).collect::<Vec<_>>());
+
+        // ranges tile [0,6) contiguously, summing to k.
+        let total: usize = ranges.iter().map(|&(_, n)| n).sum();
+        assert_eq!(total, 6);
+        let mut cursor = 0;
+        for &(lo, n) in &ranges {
+            assert_eq!(lo, cursor, "ranges must be gap-free & contiguous");
+            cursor += n;
+        }
+        assert_eq!(cursor, 6);
+
+        // Within each range, perm lists exactly that bucket's original ranks.
+        for (bi, b) in buckets.iter().enumerate() {
+            let (lo, n) = ranges[bi];
+            assert_eq!(&perm[lo..lo + n], b.ranks.as_slice());
+        }
+    }
+
+    // ── [GPU — DEFERRED] bucketing-equivalence numeric gate ─────────────────
+    //
+    // NOTE: deferred — GPU under embargo. Cannot run; left as an executable
+    // stub so a future GPU session has the exact contract.
+    //
+    // WHAT IT MUST VERIFY: take a real qwen35/lfm2moe MoE decode layer whose
+    // experts are ALL ONE tier (e.g. all MQ4G256), and run it TWICE on identical
+    // inputs:
+    //   (1) UNIFORM path: per_expert_gate_up/down = None  (mixed = false).
+    //   (2) MIXED   path: per_expert_gate_up/down = Some(vec![<that tier>; n_exp])
+    //                     (force `mixed = true` despite the table being uniform).
+    // ASSERT the `down_expanded` buffers are BIT-IDENTICAL (and the final
+    // residual `out_target` is bit-identical). This proves the permute-to-
+    // contiguous decomposition is exact (the permutation is the identity for a
+    // uniform table, so any drift would expose a slicing/offset bug) BEFORE any
+    // real ≥2-tier mixing is trusted. Run on BOTH dispatch sites once the ds4
+    // bias-aware/hash sites gain the same bucket loop (two-dispatch-site gotcha).
+    #[test]
+    #[ignore = "GPU-deferred: requires device; see NOTE — bucketing-equivalence numeric gate"]
+    fn mixed_dispatch_bucketing_equivalence() {
+        // Intentionally empty under the GPU embargo. A GPU session must build
+        // the two MoeParams described in the NOTE above, call run_moe_decode for
+        // each, download down_expanded + out_target, and assert byte-equality.
     }
 }
