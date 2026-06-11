@@ -42,6 +42,15 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// `MOE_GROUPED_BLOCK_M` (tokens are scattered into per-expert groups padded to
 /// a multiple of this).
 const MOE_GROUPED_BLOCK_M: usize = 16;
+
+/// Hard ceiling on the attention sequence length. `attention_q8_0_kv` allocates
+/// LDS = (seq_len + block_size + head_dim)·4 bytes, which reaches the 64 KiB
+/// workgroup LDS limit at seq_len ≈ 16000 → `hipModuleLaunchKernel: invalid
+/// argument`. We guard above this with a clean Err instead of crashing the
+/// daemon. STOPGAP: cohere2moe also lacks sliding-window masking, so context
+/// >4096 already runs the sliding layers full-causal (degraded). A windowed
+/// flash-attention Q8 kernel (O(1) LDS + 4096 window) is the proper fix.
+const MAX_ATTN_SEQ: usize = 15872;
 #[inline]
 fn align_up_usize(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
@@ -164,6 +173,13 @@ fn decode_step_body(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.layer_norm_eps;
     let seq_len = position as usize + 1;
+    if seq_len > MAX_ATTN_SEQ {
+        return Err(format!(
+            "cohere2moe: context {seq_len} exceeds the attention limit {MAX_ATTN_SEQ} \
+             (Q8 attention is LDS-bound; windowed long-context is a pending kernel feature). \
+             Shorten the prompt or tool output."
+        ));
+    }
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Parallel block: ONE mean-centered LayerNorm → `normed`, fed to
@@ -451,6 +467,12 @@ pub fn forward_batch(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.layer_norm_eps;
     let max_ctx = start_pos + b;
+    if max_ctx > MAX_ATTN_SEQ {
+        return Err(format!(
+            "cohere2moe forward_batch: context {max_ctx} exceeds the attention limit {MAX_ATTN_SEQ} \
+             (LDS-bound Q8 attention; windowed long-context pending). Shorten the prompt."
+        ));
+    }
     let max_seq = state.kv.physical_cap;
 
     let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
