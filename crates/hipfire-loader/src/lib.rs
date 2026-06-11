@@ -248,6 +248,67 @@ pub struct LoadedModel {
     pub chat_template: Option<String>,
 }
 
+impl LoadedModel {
+    /// Shared-field skeleton: arch state None, pp = 1, all non-core arch slots
+    /// None, collections empty, mtp defaults, asst cache from env. Callers set
+    /// only the fields they own via struct-update (`..LoadedModel::skeleton(..)`).
+    pub fn skeleton(
+        arch_id: u32,
+        tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+        max_seq: usize,
+        physical_cap: usize,
+        model_path: String,
+        chat_template: Option<String>,
+    ) -> Self {
+        LoadedModel {
+            arch_id, pp: 1, ep: None,
+            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            state: None, kv_cache: None, dn_state: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path,
+            dflash: None,
+            chat_template,
+        }
+    }
+
+    /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
+    /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
+    /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
+    pub fn skeleton_pp(
+        arch_id: u32,
+        tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+        max_seq: usize,
+        physical_cap: usize,
+        model_path: String,
+        chat_template: Option<String>,
+        pp: usize,
+        pp_gpus: Gpus,
+        pp_scratch_set: Qwen35ScratchSet,
+        pp_dn_la_to_device: Vec<u8>,
+    ) -> Self {
+        LoadedModel {
+            pp,
+            pp_gpus: Some(pp_gpus),
+            pp_scratch_set: Some(pp_scratch_set),
+            pp_dn_la_to_device: Some(pp_dn_la_to_device),
+            ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, physical_cap, model_path, chat_template)
+        }
+    }
+}
+
 /// Expert-parallel serving state.
 pub struct EpState {
     pub gpus: Gpus,
@@ -500,27 +561,10 @@ fn finish_qwen35_load(
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
-        arch_id,
-        pp: 1, ep: None,
-        pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-        state, kv_cache: None, dn_state: None, qwen2_state: None,
-        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-        deepseek4_pbs: None, deepseek4_eos_tok: 0,
-        lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-        dots_ocr_config: None, dots_ocr_weights: None,
+        state, eviction, dflash,
         vision_config, vision_weights,
-        tokenizer: Some(tokenizer),
-        seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
-        eviction, kv_adaptive: None,
-        conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-        decoded_vocab: None,
-        model_path: ctx.path.to_string(),
-        dflash,
-        chat_template,
+        max_seq: ctx.max_seq,
+        ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, ctx.path.to_string(), chat_template)
     })
 }
 
@@ -686,27 +730,9 @@ pub fn load_model(
         let Qwen2Bundle { config, weights, state } = Qwen2Carrier
             .load(ModelSource::Hfq(hfq), &mut ctx)?;
         Ok(LoadedModel {
-            arch_id, pp: 1, ep: None,
-            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
             state: Some(ModelState::Qwen2(Qwen2Bundle { config, weights, state })),
-            kv_cache: None, dn_state: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
-            tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
-            eviction: None, kv_adaptive: None,
-            conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None,
-            model_path: path.to_string(),
-            dflash: None,
-            chat_template,
+            max_seq: ctx.max_seq,
+            ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, path.to_string(), chat_template)
         })
     } else if arch_id == 5 || arch_id == 6 {
         let bundle = Qwen35Carrier.load(ModelSource::Hfq(hfq), &mut ctx)?;
@@ -716,27 +742,9 @@ pub fn load_model(
         let LlamaBundle { config, weights, scratch, kv } = LlamaCarrier
             .load(ModelSource::Hfq(hfq), &mut ctx)?;
         Ok(LoadedModel {
-            arch_id, pp: 1, ep: None,
-            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
             state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })),
-            kv_cache: None, dn_state: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
-            tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
-            eviction: None, kv_adaptive: None,
-            conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None,
-            model_path: path.to_string(),
-            dflash: None,
-            chat_template,
+            max_seq: ctx.max_seq,
+            ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, path.to_string(), chat_template)
         })
     }
 }
@@ -755,7 +763,11 @@ fn load_dots_ocr(
     let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
         .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: Some(state), deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: Some(config), dots_ocr_weights: Some(weights), vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel {
+        qwen2_state: Some(state),
+        dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
+        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+    })
 }
 
 fn load_deepseek4(
@@ -777,7 +789,12 @@ fn load_deepseek4(
         if ids.len() == 1 { ids[0] } else { 1 }
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state), deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel {
+        deepseek4_config: Some(config), deepseek4_weights: Some(weights),
+        deepseek4_state: Some(state), deepseek4_pbs: Some(pbs),
+        deepseek4_eos_tok: eos_tok,
+        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+    })
 }
 
 fn load_lfm2moe(
@@ -799,7 +816,11 @@ fn load_lfm2moe(
         try_one("<|im_end|>").or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: Some(config), lfm2moe_weights: Some(weights), lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel {
+        lfm2moe_config: Some(config), lfm2moe_weights: Some(weights),
+        lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok,
+        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+    })
 }
 
 fn load_minimax(
@@ -822,7 +843,11 @@ fn load_minimax(
         try_one("[e~[").or_else(|| try_one("<|im_end|>")).or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: Some(config), minimax_weights: Some(weights), minimax_state: Some(state), minimax_eos_tok: eos_tok, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel {
+        minimax_config: Some(config), minimax_weights: Some(weights),
+        minimax_state: Some(state), minimax_eos_tok: eos_tok,
+        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+    })
 }
 
 // ─── Unsafetensors load path ──────────────────────────────────────────
@@ -879,7 +904,10 @@ fn load_model_safetensors(
         }.map_err(|e| format!("KvCache: {e}"))?;
         let scratch = llama::ForwardScratch::new(gpu, &config)
             .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
-        return Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })), kv_cache: None, dn_state: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template });
+        return Ok(LoadedModel {
+            state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })),
+            ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        });
     }
 
     if arch_id != 5 && arch_id != 6 {
@@ -922,11 +950,12 @@ fn load_model_safetensors(
     let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
 
-    let bundle = Qwen35Bundle { config, weights, scratch, kv_cache, dn_state };
-    let Qwen35Bundle { config, weights, scratch, kv_cache, dn_state } = bundle;
     let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch, kv_cache, dn_state }));
 
-    Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state, kv_cache: None, dn_state: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq: effective_max_seq, physical_cap: effective_max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel {
+        state,
+        ..LoadedModel::skeleton(arch_id, tokenizer, effective_max_seq, effective_max_seq, path.to_string(), chat_template)
+    })
 }
 
 // ─── Pipeline-parallel load ───────────────────────────────────────────
@@ -1001,26 +1030,12 @@ fn load_model_pp(
     let gpu0 = &mut gpus.devices[0];
     let single_scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu0, &config, 2048, max_seq)
         .map_err(|e| format!("{e}"))?;
-    let bundle = Qwen35Bundle { config, weights, scratch: single_scratch, kv_cache: kv, dn_state: dn };
-    let Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn } = bundle;
-    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn }));
+    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch: single_scratch, kv_cache: kv, dn_state: dn }));
     let chat_template = resolve_chat_template(&hfq, path);
+    let arch_id = hfq.arch_id;
     Ok(LoadedModel {
-        arch_id: hfq.arch_id, pp, ep: None,
-        pp_gpus: Some(gpus), pp_scratch_set: Some(scratch_set), pp_dn_la_to_device: Some(la_to_device),
-        state, kv_cache: None, dn_state: None, qwen2_state: None,
-        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-        deepseek4_pbs: None, deepseek4_eos_tok: 0,
-        lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-        dots_ocr_config: None, dots_ocr_weights: None,
-        vision_config: None, vision_weights: None,
-        tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq,
-        eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-        decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template,
+        state,
+        ..LoadedModel::skeleton_pp(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template, pp, gpus, scratch_set, la_to_device)
     })
 }
 
@@ -1191,22 +1206,8 @@ fn load_model_ep_ds4(
         .collect();
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        arch_id, pp: 1,
         ep: Some(EpState { gpus, inner: EpArch::Ds4 { config, weights, state, partials } }),
-        pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-        state: None, kv_cache: None, dn_state: None, qwen2_state: None,
-        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-        deepseek4_pbs: None, deepseek4_eos_tok: 0,
-        lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-        dots_ocr_config: None, dots_ocr_weights: None,
-        vision_config: None, vision_weights: None,
-        tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq,
-        eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-        decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template,
+        ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
     })
 }
 
@@ -1243,22 +1244,8 @@ fn load_model_ep_minimax(
         .collect();
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        arch_id, pp: 1,
         ep: Some(EpState { gpus, inner: EpArch::Minimax { config, weights, state, partials } }),
-        pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-        state: None, kv_cache: None, dn_state: None, qwen2_state: None,
-        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-        deepseek4_pbs: None, deepseek4_eos_tok: 0,
-        lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-        dots_ocr_config: None, dots_ocr_weights: None,
-        vision_config: None, vision_weights: None,
-        tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq,
-        eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-        decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template,
+        ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
     })
 }
 
