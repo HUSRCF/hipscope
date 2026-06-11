@@ -164,6 +164,105 @@ pub fn reap_override_for<'a>(name: &str, arch: ReapArch, plan: &'a ReapPlan) -> 
     None
 }
 
+/// The per-arch routed-expert name segment and the weight-suffix predicate that
+/// together identify a routed-expert tensor. Shared by `tensor_matches` and
+/// `expert_index_of` (DRY).
+fn routed_expert_seg(arch: ReapArch) -> (&'static str, fn(&str) -> bool) {
+    match arch {
+        ReapArch::Deepseek4 => (
+            ".ffn.experts.",
+            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
+        ),
+        ReapArch::Qwen35 => (
+            ".mlp.experts.",
+            |n| n.ends_with(".gate_up_proj.weight") || n.ends_with(".down_proj.weight"),
+        ),
+        ReapArch::Lfm2Moe => (
+            ".feed_forward.experts.",
+            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
+        ),
+        ReapArch::Minimax => (
+            ".block_sparse_moe.experts.",
+            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
+        ),
+    }
+}
+
+/// Parse the routed-expert index `E` out of a per-expert tensor name for `arch`,
+/// or `None` if the name is not a routed-expert weight tensor. The index is the
+/// first dotted token after the arch's expert segment (e.g.
+/// `layers.0.ffn.experts.7.w1.weight` → `7`). Shared by `tensor_matches` (override
+/// resolution) and `bake_expert_rename` (prune/renumber) so both agree on layout.
+///
+/// NOTE: Qwen3.5-MoE ships its routed experts as a single 3-D stacked tensor
+/// (`...mlp.experts.gate_up_proj`, no per-expert index in the *source* name) that
+/// the quantizer splits into per-expert names at quant time. This parser matches
+/// the *split* form (`...mlp.experts.{E}.gate_up_proj.weight`); the bake's prune
+/// of the stacked source happens in the split loop, not via this fn.
+pub fn expert_index_of(name: &str, arch: ReapArch) -> Option<u32> {
+    let (seg, w_ok) = routed_expert_seg(arch);
+    if !name.contains(seg) || !w_ok(name) {
+        return None;
+    }
+    let after = &name[name.find(seg).unwrap() + seg.len()..];
+    after.split('.').next().and_then(|s| s.parse().ok())
+}
+
+/// For a routed-expert tensor under an active keep, decide: drop it, or emit it
+/// renamed to its compact slot. Returns `None` to drop (the expert was pruned),
+/// `Some(new_name)` to keep (the original expert-index token replaced by its
+/// compact slot index). `keep_l` is `keep[layer]` — original expert indices in
+/// compact-slot order. Non-routed-expert names (no parseable index) return `None`;
+/// callers gate this fn on routed-expert tensors only.
+pub fn bake_expert_rename(name: &str, arch: ReapArch, _layer: usize, keep_l: &[u32]) -> Option<String> {
+    let e = expert_index_of(name, arch)?;
+    let slot = keep_l.iter().position(|&k| k == e)?;
+    // Replace the expert-index token `.{seg}{E}.` with `.{seg}{slot}.`. The
+    // segment ends with `.`, and the token is immediately followed by `.`, so a
+    // bounded replace of `{seg}{E}.` → `{seg}{slot}.` is unambiguous.
+    let (seg, _) = routed_expert_seg(arch);
+    let from = format!("{seg}{e}.");
+    let to = format!("{seg}{slot}.");
+    Some(name.replacen(&from, &to, 1))
+}
+
+/// Does `name` name the MoE router weight (`[orig_experts, hidden]`) for `arch`?
+/// Used by the bake prune to row-gather the router to the kept expert set. The
+/// caller additionally checks the tensor's shape[0] == original_experts so a
+/// shared-expert gate (`[1, hidden]`) can never be mistaken for the router.
+pub fn is_reap_router_weight(name: &str, arch: ReapArch) -> bool {
+    match arch {
+        ReapArch::Deepseek4 => name.ends_with(".ffn.gate.weight"),
+        ReapArch::Qwen35 => name.ends_with(".mlp.gate.weight"),
+        ReapArch::Lfm2Moe => name.ends_with(".feed_forward.gate.weight"),
+        ReapArch::Minimax => name.ends_with(".block_sparse_moe.gate.weight"),
+    }
+}
+
+/// Does `name` name the per-expert routing bias (`[orig_experts]`) for `arch`?
+/// Row-gathered alongside the router under a keep so the bias aligns with the
+/// gathered logits in compact-slot order.
+pub fn is_reap_expert_bias(name: &str, arch: ReapArch) -> bool {
+    match arch {
+        ReapArch::Deepseek4 => name.ends_with(".ffn.gate.bias"),
+        // Qwen3.5-MoE routing has no per-expert correction bias.
+        ReapArch::Qwen35 => false,
+        ReapArch::Lfm2Moe => name.ends_with(".feed_forward.expert_bias"),
+        ReapArch::Minimax => name.ends_with(".block_sparse_moe.e_score_correction_bias"),
+    }
+}
+
+/// Parse the layer index `L` from a tensor name's `layers.{L}.` segment, or
+/// `None` if absent. All four arches embed the layer this way (with or without a
+/// `model.`/`model.language_model.` prefix). Uses `rfind` so a `.layers.` deeper
+/// in the path (none expected) prefers the last occurrence.
+pub fn bake_layer_of(name: &str) -> Option<usize> {
+    let marker = "layers.";
+    let i = name.rfind(marker)?;
+    let rest = &name[i + marker.len()..];
+    rest.split('.').next().and_then(|s| s.parse().ok())
+}
+
 fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
     // Layer gate: the name must reference `ov.layer`. All four arches embed the
     // layer index as `.layers.{L}.` or `layers.{L}.`.
@@ -173,35 +272,16 @@ fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
     }
     match ov.role {
         Role::RoutedExperts => {
-            let (seg, w_ok): (&str, fn(&str) -> bool) = match arch {
-                ReapArch::Deepseek4 => (
-                    ".ffn.experts.",
-                    |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-                ),
-                ReapArch::Qwen35 => (
-                    ".mlp.experts.",
-                    |n| n.ends_with(".gate_up_proj.weight") || n.ends_with(".down_proj.weight"),
-                ),
-                ReapArch::Lfm2Moe => (
-                    ".feed_forward.experts.",
-                    |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-                ),
-                ReapArch::Minimax => (
-                    ".block_sparse_moe.experts.",
-                    |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-                ),
-            };
+            let (seg, w_ok) = routed_expert_seg(arch);
             if !name.contains(seg) || !w_ok(name) {
                 return false;
             }
             if ov.experts.is_empty() {
                 return true; // whole role at this layer
             }
-            // expert index: the token right after `seg`. ds4 layout (verified
-            // against main.rs:5843 — `layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
-            // makes the first dotted token after `seg` the expert index.
-            let after = &name[name.find(seg).unwrap() + seg.len()..];
-            let eidx: u32 = match after.split('.').next().and_then(|s| s.parse().ok()) {
+            // expert index via the shared parser (verified against
+            // main.rs — `layers.L.ffn.experts.E.{w1,w2,w3}.weight`).
+            let eidx = match expert_index_of(name, arch) {
                 Some(e) => e,
                 None => return false,
             };
@@ -385,6 +465,217 @@ mod bake_tests {
     }
 }
 
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn renames_kept_expert_to_compact_slot() {
+        // keep[0] = [0,2,3]; original expert 2 → compact slot 1.
+        let n = "layers.0.ffn.experts.2.w1.weight";
+        assert_eq!(
+            bake_expert_rename(n, ReapArch::Deepseek4, 0, &[0, 2, 3]),
+            Some("layers.0.ffn.experts.1.w1.weight".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_pruned_expert() {
+        let n = "layers.0.ffn.experts.5.w1.weight";
+        assert_eq!(bake_expert_rename(n, ReapArch::Deepseek4, 0, &[0, 2, 3]), None);
+    }
+
+    #[test]
+    fn rename_keeps_slot0_identity() {
+        // expert 0 stays slot 0 (identity rename, still Some).
+        let n = "layers.7.ffn.experts.0.w2.weight";
+        assert_eq!(
+            bake_expert_rename(n, ReapArch::Deepseek4, 7, &[0, 4, 9]),
+            Some("layers.7.ffn.experts.0.w2.weight".to_string())
+        );
+    }
+
+    #[test]
+    fn expert_index_parses_per_arch() {
+        assert_eq!(
+            expert_index_of("layers.3.ffn.experts.12.w1.weight", ReapArch::Deepseek4),
+            Some(12)
+        );
+        assert_eq!(
+            expert_index_of(
+                "model.layers.3.mlp.experts.4.gate_up_proj.weight",
+                ReapArch::Qwen35
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            expert_index_of(
+                "layers.1.feed_forward.experts.7.w3.weight",
+                ReapArch::Lfm2Moe
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            expert_index_of(
+                "model.layers.2.block_sparse_moe.experts.31.w2.weight",
+                ReapArch::Minimax
+            ),
+            Some(31)
+        );
+        // Non-routed-expert tensors → None.
+        assert_eq!(
+            expert_index_of("layers.0.self_attn.q_proj.weight", ReapArch::Deepseek4),
+            None
+        );
+        assert_eq!(
+            expert_index_of("layers.0.ffn.gate.weight", ReapArch::Deepseek4),
+            None
+        );
+    }
+
+    #[test]
+    fn minimax_rename_renumbers() {
+        let n = "model.layers.2.block_sparse_moe.experts.9.w1.weight";
+        assert_eq!(
+            bake_expert_rename(n, ReapArch::Minimax, 2, &[1, 9, 13]),
+            Some("model.layers.2.block_sparse_moe.experts.1.w1.weight".to_string())
+        );
+    }
+
+    #[test]
+    fn layer_parse() {
+        assert_eq!(bake_layer_of("layers.0.ffn.experts.2.w1.weight"), Some(0));
+        assert_eq!(
+            bake_layer_of("model.language_model.layers.41.mlp.gate.weight"),
+            Some(41)
+        );
+        assert_eq!(bake_layer_of("model.embed_tokens.weight"), None);
+    }
+}
+
+/// SP4b Task 2 prune finalize: router/bias row-gather + metadata expert-count
+/// patch. These reach crate-internal `patch_expert_count_metadata` (in main.rs),
+/// hence the in-module placement (binary crate has no lib target).
+#[cfg(test)]
+mod bake_finalize_tests {
+    use super::*;
+    use crate::patch_expert_count_metadata;
+    use hipfire_reap::gather::gather_rows;
+
+    #[test]
+    fn router_gather_keeps_only_kept_rows() {
+        // Router weight [orig_experts=4, dim=2] of f32 (8 bytes/row). Keep {2,0}.
+        let dim = 2usize;
+        let orig = 4usize;
+        let mut bytes = Vec::new();
+        for e in 0..orig {
+            for d in 0..dim {
+                bytes.extend_from_slice(&((e * 10 + d) as f32).to_le_bytes());
+            }
+        }
+        let keep_l: Vec<u32> = vec![2, 0];
+        let (new_shape, gathered) = gather_rows(&[orig, dim], &bytes, &keep_l).unwrap();
+        // Row count == keep_l.len(); inner dim preserved.
+        assert_eq!(new_shape, vec![keep_l.len(), dim]);
+        assert_eq!(gathered.len(), keep_l.len() * dim * 4);
+        // Compact slot 0 = original expert 2's first element (2*10+0 = 20.0).
+        let slot0_e0 = f32::from_le_bytes(gathered[0..4].try_into().unwrap());
+        assert_eq!(slot0_e0, 20.0);
+        // Compact slot 1 = original expert 0's first element (0.0).
+        let slot1_e0 = f32::from_le_bytes(gathered[dim * 4..dim * 4 + 4].try_into().unwrap());
+        assert_eq!(slot1_e0, 0.0);
+    }
+
+    #[test]
+    fn router_bias_classification_per_arch() {
+        // Router weight names.
+        assert!(is_reap_router_weight("layers.5.ffn.gate.weight", ReapArch::Deepseek4));
+        assert!(is_reap_router_weight(
+            "model.layers.5.mlp.gate.weight",
+            ReapArch::Qwen35
+        ));
+        assert!(is_reap_router_weight(
+            "layers.5.feed_forward.gate.weight",
+            ReapArch::Lfm2Moe
+        ));
+        assert!(is_reap_router_weight(
+            "model.layers.5.block_sparse_moe.gate.weight",
+            ReapArch::Minimax
+        ));
+        // Shared-expert gate must NOT be classed as the router.
+        assert!(!is_reap_router_weight(
+            "model.layers.5.mlp.shared_expert_gate.weight",
+            ReapArch::Qwen35
+        ));
+        // Per-expert bias names.
+        assert!(is_reap_expert_bias("layers.5.ffn.gate.bias", ReapArch::Deepseek4));
+        assert!(is_reap_expert_bias(
+            "layers.5.feed_forward.expert_bias",
+            ReapArch::Lfm2Moe
+        ));
+        assert!(is_reap_expert_bias(
+            "model.layers.5.block_sparse_moe.e_score_correction_bias",
+            ReapArch::Minimax
+        ));
+        assert!(!is_reap_expert_bias("layers.5.ffn.gate.bias", ReapArch::Qwen35));
+    }
+
+    fn meta(config: &str) -> String {
+        format!(r#"{{"architecture":"x","config":{config},"tokenizer":"{{}}"}}"#)
+    }
+
+    #[test]
+    fn patches_ds4_n_routed_experts() {
+        let m = meta(r#"{"n_routed_experts":256,"hidden_size":7168}"#);
+        let out = patch_expert_count_metadata(&m, ReapArch::Deepseek4, 32).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["config"]["n_routed_experts"], 32);
+        assert_eq!(v["config"]["hidden_size"], 7168); // untouched
+    }
+
+    #[test]
+    fn patches_qwen35_num_experts_top_level() {
+        let m = meta(r#"{"num_experts":128}"#);
+        let out = patch_expert_count_metadata(&m, ReapArch::Qwen35, 64).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["config"]["num_experts"], 64);
+    }
+
+    #[test]
+    fn patches_qwen35_num_experts_in_text_config() {
+        // VL-style nested config: num_experts lives under text_config.
+        let m = meta(r#"{"text_config":{"num_experts":128}}"#);
+        let out = patch_expert_count_metadata(&m, ReapArch::Qwen35, 64).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["config"]["text_config"]["num_experts"], 64);
+    }
+
+    #[test]
+    fn patches_minimax_num_local_experts() {
+        let m = meta(r#"{"num_local_experts":64}"#);
+        let out = patch_expert_count_metadata(&m, ReapArch::Minimax, 16).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["config"]["num_local_experts"], 16);
+    }
+
+    #[test]
+    fn patches_lfm2_num_experts() {
+        let m = meta(r#"{"num_experts":32}"#);
+        let out = patch_expert_count_metadata(&m, ReapArch::Lfm2Moe, 8).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["config"]["num_experts"], 8);
+    }
+
+    #[test]
+    fn errors_when_field_absent() {
+        // ds4 expects n_routed_experts; a config without it must error (never
+        // silently ship the original count).
+        let m = meta(r#"{"hidden_size":7168}"#);
+        let err = patch_expert_count_metadata(&m, ReapArch::Deepseek4, 32).unwrap_err();
+        assert!(err.contains("n_routed_experts"), "got: {err}");
+    }
+}
+
 /// SP4 Task 4 integration test: `build_overlay` selection + byte-correctness,
 /// then a real `write_hfq` → `HfqFile` container round-trip.
 ///
@@ -423,6 +714,12 @@ mod integ {
 
     #[test]
     fn build_overlay_selects_and_byte_matches_then_round_trips() {
+        // This test calls `HfqFile::open`, which reads the process-global
+        // `HIPFIRE_REAP_PLAN`. Serialize against `sp4_overlay_to_sp3_load_end_to_end`
+        // (which sets/removes that env var) so a concurrent set can't leak a stray
+        // overlay into this `open` (was a latent flake before SP4b T2 added tests
+        // that perturbed scheduling).
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let arch = ReapArch::Deepseek4;
         let d = tempfile::tempdir().unwrap();
         let plan = plan_layer0_expert0_hfq4(d.path());

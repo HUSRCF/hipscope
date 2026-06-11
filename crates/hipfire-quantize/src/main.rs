@@ -3397,6 +3397,57 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     let _ = spill.flush();
 }
 
+/// The arch-correct config field naming the routed-expert count, as the arch's
+/// loader config parser reads it from the HFQ metadata `config` object:
+///   * deepseek4 → `n_routed_experts`
+///   * qwen3.5-moe / lfm2moe → `num_experts`
+///   * minimax → `num_local_experts`
+fn reap_expert_count_field(arch: reap_overlay::ReapArch) -> &'static str {
+    match arch {
+        reap_overlay::ReapArch::Deepseek4 => "n_routed_experts",
+        reap_overlay::ReapArch::Qwen35 => "num_experts",
+        reap_overlay::ReapArch::Lfm2Moe => "num_experts",
+        reap_overlay::ReapArch::Minimax => "num_local_experts",
+    }
+}
+
+/// Patch the HFQ metadata envelope's `config` so the routed-expert count reads
+/// `kept` (the pruned/compact count) for `arch`. The arch loaders parse the
+/// inner `config` object (qwen3.5 additionally descends into `config.text_config`
+/// when present), so patch the field WHEREVER it currently exists under `config`:
+/// at `config[field]` and, if present, at `config.text_config[field]`. Erroring
+/// (rather than silently no-op'ing) when the field is absent prevents shipping a
+/// baked model whose metadata still claims the original expert count.
+fn patch_expert_count_metadata(
+    metadata_json: &str,
+    arch: reap_overlay::ReapArch,
+    kept: usize,
+) -> Result<String, String> {
+    let field = reap_expert_count_field(arch);
+    let mut v: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("metadata not valid JSON: {e}"))?;
+    let config = v
+        .get_mut("config")
+        .ok_or_else(|| "metadata missing `config` object".to_string())?;
+    let mut patched = false;
+    if config.get(field).is_some() {
+        config[field] = serde_json::json!(kept);
+        patched = true;
+    }
+    if let Some(tc) = config.get_mut("text_config") {
+        if tc.get(field).is_some() {
+            tc[field] = serde_json::json!(kept);
+            patched = true;
+        }
+    }
+    if !patched {
+        return Err(format!(
+            "expert-count field '{field}' not found under config (or config.text_config) for {arch:?}"
+        ));
+    }
+    serde_json::to_string(&v).map_err(|e| format!("re-serialize metadata: {e}"))
+}
+
 fn write_hfq(
     path: &Path,
     arch: u32,
@@ -5493,7 +5544,10 @@ fn main() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
-    let metadata_json = serde_json::to_string(&metadata).unwrap();
+    // `mut` so the SP4b bake-prune path can patch the routed-expert count down to
+    // the kept count before write_hfq (so the baked model loads with the compact
+    // count and NO env var). Untouched in every non-prune path.
+    let mut metadata_json = serde_json::to_string(&metadata).unwrap();
 
     // Load all safetensors files
     let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
@@ -5674,6 +5728,21 @@ fn main() {
             output_path.display()
         );
     }
+    // Is expert pruning active? (A bake plan with a per-layer keep-map.) When
+    // active, the loop's prune hook drops pruned per-expert tensors, the kept
+    // per-expert tensors are recorded in `bake_rename` for a post-loop renumber
+    // to compact slots, routers/biases are row-gathered to the kept set, and the
+    // output metadata's expert count is patched to `kept_per_layer`.
+    let bake_keep_active = reap_bake_plan
+        .as_ref()
+        .map(|p| p.keep.is_some())
+        .unwrap_or(false);
+    // original-name → compact-renamed-name for kept per-expert tensors
+    // (ds4 score layers / lfm2 / minimax). Applied as a post-loop rename pass so
+    // the per-expert quant branches keep using the ORIGINAL name to read source
+    // bytes, then we rewrite `HfqTensor.name` to the compact slot before write.
+    let mut bake_rename: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
@@ -5850,6 +5919,116 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── SP4b: bake prune hook ──────────────────────────────────────────────
+        // BEFORE the override hook. When `--reap-bake`'s plan carries a keep-map,
+        // prune routed experts not in `keep[L]`, renumber kept experts to compact
+        // slots, and row-gather routers / per-expert biases to the kept set so the
+        // baked model loads with the compact expert count and NO load-time
+        // keep-map. `meta`/`raw_data` may be shadowed below with gathered owned
+        // copies so the override hook + arch branches transparently quantize the
+        // gathered tensor with the arch's normal encoder.
+        //
+        // Two owned holders are pre-declared so a gather can rebind the borrowed
+        // (`meta`, `raw_data`) to point at gathered data for the rest of the body.
+        let _gathered_meta: TensorMeta;
+        let _gathered_bytes: Vec<u8>;
+        let mut meta: &TensorMeta = meta;
+        let mut raw_data: &[u8] = raw_data;
+        if bake_keep_active {
+            // SAFETY of indexing: bake_keep_active ⇒ reap_bake_plan.keep is Some.
+            let plan = reap_bake_plan.as_ref().unwrap();
+            let keep = plan.keep.as_ref().unwrap();
+            let layer = reap_overlay::bake_layer_of(name);
+
+            // Per-arch routed-expert (per-expert-named) tensors: drop pruned,
+            // record kept→compact rename for the post-loop pass.
+            if reap_overlay::expert_index_of(name, reap_arch).is_some() {
+                let l = layer.unwrap_or_else(|| {
+                    eprintln!("reap bake: routed-expert tensor '{name}' has no parseable layer");
+                    std::process::exit(2);
+                });
+                // ds4 hash-layer guard: pruning layers 0..=2 requires a tid2eid
+                // remap to the compact expert space — not supported in bake.
+                if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
+                    eprintln!(
+                        "reap bake: ds4 hash-layer (0-2) tid2eid remap not supported in bake; \
+                         use the load-time keep-map for pruned ds4 hash layers"
+                    );
+                    std::process::exit(2);
+                }
+                if l >= keep.len() {
+                    eprintln!("reap bake: layer {l} for '{name}' out of keep-map range");
+                    std::process::exit(2);
+                }
+                match reap_overlay::bake_expert_rename(name, reap_arch, l, &keep[l]) {
+                    None => {
+                        // Pruned expert: drop entirely.
+                        st_files[*file_idx].drop_tensor_pages(name);
+                        continue;
+                    }
+                    Some(new_name) => {
+                        if &new_name != name {
+                            bake_rename.insert(name.to_string(), new_name);
+                        }
+                        // Fall through: the arch branch quantizes the ORIGINAL
+                        // bytes; the post-loop pass renames the output tensor.
+                    }
+                }
+            } else if let Some(l) = layer {
+                // Router weight (`*.gate.weight`, shape `[orig_experts, hidden]`)
+                // and per-expert bias (`*.gate.bias` / `e_score_correction_bias` /
+                // `expert_bias`, shape `[orig_experts]`): row-gather to the kept
+                // set BEFORE quant so the baked router/bias emit only kept rows in
+                // compact-slot order (mirrors the loader's load-time gather).
+                let is_router_w = reap_overlay::is_reap_router_weight(name, reap_arch)
+                    && meta.shape.len() == 2
+                    && meta.shape[0] == plan.original_experts;
+                let is_expert_bias = reap_overlay::is_reap_expert_bias(name, reap_arch)
+                    && meta.shape.len() == 1
+                    && meta.shape[0] == plan.original_experts;
+                if is_router_w || is_expert_bias {
+                    // ds4 hash-layer guard also covers the router of layers 0..=2.
+                    if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
+                        eprintln!(
+                            "reap bake: ds4 hash-layer (0-2) router/tid2eid remap not supported \
+                             in bake; use the load-time keep-map for pruned ds4 hash layers"
+                        );
+                        std::process::exit(2);
+                    }
+                    if l >= keep.len() {
+                        eprintln!("reap bake: layer {l} for router/bias '{name}' out of keep-map range");
+                        std::process::exit(2);
+                    }
+                    let keep_l = &keep[l];
+                    match hipfire_reap::gather::gather_rows(&meta.shape, raw_data, keep_l) {
+                        Ok((new_shape, gathered)) => {
+                            _gathered_meta = TensorMeta {
+                                dtype: meta.dtype.clone(),
+                                shape: new_shape,
+                                data_offsets: meta.data_offsets,
+                            };
+                            _gathered_bytes = gathered;
+                            eprintln!(
+                                "  {:>8}: {} {:?} → rows[{}] (kept {} of {})",
+                                "GATHER",
+                                name,
+                                meta.shape,
+                                keep_l.len(),
+                                keep_l.len(),
+                                plan.original_experts
+                            );
+                            meta = &_gathered_meta;
+                            raw_data = &_gathered_bytes;
+                        }
+                        Err(e) => {
+                            eprintln!("reap bake: router/bias gather '{name}': {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
+        }
 
         // ── SP4b: bake override hook ───────────────────────────────────────────
         // When `--reap-bake` is active and the plan overrides this tensor,
@@ -6310,7 +6489,31 @@ fn main() {
                 );
             }
 
-            // Parallelize across the 256 expert slices via rayon. Each slice
+            // ── SP4b bake prune (3D-stacked experts) ───────────────────────────
+            // Qwen3.5-MoE (and any 3D-stacked MoE) ships routed experts as one
+            // `[n_experts, ...]` tensor that this branch splits per-expert. Under
+            // an active bake keep, emit ONLY kept slices, renumbered to compact
+            // slots: `slots[slot] = orig_expert`. The slice offset + imatrix
+            // lookup key off `orig`; the output name uses `slot`. No keep ⇒
+            // identity (`slots[i] = (i, i)`), byte-identical to baseline.
+            let bake_slots: Vec<(usize, usize)> = if bake_keep_active {
+                let plan = reap_bake_plan.as_ref().unwrap();
+                let keep = plan.keep.as_ref().unwrap();
+                let l = parent_layer.unwrap_or_else(|| {
+                    eprintln!("reap bake: 3D-stacked expert tensor '{name}' has no parseable layer");
+                    std::process::exit(2);
+                });
+                if l >= keep.len() {
+                    eprintln!("reap bake: layer {l} for stacked experts '{name}' out of keep-map range");
+                    std::process::exit(2);
+                }
+                keep[l].iter().enumerate().map(|(slot, &orig)| (slot, orig as usize)).collect()
+            } else {
+                (0..n_experts).map(|i| (i, i)).collect()
+            };
+            let n_out_experts = bake_slots.len();
+
+            // Parallelize across the expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
             // The outer Rayon pool size is set in main() before this runs.
             use rayon::prelude::*;
@@ -6318,9 +6521,9 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts)
+            let mut new_tensors: Vec<HfqTensor> = bake_slots
                 .into_par_iter()
-                .map(|x| {
+                .map(|(slot, x)| {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
                     let f32_slice = to_f32(slice, &dtype);
@@ -6381,7 +6584,7 @@ fn main() {
                         (q, QuantType::HFQ4G128, 128u32)
                     };
                     HfqTensor {
-                        name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                        name: format!("{parent_owned}{slot}.{base_owned}.weight"),
                         quant_type: qt,
                         shape: inner_shape_clone.clone(),
                         group_size: gs,
@@ -6390,7 +6593,7 @@ fn main() {
                     }
                 })
                 .collect();
-            quantized_params += inner_n as u64 * n_experts as u64;
+            quantized_params += inner_n as u64 * n_out_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if expert_mq3lloyd_native {
                 "MQ3G256L"
@@ -6414,7 +6617,7 @@ fn main() {
                 "HFQ4G128"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
+            eprintln!("  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
             hfq_tensors.append(&mut new_tensors);
             // Drop source pages and spill quantized data after each expert batch.
@@ -7546,6 +7749,40 @@ fn main() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
+    // Applied only when a bake keep-map is active. Renames the per-expert-named
+    // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
+    // their compact slots, then patches the output metadata's routed-expert count
+    // to `kept_per_layer` so the baked model loads standalone (no env var, no
+    // load-time keep-map). Spill preserves `.name`, so rename order vs. spill is
+    // irrelevant. (Qwen3.5 stacked experts + all routers/biases were already
+    // pruned/gathered in-loop.)
+    if bake_keep_active {
+        let plan = reap_bake_plan.as_ref().unwrap();
+        if !bake_rename.is_empty() {
+            for t in hfq_tensors.iter_mut() {
+                if let Some(new_name) = bake_rename.get(&t.name) {
+                    t.name = new_name.clone();
+                }
+            }
+            eprintln!(
+                "REAP bake: renamed {} kept per-expert tensors to compact slots",
+                bake_rename.len()
+            );
+        }
+        let kept = plan.kept_per_layer();
+        match patch_expert_count_metadata(&metadata_json, reap_arch, kept) {
+            Ok(patched) => {
+                metadata_json = patched;
+                eprintln!("REAP bake: patched output metadata expert count → {kept}");
+            }
+            Err(e) => {
+                eprintln!("reap bake: failed to patch expert-count metadata: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
