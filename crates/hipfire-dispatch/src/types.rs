@@ -111,7 +111,7 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
         | MFP4G32 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
@@ -128,7 +128,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
         | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
@@ -187,6 +187,7 @@ pub enum KernelKey {
     GemvMq4G128,
     GemvMq3G256,
     GemvMq2G256,
+    GemvMq5G256,
     GemvMq6G256,
     GemvMq8G256,
     GemvMq2G256Lloyd,
@@ -203,6 +204,7 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq3G256Prerotated,
     GemvMq2G256Prerotated,
+    GemvMq5G256Prerotated,
     GemvMq6G256Prerotated,
     GemvMq8G256Prerotated,
     GemvMq2G256LloydPrerotated,
@@ -215,6 +217,7 @@ pub enum KernelKey {
     GemvHfq6G256Residual,
     GemvMq4G256Residual,
     GemvMq3G256Residual,
+    GemvMq5G256Residual,
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
@@ -224,6 +227,7 @@ pub enum KernelKey {
     GemvHfq6G256SwiGLUResidual,
     GemvMq4G256SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
+    GemvMq5G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
     GemvMq4G256LloydSwiGLUResidual,
@@ -532,6 +536,7 @@ impl KernelKey {
             (MQ4G128, Plain) => Ok(Self::GemvMq4G128),
             (MQ3G256, Plain) => Ok(Self::GemvMq3G256),
             (MQ2G256, Plain) => Ok(Self::GemvMq2G256),
+            (MQ5G256, Plain) => Ok(Self::GemvMq5G256),
             (MQ6G256, Plain) => Ok(Self::GemvMq6G256),
             (MQ8G256, Plain) => Ok(Self::GemvMq8G256),
             (MQ2G256Lloyd, Plain) => Ok(Self::GemvMq2G256Lloyd),
@@ -556,6 +561,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
+            MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
             MQ8G256 => Ok(Self::GemvMq8G256Prerotated),
             MQ2G256Lloyd => Ok(Self::GemvMq2G256LloydPrerotated),
@@ -596,6 +602,7 @@ impl KernelKey {
             HFQ6G256 => Ok(Self::GemvHfq6G256Residual),
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
+            MQ5G256 => Ok(Self::GemvMq5G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
@@ -614,6 +621,7 @@ impl KernelKey {
             HFQ6G256 => Ok(Self::GemvHfq6G256SwiGLUResidual),
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
+            MQ5G256 => Ok(Self::GemvMq5G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
@@ -647,6 +655,7 @@ impl KernelKey {
             | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             MQ3G256 => ArchPredicate::HasWmma,
+            MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             Q8HFQ | Raw => ArchPredicate::Always,
@@ -670,7 +679,7 @@ impl KernelKey {
             }
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
+                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
                         &[PipelineOp::RotateFwht, PipelineOp::Gemv, PipelineOp::ResidualAdd]
                     }
                     _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
@@ -679,7 +688,7 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
+                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
                         &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
                     }
                     _ => &[PipelineOp::SiluMul, PipelineOp::Gemv, PipelineOp::ResidualAdd],
@@ -696,7 +705,7 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
     use DType::*;
     matches!(
         dtype,
-        MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
+        MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
             | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
             | MFP4G32 | ParoQ4G128
     )

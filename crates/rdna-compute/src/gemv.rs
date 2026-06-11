@@ -3162,6 +3162,34 @@ impl Gpu {
         self.gemv_hfq6g256(a_raw, x_rot, y, m, k)
     }
 
+    /// MagnumQuant MQ5: rotate x via FWHT, then HFQ5 GEMV.
+    pub fn gemv_mq5g256_with_rotate(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        x_rot: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfq5g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ5 with pre-rotated x.
+    pub fn gemv_mq5g256_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_hfq5g256(a_raw, x_rot, y, m, k)
+    }
+
     /// Standalone MQ8 rotate + INT8 quantize of x into internal `mq_x_q8`/`mq_x_scales`.
     /// After this, `gemv_mq8g256_prerotated` can be called multiple times with the same x.
     pub fn rotate_quantize_x_mq8(&mut self, x: &GpuTensor, k: usize) -> HipResult<()> {
@@ -3498,6 +3526,82 @@ impl Gpu {
             )
         }
     }
+    /// HFQ5-G256 GEMV with fused residual add: y[row] += A[row] . x.
+    /// Same shape as gemv_hfq5g256; only the final write differs (+= vs =).
+    /// Used for wo and w_down in HFQ5 / MQ5 forward paths.
+    pub fn gemv_hfq5g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        // Wave64-native fast path (gfx906/908/94x): 2 rows per block, halves
+        // grid.x. Mirrors the HFQ4 sibling at line ~5378. Plan §3.1.1 item 2
+        // (gfx906-mq6-mq8-port.md v3.2.1 + v3.2.2). Byte-exact with the
+        // wave32 base since each warp's 32-lane reduction stays in-warp.
+        // ILP-prefetch variant gates on gemv_prefetch_enabled(arch) — default
+        // on for gfx906 (Phase A.1b, mirror of HFQ4 +4.8% lever from `3ef127d`).
+        if self.arch_caps.is_wave64_native() {
+            let (kname, ksrc): (&str, &str) = if self.arch_caps.gemv_prefetch_enabled() {
+                (
+                    "gemv_hfq5g256_residual_wave64_prefetch",
+                    kernels::GEMV_HFQ5G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq5g256_residual_wave64",
+                    kernels::GEMV_HFQ5G256_RESIDUAL_WAVE64_SRC,
+                )
+            };
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let func = &self.functions[kname];
+            let grid = ((m as u32) + 1) / 2;
+            return unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [grid, 1, 1],
+                    [64, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        self.ensure_kernel(
+            "gemv_hfq5g256_residual",
+            kernels::GEMV_HFQ5G256_RESIDUAL_SRC,
+            "gemv_hfq5g256_residual",
+        )?;
+        let func = &self.functions["gemv_hfq5g256_residual"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
 
     /// HFQ6-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq6g256(
@@ -3534,6 +3638,42 @@ impl Gpu {
             )
         }
     }
+    /// HFQ5-G256 GEMV. K must be multiple of 256.
+    pub fn gemv_hfq5g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_hfq5g256", kernels::GEMV_HFQ5G256_SRC, "gemv_hfq5g256")?;
+        let func = &self.functions["gemv_hfq5g256"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
 
     /// HFQ8-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq8g256(
@@ -4340,6 +4480,76 @@ impl Gpu {
         }
         result
     }
+    /// HFQ5G256 batched residual GEMV with fused sigmoid-scaled add. Same
+    /// shape as the HFQ6 sibling; reads the 168 B/group 5-bit layout. Used
+    /// by the batched MoE-FFN shared-expert `down` projection where
+    /// shared.down is MQ5.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq5g256_residual_sigmoid_scaled_gpu_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        c_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq5g256_residual_sigmoid_scaled",
+            kernels::GEMV_HFQ5G256_RESIDUAL_SIGMOID_SCALED_SRC,
+            "gemv_hfq5g256_residual_sigmoid_scaled_gpu_batched",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_batch.buf.as_ptr();
+        let y_ptr = y_batch.buf.as_ptr();
+        let c_ptr = c_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // HFQ5 weight footprint: m * (k / 256) * 168 bytes per row + 4 B per
+        // input/output cell. No dedicated profile helper yet (HFQ5 GEMV
+        // currently doesn't appear in profile.rs); inlined here.
+        let groups = k / 256;
+        let weight_bytes = m * groups * 168;
+        let bytes = batch_size * (weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq5g256_residual_sigmoid_scaled_gpu_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq5g256_residual_sigmoid_scaled_gpu_batched",
+            [m as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(c_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in a
     /// single launch. Caller passes the 8 selected experts' weight
@@ -5487,6 +5697,76 @@ impl Gpu {
         }
         result
     }
+    /// Index-aware MoE gate_up GEMV for HFQ5G256-layout routed experts.
+    /// Wave32 (RDNA) only. Mirror of the HFQ6 sibling (168 B/group, 5-bit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq5g256_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq5g256_moe_gate_up_indexed",
+            kernels::GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_hfq5g256_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // HFQ5 uses 168 bytes/group vs HFQ4's 136. Bytes estimate scales
+        // accordingly. Reuse the existing profile helper with a 168/136
+        // ratio so timer estimates are roughly correct.
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = 8 * (hfq4_bytes * 168 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq5g256_moe_gate_up_k8_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq5g256_moe_gate_up_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// HFQ6G256 batched gate_up MoE GEMV. Same kernarg signature + grid
     /// (M, K_TOP, N) + gate/up output split as the HFQ4 batched gate_up
@@ -5563,6 +5843,80 @@ impl Gpu {
         }
         result
     }
+    /// HFQ5G256 batched gate_up MoE GEMV. Same kernarg signature + grid
+    /// (M, K_TOP, N) + gate/up output split as the HFQ6 sibling; only the
+    /// per-group dequant differs (168 B/group, 5-bit). Wave32 (RDNA) only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq5g256_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq5g256_moe_gate_up_indexed_batched",
+            kernels::GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+            "gemv_hfq5g256_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // 168 vs 136 B/group: scale the HFQ4 byte estimate by 168/136.
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 168 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq5g256_moe_gate_up_k8_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq5g256_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// HFQ6G256 counterpart to `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
     /// Atomic-free expand-then-combine for the MoE down step. Pairs with
@@ -5633,6 +5987,75 @@ impl Gpu {
         }
         result
     }
+    /// HFQ5G256 counterpart to `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
+    /// Atomic-free expand-then-combine for the MoE down step. Pairs with
+    /// `moe_down_combine_k8_batched` (dtype-independent). Wave32 (RDNA) only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq5g256_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_HFQ5G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_hfq5g256_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 168 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq5g256_moe_down_k8_indexed_batched_expanded",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq5g256_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     pub fn gemv_q8_0(

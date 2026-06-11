@@ -1413,6 +1413,22 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        31 => {
+            // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw).
+            // Opaque raw buffer, same pattern as MQ4(13)/MQ6(15); the GEMV
+            // dispatch FWHT-rotates x at use. AWQ sidecar attached by the
+            // caller via DType::supports_awq_sidecar (already includes MQ5G256).
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         21 => {
             // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale. See docs/quant-formats/hfp4.md.
             // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs); refuse here so a

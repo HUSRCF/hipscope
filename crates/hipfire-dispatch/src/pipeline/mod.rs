@@ -298,7 +298,7 @@ pub fn run_moe_decode(
     // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
     // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
     // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
-    // layers outside the {k=8, MQ4G256|MQ6G256|ParoQ4G128-routed} fast path
+    // layers outside the {k=8, MQ4G256|MQ5G256|MQ6G256|ParoQ4G128-routed} fast path
     // run instead of hard-panicking. #393 deleted this; restoring it keeps the
     // dispatch migration behavior-preserving.
     //
@@ -393,6 +393,11 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MQ5G256 {
+        hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+        ))?;
     } else if p.dtypes.routed_gate_up == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
@@ -434,6 +439,11 @@ pub fn run_moe_decode(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
+    } else if p.dtypes.routed_down == DType::MQ5G256 {
+        hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+            down_m, down_k, p.k, 1,
+        ))?;
     } else if p.dtypes.routed_down == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
@@ -459,7 +469,7 @@ pub fn run_moe_decode(
 /// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393
 /// deleted from `moe_ffn_decode_impl` (origin/master qwen35.rs). Fires for any
 /// MoE layer the GPU-top-K fast path can't serve: `k != 8`, or a routed expert
-/// dtype outside `{MQ4G256, MQ6G256, ParoQ4G128}` (e.g. a Q8-routed MoE).
+/// dtype outside `{MQ4G256, MQ5G256, MQ6G256, ParoQ4G128}` (e.g. a Q8-routed MoE).
 ///
 /// Sequence mirrors master exactly:
 ///   1. softmax(router_logits)
@@ -949,6 +959,10 @@ fn dispatch_grouped_gemm(
         DType::MQ4G256 => hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
+        // DType::MQ5G256: grouped-WMMA path is gfx12-only and the kernel
+        // (`gemm_hfq5g256_moe_grouped_wmma`) is not yet wired in rdna-compute.
+        // MQ5 falls through to `_other => UnsupportedVariant`; on gfx942 the
+        // `mq5_on_non_gfx12` guard forces Path 1 so this is never reached.
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
@@ -1075,6 +1089,10 @@ pub fn run_moe_prefill(
                     p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
                     p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
                 )),
+                DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                )),
                 DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
                     p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
                     p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
@@ -1101,7 +1119,7 @@ pub fn run_moe_prefill(
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
         // activations, not weight data). AWQ-aware variant when down has AWQ.
         match p.dtypes.routed_down {
-            DType::MQ4G256 | DType::MQ6G256 => {
+            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 => {
                 if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
                     // Route A MoE-AWQ (per-routed-expert, indexed by topk slot).
                     // total_slots rows = N·k_top; each slot's expert is
@@ -1171,6 +1189,10 @@ pub fn run_moe_prefill(
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            DType::MQ5G256 => hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
                 down_m, down_k, k_top, n,
             )),

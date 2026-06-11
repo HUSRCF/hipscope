@@ -32,7 +32,7 @@ fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
 pub struct HfqTensorInfo {
     pub name: String,
-    pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
+    pub quant_type: u8, // serialized QuantType byte (e.g. 13=MQ4G256, 15=MQ6G256, 31=MQ5G256); see hipfire-quantize QuantType enum
     pub shape: Vec<u32>,
     pub group_size: u32,
     pub data_offset: usize,
@@ -717,6 +717,11 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
                 // Models quantized pre-renumber MUST be re-quantized.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        31 => { // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
+                // AWQ sidecar attached centrally below via supports_awq_sidecar().
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ5G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)

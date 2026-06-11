@@ -910,6 +910,75 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// MagnumQuant MQ5-G256: FWHT-rotated 5-bit quantization.
+/// 168 bytes/group = 8 B affine header (f32 scale + f32 min) + 160 B payload
+/// (5 bits x 256 weights = 1280 bits). 5.25 bpw. Sits between MQ4 (136 B/group)
+/// and MQ6 (200 B/group). The 5-bit codes cross byte boundaries: 8 values pack
+/// into 5 bytes (8*5 = 40 bits). The rotation is baked into the weights; the
+/// GEMV kernel rotates x instead of inverse-rotating w.
+///
+/// Pack layout (q0..q7 each 5-bit, clamped to 31), per 5-byte chunk:
+///   b0 = q0        | (q1 << 5)              // q0[4:0], q1[2:0]
+///   b1 = (q1 >> 3) | (q2 << 2) | (q3 << 7)  // q1[4:3], q2[4:0], q3[0]
+///   b2 = (q3 >> 1) | (q4 << 4)              // q3[4:1], q4[3:0]
+///   b3 = (q4 >> 4) | (q5 << 1) | (q6 << 6)  // q4[4], q5[4:0], q6[1:0]
+///   b4 = (q6 >> 2) | (q7 << 3)              // q6[4:2], q7[4:0]
+/// The HIP unpacker reverses this (read 5 bytes -> 8 codes), then
+///   val = q * scale + min.
+fn quantize_mq5g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 168; // 8 (scale+min) + 160 (packed 5-bit)
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        // Copy group and pad to 256
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        // Apply FWHT rotation — this equalizes outliers across the group
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 31.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        // Pack 8 values per 5 bytes (8*5 = 40 bits). 256/8 = 32 chunks ->
+        // 32*5 = 160 payload bytes. byte_off = 8 + (i/8)*5.
+        for i in (0..256).step_by(8) {
+            let q0 = (((group[i] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q1 = (((group[i + 1] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q2 = (((group[i + 2] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q3 = (((group[i + 3] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q4 = (((group[i + 4] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q5 = (((group[i + 5] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q6 = (((group[i + 6] - min_val) * inv_scale + 0.5) as u8).min(31);
+            let q7 = (((group[i + 7] - min_val) * inv_scale + 0.5) as u8).min(31);
+
+            let byte_off = 8 + (i / 8) * 5;
+            output[out_off + byte_off] = q0 | (q1 << 5);
+            output[out_off + byte_off + 1] = (q1 >> 3) | (q2 << 2) | (q3 << 7);
+            output[out_off + byte_off + 2] = (q3 >> 1) | (q4 << 4);
+            output[out_off + byte_off + 3] = (q4 >> 4) | (q5 << 1) | (q6 << 6);
+            output[out_off + byte_off + 4] = (q6 >> 2) | (q7 << 3);
+        }
+    }
+
+    output
+}
+
 /// MagnumQuant MQ8-G256: FWHT-rotated symmetric INT8 quantization.
 /// Format: [f16 scale][int8 × 256] = 258 bytes per 256 weights (1.008 B/w).
 /// Symmetric: scale = max(abs(group)) / 127, q = round(val / scale), no zero-point.
@@ -3121,6 +3190,9 @@ enum QuantType {
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
                        // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
                        // Models quantized pre-renumber MUST be re-quantized.
+    MQ5G256 = 31,      // MagnumQuant: FWHT-rotated 5-bit (168 B/group, 5.25 bpw).
+                       // 8B affine header (f32 scale + f32 min) + 160B payload
+                       // (5 bits × 256, cross-byte: 8 codes per 5 bytes). NOTE: 16=BF16.
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -3153,6 +3225,7 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mq2
         | GgufFormat::Mq3
         | GgufFormat::Mq4
+        | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
         | GgufFormat::Mq3Lloyd
@@ -3183,9 +3256,10 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
         (_, Mq2Lloyd | Mq3Lloyd) => false,
 
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq6) => true,
-        (Mq3, Mq4 | Mq6) => true,
-        (Mq4, Mq6) => true,
+        (Mq2, Mq3 | Mq4 | Mq5 | Mq6) => true,
+        (Mq3, Mq4 | Mq5 | Mq6) => true,
+        (Mq4, Mq5 | Mq6) => true,
+        (Mq5, Mq6) => true,
 
         // HFQ-family upward bit-width
         (Hfq4, Hfq6) => true,
@@ -4248,6 +4322,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 /// | hfq4     | HFQ4G256        | Q8F16     | dense default — no FWHT, plain   |
 /// | hfq6     | HFQ6G256        | Q8F16     | dense + higher quality           |
 /// | mq4      | MQ4G256         | Q8F16     | Qwen3.5+ (DeltaNet) — FWHT-rot   |
+/// | mq5      | MQ5G256         | Q8F16     | 5-bit FWHT (5.25 bpw, 168 B/grp) |
 /// | mq6      | MQ6G256         | Q8F16     | Qwen3.5+ (DeltaNet) + higher q   |
 /// | mq3      | MQ3G256         | Q8F16     | Sub-4-bit FWHT (3.25 bpw)        |
 /// | mq2      | MQ2G256         | Q8F16     | Sub-4-bit FWHT (2.25 bpw)        |
@@ -4262,6 +4337,7 @@ enum GgufFormat {
     Hfq4,
     Hfq6,
     Mq4,
+    Mq5,
     Mq6,
     Mq3,
     Mq2,
@@ -4278,6 +4354,7 @@ impl GgufFormat {
             "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
             "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
             "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "mq5" | "mq5g256" => Some(Self::Mq5),
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "mq2" | "mq2g256" => Some(Self::Mq2),
@@ -4295,6 +4372,7 @@ impl GgufFormat {
             Self::Hfq4 => "HFQ4G256",
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
+            Self::Mq5 => "MQ5G256",
             Self::Mq6 => "MQ6G256",
             Self::Mq3 => "MQ3G256",
             Self::Mq2 => "MQ2G256",
@@ -4525,6 +4603,10 @@ fn run_gguf_pipeline(
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 }
+                GgufFormat::Mq5 => {
+                    let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ5G256, 256u32, "MQ5G256")
+                }
                 GgufFormat::Mq3 => {
                     let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256, 256u32, "MQ3G256")
@@ -4572,6 +4654,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq5 => {
+                    let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ5G256, 256u32, "MQ5G256")
                 }
                 GgufFormat::Hfq4 => {
                     let q = quantize_hfq4g256(&f32_data);
@@ -4624,6 +4710,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq5 => {
+                    let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ5G256, 256u32, "MQ5G256")
                 }
                 GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
@@ -4835,6 +4925,7 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
+    let use_mq5g256 = format == "mq5" || format == "mq5g256";
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
@@ -6131,6 +6222,11 @@ fn main() {
                 || (kmap_promote && use_mq4_mq2lloyd_gptq_all)
                 || (kmap_promote && use_mq4_mq3lloyd_kmap))
                 && supports_g256;
+            // MQ5 routed experts: `--format mq5` ships ALL experts at MQ5
+            // (mirrors expert_mq6's use_mq6g256 base-format case). The env-var
+            // levers (HIPFIRE_MOE_EXPERTS_MQ5 / _DOWN_MQ5) below add the
+            // gate_up-stays-MQ4 + down-only-MQ5 recipe via `down_mq5`.
+            let expert_mq5 = use_mq5g256 && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
             // HIPFIRE_MOE_DOWN_MQ6=1: promote ONLY the expert down_proj to MQ6
@@ -6146,6 +6242,17 @@ fn main() {
             let down_mq6 = supports_g256
                 && (experts_mq6_all
                     || (std::env::var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
+                        && base_name == "down_proj"));
+            // HIPFIRE_MOE_EXPERTS_MQ5=1 promotes BOTH gate_up + down to MQ5; the
+            // experts-level 5-bit recipe (5.25 bpw, between MQ4 and MQ6).
+            // HIPFIRE_MOE_DOWN_MQ5=1 promotes ONLY the expert down_proj to MQ5
+            // (gate_up stays MQ4). Kept OUT of `expert_mq5` so `expert_awq_active`
+            // still fires; the AWQ branch switches its output format to MQ5.
+            let experts_mq5_all =
+                std::env::var("HIPFIRE_MOE_EXPERTS_MQ5").ok().as_deref() == Some("1");
+            let down_mq5 = supports_g256
+                && (experts_mq5_all
+                    || (std::env::var("HIPFIRE_MOE_DOWN_MQ5").ok().as_deref() == Some("1")
                         && base_name == "down_proj"));
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
             // (overrides any kmap promotion). The intent is to inject MQ2
@@ -6287,6 +6394,8 @@ fn main() {
                         awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, scales);
                         if down_mq6 {
                             (quantize_mq6g256(&scaled, &signs1, &signs2), QuantType::MQ6G256, 256u32)
+                        } else if down_mq5 || expert_mq5 {
+                            (quantize_mq5g256(&scaled, &signs1, &signs2), QuantType::MQ5G256, 256u32)
                         } else {
                             (quantize_mq4g256(&scaled, &signs1, &signs2), QuantType::MQ4G256, 256u32)
                         }
@@ -6330,6 +6439,9 @@ fn main() {
                         );
                         let q = quantize_hfq4g256(&dequant);
                         (q, QuantType::HFQ4G256, 256u32)
+                    } else if expert_mq5 || down_mq5 {
+                        let q = quantize_mq5g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ5G256, 256u32)
                     } else if expert_mq6 || down_mq6 {
                         let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ6G256, 256u32)
@@ -6377,7 +6489,13 @@ fn main() {
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if expert_awq_active && awq_in_sum2_per_expert.is_some() {
-                if down_mq6 { "MQ6G256+AWQ" } else { "MQ4G256+AWQ" }
+                if down_mq6 {
+                    "MQ6G256+AWQ"
+                } else if down_mq5 || expert_mq5 {
+                    "MQ5G256+AWQ"
+                } else {
+                    "MQ4G256+AWQ"
+                }
             } else if expert_mq3lloyd_native {
                 "MQ3G256L"
             } else if expert_mq2lloyd_native {
@@ -6388,6 +6506,8 @@ fn main() {
                 }
             } else if expert_mq2lloyd_roundtrip {
                 "MQ2L→HFQ4"
+            } else if expert_mq5 || down_mq5 {
+                "MQ5G256"
             } else if expert_mq6 || down_mq6 {
                 "MQ6G256"
             } else if expert_hfq6 {
@@ -6686,6 +6806,28 @@ fn main() {
                                 };
                                 (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                             }
+                            GgufFormat::Mq5 => {
+                                // MQ5 + AWQ on lm_head: MQ5G256 is in
+                                // DType::supports_awq_sidecar, so the runtime applies the
+                                // inverse divide via rotate_x_mq. Same AWQ inline dance as MQ4.
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq5g256(&scaled, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq5g256(&f32_data, &signs1, &signs2)
+                                    }
+                                } else {
+                                    quantize_mq5g256(&f32_data, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ5G256, 256u32, "MQ5G256")
+                            }
                             GgufFormat::Mq6 => {
                                 let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                                 (q, QuantType::MQ6G256, 256u32, "MQ6G256")
@@ -6982,6 +7124,47 @@ fn main() {
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
                             // requires 256-element segments). Matches MQ4's ragged fallback.
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq5g256 && is_embed {
+                        // MQ5 embeddings stay Q8F16 (embedding lookup is accuracy-
+                        // sensitive; matches MQ4 / MQ6 / HFQ4 pattern).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq5g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            // AWQ pre-scaling for the MQ5 base body (mirrors the MQ4
+                            // base arm). MQ5G256 is on DType::supports_awq_sidecar, so
+                            // the runtime applies the inverse divide via rotate_x_mq.
+                            // awq_eligible gates to tensors whose runtime path has the
+                            // inverse (skips o_proj / down_proj which lack it).
+                            let q = if let (Some(alpha), Some(im_weights)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq5g256(&scaled, &signs1, &signs2)
+                                } else {
+                                    quantize_mq5g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mq5g256(&f32_data, &signs1, &signs2)
+                            };
+                            (q, QuantType::MQ5G256, 256u32, "MQ5G256")
+                        } else {
+                            // Fallback to HFQ4-G128 for non-256-aligned (no MQ5G128).
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }

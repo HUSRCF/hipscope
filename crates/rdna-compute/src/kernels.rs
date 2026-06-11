@@ -897,6 +897,24 @@ pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str =
 pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64_prefetch.hip");
 
+/// HFQ5-G256: flat 5-bit with 256-weight groups (168 B/group, 5.25 bpw).
+/// Block: [f32 scale][f32 min][160B data] = 168 bytes per 256 weights.
+/// Packing: 8 weights per 5 bytes (40 bits = 8x5 bits), cross-byte.
+pub const GEMV_HFQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq5g256.hip");
+pub const GEMV_HFQ5G256_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual.hip");
+
+/// Wave64-native HFQ5-G256 residual GEMV. Mirror of the HFQ6 sibling with
+/// 5-bit unpack from `gemv_hfq5g256_residual.hip`. Used for HFQ5/MQ5 `wo`
+/// and `w_down` projections on wave64-native arches (gfx906/908/94x).
+pub const GEMV_HFQ5G256_RESIDUAL_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_wave64.hip");
+
+/// Wave64-native HFQ5-G256 residual GEMV with software-pipelined
+/// across-quad weight prefetch. Mirror of the HFQ6 prefetch sibling.
+pub const GEMV_HFQ5G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_wave64_prefetch.hip");
+
 /// gfx906 wave64+dp4a fused single-token GEMVs for HFQ6/MQ6 — the
 /// Phase A.1c headline lever. Mirror of HFQ4 fused-dp4a family; uses
 /// sdot4 with HFQ6's 6-bit unsigned weights (no zp shift correction).
@@ -969,6 +987,8 @@ pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g1
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+/// MQ5-G256 GEMV: FWHT-rotated HFQ5 (5-bit, 168 B/group). Uses pre-rotated x.
+pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
@@ -1085,6 +1105,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str =
 /// compatible with HFQ6G256, 200 B / group of 256).
 pub const GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_residual_sigmoid_scaled.hip");
+
+/// HFQ5G256 sibling of the sigmoid-scaled batched residual GEMV. Same
+/// shape; reads the 168 B/group 5-bit layout. Used for the batched MoE-FFN
+/// shared-expert `down` projection where shared.down is MQ5.
+pub const GEMV_HFQ5G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_sigmoid_scaled.hip");
 
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
@@ -1260,11 +1286,21 @@ pub const GIVENS_ROTATE_TO_SRC: &str = include_str!("../../../kernels/src/givens
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
 
+/// Index-aware MoE gate_up GEMV for HFQ5G256-layout routed experts. Mirror
+/// of the HFQ6 sibling; reads the 168 B/group 5-bit layout.
+pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_gate_up_indexed.hip");
+
 /// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
 /// (combine is dtype-independent — operates on the f32 expanded buffer).
 pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// HFQ5G256 counterpart to the atomic-free expanded batched MoE down kernel.
+/// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
+pub const GEMV_HFQ5G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_down_k8_indexed_batched_expanded.hip");
 
 /// HFQ6G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
 /// gate/up output split as the HFQ4 batched gate_up kernel, only the per-group
@@ -1272,6 +1308,12 @@ pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// kernel for the batched LFM2.5-MoE decode path (MQ6-promoted expert layers).
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
+/// HFQ5G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
+/// gate/up output split as the HFQ6 batched gate_up kernel; only the
+/// per-group dequant differs (168 B/group, 5-bit).
+pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_gate_up_k8_indexed_batched.hip");
 
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the

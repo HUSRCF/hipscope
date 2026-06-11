@@ -401,6 +401,7 @@ fn for_gemv_prerotated_maps_mq_family() {
         (DType::MQ4G256, KernelKey::GemvMq4G256Prerotated),
         (DType::MQ3G256, KernelKey::GemvMq3G256Prerotated),
         (DType::MQ2G256, KernelKey::GemvMq2G256Prerotated),
+        (DType::MQ5G256, KernelKey::GemvMq5G256Prerotated),
         (DType::MQ6G256, KernelKey::GemvMq6G256Prerotated),
         (DType::MQ8G256, KernelKey::GemvMq8G256Prerotated),
         (DType::MFP4G32, KernelKey::GemvMfp4G32Prerotated),
@@ -473,7 +474,7 @@ fn for_gemv_rejects_unsupported_variant_combo() {
 #[test]
 fn dtype_needs_rotation_true_for_mq_family() {
     for dtype in [
-        DType::MQ4G256, DType::MQ3G256, DType::MQ2G256, DType::MQ6G256,
+        DType::MQ4G256, DType::MQ3G256, DType::MQ2G256, DType::MQ5G256, DType::MQ6G256,
         DType::MQ8G256, DType::MQ4G256Lloyd, DType::MFP4G32,
     ] {
         assert!(dtype_needs_rotation(dtype), "{dtype:?} should need FWHT");
@@ -622,6 +623,18 @@ fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
     assert!(r.routed_indexable_mq4);
     assert!(!r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mq5_routed_indexable() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ5G256;
+    d.routed_down = DType::MQ5G256;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq5);
+    assert!(!r.routed_indexable_mq4);
+    assert!(!r.routed_indexable_mq6);
+    assert!(r.use_gpu_topk);
 }
 
 #[test]

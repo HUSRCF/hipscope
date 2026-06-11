@@ -56,6 +56,7 @@ pub struct MoeDtypes {
 pub struct MoeResolution {
     pub gate_side_mq4: bool,
     pub routed_indexable_mq4: bool,
+    pub routed_indexable_mq5: bool,
     pub routed_indexable_mq6: bool,
     /// Mixed routed experts: gate_up MQ4, down MQ6 (the "mq6-down" lever —
     /// promote only the sensitive residual-write projection to 6-bit while
@@ -79,16 +80,19 @@ impl MoeResolution {
             && d.experts_all_gate_up_mq4;
 
         let routed_gate_up_mq4 = d.routed_gate_up == MQ4G256;
+        let routed_gate_up_mq5 = d.routed_gate_up == MQ5G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
+        let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
 
         let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
             || routed_indexable_paro;
@@ -96,12 +100,14 @@ impl MoeResolution {
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
             || routed_gate_up_mq4
+            || routed_gate_up_mq5
             || routed_gate_up_mq6
             || routed_gate_up_paro;
 
         Self {
             gate_side_mq4,
             routed_indexable_mq4,
+            routed_indexable_mq5,
             routed_indexable_mq6,
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_paro,
@@ -112,6 +118,7 @@ impl MoeResolution {
 
     pub fn routed_indexable(&self) -> bool {
         self.routed_indexable_mq4
+            || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6
             || self.routed_indexable_paro
@@ -427,6 +434,12 @@ impl MoePrefillResolution {
         let mq6_on_non_gfx12 = d.routed_gate_up == DType::MQ6G256
             && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq6_on_non_gfx12;
+        // MQ5 grouped-WMMA (`gemm_hfq5g256_moe_grouped_wmma`) is gfx12-only
+        // (same as MQ6) — fall back to Path 1 (indexed batched GEMV) on
+        // gfx11/gfx9 to avoid the gfx12-only kernel panic.
+        let mq5_on_non_gfx12 = d.routed_gate_up == DType::MQ5G256
+            && !(arch.is_gfx1200() || arch.is_gfx1201());
+        let use_path2 = use_path2 && !mq5_on_non_gfx12;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
