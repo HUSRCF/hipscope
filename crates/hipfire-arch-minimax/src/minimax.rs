@@ -173,6 +173,9 @@ pub fn apply_reap_plan(config: &mut MiniMaxConfig) -> Result<(), String> {
     let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") else {
         return Ok(());
     };
+    if config.num_local_experts == 0 {
+        return Err(format!("minimax: HIPFIRE_REAP_PLAN={dir} set but num_local_experts == 0 (not a MoE checkpoint)"));
+    }
     let plan = hipfire_reap::plan::ReapPlan::load_any(
         &dir,
         config.num_hidden_layers,
@@ -306,6 +309,8 @@ fn load_norm_keep(
 ) -> Result<GpuTensor, String> {
     debug_assert_eq!(m, keep.len(), "minimax load_norm_keep: m must equal keep.len()");
     let (qt, data) = read_tensor(hfq, name)?;
+    // Per-element width for the row-gather. Q8_0 packs 32 elems/block, so a
+    // single bias element is not a whole row — refuse rather than corrupt.
     let elem_bytes = match qt {
         1 => 2, // F16
         2 => 4, // F32
