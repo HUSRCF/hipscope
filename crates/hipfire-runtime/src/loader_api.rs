@@ -5,23 +5,42 @@
 //! and the registry live top-of-DAG in `hipfire-loader`; this module
 //! holds only what the arch crates need to implement a carrier.
 
-use std::path::PathBuf;
+use std::path::Path;
 use crate::hfq::HfqFile;
+use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
 
 /// A model on disk, before we know its arch. Carries either a parsed
 /// HFQ header or a directory (safetensors/ParoQuant — probed later).
 pub enum ModelSource {
     Hfq(HfqFile),
-    Dir(PathBuf),
+    Dir(SafetensorsSource),
 }
 
 impl ModelSource {
-    /// Convenience: the HFQ arch_id if this is an HFQ source.
+    /// Open a model from either an HFQ file or a safetensors directory
+    /// based on whether `path` is a file or directory.
+    pub fn from_path(path: &str) -> Result<Self, String> {
+        if Path::new(path).is_dir() {
+            Ok(ModelSource::Dir(SafetensorsSource::open(Path::new(path)).map_err(|e| format!("{e:?}"))?))
+        } else {
+            Ok(ModelSource::Hfq(HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?))
+        }
+    }
+
+    /// The HFQ or safetensors arch_id.
     pub fn arch_id(&self) -> Option<u32> {
         match self {
             ModelSource::Hfq(h) => Some(h.arch_id),
-            ModelSource::Dir(_) => None,
+            ModelSource::Dir(s) => Some(s.arch_id()),
+        }
+    }
+
+    /// Human-readable description for logging.
+    pub fn describe(&self) -> String {
+        match self {
+            ModelSource::Hfq(h) => format!("HFQ arch_id={}", h.arch_id),
+            ModelSource::Dir(s) => format!("safetensors-dir arch_id={}", s.arch_id()),
         }
     }
 }

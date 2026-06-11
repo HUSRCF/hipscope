@@ -127,6 +127,11 @@ impl SafetensorsSource {
             quant_config,
         })
     }
+
+    /// Public accessor so `loader_api` doesn't need the `ModelSource` trait in scope.
+    pub fn arch_id(&self) -> u32 {
+        self.arch_id
+    }
 }
 
 impl ModelSource for SafetensorsSource {
