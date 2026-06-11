@@ -30,6 +30,33 @@ exact byte ops — no dequant. REAP and EP-sharding are mutually exclusive.
 > all `hipfire-reap` CPU unit tests pass; the 10-decimal NLL gate must be run once
 > the GPU frees. See the SP1 plan's GPU-embargo note.
 
+## Selective re-quant (overlay) — SP4
+
+Iterate a quant config WITHOUT re-quantizing the whole model. The quantizer
+(`hipfire-quantize`, CPU-only) re-quantizes ONLY the tensors named by a reap plan's
+`quant_overrides`, reading the **original fp16/bf16 safetensors** (so *up*-quanting
+recovers precision — it does not dequant the lossy base), and writes a small
+`overlay.hfq` keyed by the same tensor names:
+
+```bash
+hipfire-quantize --reap-overlay <plan-dir> --reap-arch <deepseek4|qwen35|lfm2moe|minimax> \
+                 --reap-out <plan-dir>/overlay.hfq  <original-safetensors-model-dir>
+#   plan-dir holds reap_plan.json with e.g.
+#   "quant_overrides":[{"layer":20,"role":"routed_experts","experts":[7,12],"tier":"mq3lloyd"},
+#                      {"layer":41,"role":"attention","tier":"q8"}]
+```
+
+Supported `tier`s: `q8`, `hfq4`/`hfq6`, `mq4`/`mq6`, and the Lloyd variants
+`mq2lloyd`/`mq3lloyd`/`mq4lloyd` (each byte-identical to what `--format <tier>` would
+emit for that tensor; verified by unit tests). `--reap-arch` is auto-detected from the
+model's arch_id when omitted (minimax must be passed explicitly).
+
+**Consuming the overlay:** the load-time splice (`HIPFIRE_REAP_PLAN=<plan-dir>` with an
+`overlay.hfq` present) is **SP3** (loader prefers overlay tensors over the base). An
+overlay that mixes tiers among experts *within one layer* additionally needs **SP2**
+(GPU bucketed dispatch) to serve; per-layer-uniform overrides serve through existing
+dispatch. The standalone-`.hfq` **bake** is **SP4b** (a follow-on plan).
+
 ## Workflow
 
 ```bash
