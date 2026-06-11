@@ -2,7 +2,12 @@
 
 **Date:** 2026-06-11
 **Branch:** `feature/paro-transparent-loading`
-**Status:** Revised after 2 subagent review rounds (2026-06-11) — pending user spec review
+**Status:** SUPERSEDED (2026-06-11). This design was written against a stale tree.
+The feature branch already implements a more general version (stateful
+`WeightBackend` with `candidates` resolver + `norm_bias` + Paro augmentor chain,
+covering qwen2/llama) and layers a **Carrier registry** on top — see
+`2026-06-11-carrier-registry-unified-design.md` (authoritative) and the reconciled
+`2026-06-11-qwen35-unified-weight-loading-impl.md`. Kept as a design-rationale record.
 
 ## Problem
 
