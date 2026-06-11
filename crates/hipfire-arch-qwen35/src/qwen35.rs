@@ -4499,23 +4499,47 @@ fn load_moe_ffn(
     };
 
     // ── Per-expert mixed-precision dtype-tag table ──────────────────────
-    // When the graded `.hfq` quantizes routed experts to MIXED down dtypes
-    // (top-frac MQ6, rest MQ2-Lloyd), `experts[0].down.gpu_dtype` is no
-    // longer representative — build a `[n_exp]` u8 tag table so the merged
-    // decode kernel can branch per expert. Built iff the down dtypes are
-    // not all identical (single source of truth for `routed_has_mixed_experts`).
-    // tag 0 = MQ6 (200 B/group affine), tag 1 = MQ2-Lloyd (72 B/group
-    // codebook); other dtypes map to 0 (uniform files never reach here).
+    // For N-tier graded files (T3-2L / T3-3L) the TIER_MAP assigns each
+    // expert a tier that applies to BOTH gate_up AND down.  Built iff
+    // gate_up OR down dtypes differ across experts (single source of truth
+    // for `routed_has_mixed_experts`).  Tags:
+    //   0 = MQ6G256      (200 B/group affine)
+    //   1 = MQ2G256Lloyd ( 72 B/group codebook)
+    //   2 = MQ4G256      (136 B/group affine)
+    //   3 = MQ3G256Lloyd (112 B/group codebook)
+    // Uniform files see gu0==gu_n and dn0==dn_n → None (byte-identical).
+    // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
+    // lever); for the existing down-only graded binary the gate_up types are
+    // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
     let expert_dtype_tags = if n_exp > 0 {
+        let gu0 = experts[0].gate_up.gpu_dtype;
         let dn0 = experts[0].down.gpu_dtype;
-        let mixed = experts.iter().any(|e| e.down.gpu_dtype != dn0);
+        let mixed = experts.iter().any(|e| e.gate_up.gpu_dtype != gu0)
+            || experts.iter().any(|e| e.down.gpu_dtype != dn0);
         if mixed {
+            // Map each expert to a tag based on its gate_up dtype (the tier
+            // that was assigned to BOTH projections by the quantizer).  Fall
+            // back to the down dtype for the legacy down-only-graded case
+            // (gate_up all MQ4G256 → tag2 = MQ4, which is correct).
             let tags: Vec<u8> = experts
                 .iter()
-                .map(|e| match e.down.gpu_dtype {
+                .map(|e| match e.gate_up.gpu_dtype {
                     DType::MQ6G256 => 0u8,
                     DType::MQ2G256Lloyd => 1u8,
-                    _ => 0u8,
+                    DType::MQ4G256 => {
+                        // gate_up uniform MQ4: use down dtype to distinguish
+                        // hot (MQ6) from mid (MQ4) from cold tiers so the
+                        // legacy down-only-graded binary still dispatches the
+                        // correct down branch.
+                        match e.down.gpu_dtype {
+                            DType::MQ6G256 => 0u8,       // hot (gu4 dn6 mixed)
+                            DType::MQ2G256Lloyd => 1u8,  // cold MQ2L
+                            DType::MQ3G256Lloyd => 3u8,  // cold MQ3L
+                            _ => 2u8,                    // default MQ4
+                        }
+                    }
+                    DType::MQ3G256Lloyd => 3u8,
+                    _ => 2u8,  // default: treat unknown tiers as MQ4
                 })
                 .collect();
             let t = gpu.alloc_tensor(&[n_exp], DType::Raw)?;

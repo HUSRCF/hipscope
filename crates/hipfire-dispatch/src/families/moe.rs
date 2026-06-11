@@ -46,14 +46,17 @@ pub struct MoeDtypes {
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType,       // ffn.experts[0].gate_up
     pub routed_down: DType,          // ffn.experts[0].down
-    /// Per-expert mixed routed **down** dtype: experts in one layer carry
-    /// DIFFERENT down dtypes (graded MQ6 hot / MQ2-Lloyd cold), so
-    /// `routed_down` (= experts[0]) is NOT representative. Built by the
-    /// model as `ffn.expert_dtype_tags.is_some()` — the tag table is built
-    /// iff the layer's experts are not all the same down dtype. Drives the
-    /// merged dtype-tag-branched decode kernel (one block per expert reads
-    /// its tag → branches dequant). Gate_up stays uniform MQ4 in the first
-    /// target, so only the down GEMV + self-combine flag change.
+    /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
+    /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
+    /// or MQ3L cold), so `routed_gate_up` / `routed_down` (= experts[0])
+    /// are NOT representative. Built by the model as
+    /// `ffn.expert_dtype_tags.is_some()` — the tag table is built iff any
+    /// expert's gate_up or down dtype differs from experts[0]. Tags:
+    ///   0 = MQ6G256 (200 B/grp affine)
+    ///   1 = MQ2G256Lloyd (72 B/grp codebook)
+    ///   2 = MQ4G256 (136 B/grp affine)
+    ///   3 = MQ3G256Lloyd (112 B/grp codebook)
+    /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
 }
@@ -83,12 +86,12 @@ pub struct MoeResolution {
     /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
     /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
     pub routed_indexable_mq3lloyd: bool,
-    /// Per-expert mixed routed experts (down graded MQ6/MQ2-Lloyd, gate_up
-    /// uniform MQ4). Indexable on the decode GPU-top-K path via the merged
-    /// dtype-tag-branched down kernel; gate_up uses the existing MQ4 indexed
-    /// GEMV, silu+rotate is weight-agnostic. The merged down writes the
-    /// EXPANDED buffer for BOTH dtypes → the single shared
-    /// `moe_down_combine_k8_batched` runs (NOT the Lloyd atomic self-combine).
+    /// Per-expert N-tier graded routed experts (MQ6 hot / MQ4 mid / MQ2L or
+    /// MQ3L cold, applied to BOTH gate_up and down). Indexable on the decode
+    /// GPU-top-K path via the merged dtype-tag-branched gate_up AND down
+    /// kernels. The merged down writes the EXPANDED buffer for all dtypes →
+    /// the single shared `moe_down_combine_k8_batched` runs (NOT Lloyd atomic
+    /// self-combine). silu+rotate is weight-agnostic (unchanged).
     pub routed_indexable_mixed_per_expert: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
@@ -221,9 +224,11 @@ pub struct MoeParams<'a> {
     /// plain silu+rotate, byte-identical to pre-AWQ.
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
     /// Per-expert mixed-precision decode: `[n_exp]` u8 (DType::Raw, 1 B/exp)
-    /// dtype-tag table, `Some` iff the layer's experts carry mixed down
-    /// dtypes (graded MQ6/MQ2-Lloyd). The merged dtype-tag-branched down
-    /// kernel reads `dtype_tags[expert_id]` per block (0=MQ6, 1=MQ2-Lloyd).
+    /// dtype-tag table, `Some` iff any expert's gate_up or down dtype differs
+    /// from experts[0] (N-tier graded files). The merged dtype-tag-branched
+    /// gate_up AND down kernels read `dtype_tags[expert_id]` per block:
+    ///   0=MQ6G256 (200 B/grp), 1=MQ2G256Lloyd (72 B/grp),
+    ///   2=MQ4G256 (136 B/grp), 3=MQ3G256Lloyd (112 B/grp).
     /// `None` (default) ⇒ uniform path, byte-identical to pre-mixed.
     pub expert_dtype_tags: Option<&'a GpuTensor>,
     pub routed_gate_up_k: usize,

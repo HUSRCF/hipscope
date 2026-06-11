@@ -7,28 +7,27 @@
 
 // Merged per-expert MIXED-PRECISION MoE down GEMV (expanded write).
 //
-// Each routed expert in a layer is EITHER MQ6 (hot) or MQ2-Lloyd (cold).
+// Each routed expert in a layer has one of four precision tiers.
 // The grid is block-per-(row, krank, token), so all 32 threads in a block
 // share ONE expert_id → ONE dtype tag → the per-block branch is
 // block-uniform → NO warp divergence.
 //
-//   dtype_tags[expert_id] == 0 → MQ6   (200 B/group: 4 B scale + 4 B zero
-//                                        + 192 B of 6-bit packed quants)
-//   dtype_tags[expert_id] == 1 → MQ2-Lloyd (72 B/group: 4×fp16 codebook
-//                                        + 64 B of 2-bit indices)
+//   dtype_tags[expert_id] == 0 → MQ6        (200 B/group: 4 B scale + 4 B zero
+//                                             + 192 B of 6-bit packed quants)
+//   dtype_tags[expert_id] == 1 → MQ2-Lloyd  (72 B/group: 4×fp16 codebook
+//                                             + 64 B of 2-bit indices)
+//   dtype_tags[expert_id] == 2 → MQ4        (136 B/group: 4 B scale + 4 B zero
+//                                             + 128 B of 4-bit packed quants)
+//   dtype_tags[expert_id] == 3 → MQ3-Lloyd  (112 B/group: 8×fp16 codebook
+//                                             + 96 B of 3-bit packed quants)
 //
-// MQ6 dequant copied verbatim from
-//   gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip:62-88
-// MQ2-Lloyd dequant copied verbatim (single-accumulator form, NOT the k4
-// 4-acc form) from gemv_mq2g256_lloyd_moe_down_expanded_k4.hip:65-83.
-//
-// Both branches accumulate into a SINGLE `acc` and share one wave32 reduce
-// + one expanded write — byte-identical to both reference expanded kernels.
+// All branches accumulate into a SINGLE `acc` and share one wave32 reduce
+// + one expanded write — byte-identical to the reference expanded kernels.
 // Feeds the dtype-agnostic `moe_down_combine_k8_batched`.
 //
 // Shapes:
 //   expert_ptrs    : [n_exp]
-//   dtype_tags     : [n_exp]                 u8, 0=MQ6 / 1=MQ2-Lloyd
+//   dtype_tags     : [n_exp]                 u8, 0=MQ6 / 1=MQ2-Lloyd / 2=MQ4 / 3=MQ3-Lloyd
 //   topk_indices   : [N × K_TOP]
 //   rot_batch      : [N × K_TOP × K]
 //   expert_outputs : [N × K_TOP × M]         non-atomic, one writer per cell
@@ -61,6 +60,9 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
     const int groups_per_row = K / 256;
 
     float acc = 0.0f;
+
+    // cb_lds: 32 B shared, used only by tag==3 (MQ3-Lloyd); harmless to other branches.
+    __shared__ float cb_lds[8];
 
     if (tag == 0) {
         // ---- MQ6 branch (200 B/group affine dequant) ----
@@ -100,7 +102,7 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                  + (scale * (float)q6 + zero) * x[base_idx + 6]
                  + (scale * (float)q7 + zero) * x[base_idx + 7];
         }
-    } else {
+    } else if (tag == 1) {
         // ---- MQ2-Lloyd branch (72 B/group 2-bit codebook) ----
         const int row_bytes = groups_per_row * 72;
         const char* row_ptr = A + (long long)row * row_bytes;
@@ -127,6 +129,50 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                 +  cb[(b1 >> 2) & 3] * x[base + 5]
                 +  cb[(b1 >> 4) & 3] * x[base + 6]
                 +  cb[b1 >> 6]       * x[base + 7];
+        }
+    } else if (tag == 2) {
+        // ---- MQ4 branch (136 B/group: [0..4) f32 scale, [4..8) f32 zero, [8..136) 128 B 4-bit) ----
+        const int row_bytes = groups_per_row * 136;
+        const char* row_ptr = A + (long long)row * row_bytes;
+        const int boff = tid * 4;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gptr = row_ptr + g * 136;
+            float sc = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+            float zp = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+            unsigned int pk = *(const unsigned int*)(gptr + 8 + boff);
+            const int base = g * 256 + tid * 8;
+            acc += (sc * (float)( pk        & 0xFu) + zp) * x[base]
+                 + (sc * (float)((pk >>  4) & 0xFu) + zp) * x[base + 1]
+                 + (sc * (float)((pk >>  8) & 0xFu) + zp) * x[base + 2]
+                 + (sc * (float)((pk >> 12) & 0xFu) + zp) * x[base + 3]
+                 + (sc * (float)((pk >> 16) & 0xFu) + zp) * x[base + 4]
+                 + (sc * (float)((pk >> 20) & 0xFu) + zp) * x[base + 5]
+                 + (sc * (float)((pk >> 24) & 0xFu) + zp) * x[base + 6]
+                 + (sc * (float)((pk >> 28) & 0xFu) + zp) * x[base + 7];
+        }
+    } else if (tag == 3) {
+        // ---- MQ3-Lloyd branch (112 B/group: [0..16) 8xfp16 codebook, [16..112) 96 B 3-bit) ----
+        const int row_bytes = groups_per_row * 112;
+        const char* row_ptr = A + (long long)row * row_bytes;
+        const int boff = tid * 3;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gptr = row_ptr + g * 112;
+            if (tid < 8) cb_lds[tid] = __half2float(((const __half*)gptr)[tid]);
+            __syncthreads();
+            const unsigned char* d = (const unsigned char*)(gptr + 16) + boff;
+            unsigned int pk = (unsigned int)d[0]
+                            | ((unsigned int)d[1] << 8)
+                            | ((unsigned int)d[2] << 16);
+            const int base = g * 256 + tid * 8;
+            acc += cb_lds[ pk        & 7u] * x[base]
+                 + cb_lds[(pk >>  3) & 7u] * x[base + 1]
+                 + cb_lds[(pk >>  6) & 7u] * x[base + 2]
+                 + cb_lds[(pk >>  9) & 7u] * x[base + 3]
+                 + cb_lds[(pk >> 12) & 7u] * x[base + 4]
+                 + cb_lds[(pk >> 15) & 7u] * x[base + 5]
+                 + cb_lds[(pk >> 18) & 7u] * x[base + 6]
+                 + cb_lds[(pk >> 21) & 7u] * x[base + 7];
+            __syncthreads();   // protect cb_lds before next group reload
         }
     }
 

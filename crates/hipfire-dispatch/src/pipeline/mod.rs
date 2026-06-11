@@ -393,6 +393,16 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if let Some(tags) = p.expert_dtype_tags {
+        // Per-expert mixed gate_up (N-tier graded: MQ6 hot / MQ4 mid / MQ2-Lloyd
+        // or MQ3-Lloyd cold). One merged kernel; block-per-(row,krank,token)
+        // reads tags[expert_id] (0=MQ6, 1=MQ2L, 2=MQ4, 3=MQ3L) and branches
+        // the dequant. m = 2*p.mi (kernel splits gate vs up at M/2 internally).
+        // X is the FWHT-rotated xr (same as the uniform MQ4/MQ6 arms above).
+        hip!(gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs, tags, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k, 1,
+        ))?;
     } else if p.dtypes.routed_gate_up == DType::MQ2G256Lloyd {
         // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
         // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at

@@ -4994,6 +4994,56 @@ fn main() {
             moe_hot_frac * 100.0
         );
     }
+    // ── N-tier graded MoE (HIPFIRE_MOE_TIER_MAP) ─────────────────────────────
+    // When set to a path, reads a file of "LAYER EXPERT DTYPE" lines and
+    // builds a per-(layer,expert) tier assignment for BOTH gate_up and down
+    // projections. Supported DTYPE values: MQ6, MQ4, MQ3L, MQ2L.
+    // Placed BEFORE the graded_hot arm in the rayon dispatch (takes priority).
+    // Does NOT require --imatrix; does NOT restrict to down_proj.
+    // Compose with --format mq4 --no-kmap --awq (dense attn/shared keep AWQ-MQ4).
+    let moe_tier_map: Option<std::collections::HashMap<(usize, usize), QuantType>> =
+        if let Ok(path) = std::env::var("HIPFIRE_MOE_TIER_MAP") {
+            let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("error: HIPFIRE_MOE_TIER_MAP={path}: {e}");
+                std::process::exit(2);
+            });
+            let mut map = std::collections::HashMap::new();
+            for (lineno, line) in content.lines().enumerate() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 3 {
+                    continue;
+                }
+                let lay: usize = cols[0].parse().unwrap_or_else(|_| {
+                    eprintln!("error: {path}:{}: bad layer '{}'", lineno + 1, cols[0]);
+                    std::process::exit(2);
+                });
+                let exp: usize = cols[1].parse().unwrap_or_else(|_| {
+                    eprintln!("error: {path}:{}: bad expert '{}'", lineno + 1, cols[1]);
+                    std::process::exit(2);
+                });
+                let qt = match cols[2] {
+                    "MQ6" => QuantType::MQ6G256,
+                    "MQ4" => QuantType::MQ4G256,
+                    "MQ3L" => QuantType::MQ3G256Lloyd,
+                    "MQ2L" => QuantType::MQ2G256Lloyd,
+                    other => {
+                        eprintln!(
+                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L)",
+                            lineno + 1, other
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                map.insert((lay, exp), qt);
+            }
+            eprintln!(
+                "note: HIPFIRE_MOE_TIER_MAP={path} — {} (layer,expert) tier assignments loaded.",
+                map.len()
+            );
+            Some(map)
+        } else {
+            None
+        };
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
@@ -6506,7 +6556,42 @@ fn main() {
                         .and_then(|t| t.get(x))
                         .filter(|v| v.len() == inner_k_e)
                         .map(|v| compute_awq_scales(v, awq_alpha_e));
-                    let (quantized, qt, gs) = if let Some(hot) = graded_hot.as_ref() {
+                    let (quantized, qt, gs) = if let (Some(tm), Some(lay)) =
+                        (moe_tier_map.as_ref(), parent_layer)
+                    {
+                        // N-tier TIER_MAP dispatch: look up (layer, expert) -> QuantType.
+                        // Fires for BOTH gate_up and down (unlike graded_hot which is down-only).
+                        // Falls back to uniform MQ4 for unmapped (layer,expert) pairs.
+                        // Uses the outer-scope signs1/signs2 captured by the rayon closure.
+                        match tm.get(&(lay, x)).copied().unwrap_or(QuantType::MQ4G256) {
+                            QuantType::MQ6G256 => (
+                                quantize_mq6g256(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ6G256,
+                                256u32,
+                            ),
+                            QuantType::MQ4G256 => (
+                                quantize_mq4g256(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ4G256,
+                                256u32,
+                            ),
+                            QuantType::MQ3G256Lloyd => (
+                                quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ3G256Lloyd,
+                                256u32,
+                            ),
+                            QuantType::MQ2G256Lloyd => (
+                                quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ2G256Lloyd,
+                                256u32,
+                            ),
+                            // Any other QuantType in the map → MQ4 safe fallback
+                            _ => (
+                                quantize_mq4g256(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ4G256,
+                                256u32,
+                            ),
+                        }
+                    } else if let Some(hot) = graded_hot.as_ref() {
                         // Graded mixed precision: hot expert -> MQ6, cold ->
                         // MQ2-Lloyd. Each expert's HfqTensor carries its own qt
                         // so this single parent emits MIXED dtypes; the runtime
@@ -6623,7 +6708,9 @@ fn main() {
             }
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if graded_hot.is_some() {
+            let label = if moe_tier_map.is_some() && parent_layer.is_some() {
+                "TierMap"
+            } else if graded_hot.is_some() {
                 "Graded(MQ6/MQ2L)"
             } else if expert_awq_active && awq_in_sum2_per_expert.is_some() {
                 if down_mq6 {
