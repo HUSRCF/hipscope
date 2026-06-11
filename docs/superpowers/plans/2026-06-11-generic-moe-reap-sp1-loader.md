@@ -10,6 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md` (§1, §4 SP1 gates).
 
+> ⛔ **GPU EMBARGO (2026-06-11):** the GPU is in use by separate cohere work. Do **NOT** run any
+> step that loads a model on the GPU: no `examples/daemon`, no perplexity/NLL/PPL/KLD runs, no
+> `cargo run`, and no `cargo test` on the arch crates (they may init the GPU). Allowed: editing
+> code, `cargo build -p <crate>` (compile only — kernels JIT at runtime, not build time), and
+> `cargo test -p hipfire-reap` (pure-CPU unit tests). Steps marked **[GPU — DEFERRED]** must be
+> left unchecked with a note; implement the code they verify, but do not execute them.
+
 **Scope note:** `cohere2moe` is in-flight on `nw_cohere2moe_support` and not on this base; it gets the identical Task-9-style wiring once merged. SP2 (mixed dispatch), SP3 (overlay application), SP4 (bake) get their own plans authored after this lands.
 
 ---
@@ -633,11 +640,15 @@ let (new_shape, sub) = hipfire_reap::gather::gather_rows(&shape_usize, &bytes, k
 ```
 then upload `sub`/`new_shape` as before, preserving the `info.quant_type` → `t.dtype` mapping. Do the analogous swap is NOT needed for `upload_global_f16_as_f32_keep` (it decodes f16→f32 element-wise; leave it, or refactor to call `gather_rows` then decode — optional, keep behavior identical).
 
-- [ ] **Step 5: Build + run the ds4 identity check**
+- [ ] **Step 5a: Build + CPU tests (run now)**
 
 Run: `cargo build -p hipfire-arch-deepseek4 && cargo test -p hipfire-reap`
-Then the identity NLL gate (the existing keep-all-256 sidecar): rebuild the ds4 perplexity example and confirm a keep-all `reap_plan.json` reproduces the no-plan baseline NLL to 10 decimals (use the existing `scripts/reap/build_keepall_sidecar.py`, regenerated to emit `reap_plan.json`, or point `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP` at the legacy sidecar to exercise `load_legacy_keepmap`).
-Expected: identical NLL — the lift is behavior-preserving.
+Expected: compiles; `hipfire-reap` unit tests (incl. the new `load_legacy_keepmap` test) pass.
+
+- [ ] **Step 5b: [GPU — DEFERRED] ds4 identity NLL gate**
+
+The identity NLL gate (existing keep-all-256 sidecar): confirm a keep-all `reap_plan.json` reproduces the no-plan baseline NLL to 10 decimals (use `scripts/reap/build_keepall_sidecar.py` regenerated to emit `reap_plan.json`, or point `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP` at the legacy sidecar to exercise `load_legacy_keepmap`).
+**Do NOT run under the GPU embargo** — leave unchecked; note "deferred: GPU in use". The lift must be behavior-preserving; this is the gate to run once the GPU frees.
 
 - [ ] **Step 6: Commit**
 
@@ -680,10 +691,10 @@ for slot in 0..n_slots {
 ```
 For the **router** (`{p}.mlp.gate.weight` or equivalent, `[n_exp, dim]`): when `ep` has a keep, read its bytes, `gather_rows(&[n_exp, dim_stride], &bytes, keep)`, and upload the gathered subset so the router emits logits only for kept experts. (Find the exact router tensor name in the qwen35 loader and match its existing upload.)
 
-- [ ] **Step 4: Build + identity check**
+- [ ] **Step 4: Build (run now) + [GPU — DEFERRED] identity check**
 
-Run: `cargo build -p hipfire-arch-qwen35`, then the keep-all NLL check.
-Expected: baseline reproduced.
+Run: `cargo build -p hipfire-arch-qwen35` (compile only).
+The keep-all NLL check is **[GPU — DEFERRED]** under the embargo — leave unchecked, note "deferred: GPU in use".
 
 - [ ] **Step 5: Commit**
 
@@ -710,9 +721,10 @@ In the `MoeFfnWeights::load` expert loop, replace `e` with `slot`/`src` exactly 
 
 - [ ] **Step 3: Router gather** as Task 7 Step 3 (find lfm2moe's router/gate tensor).
 
-- [ ] **Step 4: Build + identity check**
+- [ ] **Step 4: Build (run now) + [GPU — DEFERRED] identity check**
 
-Run: `cargo build -p hipfire-arch-lfm2moe`, then keep-all NLL check.
+Run: `cargo build -p hipfire-arch-lfm2moe` (compile only).
+Keep-all NLL check is **[GPU — DEFERRED]** — leave unchecked, note "deferred: GPU in use".
 
 - [ ] **Step 5: Commit**
 
@@ -748,9 +760,10 @@ The stride pointer table is then built over `n_slots` compact entries (unchanged
 
 - [ ] **Step 3: Router gather** (minimax router/gate `[n_exp, dim]`) as Task 7 Step 3.
 
-- [ ] **Step 4: Build + identity check**
+- [ ] **Step 4: Build (run now) + [GPU — DEFERRED] identity check**
 
-Run: `cargo build -p hipfire-arch-minimax`, then keep-all NLL check.
+Run: `cargo build -p hipfire-arch-minimax` (compile only).
+Keep-all NLL check is **[GPU — DEFERRED]** — leave unchecked, note "deferred: GPU in use".
 
 - [ ] **Step 5: Commit**
 
@@ -771,21 +784,22 @@ git commit -m "feat(minimax): generic REAP keep-map loader wiring"
 
 Update `scripts/reap/build_keepall_sidecar.py` to write a generic `reap_plan.json` with `keep.per_layer = [[0..N-1]] * num_layers` for a given (num_layers, n_experts), arch-agnostic.
 
-- [ ] **Step 2: Run the identity gate on every wired arch**
+- [ ] **Step 2: [GPU — DEFERRED] Run the identity gate on every wired arch**
 
 For each of ds4, qwen35, lfm2moe, minimax with an available MoE checkpoint: load with `HIPFIRE_REAP_PLAN=<keepall dir>` and confirm logits/NLL match the no-plan baseline to 10 decimals. Record results in `scripts/reap/README.md`.
-Expected: all 4 reproduce baseline (the machinery is an exact no-op under keep-all).
+**Do NOT run under the GPU embargo** — leave unchecked, note "deferred: GPU in use". Expected (when run): all 4 reproduce baseline (exact no-op under keep-all).
 
-- [ ] **Step 3: ds4 end-to-end smoke**
+- [ ] **Step 3: [GPU — DEFERRED] ds4 end-to-end smoke**
 
 Reproduce the known K144 result through the new generic path: full-256 PPL ≈ 7.56 vs pruned-144 ≈ 17.73 on wikitext2 ctx=1024 (existing `scripts/reap/run_ppl_kld.sh`, regenerated keep-map as `reap_plan.json`).
-Expected: matches the pre-lift numbers — no regression.
+**Do NOT run under the GPU embargo** — leave unchecked, note "deferred: GPU in use". Expected (when run): matches pre-lift numbers — no regression.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Commit the (Python/script) changes**
 
+Step 1 (CPU, the `build_keepall_sidecar.py` generalization) is runnable now; Steps 2–3 are deferred. Commit what's done:
 ```bash
 git add scripts/reap crates/hipfire-reap/tests
-git commit -m "test(reap): cross-arch keep-all identity gate + ds4 K144 smoke"
+git commit -m "test(reap): generalize keep-all sidecar builder; cross-arch identity gate (GPU-deferred)"
 ```
 
 ---
