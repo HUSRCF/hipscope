@@ -64,12 +64,23 @@ pub struct Cohere2MoeConfig {
     /// The first `first_k_dense_replace` layers are dense SwiGLU MLPs; the
     /// rest are MoE. North-Mini-Code: 1 (layer 0 dense).
     pub first_k_dense_replace: usize,
+    /// HF `prefix_dense_sliding_window_pattern` (North: 1). When 1, the dense
+    /// prefix layers (`l < first_k_dense_replace`) get RoPE via `force_rope`
+    /// even though they are `full_attention` — matches Cohere2MoeAttention.
+    pub prefix_dense_sliding_window_pattern: usize,
     /// Shared experts run on every token alongside the routed ones. 0 for
     /// North-Mini-Code (`num_shared_experts=0`).
     pub num_shared_experts: usize,
     pub rope_theta: f32,
-    /// Epsilon for the mean-centered `Cohere2LayerNorm` (HF `layer_norm_eps`).
+    /// Epsilon for the legacy mean-centered `Cohere2LayerNorm` fallback (HF
+    /// `layer_norm_eps`). NOTE: cohere2_moe (North) sets `rms_norm_eps`, so the
+    /// reference normalizes with plain RMSNorm — see `rms_norm_eps`.
     pub layer_norm_eps: f32,
+    /// Epsilon for the per-layer + final **RMSNorm** (HF `rms_norm_eps` = 1e-6).
+    /// The cohere2_moe modular file replaces base Cohere2's mean-centered
+    /// LayerNorm with plain `LlamaRMSNorm` when this is set (it is, for North):
+    /// `Cohere2MoeRMSNorm(eps=rms_norm_eps) if rms_norm_eps is not None`.
+    pub rms_norm_eps: f32,
     pub max_position_embeddings: usize,
     /// Local-attention window for `sliding_attention` layers (HF
     /// `sliding_window` = 4096). For sequences ≤ this, sliding == full causal.
@@ -104,12 +115,16 @@ struct RawCohere2MoeConfig {
     num_experts_per_tok: usize,
     #[serde(default = "default_first_k_dense")]
     first_k_dense_replace: usize,
+    #[serde(default = "default_one")]
+    prefix_dense_sliding_window_pattern: usize,
     #[serde(default)]
     num_shared_experts: usize,
     #[serde(default = "default_rope_theta")]
     rope_theta: f32,
     #[serde(default = "default_ln_eps")]
     layer_norm_eps: f32,
+    #[serde(default = "default_rms_eps")]
+    rms_norm_eps: f32,
     #[serde(default = "default_max_pos")]
     max_position_embeddings: usize,
     #[serde(default = "default_sliding_window")]
@@ -128,11 +143,17 @@ struct RawCohere2MoeConfig {
 fn default_first_k_dense() -> usize {
     1
 }
+fn default_one() -> usize {
+    1
+}
 fn default_rope_theta() -> f32 {
     50_000.0
 }
 fn default_ln_eps() -> f32 {
     1e-5
+}
+fn default_rms_eps() -> f32 {
+    1e-6
 }
 fn default_max_pos() -> usize {
     500_000
@@ -197,9 +218,11 @@ impl Cohere2MoeConfig {
             num_experts: raw.num_experts,
             num_experts_per_tok: raw.num_experts_per_tok,
             first_k_dense_replace: raw.first_k_dense_replace,
+            prefix_dense_sliding_window_pattern: raw.prefix_dense_sliding_window_pattern,
             num_shared_experts: raw.num_shared_experts,
             rope_theta: raw.rope_theta,
             layer_norm_eps: raw.layer_norm_eps,
+            rms_norm_eps: raw.rms_norm_eps,
             max_position_embeddings: raw.max_position_embeddings,
             sliding_window: raw.sliding_window,
             norm_topk_prob: raw.norm_topk_prob,

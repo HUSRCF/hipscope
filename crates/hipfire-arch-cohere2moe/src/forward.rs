@@ -162,22 +162,22 @@ fn decode_step_body(
     let moe_inter = cfg.moe_intermediate_size;
     let n_exp = cfg.num_experts;
     let k_top = cfg.num_experts_per_tok;
-    let eps = cfg.layer_norm_eps;
+    let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
 
     for (l, layer) in weights.layers.iter().enumerate() {
-        // ── Parallel block: ONE mean-centered LayerNorm → `normed`, fed to
-        //    BOTH the attention and the FFN branch (β = 0, weight only). ──────
-        gpu.layernorm_batched(
+        // ── Parallel block: ONE RMSNorm → `normed`, fed to BOTH the attention
+        //    and the FFN branch. cohere2_moe uses plain RMSNorm (LlamaRMSNorm,
+        //    rms_norm_eps), NOT base Cohere2's mean-centered LayerNorm. ────────
+        gpu.rmsnorm_batched(
             &state.h,
             &layer.input_norm,
-            &state.ln_beta_zero,
             &state.normed,
             1,
             hidden,
             eps,
         )
-        .map_err(|e| format!("cohere2moe L{l}: input layernorm: {e:?}"))?;
+        .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
 
         // ── Attention branch (reads `normed`) ──────────────────────────────
         weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
@@ -198,7 +198,13 @@ fn decode_step_body(
         // MUST use `rope_partial_interleaved_f32` (pairs 2i/2i+1), NOT
         // `rope_f32` (pairs i / i+head_dim/2). Rotary covers the FULL head_dim
         // (no partial_rotary_factor in the config) → n_rot = head_dim.
-        if layer.attn_kind == AttnKind::Sliding {
+        // RoPE on sliding layers AND the dense prefix layers (force_rope:
+        // l < first_k_dense_replace && prefix_dense_sliding_window_pattern == 1).
+        // North layer 0 is full_attention but STILL rotated; the other global
+        // full_attention layers are NoPE. (Matches Cohere2MoeAttention.)
+        if layer.attn_kind == AttnKind::Sliding
+            || (l < cfg.first_k_dense_replace && cfg.prefix_dense_sliding_window_pattern == 1)
+        {
             gpu.rope_interleaved_f32(
                 &state.fa_q,
                 &state.fa_k,
@@ -344,17 +350,16 @@ fn decode_step_body(
     }
     state.n_tokens = seq_len;
 
-    // Final mean-centered LayerNorm + lm_head (tied embed).
-    gpu.layernorm_batched(
+    // Final RMSNorm + lm_head (tied embed).
+    gpu.rmsnorm_batched(
         &state.h,
         &weights.final_norm,
-        &state.ln_beta_zero,
         &state.final_norm_buf,
         1,
         hidden,
         eps,
     )
-    .map_err(|e| format!("cohere2moe: final layernorm: {e:?}"))?;
+    .map_err(|e| format!("cohere2moe: final rmsnorm: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("cohere2moe: lm_head: {e}"))?;
     Ok(())
@@ -460,7 +465,7 @@ pub fn forward_batch(
     let dense_inter = cfg.dense_intermediate_size;
     let n_exp = cfg.num_experts;
     let k_top = cfg.num_experts_per_tok;
-    let eps = cfg.layer_norm_eps;
+    let eps = cfg.rms_norm_eps;
     let max_ctx = start_pos + b;
     let max_seq = state.kv.physical_cap;
 
@@ -530,7 +535,7 @@ pub fn forward_batch(
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // Parallel block: normed = mean-centered LN(x), fed to BOTH branches.
-        gpu.layernorm_batched(&x, &layer.input_norm, &state.ln_beta_zero, &normed, b, hidden, eps)
+        gpu.rmsnorm_batched(&x, &layer.input_norm, &normed, b, hidden, eps)
             .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
         // Attention from `normed` (Q8 projections).
         q8_proj_raw(gpu,&layer.wq.buf, &normed, &fq, q_dim, hidden, b, &x_f16)
@@ -540,7 +545,11 @@ pub fn forward_batch(
         q8_proj_raw(gpu,&layer.wv.buf, &normed, &fv, kv_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch v: {e:?}"))?;
         // NoPE on full layers; interleaved RoPE on sliding layers.
-        if layer.attn_kind == AttnKind::Sliding {
+        // RoPE on sliding layers AND the dense prefix layers (force_rope) — see
+        // the decode path. North layer 0 (dense, full_attention) is rotated.
+        if layer.attn_kind == AttnKind::Sliding
+            || (l < cfg.first_k_dense_replace && cfg.prefix_dense_sliding_window_pattern == 1)
+        {
             gpu.rope_interleaved_f32_batched(
                 &fq, &fk, &pos_array, n_heads, n_kv, head_dim, head_dim, cfg.rope_theta, b,
             )
@@ -664,7 +673,7 @@ pub fn forward_batch(
     gpu.hip
         .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * hidden * 4, hidden * 4)
         .map_err(|e| format!("forward_batch last copy: {e:?}"))?;
-    gpu.layernorm_batched(&x_last, &weights.final_norm, &state.ln_beta_zero, &state.final_norm_buf, 1, hidden, eps)
+    gpu.rmsnorm_batched(&x_last, &weights.final_norm, &state.final_norm_buf, 1, hidden, eps)
         .map_err(|e| format!("forward_batch final ln: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("forward_batch lm_head: {e}"))?;
