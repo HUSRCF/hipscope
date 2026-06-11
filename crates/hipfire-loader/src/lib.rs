@@ -14,9 +14,8 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
-use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_arch_llama::LlamaBundle;
 use hipfire_arch_qwen35::speculative::{
     DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
@@ -41,7 +40,6 @@ pub trait Carrier: Send + Sync {
 
 // ─── Registry ─────────────────────────────────────────────────────────
 
-use crate::carriers::*;
 const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier, &Qwen35Carrier, &LlamaCarrier,
     &DotsOcrCarrier, &Deepseek4Carrier, &MinimaxCarrier, &Lfm2MoeCarrier,

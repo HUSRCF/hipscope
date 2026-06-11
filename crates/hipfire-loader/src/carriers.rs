@@ -4,10 +4,8 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
-use std::path::Path;
 use hipfire_runtime::loader_api::{ModelSource, LoadCtx};
 use hipfire_runtime::model_source::ModelSource as _;
-use hipfire_runtime::safetensors_source::SafetensorsSource;
 use crate::Carrier;
 use crate::{LoadedModel, ModelState, finish_qwen35_load, resolve_chat_template};
 
