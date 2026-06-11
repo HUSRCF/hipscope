@@ -11194,9 +11194,10 @@ impl Gpu {
     ///   down:    x_src = rot_batch [N*K_TOP × K], x_row_div = 1
     /// `x_src_rows` is the number of rows in x_src (N or N*K_TOP).
     ///
-    /// **gfx12 (RDNA4) only.** Panics with a clear message on other archs;
-    /// the gfx11 sister can be added later by mirroring the HFQ4
-    /// `_k2` sibling.
+    /// gfx11 (RDNA3/3.5) and gfx12 (RDNA4). Dispatches
+    /// `gemm_hfq6g256_moe_grouped_wmma_k2` on gfx11 and the
+    /// `_gfx12` (or `_v2_gfx12`) variant on gfx12. Returns an error on
+    /// archs without WMMA support.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_hfq6g256_moe_grouped_wmma(
         &mut self,
@@ -11212,30 +11213,35 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_rdna4() {
-            panic!(
-                "gemm_hfq6g256_moe_grouped_wmma: gfx12-only kernel (current arch = {}). \
-                 The gfx11 sister is not yet implemented; add a _k2 variant if needed.",
-                self.arch
-            );
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_hfq6g256_moe_grouped_wmma: requires WMMA (gfx11 or gfx12); \
+                     current arch = {}",
+                    self.arch
+                ),
+            ));
         }
-        // v2 lever (M-direction 2×1 reg-block, env-gated). Defaults off;
-        // promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp covers 32 rows
-        // × 16 slots (vs 16×16); B-load halved per output. Compatible with
-        // existing BLOCK_M=16 scatter — only the M (row) dimension is
-        // restrided. The slot tile stride stays at 16 so expert-boundary
-        // safety is unchanged from v1.
-        let use_v2 = self.flags.moe_hfq6_v2;
+        // v2 lever (gfx12 only): M-direction 2×1 reg-block, env-gated.
+        let use_v2 = is_gfx12 && self.flags.moe_hfq6_v2;
         let (kernel_name, kernel_src, row_tile_stride) = if use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC,
                 32usize,
             )
-        } else {
+        } else if is_gfx12 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC,
+                16usize,
+            )
+        } else {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_k2",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC,
                 16usize,
             )
         };
@@ -11366,6 +11372,104 @@ impl Gpu {
         // HFQ4's 136 B); reuse the gemv_hfq3g256_bytes profile helper.
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq3g256_bytes(m, k));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ3-Lloyd sister of `gemm_hfq4g256_moe_grouped_wmma_k2` for MoE Path-2.
+    /// Same scatter contract + 9-tuple kernarg. gfx11 dispatches the `_k2`
+    /// (half16) kernel; gfx12 (RDNA4) the `.gfx12` (half8/k_grp) kernel.
+    /// 112 B/group = 16 B (8 × fp16 codebook) + 96 B (256 × 3-bit indices).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq3g256_lloyd_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to FP16)
+        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq3g256_lloyd_moe_grouped_wmma: requires WMMA (gfx11 or gfx12); \
+                     current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        let (kernel_name, kernel_src) = if is_gfx12 {
+            (
+                "gemm_mq3g256_lloyd_moe_grouped_wmma_gfx12",
+                kernels::GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_mq3g256_lloyd_moe_grouped_wmma_k2",
+                kernels::GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW estimate: MQ3-Lloyd row footprint = groups_per_row × 112 B.
+        let bytes =
+            m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_mq3g256_lloyd_bytes(m, k));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,

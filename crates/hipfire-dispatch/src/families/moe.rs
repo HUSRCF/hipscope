@@ -483,13 +483,14 @@ impl MoePrefillResolution {
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
-        // MQ6 grouped-WMMA (`gemm_hfq6g256_moe_grouped_wmma`) is gfx12-only
-        // (no gfx11 variant yet). Fall back to Path 1 (indexed batched GEMV)
-        // on gfx11 to avoid the gfx12-only kernel panic. Path 1 MQ6 indexed
-        // kernels exist on all WMMA archs.
-        let mq6_on_non_gfx12 = d.routed_gate_up == DType::MQ6G256
+        // MQ6 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
+        // gfx12 `_gfx12` kernel). Only suppress Path 2 for MQ6 on archs that
+        // have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and not
+        // gfx12. gfx1100/1101/1102/1103/1150/1151/1152 all have wmma_w32.
+        let mq6_on_non_wmma = d.routed_gate_up == DType::MQ6G256
+            && !arch.has_wmma_w32()
             && !(arch.is_gfx1200() || arch.is_gfx1201());
-        let use_path2 = use_path2 && !mq6_on_non_gfx12;
+        let use_path2 = use_path2 && !mq6_on_non_wmma;
         // MQ5 grouped-WMMA (`gemm_hfq5g256_moe_grouped_wmma`) is gfx12-only
         // (same as MQ6) — fall back to Path 1 (indexed batched GEMV) on
         // gfx11/gfx9 to avoid the gfx12-only kernel panic.

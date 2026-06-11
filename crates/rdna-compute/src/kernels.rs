@@ -1486,6 +1486,27 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
 
+/// gfx11 (RDNA3/3.5) sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Same kernarg + grouped contract; differs in WMMA intrinsic
+/// (__builtin_amdgcn_wmma_f32_16x16x16_f16_w32, half16_t), output mapping
+/// (acc[j]=C[2*j+(tid>>4)][tid&15]), and the 6-bit unpack (200 B/group).
+/// Enables uniform MQ6 expert batched prefill on gfx1100+gfx1151.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_k2.hip");
+
+/// gfx11 (RDNA3/3.5) MQ3-Lloyd grouped-WMMA GEMM for MoE prefill. 112 B/group
+/// = 16 B (8 × fp16 codebook) + 96 B (256 × 3-bit indices). Codebook into
+/// __shared__ _Float16[8], broadcast to all 32 lanes. T3-3L cold-tier block.
+pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) MQ3-Lloyd sister. Same 112 B/group codebook layout;
+/// differs in WMMA (_gfx12), half8_t operands, k_grp=tid>>4 split, and
+/// acc[j]=C[8*k_grp+j][m_lane] output. Distinct from
+/// GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC (that one is affine 104 B/group).
+pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma.gfx12.hip");
+
 /// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
 /// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks

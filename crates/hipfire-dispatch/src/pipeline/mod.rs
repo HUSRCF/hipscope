@@ -1049,6 +1049,9 @@ fn dispatch_grouped_gemm(
                 ))
             }
         }
+        DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
+            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        )),
         _other => Err(DispatchError::UnsupportedVariant {
             family: "moe", variant: "prefill-grouped-gemm-dtype",
             arch: "", quant: "other",
