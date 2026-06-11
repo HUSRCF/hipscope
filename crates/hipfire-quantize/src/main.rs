@@ -4720,6 +4720,25 @@ fn main() {
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
 
+    // SP4 selective re-quant overlay mode. `--reap-overlay <plan-dir>` activates
+    // it: instead of quantizing the whole model, only the tensors named by the
+    // plan's `quant_overrides` are decoded from the original safetensors and
+    // re-quantized into a small `overlay.hfq` (written to `--reap-out`).
+    // `--reap-arch` overrides the auto-detected arch family used for
+    // tensor-name matching. See reap_overlay.rs / SP4 plan Task 4.
+    let reap_overlay_dir: Option<String> = args
+        .iter()
+        .position(|a| a == "--reap-overlay")
+        .and_then(|i| args.get(i + 1).cloned());
+    let reap_out: Option<String> = args
+        .iter()
+        .position(|a| a == "--reap-out")
+        .and_then(|i| args.get(i + 1).cloned());
+    let reap_arch_flag: Option<String> = args
+        .iter()
+        .position(|a| a == "--reap-arch")
+        .and_then(|i| args.get(i + 1).cloned());
+
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
     // to bias centroid placement. See `quantize_mq2g256_lloyd_weighted`.
@@ -4773,7 +4792,16 @@ fn main() {
         || format == "deepseek4-q8"
         || format == "deepseek4-source-precision"
         || format == "deepseek4-source"
-        || format == "deepseek4-mtp-precise";
+        || format == "deepseek4-mtp-precise"
+        || format == "deepseek4-mq4lloyd"
+        || format == "deepseek4-mq3lloyd";
+    // deepseek4-mq4lloyd / deepseek4-mq3lloyd: identical recipe to deepseek4-q8
+    // (non-expert 2D → Q8F16, norms/HC → F16) EXCEPT routed experts ship as
+    // MQ4G256Lloyd (qt=30, 160 B/group) resp. MQ3G256Lloyd (qt=20, 112 B/group)
+    // instead of MQ2G256Lloyd. Both require the matching MoE GEMV kernels in the
+    // ds4 forward (MQ3-Lloyd kernels pre-existed; MQ4-Lloyd added alongside).
+    let use_deepseek4_mq4_experts = format == "deepseek4-mq4lloyd";
+    let use_deepseek4_mq3_experts = format == "deepseek4-mq3lloyd";
     // deepseek4-mtp-precise: addon-only build (use with --include-prefix mtp.) that
     // keeps every mtp.0.* DENSE weight at F16 instead of Q8F16. Doubles the
     // addon size (~2 GB → ~3 GB) but eliminates Q8 quant noise on the MTP
@@ -5490,6 +5518,99 @@ fn main() {
         fp8_scale_for.len()
     );
 
+    // ── SP4: selective re-quant overlay mode ────────────────────────────────
+    // When `--reap-overlay <plan-dir>` is set, this branch fully replaces the
+    // normal whole-model quantize: it loads the reap plan, resolves the arch
+    // family (auto from arch_id, or `--reap-arch` override), then iterates the
+    // model tensors and — for ONLY the tensors the plan overrides — decodes
+    // f32 and re-quantizes via `quantize_to_format`. Non-matched tensors skip
+    // the (expensive) f32 decode entirely. The subset is written to
+    // `--reap-out` via the existing `write_hfq`, keyed by original tensor name
+    // so a load-time splice (SP3) can overlay them onto the base model.
+    if let Some(plan_dir) = reap_overlay_dir.as_deref() {
+        let reap_out_path = reap_out.as_deref().unwrap_or_else(|| {
+            eprintln!("--reap-overlay requires --reap-out <overlay.hfq path>");
+            std::process::exit(1);
+        });
+        // Resolve arch: explicit --reap-arch overrides the auto-detection.
+        let arch: reap_overlay::ReapArch = match reap_arch_flag.as_deref() {
+            Some(s) => reap_overlay::ReapArch::from_flag(s).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }),
+            None => reap_overlay::ReapArch::from_arch_id(arch_id).unwrap_or_else(|| {
+                eprintln!(
+                    "reap overlay: could not auto-detect arch family from arch_id={arch_id}; \
+                     pass --reap-arch <deepseek4|qwen35|lfm2moe|minimax>"
+                );
+                std::process::exit(1);
+            }),
+        };
+        let plan = hipfire_reap::plan::ReapPlan::load_unchecked(plan_dir).unwrap_or_else(|e| {
+            eprintln!("reap overlay: failed to load plan from {plan_dir}: {e}");
+            std::process::exit(1);
+        });
+        eprintln!(
+            "REAP overlay mode: arch={arch:?}, {} quant_overrides, out={reap_out_path}",
+            plan.quant_overrides.len()
+        );
+
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        for (name, file_idx) in &all_tensors {
+            // Check the plan BEFORE decoding f32 — skipping the decode of
+            // non-matched tensors is the whole point of an overlay build.
+            if reap_overlay::reap_override_for(name, arch, &plan).is_none() {
+                continue;
+            }
+            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+            let f32 = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                &meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let shape: Vec<usize> = meta.shape.clone();
+            let tier = reap_overlay::reap_override_for(name, arch, &plan).unwrap();
+            match reap_overlay::quantize_to_format(name, tier, &f32, &shape) {
+                Ok(t) => {
+                    eprintln!("  overlay: {name} → {tier} ({} bytes)", t.data.len());
+                    hfq_tensors.push(t);
+                }
+                Err(e) => {
+                    eprintln!("reap overlay: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        if hfq_tensors.is_empty() {
+            eprintln!(
+                "reap overlay: no tensors matched the plan's quant_overrides \
+                 (check arch/layer/expert names)"
+            );
+            std::process::exit(1);
+        }
+
+        eprintln!(
+            "REAP overlay: {} tensors quantized; writing {reap_out_path}",
+            hfq_tensors.len()
+        );
+        write_hfq(
+            Path::new(reap_out_path),
+            arch_id,
+            &metadata_json,
+            &hfq_tensors,
+            None,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("reap overlay: failed to write {reap_out_path}: {e}");
+            std::process::exit(2);
+        });
+        eprintln!("REAP overlay written: {reap_out_path}");
+        return;
+    }
+
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
     // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
@@ -5893,15 +6014,36 @@ fn main() {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let unit_col_weights: Vec<f32> = vec![1.0; k];
-                let q = if use_mq4_mq2lloyd_gptq_all || use_mq4_mqlloyd_antirez_gptq {
-                    quantize_mq2g256_lloyd_gptq(&f32_data, &unit_col_weights, &signs1, &signs2)
-                } else {
-                    quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2)
-                };
+                let (q, expert_qt, expert_label): (Vec<u8>, QuantType, &str) =
+                    if use_deepseek4_mq4_experts {
+                        (
+                            quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2),
+                            QuantType::MQ4G256Lloyd,
+                            "MQ4L-DeepSeek V4",
+                        )
+                    } else if use_deepseek4_mq3_experts {
+                        (
+                            quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2),
+                            QuantType::MQ3G256Lloyd,
+                            "MQ3L-DeepSeek V4",
+                        )
+                    } else if use_mq4_mq2lloyd_gptq_all || use_mq4_mqlloyd_antirez_gptq {
+                        (
+                            quantize_mq2g256_lloyd_gptq(&f32_data, &unit_col_weights, &signs1, &signs2),
+                            QuantType::MQ2G256Lloyd,
+                            "MQ2L-DeepSeek V4",
+                        )
+                    } else {
+                        (
+                            quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2),
+                            QuantType::MQ2G256Lloyd,
+                            "MQ2L-DeepSeek V4",
+                        )
+                    };
                 let shape: Vec<u32> = logical_shape.iter().map(|&s| s as u32).collect();
                 eprintln!(
                     "  {:>8}: {} storage{:?} → logical{:?} ({:.1} KB → {:.1} KB)",
-                    "MQ2L-DeepSeek V4",
+                    expert_label,
                     name,
                     meta.shape,
                     logical_shape,
@@ -5910,7 +6052,7 @@ fn main() {
                 );
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
-                    quant_type: QuantType::MQ2G256Lloyd,
+                    quant_type: expert_qt,
                     shape,
                     group_size: 256,
                     data: q,

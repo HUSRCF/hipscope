@@ -66,13 +66,65 @@ pub fn quantize_to_format(
 
 /// Detected arch family for tensor-name matching (the quantizer already knows
 /// the arch_id; pass the matching variant in).
-#[allow(dead_code)] // Lfm2Moe / Minimax constructed by Task 4 (CLI arch detection)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReapArch {
     Deepseek4,
     Qwen35,
     Lfm2Moe,
     Minimax,
+}
+
+impl ReapArch {
+    /// Parse the `--reap-arch <name>` flag value.
+    pub fn from_flag(s: &str) -> Result<ReapArch, String> {
+        match s {
+            "deepseek4" | "deepseek_v4" | "ds4" => Ok(ReapArch::Deepseek4),
+            "qwen35" | "qwen3_5_moe" | "qwen3.5" => Ok(ReapArch::Qwen35),
+            "lfm2moe" | "lfm2_moe" => Ok(ReapArch::Lfm2Moe),
+            "minimax" => Ok(ReapArch::Minimax),
+            other => Err(format!(
+                "reap: unknown --reap-arch '{other}' (expected deepseek4|qwen35|lfm2moe|minimax)"
+            )),
+        }
+    }
+
+    /// Best-effort auto-detection from the quantizer's resolved `arch_id`.
+    /// Minimax has no quantizer arch_id, so it is only reachable via the
+    /// explicit `--reap-arch minimax` flag.
+    pub fn from_arch_id(arch_id: u32) -> Option<ReapArch> {
+        match arch_id {
+            9 => Some(ReapArch::Deepseek4),
+            6 => Some(ReapArch::Qwen35),
+            11 => Some(ReapArch::Lfm2Moe),
+            _ => None,
+        }
+    }
+}
+
+/// Overlay driver: quantize ONLY the tensors the plan overrides.
+///
+/// `tensors` yields `(name, shape, f32_data)` for the model's tensors. The
+/// caller is responsible for skipping the (expensive) f32 decode of tensors
+/// that don't match the plan — `build_overlay` only quantizes what it's
+/// handed (and re-checks the match so a hand-built iterator can over-supply).
+/// Returns the subset of `HfqTensor`s to write into `overlay.hfq`.
+///
+/// `main.rs`'s overlay branch inlines this logic (to skip the f32 decode of
+/// non-matched tensors); this standalone driver is exercised by the
+/// `tests/reap_overlay_integ.rs` integration target, hence the allow.
+#[allow(dead_code)]
+pub fn build_overlay(
+    arch: ReapArch,
+    plan: &ReapPlan,
+    tensors: impl Iterator<Item = (String, Vec<usize>, Vec<f32>)>,
+) -> Result<Vec<HfqTensor>, String> {
+    let mut out = Vec::new();
+    for (name, shape, f32) in tensors {
+        if let Some(fmt) = reap_override_for(&name, arch, plan) {
+            out.push(quantize_to_format(&name, fmt, &f32, &shape)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve a tensor name to its override tier under `plan`, or None.
@@ -256,5 +308,95 @@ mod resolve_tests {
             reap_override_for("model.layers.40.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
             None
         );
+    }
+}
+
+/// SP4 Task 4 integration test: `build_overlay` selection + byte-correctness,
+/// then a real `write_hfq` → `HfqFile` container round-trip.
+///
+/// This lives in-module (not under `tests/`) because `hipfire-quantize` is a
+/// binary crate with no library target — a `tests/` integration target can't
+/// reach the crate-internal `write_hfq` / `quantize_hfq4g256` / `HfqTensor`.
+/// `hipfire-runtime` (CPU-only HFQ container reader) is a dev-dependency.
+#[cfg(test)]
+mod integ {
+    use super::*;
+    use crate::{quantize_hfq4g256, write_hfq};
+    use hipfire_reap::plan::ReapPlan;
+    use hipfire_runtime::hfq::HfqFile;
+
+    fn plan_layer0_expert0_hfq4(dir: &std::path::Path) -> ReapPlan {
+        std::fs::write(
+            dir.join("reap_plan.json"),
+            r#"{"original_experts":4,"num_layers":1,
+                "quant_overrides":[{"layer":0,"role":"routed_experts","experts":[0],"tier":"hfq4"}]}"#,
+        )
+        .unwrap();
+        ReapPlan::load_unchecked(dir.to_str().unwrap()).unwrap()
+    }
+
+    /// A 4x256 tensor's worth of varied f32 (matches the plan's matched tensor).
+    fn matched_f32() -> Vec<f32> {
+        (0..4 * 256).map(|i| ((i as f32) * 0.017).sin() * 3.0).collect()
+    }
+
+    #[test]
+    fn build_overlay_selects_and_byte_matches_then_round_trips() {
+        let arch = ReapArch::Deepseek4;
+        let d = tempfile::tempdir().unwrap();
+        let plan = plan_layer0_expert0_hfq4(d.path());
+
+        // 3 hand-built tensors: one matches (layer 0 routed expert 0), two don't
+        // (wrong expert, and an attention tensor not in the plan).
+        let matched_name = "layers.0.ffn.experts.0.w1.weight".to_string();
+        let matched = matched_f32();
+        let tensors = vec![
+            (matched_name.clone(), vec![4usize, 256], matched.clone()),
+            (
+                "layers.0.ffn.experts.1.w1.weight".to_string(),
+                vec![4usize, 256],
+                vec![0.5f32; 4 * 256],
+            ),
+            (
+                "layers.0.self_attn.q_proj.weight".to_string(),
+                vec![4usize, 256],
+                vec![1.0f32; 4 * 256],
+            ),
+        ];
+
+        let out = build_overlay(arch, &plan, tensors.into_iter()).unwrap();
+
+        // (a) exactly the 1 matched tensor is emitted.
+        assert_eq!(out.len(), 1, "only the matched tensor should be emitted");
+        assert_eq!(out[0].name, matched_name);
+        assert_eq!(out[0].quant_type, QuantType::HFQ4G256);
+        assert_eq!(out[0].shape, vec![4u32, 256]);
+
+        // (b) bytes equal a direct quantize_hfq4g256 of the matched f32.
+        let direct = quantize_hfq4g256(&matched);
+        assert_eq!(out[0].data, direct, "overlay bytes must equal direct encode");
+
+        // (c) write_hfq → HfqFile round-trip: retrievable by name, right qt.
+        let overlay_path = d.path().join("overlay.hfq");
+        // Minimal metadata object — write_hfq's container + HfqFile's JSON
+        // brace-scan both accept `{}`.
+        write_hfq(&overlay_path, 9, "{}", &out, None).unwrap();
+
+        let hf = HfqFile::open(&overlay_path).unwrap();
+        assert_eq!(hf.arch_id, 9);
+        let info = hf
+            .find_tensor_info(&matched_name)
+            .expect("matched tensor retrievable by name from overlay.hfq");
+        assert_eq!(info.quant_type, QuantType::HFQ4G256 as u8);
+        assert_eq!(info.shape, vec![4u32, 256]);
+        // The non-matched tensors must be absent from the overlay.
+        assert!(hf.find_tensor_info("layers.0.self_attn.q_proj.weight").is_none());
+        assert!(hf.find_tensor_info("layers.0.ffn.experts.1.w1.weight").is_none());
+
+        // And the stored data bytes match what we wrote.
+        let (_, data) = hf
+            .tensor_data(&matched_name)
+            .expect("tensor data readable back");
+        assert_eq!(data, &direct[..], "round-tripped data must equal direct encode");
     }
 }
