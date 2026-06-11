@@ -4281,6 +4281,26 @@ impl KvCache {
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
     }
+
+    /// Zero every per-layer K/V (and scale) buffer on the GPU. Defense-in-depth
+    /// for arch `reset()`: positional KV is normally overwritten by the next
+    /// prefill (so the stale tail is never attended), but this guarantees no
+    /// prior-conversation bytes can survive a reset even under a future
+    /// window/LCP edge that reads an un-rewritten slot. Sub-millisecond memset
+    /// of the cache buffers; callers MUST also clear their token mirror so a
+    /// zeroed slot can never be stale-LCP-reused.
+    pub fn clear_gpu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for t in self
+            .k_gpu
+            .iter()
+            .chain(self.v_gpu.iter())
+            .chain(self.k_scales.iter())
+            .chain(self.v_scales.iter())
+        {
+            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
+        }
+        Ok(())
+    }
 }
 
 impl KvCache {

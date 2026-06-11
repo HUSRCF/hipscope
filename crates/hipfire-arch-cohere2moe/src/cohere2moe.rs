@@ -394,7 +394,19 @@ impl Cohere2MoeState {
         })
     }
 
-    pub fn reset(&mut self) {
+    /// Reset for a fresh conversation. Rewinds the KV cursor AND zeros the KV
+    /// buffers. The cursor rewind alone is sufficient for correctness (cohere2moe
+    /// is pure attention with no recurrent/compressed state — unlike lfm2moe's
+    /// `conv_states` — so the next cold prefill overwrites every attended slot
+    /// and the stale tail is never read), but zeroing the buffers makes the reset
+    /// holistic: no prior-conversation KV can survive even under a future
+    /// window/LCP edge. Every daemon `reset()` call site also clears
+    /// `conversation_tokens`, so a zeroed slot can never be stale-LCP-reused.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.n_tokens = 0;
+        self.kv
+            .clear_gpu(gpu)
+            .map_err(|e| format!("cohere2moe reset: clear kv: {e:?}"))?;
+        Ok(())
     }
 }

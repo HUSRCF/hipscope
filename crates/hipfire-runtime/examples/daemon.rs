@@ -2717,11 +2717,12 @@ fn main() {
                     if let Some(ref mut s) = m.minimax_state {
                         s.reset();
                     }
-                    // arch_id=12 (Cohere2-MoE / North-Mini-Code): clear the KV
-                    // cursor between turns. reset() takes no gpu (cursor-only),
-                    // same as MiniMax-M2.
+                    // arch_id=12 (Cohere2-MoE / North-Mini-Code): holistic reset
+                    // between turns — rewinds the KV cursor AND zeros the KV
+                    // buffers (conversation_tokens already cleared above, so a
+                    // zeroed slot can't be stale-LCP-reused).
                     if let Some(ref mut s) = m.cohere2moe_state {
-                        s.reset();
+                        let _ = s.reset(&mut gpu);
                     }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
@@ -3078,9 +3079,9 @@ fn main() {
                     s.reset();
                 }
                 // Cohere2-MoE (arch_id=12): KV cache shares Cohere2MoeState;
-                // reset its cursor (no gpu) for a cold prefill on the next request.
+                // holistic reset (cursor + zero KV) for a cold prefill next request.
                 if let Some(ref mut s) = m.cohere2moe_state {
-                    s.reset();
+                    let _ = s.reset(&mut gpu);
                 }
 
                 if run_ok {
@@ -13061,22 +13062,37 @@ fn generate_cohere2moe(
     // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
     // FULL rendered conversation + generation would overflow. `prompt_ids` is
     // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
-    let overflow = {
-        let state = m.cohere2moe_state.as_ref().unwrap();
-        prompt_ids.len() + max_tokens > state.max_seq
-    };
-    if overflow {
-        let (n, cap) = {
-            let state = m.cohere2moe_state.as_ref().unwrap();
-            (state.n_tokens, state.max_seq)
-        };
+    // The KV cache holds `max_seq` positions. A prompt that itself exceeds that
+    // cannot be prefilled without writing PAST the cache — which previously
+    // produced silent GPU-memory corruption (degenerate/garbage output): the
+    // guard reset the cursor but then prefilled the oversized prompt anyway.
+    // Fix: prompt too long → clean error + free KV; prompt fits but generation
+    // would overflow → cap the token budget to the remaining slots so decode
+    // stops at capacity instead of writing OOB.
+    let max_seq = m.cohere2moe_state.as_ref().unwrap().max_seq;
+    if prompt_ids.len() >= max_seq {
         eprintln!(
-            "[daemon] arch_id=12 context full ({n}/{cap}) — resetting Cohere2MoeState",
+            "[daemon] arch_id=12 prompt {} >= max_seq {} — refusing (would OOB the KV cache)",
+            prompt_ids.len(),
+            max_seq,
         );
-        m.cohere2moe_state.as_mut().unwrap().reset();
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
+                prompt_ids.len(),
+                max_seq
+            ),
+        );
+        let _ = m.cohere2moe_state.as_mut().unwrap().reset(gpu);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        return;
     }
+    // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
+    // cache. `max_tokens` is shadowed for the decode loop below.
+    let max_tokens = max_tokens.min(max_seq - prompt_ids.len());
 
     // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
     // Jinja-rendered conversation (the trained chat template). Cohere2-MoE is
@@ -13115,7 +13131,7 @@ fn generate_cohere2moe(
             prompt_ids[lcp..].to_vec()
         } else {
             if prior_len > 0 {
-                m.cohere2moe_state.as_mut().unwrap().reset();
+                let _ = m.cohere2moe_state.as_mut().unwrap().reset(gpu);
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
             }
@@ -13226,6 +13242,10 @@ fn generate_cohere2moe(
         if next_tok == eos_tok {
             break;
         }
+        // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1). Was wired into
+        // the qwen35/deepseek4 generate loops but NOT here, so coherence_probe
+        // and token-id detectors silently saw nothing for north-mini-code.
+        emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
