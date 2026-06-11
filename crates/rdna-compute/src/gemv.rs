@@ -2627,6 +2627,93 @@ impl Gpu {
         result
     }
 
+    /// Route A MoE-AWQ — per-routed-expert variant of
+    /// `fused_silu_mul_rotate_mq_awq_batched`. Each batch row (routed-expert
+    /// slot) selects its own down `awq_scale` from a device pointer table,
+    /// indexed by `topk_indices[slot]`. Serves both decode (`batch_size` =
+    /// k_top, `topk_indices` = `[k_top]`) and prefill (`batch_size` =
+    /// total_slots = N·k_top, `topk_indices` = `[N·k_top]`) — the silu+rotate
+    /// is elementwise per slot, so the same slot→expert mapping the indexed
+    /// down GEMV uses applies here.
+    ///
+    /// `expert_down_awq_ptrs`: `[2·n_exp]` F32 = n_exp `u64` device pointers,
+    /// each → that expert's `[K]` F32 down awq_scale (built by the loader, see
+    /// qwen35.rs::load_moe_ffn). On `.hfq` files without per-expert sidecars
+    /// the caller passes the plain `fused_silu_mul_rotate_mq_batched` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_silu_mul_rotate_mq_awq_indexed_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        expert_down_awq_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC,
+            "fused_silu_mul_mq_rotate_awq_indexed",
+        )?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let pp = expert_down_awq_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        // Read gate + up, 2×256 signs, write x_rot (awq_scale read is per-slot
+        // strided — folded into the gate/up term for the bandwidth estimate).
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_silu_mul_mq_rotate_awq_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up_p);
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Invalidate any `ensure_*_x` caches whose source pointer matches
     /// `dst_ptr`. Must be called by any kernel that overwrites data at
     /// `dst_ptr` since the caches key on raw pointer equality and have

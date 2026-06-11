@@ -147,6 +147,13 @@ pub struct MoeParams<'a> {
     // routed expert pointer tables + dims
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table
+    /// (`[2·n_exp]` f32 = n_exp `u64` ptrs → each expert's `[routed_down_k]`
+    /// f32 scale). `Some` only when the `.hfq` carries per-expert
+    /// `down_proj.awq_scale` sidecars; the executor then runs the AWQ-aware
+    /// indexed silu+rotate (`x/s` before the FWHT). `None` (default) = the
+    /// plain silu+rotate, byte-identical to pre-AWQ.
+    pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
@@ -330,6 +337,12 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table (see
+    /// [`MoeParams::expert_down_awq_ptrs`]). When `Some`, the prefill silu+rotate
+    /// uses the indexed AWQ kernel (per-slot scale via `topk_indices`),
+    /// superseding the single-scale `down_awq_scale` stub below for routed
+    /// experts. `None` (default) = plain silu+rotate.
+    pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
     // intermediate buffers
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,

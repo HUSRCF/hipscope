@@ -409,8 +409,16 @@ pub fn run_moe_decode(
             &paro_down.pairs, &paro_down.theta, &paro_down.scales,
             p.k, p.mi, paro_down.krot,
         ))?;
+    } else if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
+        // Route A MoE-AWQ: per-routed-expert down.awq_scale selected by
+        // topk_indices[krank]. Divides silu(g)*u by the expert's scale before
+        // the FWHT (AWQ math (W·s)·(x/s)=W·x). Only reached on .hfq files
+        // carrying per-expert down sidecars — byte-identical otherwise.
+        hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+            p.gate_batch, p.up_batch, awq_ptrs, p.topk_indices, p.rot_batch, p.mi, p.k,
+        ))?;
     } else {
-        // MQ4/MQ6: no AWQ on expert down weights for Phase 1 targets (A3B)
+        // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
         hip!(gpu.fused_silu_mul_rotate_mq_batched(p.gate_batch, p.up_batch, p.rot_batch, p.mi, p.k))?;
     }
 
@@ -1090,7 +1098,25 @@ pub fn run_moe_prefill(
         // activations, not weight data). AWQ-aware variant when down has AWQ.
         match p.dtypes.routed_down {
             DType::MQ4G256 | DType::MQ6G256 => {
-                if let Some(awq) = p.down_awq_scale {
+                if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
+                    // Route A MoE-AWQ (per-routed-expert, indexed by topk slot).
+                    // total_slots rows = N·k_top; each slot's expert is
+                    // topk_indices[slot] — the same slot→expert mapping the
+                    // indexed down GEMV below uses. Supersedes the single-scale
+                    // `down_awq_scale` (Ship 4.2 stub) which incorrectly applied
+                    // experts[0]'s scale to every routed slot.
+                    //
+                    // NOTE: correct for the indexed batched gate_up (Path 0/1,
+                    // gfx9*/non-grouped) where rot_batch[slot] aligns with
+                    // topk_indices[slot]. Path 2 grouped-WMMA (gfx11/gfx12)
+                    // reorders via sorted_slot_index — AWQ+Path2 ordering is
+                    // unverified; the only current MoE-AWQ target is A3B on
+                    // gfx942 (Path 0). See docs/moe-awq/MOE_AWQ_EXPERTS.md.
+                    hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+                        p.gate_batch, p.up_batch, awq_ptrs, p.topk_indices,
+                        p.rot_batch, mi, total_slots,
+                    ))?;
+                } else if let Some(awq) = p.down_awq_scale {
                     hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
                         p.gate_batch, p.up_batch, awq, p.rot_batch, mi, total_slots,
                     ))?;

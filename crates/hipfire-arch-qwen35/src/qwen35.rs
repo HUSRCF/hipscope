@@ -579,6 +579,14 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
 
+    /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
+    /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
+    /// `.hfq` carries per-expert `down_proj.awq_scale` sidecars (all-or-none).
+    /// Holds *non-owning* device pointers into each `experts[i].down.awq_scale`
+    /// — freed as a buffer only; the scales are freed via
+    /// `ExpertWeights::down.free_all`.
+    pub expert_down_awq_ptrs: Option<GpuTensor>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
@@ -832,6 +840,12 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     ffn.shared_expert.down.free_all(gpu);
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+    // Non-owning pointer table — free the buffer only; the per-expert scales it
+    // points into are owned by `experts[i].down.awq_scale` and freed below via
+    // `e.down.free_all`.
+    if let Some(t) = ffn.expert_down_awq_ptrs {
+        let _ = gpu.free_tensor(t);
+    }
     for e in ffn.experts {
         e.gate_up.free_all(gpu);
         e.down.free_all(gpu);
@@ -2114,6 +2128,9 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        // ParoQuant routed experts use shared per-layer Givens sidecars, not
+        // per-expert MQ4 AWQ scales — no MoE-AWQ table.
+        expert_down_awq_ptrs: None,
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
@@ -4418,6 +4435,39 @@ fn load_moe_ffn(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
 
+    // Route A MoE-AWQ: when every expert carries a down.awq_scale sidecar
+    // (auto-loaded by load_weight_tensor for MQ4G256, which supports_awq_sidecar),
+    // build the per-expert pointer table the indexed silu+rotate selects from
+    // (topk_indices[krank] → expert's [mi] scale). All-or-none — a partial set
+    // is a malformed file and disables MoE-AWQ for the layer.
+    // Debug kill-switch, read ONCE at load (never on the decode hot path):
+    // HIPFIRE_MOE_AWQ=0 forces the plain silu+rotate even on an AWQ file.
+    // NOTE: this is a path-confirmation tool, NOT a safe fallback — AWQ files
+    // bake W·s into the weights, so skipping the x/s divide yields W·s·x
+    // (garbage). Expect incoherent output when set on an AWQ file; that
+    // *confirms* the indexed AWQ kernel is the firing path. The real
+    // AWQ-vs-plain A/B uses two separately quantized files.
+    let moe_awq_enabled = std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref() != Some("0");
+    let awq_present = experts.iter().filter(|e| e.down.awq_scale.is_some()).count();
+    let expert_down_awq_ptrs = if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
+        let aw_ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| e.down.awq_scale.as_ref().unwrap().buf.as_ptr() as u64)
+            .collect();
+        let aw_bytes: Vec<u8> = aw_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
+        let t = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&t.buf, &aw_bytes)?;
+        Some(t)
+    } else {
+        if awq_present != 0 {
+            eprintln!(
+                "[moe-awq] layer {layer_idx}: partial down.awq_scale coverage \
+                 ({awq_present}/{n_exp}) — disabling MoE-AWQ for this layer"
+            );
+        }
+        None
+    };
+
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4425,6 +4475,7 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -4744,6 +4795,10 @@ fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        // Route A MoE-AWQ: `Some` only on per-expert-AWQ .hfq files (the
+        // HIPFIRE_MOE_AWQ kill-switch is applied once at load in load_moe_ffn,
+        // not per-token). `None` ⇒ plain silu+rotate (byte-identical).
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
@@ -7750,7 +7805,12 @@ fn prefill_moe_ffn_body_batched(
             krot: paro.krot as usize,
         }
     });
-    let down_awq_scale = ffn.experts[0].down.awq_scale.as_ref();
+    // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
+    // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
+    // stub applied experts[0]'s scale to every routed slot, which is wrong once
+    // experts actually carry per-expert AWQ. Pass `None` for the single scale;
+    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
+    let down_awq_scale: Option<&GpuTensor> = None;
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         dtypes: moe_dtypes,
@@ -7769,6 +7829,7 @@ fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         gate_batch,
         up_batch,
         rot_batch,
@@ -12454,6 +12515,27 @@ pub fn shard_moe_experts(
     let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
     gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+
+    // Route A MoE-AWQ under EP: rebuild the per-expert down.awq_scale pointer
+    // table over the compacted set. Non-owned slots get a valid dummy pointer
+    // (compacted[0]'s scale) — they read zeroed gate_up ⇒ silu output 0 ⇒
+    // 0/scale = 0 regardless, so the all-reduced sum is unaffected.
+    if let Some(awq_tbl) = ffn.expert_down_awq_ptrs.as_ref() {
+        let dummy_aw = compacted[0].down.awq_scale.as_ref()
+            .map(|s| s.buf.as_ptr() as u64).unwrap_or(0);
+        let mut aw = vec![dummy_aw; n_exp];
+        for (e, slot) in aw.iter_mut().enumerate() {
+            if shard.owns_expert(rank, e) {
+                let li = local_of_global[e];
+                if let Some(s) = compacted[li].down.awq_scale.as_ref() {
+                    *slot = s.buf.as_ptr() as u64;
+                }
+            }
+        }
+        let aw_b: Vec<u8> = aw.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&awq_tbl.buf, &aw_b)?;
+    }
+
     ffn.experts = compacted;
     Ok(())
 }
