@@ -6,10 +6,11 @@
 //! dispatch).
 //!
 //! The defining structural trait is the **parallel block**: a SINGLE
-//! mean-centered `Cohere2LayerNorm` feeds BOTH the attention and the FFN
-//! branch, and both add into the residual —
-//!   `h = h + o_proj(attn(LN(h))) + ffn(LN(h))`
-//! (note: the FFN reads the SAME `LN(h)` as attention, NOT the
+//! `RMSNorm` (cohere2_moe uses RMSNorm at `rms_norm_eps`, NOT base Cohere2's
+//! mean-centered LayerNorm) feeds BOTH the attention and the FFN branch, and
+//! both add into the residual —
+//!   `h = h + o_proj(attn(RMSNorm(h))) + ffn(RMSNorm(h))`
+//! (note: the FFN reads the SAME `RMSNorm(h)` as attention, NOT the
 //! post-attention residual). Per layer:
 //!   normed = layernorm_meancentered(h, input_layernorm)        [gamma only, β=0]
 //!   q,k,v  = proj(normed); RoPE only if sliding (full=NoPE); attn; h += o_proj
@@ -534,7 +535,7 @@ pub fn forward_batch(
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
-        // Parallel block: normed = mean-centered LN(x), fed to BOTH branches.
+        // Parallel block: normed = RMSNorm(x), fed to BOTH branches.
         gpu.rmsnorm_batched(&x, &layer.input_norm, &normed, b, hidden, eps)
             .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
         // Attention from `normed` (Q8 projections).
@@ -667,7 +668,7 @@ pub fn forward_batch(
     }
     state.n_tokens = start_pos + b;
 
-    // Final mean-centered LN + lm_head on the LAST row only (prefill needs the
+    // Final RMSNorm + lm_head on the LAST row only (prefill needs the
     // last position's logits to seed decode).
     let x_last = alloc(gpu, hidden, "x_last")?;
     gpu.hip

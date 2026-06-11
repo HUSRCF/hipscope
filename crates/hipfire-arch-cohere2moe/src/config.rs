@@ -23,8 +23,8 @@
 //!   2. **Interleaved attention** from `layer_types`: `full_attention`
 //!      (global, **NoPE** — no positional embedding) vs `sliding_attention`
 //!      (window 4096, **RoPE**). Every 4th layer (0,4,…,48) is full.
-//!   3. **Mean-centered LayerNorm** (`Cohere2LayerNorm`, no bias) — NOT
-//!      RMSNorm. Uses `layer_norm_eps` (1e-5).
+//!   3. **RMSNorm** (`LlamaRMSNorm`, no bias) — cohere2_moe replaced base
+//!      Cohere2's mean-centered LayerNorm; uses `rms_norm_eps` (1e-6).
 //!
 //! No QK-norm, no attention bias, `logit_scale=1.0` (no-op), tied embeddings.
 

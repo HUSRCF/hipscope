@@ -38,9 +38,9 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
 }
 
 /// Load a 1D/raw F16/F32/Q8 vector → F32 GpuTensor with the given shape. Used
-/// for the `Cohere2LayerNorm` weights and the final norm. Cohere2 LayerNorm is
-/// mean-centered with a learned weight and NO bias — only the weight ships, so
-/// this loads the gamma vector; the forward passes a zero beta.
+/// for the per-layer + final **RMSNorm** weights (cohere2_moe uses RMSNorm at
+/// `rms_norm_eps`, NOT base Cohere2's mean-centered LayerNorm). RMSNorm has a
+/// learned weight (gamma) and no bias — this loads the gamma vector.
 fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
@@ -138,7 +138,7 @@ pub enum Ffn {
 }
 
 pub struct Cohere2MoeLayerWeights {
-    /// The SINGLE `input_layernorm` (Cohere2LayerNorm gamma, [hidden]). Feeds
+    /// The SINGLE `input_layernorm` (RMSNorm gamma, [hidden]). Feeds
     /// both the attention and FFN branches (parallel block).
     pub input_norm: GpuTensor,
     pub wq: WeightTensor,
@@ -153,7 +153,7 @@ pub struct Cohere2MoeLayerWeights {
 pub struct Cohere2MoeWeights {
     pub embed: GpuTensor,      // model.embed_tokens.weight (raw bytes)
     pub embed_dtype: DType,    // dtype of `embed` (drives the lookup path)
-    pub final_norm: GpuTensor, // model.norm.weight (Cohere2LayerNorm gamma)
+    pub final_norm: GpuTensor, // model.norm.weight (RMSNorm gamma)
     pub lm_head: WeightTensor, // tied = embed_tokens
     pub layers: Vec<Cohere2MoeLayerWeights>,
 }
@@ -271,10 +271,7 @@ pub struct Cohere2MoeState {
 
     // residual + parallel-block normed input
     pub h: GpuTensor,      // [hidden] residual stream
-    pub normed: GpuTensor, // [hidden] input_layernorm(h) — fed to BOTH branches
-    /// Zero bias [hidden] for the mean-centered `layernorm_batched` (Cohere2
-    /// LayerNorm has weight only, no bias).
-    pub ln_beta_zero: GpuTensor,
+    pub normed: GpuTensor, // [hidden] input_rmsnorm(h) — fed to BOTH branches
 
     // attention scratch
     pub fa_q: GpuTensor,        // [q_dim]
@@ -321,9 +318,17 @@ pub struct Cohere2MoeState {
 /// long prefill (see `flash_partials` doc); 64 ≈ 68 MB for North-Mini-Code.
 const FLASH_PREFILL_SUBBATCH: usize = 64;
 
+/// Default KV-cache window when the caller doesn't request one. North supports
+/// `max_position_embeddings` = 500k, but the KV is allocated up front (~53 KB /
+/// token), so we default GENEROUSLY but not to the full 500k (≈26 GB): 32k
+/// (~1.7 GB) handles typical agentic long-context (large file reads) out of the
+/// box. The daemon honours an explicit larger `max_seq` up to MAX_REQUESTED_SEQ
+/// (512k) via `new_with_max_seq`. (The old 8k default was a bring-up-era cap.)
+const DEFAULT_MAX_SEQ: usize = 32_768;
+
 impl Cohere2MoeState {
     pub fn new(gpu: &mut Gpu, cfg: &Cohere2MoeConfig) -> Result<Self, String> {
-        let max_seq = cfg.max_position_embeddings.min(8192);
+        let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
         Self::new_with_max_seq(gpu, cfg, max_seq)
     }
 
@@ -352,10 +357,6 @@ impl Cohere2MoeState {
             g.alloc_tensor(&[n], DType::F32)
                 .map_err(|e| format!("cohere2moe: alloc {label}: {e:?}"))
         };
-        // Zero-bias for the mean-centered LayerNorm (constant fill).
-        let ln_beta_zero = gpu
-            .zeros(&[hidden], DType::F32)
-            .map_err(|e| format!("cohere2moe: alloc ln_beta_zero: {e:?}"))?;
 
         Ok(Cohere2MoeState {
             kv,
@@ -364,7 +365,6 @@ impl Cohere2MoeState {
             n_tokens: 0,
             h: alloc(gpu, hidden, "h")?,
             normed: alloc(gpu, hidden, "normed")?,
-            ln_beta_zero,
             fa_q: alloc(gpu, q_dim, "fa_q")?,
             fa_k: alloc(gpu, kv_dim, "fa_k")?,
             fa_v: alloc(gpu, kv_dim, "fa_v")?,

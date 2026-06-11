@@ -3986,11 +3986,12 @@ fn load_model(
         let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
         let weights = <cohere2moe::Cohere2Moe as Architecture>::load_weights(&mut hfq, &config, gpu)?;
         // Size the KV cache. North is a long-context model (max_position=500k)
-        // and KV is cheap, so default GENEROUSLY: the daemon's global default
-        // (4096) is too small — a >4096-token prompt would hit the capacity
-        // guard and error. Floor at 8192 (the arch's natural cap) so long
-        // context works out of the box; an explicit larger max_seq is honoured.
-        let max_seq = max_seq.max(8192);
+        // and KV is allocated up front (~53 KB/token), so default GENEROUSLY:
+        // the daemon's global default (4096) is too small — a >4096-token prompt
+        // would hit the capacity guard and error. Floor at 32k (~1.7 GB; the
+        // arch DEFAULT_MAX_SEQ) so long file reads work out of the box; an
+        // explicit larger max_seq (up to MAX_REQUESTED_SEQ = 512k) is honoured.
+        let max_seq = max_seq.max(32_768);
         let state = cohere2moe::Cohere2MoeState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
         // Resolve EOS via the tokenizer. Cohere2 ends a turn with
