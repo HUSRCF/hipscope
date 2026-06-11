@@ -405,7 +405,7 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
     hfq.chat_template()
 }
 
-fn parse_state_quant(
+pub(crate) fn parse_state_quant(
     mode: Option<&str>,
 ) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
     use hipfire_arch_qwen35::qwen35::StateQuant;
@@ -602,11 +602,6 @@ pub fn load_model(
     pp: usize,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    if pp > 1 {
-        let _ = (draft_path, cask, kv_adaptive_override);
-        return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
-    }
-
     let src = ModelSource::from_path(path)?;
 
     // DFlash lm_head quant check — only for HFQ sources
@@ -683,7 +678,10 @@ pub fn load_model(
     // Carrier registry dispatch
     let carrier = REGISTRY.iter().find(|c| c.probe(&src))
         .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
-    carrier.load(src, &mut ctx)
+    let result = carrier.load(src, &mut ctx)?;
+    debug_assert!(!(result.pp > 1) || result.pp_gpus.is_some(),
+        "pp>1 LoadedModel missing pp_gpus");
+    Ok(result)
 }
 
 fn load_dots_ocr(
@@ -784,87 +782,6 @@ fn load_minimax(
         minimax_config: Some(config), minimax_weights: Some(weights),
         minimax_state: Some(state), minimax_eos_tok: eos_tok,
         ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
-    })
-}
-
-// ─── Pipeline-parallel load ───────────────────────────────────────────
-
-fn load_model_pp(
-    path: &str,
-    max_seq: usize,
-    kv_mode_override: Option<&str>,
-    state_quant_override: Option<&str>,
-    pp: usize,
-    _gpu: &mut rdna_compute::Gpu,
-) -> Result<LoadedModel, String> {
-    let kv_mode = kv_mode_override
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer not found: {e}"))?;
-
-    if hfq.arch_id != 5 && hfq.arch_id != 6 {
-        return Err(format!(
-            "pp>1 supports Qwen3.5 dense (arch_id=5) and Qwen3.5-MoE / \
-             Qwen3.6-A3B (arch_id=6) only; got arch_id={}. LLaMA / Qwen3 \
-             dense (arch_id<5) is pp=1 only.",
-            hfq.arch_id
-        ));
-    }
-    // PP continues with the full load_model_pp body from daemon.rs...
-    // For the initial scaffold, we rely on the daemon's copy. Full move coming.
-    let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS").ok().filter(|s| !s.is_empty()) {
-        Some(spec) => {
-            let counts: Result<Vec<usize>, _> =
-                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
-            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
-            if counts.len() != pp {
-                return Err(format!("HIPFIRE_PP_LAYERS has {} entries, expected pp={}", counts.len(), pp));
-            }
-            let sum: usize = counts.iter().sum();
-            if sum != config.n_layers {
-                return Err(format!("HIPFIRE_PP_LAYERS sum={} != n_layers={}", sum, config.n_layers));
-            }
-            Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
-        }
-        None => Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?,
-    };
-    let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus)
-        .map_err(|e| format!("{e}"))?;
-    let is_kv_layer: Vec<bool> = config.layer_types.iter().map(|t| *t == LayerType::FullAttention).collect();
-    let kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi_filtered(
-            &mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi_filtered(
-            &mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi_filtered(
-            &mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi_filtered(
-            &mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        _ => {
-            eprintln!("  KV cache: unrecognized '{}', defaulting to asym3 for pp>1", kv_mode);
-            llama::KvCache::new_gpu_asym3_capped_multi_filtered(
-                &mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq)
-        }
-    }.map_err(|e| format!("{e}"))?;
-    let dn_quant = parse_state_quant(state_quant_override)?;
-    let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
-        .map_err(|e| format!("{e}"))?;
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(
-        &mut gpus, &config, 2048, max_seq).map_err(|e| format!("{e}"))?;
-    // PP needs a single-GPU scratch for the bundle (the multi-GPU scratch_set is kept at top level)
-    let gpu0 = &mut gpus.devices[0];
-    let single_scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu0, &config, 2048, max_seq)
-        .map_err(|e| format!("{e}"))?;
-    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch: single_scratch, kv_cache: kv, dn_state: dn }));
-    let chat_template = resolve_chat_template(&hfq, path);
-    let arch_id = hfq.arch_id;
-    Ok(LoadedModel {
-        state,
-        ..LoadedModel::skeleton_pp(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template, pp, gpus, scratch_set, la_to_device)
     })
 }
 
