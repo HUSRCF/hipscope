@@ -324,6 +324,13 @@ mod integ {
     use crate::{quantize_hfq4g256, write_hfq};
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
+    use std::sync::Mutex;
+
+    // `HfqFile::open` READS the process-global `HIPFIRE_REAP_PLAN` env var on
+    // every call. The end-to-end test below sets it before `open`, so it must
+    // serialize against any other test in this module that calls `open` (none
+    // today, but keep the guard to mirror SP3 T2's hipfire-runtime test).
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn plan_layer0_expert0_hfq4(dir: &std::path::Path) -> ReapPlan {
         std::fs::write(
@@ -398,5 +405,81 @@ mod integ {
             .tensor_data(&matched_name)
             .expect("tensor data readable back");
         assert_eq!(data, &direct[..], "round-tripped data must equal direct encode");
+    }
+
+    /// SP3 Task 3: full SP4-overlay → SP3-load round trip on REAL HFQ
+    /// containers. Build a base (expert + attention tensors, both Q8F16),
+    /// build an overlay that re-quantizes ONLY the expert tensor to HFQ4G256,
+    /// point `HIPFIRE_REAP_PLAN` at the overlay dir, then `HfqFile::open` the
+    /// base and assert: overlay attached, expert resolves to the overlay's
+    /// HFQ4G256 bytes, attention falls through to base Q8F16.
+    #[test]
+    fn sp4_overlay_to_sp3_load_end_to_end() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let exp_name = "layers.0.ffn.experts.0.w1.weight";
+        let attn_name = "layers.0.self_attn.q_proj.weight";
+        // [2, 256] = 512 f32 (multiple of the 256 group for the HFQ4G256 tier).
+        let shape = [2usize, 256];
+        let exp_f32: Vec<f32> = (0..2 * 256).map(|i| ((i as f32) * 0.019).sin() * 5.0).collect();
+        let attn_f32: Vec<f32> = (0..2 * 256).map(|i| ((i as f32) * 0.011).cos() * 2.0).collect();
+
+        // --- (1) base model: both tensors → Q8F16, arch 9, written to base.hfq.
+        let base_dir = tempfile::tempdir().unwrap();
+        let base_path = base_dir.path().join("base.hfq");
+        let exp_q8 = quantize_to_format(exp_name, "q8", &exp_f32, &shape).unwrap();
+        let attn_q8 = quantize_to_format(attn_name, "q8", &attn_f32, &shape).unwrap();
+        assert_eq!(exp_q8.quant_type, QuantType::Q8F16);
+        write_hfq(&base_path, 9, "{}", &[exp_q8, attn_q8], None).unwrap();
+
+        // --- (2) overlay: re-quantize ONLY the expert tensor → HFQ4G256.
+        let plan_dir = tempfile::tempdir().unwrap();
+        let overlay_path = plan_dir.path().join("overlay.hfq");
+        let exp_overlay = quantize_to_format(exp_name, "hfq4g256", &exp_f32, &shape).unwrap();
+        assert_eq!(exp_overlay.quant_type, QuantType::HFQ4G256);
+        write_hfq(&overlay_path, 9, "{}", &[exp_overlay], None).unwrap();
+
+        // The byte-exact reference the overlay must serve for the expert tensor.
+        let direct_hfq4 = quantize_to_format(exp_name, "hfq4g256", &exp_f32, &shape)
+            .unwrap()
+            .data;
+
+        // --- (3) point HIPFIRE_REAP_PLAN at the overlay dir, then open the base.
+        // Capture everything we need while the guard is held; remove the env var
+        // immediately after `open` (before any assert can unwind) so a failure
+        // can't leak the var to a concurrent `open`.
+        std::env::set_var("HIPFIRE_REAP_PLAN", plan_dir.path());
+        let f = HfqFile::open(&base_path).unwrap();
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+
+        // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
+        assert!(f.has_overlay(), "overlay.hfq should auto-attach from HIPFIRE_REAP_PLAN");
+
+        // Expert tensor resolves to the OVERLAY (HFQ4G256), and its bytes equal
+        // a direct hfq4g256 encode of the same f32.
+        let exp_info = f
+            .find_tensor_info(exp_name)
+            .expect("expert tensor resolvable");
+        assert_eq!(
+            exp_info.quant_type,
+            QuantType::HFQ4G256 as u8,
+            "expert tensor must resolve to the overlay tier"
+        );
+        let (exp_info2, exp_bytes) = f.tensor_data_vec(exp_name).expect("expert bytes");
+        assert_eq!(exp_info2.quant_type, QuantType::HFQ4G256 as u8);
+        assert_eq!(
+            exp_bytes, direct_hfq4,
+            "expert overlay bytes must equal a direct hfq4g256 encode"
+        );
+
+        // Attention tensor falls through to BASE (Q8F16).
+        let attn_info = f
+            .find_tensor_info(attn_name)
+            .expect("attention tensor resolvable from base");
+        assert_eq!(
+            attn_info.quant_type,
+            QuantType::Q8F16 as u8,
+            "attention tensor must fall through to base Q8F16"
+        );
     }
 }
