@@ -72,7 +72,32 @@ pub struct HfqFile {
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        Self::open_at_offset(path, 0)
+        let mut f = Self::open_at_offset(path, 0)?;
+        // REAP load-time overlay splice (SP3): when HIPFIRE_REAP_PLAN points
+        // at a dir containing `overlay.hfq`, attach it so its re-quantized
+        // tensors shadow the base by name. Opened via `open_at_offset` (NOT
+        // `open`) so the overlay does NOT recursively env-attach. A mismatched
+        // arch_id is logged and we proceed base-only — the safe default for
+        // unrelated model opens that happen to share the env var.
+        if let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") {
+            let ov_path = std::path::Path::new(&dir).join("overlay.hfq");
+            if ov_path.exists() {
+                match Self::open_at_offset(&ov_path, 0)
+                    .map_err(|e| e.to_string())
+                    .and_then(|ov| {
+                        let n = ov.tensors.len();
+                        f.attach_overlay(ov).map(|_| n)
+                    }) {
+                    Ok(n) => eprintln!(
+                        "reap: overlay ACTIVE — {n} tensor(s) from {ov_path:?} shadow the base"
+                    ),
+                    Err(e) => eprintln!(
+                        "reap: WARNING overlay at {ov_path:?} not attached: {e}"
+                    ),
+                }
+            }
+        }
+        Ok(f)
     }
 
     /// Attach an overlay whose tensors shadow this file's by name. Used by the
@@ -1401,4 +1426,21 @@ mod overlay_tests {
         assert!(err.contains("arch_id 6 != base arch_id 9"), "got: {err}");
     }
 
+    #[test]
+    fn open_auto_attaches_overlay_from_env() {
+        // Env mutation is process-global; lock so this serializes with any
+        // other env-mutating test in this module.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![1u8; 4])]);
+        // overlay.hfq lives in the plan dir.
+        let plan = tempfile::tempdir().unwrap();
+        write_min_hfq(&plan.path().join("overlay.hfq"), 9, &[("A", 8, &[1, 4], &vec![7u8; 4])]);
+        std::env::set_var("HIPFIRE_REAP_PLAN", plan.path());
+        let f = HfqFile::open(&base).unwrap();
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        assert!(f.has_overlay());
+        assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8); // overlay won
+    }
 }
