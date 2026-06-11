@@ -323,7 +323,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    Some(Qwen35Config {
+    let mut config = Qwen35Config {
         dim,
         n_layers,
         vocab_size,
@@ -355,7 +355,31 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         paged_experts: false,
         vram_budget_bytes: u64::MAX,
         reap_keep: None,
-    })
+    };
+
+    // Apply the optional REAP keep-map HERE, inside the single public config
+    // entry point, so it is IMPOSSIBLE to bypass. `config_from_hfq` has ~50
+    // direct callers (daemon, perplexity example, every bench/profile example)
+    // that never go through the `Architecture` trait shim; wiring REAP only in
+    // the trait impl would silently ignore HIPFIRE_REAP_PLAN on all of them
+    // (including the deferred identity NLL gate, which the perplexity example
+    // drives via this public fn). The trait impl therefore does NOT re-apply.
+    //
+    // Error policy: this fn returns `Option<Qwen35Config>`, shared by ~50
+    // callers that mostly `.expect()`/`.ok_or()` the Option — converting to
+    // `Result<_, String>` would be an invasive, churny signature change across
+    // all of them. REAP is OPT-IN (env-gated), so a malformed plan when the
+    // user explicitly set HIPFIRE_REAP_PLAN MUST hard-fail, never silently
+    // no-op or get swallowed into a `None` that callers misread as "bad
+    // metadata". We therefore hard-exit on Err with a clear FATAL message
+    // rather than collapsing the error into `None`. With no env var,
+    // apply_reap_plan is a no-op (Ok), so baseline behavior is unchanged.
+    if let Err(e) = apply_reap_plan(&mut config) {
+        eprintln!("FATAL: HIPFIRE_REAP_PLAN: {e}");
+        std::process::exit(1);
+    }
+
+    Some(config)
 }
 
 /// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
@@ -1674,28 +1698,29 @@ fn load_weight_tensor_keep(
         "load_weight_tensor_keep: m ({m}) must equal keep.len() ({})",
         keep.len()
     );
-    // Resolve via the same name-candidate logic as the non-keep path, taking
-    // owned bytes so the gather + AWQ-sidecar reads don't fight a borrow.
-    // `HfqTensorInfo` is not Clone, so pull out the scalars we need (quant
-    // type + on-disk row count) while the borrow is live.
-    let mut matched: Option<String> = None;
-    let mut found: Option<(u8, usize, Vec<u8>)> = None;
-    for candidate in qwen35_tensor_name_candidates(name) {
-        if let Some((info, buf)) = hfq.tensor_data_vec(&candidate) {
-            let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
-            matched = Some(candidate);
-            found = Some((info.quant_type, orig_rows, buf));
-            break;
-        }
-    }
-    let (quant_type, orig_rows, bytes) =
-        found.unwrap_or_else(|| panic!("tensor not found: {name}"));
+    // Resolve via the shared `qwen35_tensor_data_vec` helper (same candidate
+    // logic as the non-keep path; it preads + fadvise_dontneeds internally and
+    // returns OWNED bytes, so the gather + AWQ-sidecar reads don't fight a
+    // borrow). `orig_rows` is the on-disk first-axis length = original expert
+    // count. The matched (prefixed) candidate name is resolved separately for
+    // the AWQ sidecar lookup via a metadata-only existence check, since the
+    // helper doesn't surface which candidate it hit.
+    let (info, bytes) =
+        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let quant_type = info.quant_type;
+    let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
     // Row-gather to the kept set. The on-disk row count is the ORIGINAL expert
     // count (= bytes.len() / rowstride); gather_rows derives it from shape[0].
     let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig_rows], &bytes, keep)
         .map_err(|e| HipError::new(0, &format!("qwen35: router row-gather '{name}': {e}")))?;
     let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
     if wt.gpu_dtype.supports_awq_sidecar() {
+        // Resolve the matched candidate name (metadata only) so the AWQ sidecar
+        // is looked up under the same prefix the weight resolved to; fall back
+        // to the bare `name`. Mirrors the non-keep `load_weight_tensor`.
+        let matched = qwen35_tensor_name_candidates(name)
+            .into_iter()
+            .find(|c| hfq.find_tensor_info(c).is_some());
         wt.awq_scale = matched
             .as_deref()
             .and_then(|mn| load_awq_scale_for(hfq, gpu, mn, k))
@@ -4454,13 +4479,14 @@ fn load_moe_ffn(
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     //
     // REAP keep-map: `n_exp` is already the KEPT count (config.num_experts was
-    // overridden in apply_reap_plan). Iterate compact slots and load only the
-    // kept original experts under their remapped names (`ep` computed above).
-    // No keep ⇒ identity (slot==original index, `n_slots == n_exp`) — the
-    // literal original loop.
-    let n_slots = ep.as_ref().map(|e| e.n_slots(n_exp)).unwrap_or(n_exp);
-    let mut experts = Vec::with_capacity(n_slots);
-    for slot in 0..n_slots {
+    // overridden in apply_reap_plan), and under a keep `ExpertPlan::n_slots`
+    // also equals the kept count — so `n_exp` is the slot count on both the
+    // keep and no-keep paths. Iterate compact slots `0..n_exp` (matching ds4's
+    // `0..n_routed_experts`) and load only the kept original experts under
+    // their remapped names via `ep.src(slot)`. No keep ⇒ identity (slot ==
+    // original index) — the literal original loop.
+    let mut experts = Vec::with_capacity(n_exp);
+    for slot in 0..n_exp {
         let x = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
         let gate_up = load_weight_tensor(
             hfq,
