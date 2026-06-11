@@ -6137,9 +6137,16 @@ fn main() {
             // (gate_up stays MQ4) — the "mq6-down" precision lever, composable
             // with down-AWQ. Kept OUT of `expert_mq6` so `expert_awq_active` still
             // fires; the AWQ branch below switches its output format to MQ6.
-            let down_mq6 = std::env::var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
-                && base_name == "down_proj"
-                && supports_g256;
+            // HIPFIRE_MOE_EXPERTS_MQ6=1 promotes BOTH gate_up + down to MQ6 (the
+            // experts-level "+P" / kmap-experts recipe, minus the gfx12-only dense
+            // attn promotion). HIPFIRE_MOE_DOWN_MQ6=1 promotes only down. `down_mq6`
+            // means "promote THIS expert tensor to MQ6" (gate_up or down).
+            let experts_mq6_all =
+                std::env::var("HIPFIRE_MOE_EXPERTS_MQ6").ok().as_deref() == Some("1");
+            let down_mq6 = supports_g256
+                && (experts_mq6_all
+                    || (std::env::var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
+                        && base_name == "down_proj"));
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
             // (overrides any kmap promotion). The intent is to inject MQ2
             // noise specifically on the routed-expert tensors, so even
