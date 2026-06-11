@@ -4713,6 +4713,68 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
 /// buffers, never allocates.
+// ── REAP expert-importance capture (HIPFIRE_MOE_EXPERT_STATS=1) ────────────
+// Per-(layer, expert) accumulators: routing count, Σ gate_weight,
+// Σ ‖expert_output‖, Σ (gate × ‖output‖). The last is the true REAP
+// contribution (gate-weighted output norm) — compared against raw frequency
+// (count) to decide whether freq agrees with contribution before committing to
+// any per-expert mixed-precision kernel. Dumped by `dump_expert_stats`.
+static EXPERT_STATS: std::sync::Mutex<
+    Option<std::collections::HashMap<(u16, u16), (u64, f64, f64, f64)>>,
+> = std::sync::Mutex::new(None);
+static EXPERT_STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn expert_stats_enabled() -> bool {
+    *EXPERT_STATS_ON.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_EXPERT_STATS").ok().as_deref() == Some("1")
+    })
+}
+fn capture_expert_stats(
+    gpu: &Gpu,
+    layer_idx: u16,
+    k: usize,
+    hidden: usize,
+    down_expanded: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+) {
+    let dn = match gpu.download_f32(down_expanded) { Ok(v) => v, Err(_) => return };
+    let ti = match gpu.download_f32(topk_indices) { Ok(v) => v, Err(_) => return };
+    let tw = match gpu.download_f32(topk_weights) { Ok(v) => v, Err(_) => return };
+    let mut guard = EXPERT_STATS.lock().unwrap();
+    let m = guard.get_or_insert_with(std::collections::HashMap::new);
+    for krank in 0..k {
+        if krank >= ti.len() || krank >= tw.len() { break; }
+        let e = (ti[krank].to_bits() as i32) as u16; // i32-in-F32 alias
+        let w = tw[krank] as f64;
+        let base = krank * hidden;
+        if base + hidden > dn.len() { break; }
+        let mut sq = 0.0f64;
+        for j in 0..hidden { let x = dn[base + j] as f64; sq += x * x; }
+        let norm = sq.sqrt();
+        let ent = m.entry((layer_idx, e)).or_insert((0, 0.0, 0.0, 0.0));
+        ent.0 += 1; ent.1 += w; ent.2 += norm; ent.3 += w * norm;
+    }
+}
+/// Dump the accumulated per-(layer,expert) REAP stats to a TSV. Called from
+/// eval harnesses when HIPFIRE_MOE_EXPERT_STATS_OUT is set.
+pub fn dump_expert_stats(path: &str) {
+    let guard = EXPERT_STATS.lock().unwrap();
+    let m = match guard.as_ref() {
+        Some(m) if !m.is_empty() => m,
+        _ => { eprintln!("expert_stats: empty (capture not enabled?)"); return; }
+    };
+    let mut rows: Vec<_> = m.iter().collect();
+    rows.sort_by_key(|((l, e), _)| (*l, *e));
+    let mut out = String::from("layer\texpert\tcount\tsum_gate\tsum_norm\tsum_contrib\n");
+    for ((l, e), (c, sg, sn, sc)) in rows {
+        out.push_str(&format!("{l}\t{e}\t{c}\t{sg:.6}\t{sn:.6}\t{sc:.6}\n"));
+    }
+    match std::fs::write(path, out) {
+        Ok(_) => eprintln!("expert_stats: wrote {path} ({} layer×expert rows)", m.len()),
+        Err(e) => eprintln!("expert_stats: write failed {path}: {e}"),
+    }
+}
+
 fn moe_ffn_decode_impl(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -4833,6 +4895,10 @@ fn moe_ffn_decode_impl(
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     hipfire_runtime::llama::moe_family().run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
+    if expert_stats_enabled() {
+        capture_expert_stats(gpu, ffn.layer_idx, k, hidden,
+            s.down_expanded, s.topk_indices, s.topk_weights);
+    }
     Ok(())
 }
 
