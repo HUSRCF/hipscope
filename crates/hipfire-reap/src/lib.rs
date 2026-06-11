@@ -3,3 +3,6 @@
 
 pub mod gather;
 pub mod plan;
+pub mod source;
+
+pub use source::{ExpertPlan, TensorSource};
