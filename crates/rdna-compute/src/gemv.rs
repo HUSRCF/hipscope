@@ -5843,6 +5843,85 @@ impl Gpu {
         }
         result
     }
+    /// Merged per-expert MIXED-PRECISION MoE gate_up GEMV. Per-block branch on
+    /// `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+    /// codebook). Same kernarg signature + grid (M, K_TOP, N) + gate/up output
+    /// split as the HFQ6 sibling, plus a leading `dtype_tags` u8 table.
+    /// Wave32 (RDNA) only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mixed_moe_gate_up_indexed_batched",
+            kernels::GEMV_MIXED_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+            "gemv_mixed_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // Mixed dtype: byte estimate uses the larger (MQ6 200 B/group) bound.
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mixed_moe_gate_up_k8_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mixed_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// HFQ5G256 batched gate_up MoE GEMV. Same kernarg signature + grid
     /// (M, K_TOP, N) + gate/up output split as the HFQ6 sibling; only the
     /// per-group dequant differs (168 B/group, 5-bit). Wave32 (RDNA) only.
@@ -5973,6 +6052,81 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Merged per-expert MIXED-PRECISION expanded MoE down GEMV. Per-block branch
+    /// on `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+    /// codebook). Atomic-free expand-then-combine; pairs with
+    /// `moe_down_combine_k8_batched` (dtype-independent f32 combine). Wave32
+    /// (RDNA) only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mixed_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_mixed_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // Mixed dtype: byte estimate uses the larger (MQ6 200 B/group) bound.
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mixed_moe_down_k8_indexed_batched_expanded",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mixed_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
                 b.push_ptr(ip);
                 b.push_ptr(rbp);
                 b.push_ptr(eop);

@@ -587,6 +587,14 @@ pub struct MoeFfnWeights {
     /// `ExpertWeights::down.free_all`.
     pub expert_down_awq_ptrs: Option<GpuTensor>,
 
+    /// Per-expert mixed-precision decode: `[num_experts]` u8 (DType::Raw,
+    /// 1 B/expert) dtype-tag table. `Some` only when the layer's routed
+    /// experts carry MIXED down dtypes (graded MQ6 hot / MQ2-Lloyd cold);
+    /// the merged dtype-tag-branched down kernel reads `tags[expert_id]`
+    /// per block (0=MQ6, 1=MQ2-Lloyd). `None` ⇒ uniform path, byte-identical.
+    /// Owned device buffer (no aliasing) — freed as a buffer in free_moe_ffn.
+    pub expert_dtype_tags: Option<GpuTensor>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
@@ -844,6 +852,10 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     // points into are owned by `experts[i].down.awq_scale` and freed below via
     // `e.down.free_all`.
     if let Some(t) = ffn.expert_down_awq_ptrs {
+        let _ = gpu.free_tensor(t);
+    }
+    // Owned device buffer (built from per-expert gpu_dtype). Free it.
+    if let Some(t) = ffn.expert_dtype_tags {
         let _ = gpu.free_tensor(t);
     }
     for e in ffn.experts {
@@ -2147,6 +2159,8 @@ fn paro_load_moe_ffn(
         // ParoQuant routed experts use shared per-layer Givens sidecars, not
         // per-expert MQ4 AWQ scales — no MoE-AWQ table.
         expert_down_awq_ptrs: None,
+        // Paged/paro layers are uniform-dtype — no per-expert mixed table.
+        expert_dtype_tags: None,
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
@@ -4484,6 +4498,36 @@ fn load_moe_ffn(
         None
     };
 
+    // ── Per-expert mixed-precision dtype-tag table ──────────────────────
+    // When the graded `.hfq` quantizes routed experts to MIXED down dtypes
+    // (top-frac MQ6, rest MQ2-Lloyd), `experts[0].down.gpu_dtype` is no
+    // longer representative — build a `[n_exp]` u8 tag table so the merged
+    // decode kernel can branch per expert. Built iff the down dtypes are
+    // not all identical (single source of truth for `routed_has_mixed_experts`).
+    // tag 0 = MQ6 (200 B/group affine), tag 1 = MQ2-Lloyd (72 B/group
+    // codebook); other dtypes map to 0 (uniform files never reach here).
+    let expert_dtype_tags = if n_exp > 0 {
+        let dn0 = experts[0].down.gpu_dtype;
+        let mixed = experts.iter().any(|e| e.down.gpu_dtype != dn0);
+        if mixed {
+            let tags: Vec<u8> = experts
+                .iter()
+                .map(|e| match e.down.gpu_dtype {
+                    DType::MQ6G256 => 0u8,
+                    DType::MQ2G256Lloyd => 1u8,
+                    _ => 0u8,
+                })
+                .collect();
+            let t = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
+            gpu.hip.memcpy_htod(&t.buf, &tags)?;
+            Some(t)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4492,6 +4536,7 @@ fn load_moe_ffn(
         expert_gate_up_ptrs,
         expert_down_ptrs,
         expert_down_awq_ptrs,
+        expert_dtype_tags,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -4831,6 +4876,9 @@ fn moe_ffn_decode_impl(
             .first()
             .map(|e| e.down.gpu_dtype)
             .unwrap_or(DType::F32),
+        // Single source of truth: the tag table is built iff experts carry
+        // mixed down dtypes, so its presence == the mixed-per-expert flag.
+        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
@@ -4877,6 +4925,10 @@ fn moe_ffn_decode_impl(
         // HIPFIRE_MOE_AWQ kill-switch is applied once at load in load_moe_ffn,
         // not per-token). `None` ⇒ plain silu+rotate (byte-identical).
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        // Per-expert mixed-precision decode: `Some` only on graded mixed
+        // files; drives the merged dtype-tag-branched down kernel + forces
+        // the shared combine. `None` ⇒ uniform path (byte-identical).
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
@@ -7868,6 +7920,9 @@ fn prefill_moe_ffn_body_batched(
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
         routed_gate_up: ffn.experts[0].gate_up.gpu_dtype,
         routed_down: ffn.experts[0].down.gpu_dtype,
+        // Prefill never fires the merged decode kernel (decode-only), but the
+        // shared MoeDtypes struct still requires the flag; carry it honestly.
+        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
 

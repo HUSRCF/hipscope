@@ -1297,6 +1297,14 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Merged per-expert MIXED-PRECISION expanded MoE down GEMV. Per-block branch
+/// on `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+/// codebook). Block-uniform branch (grid block-per-(row,krank,token)) -> no
+/// warp divergence. Single shared accumulator + expanded write; pairs with
+/// `MOE_DOWN_COMBINE_K8_BATCHED_SRC` (dtype-independent f32 combine).
+pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded.hip");
+
 /// HFQ5G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
 pub const GEMV_HFQ5G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
@@ -1308,6 +1316,13 @@ pub const GEMV_HFQ5G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// kernel for the batched LFM2.5-MoE decode path (MQ6-promoted expert layers).
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
+/// Merged per-expert MIXED-PRECISION MoE gate_up GEMV. Per-block branch on
+/// `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+/// codebook). Block-uniform branch -> no divergence. Single shared accumulator
+/// + the gate/up split write (M = 2*MI). x indexed [bid*K] (per-token).
+pub const GEMV_MIXED_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip");
 
 /// HFQ5G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
 /// gate/up output split as the HFQ6 batched gate_up kernel; only the

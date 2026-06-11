@@ -449,7 +449,17 @@ pub fn run_moe_decode(
 
     // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-    if res.routed_indexable_paro {
+    if let Some(tags) = p.expert_dtype_tags {
+        // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
+        // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
+        // (block-uniform → no warp divergence) and branches the dequant.
+        // Writes the EXPANDED buffer for BOTH dtypes → the single shared
+        // moe_down_combine_k8_batched runs below (self-combine forced off).
+        hip!(gpu.gemv_mixed_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs, tags, p.topk_indices, p.rot_batch, p.down_expanded,
+            down_m, down_k, p.k, 1,
+        ))?;
+    } else if res.routed_indexable_paro {
         hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
@@ -496,10 +506,17 @@ pub fn run_moe_decode(
     // GEMV above (weighted accumulate into out_target). Running the expanded
     // combine here would double-count the routed contribution (atomic residual
     // + combine of stale down_expanded), so skip it for the Lloyd down path.
-    let routed_down_self_combines = matches!(
-        p.dtypes.routed_down,
-        DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-    );
+    // Per-expert mixed mode writes the EXPANDED down buffer for BOTH dtypes
+    // (incl. the MQ2-Lloyd experts), so the single shared combine MUST run.
+    // Never take the Lloyd atomic self-combine path here, or the Lloyd
+    // experts double-count (atomic + combine) or zero out (expanded written,
+    // combine skipped) — silent numerical corruption. The merged kernel's
+    // expanded write replaces the standalone Lloyd atomic GEMV.
+    let routed_down_self_combines = p.expert_dtype_tags.is_none()
+        && matches!(
+            p.dtypes.routed_down,
+            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+        );
     if !routed_down_self_combines {
         hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
     }

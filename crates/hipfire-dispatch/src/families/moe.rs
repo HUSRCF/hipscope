@@ -46,6 +46,15 @@ pub struct MoeDtypes {
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType,       // ffn.experts[0].gate_up
     pub routed_down: DType,          // ffn.experts[0].down
+    /// Per-expert mixed routed **down** dtype: experts in one layer carry
+    /// DIFFERENT down dtypes (graded MQ6 hot / MQ2-Lloyd cold), so
+    /// `routed_down` (= experts[0]) is NOT representative. Built by the
+    /// model as `ffn.expert_dtype_tags.is_some()` — the tag table is built
+    /// iff the layer's experts are not all the same down dtype. Drives the
+    /// merged dtype-tag-branched decode kernel (one block per expert reads
+    /// its tag → branches dequant). Gate_up stays uniform MQ4 in the first
+    /// target, so only the down GEMV + self-combine flag change.
+    pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
 }
 
@@ -74,6 +83,13 @@ pub struct MoeResolution {
     /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
     /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
     pub routed_indexable_mq3lloyd: bool,
+    /// Per-expert mixed routed experts (down graded MQ6/MQ2-Lloyd, gate_up
+    /// uniform MQ4). Indexable on the decode GPU-top-K path via the merged
+    /// dtype-tag-branched down kernel; gate_up uses the existing MQ4 indexed
+    /// GEMV, silu+rotate is weight-agnostic. The merged down writes the
+    /// EXPANDED buffer for BOTH dtypes → the single shared
+    /// `moe_down_combine_k8_batched` runs (NOT the Lloyd atomic self-combine).
+    pub routed_indexable_mixed_per_expert: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
@@ -102,17 +118,24 @@ impl MoeResolution {
         let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
+        // Per-expert mixed: the model already verified the experts carry
+        // different down dtypes and built the tag table (single source of
+        // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
+        // gate_up GEMV; the merged dtype-tag kernel serves the down step.
+        let routed_indexable_mixed_per_expert = d.routed_has_mixed_experts;
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
+            || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
             || routed_indexable_mq3lloyd
             || routed_indexable_paro;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
+            || routed_indexable_mixed_per_expert
             || routed_gate_up_mq4
             || routed_gate_up_mq5
             || routed_gate_up_mq6
@@ -128,6 +151,7 @@ impl MoeResolution {
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
             routed_indexable_mq3lloyd,
+            routed_indexable_mixed_per_expert,
             routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
@@ -139,6 +163,7 @@ impl MoeResolution {
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6
+            || self.routed_indexable_mixed_per_expert
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
             || self.routed_indexable_paro
@@ -195,6 +220,12 @@ pub struct MoeParams<'a> {
     /// indexed silu+rotate (`x/s` before the FWHT). `None` (default) = the
     /// plain silu+rotate, byte-identical to pre-AWQ.
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// Per-expert mixed-precision decode: `[n_exp]` u8 (DType::Raw, 1 B/exp)
+    /// dtype-tag table, `Some` iff the layer's experts carry mixed down
+    /// dtypes (graded MQ6/MQ2-Lloyd). The merged dtype-tag-branched down
+    /// kernel reads `dtype_tags[expert_id]` per block (0=MQ6, 1=MQ2-Lloyd).
+    /// `None` (default) ⇒ uniform path, byte-identical to pre-mixed.
+    pub expert_dtype_tags: Option<&'a GpuTensor>,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,

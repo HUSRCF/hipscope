@@ -2073,6 +2073,45 @@ fn imatrix_col_weights_for_parent(
     Some(out)
 }
 
+/// Returns the per-expert routing COUNT vector for a 3D MoE expert parent
+/// tensor (e.g. `...mlp.experts.gate_up_proj`). The imatrix GGUF stores a
+/// `{base_key}.counts` tensor of shape `[1, n_experts]` whose element `e` is
+/// the number of tokens routed to expert `e` during calibration. Used by the
+/// graded per-expert mixed-precision path (HIPFIRE_MOE_GRADED) to rank
+/// experts hot→cold within each layer. Returns `None` when the tensor is
+/// missing or shaped unexpectedly.
+fn imatrix_expert_counts_for_parent(
+    gguf: &gguf_input::GgufFile,
+    parent: &str,
+    n_experts: usize,
+) -> Option<Vec<f32>> {
+    let (base_key, _layer) = safetensors_to_imatrix_key(parent)?;
+    let counts_name = format!("{}.counts", base_key);
+    let counts = gguf.tensors.iter().find(|t| t.name == counts_name)?;
+    // Shape is [1, n_experts] (2D); element e = routing count for expert e.
+    if counts.shape.len() != 2 {
+        return None;
+    }
+    let n_exp = counts.shape[1];
+    if n_exp != n_experts {
+        eprintln!(
+            "  imatrix(counts): {} n_experts mismatch ({} vs {})",
+            counts_name, n_exp, n_experts
+        );
+        return None;
+    }
+    let counts_bytes = gguf.tensor_data(counts);
+    let counts_flat: Vec<f32> = counts_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if counts_flat.len() != n_exp {
+        eprintln!("  imatrix(counts): {} length mismatch", counts_name);
+        return None;
+    }
+    Some(counts_flat)
+}
+
 /// Like `imatrix_col_weights_for_parent` but returns the RAW per-expert
 /// `in_sum2[K]` (not `sqrt(in_sum2/count)`). AWQ's `compute_awq_scales` takes
 /// raw in_sum2 — it applies `^(alpha/2)` internally (≡ `rms_act^alpha` after
@@ -4926,6 +4965,35 @@ fn main() {
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq5g256 = format == "mq5" || format == "mq5g256";
+    // ── Graded per-expert mixed precision (HIPFIRE_MOE_GRADED) ────────────
+    // When set, each routed 3D-MoE expert in a layer is assigned its OWN
+    // dtype: the top `HIPFIRE_MOE_HOT_FRAC` (default 0.2) experts BY IMATRIX
+    // ROUTING COUNT → MQ6 (hot), the rest → MQ2-Lloyd (cold). A single
+    // parent (one layer's gate_up_proj or down_proj) therefore emits MIXED
+    // per-expert dtypes; the runtime builds a per-expert dtype-tag table
+    // from each expert's gpu_dtype and dispatches the merged MQ6/MQ2-Lloyd
+    // decode kernel. Requires --imatrix (the .counts tensor). Mutually
+    // exclusive with the AWQ / Lloyd-tier expert paths (graded is the first
+    // arm in the rayon dispatch). Compose with --format mq4 --no-kmap so the
+    // DENSE attn/shared weights stay MQ4 and only the 3D experts are graded.
+    let use_moe_graded = std::env::var("HIPFIRE_MOE_GRADED").ok().as_deref() == Some("1");
+    let moe_hot_frac: f64 = std::env::var("HIPFIRE_MOE_HOT_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|f| f.clamp(0.0, 1.0))
+        .unwrap_or(0.2);
+    if use_moe_graded && imatrix_path.is_none() {
+        eprintln!("error: HIPFIRE_MOE_GRADED=1 requires --imatrix <PATH> (uses per-expert .counts)");
+        std::process::exit(2);
+    }
+    if use_moe_graded {
+        eprintln!(
+            "note: HIPFIRE_MOE_GRADED=1 — top {:.0}% routed experts per layer (by\n\
+             imatrix .counts) -> MQ6, rest -> MQ2-Lloyd. Emits MIXED per-expert\n\
+             dtypes; requires the merged MQ6/MQ2-Lloyd decode kernel at runtime.",
+            moe_hot_frac * 100.0
+        );
+    }
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
@@ -6367,6 +6435,55 @@ fn main() {
                 );
             }
 
+            // ── Graded mixed-precision hot-set (HIPFIRE_MOE_GRADED) ───────────
+            // Rank this parent's experts by imatrix routing count; the top
+            // `moe_hot_frac` (DESC) get MQ6, the rest MQ2-Lloyd. Mirrors the
+            // per-layer tier formula (n_hot = round(frac*n), sort DESC, take
+            // top-n) but applied PER-PARENT over experts. Read-only; captured
+            // by reference into the rayon closure below.
+            // De-risk (Verify): the runtime wires the merged dtype-tag kernel
+            // for the DOWN projection only — gate_up stays uniform MQ4. Grade
+            // ONLY down_proj so the emitted file matches the wired decode path
+            // (mixed MQ6/MQ2-Lloyd down, uniform MQ4 gate_up). Grading gate_up
+            // would emit mixed bytes the single-dtype gate_up GEMV cannot read,
+            // producing NaN logits.
+            let graded_hot: Option<std::collections::HashSet<usize>> = if use_moe_graded && base_name == "down_proj" {
+                let counts = imatrix_gguf.as_ref().and_then(|g| {
+                    imatrix_expert_counts_for_parent(g, &imatrix_lookup_name, n_experts)
+                });
+                match counts {
+                    Some(c) => {
+                        let mut ranked: Vec<(usize, f32)> = c
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| v.is_finite())
+                            .map(|(e, &v)| (e, v))
+                            .collect();
+                        ranked.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let n_hot = ((n_experts as f64) * moe_hot_frac).round() as usize;
+                        let n_hot = n_hot.min(ranked.len());
+                        let set: std::collections::HashSet<usize> =
+                            ranked.iter().take(n_hot).map(|&(e, _)| e).collect();
+                        eprintln!(
+                            "  Graded {}{}: {} hot (MQ6) / {} cold (MQ2-Lloyd) experts",
+                            parent, base_name, set.len(), n_experts - set.len()
+                        );
+                        Some(set)
+                    }
+                    None => {
+                        eprintln!(
+                            "  Graded: no imatrix .counts for {} → ALL experts MQ2-Lloyd",
+                            imatrix_lookup_name
+                        );
+                        Some(std::collections::HashSet::new())
+                    }
+                }
+            } else {
+                None
+            };
+
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
             // The outer Rayon pool size is set in main() before this runs.
@@ -6389,7 +6506,25 @@ fn main() {
                         .and_then(|t| t.get(x))
                         .filter(|v| v.len() == inner_k_e)
                         .map(|v| compute_awq_scales(v, awq_alpha_e));
-                    let (quantized, qt, gs) = if let Some(scales) = awq_scales.as_ref() {
+                    let (quantized, qt, gs) = if let Some(hot) = graded_hot.as_ref() {
+                        // Graded mixed precision: hot expert -> MQ6, cold ->
+                        // MQ2-Lloyd. Each expert's HfqTensor carries its own qt
+                        // so this single parent emits MIXED dtypes; the runtime
+                        // builds the per-expert dtype-tag table from gpu_dtype.
+                        if hot.contains(&x) {
+                            (
+                                quantize_mq6g256(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ6G256,
+                                256u32,
+                            )
+                        } else {
+                            (
+                                quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2),
+                                QuantType::MQ2G256Lloyd,
+                                256u32,
+                            )
+                        }
+                    } else if let Some(scales) = awq_scales.as_ref() {
                         let mut scaled = f32_slice.clone();
                         awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, scales);
                         if down_mq6 {
@@ -6488,7 +6623,9 @@ fn main() {
             }
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_awq_active && awq_in_sum2_per_expert.is_some() {
+            let label = if graded_hot.is_some() {
+                "Graded(MQ6/MQ2L)"
+            } else if expert_awq_active && awq_in_sum2_per_expert.is_some() {
                 if down_mq6 {
                     "MQ6G256+AWQ"
                 } else if down_mq5 || expert_mq5 {
