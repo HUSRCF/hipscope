@@ -3002,6 +3002,10 @@ async function serve(port: number, host: string) {
                 // at 2725). Start in-think so the leading reasoning streams as
                 // reasoning_content and is split off content at the first </think>.
                 let inThink = genParams.assistant_prefix === "open_think";
+                // Latches once the daemon sends an explicit `reasoning:true` token
+                // (Cohere2/North marker-machine split). After that, unflagged
+                // tokens are visible content, not `<think>`-delimited reasoning.
+                let sawReasoningFlag = false;
                 let stripNextLeadingNl = false;
                 // Track whether we've emitted any visible content yet. Used
                 // to detect an orphan `</think>` opener — when the daemon
@@ -3030,6 +3034,31 @@ async function serve(port: number, host: string) {
                   if (msg.type === "token") {
                     completionTokens++;
                     let text = msg.text as string;
+                    // Cohere2-MoE / North-Mini-Code (and any arch whose daemon
+                    // marker state machine splits reasoning itself) tags thinking
+                    // tokens with an explicit `reasoning:true` flag and emits NO
+                    // `<think>`/`</think>` text. Honor the flag — it's
+                    // authoritative. The default thinking-on path sets
+                    // assistant_prefix="open_think" (inThink starts true) on the
+                    // assumption the model closes its reasoning with a `</think>`
+                    // token; North never emits one, so the `</think>` heuristic
+                    // below would trap the entire visible answer in
+                    // reasoning_content. Once we've seen the flag, a token WITHOUT
+                    // it is the visible answer → clear inThink so it streams as
+                    // `content`. Arches that stream literal `<think>` tags (Qwen)
+                    // never set the flag, so this is inert for them.
+                    if ((msg as any).reasoning === true) {
+                      sawReasoningFlag = true;
+                      if (text) {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                        })}\n\n`));
+                        visibleChunkSent = true;
+                      }
+                      continue;
+                    }
+                    if (sawReasoningFlag) inThink = false;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
                       if (text.includes("</think>")) {
@@ -3373,9 +3402,20 @@ async function serve(port: number, host: string) {
         // body that surfaces under `message.reasoning_content` below.
         let reasoningContent = "";
         let daemonFinishReason: string | null = null;
+        // Latches when the daemon sends an explicit `reasoning:true` token
+        // (Cohere2/North marker-machine split — see the streaming path). After
+        // that, reasoning accumulates separately and `content` holds only the
+        // visible answer, so the open_think `<think>`-strip below must be skipped
+        // (it would prepend a synthetic `<think>` and, finding no `</think>`,
+        // strip the whole answer).
+        let nsSawReasoningFlag = false;
         for await (const msg of e.generate(genParams)) {
           if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
-          if (msg.type === "token") { content += msg.text; completionTokens++; }
+          if (msg.type === "token") {
+            completionTokens++;
+            if ((msg as any).reasoning === true) { reasoningContent += msg.text; nsSawReasoningFlag = true; }
+            else content += msg.text;
+          }
           else if (msg.type === "reasoning") {
             // V4F's StreamParser splits `<think>…</think>` content out
             // as `reasoning` events. Accumulate so the non-stream chat
@@ -3460,7 +3500,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag);
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
