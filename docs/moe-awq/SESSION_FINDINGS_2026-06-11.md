@@ -134,3 +134,53 @@ Recommended order:
    cold tier before any kernel.
 2. If cold holds → build the **dtype-tag mixed kernel** (Tier 5 or 3) + confirm the graded
    quant matches the model. If it derails → cap cold at MQ3-Lloyd, re-table.
+
+---
+
+## 8. Mixed-precision merged kernel — BUILT + WIRED (down) + MEASURED (commit 687e181b)
+Workflow w5nmrl7xh. Two merged dtype-tag GEMVs `gemv_mixed_moe_{down,gate_up}_*`: per-block
+branch on `dtype_tags[expert_id]` (0 = MQ6 6-bit affine 200 B/group, 1 = MQ2-Lloyd 2-bit
+codebook 72 B/group). Grid is block-per-(row,krank,token) → all 32 threads share one
+expert → one tag → **no warp divergence**. Single shared accumulator + shared shfl-reduce;
+**expanded write** so one shared `moe_down_combine` serves both dtypes (do NOT use the Lloyd
+atomic self-combine in mixed mode — `routed_down_self_combines` is forced off when
+`expert_dtype_tags.is_some()`, else Lloyd experts double-count or zero out).
+
+Wiring (decode only): `[n_exp]` u8 tag table (`DType::Raw`, 1 B/elem) built at load iff down
+dtypes are not all identical → `MoeResolution.routed_indexable_mixed_per_expert` admits the
+k=8 gpu-topk path → `run_moe_decode` merged-down branch. Uniform files are byte-identical
+(every branch gated on `expert_dtype_tags.is_some()`, None unless the .hfq carries mixed
+per-expert down dtypes). gate_up merged kernel is built + compiles clean but **intentionally
+not wired** (first target keeps gate_up uniform MQ4).
+
+Quantizer `HIPFIRE_MOE_GRADED=1` `HIPFIRE_MOE_HOT_FRAC=0.2`: per-layer, rank experts by
+imatrix `.counts` DESC, top-frac → MQ6 else MQ2-Lloyd. Gated to **down_proj only** (a bug
+where grading both gate_up+down while only down was wired read MQ6 gate_up bytes as MQ4 →
+NaN logits; caught + fixed mid-flight). File `/workspace/q36a3b.graded` = 18.05 GB,
+51 hot (MQ6) / 205 cold (MQ2-Lloyd) down experts per layer, gate_up uniform MQ4.
+
+**Verdict — does graded down-only beat uniform MQ4? NO.**
+
+| file (size) | wt2 KLD | wt2 PPL | ag KLD | ag PPL | coherence |
+|---|---|---|---|---|---|
+| MQ4 uniform (19.7 GB) | 0.0339 | — | 0.163 | — | — |
+| **graded down-only (18.05 GB)** | **0.0770** | 5.557 | **0.2536** | 5.976 | OK 0h/0s 8/8 |
+| MQ2-Lloyd uniform (11.6 GB) | 0.238 | — | 0.466 | — | coherent |
+
+It sits ~midway between MQ2L and MQ4: 2.3× worse than MQ4 on wt2, 1.6× on agentic, only
+~8% smaller. **Expected** — matches §2's gate_up-dominant finding: putting 80% of *down*
+into 2-bit while gate_up stays MQ4 spends bits on the weak lever. Cross-domain: the
+agentic-graded hot-set does NOT transfer (wt2 degrades *more* relative to MQ4), consistent
+with the corpus-specific hot-set in §3.
+
+**Kernel proven correct/firing:** grading hot-20% down→MQ6 cut agentic KLD from the
+all-MQ2L control's 0.560 to 0.347 (−38%) — only achievable if the tag-0 MQ6 branch actually
+dequants those experts as MQ6. Combine/tag-table/coherence all validated. (Daemon path
+needs a fresh `daemon` binary — a stale one falls to the CPU per-expert path and panics
+`no impl for GemvMq2G256LloydPrerotated`; rebuild resolves, no source change.)
+
+**The one variant that could beat MQ4: full-graded (gate_up too) ~14.8 GB.** The gate_up
+merged kernel is already built; the remaining work is (a) wire `expert_dtype_tags` for
+gate_up in `run_moe_decode`, (b) un-gate the quantizer to grade gate_up, (c) re-quantize the
+~14.8 GB full-graded file, (d) re-run this KLD/coherence battery. That puts the cold bits on
+the dominant lever and is the real test of the graded-quant thesis.
