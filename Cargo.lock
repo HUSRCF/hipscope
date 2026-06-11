@@ -341,10 +341,12 @@ name = "hipfire-quantize"
 version = "0.2.0"
 dependencies = [
  "byteorder",
+ "hipfire-reap",
  "memmap2",
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

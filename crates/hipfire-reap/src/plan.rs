@@ -62,12 +62,10 @@ impl ReapPlan {
         num_layers_expected: usize,
         orig_experts_expected: usize,
     ) -> Result<Self, String> {
-        let path = Path::new(dir).join("reap_plan.json");
-        let txt = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reap: read {path:?}: {e}"))?;
-        let v: serde_json::Value =
-            serde_json::from_str(&txt).map_err(|e| format!("reap: parse {path:?}: {e}"))?;
+        let v = Self::read_plan_value(dir)?;
 
+        // Cross-check the json's counts against the model's BEFORE parsing the
+        // body, so a count mismatch is reported as the primary error.
         let original_experts = v["original_experts"]
             .as_u64()
             .unwrap_or(orig_experts_expected as u64) as usize;
@@ -83,12 +81,52 @@ impl ReapPlan {
             ));
         }
 
+        // `parse_value` defaults absent counts to 0; restore the model-derived
+        // counts so a plan that omits them still validates its keep/overrides
+        // against the model's dimensions (matching the pre-refactor behavior).
+        let mut v = v;
+        if v["original_experts"].as_u64().is_none() {
+            v["original_experts"] = serde_json::json!(orig_experts_expected);
+        }
+        if v["num_layers"].as_u64().is_none() {
+            v["num_layers"] = serde_json::json!(num_layers_expected);
+        }
+        Self::parse_value(&v, dir)
+    }
+
+    /// Load `<dir>/reap_plan.json` WITHOUT validating against the model's
+    /// layer/expert counts. The counts (`num_layers`/`original_experts`) are
+    /// taken from the json itself. Used by the quantizer, which reads the plan
+    /// before it knows the model's counts. All per-override and per-keep
+    /// validations (non-integer experts, experts-on-non-routed-role,
+    /// index-vs-original bounds, layer-count consistency) are still enforced.
+    pub fn load_unchecked(dir: &str) -> Result<Self, String> {
+        let v = Self::read_plan_value(dir)?;
+        Self::parse_value(&v, dir)
+    }
+
+    /// Read & json-parse `<dir>/reap_plan.json`.
+    fn read_plan_value(dir: &str) -> Result<serde_json::Value, String> {
+        let path = Path::new(dir).join("reap_plan.json");
+        let txt = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reap: read {path:?}: {e}"))?;
+        serde_json::from_str(&txt).map_err(|e| format!("reap: parse {path:?}: {e}"))
+    }
+
+    /// Parse a `reap_plan.json` value into a `ReapPlan`, taking `num_layers`
+    /// and `original_experts` FROM the json. Shared by `load` (which adds the
+    /// `== expected` cross-checks first) and `load_unchecked`. Defaults to 0
+    /// when a count is absent.
+    fn parse_value(v: &serde_json::Value, dir: &str) -> Result<Self, String> {
+        let original_experts = v["original_experts"].as_u64().unwrap_or(0) as usize;
+        let num_layers = v["num_layers"].as_u64().unwrap_or(0) as usize;
+
         let keep = match v["keep"]["per_layer"].as_array() {
             None => None,
             Some(arr) => {
-                if arr.len() != num_layers_expected {
+                if arr.len() != num_layers {
                     return Err(format!(
-                        "reap: keep.per_layer has {} layers, model has {num_layers_expected}",
+                        "reap: keep.per_layer has {} layers, model has {num_layers}",
                         arr.len()
                     ));
                 }
@@ -130,9 +168,9 @@ impl ReapPlan {
                     .as_u64()
                     .ok_or_else(|| format!("reap: quant_override[{i}] missing layer"))?
                     as usize;
-                if layer >= num_layers_expected {
+                if layer >= num_layers {
                     return Err(format!(
-                        "reap: quant_override[{i}] layer {layer} >= num_layers {num_layers_expected}"
+                        "reap: quant_override[{i}] layer {layer} >= num_layers {num_layers}"
                     ));
                 }
                 let role = Role::parse(
@@ -165,7 +203,7 @@ impl ReapPlan {
 
         Ok(ReapPlan {
             model_arch: v["model_arch"].as_str().map(|s| s.to_string()),
-            num_layers: num_layers_expected,
+            num_layers,
             original_experts,
             keep,
             quant_overrides,
@@ -348,6 +386,21 @@ mod tests {
         );
         let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
         assert!(err.contains("not an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn load_unchecked_parses_without_model_counts() {
+        let d = write_plan(
+            r#"{"original_experts":256,"num_layers":43,
+                "quant_overrides":[{"layer":20,"role":"routed_experts","experts":[7,12],"tier":"mq3lloyd"},
+                                   {"layer":41,"role":"attention","tier":"q8"}]}"#,
+        );
+        let p = ReapPlan::load_unchecked(d.path().to_str().unwrap()).unwrap();
+        assert_eq!(p.original_experts, 256);
+        assert_eq!(p.num_layers, 43);
+        assert_eq!(p.quant_overrides.len(), 2);
+        assert_eq!(p.quant_overrides[0].tier, "mq3lloyd");
+        assert_eq!(p.quant_overrides[0].experts, vec![7, 12]);
     }
 
     #[test]
