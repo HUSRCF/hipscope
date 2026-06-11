@@ -42,15 +42,6 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// `MOE_GROUPED_BLOCK_M` (tokens are scattered into per-expert groups padded to
 /// a multiple of this).
 const MOE_GROUPED_BLOCK_M: usize = 16;
-
-/// Hard ceiling on the attention sequence length. `attention_q8_0_kv` allocates
-/// LDS = (seq_len + block_size + head_dim)·4 bytes, which reaches the 64 KiB
-/// workgroup LDS limit at seq_len ≈ 16000 → `hipModuleLaunchKernel: invalid
-/// argument`. We guard above this with a clean Err instead of crashing the
-/// daemon. STOPGAP: cohere2moe also lacks sliding-window masking, so context
-/// >4096 already runs the sliding layers full-causal (degraded). A windowed
-/// flash-attention Q8 kernel (O(1) LDS + 4096 window) is the proper fix.
-const MAX_ATTN_SEQ: usize = 15872;
 #[inline]
 fn align_up_usize(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
@@ -173,13 +164,6 @@ fn decode_step_body(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.layer_norm_eps;
     let seq_len = position as usize + 1;
-    if seq_len > MAX_ATTN_SEQ {
-        return Err(format!(
-            "cohere2moe: context {seq_len} exceeds the attention limit {MAX_ATTN_SEQ} \
-             (Q8 attention is LDS-bound; windowed long-context is a pending kernel feature). \
-             Shorten the prompt or tool output."
-        ));
-    }
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Parallel block: ONE mean-centered LayerNorm → `normed`, fed to
@@ -228,13 +212,22 @@ fn decode_step_body(
             .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;
         }
 
-        // KV write (Q8) + GQA attention. Full causal for seq_len ≤ sliding_window
-        // (== sliding at those lengths). One KV slot per layer.
+        // KV write (Q8) + GQA attention. `sliding_attention` layers clip to the
+        // last `sliding_window` keys (window>0); `full_attention` layers are
+        // full causal (window=0). One KV slot per layer.
         gpu.kv_cache_write_q8_0(&state.kv.k_gpu[l], &state.fa_k, &state.pos_buf, n_kv, head_dim)
             .map_err(|e| format!("cohere2moe L{l}: kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0(&state.kv.v_gpu[l], &state.fa_v, &state.pos_buf, n_kv, head_dim)
             .map_err(|e| format!("cohere2moe L{l}: kv write v: {e:?}"))?;
-        gpu.attention_q8_0_kv(
+        // Flash (tiled, O(1)-LDS, online-softmax) Q8 attention — no seq-bound
+        // shared-memory ceiling, so long context (large file reads) doesn't
+        // crash the legacy LDS-bound `attention_q8_0_kv`.
+        let window = if layer.attn_kind == AttnKind::Sliding {
+            cfg.sliding_window as i32
+        } else {
+            0
+        };
+        gpu.attention_flash_q8_0_windowed(
             &state.fa_q,
             &state.kv.k_gpu[l],
             &state.kv.v_gpu[l],
@@ -245,6 +238,8 @@ fn decode_step_body(
             n_kv,
             head_dim,
             state.kv.physical_cap,
+            &state.flash_partials,
+            window,
         )
         .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
 
@@ -467,12 +462,6 @@ pub fn forward_batch(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.layer_norm_eps;
     let max_ctx = start_pos + b;
-    if max_ctx > MAX_ATTN_SEQ {
-        return Err(format!(
-            "cohere2moe forward_batch: context {max_ctx} exceeds the attention limit {MAX_ATTN_SEQ} \
-             (LDS-bound Q8 attention; windowed long-context pending). Shorten the prompt."
-        ));
-    }
     let max_seq = state.kv.physical_cap;
 
     let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
@@ -561,9 +550,20 @@ pub fn forward_batch(
             .map_err(|e| format!("cohere2moe L{l} batch kv k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(&state.kv.v_gpu[l], &fv, &pos_array, n_kv, head_dim, b)
             .map_err(|e| format!("cohere2moe L{l} batch kv v: {e:?}"))?;
-        gpu.attention_q8_0_kv_batched(
+        // Flash (tiled, O(1)-LDS) batched Q8 attention — the ">15k" prefill path
+        // (causal: tree_bias=None). Replaces the LDS-bound attention_q8_0_kv_batched.
+        // `sliding_attention` layers clip to the last `sliding_window` keys so
+        // context beyond the window attends correctly (not degraded full-causal);
+        // `full_attention` (global, NoPE) layers use window=0 = full causal.
+        let window = if layer.attn_kind == AttnKind::Sliding {
+            cfg.sliding_window as i32
+        } else {
+            0
+        };
+        gpu.attention_flash_q8_0_batched_masked_windowed(
             &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
             n_heads, n_kv, head_dim, max_seq, max_ctx, b,
+            &state.flash_partials, None, 0, 0, window,
         )
         .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
         q8_proj_raw(gpu,&layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)

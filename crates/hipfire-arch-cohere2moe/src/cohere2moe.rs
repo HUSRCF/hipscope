@@ -304,7 +304,22 @@ pub struct Cohere2MoeState {
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
     pub logits: GpuTensor,         // [vocab]
+    /// Flash-attention online-softmax partials, [n_heads · ceil(max_seq/128) ·
+    /// (2+head_dim) · FLASH_PREFILL_SUBBATCH]. Enables the tiled (O(1)-LDS) flash
+    /// Q8 attention used for BOTH decode and prefill — no seq-bound shared-memory
+    /// ceiling, so long-context (file reads) no longer crashes the LDS-bound
+    /// legacy kernel. The trailing factor IS the batched-prefill flash sub-batch
+    /// size at full context (the wrapper computes sub_batch = capacity/per_pos =
+    /// factor·max_tiles_alloc / max_tiles_actual): at full context that is the
+    /// factor itself, so a too-small factor serializes long prefill to 1 query
+    /// per launch. FLASH_PREFILL_SUBBATCH=64 keeps it batched (~68 MB for North).
+    pub flash_partials: GpuTensor,
 }
+
+/// Batched-prefill flash sub-batch size at full context — the trailing factor of
+/// the `flash_partials` allocation. Larger = fewer, bigger flash launches during
+/// long prefill (see `flash_partials` doc); 64 ≈ 68 MB for North-Mini-Code.
+const FLASH_PREFILL_SUBBATCH: usize = 64;
 
 impl Cohere2MoeState {
     pub fn new(gpu: &mut Gpu, cfg: &Cohere2MoeConfig) -> Result<Self, String> {
@@ -370,6 +385,12 @@ impl Cohere2MoeState {
             expert_down: alloc(gpu, hidden, "expert_down")?,
             final_norm_buf: alloc(gpu, hidden, "final_norm_buf")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            flash_partials: alloc(
+                gpu,
+                cfg.num_attention_heads * ((max_seq + 127) / 128) * (2 + cfg.head_dim)
+                    * FLASH_PREFILL_SUBBATCH,
+                "flash_partials",
+            )?,
         })
     }
 
