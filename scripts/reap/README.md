@@ -58,8 +58,30 @@ auto-attach is guarded: the overlay's `arch_id` must match the base, and every o
 tensor name must be a subset of the base's (a foreign tensor rejects the overlay, so a
 mismatched plan can't corrupt a load). A per-layer-uniform overlay serves through the
 existing dispatch unchanged; an overlay that mixes tiers among experts *within one
-layer* still needs **SP2** (GPU bucketed dispatch) to serve. The standalone-`.hfq`
-**bake** is **SP4b** (a follow-on plan).
+layer* still needs **SP2** (GPU bucketed dispatch) to serve.
+
+## Bake (freeze) — SP4b DONE
+
+Once a quant config is tuned, bake it into a standalone `.hfq` that serves with NO env
+var. Bake runs a full-model quantize from the original safetensors, applies the plan's
+`quant_overrides` per-tensor, and (if the plan has a `keep` map) prunes + renumbers kept
+experts to compact slots, gathers router/per-expert-bias rows to the kept set, and
+patches the routed-expert count into the output metadata:
+
+```bash
+hipfire-quantize --reap-bake <plan-dir> --reap-arch <arch> --format <base-tier> \
+                 --reap-out final.hfq  <original-safetensors-model-dir>
+# final.hfq loads through the normal path — no HIPFIRE_REAP_PLAN needed.
+```
+
+Anchor invariant: a bake with no `quant_overrides` and no `keep` is byte-identical to a
+plain `--format <base-tier>` quantize. **Limitations:** (1) deepseek4 **hash layers 0–2**
+under a `keep` map require a `tid2eid` remap that bake does not yet do — it hard-errors;
+use the **load-time keep-map** (`HIPFIRE_REAP_PLAN`) for pruned ds4 hash layers, or bake
+overrides only (no prune) for ds4. (2) The metadata expert-count patch writes one global
+field from `keep[0]`, so a *non-uniform-per-layer* keep count isn't fully reflected in
+metadata (per-tensor pruning is still per-layer correct). (3) A baked model that mixes
+tiers among experts *within one layer* needs **SP2** to serve.
 
 ## Workflow
 
