@@ -452,18 +452,18 @@ pub fn run_moe_decode(
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k,
         ))?;
     } else if res.routed_indexable_mq6 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k,
         ))?;
     } else {
         // routed_indexable_paro
         hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k,
         ))?;
     }
 
@@ -648,15 +648,15 @@ fn run_moe_decode_mixed(
         match b.tier {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs, &idx_view, xr,
-                &gate_view, &up_view, 2 * mi, gate_up_k,
+                &gate_view, &up_view, 2 * mi, gate_up_k, n,
             ))?,
             DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs, &idx_view, xr,
-                &gate_view, &up_view, 2 * mi, gate_up_k,
+                &gate_view, &up_view, 2 * mi, gate_up_k, n,
             ))?,
             DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs, &idx_view, xr,
-                &gate_view, &up_view, 2 * mi, gate_up_k,
+                &gate_view, &up_view, 2 * mi, gate_up_k, n,
             ))?,
             other => {
                 return Err(DispatchError::UnsupportedVariant {
@@ -1569,23 +1569,43 @@ mod mixed_dispatch_tests {
     // NOTE: deferred — GPU under embargo. Cannot run; left as an executable
     // stub so a future GPU session has the exact contract.
     //
-    // WHAT IT MUST VERIFY: take a real qwen35/lfm2moe MoE decode layer whose
-    // experts are ALL ONE tier (e.g. all MQ4G256), and run it TWICE on identical
-    // inputs:
-    //   (1) UNIFORM path: per_expert_gate_up/down = None  (mixed = false).
-    //   (2) MIXED   path: per_expert_gate_up/down = Some(vec![<that tier>; n_exp])
-    //                     (force `mixed = true` despite the table being uniform).
-    // ASSERT the `down_expanded` buffers are BIT-IDENTICAL (and the final
-    // residual `out_target` is bit-identical). This proves the permute-to-
-    // contiguous decomposition is exact (the permutation is the identity for a
-    // uniform table, so any drift would expose a slicing/offset bug) BEFORE any
-    // real ≥2-tier mixing is trusted. Run on BOTH dispatch sites once the ds4
-    // bias-aware/hash sites gain the same bucket loop (two-dispatch-site gotcha).
+    // WHY MULTI-BUCKET (not uniform/identity): the uniform table produces the
+    // IDENTITY permutation — a single bucket with lo=0, n=k — so every per-rank
+    // sub-view is the full buffer and grid.y = k. That case CANNOT expose the
+    // class of bug this gate guards against (gate_up grid.y must equal the
+    // bucket's rank count `n`, not a hardwired 8; OOB only manifests for a
+    // bucket with lo>0 and/or n<8). So the gate MUST use a real ≥2-tier table.
+    //
+    // WHAT IT MUST VERIFY: build a real qwen35/lfm2moe MoE decode layer with a
+    // GENUINELY MIXED ≥2-tier per-expert table — e.g. n_exp=8 experts split as
+    //   5 × MQ4G256  +  3 × MQ6G256
+    // with top-k routing (k=8) chosen so that BOTH tiers are selected. After
+    // `bucket_topk_by_tier` + `build_contiguous_permutation` this yields at
+    // least two contiguous buckets, e.g. ranges [(0, n0), (n0, n1)] with
+    //   - a non-first bucket whose base offset lo = n0 > 0, and
+    //   - at least one bucket with n < 8,
+    // which is EXACTLY the OOB-trigger geometry (gate_up over a `lo`-based
+    // sub-view, grid.y = n). Run it TWICE on identical inputs:
+    //   (1) MIXED path: per_expert_gate_up/down = Some(<the mixed table>)
+    //                   (mixed = true; real bucketing exercised).
+    //   (2) REFERENCE  : a per-rank reference that runs each selected expert's
+    //                    gate_up→silu·mul·rotate→down→combine for its OWN tier
+    //                    in natural (unpermuted) rank order — i.e. the
+    //                    mathematically-correct mixed result with no bucketing.
+    // ASSERT the `down_expanded` slots (compared rank-for-rank under the
+    // permutation) and the final residual `out_target` match within tight fp
+    // tolerance (bit-identical if the reference replays the same kernels). This
+    // proves the permute-to-contiguous + per-tier-sub-view decomposition is
+    // exact for a TRUE multi-bucket layout. Run on BOTH dispatch sites once the
+    // ds4 bias-aware/hash sites gain the same bucket loop (two-dispatch-site
+    // gotcha).
     #[test]
-    #[ignore = "GPU-deferred: requires device; see NOTE — bucketing-equivalence numeric gate"]
+    #[ignore = "GPU-deferred: requires device; see NOTE — multi-bucket (5×MQ4 + 3×MQ6) bucketing-equivalence numeric gate"]
     fn mixed_dispatch_bucketing_equivalence() {
         // Intentionally empty under the GPU embargo. A GPU session must build
-        // the two MoeParams described in the NOTE above, call run_moe_decode for
-        // each, download down_expanded + out_target, and assert byte-equality.
+        // the MIXED ≥2-tier MoeParams described in the NOTE above (5×MQ4G256 +
+        // 3×MQ6G256, routing that selects both tiers so ≥1 bucket has lo>0 and
+        // ≥1 has n<8), call run_moe_decode, download down_expanded + out_target,
+        // and assert equality against the per-rank mixed reference.
     }
 }

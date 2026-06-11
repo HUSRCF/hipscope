@@ -1818,6 +1818,7 @@ fn mtp_moe_ffn_decode(
         up_batch,
         2 * mi,
         e0.gate_up.k,
+        k_top,
     )?;
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,

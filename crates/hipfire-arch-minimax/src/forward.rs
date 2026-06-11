@@ -360,6 +360,7 @@ fn decode_step_body(
                     &state.up_batch,
                     2 * inter,
                     hidden,
+                    k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
             DType::MQ6G256 | DType::HFQ6G256 => gpu
@@ -371,6 +372,7 @@ fn decode_step_body(
                     &state.up_batch,
                     2 * inter,
                     hidden,
+                    k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up hfq6: {e:?}"))?,
             DType::MQ2G256Lloyd => gpu
@@ -590,13 +592,13 @@ fn minimax_moe_block(
         DType::MQ4G256 | DType::HFQ4G256 => gpu
             .gemv_hfq4g256_moe_gate_up_k8_indexed(
                 &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                &state.gate_batch, &state.up_batch, 2 * inter, hidden,
+                &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top,
             )
             .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
         DType::MQ6G256 | DType::HFQ6G256 => gpu
             .gemv_hfq6g256_moe_gate_up_k8_indexed(
                 &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                &state.gate_batch, &state.up_batch, 2 * inter, hidden,
+                &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top,
             )
             .map_err(|e| format!("minimax L{l}: gate_up hfq6: {e:?}"))?,
         DType::MQ2G256Lloyd => gpu
