@@ -4808,6 +4808,10 @@ fn moe_ffn_decode_impl(
             .map(|e| e.down.gpu_dtype)
             .unwrap_or(DType::F32),
         has_paro_shared: ffn.paro_shared.is_some(),
+        // SP2 mixed-tier plumbing: None ⇒ uniform fast path (Task 4 populates
+        // these when a layer's experts span multiple tiers).
+        per_expert_gate_up: None,
+        per_expert_down: None,
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
@@ -7789,6 +7793,10 @@ fn prefill_moe_ffn_body_batched(
         routed_gate_up: ffn.experts[0].gate_up.gpu_dtype,
         routed_down: ffn.experts[0].down.gpu_dtype,
         has_paro_shared: ffn.paro_shared.is_some(),
+        // SP2 mixed-tier plumbing: None ⇒ uniform fast path (Task 4 populates
+        // these when a layer's experts span multiple tiers).
+        per_expert_gate_up: None,
+        per_expert_down: None,
     };
 
     let paro_gate_up = ffn.paro_shared.as_ref().map(|paro| {

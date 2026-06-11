@@ -47,6 +47,13 @@ pub struct MoeDtypes {
     pub routed_gate_up: DType,       // ffn.experts[0].gate_up
     pub routed_down: DType,          // ffn.experts[0].down
     pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
+    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch. `None`
+    /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
+    /// resolution). `Some(table)` with >1 distinct DType marks the layer
+    /// `mixed`; a `Some` table that is all-equal collapses to the uniform path.
+    pub per_expert_gate_up: Option<Vec<DType>>,
+    /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
+    pub per_expert_down: Option<Vec<DType>>,
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -60,6 +67,11 @@ pub struct MoeResolution {
     pub routed_indexable_paro: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
+    /// True when a per-expert tier table is `Some` AND contains >1 distinct
+    /// DType — the layer's routed experts span multiple quant tiers and need
+    /// the bucketed dispatch path (Task 3). `None` tables or all-equal `Some`
+    /// tables leave this `false` ⇒ unchanged uniform fast path.
+    pub mixed: bool,
 }
 
 impl MoeResolution {
@@ -89,6 +101,17 @@ impl MoeResolution {
             || routed_gate_up_mq6
             || routed_gate_up_paro;
 
+        // A per-expert tier table is "mixed" only when it is Some AND spans more
+        // than one distinct DType. A Some table that is all-equal collapses to
+        // the uniform fast path (mixed = false), so existing arches — which pass
+        // None for both tables — are always uniform and byte-identical to today.
+        let table_varies = |t: &Option<Vec<DType>>| {
+            t.as_ref()
+                .map(|v| v.iter().any(|&dt| dt != v[0]))
+                .unwrap_or(false)
+        };
+        let mixed = table_varies(&d.per_expert_gate_up) || table_varies(&d.per_expert_down);
+
         Self {
             gate_side_mq4,
             routed_indexable_mq4,
@@ -96,6 +119,7 @@ impl MoeResolution {
             routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
+            mixed,
         }
     }
 
@@ -521,5 +545,54 @@ impl MoeFamily {
 impl KernelFamily for MoeFamily {
     fn name(&self) -> &'static str {
         "moe"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uniform_mq4() -> MoeDtypes {
+        MoeDtypes {
+            router: DType::MQ4G256,
+            shared_gate: DType::MQ4G256,
+            shared_expert_gate: DType::MQ4G256,
+            shared_expert_up: DType::MQ4G256,
+            experts_all_gate_up_mq4: true,
+            routed_gate_up: DType::MQ4G256,
+            routed_down: DType::MQ4G256,
+            has_paro_shared: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    #[test]
+    fn resolve_none_per_expert_is_not_mixed() {
+        let d = uniform_mq4();
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.mixed);
+    }
+
+    #[test]
+    fn resolve_some_per_expert_with_varied_tiers_is_mixed() {
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ6G256]); // varies
+        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ6G256]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(r.mixed);
+    }
+
+    #[test]
+    fn resolve_some_per_expert_all_same_is_not_mixed() {
+        // a per-expert table that is uniform should NOT trigger the mixed path
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ4G256]);
+        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ4G256]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(
+            !r.mixed,
+            "a uniform per-expert table must take the fast uniform path"
+        );
     }
 }

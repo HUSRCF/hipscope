@@ -241,6 +241,8 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
             has_paro_shared: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
         };
         let res = MoeResolution::resolve(&d, u.k);
         // (a) These layers MUST take the fallback, not the k8 indexed path.
@@ -294,6 +296,7 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256, routed_down: MQ4G256,
         has_paro_shared: false,
+        per_expert_gate_up: None, per_expert_down: None,
     };
     let res_k4 = MoeResolution::resolve(&mq4_k4, 4);
     assert!(
