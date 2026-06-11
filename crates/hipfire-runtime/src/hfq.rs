@@ -109,6 +109,19 @@ impl HfqFile {
                 overlay.arch_id, self.arch_id
             ));
         }
+        // A pure-shadow overlay only RE-quantizes existing tensors; it must not
+        // introduce names absent from the base. This catches an overlay built for a
+        // DIFFERENT model that happens to share arch_id (silent-wrong-weights guard).
+        // Called BEFORE self.overlay is set, so find_tensor_info searches only the
+        // base — correct.
+        for ti in &overlay.tensors {
+            if self.find_tensor_info(&ti.name).is_none() {
+                return Err(format!(
+                    "reap overlay: tensor '{}' not present in base — overlay likely built for a different model",
+                    ti.name
+                ));
+            }
+        }
         self.overlay = Some(Box::new(overlay));
         Ok(())
     }
@@ -1442,5 +1455,20 @@ mod overlay_tests {
         std::env::remove_var("HIPFIRE_REAP_PLAN");
         assert!(f.has_overlay());
         assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8); // overlay won
+    }
+
+    #[test]
+    fn overlay_with_foreign_tensor_rejected() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("b.hfq");
+        let ov = dir.path().join("o.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![0u8; 4])]);
+        // same arch_id 9, but overlay has a tensor "Z" the base lacks
+        write_min_hfq(&ov, 9, &[("A", 8, &[1, 4], &vec![1u8; 4]), ("Z", 8, &[1, 4], &vec![1u8; 4])]);
+        let mut f = HfqFile::open(&base).unwrap();
+        let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
+        assert!(err.contains("'Z' not present in base"), "got: {err}");
     }
 }
