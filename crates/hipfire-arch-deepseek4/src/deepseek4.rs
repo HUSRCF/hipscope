@@ -106,7 +106,7 @@ pub struct DeepseekV4Config {
     /// of an existing full quant — no re-quant. Not (de)serialized;
     /// populated at load time from the sidecar.
     #[serde(skip)]
-    pub reap_keep: Option<std::sync::Arc<ReapKeepMap>>,
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -223,107 +223,45 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
         };
-        // Optional REAP keep-map: emulate a pruned expert pool (e.g. 162B
+        // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
         // n_routed_experts override so validation sees the original count.
-        if let Ok(dir) = std::env::var("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP") {
-            let km = ReapKeepMap::load(&dir, config.num_hidden_layers, config.n_routed_experts)?;
+        // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
+        // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
+        // honored as a keep-only alias via ReapPlan::load_any.
+        let reap_dir = std::env::var("HIPFIRE_REAP_PLAN")
+            .ok()
+            .or_else(|| std::env::var("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP").ok());
+        if let Some(dir) = reap_dir {
+            let plan = hipfire_reap::plan::ReapPlan::load_any(
+                &dir,
+                config.num_hidden_layers,
+                config.n_routed_experts,
+            )?;
             eprintln!(
-                "deepseek4: REAP keep-map ACTIVE — keeping {} of {} routed experts/layer; sidecar {dir}",
-                km.kept_per_layer, config.n_routed_experts
+                "deepseek4: REAP plan ACTIVE — keeping {} of {} routed experts/layer; dir {dir}",
+                plan.kept_per_layer(),
+                config.n_routed_experts
             );
-            config.n_routed_experts = km.kept_per_layer;
-            config.reap_keep = Some(std::sync::Arc::new(km));
+            config.n_routed_experts = plan.kept_per_layer();
+            config.reap_keep = Some(std::sync::Arc::new(plan));
         }
         Ok(config)
     }
 }
 
-/// REAP keep-map: per-layer list of kept routed-expert indices (in compact
-/// slot order) plus the sidecar dir holding remapped hash-router `tid2eid`
-/// tables. Built by tooling from a REAP `reap_plan.json` + the pruned
-/// checkpoint. Activated via `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir>`.
-#[derive(Debug)]
-pub struct ReapKeepMap {
-    pub kept_per_layer: usize,
-    pub num_layers: usize,
-    pub original_experts: usize,
-    /// `keep[l][slot]` = original expert index loaded into compact slot `slot`.
-    pub keep: Vec<Vec<u32>>,
-    pub sidecar_dir: std::path::PathBuf,
-}
+/// DeepSeek-V4-specific REAP extras. The generic `hipfire-reap` plan owns the
+/// keep-map; this hook owns the arch-specific sidecar layout — here, the
+/// remapped hash-router `tid2eid` tables that live alongside the plan dir.
+pub struct Ds4ReapHook;
 
-impl ReapKeepMap {
-    /// Load `<dir>/keep_by_layer.json` and validate against the model's
-    /// layer/expert counts (passed BEFORE n_routed_experts is overridden).
-    pub fn load(
-        dir: &str,
-        num_layers_expected: usize,
-        orig_experts_expected: usize,
-    ) -> Result<Self, String> {
-        let path = std::path::Path::new(dir).join("keep_by_layer.json");
-        let txt = std::fs::read_to_string(&path)
-            .map_err(|e| format!("deepseek4: REAP keep-map read {path:?}: {e}"))?;
-        let v: serde_json::Value = serde_json::from_str(&txt)
-            .map_err(|e| format!("deepseek4: REAP keep-map parse {path:?}: {e}"))?;
-        let kept = v["kept_per_layer"]
-            .as_u64()
-            .ok_or("deepseek4: REAP keep-map missing kept_per_layer")? as usize;
-        let orig = v["original_experts"]
-            .as_u64()
-            .unwrap_or(orig_experts_expected as u64) as usize;
-        if orig != orig_experts_expected {
-            return Err(format!(
-                "deepseek4: REAP keep-map original_experts {orig} != model n_routed_experts {orig_experts_expected}"
-            ));
-        }
-        let keep_arr = v["keep"]
-            .as_array()
-            .ok_or("deepseek4: REAP keep-map missing `keep` array")?;
-        if keep_arr.len() != num_layers_expected {
-            return Err(format!(
-                "deepseek4: REAP keep-map has {} layers, model has {num_layers_expected}",
-                keep_arr.len()
-            ));
-        }
-        let mut keep = Vec::with_capacity(keep_arr.len());
-        for (l, row) in keep_arr.iter().enumerate() {
-            let r = row
-                .as_array()
-                .ok_or_else(|| format!("deepseek4: REAP keep layer {l} not an array"))?;
-            if r.len() != kept {
-                return Err(format!(
-                    "deepseek4: REAP keep layer {l} has {} entries, expected {kept}",
-                    r.len()
-                ));
-            }
-            let mut v32 = Vec::with_capacity(kept);
-            for x in r {
-                let idx = x
-                    .as_u64()
-                    .ok_or_else(|| format!("deepseek4: REAP keep layer {l} non-integer index"))?
-                    as u32;
-                if idx as usize >= orig {
-                    return Err(format!(
-                        "deepseek4: REAP keep layer {l} index {idx} >= original_experts {orig}"
-                    ));
-                }
-                v32.push(idx);
-            }
-            keep.push(v32);
-        }
-        Ok(Self {
-            kept_per_layer: kept,
-            num_layers: num_layers_expected,
-            original_experts: orig,
-            keep,
-            sidecar_dir: std::path::PathBuf::from(dir),
-        })
-    }
+impl hipfire_reap::hook::ReapArchHook for Ds4ReapHook {}
 
-    /// Path to the remapped hash-router `tid2eid` table for a hash layer.
-    pub fn tid2eid_path(&self, layer: usize) -> std::path::PathBuf {
-        self.sidecar_dir.join(format!("tid2eid_l{layer}.i32"))
+impl Ds4ReapHook {
+    /// Path to the remapped hash-router `tid2eid` table for a hash layer,
+    /// inside the plan dir. Preserves the legacy `tid2eid_l{layer}.i32` name.
+    pub fn tid2eid_path(plan: &hipfire_reap::plan::ReapPlan, layer: usize) -> std::path::PathBuf {
+        plan.dir.join(format!("tid2eid_l{layer}.i32"))
     }
 }
 

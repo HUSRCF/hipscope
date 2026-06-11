@@ -394,26 +394,10 @@ impl DeepseekV4 {
         let (info, bytes) = hfq
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
-        let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
-        if orig_rows == 0 || bytes.len() % orig_rows != 0 {
-            return Err(format!(
-                "deepseek4: '{name}' row-gather: {orig_rows} rows don't divide {} bytes",
-                bytes.len()
-            ));
-        }
-        let rowstride = bytes.len() / orig_rows;
-        let mut sub = Vec::with_capacity(rowstride * keep.len());
-        for &oe in keep {
-            let oe = oe as usize;
-            if oe >= orig_rows {
-                return Err(format!("deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"));
-            }
-            sub.extend_from_slice(&bytes[oe * rowstride..(oe + 1) * rowstride]);
-        }
-        let mut shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
-        shape[0] = keep.len();
+        let shape_usize: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        let (new_shape, sub) = hipfire_reap::gather::gather_rows(&shape_usize, &bytes, keep)?;
         let mut t = gpu
-            .upload_raw(&sub, &shape)
+            .upload_raw(&sub, &new_shape)
             .map_err(|e| format!("deepseek4: upload keep-subset '{name}' failed: {e:?}"))?;
         match info.quant_type {
             1 => t.dtype = rdna_compute::DType::F16,
@@ -591,12 +575,9 @@ impl DeepseekV4 {
             }
             // Routed experts: kept × {w1, w2, w3}. `n_routed_experts` is the
             // kept count under a REAP keep-map; remap slot → original index.
+            let ep = cfg.reap_keep.as_ref().map(|r| r.expert_plan(l));
             for e in 0..cfg.n_routed_experts {
-                let e_src = cfg
-                    .reap_keep
-                    .as_ref()
-                    .map(|r| r.keep[l][e] as usize)
-                    .unwrap_or(e);
+                let e_src = ep.as_ref().map(|p| p.src(e)).unwrap_or(e);
                 for proj in &["w1", "w2", "w3"] {
                     let name = format!("layers.{l}.ffn.experts.{e_src}.{proj}.weight");
                     if hfq.find_tensor_info(&name).is_none() {
@@ -1004,9 +985,14 @@ impl DeepseekV4 {
             // of actual quant. For Q8F16 routers (deepseek4-q8-mtp) that meant
             // reading Q8 bytes as MQ4 blocks → NaN logits at layer 3+
             // (the first non-hash layer that runs moe_route).
+            // Per-layer keep slice (None ⇒ keep-all / no plan ⇒ full upload).
+            let keep_l: Option<Vec<u32>> = cfg
+                .reap_keep
+                .as_ref()
+                .and_then(|r| r.expert_plan(l).keep().map(|k| k.to_vec()));
             let gate_name = format!("layers.{l}.ffn.gate.weight");
-            layer.gate_weight = Some(match cfg.reap_keep.as_ref() {
-                Some(rk) => Self::upload_quant_or_f16_keep(hfq, gpu, &gate_name, &rk.keep[l])?,
+            layer.gate_weight = Some(match keep_l.as_deref() {
+                Some(keep) => Self::upload_quant_or_f16_keep(hfq, gpu, &gate_name, keep)?,
                 None => Self::upload_quant_or_f16(hfq, gpu, &gate_name)?,
             });
             if l >= cfg.num_hash_layers {
@@ -1014,9 +1000,9 @@ impl DeepseekV4 {
                 // either be added on-device or downloaded once for CPU
                 // topk. Also cache host-side for the CPU-routing path.
                 let bias_name = format!("layers.{l}.ffn.gate.bias");
-                let bias_gpu = match cfg.reap_keep.as_ref() {
-                    Some(rk) => {
-                        Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, &rk.keep[l])?
+                let bias_gpu = match keep_l.as_deref() {
+                    Some(keep) => {
+                        Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, keep)?
                     }
                     None => Self::upload_global_f16_as_f32(hfq, gpu, &bias_name)?,
                 };
@@ -1035,8 +1021,8 @@ impl DeepseekV4 {
                     // experts redirected to kept ones, in 0..kept slot space);
                     // read the sidecar table instead of the file's original.
                     let bytes: Vec<u8> = match cfg.reap_keep.as_ref() {
-                        Some(rk) => {
-                            let p = rk.tid2eid_path(l);
+                        Some(plan) => {
+                            let p = crate::deepseek4::Ds4ReapHook::tid2eid_path(plan, l);
                             std::fs::read(&p)
                                 .map_err(|e| format!("deepseek4: REAP tid2eid read {p:?}: {e}"))?
                         }
@@ -1345,7 +1331,10 @@ impl DeepseekV4 {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
-                let keep = cfg.reap_keep.as_ref().map(|r| r.keep[l].as_slice());
+                let keep = cfg
+                    .reap_keep
+                    .as_ref()
+                    .and_then(|r| r.expert_plan(l).keep());
                 Self::upload_layer_routed_experts(
                     hfq,
                     gpu,

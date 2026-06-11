@@ -172,6 +172,95 @@ impl ReapPlan {
             dir: PathBuf::from(dir),
         })
     }
+
+    /// Load `<dir>/reap_plan.json` if present, else fall back to a legacy
+    /// `<dir>/keep_by_layer.json` (keep-only; no overrides). Lets old
+    /// deepseek4 sidecars keep working through the generic loader.
+    pub fn load_any(
+        dir: &str,
+        num_layers_expected: usize,
+        orig_experts_expected: usize,
+    ) -> Result<Self, String> {
+        if Path::new(dir).join("reap_plan.json").exists() {
+            return Self::load(dir, num_layers_expected, orig_experts_expected);
+        }
+        Self::load_legacy_keepmap(dir, num_layers_expected, orig_experts_expected)
+    }
+
+    /// Load the legacy `<dir>/keep_by_layer.json` schema (top-level
+    /// `kept_per_layer:u64`, optional `original_experts:u64`, and
+    /// `keep: [[u32; kept]; num_layers]`) and produce a keep-only
+    /// `ReapPlan`. Validation mirrors the old `ReapKeepMap::load`: the
+    /// `original_experts` must match the model, layer count must match,
+    /// each row length must equal `kept_per_layer`, and every index must
+    /// be `< original_experts`.
+    pub fn load_legacy_keepmap(
+        dir: &str,
+        num_layers_expected: usize,
+        orig_experts_expected: usize,
+    ) -> Result<Self, String> {
+        let path = Path::new(dir).join("keep_by_layer.json");
+        let txt = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reap: legacy keep-map read {path:?}: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&txt)
+            .map_err(|e| format!("reap: legacy keep-map parse {path:?}: {e}"))?;
+
+        let kept = v["kept_per_layer"]
+            .as_u64()
+            .ok_or("reap: legacy keep-map missing kept_per_layer")? as usize;
+        let original_experts = v["original_experts"]
+            .as_u64()
+            .unwrap_or(orig_experts_expected as u64) as usize;
+        if original_experts != orig_experts_expected {
+            return Err(format!(
+                "reap: legacy keep-map original_experts {original_experts} != model n_routed_experts {orig_experts_expected}"
+            ));
+        }
+        let keep_arr = v["keep"]
+            .as_array()
+            .ok_or("reap: legacy keep-map missing `keep` array")?;
+        if keep_arr.len() != num_layers_expected {
+            return Err(format!(
+                "reap: legacy keep-map has {} layers, model has {num_layers_expected}",
+                keep_arr.len()
+            ));
+        }
+        let mut keep = Vec::with_capacity(keep_arr.len());
+        for (l, row) in keep_arr.iter().enumerate() {
+            let r = row
+                .as_array()
+                .ok_or_else(|| format!("reap: legacy keep layer {l} not an array"))?;
+            if r.len() != kept {
+                return Err(format!(
+                    "reap: legacy keep layer {l} has {} entries, expected {kept}",
+                    r.len()
+                ));
+            }
+            let mut v32 = Vec::with_capacity(kept);
+            for x in r {
+                let idx = x
+                    .as_u64()
+                    .ok_or_else(|| format!("reap: legacy keep layer {l} non-integer index"))?
+                    as u32;
+                if idx as usize >= original_experts {
+                    return Err(format!(
+                        "reap: legacy keep layer {l} index {idx} >= original_experts {original_experts}"
+                    ));
+                }
+                v32.push(idx);
+            }
+            keep.push(v32);
+        }
+
+        Ok(ReapPlan {
+            model_arch: None,
+            num_layers: num_layers_expected,
+            original_experts,
+            keep: Some(keep),
+            quant_overrides: Vec::new(),
+            dir: PathBuf::from(dir),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +273,23 @@ mod tests {
         let mut f = std::fs::File::create(d.path().join("reap_plan.json")).unwrap();
         f.write_all(json.as_bytes()).unwrap();
         d
+    }
+
+    fn write_legacy(json: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(d.path().join("keep_by_layer.json")).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        d
+    }
+
+    #[test]
+    fn loads_legacy_keepmap() {
+        let d = write_legacy(
+            r#"{"kept_per_layer":2,"original_experts":4,"keep":[[0,3],[1,2]]}"#,
+        );
+        let p = ReapPlan::load_any(d.path().to_str().unwrap(), 2, 4).unwrap();
+        assert_eq!(p.kept_per_layer(), 2);
+        assert_eq!(p.keep.as_ref().unwrap()[0], vec![0, 3]);
     }
 
     #[test]
