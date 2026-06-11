@@ -1545,9 +1545,6 @@ pub fn load_weights_paroquant(
             "  loading layer {i}/{} ({:?}, ParoQuant)...",
             config.n_layers, config.layer_types[i]
         );
-        let p = format!("layers.{i}");
-        let is_moe = config.num_experts > 0;
-
         let mut b = ParoBackend { source, gpu, mp, layer: i, norm_bias: 1.0 };
         let moe = |bk: &mut ParoBackend, cfg: &Qwen35Config, li: usize| {
             crate::paro_moe::paro_load_moe_ffn(bk.source, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
