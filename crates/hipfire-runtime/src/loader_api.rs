@@ -39,14 +39,11 @@ pub struct LoadCtx<'a> {
     pub gpu: &'a mut Gpu,
 }
 
-/// One arch's load contract. Step A: probe + name only (load returns
-/// the fat LoadedModel and so lives in hipfire-loader). Step B adds an
-/// associated `Bundle` type and moves impls into the arch crates.
+/// One arch's load contract. Object-safe — usable as `&dyn Carrier`.
+/// Implementations live in `hipfire-loader::carriers`.
 pub trait Carrier {
-    type Bundle;
     fn name(&self) -> &'static str;
     fn probe(&self, src: &ModelSource) -> bool;
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<Self::Bundle, String>;
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

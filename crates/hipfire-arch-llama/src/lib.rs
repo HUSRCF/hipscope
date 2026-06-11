@@ -59,4 +59,4 @@ pub mod carrier;
 pub use hipfire_runtime::llama;
 
 pub use arch::Llama;
-pub use carrier::{LlamaBundle, LlamaCarrier};
+pub use carrier::{LlamaBundle, load_bundle as load_llama_bundle};

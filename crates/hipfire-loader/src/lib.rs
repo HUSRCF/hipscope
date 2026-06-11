@@ -15,6 +15,8 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
+use hipfire_arch_qwen35::Qwen35Bundle;
+use hipfire_arch_llama::LlamaBundle;
 use hipfire_arch_qwen35::speculative::{
     DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
@@ -22,11 +24,28 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::loader_api::{CaskConfig, Carrier, ModelSource, LoadCtx};
+use hipfire_runtime::loader_api::{CaskConfig, ModelSource, LoadCtx};
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
+
+// ─── Object-safe Carrier trait ──────────────────────────────────────
+
+/// One arch's complete load contract. Object-safe → usable as `&dyn Carrier`.
+pub trait Carrier: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn probe(&self, src: &ModelSource) -> bool;
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+}
+
+// ─── Registry ─────────────────────────────────────────────────────────
+
+use crate::carriers::*;
+const REGISTRY: &[&dyn Carrier] = &[
+    &Qwen2Carrier, &Qwen35Carrier, &LlamaCarrier,
+    &DotsOcrCarrier, &Deepseek4Carrier, &MinimaxCarrier, &Lfm2MoeCarrier,
+];
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -571,9 +590,7 @@ fn finish_qwen35_load(
 // ─── Main public API ──────────────────────────────────────────────────
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
-/// single arch-dispatch point. Non-core arches (dots_ocr, deepseek4,
-/// lfm2moe, minimax) dispatch via direct arch_id checks; core arches
-/// (qwen2, qwen35, llama) dispatch via the carrier registry.
+/// single arch-dispatch point via the carrier registry.
 pub fn load_model(
     path: &str,
     max_seq: usize,
@@ -594,18 +611,11 @@ pub fn load_model(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    let kv_adaptive_spec = kv_adaptive_override
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default());
-
     if Path::new(path).is_dir() {
         return load_model_safetensors(path, max_seq, &kv_mode, gpu);
     }
 
-    let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
 
     // DFlash lm_head quant check
     if draft_path.is_some() {
@@ -676,77 +686,17 @@ pub fn load_model(
         }
     }
 
-    let physical_cap = if cask.sidecar.is_some() {
-        let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        let safety = 256usize;
-        let floor = cask.budget + cask.beta + 4;
-        let derived = cask.budget + cask.beta + safety;
-        env_override.unwrap_or(derived).clamp(floor, max_seq)
-    } else {
-        max_seq
-    };
-
-    // Non-core arches: direct arch_id dispatch
-    match hfq.arch_id {
-        8 => return load_dots_ocr(hfq, tokenizer, gpu, max_seq, path),
-        9 => return load_deepseek4(hfq, tokenizer, gpu, max_seq, path),
-        11 => return load_lfm2moe(hfq, tokenizer, gpu, max_seq, path),
-        10 => return load_minimax(hfq, tokenizer, gpu, max_seq, path),
-        _ => {}
-    }
-
-    // Core arches: carrier dispatch
-    // Resolve shared state BEFORE moving hfq into the carrier
-    let chat_template = resolve_chat_template(&hfq, path);
-    let (vision_config, vision_weights) = if hfq.arch_id == 5 || hfq.arch_id == 6 {
-        use hipfire_arch_qwen35_vl::Qwen35Vl;
-        use hipfire_runtime::arch::Architecture;
-        let has_vision = hfq.tensor_data("model.visual.patch_embed.proj.weight").is_some();
-        let vc = Qwen35Vl::config_from_hfq(&hfq).ok();
-        match vc {
-            Some(vc) if has_vision => {
-                let vw = Qwen35Vl::load_weights(&mut hfq, &vc, gpu)
-                    .map_err(|e| format!("{e}"))?;
-                eprintln!("  VL model: vision encoder (hidden={}, layers={})",
-                    vc.hidden_size, vc.num_layers);
-                (Some(vc), Some(vw))
-            }
-            _ => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-
-    let arch_id = hfq.arch_id;
     let mut ctx = LoadCtx {
         path, max_seq, draft_path,
         kv_mode_override, kv_adaptive_override, state_quant_override,
         cask, pp, gpu,
     };
 
-    if arch_id == 7 {
-        let Qwen2Bundle { config, weights, state } = Qwen2Carrier
-            .load(ModelSource::Hfq(hfq), &mut ctx)?;
-        Ok(LoadedModel {
-            state: Some(ModelState::Qwen2(Qwen2Bundle { config, weights, state })),
-            max_seq: ctx.max_seq,
-            ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, path.to_string(), chat_template)
-        })
-    } else if arch_id == 5 || arch_id == 6 {
-        let bundle = Qwen35Carrier.load(ModelSource::Hfq(hfq), &mut ctx)?;
-        finish_qwen35_load(bundle, tokenizer, physical_cap, arch_id, chat_template,
-            &mut ctx, vision_config, vision_weights)
-    } else {
-        let LlamaBundle { config, weights, scratch, kv } = LlamaCarrier
-            .load(ModelSource::Hfq(hfq), &mut ctx)?;
-        Ok(LoadedModel {
-            state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })),
-            max_seq: ctx.max_seq,
-            ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, path.to_string(), chat_template)
-        })
-    }
+    // Carrier registry dispatch — covers HFQ core + non-core arches
+    let src = ModelSource::Hfq(hfq);
+    let carrier = REGISTRY.iter().find(|c| c.probe(&src))
+        .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
+    carrier.load(src, &mut ctx)
 }
 
 fn load_dots_ocr(

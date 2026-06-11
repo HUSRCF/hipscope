@@ -58,6 +58,6 @@ pub mod grammar;
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use carrier::{Qwen35Bundle, Qwen35Carrier};
+pub use carrier::{Qwen35Bundle, load_bundle as load_qwen35_bundle};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};

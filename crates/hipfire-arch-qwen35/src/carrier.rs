@@ -4,7 +4,7 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_runtime::loader_api::{Carrier, ModelSource, LoadCtx};
+use hipfire_runtime::loader_api::{ModelSource, LoadCtx};
 
 
 pub struct Qwen35Bundle {
@@ -15,14 +15,8 @@ pub struct Qwen35Bundle {
     pub dn_state: DeltaNetState,
 }
 
-pub struct Qwen35Carrier;
-impl Carrier for Qwen35Carrier {
-    type Bundle = Qwen35Bundle;
-    fn name(&self) -> &'static str { "qwen35" }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src.arch_id(), Some(5) | Some(6))
-    }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
+/// Build the Qwen35 GPU bundle from an HFQ source.
+pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
         let ModelSource::Hfq(mut hfq) = src else {
             return Err("qwen35: directory source unsupported".into());
         };
@@ -223,7 +217,6 @@ impl Carrier for Qwen35Carrier {
             .map_err(|e| format!("{e}"))?;
 
         Ok(Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn })
-    }
 }
 
 // ─── Helper: StateQuant parsing ─────────────────────────────────────
