@@ -419,84 +419,6 @@ pub(crate) fn parse_state_quant(
     }
 }
 
-fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static str {
-    use hipfire_arch_qwen35::qwen35::StateQuant;
-    match q {
-        StateQuant::FP32 => "FP32",
-        StateQuant::Q8 => "Q8",
-        StateQuant::Q4 => "Q4",
-    }
-}
-
-fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
-    hfq.tensors()
-        .iter()
-        .map(|t| {
-            t.shape
-                .iter()
-                .fold(1u128, |acc, &dim| acc.saturating_mul(dim as u128))
-        })
-        .sum()
-}
-
-fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQuant) {
-    use hipfire_arch_qwen35::qwen35::StateQuant;
-    const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
-    let params = hfq_parameter_count(hfq);
-    if params < TINY_MODEL_PARAMS && q != StateQuant::FP32 {
-        eprintln!(
-            "  warning: model has ~{:.2}B params; FP32 DeltaNet state is recommended below 2B for long-generation coherence (current: {})",
-            params as f64 / 1.0e9,
-            state_quant_label(q)
-        );
-    }
-}
-
-fn parse_kv_adaptive(
-    s: &str,
-) -> Option<(
-    Option<hipfire_runtime::kv_adaptive::Preset>,
-    hipfire_runtime::kv_adaptive::KMode,
-    llama::VMode,
-)> {
-    use hipfire_runtime::kv_adaptive::{KMode, Preset};
-    use llama::VMode;
-    match s {
-        "" | "off" => None,
-        "conservative" => Some((Some(Preset::Conservative), KMode::Fwht4, VMode::Lloyd4)),
-        "balanced" => Some((Some(Preset::Balanced), KMode::Fwht2, VMode::Lloyd2)),
-        "aggressive" => Some((Some(Preset::Aggressive), KMode::Fwht2, VMode::Lloyd2)),
-        other if other.starts_with("advanced:") => {
-            let spec = &other["advanced:".len()..];
-            let mut k = None;
-            let mut v = None;
-            for kvp in spec.split(',') {
-                let mut it = kvp.splitn(2, '=');
-                match (it.next(), it.next()) {
-                    (Some("k"), Some("fwht4")) => k = Some(KMode::Fwht4),
-                    (Some("k"), Some("fwht3")) => k = Some(KMode::Fwht3),
-                    (Some("k"), Some("fwht2")) => k = Some(KMode::Fwht2),
-                    (Some("v"), Some("lloyd4")) => v = Some(VMode::Lloyd4),
-                    (Some("v"), Some("lloyd3")) => v = Some(VMode::Lloyd3),
-                    (Some("v"), Some("lloyd2")) => v = Some(VMode::Lloyd2),
-                    _ => {}
-                }
-            }
-            match (k, v) {
-                (Some(k), Some(v)) => Some((None, k, v)),
-                _ => {
-                    eprintln!("[daemon] kv_adaptive='{other}' malformed — expected advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>; ignoring");
-                    None
-                }
-            }
-        }
-        other => {
-            eprintln!("[daemon] kv_adaptive='{other}' unknown — expected off|conservative|balanced|aggressive|advanced:k=..,v=..; ignoring");
-            None
-        }
-    }
-}
-
 // ─── Load functions ───────────────────────────────────────────────────
 
 // ─── Core arch carrier load ─────────────────────────────────────────────
@@ -786,38 +708,6 @@ fn load_minimax(
 }
 
 // ─── MMQ screening ────────────────────────────────────────────────────
-
-fn screen_weights_qwen35(
-    weights: &qwen35::Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> (usize, usize) {
-    use hipfire_arch_qwen35::qwen35::LayerWeights;
-    let mut n_safe = 0usize;
-    let mut n_unsafe = 0usize;
-
-    for layer in &weights.layers {
-        let wts: Vec<&hipfire_runtime::llama::WeightTensor> = match layer {
-            LayerWeights::DeltaNet(l) => vec![&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo],
-            LayerWeights::FullAttn(l) => vec![&l.wq, &l.wk, &l.wv, &l.w_gate, &l.w_up, &l.wo],
-            LayerWeights::DeltaNetMoe(l) => vec![&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.wo],
-            LayerWeights::FullAttnMoe(l) => vec![&l.wq, &l.wk, &l.wv, &l.wo],
-        };
-        for wt in wts {
-            if !matches!(
-                wt.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
-            ) {
-                continue;
-            }
-            if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
-                n_safe += 1;
-            } else {
-                n_unsafe += 1;
-            }
-        }
-    }
-    (n_safe, n_unsafe)
-}
 
 // ─── DFlash state load ────────────────────────────────────────────────
 
