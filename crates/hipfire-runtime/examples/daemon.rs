@@ -13044,6 +13044,15 @@ fn generate_cohere2moe(
             match render_result {
                 Ok(rendered) => {
                     primed_think = rendered.trim_end().ends_with("<think>");
+                    if std::env::var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                        let ids = tokenizer.encode(&rendered);
+                        eprintln!(
+                            "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
+                            rendered.len(), ids.len(),
+                            &rendered[..rendered.len().min(400)],
+                            &rendered[rendered.len().saturating_sub(800)..],
+                        );
+                    }
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
@@ -13251,6 +13260,17 @@ fn generate_cohere2moe(
     let mut sec = Sec::Pre;
     let mut action_buf = String::new();
 
+    // Degenerate-output guards. The long-context forward can collapse into a
+    // single-token attractor — observed in a Pi session where a ~30K-token
+    // prompt drove the model to emit `<PAD>` until the client aborted ~9.5 min
+    // later. These stop the decode promptly instead of hanging. They do NOT mask
+    // the underlying forward bug: a fired guard MEANS the forward produced
+    // garbage (long-context attention/KV) and is logged loudly so it's caught.
+    let pad_tok = m.tokenizer.as_ref().unwrap().special_token_id("<PAD>");
+    let mut last_tok: u32 = u32::MAX;
+    let mut repeat_run: usize = 0;
+    const REPEAT_GUARD: usize = 24; // consecutive-identical-token attractor
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
@@ -13260,6 +13280,31 @@ fn generate_cohere2moe(
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if next_tok == eos_tok {
             break;
+        }
+        // Degenerate-output guards (see above). `<PAD>` is never a valid
+        // generation token, and any token repeating REPEAT_GUARD× in a row is an
+        // attractor. Either means the forward collapsed — stop before emitting
+        // or decoding further, and log so the real bug isn't silently swallowed.
+        if Some(next_tok) == pad_tok {
+            eprintln!(
+                "[cohere2moe] DEGENERATE OUTPUT: <PAD> (id {next_tok}) emitted at gen {generated_count}, \
+                 ctx={} — forward collapse (long-context attention/KV bug); stopping",
+                m.cohere2moe_state.as_ref().map(|s| s.n_tokens).unwrap_or(0)
+            );
+            break;
+        }
+        if next_tok == last_tok {
+            repeat_run += 1;
+            if repeat_run >= REPEAT_GUARD {
+                eprintln!(
+                    "[cohere2moe] DEGENERATE OUTPUT: token {next_tok} repeated {repeat_run}× at gen {generated_count} \
+                     (attractor) — forward collapse; stopping"
+                );
+                break;
+            }
+        } else {
+            last_tok = next_tok;
+            repeat_run = 1;
         }
         // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1). Was wired into
         // the qwen35/deepseek4 generate loops but NOT here, so coherence_probe

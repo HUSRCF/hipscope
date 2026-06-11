@@ -431,6 +431,39 @@ pub fn forward_batch_supported(weights: &Cohere2MoeWeights) -> bool {
 /// MQ4/MQ6 serving tiers (Q8 attention/dense + indexed batched MoE); see
 /// `forward_batch_supported` (caller falls back to per-token otherwise).
 #[allow(clippy::too_many_arguments)]
+/// Env-gated long-context localization probe. `HIPFIRE_C2M_NORMDUMP=<step>`
+/// (default 4096 when set non-numeric) logs the LAST-token hidden-state L2 /
+/// max-abs / NaN per layer on chunks that cross a `step` boundary, so a
+/// long-context collapse can be pinned to the exact layer + op (post-attn vs
+/// post-ffn) where the residual blows up or flattens. Off by default.
+fn c2m_normdump_step() -> Option<usize> {
+    std::env::var("HIPFIRE_C2M_NORMDUMP")
+        .ok()
+        .map(|s| s.trim().parse().unwrap_or(4096))
+}
+fn dbg_row_stats(gpu: &mut Gpu, t: &GpuTensor, b: usize, hidden: usize, l: usize, ctx: usize, tag: &str) {
+    if let Ok(v) = gpu.download_f32(t) {
+        let off = (b - 1) * hidden;
+        if off + hidden > v.len() {
+            return;
+        }
+        let row = &v[off..off + hidden];
+        let mut l2 = 0.0f64;
+        let mut maxa = 0.0f32;
+        let mut nan = false;
+        for &x in row {
+            if !x.is_finite() {
+                nan = true;
+            }
+            l2 += (x as f64) * (x as f64);
+            if x.abs() > maxa {
+                maxa = x.abs();
+            }
+        }
+        eprintln!("[normdump ctx={ctx} L{l:02} {tag}] l2={:.4} maxabs={:.5} nan={nan}", l2.sqrt(), maxa);
+    }
+}
+
 pub fn forward_batch(
     cfg: &Cohere2MoeConfig,
     weights: &Cohere2MoeWeights,
@@ -534,6 +567,8 @@ pub fn forward_batch(
         gpu.free_tensor(xs).ok();
     }
 
+    let normdump =
+        c2m_normdump_step().map_or(false, |step| step > 0 && (start_pos / step != max_ctx / step));
     for (l, layer) in weights.layers.iter().enumerate() {
         // Parallel block: normed = RMSNorm(x), fed to BOTH branches.
         gpu.rmsnorm_batched(&x, &layer.input_norm, &normed, b, hidden, eps)
@@ -580,6 +615,9 @@ pub fn forward_batch(
             .map_err(|e| format!("cohere2moe L{l} batch o: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
             .map_err(|e| format!("cohere2moe L{l} batch o-resid: {e:?}"))?;
+        if normdump {
+            dbg_row_stats(gpu, &x, b, hidden, l, max_ctx, "post_attn");
+        }
 
         // FFN from the SAME `normed` (parallel block).
         match &layer.ffn {
@@ -664,6 +702,9 @@ pub fn forward_batch(
                     .run_prefill(&ctx, gpu, &params)
                     .map_err(|e| format!("cohere2moe L{l} run_prefill: {e:?}"))?;
             }
+        }
+        if normdump {
+            dbg_row_stats(gpu, &x, b, hidden, l, max_ctx, "post_ffn");
         }
     }
     state.n_tokens = start_pos + b;
