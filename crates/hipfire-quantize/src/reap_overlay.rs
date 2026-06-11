@@ -29,7 +29,7 @@ pub fn quantize_to_format(
     // Canonical FWHT sign tables (only built for the rotated tiers).
     let signs = || (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
     let (qt, gs, data) = match fmt {
-        "q8" | "q8f16" => (QuantType::Q8F16, 0u32, quantize_q8f16(f32_data)),
+        "q8" | "q8f16" => (QuantType::Q8F16, 32u32, quantize_q8f16(f32_data)),
         "hfq4" | "hfq4g256" => (QuantType::HFQ4G256, 256, quantize_hfq4g256(f32_data)),
         "hfq6" | "hfq6g256" => (QuantType::HFQ6G256, 256, quantize_hfq6g256(f32_data)),
         "mq4" | "mq4g256" => {
@@ -66,6 +66,7 @@ pub fn quantize_to_format(
 
 /// Detected arch family for tensor-name matching (the quantizer already knows
 /// the arch_id; pass the matching variant in).
+#[allow(dead_code)] // Lfm2Moe / Minimax constructed by Task 4 (CLI arch detection)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReapArch {
     Deepseek4,
@@ -165,6 +166,15 @@ mod tests {
     }
 
     #[test]
+    fn mq3lloyd_matches_with_canonical_signs() {
+        let f32: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.21).cos() * 7.0).collect();
+        let (s1, s2) = (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
+        let direct = quantize_mq3g256_lloyd(&f32, &s1, &s2);
+        let t = quantize_to_format("x", "mq3lloyd", &f32, &[1, 256]).unwrap();
+        assert_eq!(t.data, direct);
+    }
+
+    #[test]
     fn rejects_unknown_tier() {
         let err = quantize_to_format("x", "bogus", &[0.0; 256], &[1, 256]).unwrap_err();
         assert!(err.contains("unsupported overlay tier 'bogus'"), "got: {err}");
@@ -220,6 +230,16 @@ mod resolve_tests {
             reap_override_for("model.layers.5.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
             None
         );
+    }
+
+    #[test]
+    fn layer_token_no_false_positive_2_vs_20() {
+        let p = plan_with(r#"{"original_experts":256,"num_layers":43,
+            "quant_overrides":[{"layer":2,"role":"routed_experts","experts":[0],"tier":"q8"}]}"#);
+        // layer-20 tensor must NOT match a layer-2 override
+        assert_eq!(reap_override_for("layers.20.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p), None);
+        // layer-2 does match
+        assert_eq!(reap_override_for("layers.2.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p), Some("q8"));
     }
 
     #[test]
