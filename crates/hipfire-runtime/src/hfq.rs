@@ -1107,6 +1107,9 @@ fn paro_load_llama_norm_raw(
     gpu.upload_f32(&v, shape)
 }
 
+// @todo(unified-loading): llama PARO still has its own loader; qwen35 already
+// runs through layer_driver::load_layer + WeightBackend. Migrate llama onto the
+// same generic walk (the trait is arch-agnostic via norm_bias + candidates).
 /// Load LLaMA/Qwen3 weights from a ParoQuant safetensors model.
 ///
 /// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
