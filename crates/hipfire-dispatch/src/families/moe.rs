@@ -66,6 +66,14 @@ pub struct MoeResolution {
     /// gfx9* has no MQ6 down arm; eval scores per-token = decode).
     pub routed_indexable_mixed_gu4_dn6: bool,
     pub routed_indexable_paro: bool,
+    /// Uniform all-MQ2-Lloyd routed experts (gate_up == down == MQ2G256Lloyd).
+    /// Reuses the ds4/minimax indexed Lloyd MoE GEMVs on the decode GPU-top-K
+    /// path: gate_up uses the MQ2-Lloyd indexed GEMV, down uses the MQ2-Lloyd
+    /// atomic-residual GEMV (self-combining -> no separate down combine).
+    pub routed_indexable_mq2lloyd: bool,
+    /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
+    /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
+    pub routed_indexable_mq3lloyd: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
@@ -83,11 +91,15 @@ impl MoeResolution {
         let routed_gate_up_mq5 = d.routed_gate_up == MQ5G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
+        let routed_gate_up_mq2lloyd = d.routed_gate_up == MQ2G256Lloyd;
+        let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
         let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
+        let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
+        let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
 
@@ -95,6 +107,8 @@ impl MoeResolution {
             || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
+            || routed_indexable_mq2lloyd
+            || routed_indexable_mq3lloyd
             || routed_indexable_paro;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
@@ -102,6 +116,8 @@ impl MoeResolution {
             || routed_gate_up_mq4
             || routed_gate_up_mq5
             || routed_gate_up_mq6
+            || routed_gate_up_mq2lloyd
+            || routed_gate_up_mq3lloyd
             || routed_gate_up_paro;
 
         Self {
@@ -110,6 +126,8 @@ impl MoeResolution {
             routed_indexable_mq5,
             routed_indexable_mq6,
             routed_indexable_mixed_gu4_dn6,
+            routed_indexable_mq2lloyd,
+            routed_indexable_mq3lloyd,
             routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
@@ -121,6 +139,8 @@ impl MoeResolution {
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6
+            || self.routed_indexable_mq2lloyd
+            || self.routed_indexable_mq3lloyd
             || self.routed_indexable_paro
     }
 }

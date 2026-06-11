@@ -393,6 +393,21 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MQ2G256Lloyd {
+        // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
+        // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at
+        // M/2 internally); trailing k_top = p.k. X is the FWHT-rotated xr.
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k,
+        ))?;
+    } else if p.dtypes.routed_gate_up == DType::MQ3G256Lloyd {
+        // Uniform MQ3-Lloyd routed experts: same indexed-Lloyd gate_up path,
+        // MQ3 launcher.
+        hip!(gpu.deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k, p.k,
+        ))?;
     } else if p.dtypes.routed_gate_up == DType::MQ5G256 {
         hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
@@ -439,6 +454,22 @@ pub fn run_moe_decode(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
+    } else if p.dtypes.routed_down == DType::MQ2G256Lloyd {
+        // MQ2-Lloyd down: atomic, weighted, SELF-COMBINING residual GEMV.
+        // silu-output rotate (rot_batch) -> down -> * topk_weight[krank] ->
+        // atomicAdd into out_target, all in one launch. NO separate combine
+        // (skipped below). out_target = routed_out (EP zeroed partial) or
+        // x_residual; the atomic accumulate is EP-correct unchanged.
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, out_target,
+            down_m, down_k, p.k,
+        ))?;
+    } else if p.dtypes.routed_down == DType::MQ3G256Lloyd {
+        // MQ3-Lloyd down: same atomic self-combining residual GEMV, MQ3 launcher.
+        hip!(gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+            p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, out_target,
+            down_m, down_k, p.k,
+        ))?;
     } else if p.dtypes.routed_down == DType::MQ5G256 {
         hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
@@ -461,7 +492,17 @@ pub fn run_moe_decode(
     // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
     // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
     // all-reduced sum of partials equals the full single-GPU combine.
-    hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
+    // MQ2/MQ3-Lloyd down self-combines via the atomic _residual_scaled_indexed
+    // GEMV above (weighted accumulate into out_target). Running the expanded
+    // combine here would double-count the routed contribution (atomic residual
+    // + combine of stale down_expanded), so skip it for the Lloyd down path.
+    let routed_down_self_combines = matches!(
+        p.dtypes.routed_down,
+        DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+    );
+    if !routed_down_self_combines {
+        hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
+    }
 
     Ok(())
 }
