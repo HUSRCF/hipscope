@@ -1,0 +1,2 @@
+//! Model-agnostic REAP: selective expert pruning + (SP2+) selective re-quant
+//! overlay for MoE models. See docs/superpowers/specs/2026-06-11-generic-moe-reap-design.md
