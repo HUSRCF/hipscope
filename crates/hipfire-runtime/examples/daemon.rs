@@ -33,6 +33,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -41,7 +42,7 @@ use std::path::Path;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel};
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
 use hipfire_runtime::hfq::HfqFile;
 
 /// Abort-target request ID. Set asynchronously by the background
@@ -1537,20 +1538,15 @@ fn main() {
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
-                        let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
-                            (c.dim, c.n_layers, c.vocab_size)
-                        } else if let Some(ref c) = m.llama_config {
-                            (c.dim, c.n_layers, c.vocab_size)
-                        } else if let Some(ref c) = m.qwen2_config {
-                            (c.hidden_size, c.num_hidden_layers, c.vocab_size)
-                        } else if let Some(ref c) = m.dots_ocr_config {
-                            (
-                                c.text.hidden_size,
-                                c.text.num_hidden_layers,
-                                c.text.vocab_size,
-                            )
-                        } else {
-                            (0, 0, 0)
+                        let (dim, layers, vocab) = match m.state.as_ref() {
+                            Some(ModelState::Qwen35(b)) => (b.config.dim, b.config.n_layers, b.config.vocab_size),
+                            Some(ModelState::Llama(b)) => (b.config.dim, b.config.n_layers, b.config.vocab_size),
+                            Some(ModelState::Qwen2(b)) => (b.config.hidden_size, b.config.num_hidden_layers, b.config.vocab_size),
+                            _ => if let Some(ref c) = m.dots_ocr_config {
+                                (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
+                            } else {
+                                (0, 0, 0)
+                            },
                         };
 
                         // Apply MTP config from load-message params.
@@ -2041,8 +2037,8 @@ fn main() {
                         if let Some(kv) = m.kv_cache.as_mut() {
                             kv.compact_offset = 0;
                         }
-                        if let Some(kv) = m.llama_kv.as_mut() {
-                            kv.compact_offset = 0;
+                        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                            b.kv.compact_offset = 0;
                         }
                         if let Some(ref mut s) = m.qwen2_state {
                             s.reset();
@@ -2261,8 +2257,8 @@ fn main() {
                     if let Some(kv) = m.kv_cache.as_mut() {
                         kv.compact_offset = 0;
                     }
-                    if let Some(kv) = m.llama_kv.as_mut() {
-                        kv.compact_offset = 0;
+                    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                        b.kv.compact_offset = 0;
                     }
                     // arch_id=7: rewind the Qwen2State position cursor so
                     // the next prefill writes from KV[0]. Without this, a
@@ -2508,11 +2504,12 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
-                    let config = m.q35_config.as_ref().unwrap();
-                    let weights = m.q35_weights.as_ref().unwrap();
-                    let scratch = m.q35_scratch.as_ref().unwrap();
-                    let kv = m.kv_cache.as_mut().unwrap();
-                    let dn = m.dn_state.as_mut().unwrap();
+                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else { unreachable!() };
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let scratch = &b.scratch;
+                    let kv = &mut b.kv_cache;
+                    let dn = &mut b.dn_state;
                     qwen35::forward_prefill_batch(
                         &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
                         None, None,
@@ -2522,9 +2519,10 @@ fn main() {
                     // Qwen2 has no batched prefill kernel yet — per-token loop
                     // mirroring the LLaMA fallback path. The loop seeds
                     // position via `state.next_pos` (already reset above to 0).
-                    let config = m.qwen2_config.as_ref().unwrap();
-                    let weights = m.qwen2_weights.as_ref().unwrap();
-                    let state = m.qwen2_state.as_mut().unwrap();
+                    let ModelState::Qwen2(b) = m.state.as_mut().unwrap() else { unreachable!() };
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
@@ -2597,10 +2595,11 @@ fn main() {
                     }
                     ok
                 } else {
-                    let config = m.llama_config.as_ref().unwrap();
-                    let weights = m.llama_weights.as_ref().unwrap();
-                    let scratch = m.llama_scratch.as_ref().unwrap();
-                    let kv = m.llama_kv.as_mut().unwrap();
+                    let ModelState::Llama(b) = m.state.as_mut().unwrap() else { unreachable!() };
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let scratch = &b.scratch;
+                    let kv = &mut b.kv;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if llama::forward_scratch(
@@ -3595,11 +3594,11 @@ fn generate_dflash(
     //
     // ModelSlot needs its own HfqFile field but spec_step_dflash doesn't
     // actually touch it. Reopening via mmap is essentially free (few µs).
-    let target_config = m.q35_config.as_ref().unwrap().clone();
-    let weights = m.q35_weights.take().expect("q35 weights");
-    let kv_cache = m.kv_cache.take().expect("kv cache");
-    let dn_state = m.dn_state.take().expect("dn state");
-    let scratch = m.q35_scratch.take().expect("q35 scratch");
+    let Qwen35Bundle { config: orig_config, weights, scratch, kv_cache, dn_state } = match m.state.take() {
+        Some(ModelState::Qwen35(b)) => b,
+        _ => unreachable!(),
+    };
+    let target_config = orig_config.clone();
     let hfq = match HfqFile::open(Path::new(&m.model_path)) {
         Ok(h) => h,
         Err(e) => {
@@ -3609,10 +3608,7 @@ fn generate_dflash(
                 id, e
             );
             let _ = stdout.flush();
-            m.q35_weights = Some(weights);
-            m.kv_cache = Some(kv_cache);
-            m.dn_state = Some(dn_state);
-            m.q35_scratch = Some(scratch);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights, scratch, kv_cache, dn_state }));
             return;
         }
     };
@@ -3653,10 +3649,7 @@ fn generate_dflash(
             if m.eviction.is_some() { "on" } else { "off" },
         );
         let _ = stdout.flush();
-        m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
-        m.q35_scratch = Some(target.scratch);
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
         return;
     }
     if m.eviction.is_none() && prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
@@ -3666,10 +3659,7 @@ fn generate_dflash(
             id, ctx_capacity,
         );
         let _ = stdout.flush();
-        m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
-        m.q35_scratch = Some(target.scratch);
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
         return;
     }
 
@@ -3730,10 +3720,7 @@ fn generate_dflash(
                 id, e
             );
             let _ = stdout.flush();
-            m.q35_weights = Some(target.weights);
-            m.kv_cache = Some(target.kv_cache);
-            m.dn_state = Some(target.dn_state);
-            m.q35_scratch = Some(target.scratch);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
             return;
         }
     };
@@ -3743,10 +3730,7 @@ fn generate_dflash(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
-        m.q35_scratch = Some(target.scratch);
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
         // hunt3 #5-SLIVER: the suffix/cache_hit seed
         // (seed_target_hidden_suffix_abortable) partially advances the COMMITTED
         // dn_state through the new tokens then returns Ok(true) WITHOUT resetting
@@ -3838,10 +3822,7 @@ fn generate_dflash(
                 id, e
             );
             let _ = stdout.flush();
-            m.q35_weights = Some(target.weights);
-            m.kv_cache = Some(target.kv_cache);
-            m.dn_state = Some(target.dn_state);
-            m.q35_scratch = Some(target.scratch);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
             return;
         }
     };
@@ -4048,10 +4029,7 @@ fn generate_dflash(
             // (which re-seeds + resets the recurrent state). CRITICAL: without
             // putting the slot fields back, m.dn_state/kv_cache stay None and the
             // NEXT request panics at the cold-reset unwrap (daemon.rs ~4031).
-            m.q35_weights = Some(target.weights);
-            m.kv_cache = Some(target.kv_cache);
-            m.dn_state = Some(target.dn_state);
-            m.q35_scratch = Some(target.scratch);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
             m.seq_pos = 0;
             m.conversation_tokens.clear();
             free_checkpoints(&mut m.dflash_checkpoints, gpu);
@@ -4325,10 +4303,7 @@ fn generate_dflash(
     // Put target state back on LoadedModel so the next request sees fresh
     // (reset) state. We zero DN/kv on entry anyway, but we still need the
     // ownership back.
-    m.q35_weights = Some(target.weights);
-    m.kv_cache = Some(target.kv_cache);
-    m.dn_state = Some(target.dn_state);
-    m.q35_scratch = Some(target.scratch);
+    m.state = Some(ModelState::Qwen35(Qwen35Bundle { config: orig_config, weights: target.weights, scratch: target.scratch, kv_cache: target.kv_cache, dn_state: target.dn_state }));
     m.seq_pos = position;
     // Bake the FULL conversation (prefill + decode) into conversation_tokens
     // so subsequent turns can compute LCP against it. Previously this stored
@@ -4788,8 +4763,8 @@ fn generate_multi(
         if let Some(kv) = m.kv_cache.as_mut() {
             kv.compact_offset = 0;
         }
-        if let Some(llkv) = m.llama_kv.as_mut() {
-            llkv.compact_offset = 0;
+        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+            b.kv.compact_offset = 0;
         }
     }
 
@@ -4832,11 +4807,12 @@ fn generate_multi(
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
-    let config = m.q35_config.as_ref().unwrap();
-    let weights = m.q35_weights.as_ref().unwrap();
+    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else { unreachable!() };
+    let config = &b.config;
+    let weights = &b.weights;
     let scratch_set = m.pp_scratch_set.as_ref().unwrap();
-    let kv = m.kv_cache.as_mut().unwrap();
-    let dn = m.dn_state.as_mut().unwrap();
+    let kv = &mut b.kv_cache;
+    let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
     let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
 
@@ -4862,8 +4838,8 @@ fn generate_multi(
                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
             }
             kv.compact_offset = 0;
-            if let Some(llkv) = m.llama_kv.as_mut() {
-                llkv.compact_offset = 0;
+            if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                b.kv.compact_offset = 0;
             }
         }};
     }
@@ -5810,8 +5786,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         if let Some(kv) = m.kv_cache.as_mut() {
             kv.compact_offset = 0;
         }
-        if let Some(kv) = m.llama_kv.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+            b.kv.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             ad.reset();
@@ -6440,10 +6416,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     .as_ref()
                     .map(|k| k.compact_offset == 0)
                     .unwrap_or(true)
-                && m.llama_kv
-                    .as_ref()
-                    .map(|k| k.compact_offset == 0)
-                    .unwrap_or(true);
+                && m.state.as_ref().map_or(true, |s| match s {
+                    ModelState::Llama(b) => b.kv.compact_offset == 0,
+                    _ => true,
+                });
             let resume_idx = if ckpt_resume_enabled() && evict_safe && m.dn_state.is_some() {
                 m.prefill_checkpoints
                     .iter()
@@ -6503,8 +6479,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     if let Some(kv) = m.kv_cache.as_mut() {
                         kv.compact_offset = 0;
                     }
-                    if let Some(kv) = m.llama_kv.as_mut() {
-                        kv.compact_offset = 0;
+                    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                        b.kv.compact_offset = 0;
                     }
                     rendered
                 }
@@ -6555,8 +6531,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         if let Some(kv) = m.kv_cache.as_mut() {
             kv.compact_offset = 0;
         }
-        if let Some(kv) = m.llama_kv.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+            b.kv.compact_offset = 0;
         }
     }
 
@@ -6570,7 +6546,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     let trailer = nl.len();
     let absolute_pos = m.seq_pos
         + m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
-        + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+        + m.state.as_ref().and_then(|s| match s { ModelState::Llama(b) => Some(b.kv.compact_offset), _ => None }).unwrap_or(0);
     if m.eviction.is_none() {
         if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
             let _ = writeln!(
@@ -6631,11 +6607,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     if m.arch_id == 5 || m.arch_id == 6 {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
-        let config = m.q35_config.as_ref().unwrap();
-        let weights = m.q35_weights.as_ref().unwrap();
-        let scratch = m.q35_scratch.as_ref().unwrap();
-        let kv = m.kv_cache.as_mut().unwrap();
-        let dn = m.dn_state.as_mut().unwrap();
+        let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else { unreachable!() };
+        let config = &b.config;
+        let weights = &b.weights;
+        let scratch = &b.scratch;
+        let kv = &mut b.kv_cache;
+        let dn = &mut b.dn_state;
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -6767,11 +6744,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
             kv.compact_offset = 0;
-            // Reset llama_kv too (decode-abort path does the same) so a model
+            // Reset Llama KV too (decode-abort path does the same) so a model
             // carrying both caches can't be left with a stale RoPE phase on the
-            // next cold prefill. No-op when llama_kv is absent.
-            if let Some(llkv) = m.llama_kv.as_mut() {
-                llkv.compact_offset = 0;
+            // next cold prefill. No-op when Llama state is absent.
+            if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                b.kv.compact_offset = 0;
             }
             m.seq_pos = 0;
             m.conversation_tokens.clear();
@@ -7076,8 +7053,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }
                 kv.compact_offset = 0;
-                if let Some(llkv) = m.llama_kv.as_mut() {
-                    llkv.compact_offset = 0;
+                if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                    b.kv.compact_offset = 0;
                 }
                 let _ = writeln!(
                     stdout,
@@ -7750,11 +7727,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         let _ = stdout.flush();
     } else {
-        // Qwen3 / LLaMA path -- multi-turn aware
-        let config = m.llama_config.as_ref().unwrap();
-        let weights = m.llama_weights.as_ref().unwrap();
-        let scratch = m.llama_scratch.as_ref().unwrap();
-        let kv = m.llama_kv.as_mut().unwrap();
+        // LLaMA path -- multi-turn aware
+        let ModelState::Llama(b) = m.state.as_mut().unwrap() else { unreachable!() };
+        let config = &b.config;
+        let weights = &b.weights;
+        let scratch = &b.scratch;
+        let kv = &mut b.kv;
 
         let mut rng_state = 42u32;
         for (i, &tok) in new_tokens.iter().enumerate() {
@@ -9741,26 +9719,21 @@ fn generate_qwen2(
             return;
         }
     };
-    let cfg = match m.qwen2_config.as_ref() {
-        Some(c) => c,
-        None => {
+    let state_ref = match m.state.as_mut() {
+        Some(ModelState::Qwen2(b)) => b,
+        _ => {
             let _ = writeln!(
                 stdout,
-                r#"{{"type":"error","id":"{}","message":"qwen2_config missing on arch_id=7 generate"}}"#,
+                r#"{{"type":"error","id":"{}","message":"qwen2 state missing on arch_id=7 generate"}}"#,
                 id
             );
             let _ = stdout.flush();
             return;
         }
     };
-    let weights = m
-        .qwen2_weights
-        .as_ref()
-        .expect("qwen2_weights missing on arch_id=7 generate");
-    let state = m
-        .qwen2_state
-        .as_mut()
-        .expect("qwen2_state missing on arch_id=7 generate");
+    let cfg = &state_ref.config;
+    let weights = &state_ref.weights;
+    let state = &mut state_ref.state;
 
     let prompt_ids = tokenizer.encode(prompt);
     if prompt_ids.is_empty() {
@@ -10038,12 +10011,13 @@ fn generate_vl(
         return;
     }
 
-    let config = m.q35_config.as_ref().unwrap();
+    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else { unreachable!() };
+    let config = &b.config;
+    let weights = &b.weights;
+    let scratch = &b.scratch;
+    let kv = &mut b.kv_cache;
+    let dn = &mut b.dn_state;
     let vision_weights = m.vision_weights.as_ref().unwrap();
-    let weights = m.q35_weights.as_ref().unwrap();
-    let scratch = m.q35_scratch.as_ref().unwrap();
-    let kv = m.kv_cache.as_mut().unwrap();
-    let dn = m.dn_state.as_mut().unwrap();
 
     // Build the actual prompt token sequence BEFORE running the GPU vision
     // encoder so the hard capacity check uses the real prefill length, not

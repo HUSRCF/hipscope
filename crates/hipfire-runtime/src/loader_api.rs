@@ -43,8 +43,10 @@ pub struct LoadCtx<'a> {
 /// the fat LoadedModel and so lives in hipfire-loader). Step B adds an
 /// associated `Bundle` type and moves impls into the arch crates.
 pub trait Carrier {
+    type Bundle;
     fn name(&self) -> &'static str;
     fn probe(&self, src: &ModelSource) -> bool;
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<Self::Bundle, String>;
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

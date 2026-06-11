@@ -12,7 +12,6 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
-use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
@@ -181,6 +180,16 @@ impl AsstTurnCache {
     }
 }
 
+// ─── ModelState ────────────────────────────────────────────────────────
+
+/// Arch-specific core state, dispatched in `LoadedModel.state`.
+/// Shared fields (kv_cache, dn_state) stay on `LoadedModel` directly.
+pub enum ModelState {
+    Qwen2(hipfire_arch_qwen2::Qwen2Bundle),
+    Qwen35(hipfire_arch_qwen35::Qwen35Bundle),
+    Llama(hipfire_arch_llama::LlamaBundle),
+}
+
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {
@@ -190,20 +199,11 @@ pub struct LoadedModel {
     pub pp_scratch_set: Option<Qwen35ScratchSet>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
-    // Qwen3.5 state
-    pub q35_config: Option<qwen35::Qwen35Config>,
-    pub q35_weights: Option<qwen35::Qwen35Weights>,
-    pub q35_scratch: Option<qwen35::Qwen35Scratch>,
+    // Shared arch state
+    pub state: Option<ModelState>,
     pub kv_cache: Option<llama::KvCache>,
     pub dn_state: Option<DeltaNetState>,
-    // Qwen3 state
-    pub llama_config: Option<llama::LlamaConfig>,
-    pub llama_weights: Option<llama::LlamaWeights>,
-    pub llama_scratch: Option<llama::ForwardScratch>,
-    pub llama_kv: Option<llama::KvCache>,
-    // Qwen2 state
-    pub qwen2_config: Option<qwen2::Qwen2Config>,
-    pub qwen2_weights: Option<qwen2::Qwen2Weights>,
+    // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 Flash state
     pub deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
@@ -419,309 +419,26 @@ fn parse_kv_adaptive(
 
 // ─── Load functions ───────────────────────────────────────────────────
 
-fn load_qwen2(
-    mut hfq: HfqFile,
-    ctx: &mut LoadCtx,
+// ─── Core arch carrier load ─────────────────────────────────────────────
+
+/// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
+/// eviction/DFlash state. This is the common body for qwen35 dispatch
+/// where eviction and DFlash need per-arch type info.
+fn finish_qwen35_load(
+    bundle: Qwen35Bundle,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    kv_mode: String,
-    state_quant_override: Option<&str>,
     physical_cap: usize,
-) -> Result<LoadedModel, String> {
-    use hipfire_arch_qwen2::Qwen2;
-    use hipfire_runtime::arch::Architecture;
-    if ctx.draft_path.is_some() {
-        return Err(
-            "DFlash not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
-                   Reload without a draft."
-                .to_string(),
-        );
-    }
-    if ctx.cask.sidecar.is_some() {
-        return Err(
-            "CASK eviction not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
-                   Reload without --cask-sidecar."
-                .to_string(),
-        );
-    }
-    let _ = kv_mode;
-    let _ = state_quant_override;
-    let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-    let state = qwen2::Qwen2State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-        .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
-    let chat_template = resolve_chat_template(&hfq, ctx.path);
-    Ok(LoadedModel {
-        arch_id: hfq.arch_id,
-        pp: 1,
-        ep: None,
-        pp_gpus: None,
-        pp_scratch_set: None,
-        pp_dn_la_to_device: None,
-        q35_config: None,
-        q35_weights: None,
-        q35_scratch: None,
-        kv_cache: None,
-        dn_state: None,
-        llama_config: None,
-        llama_weights: None,
-        llama_scratch: None,
-        llama_kv: None,
-        qwen2_config: Some(config),
-        qwen2_weights: Some(weights),
-        qwen2_state: Some(state),
-        deepseek4_config: None,
-        deepseek4_weights: None,
-        deepseek4_state: None,
-        deepseek4_pbs: None,
-        deepseek4_eos_tok: 0,
-        lfm2moe_config: None,
-        lfm2moe_weights: None,
-        lfm2moe_state: None,
-        lfm2moe_eos_tok: 0,
-        minimax_config: None,
-        minimax_weights: None,
-        minimax_state: None,
-        minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(),
-        mtp_k: 3,
-        mtp_weights_present: false,
-        dots_ocr_config: None,
-        dots_ocr_weights: None,
-        vision_config: None,
-        vision_weights: None,
-        tokenizer: Some(tokenizer),
-        seq_pos: 0,
-        max_seq: ctx.max_seq,
-        physical_cap,
-        eviction: None,
-        kv_adaptive: None,
-        conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(),
-        dflash_checkpoints: Vec::new(),
-        decoded_vocab: None,
-        model_path: ctx.path.to_string(),
-        dflash: None,
-        chat_template,
-    })
-}
-
-fn load_qwen35(
-    mut hfq: HfqFile,
+    arch_id: u32,
+    chat_template: Option<String>,
     ctx: &mut LoadCtx,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    kv_mode: String,
-    kv_adaptive_spec: String,
-    state_quant_override: Option<&str>,
-    physical_cap: usize,
+    vision_config: Option<qwen35_vl::VisionConfig>,
+    vision_weights: Option<qwen35_vl::VisionWeights>,
 ) -> Result<LoadedModel, String> {
-    use hipfire_arch_qwen35::Qwen35;
-    use hipfire_arch_qwen35_vl::Qwen35Vl;
-    use hipfire_runtime::arch::Architecture;
-    let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-
-    let has_vision_tensors = hfq
-        .tensor_data("model.visual.patch_embed.proj.weight")
-        .is_some();
-    let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq).ok();
-    let (vision_config, vision_weights) = if let Some(vc) = vision_config {
-        if has_vision_tensors {
-            let vw = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vc, ctx.gpu)
-                .map_err(|e| format!("{e}"))?;
-            eprintln!(
-                "  VL model: vision encoder (hidden={}, layers={})",
-                vc.hidden_size, vc.num_layers
-            );
-            (Some(vc), Some(vw))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-
-    if ctx.gpu.mmq_screen.enabled
-        && matches!(
-            ctx.gpu.arch.as_str(),
-            "gfx906"
-                | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-                | "gfx1150" | "gfx1151" | "gfx1152"
-        )
-    {
-        let t0 = std::time::Instant::now();
-        let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, ctx.gpu);
-        let elapsed = t0.elapsed();
-        eprintln!(
-            "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-            ctx.gpu.mmq_screen.threshold,
-            elapsed.as_secs_f64() * 1000.0,
-        );
-    }
-
-    let is_kv_layer: Vec<bool> = config
-        .layer_types
-        .iter()
-        .map(|t| *t == LayerType::FullAttention)
-        .collect();
-    let mut kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            physical_cap,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => {
-            llama::KvCache::new_gpu_asym4_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?
-        }
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-            llama::KvCache::new_gpu_asym3_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                physical_cap,
-            )
-            .map_err(|e| format!("{e}"))?
-        }
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            physical_cap,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            physical_cap,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "fwht4" => {
-            llama::KvCache::new_gpu_fwht4_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?
-        }
-        other => {
-            eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                physical_cap,
-            )
-            .map_err(|e| format!("{e}"))?
-        }
-    };
-
-    let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
-    let v_mode_override = match kv_v_env.as_str() {
-        "lloyd2" => Some(llama::VMode::Lloyd2),
-        "lloyd3" => Some(llama::VMode::Lloyd3),
-        "lloyd4" => Some(llama::VMode::Lloyd4),
-        "q8" | "" => None,
-        other => {
-            eprintln!("[hipfire-loader] HIPFIRE_KV_V='{other}' unknown — ignoring (expected q8|lloyd2|lloyd3|lloyd4)");
-            None
-        }
-    };
-    if let Some(vm) = v_mode_override {
-        if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
-            kv.set_v_mode_realloc(ctx.gpu, vm).map_err(|e| format!("{e}"))?;
-            eprintln!(
-                "[hipfire-loader] V-cache mode override → {kv_v_env} (256-wide lloyd-V on fwht K)"
-            );
-        } else {
-            eprintln!("[hipfire-loader] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires an FWHT K mode (fwht2/3/4); cache is a different mode");
-        }
-    }
-
-    let kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive> = {
-        use hipfire_runtime::kv_adaptive::KvAdaptive;
-        match parse_kv_adaptive(&kv_adaptive_spec) {
-            None => None,
-            Some((preset, k_floor, v_floor)) => {
-                let ad = match preset {
-                    Some(p) => {
-                        KvAdaptive::from_preset(p, ctx.max_seq, config.n_kv_heads, config.head_dim)
-                    }
-                    None => KvAdaptive::new(
-                        ctx.max_seq,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        k_floor,
-                        v_floor,
-                    ),
-                };
-                if !((kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht) {
-                    eprintln!("[hipfire-loader] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
-                    None
-                } else if ctx.cask.sidecar.is_some() {
-                    eprintln!("[hipfire-loader] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV is a no-eviction capacity strategy and CASK eviction is active (mutually exclusive); reload without --cask-sidecar to use adaptive");
-                    None
-                } else if ad.current_cap() < hipfire_runtime::llama::PREFILL_MAX_BATCH {
-                    eprintln!(
-                        "[hipfire-loader] kv_adaptive={kv_adaptive_spec} ignored — max_seq={} too small: start-tier capacity {} < prefill chunk {} (raise max_seq or use a higher floor)",
-                        ctx.max_seq, ad.current_cap(), hipfire_runtime::llama::PREFILL_MAX_BATCH,
-                    );
-                    None
-                } else {
-                    if !kv.quant_asym4 {
-                        eprintln!("[hipfire-loader] kv_adaptive: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4 — capacity thresholds assume the fwht4 start footprint");
-                    }
-                    let k_floor_bph = k_floor.bytes_per_head(config.head_dim);
-                    kv.set_adaptive_floor_alloc(ctx.gpu, v_floor, k_floor_bph)
-                        .map_err(|e| format!("{e}"))?;
-                    eprintln!(
-                        "[adaptive-kv] engaged: pattern={:?} k_floor={:?} v_floor={:?} thresholds={:?} start_cap={} (max_seq={}, V buffer sized at floor)",
-                        ad.steps, ad.k_floor, ad.v_floor, ad.thresholds, ad.current_cap(), ctx.max_seq,
-                    );
-                    Some(ad)
-                }
-            }
-        }
-    };
-
-    let dn_quant = parse_state_quant(state_quant_override)?;
-    eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
-    warn_tiny_model_state(&hfq, dn_quant);
-    let dn =
-        DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
-    let scratch = qwen35::Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, physical_cap)
-        .map_err(|e| format!("{e}"))?;
-
+    use hipfire_arch_qwen35::qwen35::LayerType;
+    // Extract references for eviction/DFlash setup (borrow, don't move)
+    let config = &bundle.config;
+    let dn_state = &bundle.dn_state;
+    // ── Eviction ───────────────────────────────────────────────────
     let eviction = if let Some(ref sidecar_path) = ctx.cask.sidecar {
         let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
             use std::io::ErrorKind;
@@ -737,16 +454,8 @@ fn load_qwen35(
             format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
         })?;
         let fa_layer_ids: Vec<usize> = config
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                if *t == LayerType::FullAttention {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
+            .layer_types.iter().enumerate()
+            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
             .collect();
         if fa_layer_ids.is_empty() {
             eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
@@ -754,34 +463,17 @@ fn load_qwen35(
         } else {
             let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
             let base = EvictionCtx::new(
-                ctx.gpu,
-                &centers,
-                fa_layer_ids,
-                ctx.cask.budget,
-                ctx.cask.beta,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                n_rot,
-                config.rope_theta,
-                physical_cap,
-            )
-            .map_err(|e| format!("build EvictionCtx: {e}"))?;
+                ctx.gpu, &centers, fa_layer_ids, ctx.cask.budget, ctx.cask.beta,
+                config.n_heads, config.n_kv_heads, config.head_dim, n_rot,
+                config.rope_theta, physical_cap,
+            ).map_err(|e| format!("build EvictionCtx: {e}"))?;
             if ctx.cask.cask_m_folding {
-                eprintln!(
-                    "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                    ctx.cask.core_frac, ctx.cask.fold_m, ctx.cask.budget, ctx.cask.beta, physical_cap,
-                );
-                Some(Eviction::Cask(CaskCtx::new(
-                    base,
-                    ctx.cask.core_frac,
-                    ctx.cask.fold_m,
-                )))
+                eprintln!("  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                    ctx.cask.core_frac, ctx.cask.fold_m, ctx.cask.budget, ctx.cask.beta, physical_cap);
+                Some(Eviction::Cask(CaskCtx::new(base, ctx.cask.core_frac, ctx.cask.fold_m)))
             } else {
-                eprintln!(
-                    "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-                    ctx.cask.budget, ctx.cask.beta, physical_cap,
-                );
+                eprintln!("  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                    ctx.cask.budget, ctx.cask.beta, physical_cap);
                 Some(Eviction::Plain(base))
             }
         }
@@ -789,23 +481,16 @@ fn load_qwen35(
         None
     };
 
+    // ── DFlash ─────────────────────────────────────────────────────
     let dflash = if let Some(dp) = ctx.draft_path {
-        match load_dflash_state(dp, physical_cap, &config, &dn, ctx.gpu) {
-            Ok(state) => {
-                eprintln!(
-                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp,
-                    state.draft_config.n_layers,
-                    state.draft_config.hidden,
-                    state.draft_config.block_size,
-                );
-                Some(state)
+        match load_dflash_state(dp, physical_cap, config, dn_state, ctx.gpu) {
+            Ok(s) => {
+                eprintln!("  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
+                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size);
+                Some(s)
             }
             Err(e) => {
-                eprintln!(
-                    "  DFlash draft load failed ({}): {} — falling back to AR only",
-                    dp, e
-                );
+                eprintln!("  DFlash draft load failed ({}): {} — falling back to AR only", dp, e);
                 None
             }
         }
@@ -813,137 +498,28 @@ fn load_qwen35(
         None
     };
 
-    let chat_template = resolve_chat_template(&hfq, ctx.path);
+    let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
-        arch_id: hfq.arch_id,
-        pp: 1,
-        ep: None,
-        pp_gpus: None,
-        pp_scratch_set: None,
-        pp_dn_la_to_device: None,
-        q35_config: Some(config),
-        q35_weights: Some(weights),
-        q35_scratch: Some(scratch),
-        kv_cache: Some(kv),
-        dn_state: Some(dn),
-        llama_config: None,
-        llama_weights: None,
-        llama_scratch: None,
-        llama_kv: None,
-        qwen2_config: None,
-        qwen2_weights: None,
-        qwen2_state: None,
-        deepseek4_config: None,
-        deepseek4_weights: None,
-        deepseek4_state: None,
-        deepseek4_pbs: None,
-        deepseek4_eos_tok: 0,
-        lfm2moe_config: None,
-        lfm2moe_weights: None,
-        lfm2moe_state: None,
-        lfm2moe_eos_tok: 0,
-        minimax_config: None,
-        minimax_weights: None,
-        minimax_state: None,
-        minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(),
-        mtp_k: 3,
-        mtp_weights_present: false,
-        dots_ocr_config: None,
-        dots_ocr_weights: None,
-        vision_config,
-        vision_weights,
+        arch_id,
+        pp: 1, ep: None,
+        pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+        state, kv_cache: None, dn_state: None, qwen2_state: None,
+        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+        deepseek4_pbs: None, deepseek4_eos_tok: 0,
+        lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
+        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+        dots_ocr_config: None, dots_ocr_weights: None,
+        vision_config, vision_weights,
         tokenizer: Some(tokenizer),
-        seq_pos: 0,
-        max_seq: ctx.max_seq,
-        physical_cap,
-        eviction,
-        kv_adaptive,
+        seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
+        eviction, kv_adaptive: None,
         conversation_tokens: Vec::new(),
         asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(),
-        dflash_checkpoints: Vec::new(),
+        prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
         decoded_vocab: None,
         model_path: ctx.path.to_string(),
         dflash,
-        chat_template,
-    })
-}
-
-fn load_llama(
-    mut hfq: HfqFile,
-    ctx: &mut LoadCtx,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    kv_mode: String,
-    physical_cap: usize,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::arch::Architecture;
-    let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-    let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-    let _ = kv_mode;
-    eprintln!("  KV cache: Q8");
-    let kv = llama::KvCache::new_gpu_q8(
-        ctx.gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        ctx.max_seq,
-    )
-    .map_err(|e| format!("{e}"))?;
-    let scratch = <Llama as Architecture>::new_state(ctx.gpu, &config)?;
-    let chat_template = resolve_chat_template(&hfq, ctx.path);
-    Ok(LoadedModel {
-        arch_id: hfq.arch_id,
-        pp: 1,
-        ep: None,
-        pp_gpus: None,
-        pp_scratch_set: None,
-        pp_dn_la_to_device: None,
-        q35_config: None,
-        q35_weights: None,
-        q35_scratch: None,
-        kv_cache: None,
-        dn_state: None,
-        llama_config: Some(config),
-        llama_weights: Some(weights),
-        llama_scratch: Some(scratch),
-        llama_kv: Some(kv),
-        qwen2_config: None,
-        qwen2_weights: None,
-        qwen2_state: None,
-        deepseek4_config: None,
-        deepseek4_weights: None,
-        deepseek4_state: None,
-        deepseek4_pbs: None,
-        deepseek4_eos_tok: 0,
-        lfm2moe_config: None,
-        lfm2moe_weights: None,
-        lfm2moe_state: None,
-        lfm2moe_eos_tok: 0,
-        minimax_config: None,
-        minimax_weights: None,
-        minimax_state: None,
-        minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(),
-        mtp_k: 3,
-        mtp_weights_present: false,
-        dots_ocr_config: None,
-        dots_ocr_weights: None,
-        vision_config: None,
-        vision_weights: None,
-        tokenizer: Some(tokenizer),
-        seq_pos: 0,
-        max_seq: ctx.max_seq,
-        physical_cap,
-        eviction: None,
-        kv_adaptive: None,
-        conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(),
-        dflash_checkpoints: Vec::new(),
-        decoded_vocab: None,
-        model_path: ctx.path.to_string(),
-        dflash: None,
         chat_template,
     })
 }
@@ -983,7 +559,7 @@ pub fn load_model(
         return load_model_safetensors(path, max_seq, &kv_mode, gpu);
     }
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
@@ -1077,30 +653,91 @@ pub fn load_model(
         _ => {}
     }
 
-    // Core arches: carrier registry dispatch
-    let src = ModelSource::Hfq(hfq);
-    let registry: &[&dyn Carrier] = &[&Qwen2Carrier, &Qwen35Carrier, &LlamaCarrier];
-    let carrier = registry.iter().find(|c| c.probe(&src))
-        .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
-    let ModelSource::Hfq(hfq) = src else { unreachable!() };
-
-    let mut ctx = LoadCtx {
-        path,
-        max_seq,
-        draft_path,
-        kv_mode_override,
-        kv_adaptive_override,
-        state_quant_override,
-        cask,
-        pp,
-        gpu,
+    // Core arches: carrier dispatch
+    // Resolve shared state BEFORE moving hfq into the carrier
+    let chat_template = resolve_chat_template(&hfq, path);
+    let (vision_config, vision_weights) = if hfq.arch_id == 5 || hfq.arch_id == 6 {
+        use hipfire_arch_qwen35_vl::Qwen35Vl;
+        use hipfire_runtime::arch::Architecture;
+        let has_vision = hfq.tensor_data("model.visual.patch_embed.proj.weight").is_some();
+        let vc = Qwen35Vl::config_from_hfq(&hfq).ok();
+        match vc {
+            Some(vc) if has_vision => {
+                let vw = Qwen35Vl::load_weights(&mut hfq, &vc, gpu)
+                    .map_err(|e| format!("{e}"))?;
+                eprintln!("  VL model: vision encoder (hidden={}, layers={})",
+                    vc.hidden_size, vc.num_layers);
+                (Some(vc), Some(vw))
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
     };
 
-    match carrier.name() {
-        "qwen2" => load_qwen2(hfq, &mut ctx, tokenizer, kv_mode, state_quant_override, physical_cap),
-        "qwen35" => load_qwen35(hfq, &mut ctx, tokenizer, kv_mode, kv_adaptive_spec, state_quant_override, physical_cap),
-        "llama" => load_llama(hfq, &mut ctx, tokenizer, kv_mode, physical_cap),
-        other => Err(format!("carrier {other} has no load body")),
+    let arch_id = hfq.arch_id;
+    let mut ctx = LoadCtx {
+        path, max_seq, draft_path,
+        kv_mode_override, kv_adaptive_override, state_quant_override,
+        cask, pp, gpu,
+    };
+
+    if arch_id == 7 {
+        let Qwen2Bundle { config, weights, state } = Qwen2Carrier
+            .load(ModelSource::Hfq(hfq), &mut ctx)?;
+        Ok(LoadedModel {
+            arch_id, pp: 1, ep: None,
+            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            state: Some(ModelState::Qwen2(Qwen2Bundle { config, weights, state })),
+            kv_cache: None, dn_state: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        })
+    } else if arch_id == 5 || arch_id == 6 {
+        let bundle = Qwen35Carrier.load(ModelSource::Hfq(hfq), &mut ctx)?;
+        finish_qwen35_load(bundle, tokenizer, physical_cap, arch_id, chat_template,
+            &mut ctx, vision_config, vision_weights)
+    } else {
+        let LlamaBundle { config, weights, scratch, kv } = LlamaCarrier
+            .load(ModelSource::Hfq(hfq), &mut ctx)?;
+        Ok(LoadedModel {
+            arch_id, pp: 1, ep: None,
+            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })),
+            kv_cache: None, dn_state: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq: ctx.max_seq, physical_cap,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        })
     }
 }
 
@@ -1118,7 +755,7 @@ fn load_dots_ocr(
     let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
         .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: None, q35_weights: None, q35_scratch: None, kv_cache: None, dn_state: None, llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None, qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state), deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: Some(config), dots_ocr_weights: Some(weights), vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: Some(state), deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: Some(config), dots_ocr_weights: Some(weights), vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
 }
 
 fn load_deepseek4(
@@ -1140,7 +777,7 @@ fn load_deepseek4(
         if ids.len() == 1 { ids[0] } else { 1 }
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: None, q35_weights: None, q35_scratch: None, kv_cache: None, dn_state: None, llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None, qwen2_config: None, qwen2_weights: None, qwen2_state: None, deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state), deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state), deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
 }
 
 fn load_lfm2moe(
@@ -1162,7 +799,7 @@ fn load_lfm2moe(
         try_one("<|im_end|>").or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: None, q35_weights: None, q35_scratch: None, kv_cache: None, dn_state: None, llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None, qwen2_config: None, qwen2_weights: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: Some(config), lfm2moe_weights: Some(weights), lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: Some(config), lfm2moe_weights: Some(weights), lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
 }
 
 fn load_minimax(
@@ -1185,7 +822,7 @@ fn load_minimax(
         try_one("[e~[").or_else(|| try_one("<|im_end|>")).or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: None, q35_weights: None, q35_scratch: None, kv_cache: None, dn_state: None, llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None, qwen2_config: None, qwen2_weights: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: Some(config), minimax_weights: Some(weights), minimax_state: Some(state), minimax_eos_tok: eos_tok, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    Ok(LoadedModel { arch_id: hfq.arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: None, kv_cache: None, dn_state: None, qwen2_state: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: Some(config), minimax_weights: Some(weights), minimax_state: Some(state), minimax_eos_tok: eos_tok, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, dots_ocr_config: None, dots_ocr_weights: None, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
 }
 
 // ─── Unsafetensors load path ──────────────────────────────────────────
@@ -1242,7 +879,7 @@ fn load_model_safetensors(
         }.map_err(|e| format!("KvCache: {e}"))?;
         let scratch = llama::ForwardScratch::new(gpu, &config)
             .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
-        return Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: None, q35_weights: None, q35_scratch: None, qwen2_config: None, qwen2_weights: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, kv_cache: None, dn_state: None, llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv), deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template });
+        return Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state: Some(ModelState::Llama(LlamaBundle { config, weights, scratch, kv })), kv_cache: None, dn_state: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template });
     }
 
     if arch_id != 5 && arch_id != 6 {
@@ -1285,7 +922,11 @@ fn load_model_safetensors(
     let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
 
-    Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch), qwen2_config: None, qwen2_weights: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, kv_cache: Some(kv_cache), dn_state: Some(dn_state), llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq: effective_max_seq, physical_cap: effective_max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
+    let bundle = Qwen35Bundle { config, weights, scratch, kv_cache, dn_state };
+    let Qwen35Bundle { config, weights, scratch, kv_cache, dn_state } = bundle;
+    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch, kv_cache, dn_state }));
+
+    Ok(LoadedModel { arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None, state, kv_cache: None, dn_state: None, qwen2_state: None, dots_ocr_config: None, dots_ocr_weights: None, deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0, lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0, minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0, mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false, vision_config: None, vision_weights: None, tokenizer: Some(tokenizer), seq_pos: 0, max_seq: effective_max_seq, physical_cap: effective_max_seq, eviction: None, kv_adaptive: None, conversation_tokens: Vec::new(), asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None, model_path: path.to_string(), dflash: None, chat_template })
 }
 
 // ─── Pipeline-parallel load ───────────────────────────────────────────
@@ -1354,16 +995,20 @@ fn load_model_pp(
     let dn_quant = parse_state_quant(state_quant_override)?;
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
-    let scratch = Qwen35ScratchSet::new_with_kv_max_multi(
+    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(
         &mut gpus, &config, 2048, max_seq).map_err(|e| format!("{e}"))?;
+    // PP needs a single-GPU scratch for the bundle (the multi-GPU scratch_set is kept at top level)
+    let gpu0 = &mut gpus.devices[0];
+    let single_scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu0, &config, 2048, max_seq)
+        .map_err(|e| format!("{e}"))?;
+    let bundle = Qwen35Bundle { config, weights, scratch: single_scratch, kv_cache: kv, dn_state: dn };
+    let Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn } = bundle;
+    let state = Some(ModelState::Qwen35(Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn }));
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
         arch_id: hfq.arch_id, pp, ep: None,
-        pp_gpus: Some(gpus), pp_scratch_set: Some(scratch), pp_dn_la_to_device: Some(la_to_device),
-        q35_config: None, q35_weights: Some(weights), q35_scratch: None,
-        kv_cache: Some(kv), dn_state: Some(dn),
-        llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-        qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        pp_gpus: Some(gpus), pp_scratch_set: Some(scratch_set), pp_dn_la_to_device: Some(la_to_device),
+        state, kv_cache: None, dn_state: None, qwen2_state: None,
         deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
         deepseek4_pbs: None, deepseek4_eos_tok: 0,
         lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
@@ -1549,10 +1194,7 @@ fn load_model_ep_ds4(
         arch_id, pp: 1,
         ep: Some(EpState { gpus, inner: EpArch::Ds4 { config, weights, state, partials } }),
         pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-        q35_config: None, q35_weights: None, q35_scratch: None,
-        kv_cache: None, dn_state: None,
-        llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-        qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        state: None, kv_cache: None, dn_state: None, qwen2_state: None,
         deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
         deepseek4_pbs: None, deepseek4_eos_tok: 0,
         lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
@@ -1604,10 +1246,7 @@ fn load_model_ep_minimax(
         arch_id, pp: 1,
         ep: Some(EpState { gpus, inner: EpArch::Minimax { config, weights, state, partials } }),
         pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-        q35_config: None, q35_weights: None, q35_scratch: None,
-        kv_cache: None, dn_state: None,
-        llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-        qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        state: None, kv_cache: None, dn_state: None, qwen2_state: None,
         deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
         deepseek4_pbs: None, deepseek4_eos_tok: 0,
         lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
@@ -1625,21 +1264,17 @@ fn load_model_ep_minimax(
 
 // ─── Unload ───────────────────────────────────────────────────────────
 
-pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
-        if let Some(kv) = m.kv_cache {
-            kv.free_gpu_multi(&mut gpus);
-        }
-        if let Some(dn) = m.dn_state {
+        if let Some(ModelState::Qwen35(b)) = m.state.take() {
+            b.kv_cache.free_gpu_multi(&mut gpus);
             let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
-            dn.free_gpu_multi(&mut gpus, &la_to_device);
-        }
-        if let Some(w) = m.q35_weights {
-            w.free_gpu_multi(&mut gpus);
+            b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
+            b.weights.free_gpu_multi(&mut gpus);
         }
         for g in gpus.devices.iter_mut() {
             g.invalidate_weight_caches();
@@ -1668,15 +1303,27 @@ pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    if let Some(s) = m.q35_scratch {
-        s.free_gpu(gpu);
+    // Free arch-specific GPU state from the carrier bundle
+    if let Some(state) = m.state {
+        match state {
+            ModelState::Qwen2(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Qwen35(b) => {
+                b.kv_cache.free_gpu(gpu);
+                b.scratch.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+                b.dn_state.free_gpu(gpu);
+            }
+            ModelState::Llama(b) => {
+                b.scratch.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+                b.kv.free_gpu(gpu);
+            }
+        }
     }
-    if let Some(kv) = m.llama_kv {
-        kv.free_gpu(gpu);
-    }
-    if let Some(s) = m.llama_scratch {
-        s.free_gpu(gpu);
-    }
+    // Non-core arch weights
     if let Some(s) = m.qwen2_state {
         s.free_gpu(gpu);
     }
@@ -1685,15 +1332,6 @@ pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
-    }
-    if let Some(w) = m.q35_weights {
-        w.free_gpu(gpu);
-    }
-    if let Some(w) = m.llama_weights {
-        w.free_gpu(gpu);
-    }
-    if let Some(w) = m.qwen2_weights {
-        w.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
         w.free_gpu(gpu);

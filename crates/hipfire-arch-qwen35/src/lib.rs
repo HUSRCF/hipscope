@@ -44,6 +44,8 @@ pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
+pub mod carrier;
+#[cfg(feature = "deltanet")]
 pub mod speculative;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of
@@ -55,5 +57,7 @@ pub mod grammar;
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
+#[cfg(feature = "deltanet")]
+pub use carrier::{Qwen35Bundle, Qwen35Carrier};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
