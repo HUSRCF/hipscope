@@ -2004,6 +2004,46 @@ fn imatrix_col_weights_for_parent(
     Some(out)
 }
 
+/// Like `imatrix_col_weights_for_parent` but returns the RAW per-expert
+/// `in_sum2[K]` (not `sqrt(in_sum2/count)`). AWQ's `compute_awq_scales` takes
+/// raw in_sum2 — it applies `^(alpha/2)` internally (≡ `rms_act^alpha` after
+/// geo-mean normalization), so feeding it rms_act would halve the effective
+/// alpha vs the dense AWQ path. Used by the per-expert AWQ branch (Route A).
+fn imatrix_in_sum2_for_parent(
+    gguf: &gguf_input::GgufFile,
+    parent: &str,
+    n_experts: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let (base_key, _layer) = safetensors_to_imatrix_key(parent)?;
+    let in_sum2_name = format!("{}.in_sum2", base_key);
+    let in_sum2 = gguf.tensors.iter().find(|t| t.name == in_sum2_name)?;
+    if in_sum2.shape.len() != 2 {
+        return None;
+    }
+    let k = in_sum2.shape[0];
+    let n_exp = in_sum2.shape[1];
+    if n_exp != n_experts {
+        eprintln!(
+            "  imatrix(awq): {} n_experts mismatch ({} vs {})",
+            in_sum2_name, n_exp, n_experts
+        );
+        return None;
+    }
+    let in_sum2_flat: Vec<f32> = gguf
+        .tensor_data(in_sum2)
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if in_sum2_flat.len() != k * n_exp {
+        return None;
+    }
+    Some(
+        (0..n_exp)
+            .map(|e| in_sum2_flat[e * k..(e + 1) * k].to_vec())
+            .collect(),
+    )
+}
+
 /// Per-layer "importance score" from an imatrix GGUF, used by Phase 5
 /// tiered MQ-Lloyd to rank routed-expert layers.
 ///
@@ -6106,6 +6146,42 @@ fn main() {
                 );
             }
 
+            // ── Per-expert AWQ (Route A) ──────────────────────────────────────
+            // When `--awq` is active with a GGUF imatrix, MQ4 experts get
+            // activation-aware per-expert pre-scaling + a per-expert
+            // `.awq_scale.weight` sidecar (length K). The runtime divides x by
+            // the per-expert scale inside the indexed/grouped expert GEMM. Takes
+            // priority over plain MQ4G256; the Lloyd branches above are mutually
+            // exclusive (selected by their own flags), so AWQ only fires when
+            // none of them claimed this expert.
+            let expert_awq_active = AWQ_ALPHA.get().is_some()
+                && imatrix_gguf.is_some()
+                && supports_g256
+                && !expert_mq3lloyd_native
+                && !expert_mq2lloyd_native
+                && !expert_mq2lloyd_roundtrip
+                && !expert_mq6
+                && !expert_hfq6
+                && !expert_hfq4;
+            let awq_in_sum2_per_expert: Option<Vec<Vec<f32>>> = if expert_awq_active {
+                imatrix_in_sum2_for_parent(
+                    imatrix_gguf.as_ref().unwrap(),
+                    &imatrix_lookup_name,
+                    n_experts,
+                )
+            } else {
+                None
+            };
+            let awq_alpha_e = AWQ_ALPHA.get().copied().unwrap_or(0.5);
+            let inner_m = inner_shape[0] as usize; // out features
+            let inner_k_e = inner_shape[1] as usize; // in features (K, awq scale length)
+            if expert_awq_active && awq_in_sum2_per_expert.is_none() {
+                eprintln!(
+                    "  imatrix(awq): no entry for {} → plain MQ4G256 experts (no AWQ)",
+                    imatrix_lookup_name
+                );
+            }
+
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
             // The outer Rayon pool size is set in main() before this runs.
@@ -6114,13 +6190,29 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts)
+            let new_pairs: Vec<(HfqTensor, Option<HfqTensor>)> = (0..n_experts)
                 .into_par_iter()
                 .map(|x| {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
                     let f32_slice = to_f32(slice, &dtype);
-                    let (quantized, qt, gs) = if expert_mq3lloyd_native {
+                    // Per-expert AWQ override (Route A): when this expert has a
+                    // raw in_sum2 row, pre-scale W·s and remember s for the
+                    // sidecar. Falls through to the format branches otherwise.
+                    let awq_scales: Option<Vec<f32>> = awq_in_sum2_per_expert
+                        .as_ref()
+                        .and_then(|t| t.get(x))
+                        .filter(|v| v.len() == inner_k_e)
+                        .map(|v| compute_awq_scales(v, awq_alpha_e));
+                    let (quantized, qt, gs) = if let Some(scales) = awq_scales.as_ref() {
+                        let mut scaled = f32_slice.clone();
+                        awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, scales);
+                        (
+                            quantize_mq4g256(&scaled, &signs1, &signs2),
+                            QuantType::MQ4G256,
+                            256u32,
+                        )
+                    } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
                     } else if expert_mq2lloyd_native {
@@ -6176,19 +6268,39 @@ fn main() {
                         let q = quantize_hfq4g128(&f32_slice);
                         (q, QuantType::HFQ4G128, 128u32)
                     };
-                    HfqTensor {
+                    let weight = HfqTensor {
                         name: format!("{parent_owned}{x}.{base_owned}.weight"),
                         quant_type: qt,
                         shape: inner_shape_clone.clone(),
                         group_size: gs,
                         data: quantized,
                         spilled_len: 0,
-                    }
+                    };
+                    let sidecar = awq_scales.map(|s| HfqTensor {
+                        name: format!("{parent_owned}{x}.{base_owned}.awq_scale.weight"),
+                        quant_type: QuantType::F16,
+                        shape: vec![inner_k_e as u32],
+                        group_size: 0,
+                        data: awq_scales_to_f16_bytes(&s),
+                        spilled_len: 0,
+                    });
+                    (weight, sidecar)
                 })
                 .collect();
+            // Flatten weight+sidecar pairs; each AWQ expert emits two tensors.
+            let n_awq = new_pairs.iter().filter(|(_, s)| s.is_some()).count();
+            let mut new_tensors: Vec<HfqTensor> = Vec::with_capacity(new_pairs.len() + n_awq);
+            for (w, s) in new_pairs {
+                new_tensors.push(w);
+                if let Some(sc) = s {
+                    new_tensors.push(sc);
+                }
+            }
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq3lloyd_native {
+            let label = if expert_awq_active && awq_in_sum2_per_expert.is_some() {
+                "MQ4G256+AWQ"
+            } else if expert_mq3lloyd_native {
                 "MQ3G256L"
             } else if expert_mq2lloyd_native {
                 if imatrix_per_expert.is_some() {
