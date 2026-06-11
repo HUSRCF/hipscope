@@ -5645,8 +5645,22 @@ fn main() {
     let mut quantized_params = 0u64;
     // Spill file for large models — keeps peak RSS bounded by flushing
     // completed tensor data to disk when accumulated memory exceeds 32 GB.
-    let spill_dir = output_path.parent().unwrap_or(Path::new("."));
-    let mut spill = TensorSpill::new(spill_dir).ok();
+    // HIPFIRE_SPILL_DIR overrides the spill location (default = output dir).
+    // Point it at a RAM-backed tmpfs (e.g. /dev/shm) to keep peak DISK usage
+    // = output size only, when disk is tight but RAM is ample.
+    let spill_dir_override = std::env::var("HIPFIRE_SPILL_DIR").ok();
+    let spill_dir = match spill_dir_override.as_deref() {
+        Some(d) => Path::new(d),
+        None => output_path.parent().unwrap_or(Path::new(".")),
+    };
+    // HIPFIRE_NO_SPILL=1 disables the disk spill entirely (hold all tensors in
+    // RAM, write output directly). Needed for huge f32 oracles where spill+output
+    // would be ~2x the output size on disk — but RAM is ample.
+    let mut spill = if std::env::var("HIPFIRE_NO_SPILL").ok().as_deref() == Some("1") {
+        None
+    } else {
+        TensorSpill::new(spill_dir).ok()
+    };
     let mut total_quant_error = 0.0f64;
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
@@ -5717,6 +5731,44 @@ fn main() {
         // reads via its qt=2 arm and the engine forwards through the existing
         // F32 GEMV / attention_f32 path.
         if use_f32_passthrough {
+            // 3D MoE experts MUST be split per-expert: the qwen35 loader reads
+            // `...experts.{X}.{base}.weight`, never the stacked 3D tensor. Without
+            // this, the oracle stores `experts.gate_up_proj [256,...]` and load
+            // panics "tensor not found: ...experts.0.gate_up_proj.weight".
+            if is_moe
+                && name.contains("mlp.experts.")
+                && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
+                && meta.shape.len() == 3
+            {
+                let n_exp = meta.shape[0];
+                let inner_n: usize = meta.shape[1..].iter().product();
+                let base_name = if name.ends_with("gate_up_proj") { "gate_up_proj" } else { "down_proj" };
+                let parent = &name[..name.len() - base_name.len()]; // ends with "experts."
+                let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
+                let f32_all = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files,
+                );
+                for x in 0..n_exp {
+                    let slice = &f32_all[x * inner_n..(x + 1) * inner_n];
+                    let bytes: Vec<u8> = slice.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                    hfq_tensors.push(HfqTensor {
+                        name: format!("{parent}{x}.{base_name}.weight"),
+                        quant_type: QuantType::F32,
+                        shape: inner_shape.clone(),
+                        group_size: 0,
+                        data: bytes,
+                        spilled_len: 0,
+                    });
+                }
+                quantized_params += n_elements as u64;
+                eprintln!("  {:>8}: {} {:?} -> {} per-expert F32 [oracle split]",
+                    "F32", name, meta.shape, n_exp);
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut sp) = spill {
+                    maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name, raw_data, meta, &fp8_scale_for, &st_files,
             );
@@ -6159,7 +6211,13 @@ fn main() {
             // unset/=all does both gate_up and down (default).
             let awq_down_only =
                 std::env::var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("down");
+            // HIPFIRE_AWQ_EXPERTS=none keeps DENSE AWQ (attn/lm_head) but emits
+            // NO per-expert AWQ — the clean baseline for isolating the expert
+            // contribution against an HIPFIRE_AWQ_EXPERTS=down treatment.
+            let awq_experts_none =
+                std::env::var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("none");
             let expert_awq_active = AWQ_ALPHA.get().is_some()
+                && !awq_experts_none
                 && imatrix_gguf.is_some()
                 && supports_g256
                 && !(awq_down_only && base_name == "gate_up_proj")
