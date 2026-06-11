@@ -87,6 +87,37 @@ field; (3) dispatch in the MoE decode forward (`moe_ffn_decode_impl`): when down
 has awq_scale, call the `_awq_indexed` silu-rotate (pass ptr table + topk_indices)
 instead of the plain `fused_silu_mul_mq_rotate`. Gate behind HIPFIRE_MOE_AWQ.
 
+### 3a-NAV. Dispatch wiring runs THROUGH the unified MoE dispatch family (KEY)
+
+Navigation finding (2026-06-11): the routed-expert silu-rotate is NOT a direct
+gpu.fused_silu_mul_rotate(...) call in qwen35.rs. Path:
+
+    moe_ffn_decode_impl (qwen35.rs:4665)
+      -> builds MoeParams { expert_down_ptrs, down_expanded, routed_down_*, ... }
+      -> moe_family().run(&ctx, gpu, &moe_params)
+        -> MoeFamily::run (hipfire-dispatch/src/families/moe.rs; MoeParams @148-185)
+          -> deeper kernel sequence (gate_up GEMV -> silu-rotate -> down GEMV);
+             the silu-rotate is dispatched inside the run impl (not in
+             families/moe.rs directly).
+
+So AWQ-down dispatch is a MULTI-CRATE change, NOT a kernel swap:
+1. MoeParams (+ MoePrefillParams, hipfire-dispatch) gains
+   expert_down_awq_ptrs: Option<&GpuTensor> (None on non-AWQ files).
+2. MoeFamily::run silu-rotate step: when expert_down_awq_ptrs.is_some(), call
+   fused_silu_mul_mq_rotate_awq_indexed (pass ptr table + topk_indices) instead
+   of fused_silu_mul_rotate_mq_batched.
+3. Loader (qwen35.rs load_moe_ffn @4331, NOT paro_load_moe_ffn): per-expert
+   down.awq_scale = load_awq_scale(hfq, gpu, "...experts.{x}.down_proj.weight", mi)
+   (hfq.rs:589; load_weight_tensor does NOT auto-load it). Build
+   expert_down_awq_ptrs from e.down.awq_scale (mirror expert_down_ptrs @~4402).
+   Add the field to MoeFfnWeights (@566) + ALL constructors (paro_load_moe_ffn
+   @1959 builds an empty/None table).
+4. rdna-compute launcher for the indexed kernel (or call from the run impl).
+
+Gate on down.awq_scale.is_some() (auto-detect) + HIPFIRE_MOE_AWQ kill-switch.
+Prefill (MoePrefillParams) mirrors decode. Test file ready:
+/workspace/nex-n2-mq4awq-down.hfq (down-only AWQ, gate_up plain).
+
 ### 3a-orig. down_proj — design
 Input = per-expert SwiGLU output. The existing per-expert kernel
 **`fused_silu_mul_mq_rotate_awq.hip`** already does silu·mul + AWQ-divide +
