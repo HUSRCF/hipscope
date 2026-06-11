@@ -3985,8 +3985,12 @@ fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
         let weights = <cohere2moe::Cohere2Moe as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-        // Size the KV cache to the requested window (the trait's new_state
-        // caps at 8192; honour the caller's max_seq when it's larger/smaller).
+        // Size the KV cache. North is a long-context model (max_position=500k)
+        // and KV is cheap, so default GENEROUSLY: the daemon's global default
+        // (4096) is too small — a >4096-token prompt would hit the capacity
+        // guard and error. Floor at 8192 (the arch's natural cap) so long
+        // context works out of the box; an explicit larger max_seq is honoured.
+        let max_seq = max_seq.max(8192);
         let state = cohere2moe::Cohere2MoeState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
         // Resolve EOS via the tokenizer. Cohere2 ends a turn with
@@ -13292,6 +13296,20 @@ fn generate_cohere2moe(
                 let tokenizer = m.tokenizer.as_ref().unwrap();
                 tokenizer.decode(&[next_tok])
             };
+            // Defense-in-depth: never emit a Cohere structural marker into
+            // visible output / the action buffer. The ID state machine above
+            // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
+            // special token the model might emit (START_OF_TURN_TOKEN,
+            // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
+            // `<|MARKER|>`. The token is still fed to decode_step below; only its
+            // emit is dropped, so a state-machine miss can never leak a marker.
+            let is_marker = frag.len() > 4
+                && frag.starts_with("<|")
+                && frag.ends_with("|>")
+                && frag[2..frag.len() - 2].chars().all(|c| c.is_ascii_uppercase() || c == '_');
+            if is_marker {
+                // suppressed
+            } else {
             match sec {
                 Sec::Action => action_buf.push_str(&frag),
                 Sec::Think => {
@@ -13312,6 +13330,7 @@ fn generate_cohere2moe(
                     );
                     let _ = stdout.flush();
                 }
+            }
             }
         }
 
