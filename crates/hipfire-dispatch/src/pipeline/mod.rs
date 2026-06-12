@@ -670,6 +670,16 @@ fn run_moe_decode_cpu_fallback(
     } else {
         None
     };
+    // GPTQ-on-E8 capture staging: gather this token's per-expert down activations
+    // (silu(g)*u) so the per-(tensor,expert) XX^T accumulate — the capture
+    // bottleneck (single-threaded f64 rank-1 over a ~30 GB cold working set while
+    // the GPU sits idle) — runs ONCE, in PARALLEL across the token's disjoint
+    // accumulators, after the expert loop. `hid_host` Vecs must outlive the
+    // batched call, hence the owning stash. Zero overhead when capture is off.
+    let mut hess_down_keys: Vec<(String, Vec<f32>)> =
+        if hess_x_norm.is_some() { Vec::with_capacity(topk_indices.len()) } else { Vec::new() };
+    let mut hess_gate_keys: Vec<String> =
+        if hess_x_norm.is_some() { Vec::with_capacity(topk_indices.len()) } else { Vec::new() };
 
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
@@ -686,27 +696,43 @@ fn run_moe_decode_cpu_fallback(
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
         // GPTQ-on-E8 Hessian capture: hid_view = silu(g)*u is the RAW
         // PRE-rotation down input (run_auto below applies the FWHT internally),
-        // so download it NOW, before the down GEMV. Accumulate gate_up (over the
-        // pre-downloaded x_norm) and down (over hid_view) for THIS expert.
-        if let Some(ref xn) = hess_x_norm {
+        // so download it NOW, before the down GEMV, and STAGE it (gate_up shares
+        // the single pre-downloaded x_norm). The actual XX^T accumulate is
+        // deferred to one parallel `accumulate_token` after the loop.
+        if hess_x_norm.is_some() {
             let hid_host = hip!(gpu.download_f32(&hid_view))?;
             let l = p.layer_idx;
             let e = expert_idx;
-            let gate_up_key = format!(
+            hess_gate_keys.push(format!(
                 "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj.weight"
-            );
-            let down_key = format!(
-                "model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"
-            );
-            if let Some(cap) = gpu.hessian_capture.as_mut() {
-                cap.accumulate(&gate_up_key, xn, p.hidden);
-                cap.accumulate(&down_key, &hid_host, mi);
-            }
+            ));
+            hess_down_keys.push((
+                format!("model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"),
+                hid_host,
+            ));
         }
         {
             gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
         }
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
+    }
+
+    // GPTQ-on-E8: one batched, rayon-parallel accumulate over the token's
+    // disjoint (tensor,expert) accumulators (distinct expert ids + distinct
+    // gate_up/down tensors ⇒ disjoint targets ⇒ bit-identical to the per-expert
+    // serial accumulate; see `accumulate_token`).
+    if let Some(ref xn) = hess_x_norm {
+        let mut items: Vec<(String, &[f32], usize)> =
+            Vec::with_capacity(hess_gate_keys.len() + hess_down_keys.len());
+        for gk in &hess_gate_keys {
+            items.push((gk.clone(), xn.as_slice(), p.hidden));
+        }
+        for (dk, hid) in &hess_down_keys {
+            items.push((dk.clone(), hid.as_slice(), mi));
+        }
+        if let Some(cap) = gpu.hessian_capture.as_mut() {
+            cap.accumulate_token(&items);
+        }
     }
 
     Ok(())

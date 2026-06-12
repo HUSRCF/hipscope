@@ -509,6 +509,86 @@ impl HessianCapture {
             acc.accumulate_row(&row);
         }
     }
+
+    /// Accumulate ALL of one token's routed (tensor,expert) activation rows in
+    /// PARALLEL across rayon worker threads. `items` is the token's list of
+    /// `(name, x, k)` work-units (gate_up + down for each of the top-k experts).
+    ///
+    /// WHY THIS IS THE HOT-PATH OPTIMIZATION: the per-token capture cost is
+    /// dominated by the `accumulate_row` rank-1 XX^T updates over a HUGE, COLD
+    /// working set (A3B: ~16k distinct (tensor,expert) accumulators, ~30 GB of
+    /// f64), which is memory-system-bound (cold-line latency + first-touch page
+    /// faults), single-threaded, GPU idle, 20 host cores free. Each work-unit in
+    /// `items` targets a DISTINCT (tensor,expert) accumulator (distinct experts
+    /// per token, distinct gate_up/down tensors), so the accumulators are
+    /// pairwise DISJOINT and can be updated concurrently — spreading the cold
+    /// memory traffic + faults across cores.
+    ///
+    /// BIT-IDENTICAL TO SERIAL: each accumulator receives EXACTLY the same
+    /// `accumulate_row(x)` call it would in the per-expert serial loop, computed
+    /// by exactly ONE thread; only the (already order-independent, because the
+    /// targets are disjoint) cross-accumulator iteration is parallelized. The
+    /// internal float sum of every H[i,j] entry is byte-for-byte the serial
+    /// result. See `accumulate_token_bit_identical_to_serial` parity test.
+    pub fn accumulate_token(&mut self, items: &[(String, &[f32], usize)]) {
+        use rayon::prelude::*;
+        // 1) Ensure every entry exists (serial; allocation must not race the
+        //    HashMap). Entries are keyed by full name; first sight sizes to k.
+        for (name, _x, k) in items {
+            self.entries
+                .entry(name.clone())
+                .or_insert_with(|| BlockHessianAcc::new(*k));
+        }
+        // 2) Gather a raw *mut to each target accumulator. The targets are
+        //    pairwise disjoint iff the names within this token are distinct —
+        //    which routing guarantees (distinct expert ids; distinct tensors).
+        //    A SyncPtr wrapper lets rayon move the (provably disjoint) pointers
+        //    across threads; no two closures touch the same accumulator.
+        #[derive(Clone, Copy)]
+        struct SyncPtr(*mut BlockHessianAcc);
+        // SAFETY: each pointer addresses a distinct HashMap value (distinct keys,
+        // asserted below); the map is not mutated for the duration of the
+        // parallel section, so the pointees are stable and non-overlapping.
+        unsafe impl Send for SyncPtr {}
+        unsafe impl Sync for SyncPtr {}
+
+        // Debug guard: catch any accidental duplicate key (would alias &mut).
+        debug_assert!(
+            {
+                let mut ns: Vec<&str> = items.iter().map(|(n, _, _)| n.as_str()).collect();
+                ns.sort_unstable();
+                let before = ns.len();
+                ns.dedup();
+                ns.len() == before
+            },
+            "accumulate_token: duplicate (tensor,expert) name within one token              would alias &mut — parallel accumulate requires distinct keys"
+        );
+
+        let ptrs: Vec<(SyncPtr, &[f32], usize)> = items
+            .iter()
+            .map(|(name, x, k)| {
+                let acc: &mut BlockHessianAcc = self
+                    .entries
+                    .get_mut(name)
+                    .expect("entry ensured above");
+                (SyncPtr(acc as *mut BlockHessianAcc), *x, *k)
+            })
+            .collect();
+
+        // 3) Parallel accumulate, one work-unit per rayon task. Each task calls
+        //    the SAME `accumulate_row` as serial on its own disjoint accumulator.
+        ptrs.par_iter().for_each(|&(p, x, k)| {
+            // SAFETY: disjoint targets (distinct keys); no aliasing across tasks.
+            let acc: &mut BlockHessianAcc = unsafe { &mut *p.0 };
+            if x.len() >= k {
+                acc.accumulate_row(&x[..k]);
+            } else {
+                let mut row = vec![0.0f32; k];
+                row[..x.len()].copy_from_slice(x);
+                acc.accumulate_row(&row);
+            }
+        });
+    }
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -2306,6 +2386,105 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::HessianCapture;
+
+    /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
+    /// signed-zero, negatives, and large/small magnitudes to exercise the
+    /// zero-skip branch and fp rounding.
+    fn fixed_row(k: usize, seed: u64) -> Vec<f32> {
+        let mut state: u64 = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) as f64 / (u32::MAX as f64)
+        };
+        (0..k)
+            .map(|c| {
+                let r = next();
+                if r < 0.20 {
+                    0.0f32
+                } else if r < 0.25 {
+                    -0.0f32
+                } else {
+                    let mag = (r - 0.5) * 4.0;
+                    let scale = if c % 7 == 0 { 1.0e3 } else { 1.0 };
+                    (mag * scale) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// LOAD-BEARING CORRECTNESS GATE for the rayon-parallel `accumulate_token`.
+    /// The parallel per-token accumulate (across disjoint (tensor,expert)
+    /// accumulators) MUST be BIT-IDENTICAL to the serial per-item `accumulate`
+    /// reference — a wrong parallel sum would silently produce wrong Hessians
+    /// and reconfound the GPTQ-on-E8 experiment. We compare every f64 entry by
+    /// raw bits (`to_bits()`), not an epsilon: each accumulator is updated by
+    /// exactly one thread with the SAME ops as serial, so exact equality is the
+    /// correct, strongest assertion. Multiple tokens are accumulated to verify
+    /// the parallel path is also correct across repeated touches of an entry.
+    #[test]
+    fn accumulate_token_bit_identical_to_serial() {
+        // A3B-shaped: gate_up K=2048 (8 blocks), down K=512 (2 blocks); 8 experts
+        // (distinct ids) -> 16 distinct (tensor,expert) keys per token.
+        let n_experts = 8usize;
+        let n_tokens = 5usize;
+        let k_gate = 2048usize;
+        let k_down = 512usize;
+
+        let mut par = HessianCapture::default();
+        let mut ser = HessianCapture::default();
+
+        for t in 0..n_tokens {
+            // Build this token's distinct work-units.
+            let mut names: Vec<String> = Vec::new();
+            let mut xs: Vec<Vec<f32>> = Vec::new();
+            let mut ks: Vec<usize> = Vec::new();
+            for e in 0..n_experts {
+                let l = 7usize;
+                names.push(format!(
+                    "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj.weight"
+                ));
+                xs.push(fixed_row(k_gate, (t * 131 + e) as u64));
+                ks.push(k_gate);
+                names.push(format!(
+                    "model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"
+                ));
+                xs.push(fixed_row(k_down, (t * 977 + e + 1) as u64));
+                ks.push(k_down);
+            }
+            // Serial reference: per-item accumulate in fixed order.
+            for i in 0..names.len() {
+                ser.accumulate(&names[i], &xs[i], ks[i]);
+            }
+            // Parallel path: one batched call.
+            let items: Vec<(String, &[f32], usize)> = (0..names.len())
+                .map(|i| (names[i].clone(), xs[i].as_slice(), ks[i]))
+                .collect();
+            par.accumulate_token(&items);
+        }
+
+        // Compare every accumulator bit-for-bit.
+        assert_eq!(par.entries.len(), ser.entries.len());
+        for (name, pacc) in &par.entries {
+            let sacc = ser.entries.get(name).expect("name in serial map");
+            assert_eq!(pacc.n_blocks, sacc.n_blocks, "{name} n_blocks");
+            assert_eq!(pacc.n_rows, sacc.n_rows, "{name} n_rows");
+            for b in 0..pacc.n_blocks {
+                let pb = &pacc.blocks[b];
+                let sb = &sacc.blocks[b];
+                for idx in 0..pb.len() {
+                    assert_eq!(
+                        pb[idx].to_bits(),
+                        sb[idx].to_bits(),
+                        "{name} block={b} idx={idx}: parallel {} != serial {} (NOT bit-identical)",
+                        pb[idx], sb[idx]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mq_signs_128_deterministic() {
