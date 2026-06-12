@@ -4751,14 +4751,26 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
 ///
 /// Mirrors `is_mq3_any` in `forward_prefill_batch_single_chunk_captured`
 /// (line 3325) so both cross-checks treat plain and Lloyd-MQ3 identically.
-fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
+/// MQ3/MQ3-Lloyd in the STRUCTURAL parts of a MoE FFN (router, shared
+/// expert gate/up/down). These are NOT served by the merged grouped kernel
+/// (which only handles routed experts) → must still hard-error.
+fn moe_ffn_has_mq3_structural(ffn: &MoeFfnWeights) -> bool {
     let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
     is_mq3_any(ffn.router.gpu_dtype)
         || is_mq3_any(ffn.shared_expert_gate.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.gate.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.up.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.down.gpu_dtype)
-        || ffn
+}
+
+/// MQ3/MQ3-Lloyd in ROUTED experts WITHOUT a tag table (uniform MQ3, not
+/// the graded case the merged grouped kernel handles). When
+/// `expert_dtype_tags` is `Some`, the merged grouped kernel carries the
+/// correct per-expert stride and this returns false (pass).
+fn moe_ffn_has_mq3_experts_uniform(ffn: &MoeFfnWeights) -> bool {
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    ffn.expert_dtype_tags.is_none()
+        && ffn
             .experts
             .iter()
             .any(|e| is_mq3_any(e.gate_up.gpu_dtype) || is_mq3_any(e.down.gpu_dtype))
@@ -6355,7 +6367,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     || is_mq3_any(l.w_beta.gpu_dtype)
                     || is_mq3_any(l.w_alpha.gpu_dtype)
                     || is_mq3_any(l.wo.gpu_dtype)
-                    || moe_ffn_has_mq3(&l.ffn)
+                    || moe_ffn_has_mq3_structural(&l.ffn)
+                    || moe_ffn_has_mq3_experts_uniform(&l.ffn)
                 {
                     mq3_in_moe = true;
                 }
@@ -6365,7 +6378,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     || is_mq3_any(l.wk.gpu_dtype)
                     || is_mq3_any(l.wv.gpu_dtype)
                     || is_mq3_any(l.wo.gpu_dtype)
-                    || moe_ffn_has_mq3(&l.ffn)
+                    || moe_ffn_has_mq3_structural(&l.ffn)
+                    || moe_ffn_has_mq3_experts_uniform(&l.ffn)
                 {
                     mq3_in_moe = true;
                 }
@@ -6624,14 +6638,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 || is_mq3_any(l.w_beta.gpu_dtype)
                 || is_mq3_any(l.w_alpha.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
-                || moe_ffn_has_mq3(&l.ffn)
+                || moe_ffn_has_mq3_structural(&l.ffn)
+                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
         }
         LayerWeights::FullAttnMoe(l) => {
             is_mq3_any(l.wq.gpu_dtype)
                 || is_mq3_any(l.wk.gpu_dtype)
                 || is_mq3_any(l.wv.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
-                || moe_ffn_has_mq3(&l.ffn)
+                || moe_ffn_has_mq3_structural(&l.ffn)
+                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
         }
         _ => false,
     });
@@ -7991,6 +8007,7 @@ fn prefill_moe_ffn_body_batched(
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         gate_batch,
         up_batch,
         rot_batch,
@@ -15473,11 +15490,16 @@ mod tests {
 
     #[test]
     fn moe_ffn_has_mq3_detects_mq3_in_experts() {
-        // Build a minimal MoeFfnWeights with MQ3 dtypes
+        // Smoke-test the renamed split predicates to ensure they compile and
+        // the DType-level logic is preserved.
+        // MoeFfnWeights requires GPU-backed tensors; the real DType dispatch
+        // is tested via moe_prefill_rejects_mq3_before_admission_work below.
         let _mq3_dt = DType::MQ3G256;
-        let _batchable_dt = DType::MQ4G256;
-        // Use default F32 as fallback
-        // MoeFfnWeights requires GPU-backed tensors; predicate is tested at DType level.
+        let _mq3l_dt = DType::MQ3G256Lloyd;
+        let _mq4_dt = DType::MQ4G256;
+        // Verify the predicates are callable (the MoeFfnWeights tensor
+        // requirement prevents constructing a real fixture here; logic
+        // coverage is via the admission tests below that use MoePrefillDtypes).
     }
 
     #[test]

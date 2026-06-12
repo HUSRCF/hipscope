@@ -1507,6 +1507,26 @@ pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma.gfx12.hip");
 
+/// gfx11 (RDNA3/3.5) merged dtype-tag MoE grouped-WMMA prefill kernel.
+/// Handles all four per-expert precision tiers in one kernel via a
+/// block-uniform `dtype_tags[expert_id]` branch (zero warp divergence):
+///   tag 0 = MQ6 (200 B/group), tag 1 = MQ2-Lloyd (72 B/group),
+///   tag 2 = MQ4 (136 B/group),  tag 3 = MQ3-Lloyd (112 B/group).
+/// Enables T3-3L graded-precision MoE batched prefill on gfx1100/gfx1151.
+/// Kernarg layout: expert_weight_ptrs, dtype_tags, expert_tile_ids,
+/// sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) merged dtype-tag MoE grouped-WMMA prefill kernel.
+/// Same four-tag dispatch as `GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC` but
+/// uses the gfx12 _w32_gfx12 WMMA intrinsic, half8_t operands, K4-unroll,
+/// and k_grp=tid>>4 output mapping. Covers all four dtype tiers including
+/// an inline gfx12 MQ2-Lloyd port (no separate source file exists for that
+/// one). Same kernarg layout as the gfx11 sibling.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma.gfx12.hip");
+
 /// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
 /// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks

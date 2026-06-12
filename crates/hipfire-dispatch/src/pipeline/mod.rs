@@ -1007,6 +1007,7 @@ const MOE_GROUPED_BLOCK_M: usize = 16;
 fn dispatch_grouped_gemm(
     gpu: &mut Gpu,
     dtype: DType,
+    expert_dtype_tags: Option<&GpuTensor>,
     ptrs: &GpuTensor,
     tile_ids: &GpuTensor,
     sorted_slot_index: &GpuTensor,
@@ -1022,6 +1023,13 @@ fn dispatch_grouped_gemm(
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+    // Mixed per-expert: the merged grouped kernel carries the per-expert stride
+    // via the dtype_tags table; takes priority over the uniform dtype dispatch.
+    if let Some(tags) = expert_dtype_tags {
+        return hip!(gpu.gemm_mixed_moe_grouped_wmma(
+            ptrs, tags, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        ));
     }
     match dtype {
         DType::MQ4G256 => hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
@@ -1126,7 +1134,7 @@ pub fn run_moe_prefill(
             ))?;
         }
         dispatch_grouped_gemm(
-            gpu, p.dtypes.routed_gate_up,
+            gpu, p.dtypes.routed_gate_up, p.expert_dtype_tags,
             p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
             p.x_rot_batch, p.y_gate_up_grouped,
             2 * mi, gate_up_k, k_top, path2_m_total, n,
@@ -1230,7 +1238,7 @@ pub fn run_moe_prefill(
     if res.use_path2 {
         // Path 2: grouped-WMMA-GEMM + non-atomic combine via inverse_perm.
         dispatch_grouped_gemm(
-            gpu, p.dtypes.routed_down,
+            gpu, p.dtypes.routed_down, p.expert_dtype_tags,
             p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
             p.rot_batch, p.y_down_grouped,
             down_m, down_k, 1 /* x_row_div */, path2_m_total, total_slots,

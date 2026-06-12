@@ -11497,6 +11497,124 @@ impl Gpu {
         result
     }
 
+    /// Merged dtype-tag MoE grouped-WMMA prefill kernel.
+    ///
+    /// Routes each workgroup to the correct per-expert dequant body via a
+    /// block-uniform `dtype_tags[expert_id]` branch (zero warp divergence):
+    ///   tag 0 = MQ6 (200 B/group), tag 1 = MQ2-Lloyd (72 B/group),
+    ///   tag 2 = MQ4 (136 B/group),  tag 3 = MQ3-Lloyd (112 B/group).
+    ///
+    /// Kernarg layout differs from the uniform grouped launchers by inserting
+    /// `dtype_tags` as the 2nd argument (after `expert_weight_ptrs`):
+    ///   expert_weight_ptrs, dtype_tags, expert_tile_ids, sorted_slot_index,
+    ///   X_src, Y_grouped, M, K, x_row_div, m_total.
+    ///
+    /// `x_row_div = k_top` for gate_up, `1` for down — the kernel uses this
+    /// to construct the correct input row index, same as the uniform launchers.
+    ///
+    /// Arch dispatch: gfx1200/1201 (RDNA4) → `_gfx12` kernel (half8_t /
+    /// K4-unroll / _w32_gfx12 WMMA); gfx1100/1101/1102/1150/1151 (RDNA3/3.5)
+    /// → `_k2` kernel (half16_t / K2-unroll / _w32 WMMA). Requires WMMA on
+    /// the current arch — returns an error for non-WMMA archs (gfx9*, gfx10*).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mixed_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_dtype_tags: &GpuTensor,  // [E] u8 (DType::Raw) — tag 0/1/2/3
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to FP16)
+        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mixed_moe_grouped_wmma: requires WMMA (gfx11 or gfx12); \
+                     current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        let (kernel_name, kernel_src) = if is_gfx12 {
+            (
+                "gemm_mixed_moe_grouped_wmma_gfx12",
+                kernels::GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_mixed_moe_grouped_wmma_k2",
+                kernels::GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC,
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let dtp = expert_dtype_tags.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW estimate: mixed row footprint — use MQ4 as a conservative middle estimate.
+        let bytes =
+            m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(dtp);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///

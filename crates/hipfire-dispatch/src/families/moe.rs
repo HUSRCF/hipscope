@@ -420,6 +420,10 @@ pub struct MoePrefillParams<'a> {
     /// superseding the single-scale `down_awq_scale` stub below for routed
     /// experts. `None` (default) = plain silu+rotate.
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// Per-expert mixed-precision prefill: `[n_exp]` u8 dtype-tag table,
+    /// `Some` iff the routed experts carry mixed dtypes (graded T3-3L). Drives
+    /// the merged grouped-WMMA prefill kernel. `None` ⇒ uniform path, byte-identical.
+    pub expert_dtype_tags: Option<&'a GpuTensor>,
     // intermediate buffers
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,
@@ -497,6 +501,12 @@ impl MoePrefillResolution {
         let mq5_on_non_gfx12 = d.routed_gate_up == DType::MQ5G256
             && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq5_on_non_gfx12;
+        // Mixed per-expert: the merged grouped kernel covers all four dtype
+        // tags on any WMMA arch (gfx11 _k2 or gfx12 .gfx12). The routed
+        // representative dtype may be MQ6/MQ5 and trip the suppression above,
+        // so re-admit Path 2 when the file is graded-mixed (tag table present).
+        let use_path2 = use_path2
+            || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
