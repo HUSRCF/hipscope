@@ -113,7 +113,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 => RotationPlan::FwhtG256,
+        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -130,7 +130,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
+        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MQ4G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -194,6 +194,9 @@ pub enum KernelKey {
     GemvMq3G256Lloyd,
     GemvMq4G256Lloyd,
     GemvMfp4G32,
+    GemvMfp4G32Lloyd,
+    GemvMfp4G32P,
+    GemvMfp4G32E8,
     GemvMfp4G32Fused,
     GemvHfp4G32,
     GemvParoQ4G128,
@@ -211,6 +214,9 @@ pub enum KernelKey {
     GemvMq3G256LloydPrerotated,
     GemvMq4G256LloydPrerotated,
     GemvMfp4G32Prerotated,
+    GemvMfp4G32LloydPrerotated,
+    GemvMfp4G32PPrerotated,
+    GemvMfp4G32E8Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -543,6 +549,9 @@ impl KernelKey {
             (MQ3G256Lloyd, Plain) => Ok(Self::GemvMq3G256Lloyd),
             (MQ4G256Lloyd, Plain) => Ok(Self::GemvMq4G256Lloyd),
             (MFP4G32, Plain) => Ok(Self::GemvMfp4G32),
+            (MFP4G32Lloyd, Plain) => Ok(Self::GemvMfp4G32Lloyd),
+            (MFP4G32P, Plain) => Ok(Self::GemvMfp4G32P),
+            (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
@@ -568,6 +577,9 @@ impl KernelKey {
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydPrerotated),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
+            MFP4G32Lloyd => Ok(Self::GemvMfp4G32LloydPrerotated),
+            MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
+            MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -651,7 +663,7 @@ impl KernelKey {
             // is gfx906-only. The two are unrelated ISA features.
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
-            | HFP4G32 | MFP4G32
+            | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
             | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             MQ3G256 => ArchPredicate::HasWmma,
@@ -707,6 +719,6 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
         dtype,
         MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
             | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-            | MFP4G32 | ParoQ4G128
+            | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | ParoQ4G128
     )
 }

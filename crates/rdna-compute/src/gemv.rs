@@ -2943,6 +2943,171 @@ impl Gpu {
         self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
     }
 
+    /// MFP4G32-Lloyd GEMV. Uses the per-tensor 16-entry Lloyd codebook stored
+    /// as a 32-B prefix before row 0. x must already be FWHT-rotated.
+    pub fn gemv_mfp4g32_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_lloyd requires K%256==0, got K={k}");
+        self.ensure_kernel(
+            "gemv_mfp4g32_lloyd",
+            kernels::GEMV_MFP4G32_LLOYD_SRC,
+            "gemv_mfp4g32_lloyd",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_lloyd"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// MFP4G32-Lloyd prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_lloyd_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// mfp4+P GEMV. mfp4 byte layout (NO prefix) but the per-32-block scale byte
+    /// is E4M3 (FP8, non-power-of-2). x must already be FWHT-rotated. Uses the
+    /// hard-coded E2M1 lattice (like gemv_hfp4g32), decoding the scale as E4M3.
+    pub fn gemv_mfp4g32_p(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_p requires K%256==0, got K={k}");
+        self.ensure_kernel(
+            "gemv_mfp4g32_p",
+            kernels::GEMV_MFP4G32_P_SRC,
+            "gemv_mfp4g32_p",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_p"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4+P prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_p_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_p(a_raw, x_rot, y, m, k)
+    }
+
+
+    /// mfp4-E8 GEMV. mfp4+P byte layout (NO prefix) but the 16-B data region per block
+    /// contains 4x32-bit E8 lattice codewords (8 weights/codeword), not E2M1 nibbles.
+    /// x must already be FWHT-rotated. Decodes block scale as E4M3, then E8 coords * 0.88.
+    pub fn gemv_mfp4g32_e8(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_e8 requires K%256==0, got K={k}");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8",
+            kernels::GEMV_MFP4G32_E8_SRC,
+            "gemv_mfp4g32_e8",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_e8"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4-E8 prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_e8_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_e8(a_raw, x_rot, y, m, k)
+    }
+
     /// Fused FWHT rotation + FP8 pack for the decode FP8 path.
     /// Writes both F32 (into `x_rot`) and FP8 (into `mq_x_rot_fp8`
     /// sibling scratch) in one kernel launch. Returns the FP8 buffer's

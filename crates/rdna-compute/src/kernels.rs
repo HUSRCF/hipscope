@@ -1027,6 +1027,12 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
 /// Block: per-row 16 B header (row_scale_a:f16, row_scale_b:f16, block_count, flags),
 /// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
 pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
+pub const GEMV_MFP4G32_LLOYD_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_lloyd.hip");
+pub const GEMV_MFP4G32_P_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_p.hip");
+pub const GEMV_MFP4G32_E8_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.
@@ -1702,6 +1708,12 @@ pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_lloyd_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_P_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_p_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_E8_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_e8_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for

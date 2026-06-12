@@ -1479,6 +1479,50 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        32 => {
+            // MFP4G32Lloyd lm_head: mfp4 rows + 32-B per-tensor fp16 codebook prefix.
+            assert!(k % 256 == 0, "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32Lloyd,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        33 => {
+            // MFP4G32P lm_head: mfp4+P — mfp4 rows with E4M3 per-block scale. NO prefix;
+            // byte-identical layout to MFP4G32 (qt 24).
+            assert!(k % 256 == 0, "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32P,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        34 => {
+            // MFP4G32E8 lm_head: mfp4-E8 — mfp4+P container, NO prefix, same row_bytes;
+            // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
+            assert!(k % 256 == 0, "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
@@ -2676,6 +2720,143 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 let scale_inv = 0.0625; // 1/sqrt(256)
                 for i in 0..256 {
                     group[i] *= scale_inv * signs1[i];
+                }
+            }
+            out
+        }
+        32 => {
+            // MFP4G32Lloyd (qt 32): [32-B fp16 codebook prefix][M rows].
+            // Each row = 16-B header + (K/32)*17 B blocks (UE8M0 + nibbles).
+            // Recon: value = row_scale_a * 2^(block_e-127) * cb[nibble].
+            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { (data.len().saturating_sub(32)) / row_bytes } else { 0 };
+            let mut cb = [0.0f32; 16];
+            for i in 0..16 {
+                let bits = u16::from_le_bytes([data[2*i], data[2*i+1]]);
+                cb[i] = hipfire_runtime::llama::f16_to_f32(bits);
+            }
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = 32 + r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base+1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let block_e = data[po] as i32;
+                    let scale = row_scale_a * ((block_e - 127) as f32).exp2();
+                    for i in 0..16 {
+                        let byte = data[po + 1 + i];
+                        out[r*k_row + b*32 + 2*i]     = scale * cb[(byte & 0x0F) as usize];
+                        out[r*k_row + b*32 + 2*i + 1] = scale * cb[((byte >> 4) & 0x0F) as usize];
+                    }
+                }
+            }
+            out
+        }
+        33 => {
+            // MFP4G32P (qt 33): mfp4 rows (NO prefix) with E4M3 (FP8) per-block scale.
+            // Recon: value = row_scale_a * e4m3_decode(scale_byte) * E2M1_LUT[nibble].
+            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
+            const E2M1_MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            #[inline]
+            fn e2m1(n: u8) -> f32 {
+                let m = E2M1_MAG[(n & 0x7) as usize];
+                if (n & 0x8) != 0 { -m } else { m }
+            }
+            // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
+            // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
+            #[inline]
+            fn e4m3(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let scale = row_scale_a * e4m3(data[po]);
+                    for i in 0..16 {
+                        let byte = data[po + 1 + i];
+                        out[r*k_row + b*32 + 2*i]     = scale * e2m1(byte & 0x0F);
+                        out[r*k_row + b*32 + 2*i + 1] = scale * e2m1((byte >> 4) & 0x0F);
+                    }
+                }
+            }
+            out
+        }
+        34 => {
+            // MFP4G32E8 (qt 34): mfp4+P container, NO prefix, with E8-lattice codewords.
+            // Identical framing to qt 33 (E4M3 block scale, row_scale f16); per block
+            // decode 4 E8 codewords instead of 32 E2M1 nibbles.
+            // E8 decode — bit-identical to e8.rs::decode_index + * QUANT_STEP.
+            #[inline]
+            fn e4m3_e8(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            #[inline]
+            fn e8_decode(idx: u32, coord: usize) -> f32 {
+                // Decode a single coord of an E8 lattice point from a u32 index.
+                // Matches kernel e8_decode_index exactly.
+                let coset = (idx >> 31) & 1;
+                let e: u32;
+                if coord < 7 {
+                    e = (idx >> (4 * coord as u32)) & 0xF;
+                } else {
+                    // coord == 7: recover from parity
+                    let mut sl: u32 = 0;
+                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    let e7h = (idx >> 28) & 0x7;
+                    let p7 = e7h << 1;
+                    let lsb = (sl + p7) & 1;
+                    e = p7 | lsb;
+                }
+                let c = (e as i32 - 7) as f32;
+                if coset == 1 { c + 0.5 } else { c }
+            }
+            const QUANT_STEP: f32 = 0.88;
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let scale = row_scale_a * e4m3_e8(data[po]) * QUANT_STEP;
+                    for g in 0..4usize {
+                        let idx = u32::from_le_bytes([
+                            data[po + 1 + g * 4],
+                            data[po + 2 + g * 4],
+                            data[po + 3 + g * 4],
+                            data[po + 4 + g * 4],
+                        ]);
+                        for i in 0..8usize {
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode(idx, i);
+                        }
+                    }
                 }
             }
             out

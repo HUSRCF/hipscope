@@ -164,6 +164,15 @@ pub enum DType {
     // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
     // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
     // is shared with HFP4G32.
+    MFP4G32Lloyd, // mfp4 + per-tensor 16-entry fp16 Lloyd codebook. Same per-row byte
+    // layout as MFP4G32, plus a 32-B codebook prefix before row 0. format_flags=0x05
+    // (same FWHT rotation as MFP4G32); recon uses codebook[nibble] not E2M1_LUT.
+    MFP4G32P, // mfp4+P — mfp4 (E2M1 + FP16 row scale + offline FWHT) with the per-32-block
+    // UE8M0 scale promoted to E4M3 (FP8, non-power-of-2). Byte layout BYTE-IDENTICAL to
+    // MFP4G32 (NO prefix); only the per-block scale byte's decode differs (E4M3 vs UE8M0).
+    MFP4G32E8, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
+    // with the per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
+    // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, byte-IDENTICAL footprint to MFP4G32P.
     HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -204,6 +213,9 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::HFP4G32
             | DType::MFP4G32
+            | DType::MFP4G32Lloyd
+            | DType::MFP4G32P
+            | DType::MFP4G32E8
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }
@@ -692,6 +704,143 @@ impl Gpu {
                 func,
                 [m as u32, groups, 1],
                 [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize MFP4G32-Lloyd matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (32-B codebook prefix + M rows).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Grid: [M, K/256]. Block: [32]. Mirrors dequantize_hfq4g256_to_f16 shape.
+    pub fn dequantize_mfp4g32_lloyd_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_lloyd dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_lloyd_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC,
+            "dequantize_mfp4g32_lloyd_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_lloyd_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize an mfp4+P matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical to mfp4).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Decodes the per-block scale byte as E4M3 (FP8). Grid: [M, K/256]. Block: [32].
+    pub fn dequantize_mfp4g32_p_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_p dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_p_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_P_TO_F16_SRC,
+            "dequantize_mfp4g32_p_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_p_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+
+    /// Dequantize an mfp4-E8 matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical footprint to mfp4+P).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Decodes the per-block scale byte as E4M3 (FP8) * QUANT_STEP, then E8 coords.
+    /// Grid: [M, K/256]. Block: [32].
+    pub fn dequantize_mfp4g32_e8_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_e8 dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_e8_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_E8_TO_F16_SRC,
+            "dequantize_mfp4g32_e8_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_e8_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

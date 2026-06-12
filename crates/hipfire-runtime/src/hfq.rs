@@ -718,6 +718,25 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        32 => { // MFP4G32Lloyd -- mfp4 rows + 32-B per-tensor fp16 codebook prefix.
+                // data_size already includes the +32 B prefix; upload verbatim.
+            assert!(k % 256 == 0, "MFP4G32Lloyd weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        33 => { // MFP4G32P -- mfp4+P: mfp4 rows with E4M3 (non-power-of-2) per-block scale.
+                // Byte-IDENTICAL layout to MFP4G32 (qt 24): NO prefix, same row_bytes.
+                // Only the per-block scale byte's decode differs (E4M3 vs UE8M0).
+            assert!(k % 256 == 0, "MFP4G32P weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32P, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        34 => { // MFP4G32E8 — mfp4-E8: mfp4+P container, NO prefix, same row_bytes;
+                // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
+            assert!(k % 256 == 0, "MFP4G32E8 weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         31 => { // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
                 // AWQ sidecar attached centrally below via supports_awq_sidecar().
             let buf = gpu.upload_raw(data, &[data.len()])?;
