@@ -115,9 +115,24 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 - Config: `~/.hipfire/config.json`
 - Per-model overlay: `~/.hipfire/per_model_config.json`
 - Local model aliases: `~/.hipfire/models.json`
+- Dynamic registry cache: `~/.hipfire/registry.cache.json`
 - Pre-compiled kernels: `~/.hipfire/bin/kernels/<arch>/`
 - Daemon log: `~/.hipfire/serve.log`
 - Daemon pid file: `~/.hipfire/serve.pid`
+
+## Dynamic model registry
+
+Compiled `hipfire` binaries inline `cli/registry.json` at build time, so on
+its own a shipped binary would never learn about new models. At startup the
+CLI fetches `registry/v1.json` from this repo's `master` branch (regenerated
+daily from the HF Hub by `.github/workflows/registry.yml` →
+`scripts/registry_gen.py`) and caches it for 24h at
+`~/.hipfire/registry.cache.json`. Fallback chain: fresh cache → network →
+stale cache → bundled registry — offline use always works, and a registry
+that fails validation is rejected wholesale in favor of the next fallback.
+`hipfire diag` prints which source the current run used (`registry: ...`).
+v1 entries additionally carry `sha256` (HF LFS oid), `size_bytes`, `arch_id`
+(see `docs/architecture-ids.md`), and `quant` next to the legacy fields.
 
 ## Environment overrides
 
@@ -131,3 +146,5 @@ Single-invocation overrides bypass the config file:
 | `HIPFIRE_LOCAL=1` | `hipfire run` skips the HTTP daemon and spawns a fresh one-shot. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS=...` | Append flags to JIT kernel compilations. |
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | Dump per-position BPE merge-rank heat to stderr. |
+| `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin the bundled model registry (skip dynamic fetch + cache). |
+| `HIPFIRE_REGISTRY_URL=...` | Fetch the dynamic registry from a different URL. |
