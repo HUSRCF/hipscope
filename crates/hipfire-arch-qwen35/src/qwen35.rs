@@ -1337,208 +1337,306 @@ fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTenso
     }
 }
 
-pub fn load_weights(
-    hfq: &mut HfqFile,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<Qwen35Weights> {
-    // Drop the mmap on unix to avoid double-buffering on UMA systems.
-    // All tensor data reads go through pread + fadvise_dontneed, which
-    // doesn't require the mmap. On discrete-GPU systems this is harmless
-    // (pread is slightly slower than mmap but avoids page cache buildup).
-    #[cfg(unix)]
-    hfq.drop_mmap();
+// ── Layout ────────────────────────────────────────────────────────────────
 
-    eprintln!("  loading token_embd...");
-    if config.is_vl_text {
-        eprintln!(
-            "  qwen3.5-vl text wrapper: mrope_interleaved={} mrope_section={:?}",
-            config.mrope_interleaved, config.mrope_section
-        );
-    }
-    let (embd_meta, embd_data) =
-        qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
-    let embd_qt = embd_meta.quant_type;
-    let (token_embd, embd_fmt) =
-        load_embedding(gpu, embd_qt, &embd_data, config.vocab_size, config.dim)?;
-    drop(embd_data); // free source buffer before loading more tensors
-
-    eprintln!("  loading output_norm...");
-    // GemmaRMSNorm storage convention is uniform across the Qwen3.5+ family:
-    // safetensors store raw `w` (init from zero, can train to any magnitude),
-    // engines apply `(1 + w)` at runtime. Hipfire's `load_norm_weight` bakes
-    // `+= 1.0` at load time so the kernel can stay plain `x * w * rms` —
-    // mathematically equivalent to vLLM's runtime `weight + 1.0` and
-    // llama.cpp's GGUF-conversion-time bake. See
-    // docs/plans/qwen35-moe-rmsnorm-fix.md for the concrete arithmetic trace.
-    //
-    // The earlier `if config.num_experts > 0` fork (commit 1e01c0b) skipped
-    // the `+= 1.0` bake on MoE final norms to silence a `<think>` infinite-
-    // spiral on Qwen3.6-A3B reasoning prompts. That under-scaled the MoE
-    // final norm by ~38% (e.g. on 3.6-A3B: stored mean +1.63 → effective
-    // scale 1.63 instead of the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp
-    // produce). It was a magnitude mask, not a fix — the spiral's real root
-    // cause was the daemon's `repeat_penalty` default of 1.3 over a 128-token
-    // window penalizing legitimately repeated chain-of-thought formatting
-    // tokens, which fell off the model's well-trained reasoning path into a
-    // self-doubt / number-hallucination attractor (fixed in commit 9b4ab74a:
-    // default repeat_penalty 1.3 → 1.0). Bench A/B on Qwen3.6-35B-A3B MQ4
-    // confirms the spiral is dissolved with the new default; the prior
-    // `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` env-var escape hatch was removed
-    // together with this fork.
-    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
-
-    // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
-    let lm_head_info = qwen35_tensor_data_vec(hfq, "lm_head.weight");
-    let lm_head_is_tied = lm_head_info.is_none();
-    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
-        eprintln!(
-            "  loading output (separate lm_head, qt={})...",
-            lm_info.quant_type
-        );
-        load_weight_tensor_raw(
-            gpu,
-            lm_info.quant_type,
-            &lm_data,
-            config.vocab_size,
-            config.dim,
-        )?
-    } else {
-        // Single-GPU path: alias the embedding buffer instead of re-uploading.
-        // This saves vocab × dim × dtype_bytes of VRAM (the tied-lm_head
-        // double-alloc that the prior code paid on every load).
-        eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
-        WeightTensor {
-            buf: token_embd.shallow_clone(),
-            gpu_dtype: embedding_format_dtype(embd_fmt),
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
+/// Where each piece of the model lands across a device slice. `single` = the
+/// n==1 degenerate case (everything on device 0).
+struct Layout {
+    output_device: usize,
+    layer_to_device: Vec<usize>,
+}
+impl Layout {
+    fn single(n_layers: usize) -> Self {
+        Self {
+            output_device: 0,
+            layer_to_device: vec![0; n_layers],
         }
-    };
-    attach_lm_head_awq_sidecar(hfq, gpu, &mut output, config.dim);
+    }
+    fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
+        Self {
+            output_device: g.output_device,
+            layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
+        }
+    }
+    fn device_for_layer(&self, i: usize) -> usize {
+        self.layer_to_device[i]
+    }
+}
 
-    let is_moe = config.num_experts > 0;
+// ── WeightSource trait ────────────────────────────────────────────────────
+
+/// Whole-model weight source — the one place HFQ vs PaRo differs. Each method
+/// uploads to the caller-chosen `gpu` (native multi-GPU: the driver picks the
+/// device). `read_layer` reuses Tier-3 `load_layer<B>` internally.
+trait WeightSource {
+    /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1.
+    fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
+    fn read_embed(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+    ) -> HipResult<(GpuTensor, EmbeddingFormat)>;
+    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor>;
+    /// `can_alias` is true iff embed and output share a device (n==1); then the
+    /// tied lm_head aliases the embedding buffer instead of re-uploading.
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)>;
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        layer_idx: usize,
+    ) -> HipResult<LayerWeights>;
+}
+
+fn assemble_weights(
+    source: &mut dyn WeightSource,
+    devices: &mut [Gpu],
+    layout: &Layout,
+    config: &Qwen35Config,
+) -> HipResult<Qwen35Weights> {
+    source.prepare(devices.len())?;
+    let out_dev = layout.output_device;
+    let can_alias = devices.len() == 1;
+    let (token_embd, embd_format) = source.read_embed(&mut devices[0], config)?;
+    let output_norm = source.read_final_norm(&mut devices[out_dev], config)?;
+    let (output, lm_head_aliases_embd) = source.read_output(
+        &mut devices[out_dev],
+        config,
+        &token_embd,
+        embd_format,
+        can_alias,
+    )?;
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!(
-            "  loading layer {i}/{} ({:?}{})...",
-            config.n_layers,
-            config.layer_types[i],
-            if is_moe { " + MoE" } else { "" }
-        );
-        let p = format!("layers.{i}");
-        // Track page range for this layer so we can MADV_DONTNEED after upload.
-        let layer_page_start = hfq.layer_data_range(&p);
-
-        layers.push(load_layer_into(hfq, config, i, &p, gpu)?);
-        // Drop mmap page cache for this layer (supplements pread-based loading).
-        if let Some((start, end)) = layer_page_start {
-            hfq.drop_pages_range(start, end - start);
-        }
+        let d = layout.device_for_layer(i);
+        layers.push(source.read_layer(&mut devices[d], config, i)?);
     }
-
     Ok(Qwen35Weights {
         token_embd,
-        embd_format: embd_fmt,
+        embd_format,
         output_norm,
         output,
         moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
-        // MAD-93: paged construction goes through `load_weights_paged` (added
-        // alongside the moe_ffn_decode_impl wiring in a follow-up commit).
-        // The non-paged `load_weights` always returns `None` so today's
-        // callers see no behavior change.
         pager: None,
-        lm_head_aliases_embd: lm_head_is_tied,
+        lm_head_aliases_embd,
     })
 }
 
-pub fn load_weights_paroquant(
-    source: &dyn ModelSource,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<Qwen35Weights> {
-    source
-        .quant_config()
-        .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
+// ── HfqSource ─────────────────────────────────────────────────────────────
 
-    let mp = paro_text_prefix(source)?;
-    eprintln!("  loading token_embd (ParoQuant)...");
-    let embd_name = format!("{mp}.embed_tokens.weight");
-    let (_, embd_data) = source.tensor_data(&embd_name).ok_or_else(|| {
-        HipError::new(
-            0,
-            &format!("PARO tensor not found: embed_tokens not found at {embd_name}"),
-        )
-    })?;
-    let f32_embd: Vec<f32> = embd_data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
-    let embd_fmt = EmbeddingFormat::F32;
+struct HfqSource<'a> {
+    hfq: &'a HfqFile,
+}
+impl<'a> HfqSource<'a> {
+    fn new(hfq: &'a HfqFile) -> Self {
+        Self { hfq }
+    }
+}
+impl WeightSource for HfqSource<'_> {
+    fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+        Ok(())
+    }
 
-    eprintln!("  loading output_norm...");
-    let output_norm = paro_load_norm(source, gpu, "norm.weight", &[config.dim], 1.0)?;
-
-    // Prefer separate lm_head when checkpoint provides one (tie_word_embeddings:false);
-    // fall back to embed_tokens for tied checkpoints. shisa-ai/Qwen3.6-35B-A3B-PARO
-    // ships a distinct lm_head.weight; tying would project logits against the wrong
-    // matrix and produce coherent-but-semantically-wrong output (decoded as token 118401
-    // "出错" on the smoke prompt before this fix).
-    let lm_head_name = String::from("lm_head.weight");
-    let (output_src_name, output_tied) = if source.tensor_data(&lm_head_name).is_some() {
-        (lm_head_name, false)
-    } else {
-        (embd_name, true)
-    };
-    eprintln!(
-        "  loading output ({})...",
-        if output_tied {
-            "tied embeddings"
-        } else {
-            "separate lm_head"
+    fn read_embed(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+    ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        eprintln!("  loading token_embd...");
+        if c.is_vl_text {
+            eprintln!(
+                "  qwen3.5-vl text wrapper: mrope_interleaved={} mrope_section={:?}",
+                c.mrope_interleaved, c.mrope_section
+            );
         }
-    );
-    let output = {
-        let (_, td) = source.tensor_data(&output_src_name).ok_or_else(|| {
-            HipError::new(
-                0,
-                &format!("PARO tensor not found: output projection tensor {output_src_name}"),
-            )
-        })?;
-        let f: Vec<f32> = td
+        let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+            .expect("embed_tokens not found");
+        let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
+        drop(embd_data);
+        Ok(out)
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor> {
+        eprintln!("  loading output_norm...");
+        load_norm_weight(self.hfq, gpu, "norm.weight", &[c.dim])
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        let lm_head_info = qwen35_tensor_data_vec(self.hfq, "lm_head.weight");
+        let lm_head_is_tied = lm_head_info.is_none();
+        let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
+            eprintln!(
+                "  loading output (separate lm_head, qt={})...",
+                lm_info.quant_type
+            );
+            load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)?
+        } else if can_alias {
+            eprintln!("  loading output (tied embeddings, aliased)...");
+            WeightTensor {
+                buf: embd.shallow_clone(),
+                gpu_dtype: embedding_format_dtype(embd_fmt),
+                m: c.vocab_size,
+                k: c.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        } else {
+            let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+                .expect("embed_tokens not found");
+            eprintln!(
+                "  loading output (tied embeddings, reupload qt={})...",
+                embd_meta.quant_type
+            );
+            dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?
+        };
+        attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
+        Ok((output, lm_head_is_tied && can_alias))
+    }
+
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        layer_idx: usize,
+    ) -> HipResult<LayerWeights> {
+        let is_moe = c.num_experts > 0;
+        eprintln!(
+            "  loading layer {layer_idx}/{} ({:?}{})...",
+            c.n_layers,
+            c.layer_types[layer_idx],
+            if is_moe { " + MoE" } else { "" }
+        );
+        let p = format!("layers.{layer_idx}");
+        let page = self.hfq.layer_data_range(&p);
+        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu)?;
+        if let Some((start, end)) = page {
+            self.hfq.drop_pages_range(start, end - start);
+        }
+        Ok(lw)
+    }
+}
+
+// ── ParoSource ────────────────────────────────────────────────────────────
+
+struct ParoSource<'a> {
+    source: &'a dyn ModelSource,
+    mp: &'static str,
+}
+impl<'a> ParoSource<'a> {
+    fn new(source: &'a dyn ModelSource) -> HipResult<Self> {
+        source
+            .quant_config()
+            .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
+        let mp = paro_text_prefix(source)?;
+        Ok(Self { source, mp })
+    }
+    fn read_f16_as_f32(&self, name: &str) -> HipResult<Vec<f32>> {
+        let (_, data) = self
+            .source
+            .tensor_data(name)
+            .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
+        Ok(data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+            .collect())
+    }
+}
+impl WeightSource for ParoSource<'_> {
+    fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        if n_devices > 1 {
+            return Err(HipError::new(
+                0,
+                "ParoQuant multi-GPU loading is not supported (HFQ-only)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_embed(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+    ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        eprintln!("  loading token_embd (ParoQuant)...");
+        let f32_embd = self.read_f16_as_f32(&format!("{}.embed_tokens.weight", self.mp))?;
+        let token_embd = gpu.upload_f32(&f32_embd, &[c.vocab_size, c.dim])?;
+        Ok((token_embd, EmbeddingFormat::F32))
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor> {
+        eprintln!("  loading output_norm...");
+        paro_load_norm(self.source, gpu, "norm.weight", &[c.dim], 1.0)
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        _embd: &GpuTensor,
+        _embd_fmt: EmbeddingFormat,
+        _can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        let embd_name = format!("{}.embed_tokens.weight", self.mp);
+        let (src_name, tied) = if self.source.tensor_data("lm_head.weight").is_some() {
+            (String::from("lm_head.weight"), false)
+        } else {
+            (embd_name, true)
+        };
+        eprintln!(
+            "  loading output ({})...",
+            if tied {
+                "tied embeddings"
+            } else {
+                "separate lm_head"
+            }
+        );
+        let f = self.read_f16_as_f32(&src_name)?;
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
+        let buf = gpu.upload_raw(bytes, &[c.vocab_size, c.dim])?;
+        let output = WeightTensor {
             buf,
             gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
+            m: c.vocab_size,
+            k: c.dim,
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        }
-    };
+        };
+        Ok((output, false))
+    }
 
-    let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        c: &Qwen35Config,
+        layer_idx: usize,
+    ) -> HipResult<LayerWeights> {
         eprintln!(
-            "  loading layer {i}/{} ({:?}, ParoQuant)...",
-            config.n_layers, config.layer_types[i]
+            "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
+            c.n_layers, c.layer_types[layer_idx]
         );
         let mut b = ParoBackend {
-            source,
+            source: self.source,
             gpu,
-            mp,
-            layer: i,
+            mp: self.mp,
+            layer: layer_idx,
             norm_bias: 1.0,
         };
         let moe = |bk: &mut ParoBackend, cfg: &Qwen35Config, li: usize| {
@@ -1550,143 +1648,42 @@ pub fn load_weights_paroquant(
                 li as u16,
             )
         };
-        layers.push(crate::layer_driver::load_layer(&mut b, config, i, moe)?);
+        crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
     }
-
-    Ok(Qwen35Weights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        moe_has_mq6: layers_have_mq6_moe(&layers),
-        layers,
-        pager: None,
-        // ParoQuant path loads the lm_head separately (always untied per
-        // current checkpoint convention), so no alias.
-        lm_head_aliases_embd: false,
-    })
 }
 
-// @todo(unified-loading): multi-GPU is HFQ-only — no ParoBackend/safetensors
-// multi-GPU path (drop_pages_range has no ModelSource equivalent, band-routing
-// is HFQ-mmap-specific). See 2026-06-11-carrier-registry-unified-design.md.
-/// Multi-GPU weight loader. Variant 2 placement: `token_embd` on `gpus.devices[0]`,
-/// `output_norm + output` on `gpus.devices[gpus.output_device]`, each layer on
-/// `gpus.devices[gpus.device_for_layer(i)]`. The single-GPU `load_weights` path is
-/// not consumed by this — keeping it byte-exact for the pp=1 daemon.
-///
-/// `pager` is always `None` on this path: paged-experts (MAD-93) is not wired
-/// for pp>1 yet — would need per-band drain semantics in `WeightPager::free_all`.
+// ── Public wrappers (Task 5 collapses these) ───────────────────────────────
+
+pub fn load_weights(
+    hfq: &mut HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+) -> HipResult<Qwen35Weights> {
+    #[cfg(unix)]
+    hfq.drop_mmap();
+    let mut source = HfqSource::new(hfq);
+    let layout = Layout::single(config.n_layers);
+    assemble_weights(&mut source, std::slice::from_mut(gpu), &layout, config)
+}
+
+pub fn load_weights_paroquant(
+    source: &dyn ModelSource,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+) -> HipResult<Qwen35Weights> {
+    let mut src = ParoSource::new(source)?;
+    let layout = Layout::single(config.n_layers);
+    assemble_weights(&mut src, std::slice::from_mut(gpu), &layout, config)
+}
+
 pub fn load_weights_multi(
     hfq: &HfqFile,
     config: &Qwen35Config,
     gpus: &mut Gpus,
 ) -> HipResult<Qwen35Weights> {
-    let (token_embd, embd_fmt) = load_token_embd_into(hfq, config, &mut gpus.devices[0])?;
-    let out_dev = gpus.output_device;
-    let (output_norm, output) = load_output_into(hfq, config, &mut gpus.devices[out_dev])?;
-    let is_moe = config.num_experts > 0;
-    let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
-        let dev_idx = gpus.device_for_layer(i);
-        eprintln!(
-            "  loading layer {i}/{} on dev {dev_idx} ({:?}{})...",
-            config.n_layers,
-            config.layer_types[i],
-            if is_moe { " + MoE" } else { "" },
-        );
-        let p = format!("layers.{i}");
-        let layer_page_start = hfq.layer_data_range(&p);
-        layers.push(load_layer_into(
-            hfq,
-            config,
-            i,
-            &p,
-            &mut gpus.devices[dev_idx],
-        )?);
-        if let Some((start, end)) = layer_page_start {
-            hfq.drop_pages_range(start, end - start);
-        }
-    }
-    Ok(Qwen35Weights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        moe_has_mq6: layers_have_mq6_moe(&layers),
-        layers,
-        pager: None,
-        // Multi-GPU path never aliases — each output device gets its own
-        // upload (different physical GPU, cross-device alias impossible).
-        lm_head_aliases_embd: false,
-    })
-}
-
-fn load_token_embd_into(
-    hfq: &HfqFile,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-    eprintln!("  loading token_embd...");
-    if config.is_vl_text {
-        eprintln!(
-            "  qwen3.5-vl text wrapper: mrope_interleaved={} mrope_section={:?}",
-            config.mrope_interleaved, config.mrope_section
-        );
-    }
-    let embd_info = qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
-    load_embedding(
-        gpu,
-        embd_info.0.quant_type,
-        embd_info.1,
-        config.vocab_size,
-        config.dim,
-    )
-}
-
-fn load_output_into(
-    hfq: &HfqFile,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<(GpuTensor, WeightTensor)> {
-    eprintln!("  loading output_norm...");
-    // See the matching block in the main load path for the rationale —
-    // GemmaRMSNorm `+= 1.0` bake applies uniformly for dense and MoE.
-    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
-
-    let lm_head_info = qwen35_tensor_data(hfq, "lm_head.weight");
-    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
-        eprintln!(
-            "  loading output (separate lm_head, qt={})...",
-            lm_info.quant_type
-        );
-        load_weight_tensor_raw(
-            gpu,
-            lm_info.quant_type,
-            lm_data,
-            config.vocab_size,
-            config.dim,
-        )?
-    } else {
-        // Cross-device tied path: cannot alias the embedding buffer (it lives
-        // on device 0, the output lives on output_device). Collapse the old
-        // hand-written qt→DType match into one `dequant_weight_raw` call.
-        let embd_info =
-            qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
-        eprintln!(
-            "  loading output (tied embeddings, qt={})...",
-            embd_info.0.quant_type
-        );
-        dequant_weight_raw(
-            gpu,
-            embd_info.0.quant_type,
-            embd_info.1,
-            config.vocab_size,
-            config.dim,
-        )?
-    };
-    attach_lm_head_awq_sidecar(hfq, gpu, &mut output, config.dim);
-    Ok((output_norm, output))
+    let layout = Layout::from_gpus(gpus, config.n_layers);
+    let mut source = HfqSource::new(hfq);
+    assemble_weights(&mut source, &mut gpus.devices, &layout, config)
 }
 
 /// Build one layer's `LayerWeights` on `gpu`. Extracted for `load_weights_multi`
