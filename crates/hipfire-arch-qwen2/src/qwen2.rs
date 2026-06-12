@@ -31,8 +31,8 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, flat_name_candidates,
-    HfqBackend, load_embedding, WeightBackend,
+    dequant_f32, dequant_norm, dequant_weight_raw, flat_name_candidates,
+    HfqBackend, load_embedding, resolve_lm_head, WeightBackend,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -317,36 +317,29 @@ fn load_embed_tokens(
 /// produces a corrupted matmul (kernel reads F16 bytes as F32 values).
 /// See R4 in `docs/plans/dots-ocr-devlog.md` §7 for the catch history.
 ///
-/// TODO(transformer-extraction): the tied-embedding re-upload and the
-/// DType↔EmbeddingFormat mapping below are cross-arch primitives that
-/// also exist in `hipfire-arch-qwen35::qwen35::load_weights`. Move into
-/// `hipfire_runtime::transformer::lm_head` during consolidation; consider
-/// adding a `GpuTensor::shallow_clone` or moving to `Arc<GpuTensor>` so
-/// tied embeddings stop double-allocating VRAM.
 fn load_lm_head(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     cfg: &Qwen2Config,
     embd_token: &GpuTensor,
     embd_format: EmbeddingFormat,
 ) -> HipResult<(WeightTensor, bool)> {
-    if cfg.tie_word_embeddings {
-        // Single-GPU path: alias the embedding buffer instead of re-uploading.
-        // This saves vocab × hidden_size × dtype_bytes of VRAM.
-        let wt = WeightTensor {
-            buf: embd_token.shallow_clone(),
-            gpu_dtype: embedding_format_dtype(embd_format),
-            m: cfg.vocab_size,
-            k: cfg.hidden_size,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        };
-        Ok((wt, true))
-    } else {
-        let wt = load_weight_tensor(hfq, gpu, "lm_head.weight", cfg.vocab_size, cfg.hidden_size, flat_name_candidates)?;
-        Ok((wt, false))
-    }
+    resolve_lm_head(
+        gpu,
+        !cfg.tie_word_embeddings, // has_separate
+        true,                     // single-GPU: alias when tied
+        embd_token,
+        embd_format,
+        cfg.vocab_size,
+        cfg.hidden_size,
+        |gpu| {
+            load_weight_tensor(
+                hfq, gpu, "lm_head.weight", cfg.vocab_size, cfg.hidden_size, flat_name_candidates,
+            )
+        },
+        // qwen2 is single-GPU; the reupload arm is never taken.
+        |_gpu| unreachable!("qwen2 is single-GPU; tied lm_head always aliases"),
+    )
 }
 
 fn load_layer(
