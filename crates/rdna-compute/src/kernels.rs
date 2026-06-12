@@ -3119,6 +3119,14 @@ pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
 
+/// Multi-workgroup parallel rewrite of `sample_top_p`: vocab top-K scan split
+/// across N blocks (`sample_topk_partial`) + single-block merge/softmax/top-p
+/// (`sample_topk_finalize`) + an in-place penalty prepass
+/// (`sample_apply_repeat_penalty`). Byte-identical token to the single-block
+/// kernel for distinct logits; recovers ~290 us/token on gfx1100 A3B decode.
+pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
+    include_str!("../../../kernels/src/sample_top_p_parallel.hip");
+
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.
 /// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and

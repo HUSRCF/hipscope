@@ -570,6 +570,8 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 ksplit_det_partials: None,
                 ksplit_det_partials_bytes: 0,
+                sample_partials: None,
+                sample_partials_bytes: 0,
             },
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
