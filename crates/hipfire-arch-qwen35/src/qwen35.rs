@@ -624,6 +624,36 @@ pub struct ExpertWeights {
     pub down: WeightTensor,    // [hidden, moe_intermediate]
 }
 
+/// SP2: build the per-expert (gate_up, down) quant-tier tables that
+/// [`hipfire_dispatch::families::moe::MoeDtypes`] uses to detect an
+/// intra-layer mixed-tier layer.
+///
+/// A table is `Some(vec)` only when the layer genuinely spans >1 distinct
+/// tier; a uniform layer — or paged mode where `experts` is empty — yields
+/// `None`, which `MoeResolution::resolve` collapses to the unchanged uniform
+/// fast path. We pre-filter to `None` for the uniform/empty cases here so the
+/// common path allocates nothing and is byte-identical to before SP2.
+fn per_expert_tier_tables(
+    experts: &[ExpertWeights],
+) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
+    let gu: Vec<DType> = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
+    let dn: Vec<DType> = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    (mixed_tier_table(gu), mixed_tier_table(dn))
+}
+
+/// Collapse a per-expert dtype column to `None` when it is empty or uniform,
+/// `Some` only when it spans >1 distinct tier. Pure (no GPU weights) so it is
+/// unit-testable in isolation; `per_expert_tier_tables` is the GPU-weight
+/// adapter over it.
+fn mixed_tier_table(tiers: Vec<DType>) -> Option<Vec<DType>> {
+    match tiers.first() {
+        // Empty (paged mode) or uniform → uniform fast path.
+        None => None,
+        Some(&first) if tiers.iter().all(|&d| d == first) => None,
+        Some(_) => Some(tiers),
+    }
+}
+
 /// Shared expert storage — unlike routed experts, gate_proj and up_proj are
 /// NOT fused in the safetensors, so we keep them separate here too. The
 /// forward path does two GEMVs + silu_mul + down GEMV.
@@ -4788,6 +4818,11 @@ fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // SP2: if a layer's experts span >1 quant tier (e.g. a re-quant overlay
+    // bumped some experts), expose the per-expert tier tables so dispatch
+    // buckets by tier. The common case (a uniform layer — or paged mode where
+    // `experts` is empty) yields None → unchanged uniform fast path.
+    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(&ffn.experts);
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
@@ -4808,10 +4843,8 @@ fn moe_ffn_decode_impl(
             .map(|e| e.down.gpu_dtype)
             .unwrap_or(DType::F32),
         has_paro_shared: ffn.paro_shared.is_some(),
-        // SP2 mixed-tier plumbing: None ⇒ uniform fast path (Task 4 populates
-        // these when a layer's experts span multiple tiers).
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up,
+        per_expert_down,
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
@@ -7781,6 +7814,10 @@ fn prefill_moe_ffn_body_batched(
     let total_slots = n * k_top;
     let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
+    // SP2: per-expert tier tables for intra-layer mixed-tier dispatch (same
+    // semantics as the decode builder). Uniform layer ⇒ None ⇒ uniform fast
+    // path. This prefill site always has ≥1 expert (indexed [0] above).
+    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(&ffn.experts);
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
@@ -7793,10 +7830,8 @@ fn prefill_moe_ffn_body_batched(
         routed_gate_up: ffn.experts[0].gate_up.gpu_dtype,
         routed_down: ffn.experts[0].down.gpu_dtype,
         has_paro_shared: ffn.paro_shared.is_some(),
-        // SP2 mixed-tier plumbing: None ⇒ uniform fast path (Task 4 populates
-        // these when a layer's experts span multiple tiers).
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up,
+        per_expert_down,
     };
 
     let paro_gate_up = ffn.paro_shared.as_ref().map(|paro| {
@@ -15101,6 +15136,47 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
+    // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:
+    // empty/uniform columns collapse to None (uniform fast path), only a
+    // genuinely multi-tier column yields Some(table).
+    #[test]
+    fn mixed_tier_table_empty_is_none() {
+        // Paged mode: no resident experts → uniform fast path.
+        assert_eq!(mixed_tier_table(Vec::new()), None);
+    }
+
+    #[test]
+    fn mixed_tier_table_uniform_is_none() {
+        // The common case: every expert one tier → None → byte-identical
+        // uniform path, no allocation surfaced to MoeDtypes.
+        let tiers = vec![DType::MQ4G256; 4];
+        assert_eq!(mixed_tier_table(tiers), None);
+        // Single-expert uniform column is also None.
+        assert_eq!(mixed_tier_table(vec![DType::MQ6G256]), None);
+    }
+
+    #[test]
+    fn mixed_tier_table_mixed_is_some_preserving_order() {
+        // A re-quant overlay bumped experts 1 and 3 to MQ6 → Some, and the
+        // table preserves per-expert order/dtype so dispatch buckets correctly.
+        let tiers = vec![
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ4G256,
+            DType::MQ6G256,
+        ];
+        assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
+
+    #[test]
+    fn mixed_tier_table_mixed_first_differs() {
+        // Guard against an off-by-one where only expert[0] is compared:
+        // here every later expert differs from expert[0].
+        let tiers = vec![DType::MQ4G256, DType::MQ6G256, DType::MQ6G256];
+        assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
     // The lowered LayerProgram per variant must mirror the hand-arm op sequence
