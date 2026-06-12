@@ -103,6 +103,20 @@ fn main() {
         bi
     };
 
+    // DPM warmup BEFORE the timed prefill. `infer` is not one of the canonical
+    // bench tools, so without this each fresh process measures at idle DPM
+    // clocks — ~5-10% low decode and a worse cold prefill (see
+    // docs/methodology/perf-benchmarking.md). Mirrors bench_qwen35_mq4. Memset
+    // loop pins sclk/mclk high; does NOT dispatch the model kernels (so JIT is
+    // warmed separately by a throwaway run, not here). Default OFF.
+    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+        if secs > 0.0 {
+            eprintln!("=== DPM warmup ({secs:.1}s, pre-prefill) ===");
+            gpu.dpm_warmup(secs).expect("dpm warmup");
+        }
+    }
+
     // Prefill: batched (read each weight once for all prompt tokens, chunked
     // ≤64) when the tier supports it (MQ4/MQ6); per-token decode_step otherwise.
     let t0 = std::time::Instant::now();
