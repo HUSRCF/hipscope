@@ -5915,6 +5915,26 @@ pub struct PrefillBatchScratch {
 
 impl PrefillBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
+        // Default: allocate the spec-decode DeltaNet S-tape (tree-verify reads it).
+        Self::new_opt(gpu, config, max_batch, /*cap_gdn_tape=*/ true)
+    }
+
+    /// Like [`new`], but `cap_gdn_tape` controls allocation of the per-token
+    /// DeltaNet S-state tape (`dn_s_tape_*`, sized `[max_batch × n_v_heads ×
+    /// value_head_dim²]`). The tape is consumed ONLY by the tree-verify
+    /// (spec-decode) GDN kernels; plain prefill (`tree_parents == None`)
+    /// advances the recurrent state in place and never touches it. Pass `false`
+    /// for plain prefill to skip the tape — on A3B (16 value heads × 128²) it is
+    /// ~10 GB at an 8k batch (dn_s_tape_f32 8.2 GB + dn_s_tape_q8 2 GB), the
+    /// difference between an 8k prefill fitting and OOMing. Callers that may run
+    /// tree-verify MUST pass `true` (else the `.expect()` at the consumption site
+    /// panics).
+    pub fn new_opt(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        cap_gdn_tape: bool,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -6103,7 +6123,7 @@ impl PrefillBatchScratch {
                 DType::F32
             ),
             dn_s_tape_q8: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
@@ -6111,12 +6131,12 @@ impl PrefillBatchScratch {
                 DType::Raw
             ),
             dn_s_tape_scales: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
                 DType::F32
             ),
             dn_s_tape_f32: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim

@@ -151,7 +151,12 @@ fn main() {
         scratch_per_rank.push(Qwen35Scratch::new(g, &config, 64).expect("scratch"));
         partials.push(g.zeros(&[config.dim], DType::F32).expect("partial"));
         if batched_prefill {
-            pbs_per_rank.push(PrefillBatchScratch::new(g, &config, max_batch).expect("pbs"));
+            // Plain prefill (no spec-decode tree) never reads the DeltaNet
+            // S-tape — skip its ~10 GB alloc so long (8k+) prefills fit.
+            pbs_per_rank.push(
+                PrefillBatchScratch::new_opt(g, &config, max_batch, /*cap_gdn_tape=*/ false)
+                    .expect("pbs"),
+            );
             prefill_partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("prefill partial"));
         }
     }
