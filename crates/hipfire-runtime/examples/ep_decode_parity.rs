@@ -78,6 +78,11 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(512usize);
+    // KV quantization mode for the FA layers — lets us A/B the flash kernel's
+    // long-context behavior: q8 (LDS-score flash that falls out of the >15k ctx
+    // regime to a slower per-position path) vs asym3 / fwht3 (no-LDS-cap tiled
+    // flash that stays on the fast path at any length).
+    let kv_mode = std::env::var("HIPFIRE_EP_KV_MODE").unwrap_or_else(|_| "q8".to_string());
 
     // ── config + tokenizer (one open; per-rank loads reopen below) ──────────
     let hfq0 = HfqFile::open(model_path).expect("open model");
@@ -166,8 +171,25 @@ fn main() {
         gpus.devices[r].bind_thread().expect("bind rank");
         let g = &mut gpus.devices[r];
         kv_per_rank.push(
-            KvCache::new_gpu_q8(g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-                .expect("kv"),
+            match kv_mode.as_str() {
+                "asym3" => KvCache::new_gpu_asym3(
+                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                ),
+                "fwht3" => {
+                    let is_kv: Vec<bool> = config
+                        .layer_types
+                        .iter()
+                        .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+                        .collect();
+                    KvCache::new_gpu_fwht3_filtered(
+                        g, &is_kv, config.n_kv_heads, config.head_dim, kv_seq,
+                    )
+                }
+                _ => KvCache::new_gpu_q8(
+                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                ),
+            }
+            .expect("kv"),
         );
         dn_per_rank.push(DeltaNetState::new(g, &config).expect("dn"));
         scratch_per_rank.push(Qwen35Scratch::new(g, &config, 64).expect("scratch"));
