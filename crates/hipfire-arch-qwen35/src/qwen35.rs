@@ -13591,10 +13591,16 @@ pub fn forward_prefill_batch_ep(
         return Ok(());
     }
     let dim = config.dim;
+    // Per-call contract: one window must fit max_batch. Long prompts are driven
+    // by calling this repeatedly with advancing start_pos + persistent kv/dn
+    // (KV + DeltaNet state accumulate in place across calls, identical to the
+    // single-GPU chunk loop in forward_prefill_batch) — see ep_decode_parity's
+    // chunked-prefill loop. That bounds the prefill scratch to chunk_size, so
+    // context length is limited by the KV cache, not the activation buffers.
     assert!(
         n <= pbs_per_rank[0].max_batch,
-        "forward_prefill_batch_ep v1: prompt ({n} toks) must fit one batch (max_batch={}); \
-         chunked EP prefill is future work",
+        "forward_prefill_batch_ep: window ({n} toks) must fit one batch (max_batch={}); \
+         caller chunks long prompts into max_batch-sized windows",
         pbs_per_rank[0].max_batch,
     );
 

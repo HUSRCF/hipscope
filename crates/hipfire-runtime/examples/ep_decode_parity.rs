@@ -63,10 +63,17 @@ fn main() {
     let model_path = Path::new(&args[1]);
     let tp: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2);
     let steps: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(24);
-    let prompt = args
+    let prompt_base = args
         .get(4)
         .cloned()
         .unwrap_or_else(|| "The capital of France is".to_string());
+    // Bench-only: repeat the prompt N times to synthesize long contexts without
+    // multi-KB CLI args. Lets us drive 16k/32k+ prefills to validate that the
+    // chunked path's scratch is bounded by chunk_size, not the prompt length.
+    let prompt = match std::env::var("HIPFIRE_EP_PROMPT_REPEAT").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(r) if r > 1 => prompt_base.repeat(r),
+        _ => prompt_base,
+    };
     let kv_seq: usize = std::env::var("HIPFIRE_EP_KV_SEQ")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -96,8 +103,23 @@ fn main() {
     // ── tokenize (early — sizes the prefill batch + routed partials) ─────────
     let prompt_tokens: Vec<u32> = tokenizer.encode(&prompt);
     assert!(!prompt_tokens.is_empty(), "empty prompt tokenization");
-    let max_batch = prompt_tokens.len().max(2);
-    eprintln!("prompt tokenizes to {} tokens (max_batch={max_batch})", prompt_tokens.len());
+    // Chunked EP prefill: process the prompt in fixed `chunk_size` windows so the
+    // O(N) prefill scratch (pbs + routed partials) is bounded to ONE chunk rather
+    // than the whole prompt. forward_prefill_batch_ep advances KV + DeltaNet state
+    // in place across calls (identical to the single-GPU chunk loop in
+    // forward_prefill_batch), so a 100k-token prompt costs chunk-sized scratch, not
+    // 100k-token scratch — context length is then bounded by the KV cache, not the
+    // prefill activation buffers, and m_total=chunk*K_TOP stays under the grid limit.
+    let chunk_size: usize = std::env::var("HIPFIRE_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(2048);
+    let max_batch = chunk_size.min(prompt_tokens.len()).max(2);
+    eprintln!(
+        "prompt tokenizes to {} tokens (chunk_size={chunk_size}, max_batch={max_batch})",
+        prompt_tokens.len(),
+    );
 
     // ── bring up N ranks ────────────────────────────────────────────────────
     let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
@@ -171,11 +193,26 @@ fn main() {
     eprintln!("\n=== EP forward (prefill {} toks → decode {steps}) ===", prompt_tokens.len());
     let t_prefill = Instant::now();
     if batched_prefill {
-        qwen35::forward_prefill_batch_ep(
-            &mut gpus, &weights_per_rank, &config, &prompt_tokens, 0,
-            &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
-        )
-        .expect("forward_prefill_batch_ep");
+        // Chunked EP prefill: each window of <= chunk_size tokens runs the full
+        // layer stack (per-layer all-reduce) at its absolute start_pos, then the
+        // next window continues from the accumulated KV + DeltaNet state. Only the
+        // final window's lm_head (scratch[0].logits) feeds decode; intermediate
+        // lm_heads are one wasted GEMV each (negligible vs the 40-layer stack).
+        let mut offset = 0usize;
+        let n_chunks = prompt_tokens.len().div_ceil(chunk_size);
+        while offset < prompt_tokens.len() {
+            let chunk_n = (prompt_tokens.len() - offset).min(chunk_size);
+            qwen35::forward_prefill_batch_ep(
+                &mut gpus, &weights_per_rank, &config,
+                &prompt_tokens[offset..offset + chunk_n], offset,
+                &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
+            )
+            .expect("forward_prefill_batch_ep chunk");
+            offset += chunk_n;
+        }
+        if n_chunks > 1 {
+            eprintln!("  chunked prefill: {n_chunks} windows of <= {chunk_size} tok");
+        }
     } else {
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             qwen35::forward_ep(
