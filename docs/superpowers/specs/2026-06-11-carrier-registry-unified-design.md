@@ -262,3 +262,12 @@ so they can't be set piecemeal. The VL arm must likewise set `vision_config`/`vi
   - qwen2 (arch 7) + llama (arch <5): no local models — source one each.
   - pp>1: hiptrx only.
   - VL: no local model.
+
+### Tier 2: unified loader (WeightSource + device slice) — added 2026-06-12
+
+The three `load_weights*` entry points were unified behind one `assemble_weights`
+driver over a `&mut [Gpu]` device slice + `Layout`, with HFQ/PaRo isolated behind a
+`WeightSource` trait (`HfqSource`/`ParoSource`). Single-GPU is the `len()==1` case;
+multi-GPU is HFQ-only (PaRo `prepare(n>1)` errors). Tied-embedding alias is gated to
+`len()==1` to stay byte-identical. The public API was collapsed to a single
+`load_weights` entry (was 3). Carrier registry (Tier 1) unchanged in behavior.
