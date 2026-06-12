@@ -13276,15 +13276,45 @@ fn generate_cohere2moe(
     let mut repeat_run: usize = 0;
     const REPEAT_GUARD: usize = 24; // consecutive-identical-token attractor
 
+    // Empty-turn guard: North sometimes emits <|END_THINKING|> then
+    // <|END_OF_TURN_TOKEN|> with no response or action, surfacing as a turn with
+    // reasoning only and empty visible content (the model ends after <think>
+    // without returning a result). Track whether anything visible (a text token
+    // or a tool_call) was produced; if EOS arrives before that, mask it and
+    // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
+    // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
+    let empty_turn_guard =
+        std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD").ok().as_deref() != Some("0");
+    let mut emitted_visible = false;
+    let mut eos_suppressions = 0usize;
+    const MAX_EOS_SUPPRESS: usize = 3;
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if next_tok == eos_tok {
-            break;
+            if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
+                // Reasoning-only turn in progress — the model is ending after
+                // <think> with nothing visible. Mask EOS and re-sample to force a
+                // <|START_TEXT|>/<|START_ACTION|> continuation.
+                eos_suppressions += 1;
+                eprintln!(
+                    "[cohere2moe] empty-turn guard: suppressed EOS after thinking with no visible \
+                     output (#{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
+                );
+                last_logits[eos_tok as usize] = f32::NEG_INFINITY;
+                next_tok =
+                    deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+                if next_tok == eos_tok {
+                    break; // still EOS even masked — give up rather than loop
+                }
+            } else {
+                break;
+            }
         }
         // Degenerate-output guards (see above). `<PAD>` is never a valid
         // generation token, and any token repeating REPEAT_GUARD× in a row is an
@@ -13338,6 +13368,7 @@ fn generate_cohere2moe(
                     serde_json::json!({"type": "tool_calls", "id": id, "calls": calls}),
                 );
                 let _ = stdout.flush();
+                emitted_visible = true;
             }
             sec = Sec::Pre;
         } else {
@@ -13380,6 +13411,7 @@ fn generate_cohere2moe(
                         serde_json::json!({"type": "token", "id": id, "text": frag}),
                     );
                     let _ = stdout.flush();
+                    emitted_visible = true;
                 }
             }
             }

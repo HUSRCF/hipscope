@@ -63,6 +63,24 @@ __global__ void attention_flash_q8_0_tile_batched(
     const int tile_end = min(tile_start + tile_size, seq_len);
     const int tile_len = tile_end - tile_start;
 
+    // Sliding-window fast path: a tile entirely below win_lo has no in-window
+    // keys, so it contributes nothing to the output. Write an empty partial
+    // (tile_sum=0 → the reduce skips it via its `p[1] > 0` guard) and return
+    // BEFORE the Q load and Phase A-D. This matters because Phase D below loads
+    // V for every position even when its weight is 0, so the masked-but-iterated
+    // tiles are the dominant per-query cost on sliding layers at long context.
+    // Only fires when window>0 (cohere2moe sliding layers); window<=0 (full
+    // causal, all other arches + the global NoPE layers) is byte-identical.
+    if (window > 0 && tile_end <= win_lo) {
+        if (tid == 0) {
+            float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                 + tile_id * (2 + head_dim);
+            pe[0] = -1e30f;
+            pe[1] = 0.0f;
+        }
+        return;
+    }
+
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int q_dim = n_heads * head_dim;
