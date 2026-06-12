@@ -29,6 +29,14 @@ use crate::types::*;
 
 // ── MoE eligibility lattice ────────────────────────────
 
+/// Routed-expert tiers the mixed-tier bucketed decode path can execute: the
+/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (see
+/// `run_moe_decode_mixed`). A per-expert tier table containing any other DType
+/// cannot be served by the mixed path and is rejected up front with a clear
+/// error rather than failing deep in the per-bucket dispatch.
+pub const MIXED_SUPPORTED_TIERS: [DType; 3] =
+    [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
+
 /// Per-layer dtype snapshot the MoE eligibility lattice reads. Built by the
 /// model from its weight structs; kept dtype-only so this stays GPU-free and
 /// the dispatch crate needs no dependency on any arch crate.
@@ -107,7 +115,8 @@ impl MoeResolution {
         // None for both tables — are always uniform and byte-identical to today.
         let table_varies = |t: &Option<Vec<DType>>| {
             t.as_ref()
-                .map(|v| v.iter().any(|&dt| dt != v[0]))
+                .and_then(|v| v.split_first())
+                .map(|(first, rest)| rest.iter().any(|dt| dt != first))
                 .unwrap_or(false)
         };
         let mixed = table_varies(&d.per_expert_gate_up) || table_varies(&d.per_expert_down);
@@ -581,6 +590,16 @@ mod tests {
         d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ6G256]);
         let r = MoeResolution::resolve(&d, 8);
         assert!(r.mixed);
+    }
+
+    #[test]
+    fn resolve_empty_per_expert_table_is_not_mixed_and_does_not_panic() {
+        // A degenerate empty table must not index v[0]; it collapses to uniform.
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![]);
+        d.per_expert_down = Some(vec![]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.mixed);
     }
 
     #[test]

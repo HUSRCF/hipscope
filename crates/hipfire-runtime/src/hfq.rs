@@ -82,6 +82,12 @@ impl HfqFile {
         if let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") {
             let ov_path = std::path::Path::new(&dir).join("overlay.hfq");
             if ov_path.exists() {
+                // NOTE: a failure to attach (unreadable overlay, arch mismatch,
+                // missing tensor, or shape mismatch) is logged and we proceed
+                // base-only — the safe default for an unrelated model open that
+                // merely shares the env var. The tradeoff (tracked on PR #445):
+                // if the overlay WAS meant for this model but is broken, the
+                // model silently loads UNPRUNED — watch stderr for this WARNING.
                 match Self::open_at_offset(&ov_path, 0)
                     .map_err(|e| e.to_string())
                     .and_then(|ov| {
@@ -92,7 +98,8 @@ impl HfqFile {
                         "reap: overlay ACTIVE — {n} tensor(s) from {ov_path:?} shadow the base"
                     ),
                     Err(e) => eprintln!(
-                        "reap: WARNING overlay at {ov_path:?} not attached: {e}"
+                        "reap: WARNING overlay at {ov_path:?} not attached, \
+                         loading UNPRUNED base: {e}"
                     ),
                 }
             }
@@ -110,16 +117,29 @@ impl HfqFile {
             ));
         }
         // A pure-shadow overlay only RE-quantizes existing tensors; it must not
-        // introduce names absent from the base. This catches an overlay built for a
-        // DIFFERENT model that happens to share arch_id (silent-wrong-weights guard).
-        // Called BEFORE self.overlay is set, so find_tensor_info searches only the
-        // base — correct.
+        // introduce names absent from the base, and each shadow must have the
+        // SAME logical shape as the base tensor it replaces (only the quant tier
+        // — quant_type/group_size/data_size — may differ). The name check catches
+        // an overlay built for a DIFFERENT model; the shape check catches two
+        // same-arch checkpoints (e.g. a 0.8B vs 9B at the same arch_id) whose
+        // tensors collide by name but differ in dimensions — splicing those would
+        // silently corrupt the weights. Called BEFORE self.overlay is set, so
+        // find_tensor_info searches only the base — correct.
         for ti in &overlay.tensors {
-            if self.find_tensor_info(&ti.name).is_none() {
-                return Err(format!(
-                    "reap overlay: tensor '{}' not present in base — overlay likely built for a different model",
-                    ti.name
-                ));
+            match self.find_tensor_info(&ti.name) {
+                None => {
+                    return Err(format!(
+                        "reap overlay: tensor '{}' not present in base — overlay likely built for a different model",
+                        ti.name
+                    ));
+                }
+                Some(base_ti) if base_ti.shape != ti.shape => {
+                    return Err(format!(
+                        "reap overlay: tensor '{}' shape {:?} != base shape {:?} — overlay built for a different model",
+                        ti.name, ti.shape, base_ti.shape
+                    ));
+                }
+                Some(_) => {}
             }
         }
         self.overlay = Some(Box::new(overlay));
@@ -215,6 +235,22 @@ impl HfqFile {
                     }
                 }
             }
+        }
+        // A truncated/corrupt container whose metadata JSON never closes its
+        // top-level brace leaves `json_end == 0`. Without this guard we'd slice
+        // an empty metadata string and read the tensor-index count from the
+        // metadata start (the wrong offset) → a bogus `idx_n` that panics the
+        // `assert_eq!` below or silently mis-parses the index. Now that overlays
+        // (`overlay.hfq`) are user-built artifacts fed through this same parser,
+        // surface it as a clean error instead. (`{}` ⇒ json_end == 2, fine.)
+        if json_end == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: metadata JSON at offset {metadata_offset} is not brace-terminated \
+                     (truncated or corrupt HFQ container)"
+                ),
+            ));
         }
         let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
 

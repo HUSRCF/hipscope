@@ -131,6 +131,15 @@ impl ReapPlan {
                     ));
                 }
                 let kept = arr.first().and_then(|r| r.as_array()).map(|r| r.len()).unwrap_or(0);
+                // A keep map present but empty (0 kept experts) would override
+                // n_routed_experts to 0 downstream → a model with no routed
+                // experts (router selects from an empty set). Reject early.
+                if kept == 0 {
+                    return Err(
+                        "reap: keep.per_layer present but keeps 0 experts (empty first layer)"
+                            .to_string(),
+                    );
+                }
                 let mut out = Vec::with_capacity(arr.len());
                 for (l, row) in arr.iter().enumerate() {
                     let r = row
@@ -143,6 +152,7 @@ impl ReapPlan {
                         ));
                     }
                     let mut v32 = Vec::with_capacity(kept);
+                    let mut seen = std::collections::HashSet::with_capacity(kept);
                     for x in r {
                         let idx = x
                             .as_u64()
@@ -151,6 +161,13 @@ impl ReapPlan {
                         if idx as usize >= original_experts {
                             return Err(format!(
                                 "reap: keep layer {l} index {idx} >= original_experts {original_experts}"
+                            ));
+                        }
+                        // A duplicate kept index would gather the same expert into
+                        // two compact slots → wrong router fan-out / double-count.
+                        if !seen.insert(idx) {
+                            return Err(format!(
+                                "reap: keep layer {l} has duplicate index {idx}"
                             ));
                         }
                         v32.push(idx);
@@ -225,6 +242,45 @@ impl ReapPlan {
         Self::load_legacy_keepmap(dir, num_layers_expected, orig_experts_expected)
     }
 
+    /// Resolve a REAP plan from the environment for an arch's config loader.
+    ///
+    /// Reads `HIPFIRE_REAP_PLAN` (and `legacy_alias_env` if given — e.g. ds4's
+    /// `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP`). On a hit it rejects a dense
+    /// (`orig_experts == 0`) checkpoint, loads the plan via [`Self::load_any`]
+    /// validated against the ORIGINAL counts, logs the active prune, and returns
+    /// `Ok(Some(plan))`. No env var set ⇒ `Ok(None)` (no pruning). The caller
+    /// then overrides its own routed-expert count field to `plan.kept_per_layer()`
+    /// and stores the plan — that assignment differs per arch (`num_experts` /
+    /// `n_routed_experts` / `num_local_experts`) so it stays at the call site.
+    /// Consolidates the env-read + dense-guard + load + log boilerplate that was
+    /// duplicated across the four arch loaders (review #10). `arch` names the
+    /// caller in the error/log messages.
+    pub fn from_env(
+        arch: &str,
+        legacy_alias_env: Option<&str>,
+        num_layers: usize,
+        orig_experts: usize,
+    ) -> Result<Option<Self>, String> {
+        let dir = std::env::var("HIPFIRE_REAP_PLAN")
+            .ok()
+            .or_else(|| legacy_alias_env.and_then(|e| std::env::var(e).ok()));
+        let Some(dir) = dir else { return Ok(None) };
+        // MoE-only feature: a dense (orig_experts == 0) checkpoint has no routed
+        // experts to prune. Refuse rather than silently divide-by-zero / mislead.
+        if orig_experts == 0 {
+            return Err(format!(
+                "{arch}: HIPFIRE_REAP_PLAN={dir} set but this is a dense \
+                 (0 routed experts) checkpoint"
+            ));
+        }
+        let plan = Self::load_any(&dir, num_layers, orig_experts)?;
+        eprintln!(
+            "{arch}: REAP plan ACTIVE — keeping {} of {orig_experts} routed experts/layer; dir {dir}",
+            plan.kept_per_layer(),
+        );
+        Ok(Some(plan))
+    }
+
     /// Load the legacy `<dir>/keep_by_layer.json` schema (top-level
     /// `kept_per_layer:u64`, optional `original_experts:u64`, and
     /// `keep: [[u32; kept]; num_layers]`) and produce a keep-only
@@ -246,6 +302,9 @@ impl ReapPlan {
         let kept = v["kept_per_layer"]
             .as_u64()
             .ok_or("reap: legacy keep-map missing kept_per_layer")? as usize;
+        if kept == 0 {
+            return Err("reap: legacy keep-map keeps 0 experts (kept_per_layer == 0)".to_string());
+        }
         let original_experts = v["original_experts"]
             .as_u64()
             .unwrap_or(orig_experts_expected as u64) as usize;
@@ -275,6 +334,7 @@ impl ReapPlan {
                 ));
             }
             let mut v32 = Vec::with_capacity(kept);
+            let mut seen = std::collections::HashSet::with_capacity(kept);
             for x in r {
                 let idx = x
                     .as_u64()
@@ -283,6 +343,11 @@ impl ReapPlan {
                 if idx as usize >= original_experts {
                     return Err(format!(
                         "reap: legacy keep layer {l} index {idx} >= original_experts {original_experts}"
+                    ));
+                }
+                if !seen.insert(idx) {
+                    return Err(format!(
+                        "reap: legacy keep layer {l} has duplicate index {idx}"
                     ));
                 }
                 v32.push(idx);
@@ -401,6 +466,37 @@ mod tests {
         assert_eq!(p.quant_overrides.len(), 2);
         assert_eq!(p.quant_overrides[0].tier, "mq3lloyd");
         assert_eq!(p.quant_overrides[0].experts, vec![7, 12]);
+    }
+
+    #[test]
+    fn rejects_empty_keep_map() {
+        // A keep map that keeps 0 experts would override n_routed_experts to 0.
+        let d = write_plan(r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[]]}}"#);
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("keeps 0 experts"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_keep_index() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[1,1]]}}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("duplicate index 1"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_legacy_keep_map() {
+        let d = write_legacy(r#"{"kept_per_layer":0,"original_experts":4,"keep":[[]]}"#);
+        let err = ReapPlan::load_any(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("keeps 0 experts"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_legacy_keep_index() {
+        let d = write_legacy(r#"{"kept_per_layer":2,"original_experts":4,"keep":[[2,2]]}"#);
+        let err = ReapPlan::load_any(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("duplicate index 2"), "got: {err}");
     }
 
     #[test]

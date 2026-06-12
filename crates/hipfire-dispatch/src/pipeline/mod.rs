@@ -568,6 +568,37 @@ fn run_moe_decode_mixed(
     )?;
     let tier_of_down = p.dtypes.per_expert_down.as_ref();
 
+    // ── Validate the per-expert tier tables up front (review #6/#7) ──────────
+    // The tables are indexed by routed-expert id (0..n_exp). A mis-sized table
+    // would panic on `tier_of[e]` while bucketing; a table holding a tier the
+    // mixed path has no kernel for would otherwise fail deep in the per-bucket
+    // dispatch with a cryptic `quant: "other"`. Catch both here, clearly.
+    if tier_of_gate_up.len() != p.n_exp {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "mixed-gate_up-tier-table-len-ne-n_exp",
+            arch: "", quant: "",
+        });
+    }
+    if let Some(td) = tier_of_down {
+        if td.len() != p.n_exp {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe", variant: "mixed-down-tier-table-len-ne-n_exp",
+                arch: "", quant: "",
+            });
+        }
+    }
+    // Every gate_up tier must have per-tier kernels (down tiers are checked to
+    // equal the gate_up tier below, so they are transitively covered).
+    if let Some(&bad) = tier_of_gate_up
+        .iter()
+        .find(|t| !crate::families::moe::MIXED_SUPPORTED_TIERS.contains(t))
+    {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "mixed-unsupported-routed-tier",
+            arch: "", quant: dtype_name(bad),
+        });
+    }
+
     // ── Host top-k sync (single small D2H; see rationale block) ──────────────
     // topk_indices are i32 stored in an F32-typed scratch tensor (4-byte slots).
     let mut idx_bytes = vec![0u8; k * 4];
@@ -584,7 +615,19 @@ fn run_moe_decode_mixed(
         .collect();
 
     // ── Partition by tier, then build the permutation to contiguous ranges ───
-    let buckets = bucket_topk_by_tier(&topk_idx, tier_of_gate_up);
+    // tier_of_gate_up.len() == n_exp is enforced above and the router emits ids
+    // < n_exp, so this only fails on a corrupt routing readback — surface it as
+    // a clean error instead of an out-of-bounds panic in the bucketer.
+    let buckets = bucket_topk_by_tier(&topk_idx, tier_of_gate_up).map_err(|bad| {
+        eprintln!(
+            "moe mixed: routed expert id {bad} >= tier table len {}",
+            tier_of_gate_up.len()
+        );
+        DispatchError::UnsupportedVariant {
+            family: "moe", variant: "mixed-routed-expert-id-out-of-range",
+            arch: "", quant: "",
+        }
+    })?;
     let (perm, ranges) = build_contiguous_permutation(&buckets, k);
 
     // Assert per-expert down tier agrees with the gate_up tier we bucketed on.
@@ -744,11 +787,17 @@ fn build_contiguous_permutation(
 }
 
 /// Static name for a DType (for UnsupportedVariant.quant in the mixed path).
+/// Covers the tiers a routed expert can realistically carry so an
+/// unsupported-tier error names the actual offending tier (e.g. "Q8_0")
+/// instead of a useless "other".
 fn dtype_name(d: DType) -> &'static str {
     match d {
         DType::MQ4G256 => "MQ4G256",
         DType::MQ6G256 => "MQ6G256",
         DType::ParoQ4G128 => "ParoQ4G128",
+        DType::Q8_0 => "Q8_0",
+        DType::MQ3G256 => "MQ3G256",
+        DType::MQ2G256 => "MQ2G256",
         _ => "other",
     }
 }
@@ -1524,7 +1573,7 @@ mod mixed_dispatch_tests {
     fn all_one_tier_is_identity_permutation() {
         let topk = [3u32, 7, 1, 5, 0, 2, 6, 4];
         let tier_of = vec![MQ4G256; 8];
-        let buckets = bucket_topk_by_tier(&topk, &tier_of);
+        let buckets = bucket_topk_by_tier(&topk, &tier_of).unwrap();
         assert_eq!(buckets.len(), 1, "uniform table ⇒ one bucket");
         let (perm, ranges) = build_contiguous_permutation(&buckets, 8);
         assert_eq!(perm, (0..8).collect::<Vec<_>>(), "identity perm");
@@ -1538,7 +1587,7 @@ mod mixed_dispatch_tests {
         // experts: even→MQ4, odd→MQ6. top-k interleaves tiers.
         let tier_of = vec![MQ4G256, MQ6G256, MQ4G256, MQ6G256, MQ4G256, MQ6G256];
         let topk = [1u32, 0, 3, 2, 5, 4]; // ranks 0..5; tiers MQ6,MQ4,MQ6,MQ4,MQ6,MQ4
-        let buckets = bucket_topk_by_tier(&topk, &tier_of);
+        let buckets = bucket_topk_by_tier(&topk, &tier_of).unwrap();
         assert_eq!(buckets.len(), 2);
         let (perm, ranges) = build_contiguous_permutation(&buckets, 6);
 

@@ -159,28 +159,15 @@ fn default_routed_scale() -> f32 {
 /// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
 /// takes the literal original full-load path — byte-identical to baseline.
 pub fn apply_reap_plan(config: &mut Lfm2MoeConfig) -> Result<(), String> {
-    let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") else {
-        return Ok(());
-    };
-    // MoE-only feature: a dense (num_experts==0) checkpoint has no routed
-    // experts to prune. Refuse rather than silently divide-by-zero / mislead.
-    if config.num_experts == 0 {
-        return Err(format!(
-            "lfm2moe: HIPFIRE_REAP_PLAN={dir} set but this is a dense (num_experts==0) checkpoint"
-        ));
-    }
-    let plan = hipfire_reap::plan::ReapPlan::load_any(
-        &dir,
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        "lfm2moe",
+        None,
         config.num_hidden_layers,
         config.num_experts,
-    )?;
-    eprintln!(
-        "lfm2moe: REAP plan ACTIVE — keeping {} of {} routed experts/layer; dir {dir}",
-        plan.kept_per_layer(),
-        config.num_experts
-    );
-    config.num_experts = plan.kept_per_layer();
-    config.reap_keep = Some(std::sync::Arc::new(plan));
+    )? {
+        config.num_experts = plan.kept_per_layer();
+        config.reap_keep = Some(std::sync::Arc::new(plan));
+    }
     Ok(())
 }
 

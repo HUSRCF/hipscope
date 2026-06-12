@@ -101,31 +101,7 @@ fn load_f32_keep(
     keep: &[u32],
 ) -> Result<GpuTensor, String> {
     debug_assert_eq!(m, keep.len(), "load_f32_keep: m must equal keep.len()");
-    let (qt, data) = read_tensor(hfq, name)?;
-    // Per-element width for the row-gather. Q8_0 packs 32 elems/block, so a
-    // single bias element is not a whole row — refuse rather than corrupt.
-    let elem_bytes = match qt {
-        1 => 2, // F16
-        2 => 4, // F32
-        other => {
-            return Err(format!(
-                "lfm2moe: expert_bias {name} keep-gather needs F16/F32, got qt={other}"
-            ))
-        }
-    };
-    let orig = data.len() / elem_bytes;
-    let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig], &data, keep)
-        .map_err(|e| format!("lfm2moe: expert_bias row-gather '{name}': {e}"))?;
-    let f32_data: Vec<f32> = match qt {
-        1 => sub
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        _ => sub
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    };
+    let f32_data = hipfire_reap::load::gather_f32_vec("lfm2moe", hfq, name, keep)?;
     gpu.upload_f32(&f32_data, &[m])
         .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
 }
@@ -175,15 +151,8 @@ fn load_wt_keep(
     keep: &[u32],
 ) -> Result<WeightTensor, String> {
     debug_assert_eq!(m, keep.len(), "load_wt_keep: m must equal keep.len()");
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("lfm2moe: tensor not found in HFQ: {name}"))?;
-    // The on-disk first-axis length is the ORIGINAL expert count; gather_rows
-    // derives the rowstride from shape[0] and selects the kept rows.
-    let orig = *info.shape.first().unwrap_or(&0) as usize;
-    let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig], &data, keep)
-        .map_err(|e| format!("lfm2moe: router row-gather '{name}': {e}"))?;
-    wt_from_raw(gpu, info.quant_type, &sub, m, k)
+    let (qt, sub) = hipfire_reap::load::gather_weight_rows("lfm2moe", hfq, name, keep)?;
+    wt_from_raw(gpu, qt, &sub, m, k)
         .map_err(|e| format!("lfm2moe: load_wt_keep {name}: {e}"))
 }
 

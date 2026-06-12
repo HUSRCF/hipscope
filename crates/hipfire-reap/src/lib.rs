@@ -3,6 +3,7 @@
 
 pub mod gather;
 pub mod hook;
+pub mod load;
 pub mod plan;
 pub mod source;
 

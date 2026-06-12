@@ -229,20 +229,12 @@ impl DeepseekV4Config {
         // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
         // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
         // honored as a keep-only alias via ReapPlan::load_any.
-        let reap_dir = std::env::var("HIPFIRE_REAP_PLAN")
-            .ok()
-            .or_else(|| std::env::var("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP").ok());
-        if let Some(dir) = reap_dir {
-            let plan = hipfire_reap::plan::ReapPlan::load_any(
-                &dir,
-                config.num_hidden_layers,
-                config.n_routed_experts,
-            )?;
-            eprintln!(
-                "deepseek4: REAP plan ACTIVE — keeping {} of {} routed experts/layer; dir {dir}",
-                plan.kept_per_layer(),
-                config.n_routed_experts
-            );
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+            "deepseek4",
+            Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
+            config.num_hidden_layers,
+            config.n_routed_experts,
+        )? {
             config.n_routed_experts = plan.kept_per_layer();
             config.reap_keep = Some(std::sync::Arc::new(plan));
         }

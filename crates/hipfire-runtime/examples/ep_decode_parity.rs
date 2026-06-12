@@ -116,8 +116,15 @@ fn main() {
         let mut hfq = HfqFile::open(model_path).expect("reopen model");
         eprintln!("  [rank {r}] loading replicated weights ...");
         let mut w = qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
-        qwen35::shard_all_moe_layers(&mut gpus.devices[r], &mut w, &shard, r, config.num_experts)
-            .expect("shard_all_moe_layers");
+        qwen35::shard_all_moe_layers(
+            &mut gpus.devices[r],
+            &mut w,
+            &shard,
+            r,
+            config.num_experts,
+            config.reap_keep.is_some(),
+        )
+        .expect("shard_all_moe_layers");
         weights_per_rank.push(w);
     }
     eprintln!("  all ranks loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");

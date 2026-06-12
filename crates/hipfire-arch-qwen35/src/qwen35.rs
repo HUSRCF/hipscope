@@ -397,24 +397,12 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
 /// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map; the
 /// ParoQuant path does not (see `paro_load_moe_ffn`).
 pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
-    let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") else {
-        return Ok(());
-    };
-    // MoE-only feature: a dense (num_experts==0) checkpoint has no routed
-    // experts to prune. Refuse rather than silently divide-by-zero / mislead.
-    if config.num_experts == 0 {
-        return Err(format!(
-            "qwen35: HIPFIRE_REAP_PLAN={dir} set but this is a dense (num_experts==0) checkpoint"
-        ));
+    if let Some(plan) =
+        hipfire_reap::plan::ReapPlan::from_env("qwen35", None, config.n_layers, config.num_experts)?
+    {
+        config.num_experts = plan.kept_per_layer();
+        config.reap_keep = Some(std::sync::Arc::new(plan));
     }
-    let plan = hipfire_reap::plan::ReapPlan::load_any(&dir, config.n_layers, config.num_experts)?;
-    eprintln!(
-        "qwen35: REAP plan ACTIVE — keeping {} of {} routed experts/layer; dir {dir}",
-        plan.kept_per_layer(),
-        config.num_experts
-    );
-    config.num_experts = plan.kept_per_layer();
-    config.reap_keep = Some(std::sync::Arc::new(plan));
     Ok(())
 }
 
@@ -12564,13 +12552,27 @@ pub fn shard_moe_experts(
 /// load path so callers (the `forward_ep` driver / examples) never reach into
 /// `LayerWeights` internals. `n_exp` is the model's routed expert count
 /// (`config.num_experts`).
+///
+/// `reap_active` MUST be `config.reap_keep.is_some()`. REAP expert-pruning and
+/// EP sharding are mutually exclusive (ds4/minimax enforce the same at expert-
+/// load time): under REAP `config.num_experts` is already overridden to the
+/// KEPT count, so `shard_moe_experts`' `experts.len() == n_exp` precondition
+/// would pass on a pruned model and the per-rank ownership math would re-remap
+/// already-compacted expert ids → silent weight corruption. Refuse up front.
 pub fn shard_all_moe_layers(
     gpu: &mut Gpu,
     weights: &mut Qwen35Weights,
     shard: &ShardConfig,
     rank: usize,
     n_exp: usize,
+    reap_active: bool,
 ) -> HipResult<()> {
+    if reap_active {
+        return Err(HipError::new(
+            0,
+            "qwen35: REAP keep-map + EP sharding are mutually exclusive",
+        ));
+    }
     for layer in weights.layers.iter_mut() {
         match layer {
             LayerWeights::DeltaNetMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
