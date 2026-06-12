@@ -5712,12 +5712,16 @@ pub fn forward_scratch(
     // forward is direct-only. Policy infra (`ar_forward_kernel_dirty`,
     // `ar_forward_replay_enabled`, `end_decode_turn()`, `drop_captured_graph()`)
     // is preserved on Gpu so the path can be flipped on once the bug is fixed.
-    let use_graph = false;
-    let _ = (
-        graph_enabled,
-        allow_moe,
-        gpu.graphs.ar_forward_replay_enabled,
-    ); // suppress unused warnings
+    // RE-VERIFY GATE (2026-06-12): HIPFIRE_AR_GRAPH=1 flips the 2026-05-15
+    // disable back on to re-test the capture/replay attractor on current ROCm
+    // (HIP 7.x). Default OFF preserves the direct-only behavior. When set, the
+    // path still honors the HIPFIRE_GRAPH kill switch + arch default via
+    // `graph_enabled`.
+    static AR_GRAPH_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ar_graph_test = *AR_GRAPH_TEST
+        .get_or_init(|| std::env::var("HIPFIRE_AR_GRAPH").ok().as_deref() == Some("1"));
+    let use_graph = ar_graph_test && graph_enabled;
+    let _ = (allow_moe, gpu.graphs.ar_forward_replay_enabled); // suppress unused warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -5778,6 +5782,12 @@ pub fn forward_scratch(
         )?;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        // Intra-generate replay (2026-06-12): promote this fresh capture to the
+        // replay graph immediately so the NEXT token replays (cheap: pos memcpy
+        // + graph_launch) instead of re-capturing + re-instantiating every
+        // token. The per-token instantiate is why the path "did nothing" — the
+        // daemon never calls end_decode_turn() to enable replay.
+        gpu.graphs.ar_forward_replay_enabled = true;
     } else {
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip
