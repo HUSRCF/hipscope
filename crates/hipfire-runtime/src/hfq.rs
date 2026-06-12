@@ -1337,84 +1337,6 @@ pub fn config_from_safetensors_llama(
     })
 }
 
-/// Repack AWQ-format INT4 weights into HFQ4G128 layout (ParoQuant uses AWQ packing).
-///
-/// SYNC: must match `repack_awq_to_hfq4g128` in
-/// `crates/hipfire-arch-qwen35/src/qwen35.rs`. Duplicated to avoid a
-/// cross-crate dependency cycle (the qwen35 crate already depends on this
-/// one); keep the two bodies byte-identical when editing.
-fn repack_awq_to_hfq4g128(
-    qweight: &[u8],    // I32 raw bytes
-    qzeros: &[u8],     // I32 raw bytes
-    scales: &[u8],     // F16 raw bytes
-    out_dim: usize,    // M (output features)
-    in_dim: usize,     // K (input features)
-    group_size: usize, // 128
-) -> Vec<u8> {
-    let groups_per_row = in_dim / group_size;
-    let bytes_per_group = 8 + group_size / 2;
-    let elements_per_half_group = group_size / 2;
-    let bytes_per_row = groups_per_row * bytes_per_group;
-    let mut out = vec![0u8; out_dim * bytes_per_row];
-
-    debug_assert_eq!(
-        qweight.as_ptr() as usize % 4,
-        0,
-        "AWQ qweight not 4-byte aligned"
-    );
-    let qw: &[u32] =
-        unsafe { std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4) };
-    let qw_cols = out_dim / 8;
-
-    debug_assert_eq!(
-        qzeros.as_ptr() as usize % 4,
-        0,
-        "AWQ qzeros not 4-byte aligned"
-    );
-    let qz: &[u32] =
-        unsafe { std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4) };
-    let qz_cols = out_dim / 8;
-
-    debug_assert_eq!(
-        scales.as_ptr() as usize % 2,
-        0,
-        "AWQ scales not 2-byte aligned"
-    );
-    let sc: &[u16] =
-        unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2) };
-
-    for m in 0..out_dim {
-        for g in 0..groups_per_row {
-            let row_off = m * bytes_per_row + g * bytes_per_group;
-
-            let scale_f16 = sc[g * out_dim + m];
-            let scale_f32 = f16_to_f32(scale_f16);
-
-            let zero_i32 = qz[g * qz_cols + m / 8];
-            let zero_nibble = ((zero_i32 >> (AWQ_DEQUANT[m % 8] * 4)) & 0xF) as f32;
-            let zero_f32 = -scale_f32 * zero_nibble;
-
-            out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
-            out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
-
-            const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
-            let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
-            let qw_col = m / 8;
-            for i in 0..elements_per_half_group {
-                let in_idx0 = g * group_size + i * 2;
-                let in_idx1 = in_idx0 + 1;
-
-                let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-                let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-
-                out[row_off + 8 + i] = nib0 | (nib1 << 4);
-            }
-        }
-    }
-
-    out
-}
-
 /// Load a ParoQuant-quantized weight tensor from a safetensors source.
 /// Repacks AWQ INT4 data to HFQ4G128 and uploads ParoQuant rotation metadata.
 fn load_paroquant_weight_from_source(
@@ -1445,7 +1367,7 @@ fn load_paroquant_weight_from_source(
         .tensor_data(&sc_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
 
-    let hfq_data = repack_awq_to_hfq4g128(
+    let hfq_data = crate::paro::repack_awq_to_hfq4g128(
         qw_data,
         qz_data,
         sc_data,

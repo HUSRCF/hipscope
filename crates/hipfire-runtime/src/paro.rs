@@ -11,7 +11,7 @@ use crate::model_source::ModelSource;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-// ── AWQ repack (canonical copy; the duplicate in hfq.rs can be removed later) ──
+// ── AWQ repack (sole copy; hfq.rs calls this via crate::paro) ──
 
 /// Repack AWQ-format INT4 weights (qweight/qzeros/scales) into flat HFQ4G128
 /// nibble layout expected by `gemv_hfq4g128`.
