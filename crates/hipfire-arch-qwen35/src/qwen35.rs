@@ -33,8 +33,8 @@ use hipfire_runtime::paro::{
 };
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_awq_scale_for,
-    load_embedding, resolve_lm_head, reupload_f16_as_f32, HfqBackend, ParoBackend,
+    dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding,
+    resolve_lm_head, reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1529,30 +1529,36 @@ impl WeightSource for ParoSource<'_> {
     fn read_output(
         &mut self,
         gpu: &mut Gpu,
-        _embd: &GpuTensor,
-        _embd_fmt: EmbeddingFormat,
-        _can_alias: bool,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
-        let embd_name = format!("{}.embed_tokens.weight", self.mp);
-        let (src_name, tied) = if self.source.tensor_data("lm_head.weight").is_some() {
-            (String::from("lm_head.weight"), false)
-        } else {
-            (embd_name, true)
-        };
-        eprintln!(
-            "  loading output ({})...",
-            if tied {
-                "tied embeddings"
-            } else {
-                "separate lm_head"
-            }
-        );
-        let (_, f16) = self
-            .source
-            .tensor_data(&src_name)
-            .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {src_name}")))?;
-        let output = reupload_f16_as_f32(gpu, &f16, self.c.vocab_size, self.c.dim)?;
-        Ok((output, false))
+        let mp = self.mp;
+        let c = self.c;
+        let source = self.source;
+        let has_separate = source.tensor_data("lm_head.weight").is_some();
+        resolve_lm_head(
+            gpu,
+            has_separate,
+            can_alias,
+            embd,
+            embd_fmt,
+            c.vocab_size,
+            c.dim,
+            |gpu| {
+                let (_, f16) = source
+                    .tensor_data("lm_head.weight")
+                    .ok_or_else(|| HipError::new(0, "PARO tensor not found: lm_head.weight"))?;
+                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
+            },
+            |gpu| {
+                let embd_name = format!("{mp}.embed_tokens.weight");
+                let (_, f16) = source.tensor_data(&embd_name).ok_or_else(|| {
+                    HipError::new(0, &format!("PARO tensor not found: {embd_name}"))
+                })?;
+                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
+            },
+        )
     }
 
     fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
