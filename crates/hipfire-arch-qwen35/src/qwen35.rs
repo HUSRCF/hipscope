@@ -25,16 +25,16 @@ use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
     weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor,
 };
+use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::paro::{
     load_fp16_weight_from_source, paro_load_f32, paro_load_norm, paro_text_prefix,
 };
 use hipfire_runtime::tp_shard::ShardConfig;
-use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_awq_scale_for,
-    load_embedding, reupload_f16_as_f32, HfqBackend, ParoBackend,
+    load_embedding, resolve_lm_head, reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1428,36 +1428,31 @@ impl WeightSource for HfqSource<'_> {
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
         let c = self.c;
-        let lm_head_info = qwen35_tensor_data_vec(self.hfq, "lm_head.weight");
-        let lm_head_is_tied = lm_head_info.is_none();
-        let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
-            eprintln!(
-                "  loading output (separate lm_head, qt={})...",
-                lm_info.quant_type
-            );
-            load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)?
-        } else if can_alias {
-            eprintln!("  loading output (tied embeddings, aliased)...");
-            WeightTensor {
-                buf: embd.shallow_clone(),
-                gpu_dtype: embedding_format_dtype(embd_fmt),
-                m: c.vocab_size,
-                k: c.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            }
-        } else {
-            let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
-                .expect("embed_tokens not found");
-            eprintln!(
-                "  loading output (tied embeddings, reupload qt={})...",
-                embd_meta.quant_type
-            );
-            dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?
-        };
+        let hfq = &*self.hfq;
+        let has_separate = qwen35_tensor_name_candidates("lm_head.weight")
+            .iter()
+            .any(|n| hfq.find_tensor_info(n).is_some());
+        let (mut output, aliases) = resolve_lm_head(
+            gpu,
+            has_separate,
+            can_alias,
+            embd,
+            embd_fmt,
+            c.vocab_size,
+            c.dim,
+            |gpu| {
+                let (lm_info, lm_data) =
+                    qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
+                load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
+            },
+            |gpu| {
+                let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                    .expect("embed_tokens not found");
+                dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
+            },
+        )?;
         attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
-        Ok((output, lm_head_is_tied && can_alias))
+        Ok((output, aliases))
     }
 
     fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
@@ -1546,7 +1541,11 @@ impl WeightSource for ParoSource<'_> {
         };
         eprintln!(
             "  loading output ({})...",
-            if tied { "tied embeddings" } else { "separate lm_head" }
+            if tied {
+                "tied embeddings"
+            } else {
+                "separate lm_head"
+            }
         );
         let (_, f16) = self
             .source
