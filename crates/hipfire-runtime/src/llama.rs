@@ -657,6 +657,10 @@ pub struct LlamaWeights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    /// True iff `output.buf` is a non-owning view of `token_embd.buf`
+    /// (tied lm_head, single-GPU alias). When true, `free_gpu` must NOT free
+    /// `output.buf`. Mirrors `Qwen35Weights` / `Qwen2Weights`.
+    pub lm_head_aliases_embd: bool,
 }
 
 pub struct LayerWeights {
@@ -678,7 +682,9 @@ impl LlamaWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
+        if !self.lm_head_aliases_embd {
+            let _ = gpu.free_tensor(self.output.buf);
+        }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
             let _ = gpu.free_tensor(l.wq.buf);
@@ -2986,6 +2992,7 @@ pub fn load_weights(
         output_norm,
         output,
         layers,
+        lm_head_aliases_embd: false,
     })
 }
 

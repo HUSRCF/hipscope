@@ -1101,19 +1101,36 @@ fn load_embedding_llama(
         .expect("embed_tokens not found");
     let pair = if embd_info.0.quant_type == 4 {
         eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q4K)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::Q4K,
+        )
     } else if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::HFQ4G256,
+        )
     } else if embd_info.0.quant_type == 7 {
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::HFQ4G128,
+        )
     } else if embd_info.0.quant_type == 3 {
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::Q8_0,
+        )
     } else if matches!(embd_info.0.quant_type, 1 | 2 | 16) {
         (
-            load_f16_tensor(hfq, gpu, "model.embed_tokens.weight", &[config.vocab_size, config.dim])?,
+            load_f16_tensor(
+                hfq,
+                gpu,
+                "model.embed_tokens.weight",
+                &[config.vocab_size, config.dim],
+            )?,
             EmbeddingFormat::F32,
         )
     } else {
@@ -1179,9 +1196,22 @@ pub fn load_weights_hfq(
 
     let mut source = LlamaHfqSource { hfq, cfg: config };
     let layout = crate::model_load::Layout::single(config.n_layers);
-    let LoadedWeights { token_embd, embd_format, output_norm, output, layers, .. } =
-        rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
-    Ok(LlamaWeights { token_embd, embd_format, output_norm, output, layers })
+    let LoadedWeights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+        lm_head_aliases_embd,
+    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
+    Ok(LlamaWeights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+        lm_head_aliases_embd,
+    })
 }
 
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
@@ -1605,5 +1635,6 @@ pub fn load_weights_paroquant_llama(
         output_norm,
         output,
         layers,
+        lm_head_aliases_embd: false,
     })
 }
