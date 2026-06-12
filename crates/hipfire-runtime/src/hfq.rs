@@ -1571,54 +1571,48 @@ pub fn load_weights_paroquant_llama(
     eprintln!("  loading output_norm...");
     let output_norm = paro_load_llama_norm_raw(source, gpu, "norm.weight", &[config.dim])?;
 
-    // Output / lm_head (tied or separate)
-    let output = if source.tensor_info("lm_head.weight").is_some() {
-        eprintln!("  loading output (separate lm_head)...");
-        let lm_prefix = "lm_head";
-        if source
-            .tensor_info(&format!("{lm_prefix}.qweight"))
-            .is_some()
-        {
-            load_paroquant_weight_from_source(
-                source,
-                gpu,
-                lm_prefix,
-                config.vocab_size,
-                config.dim,
-                gs,
-                kr,
-            )?
-        } else {
-            load_fp16_weight_tensor_from_source(
-                source,
-                gpu,
-                &format!("{lm_prefix}.weight"),
-                config.vocab_size,
-                config.dim,
-            )?
-        }
-    } else {
-        eprintln!("  loading output (tied embeddings)...");
-        let (_, td) = source
-            .tensor_data(embd_name)
-            .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens for lm_head"))?;
-        let f: Vec<f32> = td
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        }
-    };
+    // Output / lm_head (tied or separate) — alias the F32 embd buffer when tied.
+    let has_separate = source.tensor_info("lm_head.weight").is_some();
+    let (output, lm_head_aliases_embd) = resolve_lm_head(
+        gpu,
+        has_separate,
+        true, // load_weights_paroquant_llama is single-GPU only
+        &token_embd,
+        embd_fmt,
+        config.vocab_size,
+        config.dim,
+        |gpu| {
+            let lm_prefix = "lm_head";
+            if source
+                .tensor_info(&format!("{lm_prefix}.qweight"))
+                .is_some()
+            {
+                load_paroquant_weight_from_source(
+                    source,
+                    gpu,
+                    lm_prefix,
+                    config.vocab_size,
+                    config.dim,
+                    gs,
+                    kr,
+                )
+            } else {
+                load_fp16_weight_tensor_from_source(
+                    source,
+                    gpu,
+                    &format!("{lm_prefix}.weight"),
+                    config.vocab_size,
+                    config.dim,
+                )
+            }
+        },
+        |gpu| {
+            let (_, td) = source.tensor_data(embd_name).ok_or_else(|| {
+                HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
+            })?;
+            reupload_f16_as_f32(gpu, &td, config.vocab_size, config.dim)
+        },
+    )?;
 
     // Layers — shared `load_layer` walk
     let q_out_dim = config.n_heads * config.head_dim;
@@ -1647,6 +1641,6 @@ pub fn load_weights_paroquant_llama(
         output_norm,
         output,
         layers,
-        lm_head_aliases_embd: false,
+        lm_head_aliases_embd,
     })
 }
