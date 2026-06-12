@@ -41,7 +41,12 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
 /// for the per-layer + final **RMSNorm** weights (cohere2_moe uses RMSNorm at
 /// `rms_norm_eps`, NOT base Cohere2's mean-centered LayerNorm). RMSNorm has a
 /// learned weight (gamma) and no bias — this loads the gamma vector.
-fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result<GpuTensor, String> {
+fn load_f32(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
         1 => data
@@ -53,7 +58,11 @@ fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         3 => dequant_q8_0(&data),
-        _ => return Err(format!("cohere2moe: expected F16/F32/Q8 for {name}, got qt={qt}")),
+        _ => {
+            return Err(format!(
+                "cohere2moe: expected F16/F32/Q8 for {name}, got qt={qt}"
+            ))
+        }
     };
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("cohere2moe: upload {name}: {e:?}"))
@@ -71,14 +80,26 @@ fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
     out
 }
 
-fn load_wt(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> Result<WeightTensor, String> {
+fn load_wt(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("cohere2moe: load_wt {name}: {e}"))
 }
 
 /// quant_type → DType mapping (mirrors lfm2moe/minimax::wt_from_raw); uploads
 /// raw bytes and tags the dtype for kernel dispatch.
-fn wt_from_raw(gpu: &mut Gpu, qt: u8, data: &[u8], m: usize, k: usize) -> Result<WeightTensor, String> {
+fn wt_from_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let dtype = match qt {
         1 => DType::F16,
         2 => DType::F32,
@@ -172,7 +193,13 @@ impl Cohere2MoeWeights {
         let embed = gpu
             .upload_raw(&embed_bytes, &[embed_bytes.len()])
             .map_err(|e| format!("cohere2moe: upload embed: {e:?}"))?;
-        let lm_head = load_wt(hfq, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+        let lm_head = load_wt(
+            hfq,
+            gpu,
+            "model.embed_tokens.weight",
+            cfg.vocab_size,
+            hidden,
+        )?;
         let embed_dtype = lm_head.gpu_dtype;
         let final_norm = load_f32(hfq, gpu, "model.norm.weight", &[hidden])?;
 
@@ -180,15 +207,57 @@ impl Cohere2MoeWeights {
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
             let input_norm = load_f32(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[hidden])?;
-            let wq = load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, hidden)?;
-            let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
-            let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden)?;
-            let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?;
+            let wq = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_proj.weight"),
+                q_dim,
+                hidden,
+            )?;
+            let wk = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_proj.weight"),
+                kv_dim,
+                hidden,
+            )?;
+            let wv = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.v_proj.weight"),
+                kv_dim,
+                hidden,
+            )?;
+            let wo = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.o_proj.weight"),
+                hidden,
+                q_dim,
+            )?;
 
             let ffn = if cfg.is_dense_ffn(l) {
-                let gate = load_wt(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), dense_inter, hidden)?;
-                let up = load_wt(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), dense_inter, hidden)?;
-                let down = load_wt(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), hidden, dense_inter)?;
+                let gate = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    dense_inter,
+                    hidden,
+                )?;
+                let up = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    dense_inter,
+                    hidden,
+                )?;
+                let down = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    hidden,
+                    dense_inter,
+                )?;
                 Ffn::Dense(DenseFfn { gate, up, down })
             } else {
                 let router = load_wt(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, hidden)?;
@@ -285,18 +354,18 @@ pub struct Cohere2MoeState {
     pub dense_act: GpuTensor,  // [dense_inter] silu(gate)*up
 
     // moe scratch
-    pub ffn_x_rot: GpuTensor,     // [hidden] FWHT(normed) for MQ4/MQ6 experts
+    pub ffn_x_rot: GpuTensor, // [hidden] FWHT(normed) for MQ4/MQ6 experts
     pub router_logits: GpuTensor, // [n_exp]
-    pub topk_indices: GpuTensor,  // [k_top] i32-in-F32
-    pub topk_weights: GpuTensor,  // [k_top]
-    pub gate_batch: GpuTensor,    // [k_top*moe_inter]
-    pub up_batch: GpuTensor,      // [k_top*moe_inter]
-    pub rot_batch: GpuTensor,     // [k_top*moe_inter]
+    pub topk_indices: GpuTensor, // [k_top] i32-in-F32
+    pub topk_weights: GpuTensor, // [k_top]
+    pub gate_batch: GpuTensor, // [k_top*moe_inter]
+    pub up_batch: GpuTensor,  // [k_top*moe_inter]
+    pub rot_batch: GpuTensor, // [k_top*moe_inter]
     pub down_expanded: GpuTensor, // [k_top*hidden]
     /// Per-expert scratch for the F16/Q8 (non-indexed) MoE path.
     pub expert_gate_up: GpuTensor, // [2*moe_inter]
-    pub expert_act: GpuTensor,     // [moe_inter] silu(gate)*up
-    pub expert_down: GpuTensor,    // [hidden]
+    pub expert_act: GpuTensor, // [moe_inter] silu(gate)*up
+    pub expert_down: GpuTensor, // [hidden]
 
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
@@ -332,7 +401,11 @@ impl Cohere2MoeState {
         Self::new_with_max_seq(gpu, cfg, max_seq)
     }
 
-    pub fn new_with_max_seq(gpu: &mut Gpu, cfg: &Cohere2MoeConfig, max_seq: usize) -> Result<Self, String> {
+    pub fn new_with_max_seq(
+        gpu: &mut Gpu,
+        cfg: &Cohere2MoeConfig,
+        max_seq: usize,
+    ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -346,8 +419,14 @@ impl Cohere2MoeState {
             .map_err(|e| format!("cohere2moe: ensure_mq_signs: {e:?}"))?;
 
         // One KV slot per layer (every layer is attention).
-        let kv = KvCache::new_gpu_q8(gpu, cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, max_seq)
-            .map_err(|e| format!("cohere2moe: kv cache: {e:?}"))?;
+        let kv = KvCache::new_gpu_q8(
+            gpu,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("cohere2moe: kv cache: {e:?}"))?;
         let pos_buf = gpu
             .hip
             .malloc(4)
@@ -387,7 +466,9 @@ impl Cohere2MoeState {
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
             flash_partials: alloc(
                 gpu,
-                cfg.num_attention_heads * ((max_seq + 127) / 128) * (2 + cfg.head_dim)
+                cfg.num_attention_heads
+                    * ((max_seq + 127) / 128)
+                    * (2 + cfg.head_dim)
                     * FLASH_PREFILL_SUBBATCH,
                 "flash_partials",
             )?,

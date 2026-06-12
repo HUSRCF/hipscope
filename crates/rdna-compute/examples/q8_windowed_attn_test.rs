@@ -59,7 +59,10 @@ fn fill_kv(ctx: usize, huge_below: usize) -> Vec<u8> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn main() {
@@ -68,7 +71,9 @@ fn main() {
     let bytes_per_pos = NKV * blocks_per_head * BLK;
 
     // Q: [1 × NH × HD], a varied pattern.
-    let q_data: Vec<f32> = (0..NH * HD).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let q_data: Vec<f32> = (0..NH * HD)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
     let q = gpu.upload_f32(&q_data, &[NH * HD]).expect("q");
 
     // positions: single query at the tail (pos = S-1).
@@ -113,11 +118,15 @@ fn main() {
 
     let mut ok = true;
     if !(d_clip > 1e-3) {
-        eprintln!("FAIL (1): windowed output == full-causal; window had NO effect (masking not applied)");
+        eprintln!(
+            "FAIL (1): windowed output == full-causal; window had NO effect (masking not applied)"
+        );
         ok = false;
     }
     if !(d_invar < 1e-3) {
-        eprintln!("FAIL (2): huge OUT-OF-WINDOW keys changed the output; they leaked past the mask");
+        eprintln!(
+            "FAIL (2): huge OUT-OF-WINDOW keys changed the output; they leaked past the mask"
+        );
         ok = false;
     }
     if !(d_equiv < 1e-3) {
@@ -132,7 +141,18 @@ fn main() {
         let v = gpu.upload_raw(kv, &[kv.len()]).expect("v");
         let out = gpu.zeros(&[NH * HD], DType::F32).expect("out");
         gpu.attention_flash_q8_0_windowed(
-            &q, &k, &v, &out, &positions.buf, S, NH, NKV, HD, S, &partials, window,
+            &q,
+            &k,
+            &v,
+            &out,
+            &positions.buf,
+            S,
+            NH,
+            NKV,
+            HD,
+            S,
+            &partials,
+            window,
         )
         .expect("nb windowed attn launch");
         gpu.download_f32(&out).expect("download")

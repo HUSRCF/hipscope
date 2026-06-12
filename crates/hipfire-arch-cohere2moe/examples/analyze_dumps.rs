@@ -45,7 +45,9 @@ fn kl(r: &[f32], c: &[f32]) -> f64 {
 }
 
 fn pct(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     sorted[(((sorted.len() - 1) as f64) * q).round() as usize]
 }
 
@@ -57,35 +59,60 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--tokens" => { tokens_path = argv[i + 1].clone(); i += 2; }
-            "--ref" => { refn = Some(argv[i + 1].clone()); i += 2; }
+            "--tokens" => {
+                tokens_path = argv[i + 1].clone();
+                i += 2;
+            }
+            "--ref" => {
+                refn = Some(argv[i + 1].clone());
+                i += 2;
+            }
             "--dump" => {
                 let (n, p) = argv[i + 1].split_once('=').expect("name=path");
                 dumps.push((n.to_string(), p.to_string()));
                 i += 2;
             }
-            o => { eprintln!("unknown arg {o}"); std::process::exit(1); }
+            o => {
+                eprintln!("unknown arg {o}");
+                std::process::exit(1);
+            }
         }
     }
-    let toks: Vec<usize> = serde_json::from_str::<Vec<i64>>(
-        &fs::read_to_string(&tokens_path).expect("read tokens"),
-    ).expect("parse tokens").into_iter().map(|t| t as usize).collect();
+    let toks: Vec<usize> =
+        serde_json::from_str::<Vec<i64>>(&fs::read_to_string(&tokens_path).expect("read tokens"))
+            .expect("parse tokens")
+            .into_iter()
+            .map(|t| t as usize)
+            .collect();
 
-    let loaded: HashMap<String, (usize, usize, Vec<f32>)> =
-        dumps.iter().map(|(n, p)| (n.clone(), load_dump(p))).collect();
+    let loaded: HashMap<String, (usize, usize, Vec<f32>)> = dumps
+        .iter()
+        .map(|(n, p)| (n.clone(), load_dump(p)))
+        .collect();
     let ref_name = refn.unwrap_or_else(|| dumps[0].0.clone());
     let (n_pos, vocab, ref_d) = &loaded[&ref_name];
     let n_pos = *n_pos;
     let vocab = *vocab;
-    eprintln!("ref={ref_name} n_pos={n_pos} vocab={vocab} tokens={}", toks.len());
+    eprintln!(
+        "ref={ref_name} n_pos={n_pos} vocab={vocab} tokens={}",
+        toks.len()
+    );
 
-    println!("{:>6} | {:>9} {:>9} {:>9} | {:>9}", "tier", "KL.mean", "KL.med", "KL.p99", "PPL");
+    println!(
+        "{:>6} | {:>9} {:>9} {:>9} | {:>9}",
+        "tier", "KL.mean", "KL.med", "KL.p99", "PPL"
+    );
     println!("{}", "-".repeat(56));
     for (name, _) in &dumps {
         let (_, _, d) = &loaded[name];
         // KL(ref || tier) per position.
         let mut kls: Vec<f64> = (0..n_pos)
-            .map(|p| kl(&ref_d[p * vocab..(p + 1) * vocab], &d[p * vocab..(p + 1) * vocab]))
+            .map(|p| {
+                kl(
+                    &ref_d[p * vocab..(p + 1) * vocab],
+                    &d[p * vocab..(p + 1) * vocab],
+                )
+            })
             .collect();
         let mean = kls.iter().sum::<f64>() / kls.len() as f64;
         kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -97,7 +124,13 @@ fn main() {
             nll += logsumexp(row) - row[toks[p + 1]] as f64;
         }
         let ppl = (nll / ppl_n as f64).exp();
-        println!("{:>6} | {:>9.5} {:>9.5} {:>9.5} | {:>9.3}",
-            name, mean, pct(&kls, 0.5), pct(&kls, 0.99), ppl);
+        println!(
+            "{:>6} | {:>9.5} {:>9.5} {:>9.5} | {:>9.3}",
+            name,
+            mean,
+            pct(&kls, 0.5),
+            pct(&kls, 0.99),
+            ppl
+        );
     }
 }

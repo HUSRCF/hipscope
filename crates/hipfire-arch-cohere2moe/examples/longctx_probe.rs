@@ -29,7 +29,9 @@ use std::path::Path;
 
 fn arg(flag: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
-    a.iter().position(|x| x == flag).and_then(|i| a.get(i + 1).cloned())
+    a.iter()
+        .position(|x| x == flag)
+        .and_then(|i| a.get(i + 1).cloned())
 }
 fn has(flag: &str) -> bool {
     std::env::args().any(|x| x == flag)
@@ -54,7 +56,12 @@ fn analyze(logits: &[f32]) -> (u32, f32, f32, Vec<(u32, f32)>) {
     probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let argmax = probs[0].0;
     let pmax = probs[0].1;
-    (argmax, pmax, ent as f32, probs.into_iter().take(5).collect())
+    (
+        argmax,
+        pmax,
+        ent as f32,
+        probs.into_iter().take(5).collect(),
+    )
 }
 
 fn main() {
@@ -100,7 +107,10 @@ fn main() {
     let mut state = Cohere2MoeState::new_with_max_seq(&mut gpu, &cfg, want + 16).expect("state");
     let _ = state.reset(&mut gpu);
 
-    println!("# mode={}  chunk={chunk}  (entropy in nats; healthy≫0, collapsed≈0)", if use_batch { "batched" } else { "per-token" });
+    println!(
+        "# mode={}  chunk={chunk}  (entropy in nats; healthy≫0, collapsed≈0)",
+        if use_batch { "batched" } else { "per-token" }
+    );
     println!("#     L    argmax    pmax  entropy  is_pad  argmax_decoded  | top5(id:prob)");
 
     let mut cp_idx = 0usize;
@@ -108,11 +118,22 @@ fn main() {
     let mut last: Vec<f32> = Vec::new();
     while i < want && cp_idx < lengths.len() {
         let cp = lengths[cp_idx];
-        let end = if use_batch { (i + chunk).min(cp) } else { i + 1 };
+        let end = if use_batch {
+            (i + chunk).min(cp)
+        } else {
+            i + 1
+        };
         let start_pos = state.n_tokens;
         if use_batch {
-            last = forward_batch(&cfg, &weights, &mut state, &mut gpu, &toks[i..end], start_pos)
-                .expect("forward_batch");
+            last = forward_batch(
+                &cfg,
+                &weights,
+                &mut state,
+                &mut gpu,
+                &toks[i..end],
+                start_pos,
+            )
+            .expect("forward_batch");
         } else {
             last = decode_step(&cfg, &weights, &mut state, &mut gpu, toks[i], i as u32)
                 .expect("decode_step");

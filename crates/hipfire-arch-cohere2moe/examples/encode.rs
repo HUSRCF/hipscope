@@ -18,11 +18,26 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--text" => { text = Some(argv[i + 1].clone()); i += 2; }
-            "--text-file" => { text_file = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
-            other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--text" => {
+                text = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--text-file" => {
+                text_file = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--max" => {
+                max = argv[i + 1].parse().expect("--max");
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown arg {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");

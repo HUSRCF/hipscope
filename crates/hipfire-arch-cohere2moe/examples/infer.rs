@@ -8,8 +8,8 @@
 //!
 //! Usage: infer --model <hfq> [--prompt <text>] [--max N] [--tokens <json>] [--eos <id>]
 
-use hipfire_arch_cohere2moe::config::Cohere2MoeConfig;
 use hipfire_arch_cohere2moe::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights};
+use hipfire_arch_cohere2moe::config::Cohere2MoeConfig;
 use hipfire_arch_cohere2moe::forward::{decode_step, forward_batch, forward_batch_supported};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -26,25 +26,54 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--prompt" => { prompt = argv[i + 1].clone(); i += 2; }
-            "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
-            "--tokens" => { tokens_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--eos" => { eos_extra = Some(argv[i + 1].parse().expect("--eos")); i += 2; }
-            "--chunk" => { chunk = argv[i + 1].parse().expect("--chunk"); i += 2; }
-            other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--prompt" => {
+                prompt = argv[i + 1].clone();
+                i += 2;
+            }
+            "--max" => {
+                max = argv[i + 1].parse().expect("--max");
+                i += 2;
+            }
+            "--tokens" => {
+                tokens_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--eos" => {
+                eos_extra = Some(argv[i + 1].parse().expect("--eos"));
+                i += 2;
+            }
+            "--chunk" => {
+                chunk = argv[i + 1].parse().expect("--chunk");
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown arg {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
-    assert_eq!(hfq.arch_id, 12, "infer(cohere2moe): expected arch_id 12, got {}", hfq.arch_id);
+    assert_eq!(
+        hfq.arch_id, 12,
+        "infer(cohere2moe): expected arch_id 12, got {}",
+        hfq.arch_id
+    );
     let cfg = Cohere2MoeConfig::from_hfq(&hfq).expect("config");
     eprintln!(
         "cohere2moe hidden={} layers={} experts={}/{} dense_prefix={} vocab={}",
-        cfg.hidden_size, cfg.num_hidden_layers, cfg.num_experts,
-        cfg.num_experts_per_tok, cfg.first_k_dense_replace, cfg.vocab_size,
+        cfg.hidden_size,
+        cfg.num_hidden_layers,
+        cfg.num_experts,
+        cfg.num_experts_per_tok,
+        cfg.first_k_dense_replace,
+        cfg.vocab_size,
     );
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let t_load = std::time::Instant::now();
@@ -66,7 +95,10 @@ fn main() {
         let mut bi = 0u32;
         let mut bv = f32::NEG_INFINITY;
         for (i, &x) in v.iter().enumerate() {
-            if x > bv { bv = x; bi = i as u32; }
+            if x > bv {
+                bv = x;
+                bi = i as u32;
+            }
         }
         bi
     };
@@ -86,7 +118,8 @@ fn main() {
         }
     } else {
         for (pos, &t) in prompt_ids.iter().enumerate() {
-            logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
+            logits =
+                decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
         }
     }
     eprintln!(
@@ -106,11 +139,17 @@ fn main() {
         if matches!(next, 255001 | 0) || Some(next) == eos_extra {
             break;
         }
-        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
+        logits =
+            decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();
-    eprintln!("decoded {} tok in {:.2}s ({:.1} tok/s)", gen.len(), dt, gen.len() as f64 / dt);
+    eprintln!(
+        "decoded {} tok in {:.2}s ({:.1} tok/s)",
+        gen.len(),
+        dt,
+        gen.len() as f64 / dt
+    );
     println!(
         "=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}",
         tok.decode(&gen)

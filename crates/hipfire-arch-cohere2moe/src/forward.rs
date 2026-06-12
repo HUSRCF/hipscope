@@ -29,8 +29,8 @@
 //! matters at ALL lengths) is implemented here. A windowed-mask path for
 //! >4096-token context is a follow-up.
 
-use crate::config::{AttnKind, Cohere2MoeConfig};
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
+use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
 use hipfire_runtime::llama::{
@@ -52,7 +52,10 @@ fn align_up_usize(x: usize, a: usize) -> usize {
 #[inline]
 fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
     let live = total_slots.min(n_exp);
-    align_up_usize(total_slots + live * (MOE_GROUPED_BLOCK_M - 1), MOE_GROUPED_BLOCK_M)
+    align_up_usize(
+        total_slots + live * (MOE_GROUPED_BLOCK_M - 1),
+        MOE_GROUPED_BLOCK_M,
+    )
 }
 
 /// Batched Q8_0 projection GEMM for prefill (`Y[b,m] = X[b,k] @ W_q8[m,k]^T`).
@@ -170,15 +173,8 @@ fn decode_step_body(
         // ── Parallel block: ONE RMSNorm → `normed`, fed to BOTH the attention
         //    and the FFN branch. cohere2_moe uses plain RMSNorm (LlamaRMSNorm,
         //    rms_norm_eps), NOT base Cohere2's mean-centered LayerNorm. ────────
-        gpu.rmsnorm_batched(
-            &state.h,
-            &layer.input_norm,
-            &state.normed,
-            1,
-            hidden,
-            eps,
-        )
-        .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
+        gpu.rmsnorm_batched(&state.h, &layer.input_norm, &state.normed, 1, hidden, eps)
+            .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
 
         // ── Attention branch (reads `normed`) ──────────────────────────────
         weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
@@ -222,10 +218,22 @@ fn decode_step_body(
         // KV write (Q8) + GQA attention. `sliding_attention` layers clip to the
         // last `sliding_window` keys (window>0); `full_attention` layers are
         // full causal (window=0). One KV slot per layer.
-        gpu.kv_cache_write_q8_0(&state.kv.k_gpu[l], &state.fa_k, &state.pos_buf, n_kv, head_dim)
-            .map_err(|e| format!("cohere2moe L{l}: kv write k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0(&state.kv.v_gpu[l], &state.fa_v, &state.pos_buf, n_kv, head_dim)
-            .map_err(|e| format!("cohere2moe L{l}: kv write v: {e:?}"))?;
+        gpu.kv_cache_write_q8_0(
+            &state.kv.k_gpu[l],
+            &state.fa_k,
+            &state.pos_buf,
+            n_kv,
+            head_dim,
+        )
+        .map_err(|e| format!("cohere2moe L{l}: kv write k: {e:?}"))?;
+        gpu.kv_cache_write_q8_0(
+            &state.kv.v_gpu[l],
+            &state.fa_v,
+            &state.pos_buf,
+            n_kv,
+            head_dim,
+        )
+        .map_err(|e| format!("cohere2moe L{l}: kv write v: {e:?}"))?;
         // Flash (tiled, O(1)-LDS, online-softmax) Q8 attention — no seq-bound
         // shared-memory ceiling, so long context (large file reads) doesn't
         // crash the legacy LDS-bound `attention_q8_0_kv`.
@@ -289,41 +297,83 @@ fn decode_step_body(
                     // FWHT-pre-rotated indexed MoE GEMV (MQ4/MQ6 tiers).
                     DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256 => {
                         let mq6 = matches!(edt, DType::MQ6G256 | DType::HFQ6G256);
-                        rotate_x_mq_for(gpu, &m.experts[0].gate_up, &state.normed, &state.ffn_x_rot, hidden)
-                            .map_err(|e| format!("cohere2moe L{l}: ffn rotate: {e:?}"))?;
+                        rotate_x_mq_for(
+                            gpu,
+                            &m.experts[0].gate_up,
+                            &state.normed,
+                            &state.ffn_x_rot,
+                            hidden,
+                        )
+                        .map_err(|e| format!("cohere2moe L{l}: ffn rotate: {e:?}"))?;
                         if mq6 {
                             gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                                &state.gate_batch, &state.up_batch, 2 * moe_inter, hidden, k_top, 1,
+                                &m.expert_gate_up_ptrs,
+                                &state.topk_indices,
+                                &state.ffn_x_rot,
+                                &state.gate_batch,
+                                &state.up_batch,
+                                2 * moe_inter,
+                                hidden,
+                                k_top,
+                                1,
                             )
                             .map_err(|e| format!("cohere2moe L{l}: gate_up(mq6): {e:?}"))?;
                         } else {
                             gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                                &state.gate_batch, &state.up_batch, 2 * moe_inter, hidden, k_top, 1,
+                                &m.expert_gate_up_ptrs,
+                                &state.topk_indices,
+                                &state.ffn_x_rot,
+                                &state.gate_batch,
+                                &state.up_batch,
+                                2 * moe_inter,
+                                hidden,
+                                k_top,
+                                1,
                             )
                             .map_err(|e| format!("cohere2moe L{l}: gate_up(mq4): {e:?}"))?;
                         }
                         fused_silu_mul_rotate_mq_batched_for(
-                            gpu, &m.experts[0].down, &state.gate_batch, &state.up_batch,
-                            &state.rot_batch, moe_inter, k_top,
+                            gpu,
+                            &m.experts[0].down,
+                            &state.gate_batch,
+                            &state.up_batch,
+                            &state.rot_batch,
+                            moe_inter,
+                            k_top,
                         )
                         .map_err(|e| format!("cohere2moe L{l}: silu_mul_rotate: {e:?}"))?;
                         if mq6 {
                             gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs, &state.topk_indices, &state.rot_batch,
-                                &state.down_expanded, hidden, moe_inter, k_top, 1,
+                                &m.expert_down_ptrs,
+                                &state.topk_indices,
+                                &state.rot_batch,
+                                &state.down_expanded,
+                                hidden,
+                                moe_inter,
+                                k_top,
+                                1,
                             )
                             .map_err(|e| format!("cohere2moe L{l}: down(mq6): {e:?}"))?;
                         } else {
                             gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs, &state.topk_indices, &state.rot_batch,
-                                &state.down_expanded, hidden, moe_inter, k_top, 1,
+                                &m.expert_down_ptrs,
+                                &state.topk_indices,
+                                &state.rot_batch,
+                                &state.down_expanded,
+                                hidden,
+                                moe_inter,
+                                k_top,
+                                1,
                             )
                             .map_err(|e| format!("cohere2moe L{l}: down(mq4): {e:?}"))?;
                         }
                         gpu.moe_down_combine_k8_batched(
-                            &state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1,
+                            &state.down_expanded,
+                            &state.topk_weights,
+                            &state.h,
+                            hidden,
+                            k_top,
+                            1,
                         )
                         .map_err(|e| format!("cohere2moe L{l}: combine: {e:?}"))?;
                     }
@@ -335,7 +385,9 @@ fn decode_step_body(
                         moe_per_expert(gpu, m, state, moe_inter, k_top, l)?;
                     }
                     other => {
-                        return Err(format!("cohere2moe L{l}: unsupported expert dtype {other:?}"))
+                        return Err(format!(
+                            "cohere2moe L{l}: unsupported expert dtype {other:?}"
+                        ))
                     }
                 }
             }
@@ -345,7 +397,10 @@ fn decode_step_body(
                 let l2 = hv.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let mx = hv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let nan = hv.iter().filter(|v| v.is_nan()).count();
-                eprintln!("[dbg] L{l} {:?} h.l2={l2:.2} max={mx:.3} nan={nan}", layer.attn_kind);
+                eprintln!(
+                    "[dbg] L{l} {:?} h.l2={l2:.2} max={mx:.3} nan={nan}",
+                    layer.attn_kind
+                );
             }
         }
     }
@@ -441,7 +496,15 @@ fn c2m_normdump_step() -> Option<usize> {
         .ok()
         .map(|s| s.trim().parse().unwrap_or(4096))
 }
-fn dbg_row_stats(gpu: &mut Gpu, t: &GpuTensor, b: usize, hidden: usize, l: usize, ctx: usize, tag: &str) {
+fn dbg_row_stats(
+    gpu: &mut Gpu,
+    t: &GpuTensor,
+    b: usize,
+    hidden: usize,
+    l: usize,
+    ctx: usize,
+    tag: &str,
+) {
     if let Ok(v) = gpu.download_f32(t) {
         let off = (b - 1) * hidden;
         if off + hidden > v.len() {
@@ -460,7 +523,11 @@ fn dbg_row_stats(gpu: &mut Gpu, t: &GpuTensor, b: usize, hidden: usize, l: usize
                 maxa = x.abs();
             }
         }
-        eprintln!("[normdump ctx={ctx} L{l:02} {tag}] l2={:.4} maxabs={:.5} nan={nan}", l2.sqrt(), maxa);
+        eprintln!(
+            "[normdump ctx={ctx} L{l:02} {tag}] l2={:.4} maxabs={:.5} nan={nan}",
+            l2.sqrt(),
+            maxa
+        );
     }
 }
 
@@ -484,10 +551,15 @@ pub fn forward_batch(
     // (≈4 at b=64 → ≈16 at b=256 with n_exp=128), shrinking the BLOCK_M=16
     // padding waste. 512 is a generous scratch-memory ceiling.
     if b > 512 {
-        return Err(format!("cohere2moe forward_batch: B={b} exceeds scratch cap 512"));
+        return Err(format!(
+            "cohere2moe forward_batch: B={b} exceeds scratch cap 512"
+        ));
     }
     if !forward_batch_supported(weights) {
-        return Err("cohere2moe forward_batch: unsupported tier (needs Q8 attn + indexed experts)".to_string());
+        return Err(
+            "cohere2moe forward_batch: unsupported tier (needs Q8 attn + indexed experts)"
+                .to_string(),
+        );
     }
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
@@ -549,7 +621,9 @@ pub fn forward_batch(
         .map_err(|e| format!("forward_batch alloc x_f16: {e:?}"))?;
 
     // positions [B] i32 (stored in an f32-sized buffer; kernels read it as i32).
-    let pos_bytes: Vec<u8> = (0..b).flat_map(|i| ((start_pos + i) as i32).to_ne_bytes()).collect();
+    let pos_bytes: Vec<u8> = (0..b)
+        .flat_map(|i| ((start_pos + i) as i32).to_ne_bytes())
+        .collect();
     let pos_array = alloc(gpu, b, "pos_array")?;
     gpu.hip
         .memcpy_htod(&pos_array.buf, &pos_bytes)
@@ -567,18 +641,19 @@ pub fn forward_batch(
         gpu.free_tensor(xs).ok();
     }
 
-    let normdump =
-        c2m_normdump_step().map_or(false, |step| step > 0 && (start_pos / step != max_ctx / step));
+    let normdump = c2m_normdump_step().map_or(false, |step| {
+        step > 0 && (start_pos / step != max_ctx / step)
+    });
     for (l, layer) in weights.layers.iter().enumerate() {
         // Parallel block: normed = RMSNorm(x), fed to BOTH branches.
         gpu.rmsnorm_batched(&x, &layer.input_norm, &normed, b, hidden, eps)
             .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
         // Attention from `normed` (Q8 projections).
-        q8_proj_raw(gpu,&layer.wq.buf, &normed, &fq, q_dim, hidden, b, &x_f16)
+        q8_proj_raw(gpu, &layer.wq.buf, &normed, &fq, q_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch q: {e:?}"))?;
-        q8_proj_raw(gpu,&layer.wk.buf, &normed, &fk, kv_dim, hidden, b, &x_f16)
+        q8_proj_raw(gpu, &layer.wk.buf, &normed, &fk, kv_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch k: {e:?}"))?;
-        q8_proj_raw(gpu,&layer.wv.buf, &normed, &fv, kv_dim, hidden, b, &x_f16)
+        q8_proj_raw(gpu, &layer.wv.buf, &normed, &fv, kv_dim, hidden, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch v: {e:?}"))?;
         // NoPE on full layers; interleaved RoPE on sliding layers.
         // RoPE on sliding layers AND the dense prefix layers (force_rope) — see
@@ -587,7 +662,15 @@ pub fn forward_batch(
             || (l < cfg.first_k_dense_replace && cfg.prefix_dense_sliding_window_pattern == 1)
         {
             gpu.rope_interleaved_f32_batched(
-                &fq, &fk, &pos_array, n_heads, n_kv, head_dim, head_dim, cfg.rope_theta, b,
+                &fq,
+                &fk,
+                &pos_array,
+                n_heads,
+                n_kv,
+                head_dim,
+                head_dim,
+                cfg.rope_theta,
+                b,
             )
             .map_err(|e| format!("cohere2moe L{l} batch rope: {e:?}"))?;
         }
@@ -606,12 +689,25 @@ pub fn forward_batch(
             0
         };
         gpu.attention_flash_q8_0_batched_masked_windowed(
-            &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
-            n_heads, n_kv, head_dim, max_seq, max_ctx, b,
-            &state.flash_partials, None, 0, 0, window,
+            &fq,
+            &state.kv.k_gpu[l],
+            &state.kv.v_gpu[l],
+            &attn_out,
+            &pos_array,
+            n_heads,
+            n_kv,
+            head_dim,
+            max_seq,
+            max_ctx,
+            b,
+            &state.flash_partials,
+            None,
+            0,
+            0,
+            window,
         )
         .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
-        q8_proj_raw(gpu,&layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)
+        q8_proj_raw(gpu, &layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)
             .map_err(|e| format!("cohere2moe L{l} batch o: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
             .map_err(|e| format!("cohere2moe L{l} batch o-resid: {e:?}"))?;
@@ -622,24 +718,65 @@ pub fn forward_batch(
         // FFN from the SAME `normed` (parallel block).
         match &layer.ffn {
             Ffn::Dense(d) => {
-                q8_proj_raw(gpu,&d.gate.buf, &normed, &dense_gate, dense_inter, hidden, b, &x_f16)
-                    .map_err(|e| format!("cohere2moe L{l} batch dgate: {e:?}"))?;
-                q8_proj_raw(gpu,&d.up.buf, &normed, &dense_up, dense_inter, hidden, b, &x_f16)
-                    .map_err(|e| format!("cohere2moe L{l} batch dup: {e:?}"))?;
+                q8_proj_raw(
+                    gpu,
+                    &d.gate.buf,
+                    &normed,
+                    &dense_gate,
+                    dense_inter,
+                    hidden,
+                    b,
+                    &x_f16,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch dgate: {e:?}"))?;
+                q8_proj_raw(
+                    gpu,
+                    &d.up.buf,
+                    &normed,
+                    &dense_up,
+                    dense_inter,
+                    hidden,
+                    b,
+                    &x_f16,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch dup: {e:?}"))?;
                 gpu.silu_mul_f32(&dense_gate, &dense_up, &dense_act)
                     .map_err(|e| format!("cohere2moe L{l} batch dsilu: {e:?}"))?;
-                q8_proj_raw(gpu,&d.down.buf, &dense_act, &o, hidden, dense_inter, b, &x_f16)
-                    .map_err(|e| format!("cohere2moe L{l} batch ddown: {e:?}"))?;
+                q8_proj_raw(
+                    gpu,
+                    &d.down.buf,
+                    &dense_act,
+                    &o,
+                    hidden,
+                    dense_inter,
+                    b,
+                    &x_f16,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch ddown: {e:?}"))?;
                 gpu.add_inplace_f32(&x, &o)
                     .map_err(|e| format!("cohere2moe L{l} batch ddown-resid: {e:?}"))?;
             }
             Ffn::Moe(m) => {
-                q8_proj_raw(gpu,&m.router.buf, &normed, &router_logits, n_exp, hidden, b, &x_f16)
-                    .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
+                q8_proj_raw(
+                    gpu,
+                    &m.router.buf,
+                    &normed,
+                    &router_logits,
+                    n_exp,
+                    hidden,
+                    b,
+                    &x_f16,
+                )
+                .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
                 gpu.sigmoid_f32(&router_logits)
                     .map_err(|e| format!("cohere2moe L{l} batch sigmoid: {e:?}"))?;
                 gpu.moe_topk_renorm_k8_batched(
-                    &router_logits, &topk_idx, &topk_w, n_exp, cfg.norm_topk_prob, b,
+                    &router_logits,
+                    &topk_idx,
+                    &topk_w,
+                    n_exp,
+                    cfg.norm_topk_prob,
+                    b,
                 )
                 .map_err(|e| format!("cohere2moe L{l} batch topk: {e:?}"))?;
                 // `ffn_x_rot` ← FWHT(normed): run_moe_prefill's MQ4/MQ6 path
@@ -715,8 +852,15 @@ pub fn forward_batch(
     gpu.hip
         .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * hidden * 4, hidden * 4)
         .map_err(|e| format!("forward_batch last copy: {e:?}"))?;
-    gpu.rmsnorm_batched(&x_last, &weights.final_norm, &state.final_norm_buf, 1, hidden, eps)
-        .map_err(|e| format!("forward_batch final ln: {e:?}"))?;
+    gpu.rmsnorm_batched(
+        &x_last,
+        &weights.final_norm,
+        &state.final_norm_buf,
+        1,
+        hidden,
+        eps,
+    )
+    .map_err(|e| format!("forward_batch final ln: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("forward_batch lm_head: {e}"))?;
     let logits = gpu
@@ -724,10 +868,34 @@ pub fn forward_batch(
         .map_err(|e| format!("forward_batch download logits: {e:?}"))?;
 
     for t in [
-        x, normed, fq, fk, fv, attn_out, o, ffn_x_rot, router_logits, topk_idx, topk_w,
-        gate, up, rot, down_exp, dense_gate, dense_up, dense_act, pos_array, x_last,
-        expert_token_counts, expert_offsets, sorted_slot_index, inverse_perm, expert_tile_ids,
-        y_gate_up_grouped, y_down_grouped, x_f16,
+        x,
+        normed,
+        fq,
+        fk,
+        fv,
+        attn_out,
+        o,
+        ffn_x_rot,
+        router_logits,
+        topk_idx,
+        topk_w,
+        gate,
+        up,
+        rot,
+        down_exp,
+        dense_gate,
+        dense_up,
+        dense_act,
+        pos_array,
+        x_last,
+        expert_token_counts,
+        expert_offsets,
+        sorted_slot_index,
+        inverse_perm,
+        expert_tile_ids,
+        y_gate_up_grouped,
+        y_down_grouped,
+        x_f16,
     ] {
         gpu.free_tensor(t).ok();
     }
