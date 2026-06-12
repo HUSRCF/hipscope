@@ -12,6 +12,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod e8;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -1268,6 +1269,429 @@ fn quantize_mfp4g32_2d(
     out
 }
 
+
+// ─── mfp4+P — mfp4 with E4M3 (non-power-of-2) per-block scale ────────────────
+//
+// mfp4+P = mfp4 (E2M1 4-bit element + FP16 per-row scale + offline FWHT) but the
+// per-32-block scale byte is an **E4M3 FP8** encoding of the EXACT scale ratio
+// s = block_max_normalized / 6.0, instead of mfp4's UE8M0 ceil-log2 (power-of-2-
+// only). E4M3 carries ~3 mantissa bits, so each block's E2M1 [-6,6] grid is more
+// fully used (UE8M0 wastes up to ~1 bit by rounding the scale up to the next
+// power of 2). Byte layout is BYTE-IDENTICAL to mfp4 (16-B header + n_blocks×17 B,
+// NO codebook prefix); the only change is the meaning of the per-block scale byte.
+//
+// Reconstruction:  value = row_scale_a · e4m3_decode(scale_byte) · e2m1_to_f32(nibble)
+
+/// Decode an UNSIGNED E4M3 (FP8, 4 exp bias 7 + 3 mantissa) byte to f32.
+/// Bit-identical to `e4m3_to_f32` for sign=0, restated here standalone so the
+/// mfp4+P scale path is self-contained and matches the gfx942 kernel decode
+/// exactly. exp=0 → subnormal 2^-6·(mant/8); exp=15,mant=7 → NaN (never emitted
+/// by our round-up encoder, which clamps to 448); otherwise 2^(exp-7)·(1+mant/8).
+#[inline]
+fn e4m3_scale_decode(byte: u8) -> f32 {
+    let exp = ((byte >> 3) & 0xf) as i32;
+    let mant = (byte & 0x7) as u32;
+    if exp == 0 {
+        // subnormal (incl. zero): 2^-6 * (mant/8)
+        return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+    }
+    if exp == 0xf && mant == 7 {
+        // E4M3's single NaN code — our encoder never emits it; decode defensively
+        // to the max finite (448) so a stray byte cannot poison a block.
+        return 448.0;
+    }
+    (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+}
+
+/// Encode a NON-NEGATIVE f32 scale `s` to an UNSIGNED E4M3 byte, ROUNDED UP
+/// (ceil) to the nearest representable E4M3 value ≥ s. Round-up mirrors mfp4's
+/// UE8M0 ceil intent: the block scale must COVER block_max so e2m1_round never
+/// clips the block max above the [-6,6] E2M1 grid. Sign bit is always 0.
+///
+/// The decode side (`e4m3_scale_decode` / the gfx942 kernel) MUST be bit-identical;
+/// this function is defined as "smallest E4M3 code whose DECODED value ≥ s", which
+/// is round-trip-exact by construction (we search the decode, not a formula).
+///
+/// Representable unsigned E4M3 (exp 0..15, bias 7, 3 mantissa):
+///   exp=0  : subnormals 0, 2^-9, 2·2^-9 … 7·2^-9   (2^-6·mant/8)
+///   exp1..14, exp15&mant<7 : 2^(exp-7)·(1+mant/8)
+///   exp=15,mant=7 : NaN (excluded)  → max finite = 2^8·1.875 = 448
+#[inline]
+fn e4m3_scale_encode_roundup(s: f32) -> u8 {
+    // Non-finite / non-positive guard. s<=0 → smallest code (0x00 == +0.0).
+    if !(s > 0.0) {
+        return 0x00;
+    }
+    if s >= 448.0 {
+        // Saturate to the largest finite E4M3 (exp=15, mant=6 → 0x7E).
+        return 0x7E;
+    }
+    // Find the smallest code in [0x00, 0x7E] (sign=0, NaN 0x7F excluded) whose
+    // decoded value is ≥ s. Codes are monotonically non-decreasing in `byte`
+    // for sign=0 across the exp/mantissa range (standard FP8 ordering), so a
+    // forward scan returns the ceil code. Exhaustive 127-entry scan is trivially
+    // cheap (called once per 32-element block at quant time, offline).
+    for code in 0u8..=0x7E {
+        if e4m3_scale_decode(code) >= s {
+            return code;
+        }
+    }
+    0x7E
+}
+
+/// Quantize one row of K FP32 weights to mfp4+P byte format. Byte-identical to
+/// `quantize_hfp4g32_row` EXCEPT the per-block scale byte is an E4M3 round-up
+/// encoding of the exact ratio s = block_max_normalized / 6.0 (NOT UE8M0
+/// ceil-log2). Returns 16-B header + (K/32) × 17-B blocks.
+fn quantize_mfp4g32_p_row(row: &[f32]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "mfp4+P requires K%32 == 0, got K={}", row.len());
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+    out[6] = 0x05; // format_flags: bit0 + bits2-3=01 = offline FWHT (same as mfp4)
+    out[7] = 0u8;
+
+    for b in 0..n_blocks {
+        let block = &row[b * 32..b * 32 + 32];
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+
+        // Exact scale ratio s = block_max_normalized / 6.0. E4M3 round-UP so the
+        // decoded scale covers block_max (no clip above the [-6,6] E2M1 grid).
+        // Empty block → s=0 → code 0x00 (decodes to +0.0; inv → 0 → all nibbles 0).
+        let s = if block_max_normalized > 0.0 { block_max_normalized / 6.0 } else { 0.0 };
+        let scale_byte = e4m3_scale_encode_roundup(s);
+
+        // Reconstruct the ACTUAL decoded scale (round-up may exceed s) and invert.
+        let block_scale_factor = e4m3_scale_decode(scale_byte);
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+
+        let payload_off = 16 + b * 17;
+        out[payload_off] = scale_byte;
+        for i in 0..16 {
+            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
+            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
+            let lo_nibble = e2m1_round(lo);
+            let hi_nibble = e2m1_round(hi);
+            out[payload_off + 1 + i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
+        }
+    }
+    out
+}
+
+/// mfp4+P 2D: FWHT-rotate the tensor (same signs as mfp4), then per-row
+/// `quantize_mfp4g32_p_row`. Byte layout identical to mfp4 (NO prefix). Stamps
+/// format_flags=0x05 per row (handled inside the row fn).
+fn quantize_mfp4g32_p_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert!(k % 256 == 0, "mfp4+P requires k % 256 == 0 for 256-element FWHT, got k={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        out.extend_from_slice(&quantize_mfp4g32_p_row(&row_buf));
+    }
+    debug_assert_eq!(out.len(), m * row_bytes);
+    out
+}
+
+/// CPU reference dequant for mfp4+P. Returns row-major f32 [m*k] in the ROTATED
+/// domain. Bit-exact mirror of the gfx942 gemv/dequant kernels' E4M3 decode.
+#[allow(dead_code)]
+fn dequant_mfp4g32_p(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let row_bytes = 16 + 17 * (k / 32);
+    assert_eq!(packed.len(), m * row_bytes, "mfp4+P size mismatch");
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = r * row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+        for b in 0..(k / 32) {
+            let po = base + 16 + b * 17;
+            let scale = row_scale_a * e4m3_scale_decode(packed[po]);
+            for i in 0..16 {
+                let byte = packed[po + 1 + i];
+                out[r * k + b * 32 + 2 * i]     = scale * e2m1_to_f32(byte & 0x0F);
+                out[r * k + b * 32 + 2 * i + 1] = scale * e2m1_to_f32((byte >> 4) & 0x0F);
+            }
+        }
+    }
+    out
+}
+
+
+/// Quantize one row of K FP32 weights to mfp4-E8 byte format.
+/// Same E4M3 scale as mfp4+P; per-32-weight-block data = 4 E8 codewords (u32 each).
+/// Returns 16-B header + (K/32) x 17-B blocks. Byte-identical footprint to mfp4+P.
+fn quantize_mfp4g32_e8_row(row: &[f32]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "mfp4-E8 requires K%32==0, got K={}", row.len());
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+    out[6] = 0x05; // FWHT flag, identical to mfp4+P
+    out[7] = 0u8;
+    for b in 0..n_blocks {
+        let block = &row[b * 32..b * 32 + 32];
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+        let s = if block_max_normalized > 0.0 { block_max_normalized / 6.0 } else { 0.0 };
+        let scale_byte = e4m3_scale_encode_roundup(s);
+        let block_scale_factor = e4m3_scale_decode(scale_byte);
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let payload_off = 16 + b * 17;
+        out[payload_off] = scale_byte;
+        // 4 E8 codewords, 8 weights each, 32 bits little-endian.
+        for g in 0..4 {
+            let mut v = [0.0f32; 8];
+            for i in 0..8 {
+                v[i] = block[g * 8 + i] * inv_row_scale * inv_block_scale; // => [-6,6]
+            }
+            let idx = e8::quantize8(&v, e8::QUANT_STEP);
+            out[payload_off + 1 + g * 4..payload_off + 1 + g * 4 + 4]
+                .copy_from_slice(&idx.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// mfp4-E8 2D: FWHT-rotate the tensor (same signs as mfp4+P), then per-row
+/// quantize_mfp4g32_e8_row. Byte layout identical to mfp4+P (NO prefix).
+fn quantize_mfp4g32_e8_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k);
+    assert!(k % 256 == 0, "mfp4-E8 requires k%256==0, got k={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        out.extend_from_slice(&quantize_mfp4g32_e8_row(&row_buf));
+    }
+    out
+}
+
+/// CPU reference dequant for mfp4-E8. Returns row-major f32 [m*k] in the ROTATED domain.
+/// Bit-exact mirror of the gfx942 dequantize_mfp4g32_e8_to_f16 kernel decode.
+#[allow(dead_code)]
+fn dequant_mfp4g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let row_bytes = 16 + 17 * (k / 32);
+    assert_eq!(packed.len(), m * row_bytes, "mfp4-E8 size mismatch");
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = r * row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+        for b in 0..(k / 32) {
+            let po = base + 16 + b * 17;
+            let scale = row_scale_a * e4m3_scale_decode(packed[po]);
+            for g in 0..4 {
+                let idx = u32::from_le_bytes([
+                    packed[po + 1 + g * 4],
+                    packed[po + 2 + g * 4],
+                    packed[po + 3 + g * 4],
+                    packed[po + 4 + g * 4],
+                ]);
+                let vd = e8::dequantize8(idx, e8::QUANT_STEP);
+                for i in 0..8 {
+                    out[r * k + b * 32 + g * 8 + i] = scale * vd[i];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fit ONE 16-entry fp16 Lloyd-Max codebook over ALL normalized values of a
+/// FWHT-rotated tensor, in the same ~[-6,6] domain that feeds e2m1_round in
+/// mfp4. `vals` are pre-collected: for every element, value*inv_row_scale*
+/// inv_block_scale (i.e. exactly what mfp4 hands to e2m1_round). Mirrors the
+/// percentile-init + 8 k-means iters + sort-ascending recipe of
+/// quantize_mq4g256_lloyd, but tensor-global instead of per-block.
+fn fit_mfp4_lloyd_codebook(vals: &[f32]) -> [f32; 16] {
+    let mut sorted: Vec<f32> = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let mut cb = [0.0f32; 16];
+    if n == 0 {
+        for k in 0..16 { cb[k] = E2M1_LUT[k]; }
+        return cb;
+    }
+    for k in 0..16 {
+        let frac = (2 * k + 1) as f32 / 32.0;
+        let idx = ((frac * (n as f32 - 1.0)).round() as usize).min(n - 1);
+        cb[k] = sorted[idx];
+    }
+    let range = sorted[n - 1] - sorted[0];
+    if range > 0.0 {
+        let mut _it = 0usize;
+        loop {
+            let mut sums = [0.0f64; 16];
+            let mut counts = [0u64; 16];
+            for &w in vals {
+                let mut best = 0usize;
+                let mut best_d = (w - cb[0]).abs();
+                for k in 1..16 {
+                    let d = (w - cb[k]).abs();
+                    if d < best_d { best_d = d; best = k; }
+                }
+                sums[best] += w as f64;
+                counts[best] += 1;
+            }
+            let mut moved = false;
+            for k in 0..16 {
+                if counts[k] > 0 {
+                    let c = (sums[k] / counts[k] as f64) as f32;
+                    if c != cb[k] { moved = true; }
+                    cb[k] = c;
+                }
+            }
+            _it += 1;
+            if !moved || _it >= 8 { break; }
+        }
+    }
+    cb.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cb
+}
+
+/// Nearest-codebook index for mfp4L. The codebook is fp16-rounded BEFORE search
+/// so quantize matches kernel recon (kernel reads fp16 cb).
+fn nearest_cb_idx(x: f32, cb: &[f32; 16]) -> u8 {
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for (i, &c) in cb.iter().enumerate() {
+        let cf = f16_to_f32(f32_to_f16(c));
+        let e = (cf - x).abs();
+        if e < best_err { best_err = e; best = i as u8; }
+    }
+    best
+}
+
+/// Quantize one mfp4-normalized row to 17-B-block bytes using a fixed
+/// per-tensor codebook (nibble = nearest-codebook-index).
+fn quantize_mfp4g32_lloyd_row(row: &[f32], cb: &[f32; 16]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "mfp4L requires K%32==0, got K={}", row.len());
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+    out[6] = 0x05;
+    out[7] = 0u8;
+    for b in 0..n_blocks {
+        let block = &row[b * 32..b * 32 + 32];
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+        let block_e: u8 = if block_max_normalized > 0.0 {
+            let e_signed = (block_max_normalized / 6.0).log2().ceil() as i32 + 127;
+            e_signed.clamp(0, 254) as u8
+        } else { 0u8 };
+        let block_scale_factor = ((block_e as i32 - 127) as f32).exp2();
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let payload_off = 16 + b * 17;
+        out[payload_off] = block_e;
+        for i in 0..16 {
+            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
+            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
+            out[payload_off + 1 + i] = (nearest_cb_idx(lo, cb) & 0x0F) | ((nearest_cb_idx(hi, cb) & 0x0F) << 4);
+        }
+    }
+    out
+}
+
+/// MFP4G32-Lloyd 2D: FWHT-rotate the tensor, fit ONE per-tensor 16-entry codebook,
+/// then emit [32-B fp16 codebook][M rows].
+fn quantize_mfp4g32_lloyd_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k);
+    assert!(k % 256 == 0, "MFP4G32Lloyd requires k%256==0, got k={}", k);
+    let mut rotated = vec![0.0f32; m * k];
+    let mut norm_vals: Vec<f32> = Vec::with_capacity(m * k);
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        rotated[r * k..(r + 1) * k].copy_from_slice(&row_buf);
+        let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+        let inv_row_scale = if row_max_abs > 0.0 { 6.0 / row_max_abs } else { 0.0 };
+        for b in 0..(k / 32) {
+            let block = &row_buf[b * 32..b * 32 + 32];
+            let bmax = block.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+            let bmn = bmax * inv_row_scale;
+            let block_e: i32 = if bmn > 0.0 { (bmn / 6.0).log2().ceil() as i32 + 127 } else { 0 };
+            let inv_block_scale = (-(block_e.clamp(0, 254) - 127) as f32).exp2();
+            for &v in block { norm_vals.push(v * inv_row_scale * inv_block_scale); }
+        }
+    }
+    let cb = fit_mfp4_lloyd_codebook(&norm_vals);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(32 + m * row_bytes);
+    for k16 in 0..16usize { out.extend_from_slice(&f32_to_f16(cb[k16]).to_le_bytes()); }
+    for r in 0..m {
+        out.extend_from_slice(&quantize_mfp4g32_lloyd_row(&rotated[r * k..(r + 1) * k], &cb));
+    }
+    debug_assert_eq!(out.len(), 32 + m * row_bytes);
+    out
+}
+
+/// CPU reference dequant for mfp4L.
+/// Returns row-major f32 [m*k] in the ROTATED domain.
+#[allow(dead_code)]
+fn dequant_mfp4g32_lloyd(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let row_bytes = 16 + 17 * (k / 32);
+    assert_eq!(packed.len(), 32 + m * row_bytes, "mfp4L size mismatch");
+    let mut cb = [0.0f32; 16];
+    for i in 0..16 { cb[i] = f16_to_f32(u16::from_le_bytes([packed[2*i], packed[2*i+1]])); }
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = 32 + r * row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base+1]]));
+        for b in 0..(k / 32) {
+            let po = base + 16 + b * 17;
+            let block_e = packed[po] as i32;
+            let scale = row_scale_a * ((block_e - 127) as f32).exp2();
+            for i in 0..16 {
+                let byte = packed[po + 1 + i];
+                out[r*k + b*32 + 2*i]     = scale * cb[(byte & 0x0F) as usize];
+                out[r*k + b*32 + 2*i + 1] = scale * cb[((byte >> 4) & 0x0F) as usize];
+            }
+        }
+    }
+    out
+}
+
+
 /// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
 /// Returns the K reconstructed FP32 weights for one row.
 #[allow(dead_code)] // used by tests + future round-trip diagnostics
@@ -1588,6 +2012,45 @@ mod hfp4_tests {
     // across K = {512, 1024, 1280, 1536, 1792, 2048} on real GPU hardware (max-abs error
     // ≤ 1.14e-5 vs 5e-3 tolerance — three orders of magnitude under). A CPU-only unit test
     // can't tighten that further without duplicating the GPU's CPU-reference path.
+
+    #[test]
+    fn mfp4_lloyd_round_trip_cpu() {
+        let (m, k) = (64usize, 256usize);
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        // Deterministic pseudo-random weights (xorshift64).
+        let mut s: u64 = 0x1234_5678_9abc_def0;
+        let mut rnd = || {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            ((s & 0xFF_FFFF) as f32 / 0xFF_FFFF_u32 as f32) * 2.0 - 1.0
+        };
+        let data: Vec<f32> = (0..m * k).map(|_| 0.5 * rnd()).collect();
+        let packed = quantize_mfp4g32_lloyd_2d(&data, m, k, &signs1, &signs2);
+        let row_bytes = 16 + 17 * (k / 32);
+        assert_eq!(packed.len(), 32 + m * row_bytes, "byte size incl 32-B prefix");
+        // Build reference: FWHT-rotated original (same as what dequant returns).
+        let mut rotated_ref = vec![0.0f32; m * k];
+        let mut row_buf = vec![0.0f32; k];
+        for r in 0..m {
+            row_buf.copy_from_slice(&data[r*k..(r+1)*k]);
+            for seg in 0..(k/256) {
+                cpu_fwht_256(&mut row_buf[seg*256..(seg+1)*256], &signs1, &signs2);
+            }
+            rotated_ref[r*k..(r+1)*k].copy_from_slice(&row_buf);
+        }
+        // Compare dequant output (rotated domain) to the ROTATED reference.
+        let recon_rot = dequant_mfp4g32_lloyd(&packed, m, k);
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..m*k {
+            let e = (recon_rot[i] - rotated_ref[i]) as f64;
+            num += e * e;
+            den += (rotated_ref[i] as f64).powi(2);
+        }
+        let nrmse = (num / den).sqrt();
+        // FWHT homogenizes magnitudes; 4-bit Lloyd error in rotated domain should be small.
+        assert!(nrmse < 0.15, "mfp4L NRMSE {} too high (layout/codebook bug)", nrmse);
+    }
 }
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
@@ -3230,8 +3693,18 @@ enum QuantType {
                        // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
                        // Models quantized pre-renumber MUST be re-quantized.
     MQ5G256 = 31,      // MagnumQuant: FWHT-rotated 5-bit (168 B/group, 5.25 bpw).
+    MFP4G32Lloyd = 32, // mfp4 (E2M1+UE8M0 g32+FP16 row scale+offline FWHT) with the fixed
+                       // E2M1 grid replaced by ONE per-tensor 16-entry fp16 Lloyd codebook
+                       // prepended (32 B) before row 0. Rows byte-identical to MFP4G32 (qt 24).
                        // 8B affine header (f32 scale + f32 min) + 160B payload
                        // (5 bits × 256, cross-byte: 8 codes per 5 bytes). NOTE: 16=BF16.
+    MFP4G32P = 33,     // mfp4+P: mfp4 (E2M1+FP16 row scale+offline FWHT) with the per-32-block
+                       // UE8M0 scale promoted to E4M3 (FP8, non-power-of-2). Byte layout
+                       // BYTE-IDENTICAL to MFP4G32 (qt 24): 16-B hdr + n_blocks×17 B, NO prefix.
+                       // Only the per-block scale byte's meaning differs (E4M3 vs UE8M0).
+    MFP4G32E8 = 34,    // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
+                       // with the 32 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
+                       // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -3272,6 +3745,9 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
         GgufFormat::Hfp4 => GgufFormat::Hfp4,
         GgufFormat::Mfp4 => GgufFormat::Mfp4,
+        GgufFormat::Mfp4Lloyd => GgufFormat::Mfp4Lloyd,
+        GgufFormat::Mfp4P => GgufFormat::Mfp4P,
+        GgufFormat::Mfp4E8 => GgufFormat::Mfp4E8,
     }
 }
 
@@ -4385,6 +4861,9 @@ enum GgufFormat {
     Mq4Lloyd,
     Hfp4, // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
     Mfp4, // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
+    Mfp4Lloyd, // mfp4 + per-tensor 16-entry Lloyd codebook
+    Mfp4P, // mfp4+P — mfp4 with E4M3 (non-power-of-2) per-block scale
+    Mfp4E8, // mfp4-E8 — mfp4+P container with E8-lattice vector quantization (4 codewords/32 weights)
 }
 
 impl GgufFormat {
@@ -4402,6 +4881,9 @@ impl GgufFormat {
             "mq4-lloyd" | "mq4g256-lloyd" | "mq4lloyd" => Some(Self::Mq4Lloyd),
             "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
             "mfp4" | "mfp4g32" | "mf4p" => Some(Self::Mfp4),
+            "mfp4l" | "mfp4-lloyd" | "mfp4g32-lloyd" | "mfp4lloyd" => Some(Self::Mfp4Lloyd),
+            "mfp4p" | "mfp4+p" | "mfp4-p" => Some(Self::Mfp4P),
+            "mfp4e8" | "mfp4-e8" | "mfp4l8" => Some(Self::Mfp4E8),
             _ => None,
         }
     }
@@ -4420,6 +4902,9 @@ impl GgufFormat {
             Self::Mq4Lloyd => "MQ4G256Lloyd",
             Self::Hfp4 => "HFP4G32",
             Self::Mfp4 => "MFP4G32",
+            Self::Mfp4Lloyd => "MFP4G32Lloyd",
+            Self::Mfp4P => "MFP4G32P",
+            Self::Mfp4E8 => "MFP4G32E8",
         }
     }
 }
@@ -4496,6 +4981,8 @@ fn run_gguf_pipeline(
             | GgufFormat::Mq3Lloyd
             | GgufFormat::Mq4Lloyd
             | GgufFormat::Mfp4
+            | GgufFormat::Mfp4P
+            | GgufFormat::Mfp4E8
     );
     let signs1 = if needs_signs {
         gen_fwht_signs(42, 256)
@@ -4635,6 +5122,25 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
+                GgufFormat::Mfp4Lloyd => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+                }
+                GgufFormat::Mfp4P => {
+                    // No MFP6 variant. Promote6 for mfp4+P stays at MFP4G32P (4.25 bpw).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_p_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+                }
+                GgufFormat::Mfp4E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                }
                 // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
                 // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
                 // as the Base arm below; just dispatched via the promote target.
@@ -4732,6 +5238,21 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
+                GgufFormat::Mfp4Lloyd => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+                }
+                GgufFormat::Mfp4P => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+                }
+                GgufFormat::Mfp4E8 => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -4789,6 +5310,24 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                }
+                GgufFormat::Mfp4Lloyd => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+                }
+                GgufFormat::Mfp4P => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_p_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+                }
+                GgufFormat::Mfp4E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
             }
         } else {
@@ -5292,6 +5831,13 @@ fn main() {
     // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
     // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
     let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
+    let use_mfp4l = format == "mfp4l" || format == "mfp4-lloyd"
+        || format == "mfp4g32-lloyd" || format == "mfp4lloyd";
+    // mfp4+P — mfp4 with E4M3 (non-power-of-2) per-block scale. Byte layout
+    // identical to mfp4 (no prefix); only the per-block scale byte's meaning differs.
+    let use_mfp4p = format == "mfp4p" || format == "mfp4+p" || format == "mfp4-p";
+    // mfp4-E8 — mfp4+P container with E8-lattice vector quantization.
+    let use_mfp4e8 = format == "mfp4e8" || format == "mfp4-e8" || format == "mfp4l8";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     // Conv1d (DeltaNet) defaults to Q8 regardless of --format — the tensor is
     // small (~32K elem) but runs every token and lossy 4-bit FWHT formats
@@ -6671,6 +7217,15 @@ fn main() {
                     } else if expert_hfq4 {
                         let q = quantize_hfq4g256(&f32_slice);
                         (q, QuantType::HFQ4G256, 256u32)
+                    } else if use_mfp4 && supports_g256 {
+                        let q = quantize_mfp4g32_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MFP4G32, 32u32)
+                    } else if use_mfp4p && supports_g256 {
+                        let q = quantize_mfp4g32_p_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MFP4G32P, 32u32)
+                    } else if use_mfp4e8 && supports_g256 {
+                        let q = quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8, 32u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -6738,6 +7293,12 @@ fn main() {
                 "HFQ6G256"
             } else if expert_hfq4 {
                 "HFQ4G256"
+            } else if use_mfp4 && supports_g256 {
+                "MFP4G32"
+            } else if use_mfp4p && supports_g256 {
+                "MFP4G32P"
+            } else if use_mfp4e8 && supports_g256 {
+                "MFP4G32E8"
             } else if supports_g256 {
                 "MQ4G256"
             } else {
@@ -7115,6 +7676,33 @@ fn main() {
                                 let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
                                 (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                             }
+                            GgufFormat::Mfp4Lloyd => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+                            }
+                            GgufFormat::Mfp4P => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+                            }
+                            GgufFormat::Mfp4E8 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                            }
                             GgufFormat::Hfp4 => {
                                 let m = if meta.shape.len() == 2 {
                                     meta.shape[0]
@@ -7348,6 +7936,67 @@ fn main() {
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
                             // requires 256-element segments). Matches MQ4's ragged fallback.
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp4l && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mfp4l {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp4p && is_embed {
+                        // mfp4+P embeddings stay Q8F16 (same rationale as mfp4 / mfp4L).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mfp4p {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+                        } else {
+                            // Ragged dim fallback — matches mfp4 / mfp4L (HFQ4-G128, no rotation).
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp4e8 && is_embed {
+                        // mfp4-E8 embeddings stay Q8F16 (same rationale as mfp4+P / mfp4 / mfp4L).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mfp4e8 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                        } else {
+                            // Ragged dim fallback — matches mfp4+P (HFQ4-G128, no rotation).
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
