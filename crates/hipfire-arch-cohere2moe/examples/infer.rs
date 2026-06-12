@@ -23,31 +23,39 @@ fn main() {
     let mut tokens_path: Option<PathBuf> = None;
     let mut eos_extra: Option<u32> = None;
     let mut chunk: usize = 256;
+    // Fetch the value for a value-taking flag, or exit cleanly instead of
+    // panicking with an index-out-of-bounds when the flag is trailing.
+    let need_val = |i: usize| -> String {
+        argv.get(i + 1).cloned().unwrap_or_else(|| {
+            eprintln!("missing value for {}", argv[i]);
+            std::process::exit(1);
+        })
+    };
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--model" => {
-                model = Some(PathBuf::from(&argv[i + 1]));
+                model = Some(PathBuf::from(need_val(i)));
                 i += 2;
             }
             "--prompt" => {
-                prompt = argv[i + 1].clone();
+                prompt = need_val(i);
                 i += 2;
             }
             "--max" => {
-                max = argv[i + 1].parse().expect("--max");
+                max = need_val(i).parse().expect("--max");
                 i += 2;
             }
             "--tokens" => {
-                tokens_path = Some(PathBuf::from(&argv[i + 1]));
+                tokens_path = Some(PathBuf::from(need_val(i)));
                 i += 2;
             }
             "--eos" => {
-                eos_extra = Some(argv[i + 1].parse().expect("--eos"));
+                eos_extra = Some(need_val(i).parse().expect("--eos"));
                 i += 2;
             }
             "--chunk" => {
-                chunk = argv[i + 1].parse().expect("--chunk");
+                chunk = need_val(i).parse().expect("--chunk");
                 i += 2;
             }
             other => {

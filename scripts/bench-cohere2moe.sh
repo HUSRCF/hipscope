@@ -11,17 +11,20 @@
 #   * One throwaway "warmup" run per tier compiles that tier's dtype GEMM +
 #     flash-attention kernels into .hipfire_kernels (DPM warmup does NOT compile
 #     kernels), so JIT never lands inside a timed window. Lengths are exact
-#     multiples of the 64 prefill chunk, so JIT is per-tier-dtype, not per-len.
+#     multiples of both infer's 256-token driver chunk and forward_batch's ≤64
+#     internal GEMM sub-batch, so every prefill GEMM is a full-B shape → JIT is
+#     per-tier-dtype, not per-len.
 #   * Prompts are deterministic exact-length token files (throughput is
 #     content-independent); their md5s are logged for byte-identical re-runs.
 #
-# Reproduce:
+# Reproduce (REPO is derived from this script's location; point MODELS at the
+# directory holding the north-mini-code.{q8,mq6,mq4}.hfq files if not /data):
 #   cargo build --release --example infer -p hipfire-arch-cohere2moe
-#   scripts/bench-cohere2moe.sh
+#   MODELS=/path/to/hfq-dir scripts/bench-cohere2moe.sh
 set -uo pipefail
 
-REPO="/home/nick/repos/hipfire"
-MODELS="/data/hipfire-models"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MODELS="${MODELS:-/data/hipfire-models}"
 INFER="$REPO/target/release/examples/infer"
 OUT="${1:-$REPO/benchmarks/cohere2moe-perf}"
 DECODE="${DECODE:-128}"
@@ -76,7 +79,9 @@ for tier in "${ORDER[@]}"; do
 
   # JIT-compile this tier's kernels (throwaway, discarded)
   log ">>> warmup $tier @ $WARM_LEN (compile kernels)"
-  timeout 600 "$INFER" --model "$model" --tokens "$OUT/tokens/toks_$WARM_LEN.json" --max 4 \
+  # No DPM warmup on this throwaway compile pass — it only needs to populate the
+  # kernel cache, not measure, so skip the 10s clock-pin.
+  HIPFIRE_DPM_WARMUP_SECS=0 timeout 600 "$INFER" --model "$model" --tokens "$OUT/tokens/toks_$WARM_LEN.json" --max 4 \
       >"$OUT/logs/${tier}_warmup.log" 2>&1 || log "    (warmup rc=$? — continuing)"
 
   for L in "${LENS[@]}"; do

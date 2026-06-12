@@ -447,6 +447,9 @@ fn moe_per_expert(
         // The router must produce in-range expert ids; a silent `.min()` clamp
         // would mask a routing/topk bug as quietly-wrong output (worst place to
         // be silent — this is the oracle/Q8 correctness path). Fail loudly.
+        // (The batched `run_prefill` path instead clamps an OOB id to expert 0
+        // in-kernel — bounded-wrong but memory-safe, since the indexed GEMM
+        // can't take a runtime loop bound; that asymmetry is intentional.)
         let e = idx_bits[j].to_bits() as usize;
         if e >= m.experts.len() {
             return Err(format!(

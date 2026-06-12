@@ -5,9 +5,10 @@
 //! `Architecture` trait impl for Cohere2-MoE (North-Mini-Code). arch_id = 12
 //! (next free after lfm2/lfm2_moe = 11; see docs/architecture-ids.md).
 //!
-//! Maps onto hipfire's existing kernels with NO new GPU kernels: GQA + full
-//! rotate_half RoPE (skipped on global/NoPE layers) + Q8 KV attention, the
-//! mean-centered `layernorm_batched` (Cohere2LayerNorm), `moe_topk_renorm_k8`
+//! Maps onto hipfire's existing kernels with NO new GPU kernels: GQA +
+//! interleaved (GPT-J) RoPE (skipped on the global/NoPE layers; sliding layers
+//! use the windowed flash path) + Q8 KV attention, `rmsnorm_batched` (RMSNorm at
+//! `rms_norm_eps` — NOT base Cohere2's mean-centered LayerNorm), `moe_topk_renorm_k8`
 //! (sigmoid scoring, `norm_topk_prob=false`), and the qwen35/lfm2/minimax
 //! indexed-MoE GEMV family for the MQ4/MQ6 expert tiers.
 
