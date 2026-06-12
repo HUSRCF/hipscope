@@ -12,22 +12,23 @@
 //!   `h = h + o_proj(attn(RMSNorm(h))) + ffn(RMSNorm(h))`
 //! (note: the FFN reads the SAME `RMSNorm(h)` as attention, NOT the
 //! post-attention residual). Per layer:
-//!   normed = layernorm_meancentered(h, input_layernorm)        [gamma only, β=0]
+//!   normed = rmsnorm(h, input_layernorm)                       [gamma scale, no mean-center / no β]
 //!   q,k,v  = proj(normed); RoPE only if sliding (full=NoPE); attn; h += o_proj
 //!   if dense (first_k_dense_replace prefix): h += down(silu(gate(normed))·up(normed))
 //!   if moe:  router = sigmoid(gate·normed); top-8 (NO renorm: norm_topk_prob=false);
 //!            h += Σ w_e · expert_e(normed)
-//! then logits = lm_head(layernorm_meancentered(h, model.norm)) · logit_scale.
+//! then logits = lm_head(rmsnorm(h, model.norm)) · logit_scale.
 //!
 //! Routed experts: the MQ4/MQ6 tiers use the FWHT-pre-rotated indexed-MoE GEMV
 //! kernels (exactly the qwen35/lfm2/minimax path). The F16 oracle and Q8 expert
 //! tiers have no indexed kernel, so they take a per-expert `weight_gemv` loop
 //! (correctness over speed — the KLD/PPL harness is offline).
 //!
-//! Attention is full causal for sequences ≤ `sliding_window` (4096): at those
-//! lengths sliding == full, so only the per-layer NoPE/RoPE split (which
-//! matters at ALL lengths) is implemented here. A windowed-mask path for
-//! >4096-token context is a follow-up.
+//! Attention: a per-layer NoPE/RoPE split (full_attention layers are NoPE;
+//! sliding layers use interleaved RoPE), plus a windowed-mask flash path
+//! (`attention_flash_q8_0_windowed`) that applies the sliding-window mask so
+//! context beyond the 4096 window attends correctly. At ≤4096, sliding == full
+//! causal, so the window is a no-op there.
 
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
@@ -443,7 +444,16 @@ fn moe_per_expert(
         .download_f32(&state.topk_weights)
         .map_err(|e| format!("cohere2moe L{l}: dl topk w: {e:?}"))?;
     for j in 0..k_top {
-        let e = (idx_bits[j].to_bits() as usize).min(m.experts.len() - 1);
+        // The router must produce in-range expert ids; a silent `.min()` clamp
+        // would mask a routing/topk bug as quietly-wrong output (worst place to
+        // be silent — this is the oracle/Q8 correctness path). Fail loudly.
+        let e = idx_bits[j].to_bits() as usize;
+        if e >= m.experts.len() {
+            return Err(format!(
+                "cohere2moe L{l}: router produced OOB expert id {e} (n_experts={})",
+                m.experts.len()
+            ));
+        }
         let w = weights[j];
         let expert = &m.experts[e];
         // gate_up = [2*moe_inter] (gate ‖ up), then split into halves.

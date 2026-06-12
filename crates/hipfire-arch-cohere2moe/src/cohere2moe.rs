@@ -266,7 +266,16 @@ impl Cohere2MoeWeights {
                 for e in 0..n_exp {
                     let ep = format!("{p}.mlp.experts.{e}");
                     let (qt_g, g) = read_tensor(hfq, &format!("{ep}.gate_proj.weight"))?;
-                    let (_qt_u, u) = read_tensor(hfq, &format!("{ep}.up_proj.weight"))?;
+                    let (qt_u, u) = read_tensor(hfq, &format!("{ep}.up_proj.weight"))?;
+                    // gate_proj‖up_proj are byte-fused into one buffer tagged with a
+                    // single dtype (qt_g); valid only when they are co-quantized. A
+                    // mixed-dtype export would mis-read the up half as qt_g — refuse
+                    // at load rather than serve silently-wrong inference.
+                    if qt_g != qt_u {
+                        return Err(format!(
+                            "cohere2moe L{l}E{e}: gate/up dtype mismatch ({qt_g:?} vs {qt_u:?}) — cannot byte-fuse gate_up"
+                        ));
+                    }
                     let mut gate_up_bytes = g;
                     gate_up_bytes.extend_from_slice(&u);
                     let gate_up = wt_from_raw(gpu, qt_g, &gate_up_bytes, 2 * moe_inter, hidden)

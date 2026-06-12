@@ -12986,9 +12986,12 @@ fn generate_cohere2moe(
     // ── Prompt build (same two-path branch as the minimax / lfm2moe AR path) ──
     // `primed_think` records whether the rendered prompt actually ended with a
     // `<think>` generation-primer, so we only re-emit the opener (below) when
-    // the model truly begins inside the reasoning block. A jinja render failure
-    // that falls back to the Plain frame leaves it false.
-    let mut primed_think = false;
+    // the model truly begins inside the reasoning block. (A jinja render failure
+    // now returns an error rather than falling back, so we never reach decode
+    // with an off-distribution Plain frame.)
+    // Set on the sole surviving (successful-render) path; the failure paths in
+    // the block below return, so this needs no dead initializer.
+    let primed_think: bool;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // Cohere2-MoE / North-Mini-Code REQUIRES its embedded Jinja chat_template
@@ -13056,26 +13059,28 @@ fn generate_cohere2moe(
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in cohere2moe path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
-                    }
-                    .build()
+                    // North-Mini-Code's turns are NOT ChatML; a Plain frame emits
+                    // <|im_start|>/<|im_end|> the model never trained on → off-
+                    // distribution garbage that reads as a model-quality bug. Refuse
+                    // rather than silently serve it.
+                    eprintln!("[daemon] cohere2moe jinja render failed ({e}) — refusing ChatML fallback");
+                    emit_error_with_id(stdout, id, format!("cohere2moe jinja render failed: {e}"));
+                    return;
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
-                tokenizer,
-                system: system_prompt,
-                user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                raw: false,
-            }
-            .build()
+            // cohere2moe REQUIRES its embedded jinja template (see above). When it
+            // is unavailable — HIPFIRE_JINJA_CHAT=0, or the .hfq carries no template
+            // — the only frame we could build is Plain ChatML, off-distribution for
+            // North. Refuse loudly instead of serving garbage.
+            let why = if !jinja_enabled {
+                "HIPFIRE_JINJA_CHAT=0 disables the required template"
+            } else {
+                "model .hfq carries no chat_template"
+            };
+            eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
+            emit_error_with_id(stdout, id, format!("cohere2moe requires its jinja chat template ({why})"));
+            return;
         }
     };
 
