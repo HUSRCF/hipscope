@@ -216,13 +216,12 @@ fn main() {
     // Load text weights
     eprintln!("Loading text weights...");
     let weights = {
-        let mut src = qwen35::HfqSource::new(&mut hfq);
+        let mut src = qwen35::HfqSource::new(&mut hfq, &text_config);
         let layout = qwen35::Layout::single(text_config.n_layers);
         qwen35::load_weights(
             &mut src,
             std::slice::from_mut(&mut gpu),
             &layout,
-            &text_config,
         )
     }
     .expect("failed to load text weights");

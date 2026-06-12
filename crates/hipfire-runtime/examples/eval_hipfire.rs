@@ -210,13 +210,12 @@ fn main() {
         let source = SafetensorsSource::open(&args.model).expect("safetensors open");
         let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
         eprintln!("  loading via safetensors (ParoQuant path)");
-        let mut paro_source = qwen35::ParoSource::new(&source).expect("ParoSource::new");
+        let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
         let paro_layout = qwen35::Layout::single(config.n_layers);
         let weights = qwen35::load_weights(
             &mut paro_source,
             std::slice::from_mut(&mut gpu),
             &paro_layout,
-            &config,
         )
         .expect("load_weights");
         (config, weights)
@@ -224,9 +223,9 @@ fn main() {
         let mut hfq = HfqFile::open(&args.model).expect("open model");
         let config = qwen35::config_from_hfq(&hfq).expect("read config");
         let weights = {
-            let mut src = qwen35::HfqSource::new(&mut hfq);
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout, &config)
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
         }
         .expect("load weights");
         (config, weights)

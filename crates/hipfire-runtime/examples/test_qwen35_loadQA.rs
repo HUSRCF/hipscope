@@ -107,13 +107,12 @@ fn run(path: &str) -> Result<String, Outcome> {
         let mut gpu = rdna_compute::Gpu::init()
             .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
         let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut src = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq);
+            let mut src = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq, &q35_config);
             let layout = hipfire_arch_qwen35::qwen35::Layout::single(q35_config.n_layers);
             hipfire_arch_qwen35::qwen35::load_weights(
                 &mut src,
                 std::slice::from_mut(&mut gpu),
                 &layout,
-                &q35_config,
             )
         }))
         .map_err(|panic| Outcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?

@@ -160,9 +160,9 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("gpu init");
     let weights = {
-        let mut src = qwen35::HfqSource::new(&mut hfq);
+        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
         let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout, &config)
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
     }
     .expect("weights");
 

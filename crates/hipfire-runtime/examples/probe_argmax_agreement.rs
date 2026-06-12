@@ -68,13 +68,12 @@ fn main() {
         small_cfg.dim, small_cfg.n_layers, small_cfg.n_heads, small_cfg.vocab_size
     );
     let small_weights = {
-        let mut src = qwen35::HfqSource::new(&mut small_hfq);
+        let mut src = qwen35::HfqSource::new(&mut small_hfq, &small_cfg);
         let layout = qwen35::Layout::single(small_cfg.n_layers);
         qwen35::load_weights(
             &mut src,
             std::slice::from_mut(&mut gpu),
             &layout,
-            &small_cfg,
         )
     }
     .expect("small load");
@@ -92,13 +91,12 @@ fn main() {
         "vocab sizes must match for argmax comparison"
     );
     let large_weights = {
-        let mut src = qwen35::HfqSource::new(&mut large_hfq);
+        let mut src = qwen35::HfqSource::new(&mut large_hfq, &large_cfg);
         let layout = qwen35::Layout::single(large_cfg.n_layers);
         qwen35::load_weights(
             &mut src,
             std::slice::from_mut(&mut gpu),
             &layout,
-            &large_cfg,
         )
     }
     .expect("large load");

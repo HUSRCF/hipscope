@@ -138,13 +138,12 @@ fn main() {
         let mut hfq = HfqFile::open(model_path).expect("reopen model");
         eprintln!("  [rank {r}] loading replicated weights ...");
         let mut w = {
-            let mut src = qwen35::HfqSource::new(&mut hfq);
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let layout = qwen35::Layout::single(config.n_layers);
             qwen35::load_weights(
                 &mut src,
                 std::slice::from_mut(&mut gpus.devices[r]),
                 &layout,
-                &config,
             )
         }
         .expect("load_weights");

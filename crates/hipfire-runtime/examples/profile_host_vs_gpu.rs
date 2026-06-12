@@ -50,9 +50,9 @@ fn main() {
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let weights = {
-        let mut src = qwen35::HfqSource::new(&mut hfq);
+        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
         let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout, &config)
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
     }
     .expect("weights");
     eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
