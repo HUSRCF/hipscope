@@ -1194,6 +1194,16 @@ pub fn run_moe_prefill(
             paro.pairs, paro.theta, paro.scales,
             total_slots, mi, paro.krot,
         ))?;
+    } else if p.expert_dtype_tags.is_some() {
+        // Graded/mixed routed experts: the silu+rotate is weight-agnostic (the
+        // per-expert down dtype only affects the down GEMM that READS rot_batch;
+        // graded files carry no expert AWQ). This mirrors run_moe_decode, which
+        // calls this unconditionally. Without this, the routed_down dtype match
+        // below rejects the cold-tier Lloyd dtype (experts[0].down) as `_other`
+        // and the prefill forward panics.
+        hip!(gpu.fused_silu_mul_rotate_mq_batched(
+            p.gate_batch, p.up_batch, p.rot_batch, mi, total_slots,
+        ))?;
     } else {
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
         // activations, not weight data). AWQ-aware variant when down has AWQ.
