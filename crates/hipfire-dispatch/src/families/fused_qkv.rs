@@ -273,6 +273,21 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             })?;
             hip!(gpu.gemm_qkvza_hfp4g32(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
         }
+        // MFP4G32E8 fused QKVZA — DECODE-ONLY (gfx1151 launch-fusion). The
+        // producing guard (`guard_qkvza_mfp4g32e8`) only fires in execute_steps
+        // decode, so batch_size is always None here; a Some(n) would mean a
+        // prefill site wrongly emitted this key (no such site exists).
+        KernelKey::FusedQkvzaMfp4G32E8 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            if params.batch_size.is_some() {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "fused_qkv", variant: "qkvza", arch: "gfx1151", quant: "mfp4g32e8 (decode-only)",
+                });
+            }
+            hip!(gpu.fused_qkvza_mfp4g32_e8(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k))
+        }
 
         // ── 2-way Fused Gate+Up (FFN) ────────────────────────
         //
@@ -291,6 +306,19 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 Some(n) => hip!(gpu.gemm_gate_up_hfq4g256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
                 None => hip!(gpu.fused_gate_up_hfq4g256(w_gate, w_up, x, gate, up, mg, mu, k)),
             }
+        }
+        // MFP4G32E8 fused gate+up — DECODE-ONLY (gfx1151 launch-fusion). Same
+        // rationale as FusedQkvzaMfp4G32E8: guard only fires in decode.
+        KernelKey::FusedGateUpMfp4G32E8 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            if params.batch_size.is_some() {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "fused_qkv", variant: "gate_up", arch: "gfx1151", quant: "mfp4g32e8 (decode-only)",
+                });
+            }
+            hip!(gpu.fused_gate_up_mfp4g32_e8(w_gate, w_up, x, gate, up, mg, mu, k))
         }
         KernelKey::FusedGateUpMq3G256Lloyd => {
             let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 2))?;

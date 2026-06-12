@@ -199,6 +199,30 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
         && gemv_steps_uniform(steps, dt, true)
 }
 
+// ── mfp4-E8 decode launch-fusion guards (gfx1151 / Strix Halo ONLY) ──
+// These are the SOLE producers of the FusedGateUpMfp4G32E8 / FusedQkvzaMfp4G32E8
+// keys. The `is_gfx1151()` check is the firewall that keeps the gfx1151-only
+// fused kernels from ever bleeding to gfx1100/942/1201 — on every other arch
+// these return false and the projections fall through to the per-projection
+// gemv_mfp4g32_e8 path unchanged. The fused kernels embed the byte-identical
+// gemv_mfp4g32_e8_gfx1151 per-row body, so the fused output equals N sequential
+// GEMVs bit-for-bit (only the launch count shrinks).
+pub(crate) fn guard_gate_up_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if !ctx.arch.is_gfx1151() { return false; }
+    if steps.len() != 3 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    dt == DType::MFP4G32E8 && gemv_steps_uniform(steps, dt, true)
+}
+
+pub(crate) fn guard_qkvza_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if !ctx.arch.is_gfx1151() { return false; }
+    if steps.len() != 5 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    dt == DType::MFP4G32E8 && gemv_steps_uniform(steps, dt, true)
+}
+
 // ── Paro fused guards (Raw input — kernel rotates internally) ──
 
 // ── Q8_0 / Q4K fused guards (non-rotated, Prerotated input) ──
@@ -331,11 +355,15 @@ const FUSED_TABLE: &[FusedPattern] = &[
     FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq3G256Lloyd,  guard: guard_qkvza_mq3g256lloyd  },
     FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq4G256,      guard: guard_qkvza_hfq4g256      },
     FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq6G256,      guard: guard_qkvza_hfq6g256      },
+    // mfp4-E8 decode launch-fusion — gfx1151-ONLY (guard firewalls the arch).
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMfp4G32E8,     guard: guard_qkvza_mfp4g32e8     },
     // ── Gate+Up 2-way ───────────────────────────────────────────────────────
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq4G256Lloyd, guard: guard_gate_up_mq4g256lloyd },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+    // mfp4-E8 decode launch-fusion — gfx1151-ONLY (guard firewalls the arch).
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMfp4G32E8,    guard: guard_gate_up_mfp4g32e8    },
     // ── Q8_0 / Q4K fused entries (non-rotated, Always arch gate) ─────────
     // No FusedQkvQ8_0 entry: neither qwen2 (QKV is HFQ4G256) nor llama (QKV is
     // Q4K/MQ/plain) uses Q8_0 for QKV — only gate+up.
@@ -540,7 +568,8 @@ fn launch_fused(
         | KernelKey::FusedGateUpHfq4G256
         | KernelKey::FusedGateUpHfq6G256
         | KernelKey::FusedGateUpQ4K
-        | KernelKey::FusedGateUpQ8_0 => {
+        | KernelKey::FusedGateUpQ8_0
+        | KernelKey::FusedGateUpMfp4G32E8 => {
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up)   = gemv_weight_out(&steps[2]);
             fused_qkv.run(ctx, gpu, &FusedQkvParams {
@@ -558,7 +587,8 @@ fn launch_fused(
         KernelKey::FusedQkvzaHfq4G256
         | KernelKey::FusedQkvzaMq3G256Lloyd
         | KernelKey::FusedQkvzaMq4G256Lloyd
-        | KernelKey::FusedQkvzaHfq6G256 => {
+        | KernelKey::FusedQkvzaHfq6G256
+        | KernelKey::FusedQkvzaMfp4G32E8 => {
             let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
             let (wz, z)       = gemv_weight_out(&steps[2]);
             let (wb, beta)    = gemv_weight_out(&steps[3]);

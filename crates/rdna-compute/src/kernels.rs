@@ -1045,6 +1045,15 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
+/// gfx1151-specific fused gate+up mfp4-E8 decode GEMV (2-way launch-fusion).
+/// ONLY dispatched on gfx1151 (Strix Halo) via the steps.rs guard; embeds the
+/// byte-identical gemv_mfp4g32_e8_gfx1151 per-row body. No bleed to other archs.
+pub const FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_mfp4g32_e8.gfx1151.hip");
+/// gfx1151-specific fused QKVZA mfp4-E8 decode GEMV (4-way launch-fusion) for
+/// the Qwen3.5 DeltaNet LA preamble. ONLY dispatched on gfx1151.
+pub const FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_mfp4g32_e8.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

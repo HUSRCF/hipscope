@@ -3139,6 +3139,137 @@ impl Gpu {
         self.gemv_mfp4g32_e8(a_raw, x_rot, y, m, k)
     }
 
+    /// Fused gate+up mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
+    /// Two GEMVs (gate, up) in one launch over [gate_m + up_m] blocks. x must
+    /// already be FWHT-rotated (the execute_steps RmsnormAutomatic producer does
+    /// it). Bit-exact with two sequential gemv_mfp4g32_e8 calls — only the launch
+    /// count shrinks (the gfx1151 launch-fusion lever). Reached ONLY via the
+    /// gfx1151-gated guard in pipeline/steps.rs, so it never runs on other archs.
+    pub fn fused_gate_up_mfp4g32_e8(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "fused_gate_up_mfp4g32_e8 requires K%256==0, got K={k}");
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "fused_gate_up_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        self.ensure_kernel(
+            "fused_gate_up_mfp4g32_e8_gfx1151",
+            kernels::FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC,
+            "fused_gate_up_mfp4g32_e8_gfx1151",
+        )?;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let total = (gate_m + up_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["fused_gate_up_mfp4g32_e8_gfx1151"],
+                [total, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Fused QKVZA mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
+    /// Four DeltaNet LA-preamble GEMVs (qkv, z, beta, alpha) in one launch. x
+    /// must already be FWHT-rotated. Bit-exact with four sequential
+    /// gemv_mfp4g32_e8 calls. gfx1151-gated via the steps.rs guard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_mfp4g32_e8(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "fused_qkvza_mfp4g32_e8 requires K%256==0, got K={k}");
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "fused_qkvza_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        self.ensure_kernel(
+            "fused_qkvza_mfp4g32_e8_gfx1151",
+            kernels::FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC,
+            "fused_qkvza_mfp4g32_e8_gfx1151",
+        )?;
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let mqkv = qkv_m as i32;
+        let mz = z_m as i32;
+        let mb = beta_m as i32;
+        let ma = alpha_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &mqkv as *const _ as *mut c_void,
+            &mz as *const _ as *mut c_void,
+            &mb as *const _ as *mut c_void,
+            &ma as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["fused_qkvza_mfp4g32_e8_gfx1151"],
+                [total, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// mfp4-E8 SoA GEMV. Same E8 data as AoS but in structure-of-arrays layout
     /// (flag=0x06) for fully-coalesced codeword reads on gfx1151.
     /// x must already be FWHT-rotated. Output is bit-exact with gemv_mfp4g32_e8.
