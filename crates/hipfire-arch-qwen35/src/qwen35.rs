@@ -4371,10 +4371,42 @@ fn load_layer_into(
     })
 }
 
+thread_local! {
+    /// Per-thread EP expert-shard context. When `Some((shard, rank))`,
+    /// [`load_moe_ffn`] loads ONLY this rank's owned experts (streaming
+    /// owned-only) and builds the `[n_exp]` global pointer tables with dummy
+    /// pointers for non-owned slots — the SAME structure post-load
+    /// [`shard_moe_experts`] produces, but WITHOUT the full-model load peak that
+    /// OOMs a model larger than one card's VRAM. Set by the EP load driver
+    /// around `load_weights`, cleared (`None`) after. `None` = full replicated
+    /// load (the default for every non-EP caller).
+    static EP_EXPERT_SHARD: std::cell::RefCell<Option<(ShardConfig, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the per-thread EP expert-shard context consumed by `load_weights` →
+/// [`load_moe_ffn`]. The EP load driver calls this with `Some((shard, rank))`
+/// immediately before `load_weights` on each rank, then `None` immediately
+/// after. Mirrors DeepSeek-V4's `load_weights_sharded` but threaded via TLS so
+/// the 87 existing `load_weights` callers need no signature change.
+pub fn set_ep_expert_shard(ctx: Option<(ShardConfig, usize)>) {
+    EP_EXPERT_SHARD.with(|c| *c.borrow_mut() = ctx);
+}
+
+fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
+    EP_EXPERT_SHARD.with(|c| c.borrow().clone())
+}
+
 /// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
+///
+/// EP streaming-shard mode: when [`current_ep_expert_shard`] is `Some`, only the
+/// rank's owned experts are read/allocated; the pointer tables are built global
+/// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
+/// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
+/// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
 fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4428,8 +4460,18 @@ fn load_moe_ffn(
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
+    // EP streaming-shard: load ONLY this rank's owned experts (see fn doc). When
+    // not sharding (`None`), `owns(x)` is always true → full replicated load.
+    // The closure caches the decision so the pointer-table build below agrees
+    // with this load loop.
+    let ep_shard = current_ep_expert_shard();
+    let owns = |x: usize| ep_shard.as_ref().map_or(true, |(sh, r)| sh.owns_expert(*r, x));
+
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
+        if !owns(x) {
+            continue; // non-owned on this rank: dummy pointer assigned below
+        }
         let gate_up = load_weight_tensor(
             hfq,
             gpu,
@@ -4452,11 +4494,39 @@ fn load_moe_ffn(
     // address of an expert's `gate_up.buf` / `down.buf`). Stored as an
     // F32 tensor of length 2 * num_experts because each pointer occupies
     // 8 bytes = 2 F32 slots; the kernel reads them via a u64 cast.
-    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
-        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
+    // GLOBAL [n_exp] device pointer tables (8 B/ptr = 2 F32 slots). Full load:
+    // gu_ptrs[e] = experts[e]. EP shard: non-owned slots get a dummy pointer
+    // (zeroed gate_up ⇒ silu output 0 ⇒ 0 contribution to the EP all-reduce;
+    // the down dummy is a real owned buffer so its uniform-dtype dequant stays
+    // in-bounds) — exactly what `shard_moe_experts` builds post-load.
+    let mut gu_ptrs = vec![0u64; n_exp];
+    let mut dn_ptrs = vec![0u64; n_exp];
+    if ep_shard.is_some() {
+        assert!(!experts.is_empty(), "EP shard: rank owns no experts in layer {layer_idx}");
+        // Shared zeroed gate_up dummy (same byte size as a real expert gate_up).
+        // LEAKED so the ptr stays valid for the model's lifetime (matches
+        // shard_moe_experts v1).
+        let gu_buf_bytes = experts[0].gate_up.buf.buf.size();
+        let zero_gu = gpu.zeros(&[gu_buf_bytes / 4], DType::F32)?;
+        let dummy_gu = zero_gu.buf.as_ptr() as u64;
+        std::mem::forget(zero_gu);
+        let dummy_dn = experts[0].down.buf.buf.as_ptr() as u64;
+        let mut li = 0usize;
+        for e in 0..n_exp {
+            if owns(e) {
+                gu_ptrs[e] = experts[li].gate_up.buf.buf.as_ptr() as u64;
+                dn_ptrs[e] = experts[li].down.buf.buf.as_ptr() as u64;
+                li += 1;
+            } else {
+                gu_ptrs[e] = dummy_gu;
+                dn_ptrs[e] = dummy_dn;
+            }
+        }
+    } else {
+        for (e, ew) in experts.iter().enumerate() {
+            gu_ptrs[e] = ew.gate_up.buf.buf.as_ptr() as u64;
+            dn_ptrs[e] = ew.down.buf.buf.as_ptr() as u64;
+        }
     }
     let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -4479,7 +4549,18 @@ fn load_moe_ffn(
     // AWQ-vs-plain A/B uses two separately quantized files.
     let moe_awq_enabled = std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref() != Some("0");
     let awq_present = experts.iter().filter(|e| e.down.awq_scale.is_some()).count();
-    let expert_down_awq_ptrs = if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
+    let expert_down_awq_ptrs = if ep_shard.is_some() {
+        // EP shard: AWQ-EP needs a sharded scale pointer table (dummies for
+        // non-owned slots). Not yet supported — guard rather than silently
+        // disable. Uniform-no-AWQ files (e.g. .mq6) hit `awq_present == 0` → None.
+        if awq_present != 0 {
+            return Err(HipError::new(
+                0,
+                "AWQ MoE EP not yet supported (quantize experts without AWQ for EP serving)",
+            ));
+        }
+        None
+    } else if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
         let aw_ptrs: Vec<u64> = experts
             .iter()
             .map(|e| e.down.awq_scale.as_ref().unwrap().buf.as_ptr() as u64)
@@ -4511,7 +4592,19 @@ fn load_moe_ffn(
     // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
     // lever); for the existing down-only graded binary the gate_up types are
     // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
-    let expert_dtype_tags = if n_exp > 0 {
+    let expert_dtype_tags = if ep_shard.is_some() {
+        // EP shard: a graded (mixed-dtype) file needs the FULL [n_exp] global tag
+        // map, but only this rank's owned experts are loaded, so non-owned dtypes
+        // aren't visible. Uniform files (all owned experts same dtype, e.g. .mq6)
+        // → None; graded EP is not yet supported.
+        let mixed = !experts.is_empty()
+            && (experts.iter().any(|e| e.gate_up.gpu_dtype != experts[0].gate_up.gpu_dtype)
+                || experts.iter().any(|e| e.down.gpu_dtype != experts[0].down.gpu_dtype));
+        if mixed {
+            return Err(HipError::new(0, "graded (mixed-dtype) MoE EP not yet supported"));
+        }
+        None
+    } else if n_exp > 0 {
         let gu0 = experts[0].gate_up.gpu_dtype;
         let dn0 = experts[0].down.gpu_dtype;
         let mixed = experts.iter().any(|e| e.gate_up.gpu_dtype != gu0)

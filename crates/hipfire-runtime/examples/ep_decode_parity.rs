@@ -114,13 +114,17 @@ fn main() {
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
         let mut hfq = HfqFile::open(model_path).expect("reopen model");
-        eprintln!("  [rank {r}] loading replicated weights ...");
-        let mut w = qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
-        qwen35::shard_all_moe_layers(&mut gpus.devices[r], &mut w, &shard, r, config.num_experts)
-            .expect("shard_all_moe_layers");
+        eprintln!("  [rank {r}] streaming-load owned experts (EP shard) ...");
+        // Stream ONLY rank r's owned experts during load — load_moe_ffn reads
+        // this TLS shard context and skips non-owned experts, bounding the load
+        // peak to ~(sharded total + one layer) instead of the full model (which
+        // OOMs a >VRAM model like .mq6 even with EP). Cleared after the load.
+        qwen35::set_ep_expert_shard(Some((shard.clone(), r)));
+        let w = qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
+        qwen35::set_ep_expert_shard(None);
         weights_per_rank.push(w);
     }
-    eprintln!("  all ranks loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");
+    eprintln!("  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");
 
     // ── per-rank state + routed partials (+ prefill scratch when batched) ────
     use hipfire_arch_qwen35::qwen35::PrefillBatchScratch;
