@@ -5,10 +5,10 @@
 //! and the registry live top-of-DAG in `hipfire-loader`; this module
 //! holds only what the arch crates need to implement a carrier.
 
-use std::path::Path;
 use crate::hfq::HfqFile;
 use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
+use std::path::Path;
 
 /// A model on disk, before we know its arch. Carries either a parsed
 /// HFQ header or a directory (safetensors/ParoQuant — probed later).
@@ -22,9 +22,13 @@ impl ModelSource {
     /// based on whether `path` is a file or directory.
     pub fn from_path(path: &str) -> Result<Self, String> {
         if Path::new(path).is_dir() {
-            Ok(ModelSource::Dir(SafetensorsSource::open(Path::new(path)).map_err(|e| format!("{e:?}"))?))
+            Ok(ModelSource::Dir(
+                SafetensorsSource::open(Path::new(path)).map_err(|e| format!("{e:?}"))?,
+            ))
         } else {
-            Ok(ModelSource::Hfq(HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?))
+            Ok(ModelSource::Hfq(
+                HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?,
+            ))
         }
     }
 
@@ -75,5 +79,3 @@ pub struct CaskConfig {
     pub core_frac: f32,
     pub fold_m: usize,
 }
-
-

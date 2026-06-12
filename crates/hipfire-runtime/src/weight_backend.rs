@@ -463,7 +463,12 @@ pub fn dequant_norm(
         _ => panic!("expected F16/F32 for norm, got qt={quant_type}"),
     };
     let expected: usize = shape.iter().product();
-    assert_eq!(f32_data.len(), expected, "dequant_norm: tensor has {} elements, expected {expected} (shape {shape:?})", f32_data.len());
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "dequant_norm: tensor has {} elements, expected {expected} (shape {shape:?})",
+        f32_data.len()
+    );
     for v in &mut f32_data {
         *v += bias;
     }
@@ -527,12 +532,11 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
         }
         6 | 7 | 13 | 15 => {
             let is_6bit = quant_type == 15;
-            let group_size: usize =
-                if quant_type == 6 || quant_type == 13 || quant_type == 15 {
-                    256
-                } else {
-                    128
-                };
+            let group_size: usize = if quant_type == 6 || quant_type == 13 || quant_type == 15 {
+                256
+            } else {
+                128
+            };
             let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
             let n_groups = data.len() / bytes_per_group;
             let is_mq = quant_type == 13 || quant_type == 15;
@@ -982,15 +986,25 @@ pub struct HfqBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub norm_bias: f32,
     pub candidates: fn(&str) -> Vec<String>,
-    pub read_proj: fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub read_proj:
+        fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
     pub layer: usize,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
-    fn set_layer(&mut self, layer: usize) { self.layer = layer; }
+    fn set_layer(&mut self, layer: usize) {
+        self.layer = layer;
+    }
 
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
-        (self.read_proj)(self.hfq, self.gpu, &hfq_proj_name(self.layer, rel), m, k, self.candidates)
+        (self.read_proj)(
+            self.hfq,
+            self.gpu,
+            &hfq_proj_name(self.layer, rel),
+            m,
+            k,
+            self.candidates,
+        )
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
@@ -1009,8 +1023,12 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
-        assert_eq!(t.numel(), n,
-            "bias {name} has {} elements, expected {n}", t.numel());
+        assert_eq!(
+            t.numel(),
+            n,
+            "bias {name} has {} elements, expected {n}",
+            t.numel()
+        );
         Ok(t)
     }
 }
@@ -1041,23 +1059,36 @@ pub struct ParoBackend<'a> {
 }
 
 impl<'a> WeightBackend for ParoBackend<'a> {
-    fn set_layer(&mut self, layer: usize) { self.layer = layer; }
+    fn set_layer(&mut self, layer: usize) {
+        self.layer = layer;
+    }
 
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
         let base = paro_proj_name(self.mp, self.layer, rel);
         match try_augmentors(self.source, &base, m, k, self.gpu, DEFAULT_AUGMENTORS)? {
             Some(t) => Ok(t),
-            None => load_fp16_weight_from_source(self.source, self.gpu, &format!("{base}.weight"), m, k),
+            None => {
+                load_fp16_weight_from_source(self.source, self.gpu, &format!("{base}.weight"), m, k)
+            }
         }
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-        paro_load_norm(self.source, self.gpu, &paro_plain_name(self.layer, rel), shape, self.norm_bias)
+        paro_load_norm(
+            self.source,
+            self.gpu,
+            &paro_plain_name(self.layer, rel),
+            shape,
+            self.norm_bias,
+        )
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
     }
     fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
-        Err(hip_bridge::HipError::new(0, "ParoBackend: attention biases unsupported"))
+        Err(hip_bridge::HipError::new(
+            0,
+            "ParoBackend: attention biases unsupported",
+        ))
     }
 }
 
@@ -1068,7 +1099,10 @@ mod tests {
     #[test]
     fn nested_candidates_cover_both_layouts() {
         let c = hf_name_candidates("layers.0.self_attn.q_proj.weight");
-        assert_eq!(c[0], "model.language_model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(
+            c[0],
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        );
         assert_eq!(c[1], "model.layers.0.self_attn.q_proj.weight");
         assert_eq!(c[2], "layers.0.self_attn.q_proj.weight");
     }
@@ -1080,17 +1114,32 @@ mod tests {
     }
     #[test]
     fn flat_candidates_are_two() {
-        assert_eq!(flat_name_candidates("layers.0.mlp.down_proj.weight"),
-                   vec!["model.layers.0.mlp.down_proj.weight".to_string(),
-                        "layers.0.mlp.down_proj.weight".to_string()]);
+        assert_eq!(
+            flat_name_candidates("layers.0.mlp.down_proj.weight"),
+            vec![
+                "model.layers.0.mlp.down_proj.weight".to_string(),
+                "layers.0.mlp.down_proj.weight".to_string()
+            ]
+        );
     }
     #[test]
     fn name_builders() {
-        assert_eq!(hfq_proj_name(3, "self_attn.q_proj"), "layers.3.self_attn.q_proj.weight");
-        assert_eq!(hfq_plain_name(3, "input_layernorm.weight"), "layers.3.input_layernorm.weight");
-        assert_eq!(paro_proj_name("model.language_model", 0, "linear_attn.in_proj_qkv"),
-                   "model.language_model.layers.0.linear_attn.in_proj_qkv");
-        assert_eq!(paro_plain_name(0, "input_layernorm.weight"), "layers.0.input_layernorm.weight");
+        assert_eq!(
+            hfq_proj_name(3, "self_attn.q_proj"),
+            "layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            hfq_plain_name(3, "input_layernorm.weight"),
+            "layers.3.input_layernorm.weight"
+        );
+        assert_eq!(
+            paro_proj_name("model.language_model", 0, "linear_attn.in_proj_qkv"),
+            "model.language_model.layers.0.linear_attn.in_proj_qkv"
+        );
+        assert_eq!(
+            paro_plain_name(0, "input_layernorm.weight"),
+            "layers.0.input_layernorm.weight"
+        );
     }
 
     // ── Embedding / tied-lm_head tests ──────────────────────────────────────
@@ -1132,8 +1181,14 @@ mod tests {
     }
     #[test]
     fn embedding_format_dtype_mapping() {
-        assert_eq!(embedding_format_dtype(EmbeddingFormat::HFQ4G256), DType::HFQ4G256);
-        assert_eq!(embedding_format_dtype(EmbeddingFormat::HFQ4G128), DType::HFQ4G128);
+        assert_eq!(
+            embedding_format_dtype(EmbeddingFormat::HFQ4G256),
+            DType::HFQ4G256
+        );
+        assert_eq!(
+            embedding_format_dtype(EmbeddingFormat::HFQ4G128),
+            DType::HFQ4G128
+        );
         assert_eq!(embedding_format_dtype(EmbeddingFormat::Q8_0), DType::Q8_0);
         assert_eq!(embedding_format_dtype(EmbeddingFormat::F32), DType::F32);
     }

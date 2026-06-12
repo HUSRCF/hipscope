@@ -7,8 +7,8 @@
 //! `load_layer_into` (multi-GPU HFQ) all funnel through `load_layer`.
 
 use crate::qwen35::{
-    DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights,
-    FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
+    DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
+    LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
 };
 use hip_bridge::HipResult;
 use hipfire_runtime::weight_backend::WeightBackend;
@@ -36,11 +36,22 @@ pub(crate) fn load_layer<B: WeightBackend>(
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
             wqkv: b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?,
             wz: b.proj("linear_attn.in_proj_z", d_inner, config.dim)?,
-            w_alpha: b.proj("linear_attn.in_proj_a", config.linear_num_value_heads, config.dim)?,
-            w_beta: b.proj("linear_attn.in_proj_b", config.linear_num_value_heads, config.dim)?,
+            w_alpha: b.proj(
+                "linear_attn.in_proj_a",
+                config.linear_num_value_heads,
+                config.dim,
+            )?,
+            w_beta: b.proj(
+                "linear_attn.in_proj_b",
+                config.linear_num_value_heads,
+                config.dim,
+            )?,
             a_log: b.raw_f32("linear_attn.A_log", config.linear_num_value_heads)?,
             dt_bias: b.raw_f32("linear_attn.dt_bias", config.linear_num_value_heads)?,
-            conv_weight: b.raw_f32("linear_attn.conv1d.weight", qkv_dim * config.conv_kernel_dim)?,
+            conv_weight: b.raw_f32(
+                "linear_attn.conv1d.weight",
+                qkv_dim * config.conv_kernel_dim,
+            )?,
             norm_weight: b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?,
             wo: b.proj("linear_attn.out_proj", config.dim, d_inner)?,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
@@ -65,11 +76,22 @@ pub(crate) fn load_layer<B: WeightBackend>(
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
             wqkv: b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?,
             wz: b.proj("linear_attn.in_proj_z", d_inner, config.dim)?,
-            w_alpha: b.proj("linear_attn.in_proj_a", config.linear_num_value_heads, config.dim)?,
-            w_beta: b.proj("linear_attn.in_proj_b", config.linear_num_value_heads, config.dim)?,
+            w_alpha: b.proj(
+                "linear_attn.in_proj_a",
+                config.linear_num_value_heads,
+                config.dim,
+            )?,
+            w_beta: b.proj(
+                "linear_attn.in_proj_b",
+                config.linear_num_value_heads,
+                config.dim,
+            )?,
             a_log: b.raw_f32("linear_attn.A_log", config.linear_num_value_heads)?,
             dt_bias: b.raw_f32("linear_attn.dt_bias", config.linear_num_value_heads)?,
-            conv_weight: b.raw_f32("linear_attn.conv1d.weight", qkv_dim * config.conv_kernel_dim)?,
+            conv_weight: b.raw_f32(
+                "linear_attn.conv1d.weight",
+                qkv_dim * config.conv_kernel_dim,
+            )?,
             norm_weight: b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?,
             wo: b.proj("linear_attn.out_proj", config.dim, d_inner)?,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,

@@ -1341,25 +1341,28 @@ fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTenso
 
 /// Where each piece of the model lands across a device slice. `single` = the
 /// n==1 degenerate case (everything on device 0).
-struct Layout {
+pub struct Layout {
     output_device: usize,
     layer_to_device: Vec<usize>,
 }
 impl Layout {
-    fn single(n_layers: usize) -> Self {
+    pub fn single(n_layers: usize) -> Self {
         Self {
             output_device: 0,
             layer_to_device: vec![0; n_layers],
         }
     }
-    fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
+    pub fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
         Self {
             output_device: g.output_device,
             layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
         }
     }
-    fn device_for_layer(&self, i: usize) -> usize {
+    pub fn device_for_layer(&self, i: usize) -> usize {
         self.layer_to_device[i]
+    }
+    pub fn output_device(&self) -> usize {
+        self.output_device
     }
 }
 
@@ -1368,7 +1371,7 @@ impl Layout {
 /// Whole-model weight source — the one place HFQ vs PaRo differs. Each method
 /// uploads to the caller-chosen `gpu` (native multi-GPU: the driver picks the
 /// device). `read_layer` reuses Tier-3 `load_layer<B>` internally.
-trait WeightSource {
+pub trait WeightSource {
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
     fn read_embed(
@@ -1395,7 +1398,7 @@ trait WeightSource {
     ) -> HipResult<LayerWeights>;
 }
 
-fn assemble_weights(
+pub fn load_weights(
     source: &mut dyn WeightSource,
     devices: &mut [Gpu],
     layout: &Layout,
@@ -1432,16 +1435,20 @@ fn assemble_weights(
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
 
-struct HfqSource<'a> {
-    hfq: &'a HfqFile,
+pub struct HfqSource<'a> {
+    hfq: &'a mut HfqFile,
 }
 impl<'a> HfqSource<'a> {
-    fn new(hfq: &'a HfqFile) -> Self {
+    pub fn new(hfq: &'a mut HfqFile) -> Self {
         Self { hfq }
     }
 }
 impl WeightSource for HfqSource<'_> {
-    fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+    fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        #[cfg(unix)]
+        if n_devices == 1 {
+            self.hfq.drop_mmap();
+        }
         Ok(())
     }
 
@@ -1534,12 +1541,12 @@ impl WeightSource for HfqSource<'_> {
 
 // ── ParoSource ────────────────────────────────────────────────────────────
 
-struct ParoSource<'a> {
+pub struct ParoSource<'a> {
     source: &'a dyn ModelSource,
     mp: &'static str,
 }
 impl<'a> ParoSource<'a> {
-    fn new(source: &'a dyn ModelSource) -> HipResult<Self> {
+    pub fn new(source: &'a dyn ModelSource) -> HipResult<Self> {
         source
             .quant_config()
             .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
@@ -1650,40 +1657,6 @@ impl WeightSource for ParoSource<'_> {
         };
         crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
     }
-}
-
-// ── Public wrappers (Task 5 collapses these) ───────────────────────────────
-
-pub fn load_weights(
-    hfq: &mut HfqFile,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<Qwen35Weights> {
-    #[cfg(unix)]
-    hfq.drop_mmap();
-    let mut source = HfqSource::new(hfq);
-    let layout = Layout::single(config.n_layers);
-    assemble_weights(&mut source, std::slice::from_mut(gpu), &layout, config)
-}
-
-pub fn load_weights_paroquant(
-    source: &dyn ModelSource,
-    config: &Qwen35Config,
-    gpu: &mut Gpu,
-) -> HipResult<Qwen35Weights> {
-    let mut src = ParoSource::new(source)?;
-    let layout = Layout::single(config.n_layers);
-    assemble_weights(&mut src, std::slice::from_mut(gpu), &layout, config)
-}
-
-pub fn load_weights_multi(
-    hfq: &HfqFile,
-    config: &Qwen35Config,
-    gpus: &mut Gpus,
-) -> HipResult<Qwen35Weights> {
-    let layout = Layout::from_gpus(gpus, config.n_layers);
-    let mut source = HfqSource::new(hfq);
-    assemble_weights(&mut source, &mut gpus.devices, &layout, config)
 }
 
 /// Build one layer's `LayerWeights` on `gpu`. Extracted for `load_weights_multi`

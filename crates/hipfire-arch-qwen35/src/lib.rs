@@ -28,6 +28,10 @@
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]
+pub mod carrier;
+#[cfg(feature = "deltanet")]
+pub(crate) mod layer_driver;
+#[cfg(feature = "deltanet")]
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
 pub mod mtp_head;
@@ -36,15 +40,11 @@ pub mod mtp_probe;
 #[cfg(feature = "deltanet")]
 pub mod mtp_spec;
 #[cfg(feature = "deltanet")]
+pub(crate) mod paro_moe;
+#[cfg(feature = "deltanet")]
 pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
-#[cfg(feature = "deltanet")]
-pub(crate) mod paro_moe;
-#[cfg(feature = "deltanet")]
-pub(crate) mod layer_driver;
-#[cfg(feature = "deltanet")]
-pub mod carrier;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
 
@@ -58,6 +58,6 @@ pub mod grammar;
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use carrier::{Qwen35Bundle, load_bundle as load_qwen35_bundle};
+pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};

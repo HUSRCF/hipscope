@@ -377,26 +377,43 @@ mod tests {
             };
             // plant the sentinel tensor the prefix-detector checks
             let key = format!("{layout}.embed_tokens.weight");
-            s.tensors.insert(key.clone(), TensorInfo {
-                name: key,
-                dtype: "F16".into(),
-                shape: vec![1, 1],
-                quant_type: 0xFF,
-                data_offset: 0,
-                data_size: 2,
-            });
+            s.tensors.insert(
+                key.clone(),
+                TensorInfo {
+                    name: key,
+                    dtype: "F16".into(),
+                    shape: vec![1, 1],
+                    quant_type: 0xFF,
+                    data_offset: 0,
+                    data_size: 2,
+                },
+            );
             s
         }
     }
     // Implement only the methods paro_text_prefix actually calls:
     impl ModelSource for MockSource {
-        fn metadata_json(&self) -> &str { "{}" }
-        fn arch_id(&self) -> u32 { 5 }
-        fn quant_config(&self) -> Option<&QuantConfig> { self.qc.as_ref() }
-        fn tensor_data(&self, _name: &str) -> Option<(&TensorInfo, &[u8])> { None }
-        fn tensor_info(&self, name: &str) -> Option<&TensorInfo> { self.tensors.get(name) }
-        fn tensor_names(&self) -> Vec<&str> { self.tensors.keys().map(|s| s.as_str()).collect() }
-        fn path(&self) -> &Path { Path::new("/tmp/mock") }
+        fn metadata_json(&self) -> &str {
+            "{}"
+        }
+        fn arch_id(&self) -> u32 {
+            5
+        }
+        fn quant_config(&self) -> Option<&QuantConfig> {
+            self.qc.as_ref()
+        }
+        fn tensor_data(&self, _name: &str) -> Option<(&TensorInfo, &[u8])> {
+            None
+        }
+        fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+            self.tensors.get(name)
+        }
+        fn tensor_names(&self) -> Vec<&str> {
+            self.tensors.keys().map(|s| s.as_str()).collect()
+        }
+        fn path(&self) -> &Path {
+            Path::new("/tmp/mock")
+        }
     }
 
     #[test]

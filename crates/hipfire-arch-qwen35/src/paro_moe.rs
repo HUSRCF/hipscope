@@ -8,17 +8,17 @@
 //! Qwen3.5-specific types: `MoeParoSidecars`, `MoeFfnWeights`, `Qwen35Config`,
 //! `SharedExpertWeights`, and `ExpertWeights`.
 
+use crate::qwen35::{
+    ExpertWeights, MoeFfnWeights, MoeParoSidecars, Qwen35Config, SharedExpertWeights,
+};
 use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::{
-    alias_paro_rotation, load_fp16_weight_from_source, paro_repack_moe_projection,
-    paro_load_wt, paro_text_prefix,
+    alias_paro_rotation, load_fp16_weight_from_source, paro_load_wt, paro_repack_moe_projection,
+    paro_text_prefix,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use crate::qwen35::{
-    ExpertWeights, MoeFfnWeights, MoeParoSidecars, Qwen35Config, SharedExpertWeights,
-};
 
 /// Upload the per-layer shared PARO rotation sidecars (one tuple for gate||up,
 /// one for down). All 256 experts will reference these via non-owning

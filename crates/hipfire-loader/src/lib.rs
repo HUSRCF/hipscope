@@ -7,27 +7,27 @@
 mod carriers;
 pub use carriers::*;
 
-use std::path::Path;
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
-use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35::speculative::{
     DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
+use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::loader_api::{CaskConfig, ModelSource, LoadCtx};
 use hipfire_runtime::llama;
+use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
+use std::path::Path;
 
 // ─── Object-safe Carrier trait ──────────────────────────────────────
 
@@ -41,8 +41,13 @@ pub trait Carrier: Send + Sync {
 // ─── Registry ─────────────────────────────────────────────────────────
 
 const REGISTRY: &[&dyn Carrier] = &[
-    &Qwen2Carrier, &Qwen35Carrier, &LlamaCarrier,
-    &DotsOcrCarrier, &Deepseek4Carrier, &MinimaxCarrier, &Lfm2MoeCarrier,
+    &Qwen2Carrier,
+    &Qwen35Carrier,
+    &LlamaCarrier,
+    &DotsOcrCarrier,
+    &Deepseek4Carrier,
+    &MinimaxCarrier,
+    &Lfm2MoeCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -278,22 +283,46 @@ impl LoadedModel {
         chat_template: Option<String>,
     ) -> Self {
         LoadedModel {
-            arch_id, pp: 1, ep: None,
-            pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
-            state: None, kv_cache: None, dn_state: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None, lfm2moe_eos_tok: 0,
-            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            state: None,
+            kv_cache: None,
+            dn_state: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap,
-            eviction: None, kv_adaptive: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap,
+            eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,
             dflash: None,
@@ -321,7 +350,14 @@ impl LoadedModel {
             pp_gpus: Some(pp_gpus),
             pp_scratch_set: Some(pp_scratch_set),
             pp_dn_la_to_device: Some(pp_dn_la_to_device),
-            ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, physical_cap, model_path, chat_template)
+            ..LoadedModel::skeleton(
+                arch_id,
+                tokenizer,
+                max_seq,
+                physical_cap,
+                model_path,
+                chat_template,
+            )
         }
     }
 }
@@ -454,8 +490,16 @@ fn finish_qwen35_load(
             format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
         })?;
         let fa_layer_ids: Vec<usize> = config
-            .layer_types.iter().enumerate()
-            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                if *t == LayerType::FullAttention {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect();
         if fa_layer_ids.is_empty() {
             eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
@@ -463,17 +507,38 @@ fn finish_qwen35_load(
         } else {
             let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
             let base = EvictionCtx::new(
-                ctx.gpu, &centers, fa_layer_ids, ctx.cask.budget, ctx.cask.beta,
-                config.n_heads, config.n_kv_heads, config.head_dim, n_rot,
-                config.rope_theta, physical_cap,
-            ).map_err(|e| format!("build EvictionCtx: {e}"))?;
+                ctx.gpu,
+                &centers,
+                fa_layer_ids,
+                ctx.cask.budget,
+                ctx.cask.beta,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                n_rot,
+                config.rope_theta,
+                physical_cap,
+            )
+            .map_err(|e| format!("build EvictionCtx: {e}"))?;
             if ctx.cask.cask_m_folding {
-                eprintln!("  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                    ctx.cask.core_frac, ctx.cask.fold_m, ctx.cask.budget, ctx.cask.beta, physical_cap);
-                Some(Eviction::Cask(CaskCtx::new(base, ctx.cask.core_frac, ctx.cask.fold_m)))
+                eprintln!(
+                    "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                    ctx.cask.core_frac,
+                    ctx.cask.fold_m,
+                    ctx.cask.budget,
+                    ctx.cask.beta,
+                    physical_cap
+                );
+                Some(Eviction::Cask(CaskCtx::new(
+                    base,
+                    ctx.cask.core_frac,
+                    ctx.cask.fold_m,
+                )))
             } else {
-                eprintln!("  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-                    ctx.cask.budget, ctx.cask.beta, physical_cap);
+                eprintln!(
+                    "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                    ctx.cask.budget, ctx.cask.beta, physical_cap
+                );
                 Some(Eviction::Plain(base))
             }
         }
@@ -485,12 +550,17 @@ fn finish_qwen35_load(
     let dflash = if let Some(dp) = ctx.draft_path {
         match load_dflash_state(dp, physical_cap, config, dn_state, ctx.gpu) {
             Ok(s) => {
-                eprintln!("  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size);
+                eprintln!(
+                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
+                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size
+                );
                 Some(s)
             }
             Err(e) => {
-                eprintln!("  DFlash draft load failed ({}): {} — falling back to AR only", dp, e);
+                eprintln!(
+                    "  DFlash draft load failed ({}): {} — falling back to AR only",
+                    dp, e
+                );
                 None
             }
         }
@@ -500,10 +570,20 @@ fn finish_qwen35_load(
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
-        state, eviction, dflash,
-        vision_config, vision_weights,
+        state,
+        eviction,
+        dflash,
+        vision_config,
+        vision_weights,
         max_seq: ctx.max_seq,
-        ..LoadedModel::skeleton(arch_id, tokenizer, ctx.max_seq, physical_cap, ctx.path.to_string(), chat_template)
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            ctx.max_seq,
+            physical_cap,
+            ctx.path.to_string(),
+            chat_template,
+        )
     })
 }
 
@@ -573,9 +653,15 @@ pub fn load_model(
             });
             if let Some((qt_label, name)) = mq_unsupported {
                 let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
-                    format!("arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels", hfq.arch_id)
+                    format!(
+                        "arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels",
+                        hfq.arch_id
+                    )
                 } else {
-                    format!("arch={} lacks the corresponding batched WMMA prefill family", gpu.arch)
+                    format!(
+                        "arch={} lacks the corresponding batched WMMA prefill family",
+                        gpu.arch
+                    )
                 };
                 return Err(format!(
                     "DFlash draft requested but model contains {qt_label} weight \
@@ -590,17 +676,27 @@ pub fn load_model(
     }
 
     let mut ctx = LoadCtx {
-        path, max_seq, draft_path,
-        kv_mode_override, kv_adaptive_override, state_quant_override,
-        cask, pp, gpu,
+        path,
+        max_seq,
+        draft_path,
+        kv_mode_override,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        gpu,
     };
 
     // Carrier registry dispatch
-    let carrier = REGISTRY.iter().find(|c| c.probe(&src))
+    let carrier = REGISTRY
+        .iter()
+        .find(|c| c.probe(&src))
         .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
     let result = carrier.load(src, &mut ctx)?;
-    debug_assert!(!(result.pp > 1) || result.pp_gpus.is_some(),
-        "pp>1 LoadedModel missing pp_gpus");
+    debug_assert!(
+        !(result.pp > 1) || result.pp_gpus.is_some(),
+        "pp>1 LoadedModel missing pp_gpus"
+    );
     Ok(result)
 }
 
@@ -620,8 +716,16 @@ fn load_dots_ocr(
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
         qwen2_state: Some(state),
-        dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
-        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        dots_ocr_config: Some(config),
+        dots_ocr_weights: Some(weights),
+        ..LoadedModel::skeleton(
+            hfq.arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 
@@ -637,18 +741,33 @@ fn load_deepseek4(
     let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
     let state = deepseek4::DeepseekV4State::new(&config)?;
     let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
     let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
-        if ids.len() == 1 { ids[0] } else { 1 }
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            1
+        }
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        deepseek4_config: Some(config), deepseek4_weights: Some(weights),
-        deepseek4_state: Some(state), deepseek4_pbs: Some(pbs),
+        deepseek4_config: Some(config),
+        deepseek4_weights: Some(weights),
+        deepseek4_state: Some(state),
+        deepseek4_pbs: Some(pbs),
         deepseek4_eos_tok: eos_tok,
-        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        ..LoadedModel::skeleton(
+            hfq.arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 
@@ -666,15 +785,31 @@ fn load_lfm2moe(
     let eos_tok: u32 = {
         let try_one = |s: &str| -> Option<u32> {
             let ids = tokenizer.encode(s);
-            if ids.len() == 1 { Some(ids[0]) } else { None }
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
         };
-        try_one("<|im_end|>").or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
+        try_one("<|im_end|>")
+            .or_else(|| try_one("</s>"))
+            .or_else(|| try_one("<|endoftext|>"))
+            .unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        lfm2moe_config: Some(config), lfm2moe_weights: Some(weights),
-        lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok,
-        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        lfm2moe_config: Some(config),
+        lfm2moe_weights: Some(weights),
+        lfm2moe_state: Some(state),
+        lfm2moe_eos_tok: eos_tok,
+        ..LoadedModel::skeleton(
+            hfq.arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 
@@ -693,15 +828,32 @@ fn load_minimax(
     let eos_tok: u32 = {
         let try_one = |s: &str| -> Option<u32> {
             let ids = tokenizer.encode(s);
-            if ids.len() == 1 { Some(ids[0]) } else { None }
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
         };
-        try_one("[e~[").or_else(|| try_one("<|im_end|>")).or_else(|| try_one("</s>")).or_else(|| try_one("<|endoftext|>")).unwrap_or(1)
+        try_one("[e~[")
+            .or_else(|| try_one("<|im_end|>"))
+            .or_else(|| try_one("</s>"))
+            .or_else(|| try_one("<|endoftext|>"))
+            .unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        minimax_config: Some(config), minimax_weights: Some(weights),
-        minimax_state: Some(state), minimax_eos_tok: eos_tok,
-        ..LoadedModel::skeleton(hfq.arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        minimax_config: Some(config),
+        minimax_weights: Some(weights),
+        minimax_state: Some(state),
+        minimax_eos_tok: eos_tok,
+        ..LoadedModel::skeleton(
+            hfq.arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 
@@ -717,12 +869,14 @@ fn load_dflash_state(
     gpu: &mut Gpu,
 ) -> Result<DflashState, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
-    use hipfire_arch_qwen35::speculative::{DeltaNetSnapshot, DdtreeScratch, GdnTape, VerifyScratch, HiddenStateRingBuffer};
+    use hipfire_arch_qwen35::speculative::{
+        DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
+    };
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let draft_weights = DflashWeights::load(gpu, &draft_hfq, &draft_config)
-        .map_err(|e| format!("{e}"))?;
+    let draft_weights =
+        DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
     let max_n = block_size + 1;
     let draft_scratch = DflashScratch::new(gpu, &draft_config, block_size, ctx_capacity)
@@ -735,11 +889,18 @@ fn load_dflash_state(
         target_config.dim,
         ctx_capacity,
         max_n,
-    ).map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
+    )
+    .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
     let hidden_k = target_config.dim.next_power_of_two();
     let verify_scratch = VerifyScratch::with_prefill(
-        gpu, max_n, target_config.dim, target_config.vocab_size, hidden_k, target_config,
-    ).map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
+        gpu,
+        max_n,
+        target_config.dim,
+        target_config.vocab_size,
+        hidden_k,
+        target_config,
+    )
+    .map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
         .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?;
     let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
@@ -747,16 +908,23 @@ fn load_dflash_state(
     let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
     // DDTree
     let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let ddtree = if ddtree_budget > 0 {
         let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
         let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
             + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
-        let n_fa_layers = target_config.layer_types.iter()
-            .filter(|t| **t == LayerType::FullAttention).count();
-        let post_seed_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-            .map_err(|e| format!("{e}"))?;
+        let n_fa_layers = target_config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        let post_seed_snap =
+            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
         let scratch = DdtreeScratch::new(
             gpu,
             ddtree_budget,
@@ -764,11 +932,12 @@ fn load_dflash_state(
             target_config.head_dim,
             qkv_dim,
             n_fa_layers,
-        ).map_err(|e| format!("DdtreeScratch::new: {e}"))?;
-        let path_c_parent_pre_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-            .map_err(|e| format!("{e}"))?;
-        let path_c_main_end_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-            .map_err(|e| format!("{e}"))?;
+        )
+        .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
+        let path_c_parent_pre_snap =
+            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
+        let path_c_main_end_snap =
+            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
         Some(DdtreeState {
             post_seed_snap,
             scratch,
@@ -797,32 +966,33 @@ fn load_dflash_state(
 
 // ─── EP load functions ────────────────────────────────────────────────
 
-pub fn load_model_ep(
-    path: &str, max_seq: usize, tp: usize,
-) -> Result<LoadedModel, String> {
+pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(path, max_seq, tp),
         10 => load_model_ep_minimax(path, max_seq, tp),
-        id => Err(format!("EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)")),
+        id => Err(format!(
+            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
+        )),
     }
 }
 
-fn load_model_ep_ds4(
-    path: &str, max_seq: usize, tp: usize,
-) -> Result<LoadedModel, String> {
+fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
     let arch_id = hfq.arch_id;
-    let mut gpus = Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
+    let mut gpus =
+        Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
     let weights: Vec<deepseek4::DeepseekV4Weights> = (0..tp)
         .map(|rank| {
             let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
             <deepseek4::DeepseekV4 as Architecture>::load_weights(
-                &mut hfq, &config, &mut gpus.devices[rank],
+                &mut hfq,
+                &config,
+                &mut gpus.devices[rank],
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -835,51 +1005,83 @@ fn load_model_ep_ds4(
     let partials: Vec<rdna_compute::GpuTensor> = (0..tp)
         .map(|rank| {
             let g = &mut gpus.devices[rank];
-            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32).unwrap()
+            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32)
+                .unwrap()
         })
         .collect();
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        ep: Some(EpState { gpus, inner: EpArch::Ds4 { config, weights, state, partials } }),
-        ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Ds4 {
+                config,
+                weights,
+                state,
+                partials,
+            },
+        }),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 
-fn load_model_ep_minimax(
-    path: &str, max_seq: usize, tp: usize,
-) -> Result<LoadedModel, String> {
+fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
     let arch_id = hfq.arch_id;
-    let mut gpus = Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
+    let mut gpus =
+        Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
     let weights: Vec<minimax::MiniMaxWeights> = (0..tp)
         .map(|rank| {
             let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
             <minimax::MiniMaxM2 as Architecture>::load_weights(
-                &mut hfq, &config, &mut gpus.devices[rank],
+                &mut hfq,
+                &config,
+                &mut gpus.devices[rank],
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
     let state: Vec<minimax::MiniMaxState> = (0..tp)
         .map(|rank| {
-            minimax::MiniMaxState::new_with_max_seq(
-                &mut gpus.devices[rank], &config, max_seq,
-            ).unwrap()
+            minimax::MiniMaxState::new_with_max_seq(&mut gpus.devices[rank], &config, max_seq)
+                .unwrap()
         })
         .collect();
     let partials: Vec<rdna_compute::GpuTensor> = (0..tp)
         .map(|rank| {
             let g = &mut gpus.devices[rank];
-            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32).unwrap()
+            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32)
+                .unwrap()
         })
         .collect();
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        ep: Some(EpState { gpus, inner: EpArch::Minimax { config, weights, state, partials } }),
-        ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Minimax {
+                config,
+                weights,
+                state,
+                partials,
+            },
+        }),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
     })
 }
 

@@ -1,11 +1,12 @@
-use crate::qwen35::{DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant};
+use crate::qwen35::{
+    DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
+};
 use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_runtime::loader_api::{ModelSource, LoadCtx};
-
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
     pub config: Qwen35Config,
@@ -17,206 +18,219 @@ pub struct Qwen35Bundle {
 
 /// Build the Qwen35 GPU bundle from an HFQ source.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
-        let ModelSource::Hfq(mut hfq) = src else {
-            return Err("qwen35: directory source unsupported".into());
-        };
+    let ModelSource::Hfq(mut hfq) = src else {
+        return Err("qwen35: directory source unsupported".into());
+    };
 
-        let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-        let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
 
-        // ── MMQ screening ────────────────────────────────────────
-        if ctx.gpu.mmq_screen.enabled
-            && matches!(
-                ctx.gpu.arch.as_str(),
-                "gfx906"
-                    | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-                    | "gfx1150" | "gfx1151" | "gfx1152"
+    // ── MMQ screening ────────────────────────────────────────
+    if ctx.gpu.mmq_screen.enabled
+        && matches!(
+            ctx.gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        let t0 = std::time::Instant::now();
+        let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, ctx.gpu);
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
+            ctx.gpu.mmq_screen.threshold,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+
+    // ── KV mode ──────────────────────────────────────────────
+    let kv_mode = ctx
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
+
+    let mut kv = match kv_mode.as_str() {
+        "q8" => KvCache::new_gpu_q8_capped_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym4" | "turbo4" => KvCache::new_gpu_asym4_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym2" | "turbo2" => KvCache::new_gpu_asym2_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => KvCache::new_gpu_asym3_capped_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "fwht3" => KvCache::new_gpu_fwht3_capped_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "fwht2" => KvCache::new_gpu_fwht2_capped_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "fwht4" => KvCache::new_gpu_fwht4_filtered(
+            ctx.gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        other => {
+            eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
+            KvCache::new_gpu_asym3_capped_filtered(
+                ctx.gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                ctx.max_seq,
+                ctx.max_seq,
             )
-        {
-            let t0 = std::time::Instant::now();
-            let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, ctx.gpu);
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-                ctx.gpu.mmq_screen.threshold,
-                elapsed.as_secs_f64() * 1000.0,
-            );
+            .map_err(|e| format!("{e}"))?
         }
+    };
 
-        // ── KV mode ──────────────────────────────────────────────
-        let kv_mode = ctx
-            .kv_mode_override
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-
-        let is_kv_layer: Vec<bool> = config
-            .layer_types
-            .iter()
-            .map(|t| *t == LayerType::FullAttention)
-            .collect();
-
-        let mut kv = match kv_mode.as_str() {
-            "q8" => KvCache::new_gpu_q8_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            "asym4" | "turbo4" => KvCache::new_gpu_asym4_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            "asym2" | "turbo2" => KvCache::new_gpu_asym2_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-                KvCache::new_gpu_asym3_capped_filtered(
-                    ctx.gpu,
-                    &is_kv_layer,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    ctx.max_seq,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("{e}"))?
-            }
-            "fwht3" => KvCache::new_gpu_fwht3_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            "fwht2" => KvCache::new_gpu_fwht2_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            "fwht4" => KvCache::new_gpu_fwht4_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?,
-            other => {
-                eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                KvCache::new_gpu_asym3_capped_filtered(
-                    ctx.gpu,
-                    &is_kv_layer,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    ctx.max_seq,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("{e}"))?
-            }
-        };
-
-        // ── V-mode override via env ──────────────────────────────
-        let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
-        let v_mode_override = match kv_v_env.as_str() {
-            "lloyd2" => Some(llama::VMode::Lloyd2),
-            "lloyd3" => Some(llama::VMode::Lloyd3),
-            "lloyd4" => Some(llama::VMode::Lloyd4),
-            "q8" | "" => None,
-            other => {
-                eprintln!("[hipfire-arch-qwen35] HIPFIRE_KV_V='{other}' unknown — ignoring (expected q8|lloyd2|lloyd3|lloyd4)");
-                None
-            }
-        };
-        if let Some(vm) = v_mode_override {
-            if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
-                kv.set_v_mode_realloc(ctx.gpu, vm)
-                    .map_err(|e| format!("{e}"))?;
-                eprintln!(
+    // ── V-mode override via env ──────────────────────────────
+    let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
+    let v_mode_override = match kv_v_env.as_str() {
+        "lloyd2" => Some(llama::VMode::Lloyd2),
+        "lloyd3" => Some(llama::VMode::Lloyd3),
+        "lloyd4" => Some(llama::VMode::Lloyd4),
+        "q8" | "" => None,
+        other => {
+            eprintln!("[hipfire-arch-qwen35] HIPFIRE_KV_V='{other}' unknown — ignoring (expected q8|lloyd2|lloyd3|lloyd4)");
+            None
+        }
+    };
+    if let Some(vm) = v_mode_override {
+        if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
+            kv.set_v_mode_realloc(ctx.gpu, vm)
+                .map_err(|e| format!("{e}"))?;
+            eprintln!(
                     "[hipfire-arch-qwen35] V-cache mode override → {kv_v_env} (256-wide lloyd-V on fwht K)"
                 );
-            } else {
-                eprintln!("[hipfire-arch-qwen35] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires an FWHT K mode (fwht2/3/4); cache is a different mode");
-            }
+        } else {
+            eprintln!("[hipfire-arch-qwen35] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires an FWHT K mode (fwht2/3/4); cache is a different mode");
         }
+    }
 
-        // ── KV adaptive ──────────────────────────────────────────
-        let kv_adaptive_spec = ctx
-            .kv_adaptive_override
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default());
+    // ── KV adaptive ──────────────────────────────────────────
+    let kv_adaptive_spec = ctx
+        .kv_adaptive_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default());
 
-        let _kv_adaptive: Option<KvAdaptive> = {
-            match parse_kv_adaptive(&kv_adaptive_spec) {
-                None => None,
-                Some((preset, k_floor, v_floor)) => {
-                    let ad = match preset {
-                        Some(p) => KvAdaptive::from_preset(
-                            p, ctx.max_seq, config.n_kv_heads, config.head_dim,
-                        ),
-                        None => KvAdaptive::new(
-                            ctx.max_seq, config.n_kv_heads, config.head_dim, k_floor, v_floor,
-                        ),
-                    };
-                    if !((kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht) {
-                        eprintln!("[hipfire-arch-qwen35] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
-                        None
-                    } else if ctx.cask.sidecar.is_some() {
-                        eprintln!("[hipfire-arch-qwen35] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV is a no-eviction capacity strategy and CASK eviction is active (mutually exclusive)");
-                        None
-                    } else if ad.current_cap() < hipfire_runtime::llama::PREFILL_MAX_BATCH {
-                        eprintln!(
+    let _kv_adaptive: Option<KvAdaptive> = {
+        match parse_kv_adaptive(&kv_adaptive_spec) {
+            None => None,
+            Some((preset, k_floor, v_floor)) => {
+                let ad = match preset {
+                    Some(p) => {
+                        KvAdaptive::from_preset(p, ctx.max_seq, config.n_kv_heads, config.head_dim)
+                    }
+                    None => KvAdaptive::new(
+                        ctx.max_seq,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        k_floor,
+                        v_floor,
+                    ),
+                };
+                if !((kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht) {
+                    eprintln!("[hipfire-arch-qwen35] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
+                    None
+                } else if ctx.cask.sidecar.is_some() {
+                    eprintln!("[hipfire-arch-qwen35] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV is a no-eviction capacity strategy and CASK eviction is active (mutually exclusive)");
+                    None
+                } else if ad.current_cap() < hipfire_runtime::llama::PREFILL_MAX_BATCH {
+                    eprintln!(
                             "[hipfire-arch-qwen35] kv_adaptive={kv_adaptive_spec} ignored — max_seq={} too small: start-tier capacity {} < prefill chunk {}",
                             ctx.max_seq, ad.current_cap(), hipfire_runtime::llama::PREFILL_MAX_BATCH,
                         );
-                        None
-                    } else {
-                        if !kv.quant_asym4 {
-                            eprintln!("[hipfire-arch-qwen35] kv_adaptive: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4");
-                        }
-                        let k_floor_bph = k_floor.bytes_per_head(config.head_dim);
-                        kv.set_adaptive_floor_alloc(ctx.gpu, v_floor, k_floor_bph)
-                            .map_err(|e| format!("{e}"))?;
-                        eprintln!(
+                    None
+                } else {
+                    if !kv.quant_asym4 {
+                        eprintln!("[hipfire-arch-qwen35] kv_adaptive: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4");
+                    }
+                    let k_floor_bph = k_floor.bytes_per_head(config.head_dim);
+                    kv.set_adaptive_floor_alloc(ctx.gpu, v_floor, k_floor_bph)
+                        .map_err(|e| format!("{e}"))?;
+                    eprintln!(
                             "[adaptive-kv] engaged: pattern={:?} k_floor={:?} v_floor={:?} thresholds={:?} start_cap={} (max_seq={}, V buffer sized at floor)",
                             ad.steps, ad.k_floor, ad.v_floor, ad.thresholds, ad.current_cap(), ctx.max_seq,
                         );
-                        Some(ad)
-                    }
+                    Some(ad)
                 }
             }
-        };
+        }
+    };
 
-        // ── DeltaNet state ───────────────────────────────────────
-        let dn_quant = parse_state_quant(ctx.state_quant_override)?;
-        eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
-        warn_tiny_model_state(&hfq, dn_quant);
-        let dn = DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant)
-            .map_err(|e| format!("{e}"))?;
+    // ── DeltaNet state ───────────────────────────────────────
+    let dn_quant = parse_state_quant(ctx.state_quant_override)?;
+    eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+    warn_tiny_model_state(&hfq, dn_quant);
+    let dn =
+        DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
 
-        // ── Scratch ──────────────────────────────────────────────
-        let scratch = Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq)
-            .map_err(|e| format!("{e}"))?;
+    // ── Scratch ──────────────────────────────────────────────
+    let scratch = Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq)
+        .map_err(|e| format!("{e}"))?;
 
-        Ok(Qwen35Bundle { config, weights, scratch, kv_cache: kv, dn_state: dn })
+    Ok(Qwen35Bundle {
+        config,
+        weights,
+        scratch,
+        kv_cache: kv,
+        dn_state: dn,
+    })
 }
 
 // ─── Helper: StateQuant parsing ─────────────────────────────────────
@@ -242,17 +256,16 @@ fn state_quant_label(q: StateQuant) -> &'static str {
 
 // ─── Helper: MMQ screening (inline from hipfire-loader) ───────────
 
-fn screen_weights_qwen35(
-    weights: &Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> (usize, usize) {
+fn screen_weights_qwen35(weights: &Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
     use crate::qwen35::LayerWeights;
     let mut n_safe = 0usize;
     let mut n_unsafe = 0usize;
     for layer in &weights.layers {
         let wts: Vec<&hipfire_runtime::llama::WeightTensor> = match layer {
             LayerWeights::DeltaNet(l) => {
-                vec![&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo]
+                vec![
+                    &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo,
+                ]
             }
             LayerWeights::FullAttn(l) => {
                 vec![&l.wq, &l.wk, &l.wv, &l.w_gate, &l.w_up, &l.wo]

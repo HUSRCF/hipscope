@@ -27,7 +27,10 @@ pub trait WeightAugmentor: Send + Sync {
     /// True if this augmentor applies to the given source (delegates to
     /// is_active_for if quant_config is present, otherwise false).
     fn is_active(&self, source: &dyn ModelSource) -> bool {
-        source.quant_config().map(|qc| self.is_active_for(qc)).unwrap_or(false)
+        source
+            .quant_config()
+            .map(|qc| self.is_active_for(qc))
+            .unwrap_or(false)
     }
 
     /// Attempt to fully load the weight tensor named `base_name` (no extension).
@@ -80,7 +83,9 @@ impl ParoAugmentor {
 }
 
 impl WeightAugmentor for ParoAugmentor {
-    fn name(&self) -> &'static str { "paroquant" }
+    fn name(&self) -> &'static str {
+        "paroquant"
+    }
 
     fn is_active_for(&self, qc: &QuantConfig) -> bool {
         ParoAugmentor::is_active_for(qc)
@@ -97,12 +102,23 @@ impl WeightAugmentor for ParoAugmentor {
         // Only fires if the quantized tensors actually exist for this weight.
         // Some tensors are excluded from quantization (router, embeddings) and
         // have no .qweight — paro_load_wt falls back to .weight for those.
-        if source.tensor_info(&format!("{base_name}.qweight")).is_none() {
+        if source
+            .tensor_info(&format!("{base_name}.qweight"))
+            .is_none()
+        {
             return Ok(None);
         }
-        let qc = source.quant_config().expect("ParoAugmentor: quant_config required");
+        let qc = source
+            .quant_config()
+            .expect("ParoAugmentor: quant_config required");
         let t = crate::paro::load_paro_weight(
-            source, gpu, base_name, out_dim, in_dim, qc.group_size, qc.krot,
+            source,
+            gpu,
+            base_name,
+            out_dim,
+            in_dim,
+            qc.group_size,
+            qc.krot,
         )?;
         Ok(Some(t))
     }
@@ -119,7 +135,7 @@ pub static DEFAULT_AUGMENTORS: &[&dyn WeightAugmentor] = &[&PARO];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_source::{QuantConfig};
+    use crate::model_source::QuantConfig;
 
     fn make_quant_config(krot: u8) -> QuantConfig {
         QuantConfig {
