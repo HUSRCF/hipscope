@@ -52,6 +52,12 @@ fn main() {
     let mut out_dir: PathBuf = PathBuf::from("/mnt/vol/e8hess");
     let mut n_ctx: usize = 512;
     let mut max_chunks: Option<usize> = None;
+    // ROW_GATE: skip writing a .hblk for any (tensor,expert) whose accumulated
+    // row count is below this threshold; the quantizer missing-file -> RTN
+    // fallback then auto-gates under-sampled experts. Default 1024 = 4x the
+    // 256 block-dim. Overridable via --row-gate or HIPFIRE_E8_ROW_GATE.
+    let mut row_gate: u64 = std::env::var("HIPFIRE_E8_ROW_GATE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -60,8 +66,9 @@ fn main() {
             "--out-dir" => { out_dir = PathBuf::from(&argv[i + 1]); i += 2; }
             "--n-ctx" => { n_ctx = argv[i + 1].parse().expect("--n-ctx int"); i += 2; }
             "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
+            "--row-gate" => { row_gate = argv[i + 1].parse().expect("--row-gate int"); i += 2; }
             "-h" | "--help" => {
-                eprintln!("Usage: collect_e8_hessian_native --model <hfq> --slice <calib.txt> [--slice ...] --out-dir <dir> [--n-ctx 512] [--max-chunks N]");
+                eprintln!("Usage: collect_e8_hessian_native --model <hfq> --slice <calib.txt> [--slice ...] --out-dir <dir> [--n-ctx 512] [--max-chunks N] [--row-gate 1024]");
                 std::process::exit(0);
             }
             o => { eprintln!("unknown arg: {o}"); std::process::exit(1); }
@@ -183,6 +190,11 @@ fn main() {
     let mut min_diag = f64::INFINITY;
     let mut max_diag = f64::NEG_INFINITY;
     let mut zero_diag = 0u64;
+    // ROW_GATE bookkeeping: count experts cleared/gated + row-count distribution.
+    let mut gated_skipped = 0u64;
+    let mut cleared = 0u64;
+    let mut row_counts: Vec<u64> = Vec::with_capacity(cap.entries.len());
+    eprintln!("ROW_GATE = {row_gate} rows (skip .hblk below this; quantizer RTN-fallback gates them)");
     // Deterministic order for the log.
     let mut names: Vec<&String> = cap.entries.keys().collect();
     names.sort();
@@ -193,6 +205,15 @@ fn main() {
         if md > max_diag { max_diag = md; }
         if md <= 0.0 { zero_diag += 1; }
         total_rows += acc.n_rows;
+        row_counts.push(acc.n_rows);
+        // ROW_GATE: under-sampled (tensor,expert) Hessians are unreliable for LDLQ
+        // (a 256-dim block needs >> 256 rows for a well-conditioned H). Skip the
+        // .hblk; the quantizer falls back to RTN-E8 for any missing file.
+        if acc.n_rows < row_gate {
+            gated_skipped += 1;
+            continue;
+        }
+        cleared += 1;
         if name.ends_with("gate_up_proj.weight") { gate_up_cnt += 1; }
         if name.ends_with("down_proj.weight") { down_cnt += 1; }
         acc.write_hblk(&out_dir, name).unwrap_or_else(|e| {
@@ -204,6 +225,17 @@ fn main() {
     eprintln!(
         "wrote {} .hblk files to {} ({} gate_up, {} down; total_rows={}, mean_diag range [{:.4e}, {:.4e}], zero-diag entries={})",
         n_written, out_dir.display(), gate_up_cnt, down_cnt, total_rows, min_diag, max_diag, zero_diag,
+    );
+    // ROW_GATE distribution report.
+    row_counts.sort_unstable();
+    let n_seen = row_counts.len() as u64;
+    let mean_rows = if n_seen > 0 { total_rows as f64 / n_seen as f64 } else { 0.0 };
+    let median_rows = if n_seen > 0 { row_counts[(n_seen / 2) as usize] } else { 0 };
+    let min_rows = row_counts.first().copied().unwrap_or(0);
+    let max_rows = row_counts.last().copied().unwrap_or(0);
+    eprintln!(
+        "ROW_GATE stats: {} (tensor,expert) seen; {} cleared (>= {} rows, wrote .hblk) / {} gated-to-RTN (< {} rows). rows: min={} median={} mean={:.0} max={}",
+        n_seen, cleared, row_gate, gated_skipped, row_gate, min_rows, median_rows, mean_rows, max_rows,
     );
     // Spot-check: print 3 example keys so a name-mismatch can't pass silently.
     let mut ex: Vec<&String> = cap.entries.keys().collect();
