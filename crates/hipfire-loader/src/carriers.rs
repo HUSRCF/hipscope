@@ -114,12 +114,12 @@ impl Carrier for Qwen35Carrier {
                     };
                     let layout =
                         hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
-                    let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file);
+                    let mut hfq_source =
+                        hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
                     let weights = hipfire_arch_qwen35::qwen35::load_weights(
                         &mut hfq_source,
                         &mut gpus.devices,
                         &layout,
-                        &config,
                     )
                     .map_err(|e| format!("{e}"))?;
                     let is_kv_layer: Vec<bool> = config
@@ -311,14 +311,14 @@ impl Carrier for Qwen35Carrier {
 
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
                     .ok_or("failed to parse Qwen3.5 config from config.json")?;
-                let mut paro_source = hipfire_arch_qwen35::qwen35::ParoSource::new(&source)
-                    .map_err(|e| format!("ParoSource::new: {e:?}"))?;
+                let mut paro_source =
+                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
+                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
                 let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
                 let weights = hipfire_arch_qwen35::qwen35::load_weights(
                     &mut paro_source,
                     std::slice::from_mut(ctx.gpu),
                     &paro_layout,
-                    &config,
                 )
                 .map_err(|e| format!("load_weights: {e:?}"))?;
                 let is_kv_layer: Vec<bool> = config

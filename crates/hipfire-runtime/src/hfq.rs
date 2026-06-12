@@ -7,7 +7,8 @@
 use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
-use crate::weight_backend::{flat_name_candidates, HfqBackend, WeightBackend};
+use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use crate::weight_backend::{flat_name_candidates, reupload_f16_as_f32, HfqBackend, WeightBackend};
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1018,6 +1019,118 @@ fn load_weight_tensor(
     Ok(wt)
 }
 
+/// Llama-family HFQ weight source. Single-GPU only in practice; preserves the
+/// pre-refactor behaviour exactly — no mmap drop, no tied-lm_head alias
+/// (always reupload), flat name layout, `norm_bias = 0.0`.
+struct LlamaHfqSource<'a> {
+    hfq: &'a HfqFile,
+    cfg: &'a LlamaConfig,
+}
+impl WeightSource for LlamaHfqSource<'_> {
+    type Layer = LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.cfg.n_layers
+    }
+
+    fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+        Ok(()) // llama keeps the mmap (read-only `&HfqFile`); matches pre-refactor.
+    }
+
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        load_embedding_llama(self.hfq, gpu, self.cfg)
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
+        eprintln!("  loading output_norm...");
+        load_f16_tensor(self.hfq, gpu, "model.norm.weight", &[self.cfg.dim])
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        _embd: &GpuTensor,
+        _embd_fmt: EmbeddingFormat,
+        _can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        let cfg = self.cfg;
+        eprintln!("  loading output...");
+        let output = if self.hfq.find_tensor("lm_head.weight").is_some() {
+            load_weight_tensor(
+                self.hfq,
+                gpu,
+                "lm_head.weight",
+                cfg.vocab_size,
+                cfg.dim,
+                flat_name_candidates,
+            )?
+        } else {
+            let data = self.hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
+            reupload_f16_as_f32(gpu, &data, cfg.vocab_size, cfg.dim)?
+        };
+        Ok((output, false))
+    }
+
+    fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
+        let cfg = self.cfg;
+        let q_out_dim = cfg.n_heads * cfg.head_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        eprintln!("  loading layer {i}/{} ...", cfg.n_layers);
+        let mut b = HfqBackend {
+            hfq: self.hfq,
+            gpu,
+            norm_bias: 0.0,
+            candidates: flat_name_candidates,
+            read_proj: load_weight_tensor,
+            layer: i,
+        };
+        load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
+    }
+}
+
+/// Load llama-family `model.embed_tokens.weight` and classify its embedding
+/// format. Verbatim extraction of the former inline block in `load_weights_hfq`.
+fn load_embedding_llama(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    config: &LlamaConfig,
+) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    eprintln!("  loading token_embd...");
+    let embd_info = hfq
+        .tensor_data("model.embed_tokens.weight")
+        .expect("embed_tokens not found");
+    let pair = if embd_info.0.quant_type == 4 {
+        eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q4K)
+    } else if embd_info.0.quant_type == 6 {
+        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
+    } else if embd_info.0.quant_type == 7 {
+        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+    } else if embd_info.0.quant_type == 3 {
+        eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
+    } else if matches!(embd_info.0.quant_type, 1 | 2 | 16) {
+        (
+            load_f16_tensor(hfq, gpu, "model.embed_tokens.weight", &[config.vocab_size, config.dim])?,
+            EmbeddingFormat::F32,
+        )
+    } else {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "token_embd has quant_type={} which has no embedding-lookup kernel. \
+             Embedding tables must be F32, Q8_0 (qt=3), Q4K (qt=4), \
+             HFQ4G256 (qt=6) or HFQ4G128 (qt=7). Re-quantize the model so \
+             embed_tokens lands in one of those formats.",
+                embd_info.0.quant_type
+            ),
+        ));
+    };
+    Ok(pair)
+}
+
 /// Load LLaMA weights from an HFQ file onto GPU.
 pub fn load_weights_hfq(
     hfq: &HfqFile,
@@ -1064,126 +1177,11 @@ pub fn load_weights_hfq(
         ));
     }
 
-    eprintln!("  loading token_embd...");
-    let embd_info = hfq
-        .tensor_data("model.embed_tokens.weight")
-        .expect("embed_tokens not found");
-    let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
-        // Q4_K: upload raw, use Q4K embedding lookup at inference
-        eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::Q4K,
-        )
-    } else if embd_info.0.quant_type == 6 {
-        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G256,
-        )
-    } else if embd_info.0.quant_type == 7 {
-        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G128,
-        )
-    } else if embd_info.0.quant_type == 3 {
-        // Q8F16: upload raw, use Q8 embedding lookup at inference
-        eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::Q8_0,
-        )
-    } else if matches!(embd_info.0.quant_type, 1 | 2 | 16) {
-        // F16 / F32 / BF16 source — dequantize to F32 and use the D2D lookup.
-        (
-            load_f16_tensor(
-                hfq,
-                gpu,
-                "model.embed_tokens.weight",
-                &[config.vocab_size, config.dim],
-            )?,
-            EmbeddingFormat::F32,
-        )
-    } else {
-        // Any other quant type (MQ4/MQ8/MQ6/HFQ6/HFQ2-3/MFP4/HFP4/…) has no
-        // embedding-lookup kernel — only F32/Q8_0/Q4K/HFQ4G256/HFQ4G128 do.
-        // The first-party packager never emits these for token_embd (it demotes
-        // embeddings to Q8/HFQ4), but an externally-produced .hfq can. Fail loud
-        // here instead of silently reinterpreting the bytes as F16 → garbage.
-        // Mirrors the qwen35 embed_classify guard (commit 715c9063).
-        return Err(HipError::new(
-            0,
-            &format!(
-                "token_embd has quant_type={} which has no embedding-lookup kernel. \
-             Embedding tables must be F32, Q8_0 (qt=3), Q4K (qt=4), \
-             HFQ4G256 (qt=6) or HFQ4G128 (qt=7). Re-quantize the model so \
-             embed_tokens lands in one of those formats.",
-                embd_info.0.quant_type
-            ),
-        ));
-    };
-
-    eprintln!("  loading output_norm...");
-    let output_norm = load_f16_tensor(hfq, gpu, "model.norm.weight", &[config.dim])?;
-
-    eprintln!("  loading output...");
-    let output = if hfq.find_tensor("lm_head.weight").is_some() {
-        load_weight_tensor(
-            hfq,
-            gpu,
-            "lm_head.weight",
-            config.vocab_size,
-            config.dim,
-            flat_name_candidates,
-        )?
-    } else {
-        // Tied embeddings — reuse token_embd as output weights (F32 for GEMV)
-        let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-        };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        }
-    };
-
-    let q_out_dim = config.n_heads * config.head_dim;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut layers = Vec::with_capacity(config.n_layers);
-    {
-        let mut b = HfqBackend {
-            hfq,
-            gpu,
-            norm_bias: 0.0,
-            candidates: flat_name_candidates,
-            read_proj: load_weight_tensor,
-            layer: 0,
-        };
-        for i in 0..config.n_layers {
-            eprintln!("  loading layer {i}/{} ...", config.n_layers);
-            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
-        }
-    }
-
-    Ok(LlamaWeights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        layers,
-    })
+    let mut source = LlamaHfqSource { hfq, cfg: config };
+    let layout = crate::model_load::Layout::single(config.n_layers);
+    let LoadedWeights { token_embd, embd_format, output_norm, output, layers, .. } =
+        rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
+    Ok(LlamaWeights { token_embd, embd_format, output_norm, output, layers })
 }
 
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,

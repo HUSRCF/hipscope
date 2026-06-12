@@ -31,9 +31,10 @@ use hipfire_runtime::paro::{
     load_fp16_weight_from_source, paro_load_f32, paro_load_norm, paro_text_prefix,
 };
 use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_awq_scale_for,
-    load_embedding, HfqBackend, ParoBackend,
+    load_embedding, reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1337,90 +1338,28 @@ fn attach_lm_head_awq_sidecar(hfq: &HfqFile, gpu: &Gpu, output: &mut WeightTenso
     }
 }
 
-// ── Layout ────────────────────────────────────────────────────────────────
+// ── Layout (re-exported from runtime) ─────────────────────────────────────
 
-/// Where each piece of the model lands across a device slice. `single` = the
-/// n==1 degenerate case (everything on device 0).
-pub struct Layout {
-    output_device: usize,
-    layer_to_device: Vec<usize>,
-}
-impl Layout {
-    pub fn single(n_layers: usize) -> Self {
-        Self {
-            output_device: 0,
-            layer_to_device: vec![0; n_layers],
-        }
-    }
-    pub fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
-        Self {
-            output_device: g.output_device,
-            layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
-        }
-    }
-    pub fn device_for_layer(&self, i: usize) -> usize {
-        self.layer_to_device[i]
-    }
-    pub fn output_device(&self) -> usize {
-        self.output_device
-    }
-}
+pub use hipfire_runtime::model_load::Layout;
 
-// ── WeightSource trait ────────────────────────────────────────────────────
+// ── load_weights (thin assembler over runtime orchestrator) ───────────────
 
-/// Whole-model weight source — the one place HFQ vs PaRo differs. Each method
-/// uploads to the caller-chosen `gpu` (native multi-GPU: the driver picks the
-/// device). `read_layer` reuses Tier-3 `load_layer<B>` internally.
-pub trait WeightSource {
-    /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1.
-    fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
-    fn read_embed(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-    ) -> HipResult<(GpuTensor, EmbeddingFormat)>;
-    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor>;
-    /// `can_alias` is true iff embed and output share a device (n==1); then the
-    /// tied lm_head aliases the embedding buffer instead of re-uploading.
-    fn read_output(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-        embd: &GpuTensor,
-        embd_fmt: EmbeddingFormat,
-        can_alias: bool,
-    ) -> HipResult<(WeightTensor, bool)>;
-    fn read_layer(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-        layer_idx: usize,
-    ) -> HipResult<LayerWeights>;
-}
-
+/// Drive a qwen35 `WeightSource` over the device slice (runtime orchestrator),
+/// then assemble `Qwen35Weights`. `pager` is always `None` here; paged-experts
+/// wiring is unchanged and set by the caller post-load.
 pub fn load_weights(
-    source: &mut dyn WeightSource,
+    source: &mut (impl WeightSource<Layer = LayerWeights>),
     devices: &mut [Gpu],
     layout: &Layout,
-    config: &Qwen35Config,
 ) -> HipResult<Qwen35Weights> {
-    source.prepare(devices.len())?;
-    let out_dev = layout.output_device;
-    let can_alias = devices.len() == 1;
-    let (token_embd, embd_format) = source.read_embed(&mut devices[0], config)?;
-    let output_norm = source.read_final_norm(&mut devices[out_dev], config)?;
-    let (output, lm_head_aliases_embd) = source.read_output(
-        &mut devices[out_dev],
-        config,
-        &token_embd,
+    let LoadedWeights {
+        token_embd,
         embd_format,
-        can_alias,
-    )?;
-    let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
-        let d = layout.device_for_layer(i);
-        layers.push(source.read_layer(&mut devices[d], config, i)?);
-    }
+        output_norm,
+        output,
+        layers,
+        lm_head_aliases_embd,
+    } = rt_load_weights(source, devices, layout)?;
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -1437,26 +1376,31 @@ pub fn load_weights(
 
 pub struct HfqSource<'a> {
     hfq: &'a mut HfqFile,
+    c: &'a Qwen35Config,
 }
 impl<'a> HfqSource<'a> {
-    pub fn new(hfq: &'a mut HfqFile) -> Self {
-        Self { hfq }
+    pub fn new(hfq: &'a mut HfqFile, c: &'a Qwen35Config) -> Self {
+        Self { hfq, c }
     }
 }
 impl WeightSource for HfqSource<'_> {
+    type Layer = LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.c.n_layers
+    }
+
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
         #[cfg(unix)]
         if n_devices == 1 {
             self.hfq.drop_mmap();
         }
+        let _ = n_devices;
         Ok(())
     }
 
-    fn read_embed(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-    ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        let c = self.c;
         eprintln!("  loading token_embd...");
         if c.is_vl_text {
             eprintln!(
@@ -1471,19 +1415,19 @@ impl WeightSource for HfqSource<'_> {
         Ok(out)
     }
 
-    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor> {
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
         eprintln!("  loading output_norm...");
-        load_norm_weight(self.hfq, gpu, "norm.weight", &[c.dim])
+        load_norm_weight(self.hfq, gpu, "norm.weight", &[self.c.dim])
     }
 
     fn read_output(
         &mut self,
         gpu: &mut Gpu,
-        c: &Qwen35Config,
         embd: &GpuTensor,
         embd_fmt: EmbeddingFormat,
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
+        let c = self.c;
         let lm_head_info = qwen35_tensor_data_vec(self.hfq, "lm_head.weight");
         let lm_head_is_tied = lm_head_info.is_none();
         let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
@@ -1516,12 +1460,8 @@ impl WeightSource for HfqSource<'_> {
         Ok((output, lm_head_is_tied && can_alias))
     }
 
-    fn read_layer(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-        layer_idx: usize,
-    ) -> HipResult<LayerWeights> {
+    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+        let c = self.c;
         let is_moe = c.num_experts > 0;
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}{})...",
@@ -1544,27 +1484,31 @@ impl WeightSource for HfqSource<'_> {
 pub struct ParoSource<'a> {
     source: &'a dyn ModelSource,
     mp: &'static str,
+    c: &'a Qwen35Config,
 }
 impl<'a> ParoSource<'a> {
-    pub fn new(source: &'a dyn ModelSource) -> HipResult<Self> {
+    pub fn new(source: &'a dyn ModelSource, c: &'a Qwen35Config) -> HipResult<Self> {
         source
             .quant_config()
             .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
         let mp = paro_text_prefix(source)?;
-        Ok(Self { source, mp })
+        Ok(Self { source, mp, c })
     }
     fn read_f16_as_f32(&self, name: &str) -> HipResult<Vec<f32>> {
         let (_, data) = self
             .source
             .tensor_data(name)
             .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-        Ok(data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect())
+        Ok(hipfire_runtime::weight_backend::f16_bytes_to_f32(&data))
     }
 }
 impl WeightSource for ParoSource<'_> {
+    type Layer = LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.c.n_layers
+    }
+
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
         if n_devices > 1 {
             return Err(HipError::new(
@@ -1575,26 +1519,21 @@ impl WeightSource for ParoSource<'_> {
         Ok(())
     }
 
-    fn read_embed(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-    ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
         eprintln!("  loading token_embd (ParoQuant)...");
         let f32_embd = self.read_f16_as_f32(&format!("{}.embed_tokens.weight", self.mp))?;
-        let token_embd = gpu.upload_f32(&f32_embd, &[c.vocab_size, c.dim])?;
+        let token_embd = gpu.upload_f32(&f32_embd, &[self.c.vocab_size, self.c.dim])?;
         Ok((token_embd, EmbeddingFormat::F32))
     }
 
-    fn read_final_norm(&mut self, gpu: &mut Gpu, c: &Qwen35Config) -> HipResult<GpuTensor> {
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
         eprintln!("  loading output_norm...");
-        paro_load_norm(self.source, gpu, "norm.weight", &[c.dim], 1.0)
+        paro_load_norm(self.source, gpu, "norm.weight", &[self.c.dim], 1.0)
     }
 
     fn read_output(
         &mut self,
         gpu: &mut Gpu,
-        c: &Qwen35Config,
         _embd: &GpuTensor,
         _embd_fmt: EmbeddingFormat,
         _can_alias: bool,
@@ -1607,34 +1546,18 @@ impl WeightSource for ParoSource<'_> {
         };
         eprintln!(
             "  loading output ({})...",
-            if tied {
-                "tied embeddings"
-            } else {
-                "separate lm_head"
-            }
+            if tied { "tied embeddings" } else { "separate lm_head" }
         );
-        let f = self.read_f16_as_f32(&src_name)?;
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
-        let buf = gpu.upload_raw(bytes, &[c.vocab_size, c.dim])?;
-        let output = WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: c.vocab_size,
-            k: c.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        };
+        let (_, f16) = self
+            .source
+            .tensor_data(&src_name)
+            .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {src_name}")))?;
+        let output = reupload_f16_as_f32(gpu, &f16, self.c.vocab_size, self.c.dim)?;
         Ok((output, false))
     }
 
-    fn read_layer(
-        &mut self,
-        gpu: &mut Gpu,
-        c: &Qwen35Config,
-        layer_idx: usize,
-    ) -> HipResult<LayerWeights> {
+    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+        let c = self.c;
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
             c.n_layers, c.layer_types[layer_idx]

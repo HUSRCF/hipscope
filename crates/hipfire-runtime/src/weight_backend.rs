@@ -184,7 +184,41 @@ pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Opt
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
-// ── Dequant primitives (bodies filled in Task 2) ────────────────────────────
+/// Decode a little-endian f16 byte buffer to `f32`. Pure (GPU-free). The shared
+/// core of every tied-lm_head reupload across HFQ + ParoQuant arches.
+pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Reupload an f16 weight buffer as a device F32 `WeightTensor [m, k]`. The
+/// canonical tied-lm_head / ParoQuant-output reupload — replaces three hand-rolled
+/// `unsafe { from_raw_parts }` copies.
+pub fn reupload_f16_as_f32(
+    gpu: &mut Gpu,
+    f16_bytes: &[u8],
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let f32_data = f16_bytes_to_f32(f16_bytes);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+    };
+    let buf = gpu.upload_raw(bytes, &[m, k])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
+// ── Dequant primitives ───────────────────────────────────────────────
 
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
@@ -1196,5 +1230,12 @@ mod tests {
     #[should_panic(expected = "Q4K not valid")]
     fn embedding_format_dtype_q4k_panics() {
         embedding_format_dtype(EmbeddingFormat::Q4K);
+    }
+
+    #[test]
+    fn f16_bytes_to_f32_roundtrips_known_values() {
+        // 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00 (little-endian byte pairs).
+        let bytes = [0x00, 0x3C, 0x00, 0x40, 0x00, 0xBC];
+        assert_eq!(f16_bytes_to_f32(&bytes), vec![1.0, 2.0, -1.0]);
     }
 }

@@ -33,6 +33,7 @@ pub mod kv_adaptive;
 pub mod llama;
 pub mod loader_api;
 pub mod loop_guard;
+pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;

@@ -72,9 +72,9 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        let mut source = HfqSource::new(hfq);
+        let mut source = HfqSource::new(hfq, cfg);
         let layout = Layout::single(cfg.n_layers);
-        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout, cfg)
+        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }
 
