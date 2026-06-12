@@ -13289,13 +13289,43 @@ fn generate_cohere2moe(
     let mut eos_suppressions = 0usize;
     const MAX_EOS_SUPPRESS: usize = 3;
 
+    // Think-budget force-close (mechanism #2): a heavy reasoner can out-think its
+    // token budget and return reasoning only (it hits max_tokens still inside
+    // <think>). Reserve room for an answer; honor an explicit max_think_tokens
+    // when the client sets one. When thinking reaches the budget with nothing
+    // visible yet, inject <|END_THINKING|> + <|START_TEXT|> so the model closes
+    // thinking and answers within the reserve instead of hitting the cap empty.
+    let think_reserve = (max_tokens / 4).clamp(64, 512).min(max_tokens / 2);
+    let think_budget = if max_think_tokens > 1 {
+        max_think_tokens.min(max_tokens.saturating_sub(think_reserve))
+    } else {
+        max_tokens.saturating_sub(think_reserve)
+    };
+    let mut think_count = 0usize;
+    let mut think_force_closed = false;
+    let mut forced_toks: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
             break;
         }
-        let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if empty_turn_guard && forced_toks.is_empty() && !think_force_closed
+            && !emitted_visible && sec == Sec::Think && think_count >= think_budget
+        {
+            eprintln!(
+                "[cohere2moe] think-budget guard: force-closing thinking at {think_count} think-tok \
+                 (budget {think_budget}, max_tokens {max_tokens}) — forcing an answer"
+            );
+            forced_toks.push_back(mk_think1);
+            forced_toks.push_back(mk_text0);
+            think_force_closed = true;
+        }
+        let mut next_tok = match forced_toks.pop_front() {
+            Some(t) => t,
+            None => deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng),
+        };
         if next_tok == eos_tok {
             if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
                 // Reasoning-only turn in progress — the model is ending after
@@ -13403,6 +13433,7 @@ fn generate_cohere2moe(
                         serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true}),
                     );
                     let _ = stdout.flush();
+                    think_count += 1;
                 }
                 Sec::Text | Sec::Pre => {
                     let _ = writeln!(
