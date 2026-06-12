@@ -8,7 +8,9 @@ use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
-use crate::weight_backend::{flat_name_candidates, reupload_f16_as_f32, HfqBackend, WeightBackend};
+use crate::weight_backend::{
+    flat_name_candidates, resolve_lm_head, reupload_f16_as_f32, HfqBackend, WeightBackend,
+};
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1049,26 +1051,36 @@ impl WeightSource for LlamaHfqSource<'_> {
     fn read_output(
         &mut self,
         gpu: &mut Gpu,
-        _embd: &GpuTensor,
-        _embd_fmt: EmbeddingFormat,
-        _can_alias: bool,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
         let cfg = self.cfg;
-        eprintln!("  loading output...");
-        let output = if self.hfq.find_tensor("lm_head.weight").is_some() {
-            load_weight_tensor(
-                self.hfq,
-                gpu,
-                "lm_head.weight",
-                cfg.vocab_size,
-                cfg.dim,
-                flat_name_candidates,
-            )?
-        } else {
-            let data = self.hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
-            reupload_f16_as_f32(gpu, &data, cfg.vocab_size, cfg.dim)?
-        };
-        Ok((output, false))
+        let hfq = self.hfq;
+        let has_separate = hfq.find_tensor("lm_head.weight").is_some();
+        resolve_lm_head(
+            gpu,
+            has_separate,
+            can_alias,
+            embd,
+            embd_fmt,
+            cfg.vocab_size,
+            cfg.dim,
+            |gpu| {
+                load_weight_tensor(
+                    hfq,
+                    gpu,
+                    "lm_head.weight",
+                    cfg.vocab_size,
+                    cfg.dim,
+                    flat_name_candidates,
+                )
+            },
+            |gpu| {
+                let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
+                reupload_f16_as_f32(gpu, &data, cfg.vocab_size, cfg.dim)
+            },
+        )
     }
 
     fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
