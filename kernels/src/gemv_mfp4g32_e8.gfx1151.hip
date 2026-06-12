@@ -4,13 +4,12 @@
 //
 // ONLY for gfx1151. Other archs use gemv_mfp4g32_e8 (generic).
 //
-// Changes vs generic:
-// 1. e8_decode_index is fully inlined with manual loop unroll to reduce
-//    instruction-level latency and enable wider VALU ILP.
-// 2. Partial e7 reconstruction uses precomputed sl from 4-bit adds.
-// 3. coset check folded into coords with a single sub-1.0 pattern.
+// Variant A: sequential decode-accumulate + 2-way acc interleave.
+// Goal: reduce VGPR from 94 to ~64-72, improving occupancy 5→7 waves/SIMD32.
+// Key change: decode ONE codeword at a time into float p[8] (reuse registers),
+// 2-way acc interleave instead of 4-way.
 //
-// Bit-exact with generic kernel (same math, just unrolled).
+// Bit-exact with original gfx1151 kernel (same math, same __launch_bounds__).
 
 #include <hip/hip_runtime.h>
 
@@ -23,49 +22,27 @@ __device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
     return pow2 * (1.0f + ((float)mant) * 0.125f);
 }
 
-// Fully unrolled E8 decode + dot product.
-// Computes dot(coords, x[base..base+7]) * ssc and adds to acc.
-// Inlined to allow the compiler to schedule the 7 nibble extracts
-// independently of the FMA chain.
-__device__ __forceinline__ void e8_dog_inlined(
-    unsigned int idx, float ssc,
-    const float* __restrict__ x, int base, float& acc)
-{
+// Sequential decode: decode ONE E8 codeword into p[8], then dot-product, then discard.
+// Bit-exact with e8_decode_index in generic kernel.
+__device__ __forceinline__ void e8_decode_index(unsigned int idx, float p[8]) {
     const int coset = (int)((idx >> 31) & 1u);
-
-    // Extract 7 nibbles (4 bits each)
-    const unsigned int n0 = (idx)       & 0xFu;
-    const unsigned int n1 = (idx >>  4) & 0xFu;
-    const unsigned int n2 = (idx >>  8) & 0xFu;
-    const unsigned int n3 = (idx >> 12) & 0xFu;
-    const unsigned int n4 = (idx >> 16) & 0xFu;
-    const unsigned int n5 = (idx >> 20) & 0xFu;
-    const unsigned int n6 = (idx >> 24) & 0xFu;
-    const unsigned int sl = n0 + n1 + n2 + n3 + n4 + n5 + n6;
-
-    // e7: high 3 bits from idx[28..30], lsb from parity
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) {
+        e[i] = (idx >> (unsigned)(4 * i)) & 0xFu;
+        sl += e[i];
+    }
     const unsigned int e7_high = (idx >> 28) & 0x7u;
     const unsigned int p7 = e7_high << 1;
-    const unsigned int n7 = p7 | ((sl + p7) & 1u);
-
-    // Decode: coord = nibble - 7, then offset by +0.5 if coset
-    const float off = coset ? 0.5f : 0.0f;
-    const float c0 = (float)((int)n0 - 7) + off;
-    const float c1 = (float)((int)n1 - 7) + off;
-    const float c2 = (float)((int)n2 - 7) + off;
-    const float c3 = (float)((int)n3 - 7) + off;
-    const float c4 = (float)((int)n4 - 7) + off;
-    const float c5 = (float)((int)n5 - 7) + off;
-    const float c6 = (float)((int)n6 - 7) + off;
-    const float c7 = (float)((int)n7 - 7) + off;
-
-    acc += ssc*c0*x[base]   + ssc*c1*x[base+1]
-         + ssc*c2*x[base+2] + ssc*c3*x[base+3]
-         + ssc*c4*x[base+4] + ssc*c5*x[base+5]
-         + ssc*c6*x[base+6] + ssc*c7*x[base+7];
+    const unsigned int lsb = (sl + p7) & 1u;
+    e[7] = p7 | lsb;
+    for (int i = 0; i < 8; i++) {
+        float c = (float)((int)e[i] - 7);
+        p[i] = coset ? c + 0.5f : c;
+    }
 }
 
-__launch_bounds__(32, 16)
+__launch_bounds__(32, 7)
 extern "C" __global__ void gemv_mfp4g32_e8_gfx1151(
     const char* __restrict__ A,
     const float* __restrict__ x,
@@ -88,57 +65,53 @@ extern "C" __global__ void gemv_mfp4g32_e8_gfx1151(
     const int cw_off = (tid & 3) * 4;
     const int thread_block_off = block_in_iter * 17;
 
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-    const int quads = groups_per_row >> 2;
-    const int tail  = groups_per_row & 3;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const int pairs = groups_per_row >> 1;
+    const int tail  = groups_per_row & 1;
 
-    for (int q = 0; q < quads; q++) {
-        const int g = q << 2;
+    for (int p = 0; p < pairs; p++) {
+        const int g = p << 1;
         const char* gp0 = row_ptr + (long long)g * 136 + thread_block_off;
         const char* gp1 = gp0 + 136;
-        const char* gp2 = gp1 + 136;
-        const char* gp3 = gp2 + 136;
 
         const float ssc0 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp0) * 0.88f;
         const float ssc1 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp1) * 0.88f;
-        const float ssc2 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp2) * 0.88f;
-        const float ssc3 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp3) * 0.88f;
 
         const unsigned int ew0 = *(const unsigned int*)(gp0 + 1 + cw_off);
         const unsigned int ew1 = *(const unsigned int*)(gp1 + 1 + cw_off);
-        const unsigned int ew2 = *(const unsigned int*)(gp2 + 1 + cw_off);
-        const unsigned int ew3 = *(const unsigned int*)(gp3 + 1 + cw_off);
 
+        const int base0 = g * 256 + tid * 8;
+        const int base1 = base0 + 256;
+
+        float pe[8];
+        e8_decode_index(ew0, pe);
+        acc0 += ssc0*pe[0]*x[base0  ] + ssc0*pe[1]*x[base0+1]
+              + ssc0*pe[2]*x[base0+2] + ssc0*pe[3]*x[base0+3]
+              + ssc0*pe[4]*x[base0+4] + ssc0*pe[5]*x[base0+5]
+              + ssc0*pe[6]*x[base0+6] + ssc0*pe[7]*x[base0+7];
+
+        e8_decode_index(ew1, pe);
+        acc1 += ssc1*pe[0]*x[base1  ] + ssc1*pe[1]*x[base1+1]
+              + ssc1*pe[2]*x[base1+2] + ssc1*pe[3]*x[base1+3]
+              + ssc1*pe[4]*x[base1+4] + ssc1*pe[5]*x[base1+5]
+              + ssc1*pe[6]*x[base1+6] + ssc1*pe[7]*x[base1+7];
+    }
+
+    if (tail) {
+        const int g = pairs << 1;
+        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
+        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
         const int base = g * 256 + tid * 8;
-        e8_dog_inlined(ew0, ssc0, x, base,         acc0);
-        e8_dog_inlined(ew1, ssc1, x, base + 256,   acc1);
-        e8_dog_inlined(ew2, ssc2, x, base + 512,   acc2);
-        e8_dog_inlined(ew3, ssc3, x, base + 768,   acc3);
+        float pe[8];
+        e8_decode_index(ew, pe);
+        acc0 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1]
+              + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5]
+              + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
     }
 
-    if (tail >= 1) {
-        const int g = quads << 2;
-        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
-        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
-        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
-        e8_dog_inlined(ew, ssc, x, g * 256 + tid * 8, acc0);
-    }
-    if (tail >= 2) {
-        const int g = (quads << 2) + 1;
-        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
-        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
-        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
-        e8_dog_inlined(ew, ssc, x, g * 256 + tid * 8, acc1);
-    }
-    if (tail >= 3) {
-        const int g = (quads << 2) + 2;
-        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
-        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
-        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
-        e8_dog_inlined(ew, ssc, x, g * 256 + tid * 8, acc2);
-    }
-
-    float acc = (acc0 + acc1) + (acc2 + acc3);
+    float acc = acc0 + acc1;
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
