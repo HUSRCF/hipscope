@@ -24,7 +24,9 @@ pub fn repack_awq_to_hfq4g128(
     group_size: usize, // 128
 ) -> Vec<u8> {
     let groups_per_row = in_dim / group_size;
-    let bytes_per_row = groups_per_row * 72;
+    let bytes_per_group = 8 + group_size / 2;
+    let elements_per_half_group = group_size / 2;
+    let bytes_per_row = groups_per_row * bytes_per_group;
     let mut out = vec![0u8; out_dim * bytes_per_row];
 
     // Parse qweight as &[u32] (LE)
@@ -65,7 +67,7 @@ pub fn repack_awq_to_hfq4g128(
 
     for m in 0..out_dim {
         for g in 0..groups_per_row {
-            let row_off = m * bytes_per_row + g * 72;
+            let row_off = m * bytes_per_row + g * bytes_per_group;
 
             let scale_f16 = sc[g * out_dim + m];
             let scale_f32 = f16_to_f32(scale_f16);
@@ -79,14 +81,13 @@ pub fn repack_awq_to_hfq4g128(
 
             let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
             let qw_col = m / 8;
-            for i in 0..64 {
+            for i in 0..elements_per_half_group {
                 let in_idx0 = g * group_size + i * 2;
                 let in_idx1 = in_idx0 + 1;
 
                 let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
                 let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
 
-                // HFQ4G128: lo nibble = even element, hi nibble = odd element
                 out[row_off + 8 + i] = nib0 | (nib1 << 4);
             }
         }

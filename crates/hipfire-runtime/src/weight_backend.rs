@@ -970,6 +970,8 @@ pub trait WeightBackend {
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor>;
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor>;
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+    /// Load a bias vector (f32). Only qwen2 attention biases use this today.
+    fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1001,6 +1003,15 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         dequant_f32(self.gpu, info.quant_type, &data, n)
+    }
+    fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
+        let name = hfq_plain_name(self.layer, rel);
+        let (info, data) = read_first(self.hfq, &name, self.candidates)
+            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
+        assert_eq!(t.numel(), n,
+            "bias {name} has {} elements, expected {n}", t.numel());
+        Ok(t)
     }
 }
 
@@ -1044,6 +1055,9 @@ impl<'a> WeightBackend for ParoBackend<'a> {
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
+    }
+    fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
+        Err(hip_bridge::HipError::new(0, "ParoBackend: attention biases unsupported"))
     }
 }
 

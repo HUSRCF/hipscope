@@ -7,6 +7,7 @@
 use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
+use crate::weight_backend::{flat_name_candidates, HfqBackend, WeightBackend};
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -621,8 +622,19 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
-fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
-    let (info, data) = hfq.tensor_data(st_name)
+fn load_weight_tensor(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    candidates: fn(&str) -> Vec<String>,
+) -> HipResult<WeightTensor> {
+    let st_name = candidates(name)
+        .into_iter()
+        .find(|c| hfq.find_tensor_info(c).is_some())
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let (info, data) = hfq.tensor_data(&st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
 
     let mut wt = match info.quant_type {
@@ -739,7 +751,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
     // so future widening is a single helper edit, not a scattered
     // per-loader hunt. See dispatch.rs for the allow-list rationale.
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, st_name, k);
+        wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
     }
     Ok(wt)
 }
@@ -814,7 +826,7 @@ pub fn load_weights_hfq(
 
     eprintln!("  loading output...");
     let output = if hfq.find_tensor("lm_head.weight").is_some() {
-        load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
+        load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim, flat_name_candidates)?
     } else {
         // Tied embeddings — reuse token_embd as output weights (F32 for GEMV)
         let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
@@ -828,45 +840,53 @@ pub fn load_weights_hfq(
         WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
     };
 
+    let q_out_dim = config.n_heads * config.head_dim;
+    let kv_dim = config.n_kv_heads * config.head_dim;
     let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
-        eprintln!("  loading layer {i}/{} ...", config.n_layers);
-        let p = format!("model.layers.{i}");
-        let kv_dim = config.n_kv_heads * config.head_dim;
-        let q_out_dim = config.n_heads * config.head_dim;
-
-        let layer = LayerWeights {
-            attn_norm: load_f16_tensor(hfq, gpu,
-                &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-            wq: load_weight_tensor(hfq, gpu,
-                &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-            wk: load_weight_tensor(hfq, gpu,
-                &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-            wv: load_weight_tensor(hfq, gpu,
-                &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-            wo: load_weight_tensor(hfq, gpu,
-                &format!("{p}.self_attn.o_proj.weight"), config.dim, q_out_dim)?,
-            q_norm: if config.has_qk_norm {
-                Some(load_f16_tensor(hfq, gpu,
-                    &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?)
-            } else { None },
-            k_norm: if config.has_qk_norm {
-                Some(load_f16_tensor(hfq, gpu,
-                    &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?)
-            } else { None },
-            ffn_norm: load_f16_tensor(hfq, gpu,
-                &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-            w_gate: load_weight_tensor(hfq, gpu,
-                &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-            w_up: load_weight_tensor(hfq, gpu,
-                &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-            w_down: load_weight_tensor(hfq, gpu,
-                &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+    {
+        let mut b = HfqBackend {
+            hfq, gpu, norm_bias: 0.0,
+            candidates: flat_name_candidates,
+            read_proj: load_weight_tensor,
+            layer: 0,
         };
-        layers.push(layer);
+        for i in 0..config.n_layers {
+            eprintln!("  loading layer {i}/{} ...", config.n_layers);
+            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
+        }
     }
 
     Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
+}
+
+/// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
+/// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
+/// exact dims it already computes.
+pub(crate) fn load_layer<B: WeightBackend>(
+    b: &mut B,
+    config: &crate::llama::LlamaConfig,
+    q_out_dim: usize,
+    kv_dim: usize,
+    i: usize,
+) -> HipResult<LayerWeights> {
+    b.set_layer(i);
+    Ok(LayerWeights {
+        attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
+        wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
+        wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
+        wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
+        wo: b.proj("self_attn.o_proj", config.dim, q_out_dim)?,
+        q_norm: if config.has_qk_norm {
+            Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?)
+        } else { None },
+        k_norm: if config.has_qk_norm {
+            Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?)
+        } else { None },
+        ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
+        w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
+        w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
+        w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
+    })
 }
 
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
@@ -940,7 +960,9 @@ fn repack_awq_to_hfq4g128(
     group_size: usize, // 128
 ) -> Vec<u8> {
     let groups_per_row = in_dim / group_size;
-    let bytes_per_row = groups_per_row * 72;
+    let bytes_per_group = 8 + group_size / 2;
+    let elements_per_half_group = group_size / 2;
+    let bytes_per_row = groups_per_row * bytes_per_group;
     let mut out = vec![0u8; out_dim * bytes_per_row];
 
     debug_assert_eq!(qweight.as_ptr() as usize % 4, 0, "AWQ qweight not 4-byte aligned");
@@ -962,7 +984,7 @@ fn repack_awq_to_hfq4g128(
 
     for m in 0..out_dim {
         for g in 0..groups_per_row {
-            let row_off = m * bytes_per_row + g * 72;
+            let row_off = m * bytes_per_row + g * bytes_per_group;
 
             let scale_f16 = sc[g * out_dim + m];
             let scale_f32 = f16_to_f32(scale_f16);
@@ -977,7 +999,7 @@ fn repack_awq_to_hfq4g128(
             const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
             let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
             let qw_col = m / 8;
-            for i in 0..64 {
+            for i in 0..elements_per_half_group {
                 let in_idx0 = g * group_size + i * 2;
                 let in_idx1 = in_idx0 + 1;
 
@@ -1071,24 +1093,6 @@ fn load_fp16_weight_tensor_from_source(
     Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
 }
 
-/// Load a ParoQuant weight (quantized or FP16 fallback) using `model.` tensor prefix.
-fn paro_load_llama_wt(
-    source: &dyn crate::model_source::ModelSource,
-    gpu: &Gpu,
-    prefix: &str, // e.g. "layers.0.self_attn.q_proj"
-    m: usize,
-    k: usize,
-    gs: u32,
-    kr: u8,
-) -> HipResult<WeightTensor> {
-    let fp = format!("model.{prefix}");
-    if source.tensor_info(&format!("{fp}.qweight")).is_some() {
-        load_paroquant_weight_from_source(source, gpu, &fp, m, k, gs, kr)
-    } else {
-        load_fp16_weight_tensor_from_source(source, gpu, &format!("{fp}.weight"), m, k)
-    }
-}
-
 /// Load an F16 norm weight as F32 on GPU (raw, no +1.0 bias — HF convention).
 fn paro_load_llama_norm_raw(
     source: &dyn crate::model_source::ModelSource,
@@ -1107,9 +1111,6 @@ fn paro_load_llama_norm_raw(
     gpu.upload_f32(&v, shape)
 }
 
-// @todo(unified-loading): llama PARO still has its own loader; qwen35 already
-// runs through layer_driver::load_layer + WeightBackend. Migrate llama onto the
-// same generic walk (the trait is arch-agnostic via norm_bias + candidates).
 /// Load LLaMA/Qwen3 weights from a ParoQuant safetensors model.
 ///
 /// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
@@ -1160,50 +1161,21 @@ pub fn load_weights_paroquant_llama(
         WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
     };
 
-    // Layers
+    // Layers — shared `load_layer` walk
+    let q_out_dim = config.n_heads * config.head_dim;
+    let kv_dim = config.n_kv_heads * config.head_dim;
     let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
-        eprintln!("  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...", config.n_layers);
-        let p = format!("layers.{i}");
-        let q_out_dim = config.n_heads * config.head_dim;
-        let kv_dim = config.n_kv_heads * config.head_dim;
-
-        let q_norm = if config.has_qk_norm {
-            Some(paro_load_llama_norm_raw(source, gpu,
-                &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?)
-        } else {
-            None
+    {
+        let mut b = crate::weight_backend::ParoBackend {
+            source, gpu,
+            mp: "model",
+            layer: 0,
+            norm_bias: 0.0,
         };
-        let k_norm = if config.has_qk_norm {
-            Some(paro_load_llama_norm_raw(source, gpu,
-                &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?)
-        } else {
-            None
-        };
-
-        let layer = LayerWeights {
-            attn_norm: paro_load_llama_norm_raw(source, gpu,
-                &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-            wq: paro_load_llama_wt(source, gpu,
-                &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
-            wk: paro_load_llama_wt(source, gpu,
-                &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
-            wv: paro_load_llama_wt(source, gpu,
-                &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
-            wo: paro_load_llama_wt(source, gpu,
-                &format!("{p}.self_attn.o_proj"), config.dim, q_out_dim, gs, kr)?,
-            q_norm,
-            k_norm,
-            ffn_norm: paro_load_llama_norm_raw(source, gpu,
-                &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-            w_gate: paro_load_llama_wt(source, gpu,
-                &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
-            w_up: paro_load_llama_wt(source, gpu,
-                &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
-            w_down: paro_load_llama_wt(source, gpu,
-                &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
-        };
-        layers.push(layer);
+        for i in 0..config.n_layers {
+            eprintln!("  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...", config.n_layers);
+            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
+        }
     }
 
     Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })

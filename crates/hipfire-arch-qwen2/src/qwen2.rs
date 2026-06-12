@@ -31,7 +31,8 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, load_embedding,
+    dequant_f32, dequant_norm, dequant_weight_raw, embedding_format_dtype, flat_name_candidates,
+    HfqBackend, load_embedding, WeightBackend,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -343,7 +344,7 @@ fn load_lm_head(
         };
         Ok((wt, true))
     } else {
-        let wt = load_weight_tensor(hfq, gpu, "lm_head.weight", cfg.vocab_size, cfg.hidden_size)?;
+        let wt = load_weight_tensor(hfq, gpu, "lm_head.weight", cfg.vocab_size, cfg.hidden_size, flat_name_candidates)?;
         Ok((wt, false))
     }
 }
@@ -354,31 +355,29 @@ fn load_layer(
     cfg: &Qwen2Config,
     i: usize,
 ) -> HipResult<Qwen2LayerWeights> {
-    let p = format!("model.layers.{i}");
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    let attn_norm = load_norm_weight_raw(hfq, gpu, &format!("{p}.input_layernorm.weight"), cfg.hidden_size)?;
-
-    let wq = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, cfg.hidden_size)?;
-    let wq_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
-    let wk = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wk_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
-    let wv = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wv_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
-    let wo = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), cfg.hidden_size, q_dim)?;
-
-    let ffn_norm = load_norm_weight_raw(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), cfg.hidden_size)?;
-
-    let w_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_up = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_down = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), cfg.hidden_size, cfg.intermediate_size)?;
+    let mut b = HfqBackend {
+        hfq, gpu, norm_bias: 0.0,
+        candidates: flat_name_candidates,
+        read_proj: load_weight_tensor,
+        layer: i,
+    };
 
     Ok(Qwen2LayerWeights {
-        attn_norm,
-        wq, wq_bias, wk, wk_bias, wv, wv_bias, wo,
-        ffn_norm,
-        w_gate, w_up, w_down,
+        attn_norm: b.norm("input_layernorm.weight", &[cfg.hidden_size])?,
+        wq:      b.proj("self_attn.q_proj", q_dim, cfg.hidden_size)?,
+        wq_bias: b.bias("self_attn.q_proj.bias", q_dim)?,
+        wk:      b.proj("self_attn.k_proj", kv_dim, cfg.hidden_size)?,
+        wk_bias: b.bias("self_attn.k_proj.bias", kv_dim)?,
+        wv:      b.proj("self_attn.v_proj", kv_dim, cfg.hidden_size)?,
+        wv_bias: b.bias("self_attn.v_proj.bias", kv_dim)?,
+        wo:      b.proj("self_attn.o_proj", cfg.hidden_size, q_dim)?,
+        ffn_norm: b.norm("post_attention_layernorm.weight", &[cfg.hidden_size])?,
+        w_gate:  b.proj("mlp.gate_proj", cfg.intermediate_size, cfg.hidden_size)?,
+        w_up:    b.proj("mlp.up_proj", cfg.intermediate_size, cfg.hidden_size)?,
+        w_down:  b.proj("mlp.down_proj", cfg.hidden_size, cfg.intermediate_size)?,
     })
 }
 
@@ -402,25 +401,6 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
     Ok(t)
 }
 
-/// Load a bias tensor (Q/K/V projection bias) as F32 on GPU.
-///
-/// TODO(transformer-extraction): qwen35 has no equivalent because Qwen3
-/// uses `attention_bias=false` — qwen35's QKV linears have no bias. This
-/// helper is unique to Qwen2-family arches (Qwen2 + dots.ocr's Qwen2
-/// backbone). When the Transformer-extraction PR lands, this can live
-/// next to `load_norm_weight` as a sibling F32-uploader keyed by tensor
-/// element count.
-fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    let t = dequant_f32(gpu, info.quant_type, &data, n)?;
-    // Length assert as a cheap guard against config/tensor mismatch
-    // (dequant_f32 does not assert n).
-    assert_eq!(t.numel(), n,
-        "qwen2: bias {name} has {} elements, expected {n}", t.numel());
-    Ok(t)
-}
-
 /// TODO(transformer-extraction): duplicates `load_weight_tensor` +
 /// `load_weight_tensor_raw` in `hipfire-arch-qwen35::qwen35`. The qwen35
 /// version handles ~14 quant_types; this rev-1 starter only covers the
@@ -433,10 +413,14 @@ fn load_weight_tensor(
     name: &str,
     m: usize,
     k: usize,
+    candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    dequant_weight_raw(gpu, info.quant_type, &data, m, k)
+    for cand in candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
+            return dequant_weight_raw(gpu, info.quant_type, &data, m, k);
+        }
+    }
+    panic!("qwen2: tensor not found: {name}");
 }
 
 // ─── State ───────────────────────────────────────────────────────────────
