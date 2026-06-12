@@ -1611,6 +1611,84 @@ fn dequant_mfp4g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
     out
 }
 
+/// Convert an AoS-packed mfp4-E8 row to SoA layout.
+/// AoS layout: [16B hdr] + n_blocks * [1B E4M3 scale + 16B codewords]
+/// SoA layout: [16B hdr] + [n_blocks B scales, pad to 16B] + [n_blocks * 16B codewords]
+/// The header is the same except byte[6] (flag) is set to 0x06 (was 0x05).
+fn aos_to_soa_row(aos: &[u8], n_blocks: usize) -> Vec<u8> {
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_len = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; soa_len];
+    // Copy header, change flag byte
+    out[..16].copy_from_slice(&aos[..16]);
+    out[6] = 0x06; // SoA flag
+    // Gather scales
+    for b in 0..n_blocks {
+        out[16 + b] = aos[16 + b * 17]; // scale byte at start of each 17B AoS block
+    }
+    // Gather codewords (4 x u32 = 16B per block)
+    let cw_start = 16 + scale_padded;
+    for b in 0..n_blocks {
+        let src = 16 + b * 17 + 1; // skip the 1B scale
+        let dst = cw_start + b * 16;
+        out[dst..dst + 16].copy_from_slice(&aos[src..src + 16]);
+    }
+    out
+}
+
+/// mfp4-E8 SoA quantizer: same E8 encoding as quantize_mfp4g32_e8_2d, then permuted to SoA.
+fn quantize_mfp4g32_e8_soa_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k);
+    assert!(k % 256 == 0, "mfp4-E8-SoA requires k%256==0, got k={}", k);
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    let mut out = Vec::with_capacity(m * soa_row_bytes);
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        let aos_row = quantize_mfp4g32_e8_row(&row_buf);
+        out.extend_from_slice(&aos_to_soa_row(&aos_row, n_blocks));
+    }
+    out
+}
+
+/// CPU reference dequant for mfp4-E8 SoA. Returns row-major f32 [m*k] in ROTATED domain.
+/// Bit-exact with dequant_mfp4g32_e8 for the same weight data.
+#[allow(dead_code)]
+fn dequant_mfp4g32_e8_soa(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    assert_eq!(packed.len(), m * soa_row_bytes, "mfp4-E8-SoA size mismatch");
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = r * soa_row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+        let scale_arr = &packed[base + 16..base + 16 + n_blocks];
+        let cw_arr    = &packed[base + 16 + scale_padded..base + 16 + scale_padded + n_blocks * 16];
+        for b in 0..n_blocks {
+            let scale = row_scale_a * e4m3_scale_decode(scale_arr[b]);
+            for g in 0..4 {
+                let co = b * 16 + g * 4;
+                let idx = u32::from_le_bytes([
+                    cw_arr[co], cw_arr[co + 1], cw_arr[co + 2], cw_arr[co + 3],
+                ]);
+                let vd = e8::dequantize8(idx, e8::QUANT_STEP);
+                for i in 0..8 {
+                    out[r * k + b * 32 + g * 8 + i] = scale * vd[i];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Fit ONE 16-entry fp16 Lloyd-Max codebook over ALL normalized values of a
 /// FWHT-rotated tensor, in the same ~[-6,6] domain that feeds e2m1_round in
 /// mfp4. `vals` are pre-collected: for every element, value*inv_row_scale*
@@ -3791,6 +3869,8 @@ enum QuantType {
     MFP4G32E8 = 34,    // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
                        // with the 32 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
                        // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
+    MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
+                       // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -3834,6 +3914,7 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4Lloyd => GgufFormat::Mfp4Lloyd,
         GgufFormat::Mfp4P => GgufFormat::Mfp4P,
         GgufFormat::Mfp4E8 => GgufFormat::Mfp4E8,
+        GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
     }
 }
 
@@ -4950,6 +5031,7 @@ enum GgufFormat {
     Mfp4Lloyd, // mfp4 + per-tensor 16-entry Lloyd codebook
     Mfp4P, // mfp4+P — mfp4 with E4M3 (non-power-of-2) per-block scale
     Mfp4E8, // mfp4-E8 — mfp4+P container with E8-lattice vector quantization (4 codewords/32 weights)
+    Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
 }
 
 impl GgufFormat {
@@ -4970,6 +5052,7 @@ impl GgufFormat {
             "mfp4l" | "mfp4-lloyd" | "mfp4g32-lloyd" | "mfp4lloyd" => Some(Self::Mfp4Lloyd),
             "mfp4p" | "mfp4+p" | "mfp4-p" => Some(Self::Mfp4P),
             "mfp4e8" | "mfp4-e8" | "mfp4l8" => Some(Self::Mfp4E8),
+            "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
             _ => None,
         }
     }
@@ -4991,6 +5074,7 @@ impl GgufFormat {
             Self::Mfp4Lloyd => "MFP4G32Lloyd",
             Self::Mfp4P => "MFP4G32P",
             Self::Mfp4E8 => "MFP4G32E8",
+            Self::Mfp4E8Soa => "MFP4G32E8SOA",
         }
     }
 }
@@ -5227,6 +5311,12 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
+                GgufFormat::Mfp4E8Soa => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                }
                 // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
                 // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
                 // as the Base arm below; just dispatched via the promote target.
@@ -5339,6 +5429,11 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
+                GgufFormat::Mfp4E8Soa => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -5414,6 +5509,12 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                }
+                GgufFormat::Mfp4E8Soa => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
             }
         } else {
@@ -5929,6 +6030,7 @@ fn main() {
     let use_gptq_e8 = format == "mfp4e8-gptq" || format == "mfp4-e8-gptq";
     let use_mfp4e8 = format == "mfp4e8" || format == "mfp4-e8" || format == "mfp4l8"
         || use_gptq_e8;
+    let use_mfp4e8soa = format == "mfp4e8soa" || format == "mfp4-e8-soa" || format == "mfp4e8-soa";
     // GPTQ-E8 Hessian directory: per-(tensor,expert) 256-block XX^T captured by
     // the collect_e8_hessian binary. Missing/degenerate Hessians silently fall
     // back to RTN per-block (never worse than baseline). REQUIRED when --format
@@ -7356,6 +7458,9 @@ fn main() {
                             quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
                         };
                         (q, QuantType::MFP4G32E8, 32u32)
+                    } else if use_mfp4e8soa && supports_g256 {
+                        let q = quantize_mfp4g32_e8_soa_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8SOA, 32u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -7429,6 +7534,8 @@ fn main() {
                 "MFP4G32P"
             } else if use_mfp4e8 && supports_g256 {
                 "MFP4G32E8"
+            } else if use_mfp4e8soa && supports_g256 {
+                "MFP4G32E8SOA"
             } else if supports_g256 {
                 "MQ4G256"
             } else {
@@ -7833,6 +7940,15 @@ fn main() {
                                 let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                                 (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                             }
+                            GgufFormat::Mfp4E8Soa => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                            }
                             GgufFormat::Hfp4 => {
                                 let m = if meta.shape.len() == 2 {
                                     meta.shape[0]
@@ -8109,8 +8225,8 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp4e8 && is_embed {
-                        // mfp4-E8 embeddings stay Q8F16 (same rationale as mfp4+P / mfp4 / mfp4L).
+                    } else if (use_mfp4e8 || use_mfp4e8soa) && is_embed {
+                        // mfp4-E8 / mfp4-E8-SoA embeddings stay Q8F16.
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mfp4e8 {
@@ -8146,6 +8262,23 @@ fn main() {
                             (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                         } else {
                             // Ragged dim fallback — matches mfp4+P (HFQ4-G128, no rotation).
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp4e8soa {
+                        // mfp4-E8-SoA: same E8 encoding permuted to SoA layout for coalesced GEMV.
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                        } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }

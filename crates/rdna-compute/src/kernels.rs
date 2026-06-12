@@ -1037,6 +1037,14 @@ pub const GEMV_MFP4G32_E8_SRC: &str =
 /// ONLY dispatched on gfx1151 (Strix Halo); all other archs use GEMV_MFP4G32_E8_SRC.
 pub const GEMV_MFP4G32_E8_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8.gfx1151.hip");
+/// mfp4-E8 SoA GEMV — generic fallback for non-gfx1151 arches.
+/// Reads the SoA layout (flag=0x06); bit-exact output vs AoS.
+pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.hip");
+/// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
+/// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
+pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

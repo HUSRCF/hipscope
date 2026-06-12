@@ -3139,6 +3139,89 @@ impl Gpu {
         self.gemv_mfp4g32_e8(a_raw, x_rot, y, m, k)
     }
 
+    /// mfp4-E8 SoA GEMV. Same E8 data as AoS but in structure-of-arrays layout
+    /// (flag=0x06) for fully-coalesced codeword reads on gfx1151.
+    /// x must already be FWHT-rotated. Output is bit-exact with gemv_mfp4g32_e8.
+    pub fn gemv_mfp4g32_e8_soa(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}");
+
+        if self.arch_caps.is_gfx1151() {
+            self.ensure_kernel(
+                "gemv_mfp4g32_e8_soa_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GFX1151_SRC,
+                "gemv_mfp4g32_e8_soa_gfx1151",
+            )?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            return unsafe {
+                self.hip.launch_kernel(
+                    &self.functions["gemv_mfp4g32_e8_soa_gfx1151"],
+                    [m as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        // Generic fallback for non-gfx1151
+        self.ensure_kernel("gemv_mfp4g32_e8_soa", kernels::GEMV_MFP4G32_E8_SOA_SRC, "gemv_mfp4g32_e8_soa")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_e8_soa"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4-E8 SoA prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_e8_soa_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_e8_soa(a_raw, x_rot, y, m, k)
+    }
+
     /// Fused FWHT rotation + FP8 pack for the decode FP8 path.
     /// Writes both F32 (into `x_rot`) and FP8 (into `mq_x_rot_fp8`
     /// sibling scratch) in one kernel launch. Returns the FP8 buffer's

@@ -411,6 +411,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMfp4G32Lloyd | K::GemvMfp4G32LloydPrerotated => hip!(gpu.gemv_mfp4g32_lloyd(w.buf, x, y, m, k)),
         K::GemvMfp4G32P | K::GemvMfp4G32PPrerotated => hip!(gpu.gemv_mfp4g32_p(w.buf, x, y, m, k)),
         K::GemvMfp4G32E8 | K::GemvMfp4G32E8Prerotated => hip!(gpu.gemv_mfp4g32_e8(w.buf, x, y, m, k)),
+        K::GemvMfp4G32E8Soa | K::GemvMfp4G32E8SoaPrerotated => hip!(gpu.gemv_mfp4g32_e8_soa(w.buf, x, y, m, k)),
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }

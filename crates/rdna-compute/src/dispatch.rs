@@ -173,6 +173,11 @@ pub enum DType {
     MFP4G32E8, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
     // with the per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
     // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, byte-IDENTICAL footprint to MFP4G32P.
+    MFP4G32E8SOA, // mfp4-E8 SoA: same E8 data as MFP4G32E8 permuted for coalesced reads.
+    // Per-row: [16B hdr: row_scale_a:f16@0, n_blocks:u16@4, flag:0x06@6]
+    //   + [n_blocks B: E4M3 scales, pad to 16B boundary]
+    //   + [n_blocks*16 B: 4xu32 E8 codewords/block, 16B-aligned].
+    // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -216,6 +221,7 @@ impl DType {
             | DType::MFP4G32Lloyd
             | DType::MFP4G32P
             | DType::MFP4G32E8
+            | DType::MFP4G32E8SOA
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }

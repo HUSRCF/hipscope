@@ -1615,6 +1615,20 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        35 => {
+            // MFP4G32E8SOA lm_head: mfp4-E8 SoA layout for coalesced GEMV.
+            assert!(k % 256 == 0, "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8SOA,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -2855,6 +2869,68 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                         ]);
                         for i in 0..8usize {
                             out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode(idx, i);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        35 => {
+            // MFP4G32E8SOA (qt 35): same E8 data as qt 34 but in SoA layout.
+            // Per-row: [16B hdr] + [n_blocks bytes E4M3 scales, pad16] + [n_blocks*16 bytes codewords].
+            #[inline]
+            fn e4m3_e8_soa(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            #[inline]
+            fn e8_decode_soa(idx: u32, coord: usize) -> f32 {
+                let coset = (idx >> 31) & 1;
+                let e: u32;
+                if coord < 7 {
+                    e = (idx >> (4 * coord as u32)) & 0xF;
+                } else {
+                    let mut sl: u32 = 0;
+                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    let e7h = (idx >> 28) & 0x7;
+                    let p7 = e7h << 1;
+                    let lsb = (sl + p7) & 1;
+                    e = p7 | lsb;
+                }
+                let c = (e as i32 - 7) as f32;
+                if coset == 1 { c + 0.5 } else { c }
+            }
+            const QUANT_STEP_SOA: f32 = 0.88;
+            // Decode assuming n = k_row; figure out m_rows from total bytes.
+            // n_blocks = n/32; scale_padded = ceil(n_blocks/16)*16
+            let n_blocks = n / 32;
+            let scale_padded = ((n_blocks + 15) >> 4) << 4;
+            let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+            let m_rows = if soa_row_bytes > 0 { data.len() / soa_row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks2 = k_row / 32;
+            let scale_padded2 = ((n_blocks2 + 15) >> 4) << 4;
+            let row_bytes2 = 16 + scale_padded2 + n_blocks2 * 16;
+            for r in 0..m_rows {
+                let base = r * row_bytes2;
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let scale_arr = &data[base + 16..base + 16 + n_blocks2];
+                let cw_arr    = &data[base + 16 + scale_padded2..base + 16 + scale_padded2 + n_blocks2 * 16];
+                for b in 0..n_blocks2 {
+                    let scale = row_scale_a * e4m3_e8_soa(scale_arr[b]) * QUANT_STEP_SOA;
+                    for g in 0..4usize {
+                        let co = b * 16 + g * 4;
+                        let idx = u32::from_le_bytes([
+                            cw_arr[co], cw_arr[co + 1], cw_arr[co + 2], cw_arr[co + 3],
+                        ]);
+                        for i in 0..8usize {
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode_soa(idx, i);
                         }
                     }
                 }

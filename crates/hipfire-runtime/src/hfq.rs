@@ -737,6 +737,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        35 => { // MFP4G32E8SOA — mfp4-E8 SoA: same E8 data as qt=34 but in SoA layout.
+                // Per-row: [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
+            assert!(k % 256 == 0, "MFP4G32E8SOA weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8SOA, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         31 => { // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
                 // AWQ sidecar attached centrally below via supports_awq_sidecar().
             let buf = gpu.upload_raw(data, &[data.len()])?;
