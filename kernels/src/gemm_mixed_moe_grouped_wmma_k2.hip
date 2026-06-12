@@ -110,14 +110,18 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
 
                 const unsigned char* wa = (const unsigned char*)(gp + 8 + kt * 12);
                 const unsigned char* wb = (const unsigned char*)(gp + 8 + (kt + 1) * 12);
+                // a3/c3 use only bits 0..23 (3 bytes); a `*(uint*)(w+9)` fetches a
+                // 4th byte at w+12 that is 1 B past the group on the last tile of
+                // the last group → GPU VM read fault on tightly-packed graded
+                // buffers. Read exactly 3 bytes (bit-identical).
                 unsigned int a0 = *(const unsigned int*)(wa);
                 unsigned int a1 = *(const unsigned int*)(wa + 3);
                 unsigned int a2 = *(const unsigned int*)(wa + 6);
-                unsigned int a3 = *(const unsigned int*)(wa + 9);
+                unsigned int a3 = (unsigned int)wa[9] | ((unsigned int)wa[10] << 8) | ((unsigned int)wa[11] << 16);
                 unsigned int c0 = *(const unsigned int*)(wb);
                 unsigned int c1 = *(const unsigned int*)(wb + 3);
                 unsigned int c2 = *(const unsigned int*)(wb + 6);
-                unsigned int c3 = *(const unsigned int*)(wb + 9);
+                unsigned int c3 = (unsigned int)wb[9] | ((unsigned int)wb[10] << 8) | ((unsigned int)wb[11] << 16);
 
                 half16_t b_a, b_b;
                 if (xg != nullptr) {
