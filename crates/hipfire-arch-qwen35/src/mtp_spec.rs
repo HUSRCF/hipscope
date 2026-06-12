@@ -1619,6 +1619,7 @@ pub fn spec_step_mtp(
         // happens when EOS hits with accept_count==0 AND bonus==eos
         // (very rare), or when the bonus was committed alone (also implies
         // accept_count==0, which is the common AR-degraded case).
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             trunk_weights,
@@ -2009,6 +2010,7 @@ pub fn spec_step_mtp_compressed(
             None,
         )?;
     } else {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             trunk_weights,
@@ -2970,6 +2972,7 @@ pub fn spec_step_mtp_compressed_serial(
                     None,
                 )?;
             } else {
+                gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
                 qwen35::forward_scratch(
                     gpu,
                     trunk_weights,

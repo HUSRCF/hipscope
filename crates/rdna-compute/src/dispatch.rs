@@ -583,8 +583,10 @@ impl Gpu {
                 capture_blobs: Vec::new(),
                 graph_exec: None,
                 captured_graph: None,
+                ar_forward_blobs: Vec::new(),
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
+                ar_graph_eligible: true,
                 verify: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),

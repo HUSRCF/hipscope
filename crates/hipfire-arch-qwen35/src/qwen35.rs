@@ -5720,7 +5720,18 @@ pub fn forward_scratch(
     static AR_GRAPH_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ar_graph_test = *AR_GRAPH_TEST
         .get_or_init(|| std::env::var("HIPFIRE_AR_GRAPH").ok().as_deref() == Some("1"));
-    let use_graph = ar_graph_test && graph_enabled;
+    // AR-forward hipGraph eligibility. Plain sequential single-token AR decode
+    // is eligible BY DEFAULT (the consume below resets to true); spec-decode /
+    // MTP re-seed and the verify/prefill batch path explicitly set this FALSE
+    // right before their `forward_scratch` call so the plain-AR graph can never
+    // capture or replay in a non-sequential context. An ineligible call also
+    // INVALIDATES any captured graph (forces re-capture on the next plain call).
+    let graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    if ar_graph_test && !graph_eligible {
+        gpu.graphs.ar_forward_replay_enabled = false;
+        gpu.graphs.ar_forward_kernel_dirty = true;
+    }
+    let use_graph = ar_graph_test && graph_enabled && graph_eligible;
     let _ = (allow_moe, gpu.graphs.ar_forward_replay_enabled); // suppress unused warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -5742,8 +5753,11 @@ pub fn forward_scratch(
 
     let pos_i32 = pos as i32;
     if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
-        // ── Replay path: caller has signalled end_decode_turn() since the
-        // last capture AND kernels are not dirty. Cheapest path. ──
+        // ── Replay path: graph captured + kernels clean. Cheapest path: pos
+        // memcpy + graph replay. The graph is position-agnostic (pos via
+        // pos_buf), so replay is correct across positions and requests as long
+        // as the buffers are the plain-AR continuation — which the spec markers
+        // + verify invalidation guarantee. ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
@@ -6715,6 +6729,17 @@ pub fn forward_prefill_batch_with_pbs_opts(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
 ) -> HipResult<()> {
+    // Plain single-token AR decode? Only then is the per-token `forward_scratch`
+    // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
+    // marker (tree_verify / gdn_tape / per-token-hidden extraction / hidden ring)
+    // or a multi-token batch means this is prefill or a spec/MTP verify forward,
+    // which must NOT replay the plain-AR graph. See `forward_scratch`'s
+    // `ar_graph_eligible` one-shot signal.
+    let plain_ar_graph_eligible = tree_verify.is_none()
+        && gdn_tape.is_none()
+        && per_token_hidden_out.is_none()
+        && hidden_rb.is_none()
+        && tokens.len() == 1;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
     //
@@ -6876,6 +6901,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
                     rb,
                 )?;
             } else {
+                // One-shot: mark this forward AR-graph-eligible iff it's plain
+                // single-token decode (consumed inside forward_scratch).
+                gpu.graphs.ar_graph_eligible = plain_ar_graph_eligible;
                 forward_scratch(
                     gpu,
                     weights,

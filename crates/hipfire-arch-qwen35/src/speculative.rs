@@ -661,6 +661,7 @@ impl ModelSlot {
 
     /// Single-token forward pass. Writes logits into `self.scratch.logits`.
     pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             &self.weights,
