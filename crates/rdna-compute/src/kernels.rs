@@ -1033,6 +1033,10 @@ pub const GEMV_MFP4G32_P_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_p.hip");
 pub const GEMV_MFP4G32_E8_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8.hip");
+/// gfx1151-specific mfp4-E8 GEMV with coalesced LDS-staged group loads.
+/// ONLY dispatched on gfx1151 (Strix Halo); all other archs use GEMV_MFP4G32_E8_SRC.
+pub const GEMV_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

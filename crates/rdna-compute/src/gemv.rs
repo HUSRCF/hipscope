@@ -2259,7 +2259,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             "rotate_with_rms_gfx942",
             [groups, batch_size as u32, 1],
-            [64, 1, 1],
+            [128, 1, 1],
             0,
             &mut params_b,
             || {
@@ -3066,11 +3066,42 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(k % 256 == 0, "gemv_mfp4g32_e8 requires K%256==0, got K={k}");
-        self.ensure_kernel(
-            "gemv_mfp4g32_e8",
-            kernels::GEMV_MFP4G32_E8_SRC,
-            "gemv_mfp4g32_e8",
-        )?;
+
+        // gfx1151 (Strix Halo): 2-rows-per-block variant for better occupancy.
+        // 2 wave32 subgroups per block hide LPDDR5X latency better than 1 wave/block.
+        // All other archs use the generic kernel (1 row/block, 32 threads) unchanged.
+        if self.arch_caps.is_gfx1151() {
+            self.ensure_kernel(
+                "gemv_mfp4g32_e8_gfx1151",
+                kernels::GEMV_MFP4G32_E8_GFX1151_SRC,
+                "gemv_mfp4g32_e8_gfx1151",
+            )?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            let grid_x = m as u32;
+            return unsafe {
+                self.hip.launch_kernel(
+                    &self.functions["gemv_mfp4g32_e8_gfx1151"],
+                    [grid_x, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        self.ensure_kernel("gemv_mfp4g32_e8", kernels::GEMV_MFP4G32_E8_SRC, "gemv_mfp4g32_e8")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -3666,7 +3697,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [grid, 1, 1],
-                    [64, 1, 1],
+                    [32, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -3741,7 +3772,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [grid, 1, 1],
-                    [64, 1, 1],
+                    [32, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4047,7 +4078,7 @@ impl Gpu {
             self.launch_maybe_blob(
                 "gemv_hfq4g256_wide",
                 [grid, 1, 1],
-                [64, 1, 1],
+                [32, 1, 1],
                 0,
                 &mut params,
                 blob_builder,
@@ -4187,7 +4218,7 @@ impl Gpu {
                 };
                 self.ensure_kernel(kname, ksrc, kname)?;
                 let grid = ((m as u32) + 1) / 2;
-                self.launch_maybe_blob(kname, [grid, 1, 1], [64, 1, 1], 0, &mut params, || {
+                self.launch_maybe_blob(kname, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(a_ptr);
                     b.push_ptr(x_ptr);
@@ -5410,7 +5441,7 @@ impl Gpu {
             )?;
             (
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
-                [64, 1, 1],
+                [32, 1, 1],
                 2,
             )
         } else {
@@ -5503,7 +5534,7 @@ impl Gpu {
             )?;
             (
                 "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
-                [64, 1, 1],
+                [32, 1, 1],
                 2,
             )
         } else {
