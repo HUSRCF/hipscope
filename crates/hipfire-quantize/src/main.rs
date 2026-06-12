@@ -13,6 +13,7 @@
 
 mod gguf_input;
 mod e8;
+mod e8_gptq;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -1477,6 +1478,84 @@ fn quantize_mfp4g32_e8_row(row: &[f32]) -> Vec<u8> {
 
 /// mfp4-E8 2D: FWHT-rotate the tensor (same signs as mfp4+P), then per-row
 /// quantize_mfp4g32_e8_row. Byte layout identical to mfp4+P (NO prefix).
+/// On-disk per-256-block Hessian magic ("E8H1").
+const E8_HESSIAN_MAGIC: u32 = 0x45_38_48_31;
+
+/// Sanitize a full safetensors tensor name into a filesystem-safe key.
+fn hessian_key(tensor_name: &str) -> String {
+    tensor_name.replace(['/', '\\'], "_").replace("..", "_")
+}
+
+/// Read per-256-block Hessians for one tensor from `<dir>/<key>.hblk`.
+/// File layout: [u32 magic][u32 n_blocks][u32 k][f32 ... n_blocks*256*256].
+/// Returns empty Vec if the file is missing (-> caller falls back to RTN).
+fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq::HBlock> {
+    let path = dir.join(format!("{}.hblk", hessian_key(tensor_name)));
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    if bytes.len() < 12 {
+        return Vec::new();
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic != E8_HESSIAN_MAGIC {
+        eprintln!("warning: {} bad Hessian magic; ignoring", path.display());
+        return Vec::new();
+    }
+    let n_blocks = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let want = 12 + n_blocks * 256 * 256 * 4;
+    if bytes.len() < want {
+        eprintln!(
+            "warning: {} truncated Hessian ({} < {}); ignoring",
+            path.display(),
+            bytes.len(),
+            want
+        );
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n_blocks);
+    let mut off = 12usize;
+    for _ in 0..n_blocks {
+        let mut blk = vec![0.0f32; 256 * 256];
+        for v in blk.iter_mut() {
+            *v = f32::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+            ]);
+            off += 4;
+        }
+        out.push(blk);
+    }
+    out
+}
+
+/// GPTQ-E8 wrapper that wires the production helpers into the e8_gptq module.
+/// `h_blocks` empty -> RTN fallback (byte-identical to quantize_mfp4g32_e8_2d).
+fn quantize_mfp4g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[e8_gptq::HBlock],
+) -> Vec<u8> {
+    e8_gptq::quantize_mfp4g32_e8_gptq_2d(
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        &cpu_fwht_256,
+        &e4m3_scale_encode_roundup,
+        &e4m3_scale_decode,
+        &f32_to_f16,
+    )
+}
+
 fn quantize_mfp4g32_e8_2d(
     f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
 ) -> Vec<u8> {
@@ -5837,7 +5916,30 @@ fn main() {
     // identical to mfp4 (no prefix); only the per-block scale byte's meaning differs.
     let use_mfp4p = format == "mfp4p" || format == "mfp4+p" || format == "mfp4-p";
     // mfp4-E8 — mfp4+P container with E8-lattice vector quantization.
-    let use_mfp4e8 = format == "mfp4e8" || format == "mfp4-e8" || format == "mfp4l8";
+    // The `-gptq` suffix activates Hessian-aware sequential rounding (LDLQ on
+    // the E8 lattice) — output bytes are IDENTICAL format (same E4M3 scale + 4
+    // E8 codewords); GPTQ only changes the lattice-point assignment.
+    let use_gptq_e8 = format == "mfp4e8-gptq" || format == "mfp4-e8-gptq";
+    let use_mfp4e8 = format == "mfp4e8" || format == "mfp4-e8" || format == "mfp4l8"
+        || use_gptq_e8;
+    // GPTQ-E8 Hessian directory: per-(tensor,expert) 256-block XX^T captured by
+    // the collect_e8_hessian binary. Missing/degenerate Hessians silently fall
+    // back to RTN per-block (never worse than baseline). REQUIRED when --format
+    // mfp4e8-gptq is set.
+    let hessian_dir: Option<PathBuf> = args
+        .iter()
+        .position(|a| a == "--hessian-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    if use_gptq_e8 && hessian_dir.is_none() {
+        eprintln!("warning: --format mfp4e8-gptq without --hessian-dir; every tensor falls back to RTN E8 (== plain mfp4e8). Pass --hessian-dir <dir> to enable GPTQ.");
+    }
+    if let Some(hd) = &hessian_dir {
+        if !hd.exists() {
+            eprintln!("error: --hessian-dir not found: {}", hd.display());
+            std::process::exit(1);
+        }
+    }
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     // Conv1d (DeltaNet) defaults to Q8 regardless of --format — the tensor is
     // small (~32K elem) but runs every token and lossy 4-bit FWHT formats
@@ -7088,6 +7190,14 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
+            // GPTQ-E8: borrow the Hessian dir into the rayon closure. Each
+            // expert reads its own per-(tensor,expert) 256-block file; missing
+            // -> RTN fallback. None unless --format mfp4e8-gptq + --hessian-dir.
+            let hessian_dir_ref: Option<&Path> = if use_gptq_e8 {
+                hessian_dir.as_deref()
+            } else {
+                None
+            };
             let new_pairs: Vec<(HfqTensor, Option<HfqTensor>)> = (0..n_experts)
                 .into_par_iter()
                 .map(|x| {
@@ -7224,7 +7334,15 @@ fn main() {
                         let q = quantize_mfp4g32_p_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MFP4G32P, 32u32)
                     } else if use_mfp4e8 && supports_g256 {
-                        let q = quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        let q = if let Some(hdir) = hessian_dir_ref {
+                            let tname = format!("{parent_owned}{x}.{base_owned}.weight");
+                            let hblk = load_hessian_blocks(hdir, &tname);
+                            quantize_mfp4g32_e8_gptq_2d(
+                                &f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk,
+                            )
+                        } else {
+                            quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
+                        };
                         (q, QuantType::MFP4G32E8, 32u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
@@ -7993,7 +8111,21 @@ fn main() {
                             let signs1 = gen_fwht_signs(42, 256);
                             let signs2 = gen_fwht_signs(1042, 256);
                             let m = meta.shape[0];
-                            let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            // GPTQ-E8 for dense tensors: keyed by the full
+                            // safetensors name (no expert idx). Missing Hessian
+                            // -> RTN fallback (byte-identical to plain mfp4e8).
+                            let q = if use_gptq_e8 {
+                                if let Some(hdir) = hessian_dir.as_deref() {
+                                    let hblk = load_hessian_blocks(hdir, name);
+                                    quantize_mfp4g32_e8_gptq_2d(
+                                        &f32_data, m, k_dim, &signs1, &signs2, &hblk,
+                                    )
+                                } else {
+                                    quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                            };
                             (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                         } else {
                             // Ragged dim fallback — matches mfp4+P (HFQ4-G128, no rotation).
