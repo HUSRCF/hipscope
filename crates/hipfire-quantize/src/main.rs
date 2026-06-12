@@ -1532,6 +1532,13 @@ fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq::HBlock> {
     out
 }
 
+/// GPTQ-on-E8 fired/fallback telemetry. `fired` = a non-empty `.hblk` was
+/// loaded for this (tensor,expert) (Hessian-aware LDLQ ran); `fallback` =
+/// empty/missing Hessian -> silent RTN E8. ~0 fired with --hessian-dir set
+/// means a KEY-MISMATCH BUG (filenames != hessian_key), not a flat result.
+static GPTQ_E8_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPTQ_E8_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// GPTQ-E8 wrapper that wires the production helpers into the e8_gptq module.
 /// `h_blocks` empty -> RTN fallback (byte-identical to quantize_mfp4g32_e8_2d).
 fn quantize_mfp4g32_e8_gptq_2d(
@@ -7337,6 +7344,11 @@ fn main() {
                         let q = if let Some(hdir) = hessian_dir_ref {
                             let tname = format!("{parent_owned}{x}.{base_owned}.weight");
                             let hblk = load_hessian_blocks(hdir, &tname);
+                            if hblk.is_empty() {
+                                GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             quantize_mfp4g32_e8_gptq_2d(
                                 &f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk,
                             )
@@ -8117,6 +8129,11 @@ fn main() {
                             let q = if use_gptq_e8 {
                                 if let Some(hdir) = hessian_dir.as_deref() {
                                     let hblk = load_hessian_blocks(hdir, name);
+                                    if hblk.is_empty() {
+                                        GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     quantize_mfp4g32_e8_gptq_2d(
                                         &f32_data, m, k_dim, &signs1, &signs2, &hblk,
                                     )
@@ -8700,6 +8717,19 @@ fn main() {
             }
         })
         .sum();
+    {
+        let fired = GPTQ_E8_FIRED.load(std::sync::atomic::Ordering::Relaxed);
+        let fb = GPTQ_E8_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        if fired + fb > 0 {
+            eprintln!(
+                "  GPTQ-on-E8: {fired} tensors FIRED (Hessian-aware LDLQ), {fb} RTN-fallback (missing/singular H). {:.1}% fired.",
+                100.0 * fired as f64 / (fired + fb) as f64
+            );
+            if fired == 0 {
+                eprintln!("  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result.");
+            }
+        }
+    }
     let mean_quant_error = if quantized_params > 0 {
         total_quant_error / quantized_params as f64
     } else {

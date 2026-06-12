@@ -5112,6 +5112,7 @@ fn moe_ffn_decode_impl(
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
+        layer_idx: ffn.layer_idx,
         x_norm,
         x_residual,
         // EP (Ship 6 substrate-EP): threaded from moe_ffn_decode_impl params.

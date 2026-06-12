@@ -380,6 +380,135 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Native GPTQ-on-E8 Hessian collection. `None` in production (zero
+    /// overhead -- a single `is_some()` branch in the MoE CPU-top-K fallback
+    /// per routed expert). The `collect_e8_hessian_native` example sets this to
+    /// `Some(default)` before running the calibration forward; every routed
+    /// expert then accumulates its per-256-block XX^T over the RAW pre-rotation
+    /// input (gate_up: post-rmsnorm x; down: silu(g)*u), keyed by the full
+    /// safetensors tensor name == `hipfire-quantize::main::hessian_key`. Drained
+    /// to per-(tensor,expert) `.hblk` files after the pass. See
+    /// `hipfire-dispatch::pipeline::run_moe_decode_cpu_fallback` for the hook.
+    pub hessian_capture: Option<HessianCapture>,
+}
+
+/// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
+/// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
+/// same accumulation + `.hblk` layout as
+/// `hipfire-quantize::bin::collect_e8_hessian::BlockHessian` (duplicated here
+/// because that lives in a `bin` crate the GPU layer cannot import). The
+/// quantizer's `load_hessian_blocks` reads exactly this format.
+#[derive(Debug)]
+pub struct BlockHessianAcc {
+    pub k: usize,
+    pub n_blocks: usize,
+    /// `n_blocks` blocks of `256*256` f64 accumulators (row-major per block).
+    pub blocks: Vec<Vec<f64>>,
+    pub n_rows: u64,
+}
+
+impl BlockHessianAcc {
+    pub fn new(k: usize) -> Self {
+        assert!(k % 256 == 0, "Hessian K={k} must be divisible by 256");
+        let n_blocks = k / 256;
+        BlockHessianAcc {
+            k,
+            n_blocks,
+            blocks: (0..n_blocks).map(|_| vec![0.0f64; 256 * 256]).collect(),
+            n_rows: 0,
+        }
+    }
+
+    /// Accumulate one pre-rotation activation row `x[0..K]` into the per-256-block
+    /// diagonal XX^T (block b += x_b x_b^T over its 256 channels).
+    pub fn accumulate_row(&mut self, x: &[f32]) {
+        debug_assert_eq!(x.len(), self.k);
+        for b in 0..self.n_blocks {
+            let xb = &x[b * 256..b * 256 + 256];
+            let acc = &mut self.blocks[b];
+            for i in 0..256 {
+                let xi = xb[i] as f64;
+                if xi == 0.0 {
+                    continue;
+                }
+                let row = &mut acc[i * 256..i * 256 + 256];
+                for j in 0..256 {
+                    row[j] += xi * xb[j] as f64;
+                }
+            }
+        }
+        self.n_rows += 1;
+    }
+
+    /// Serialize to the `.hblk` format consumed by
+    /// `hipfire-quantize::main::load_hessian_blocks`:
+    /// `[u32 magic=0x45384831][u32 n_blocks=K/256][u32 K][f32 ... n_blocks*256*256]`.
+    pub fn write_hblk(&self, dir: &std::path::Path, tensor_name: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        // MUST byte-match hessian_key(): replace('/','_').replace('\\','_').replace("..","_").
+        let key = tensor_name.replace(['/', '\\'], "_").replace("..", "_");
+        let path = dir.join(format!("{key}.hblk"));
+        let mut buf = Vec::with_capacity(12 + self.n_blocks * 256 * 256 * 4);
+        buf.extend_from_slice(&0x45_38_48_31u32.to_le_bytes()); // "E8H1"
+        buf.extend_from_slice(&(self.n_blocks as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.k as u32).to_le_bytes());
+        for b in 0..self.n_blocks {
+            for &v in &self.blocks[b] {
+                buf.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &buf)
+    }
+
+    /// Mean of the per-block diagonal (sanity: should be > 0 for a frequently
+    /// routed expert; 0 == never accumulated).
+    pub fn mean_diag(&self) -> f64 {
+        let mut s = 0.0f64;
+        let mut n = 0u64;
+        for b in 0..self.n_blocks {
+            for i in 0..256 {
+                s += self.blocks[b][i * 256 + i];
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { s / n as f64 }
+    }
+}
+
+/// Host-side accumulator for native GPTQ-on-E8 Hessian collection. Lives on
+/// [`Gpu`] so the MoE CPU-top-K fallback chokepoint can reach it without
+/// threading a parameter through every forward path. Pure host data.
+///
+/// Keyed by the FULL safetensors tensor name (== the quantizer's
+/// `hessian_key` input), e.g.
+/// `model.language_model.layers.7.mlp.experts.42.gate_up_proj.weight`.
+#[derive(Debug, Default)]
+pub struct HessianCapture {
+    /// `tensor_name -> per-256-block XX^T`. Lazily sized to the tensor's K on
+    /// first sighting of that (tensor,expert).
+    pub entries: HashMap<String, BlockHessianAcc>,
+    /// Total calibration tokens processed (collector increments once/step).
+    pub n_tokens: u64,
+}
+
+impl HessianCapture {
+    /// Accumulate one RAW pre-rotation activation row for `name`. `x` is the
+    /// linear's pre-rotation input (gate_up: post-rmsnorm x; down: silu(g)*u);
+    /// only the first `k` channels are used. Creates the entry on first sight.
+    pub fn accumulate(&mut self, name: &str, x: &[f32], k: usize) {
+        let acc = self
+            .entries
+            .entry(name.to_string())
+            .or_insert_with(|| BlockHessianAcc::new(k));
+        if x.len() >= k {
+            acc.accumulate_row(&x[..k]);
+        } else {
+            let mut row = vec![0.0f32; k];
+            row[..x.len()].copy_from_slice(x);
+            acc.accumulate_row(&row);
+        }
+    }
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -610,6 +739,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            hessian_capture: None,
         }).map(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");

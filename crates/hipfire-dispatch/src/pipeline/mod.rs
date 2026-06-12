@@ -659,6 +659,18 @@ fn run_moe_decode_cpu_fallback(
     static GEMV_FB: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV_FB.get_or_init(GemvFamily::new);
 
+    // GPTQ-on-E8 native Hessian capture (gpu.hessian_capture is Some only
+    // under the collect_e8_hessian_native calibration driver; None == zero
+    // overhead in production). x_norm is the RAW pre-rotation gate_up input
+    // (post-rmsnorm hidden, pre-FWHT) and is identical for every top-k expert
+    // of this token, so download it ONCE here. Keyed by the FULL safetensors
+    // name == hipfire-quantize::main::hessian_key.
+    let hess_x_norm: Option<Vec<f32>> = if gpu.hessian_capture.is_some() {
+        Some(hip!(gpu.download_f32(p.x_norm))?)
+    } else {
+        None
+    };
+
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
 
@@ -672,6 +684,25 @@ fn run_moe_decode_cpu_fallback(
         // silu(gate)·up → ffn_hidden, then down GEMV, then weighted residual add.
         let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
+        // GPTQ-on-E8 Hessian capture: hid_view = silu(g)*u is the RAW
+        // PRE-rotation down input (run_auto below applies the FWHT internally),
+        // so download it NOW, before the down GEMV. Accumulate gate_up (over the
+        // pre-downloaded x_norm) and down (over hid_view) for THIS expert.
+        if let Some(ref xn) = hess_x_norm {
+            let hid_host = hip!(gpu.download_f32(&hid_view))?;
+            let l = p.layer_idx;
+            let e = expert_idx;
+            let gate_up_key = format!(
+                "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj.weight"
+            );
+            let down_key = format!(
+                "model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"
+            );
+            if let Some(cap) = gpu.hessian_capture.as_mut() {
+                cap.accumulate(&gate_up_key, xn, p.hidden);
+                cap.accumulate(&down_key, &hid_host, mi);
+            }
+        }
         {
             gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
         }

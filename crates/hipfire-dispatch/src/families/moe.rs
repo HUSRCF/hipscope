@@ -192,6 +192,10 @@ pub struct MoeParams<'a> {
     pub n_exp: usize,
     pub norm_topk_prob: bool,
     pub x_rot_prerotated: bool,
+    /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used
+    /// by native GPTQ-on-E8 Hessian capture in the CPU-top-K fallback to
+    /// build the per-(tensor,expert) key; ignored on the hot path.
+    pub layer_idx: u16,
     // activations / residual
     pub x_norm: &'a GpuTensor,
     pub x_residual: &'a GpuTensor,
