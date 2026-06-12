@@ -69,6 +69,7 @@ pub struct FeatureFlags {
     pub moe_grouped_i8_k4: bool,
     pub moe_grouped_i8_k4_gfx12: bool,
     pub moe_grouped_m2: bool,
+    pub moe_hfq6_i8: bool,
     pub moe_hfq6_v2: bool,
     // ── MoE prefill (Ship 4.2) ────────────────────────────────────
     /// Grouped-GEMM MoE prefill gate (HIPFIRE_MOE_GROUPED_GEMM). Default ON.
@@ -223,6 +224,7 @@ impl FeatureFlags {
             moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
                 == Ok("1"),
             moe_grouped_m2: std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
+            moe_hfq6_i8: std::env::var("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
             moe_hfq6_v2: std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
             // MoE prefill (Ship 4.2)
             moe_grouped_gemm: match std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
@@ -380,6 +382,7 @@ impl FeatureFlags {
             moe_grouped_i8_k4: false,
             moe_grouped_i8_k4_gfx12: false,
             moe_grouped_m2: false,
+            moe_hfq6_i8: false,
             moe_hfq6_v2: false,
             moe_grouped_gemm: true,
             moe_paro_i8: None,

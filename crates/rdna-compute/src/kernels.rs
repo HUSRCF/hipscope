@@ -1406,11 +1406,23 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX12_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx12.hip");
 
+/// gfx1151 (RDNA3.5) HFQ6/MQ6 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC
+/// for AWQ MoE experts. Same gfx11 WMMA tile geometry + grouped dispatch
+/// contract; differs only in the 200 B/group HFQ6 dequant inner loop.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx1151.hip");
+
+/// gfx1151 i8-WMMA MMQ sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC.
+/// Uses Q8_1 activation prequant plus the HFQ6/MQ6 correction term:
+/// sc * d_x * dot_i8(q, qx) + zp * sum_x.
+pub const GEMM_HFQ6G256_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_mmq.gfx1151.hip");
+
 /// HFQ6/MQ6 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC for AWQ MoE
 /// experts. Same WMMA tile geometry + grouped dispatch contract; differs
 /// only in the 200 B/group HFQ6 dequant inner loop (4 B scale + 4 B zero
 /// + 192 B packed 6-bit). The kernel is dtype-agnostic between HFQ6 and
-/// MQ6 — MQ6G256 uses the identical 200 B layout and the caller applies
+/// MQ6 -- MQ6G256 uses the identical 200 B layout and the caller applies
 /// the FWHT rotation to X before dispatch, same convention as MQ4/HFQ4.
 /// **gfx12 (RDNA4) only.** Unblocks AWQ A3B prefill (~50% of experts MQ6).
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
