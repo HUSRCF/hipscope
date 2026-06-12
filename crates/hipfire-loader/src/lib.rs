@@ -34,7 +34,17 @@ use std::path::Path;
 /// One arch's complete load contract. Object-safe → usable as `&dyn Carrier`.
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
-    fn probe(&self, src: &ModelSource) -> bool;
+    /// Whether this carrier claims a given `arch_id`. `is_dir` distinguishes
+    /// the two namespaces: HFQ-header ids (`HfqFile::arch_id`) vs the
+    /// `derive_arch_id` ids emitted for safetensors directories. Kept as a
+    /// pure `(u32, bool) -> bool` fn so the registry's disjointness can be
+    /// unit-tested without constructing a real `ModelSource`.
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool;
+    /// Default probe delegates to [`Carrier::claims_arch_id`]; carriers only
+    /// implement the pure id predicate.
+    fn probe(&self, src: &ModelSource) -> bool {
+        matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
 }
 
@@ -687,11 +697,21 @@ pub fn load_model(
         gpu,
     };
 
-    // Carrier registry dispatch
-    let carrier = REGISTRY
-        .iter()
-        .find(|c| c.probe(&src))
-        .ok_or_else(|| format!("no carrier for arch_id={:?}", src.arch_id()))?;
+    // Carrier registry dispatch. Collect all matches so an overlap between
+    // two carriers' `claims_arch_id` fails loudly here instead of silently
+    // resolving to whichever was registered first.
+    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
+    let carrier = matches
+        .next()
+        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
+    if let Some(other) = matches.next() {
+        return Err(format!(
+            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
+            src.describe(),
+            carrier.name(),
+            other.name()
+        ));
+    }
     let result = carrier.load(src, &mut ctx)?;
     debug_assert!(
         !(result.pp > 1) || result.pp_gpus.is_some(),
@@ -1165,4 +1185,82 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::REGISTRY;
+
+    /// Every known arch_id must be claimed by AT MOST one carrier, for both
+    /// source namespaces (HFQ header ids and `derive_arch_id` dir ids). This
+    /// guards the otherwise-silent first-match overlap in `load_model`: add a
+    /// carrier whose `claims_arch_id` collides with an existing one and this
+    /// fails in CI instead of mis-routing weights at runtime.
+    #[test]
+    fn carriers_are_disjoint() {
+        // Sweep well past the assigned range, plus the reserved sentinels
+        // (20 = DFlash draft, 0xFF = toy/template — neither should dispatch).
+        let ids = (0u32..=64).chain([20, 0xFF]);
+        for id in ids {
+            for is_dir in [false, true] {
+                let claimers: Vec<&str> = REGISTRY
+                    .iter()
+                    .filter(|c| c.claims_arch_id(id, is_dir))
+                    .map(|c| c.name())
+                    .collect();
+                assert!(
+                    claimers.len() <= 1,
+                    "arch_id={id} is_dir={is_dir} claimed by multiple carriers: {claimers:?}"
+                );
+            }
+        }
+    }
+
+    /// Pin the intended routing so a future probe edit can't silently move an
+    /// existing model to the wrong carrier. `is_dir` matters: Qwen2 is HFQ id
+    /// 7 but its dir form derives to id 1 (→ llama path).
+    #[test]
+    fn known_ids_route_as_expected() {
+        let cases: &[(u32, bool, &str)] = &[
+            (7, false, "qwen2"),
+            (5, false, "qwen35"),
+            (6, false, "qwen35"),
+            (5, true, "qwen35"),
+            (6, true, "qwen35"),
+            (0, false, "llama"),
+            (1, false, "llama"),
+            (0, true, "llama"),
+            (1, true, "llama"),
+            (8, false, "dots_ocr"),
+            (9, false, "deepseek4"),
+            (10, false, "minimax"),
+            (11, false, "lfm2moe"),
+        ];
+        for &(id, is_dir, want) in cases {
+            let got: Vec<&str> = REGISTRY
+                .iter()
+                .filter(|c| c.claims_arch_id(id, is_dir))
+                .map(|c| c.name())
+                .collect();
+            assert_eq!(
+                got,
+                vec![want],
+                "arch_id={id} is_dir={is_dir} should route to exactly [{want}]"
+            );
+        }
+    }
+
+    /// The unassigned HFQ ids 2..=4 must reach NO carrier — this is the
+    /// regression guard for fix B (the old `arch_id < 5` open range silently
+    /// loaded them as llama).
+    #[test]
+    fn unassigned_low_ids_match_nothing() {
+        for id in [2u32, 3, 4] {
+            let n = REGISTRY
+                .iter()
+                .filter(|c| c.claims_arch_id(id, false))
+                .count();
+            assert_eq!(n, 0, "arch_id={id} (unassigned) should match no carrier");
+        }
+    }
 }

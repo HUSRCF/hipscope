@@ -16,8 +16,9 @@ impl Carrier for Qwen2Carrier {
     fn name(&self) -> &'static str {
         "qwen2"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id == 7)
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        // HFQ id 7 only; qwen2 dirs derive to id 1 → handled by LlamaCarrier.
+        !is_dir && arch_id == 7
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -60,9 +61,9 @@ impl Carrier for Qwen35Carrier {
     fn name(&self) -> &'static str {
         "qwen35"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if matches!(h.arch_id, 5 | 6))
-            || matches!(src, ModelSource::Dir(s) if matches!(s.arch_id(), 5 | 6))
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
+        matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         match src {
@@ -420,9 +421,11 @@ impl Carrier for LlamaCarrier {
     fn name(&self) -> &'static str {
         "llama"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id < 5)
-            || matches!(src, ModelSource::Dir(s) if matches!(s.arch_id(), 0 | 1))
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // 0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2 (both namespaces).
+        // Explicit allowlist (was an open `< 5` range that would silently
+        // swallow any future HFQ id in 2..=4 into the llama path).
+        matches!(arch_id, 0 | 1)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         match src {
@@ -559,8 +562,8 @@ impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
         "deepseek4"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id == 9)
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 9
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -581,8 +584,8 @@ impl Carrier for DotsOcrCarrier {
     fn name(&self) -> &'static str {
         "dots_ocr"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id == 8)
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 8
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -603,8 +606,8 @@ impl Carrier for Lfm2MoeCarrier {
     fn name(&self) -> &'static str {
         "lfm2moe"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id == 11)
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 11
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -625,8 +628,8 @@ impl Carrier for MinimaxCarrier {
     fn name(&self) -> &'static str {
         "minimax"
     }
-    fn probe(&self, src: &ModelSource) -> bool {
-        matches!(src, ModelSource::Hfq(h) if h.arch_id == 10)
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 10
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {

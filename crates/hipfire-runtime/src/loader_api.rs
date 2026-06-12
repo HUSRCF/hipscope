@@ -40,6 +40,13 @@ impl ModelSource {
         }
     }
 
+    /// Whether this source is a safetensors directory (vs an HFQ file).
+    /// Carriers route on this because the HFQ and `derive_arch_id`
+    /// namespaces are distinct (e.g. Qwen2 is HFQ id 7 but dir id 1).
+    pub fn is_dir(&self) -> bool {
+        matches!(self, ModelSource::Dir(_))
+    }
+
     /// Human-readable description for logging.
     pub fn describe(&self) -> String {
         match self {
