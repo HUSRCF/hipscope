@@ -38,6 +38,13 @@ use hipfire_runtime::weight_backend::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
+/// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
+/// and both final-norm paths so the four former hardcoded `1.0` sites cannot drift apart.
+const QWEN35_NORM_BIAS: f32 = 1.0;
+
+const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
+
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1187,7 +1194,7 @@ fn load_norm_weight(
 ) -> HipResult<GpuTensor> {
     let (info, data) =
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
-    dequant_norm(gpu, info.quant_type, &data, shape, 1.0)
+    dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
 fn load_weight_tensor_raw(
@@ -1523,7 +1530,13 @@ impl WeightSource for ParoSource<'_> {
 
     fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
         eprintln!("  loading output_norm...");
-        paro_load_norm(self.source, gpu, "norm.weight", &[self.c.dim], 1.0)
+        paro_load_norm(
+            self.source,
+            gpu,
+            "norm.weight",
+            &[self.c.dim],
+            QWEN35_NORM_BIAS,
+        )
     }
 
     fn read_output(
@@ -1567,13 +1580,7 @@ impl WeightSource for ParoSource<'_> {
             "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
             c.n_layers, c.layer_types[layer_idx]
         );
-        let mut b = ParoBackend {
-            source: self.source,
-            gpu,
-            mp: self.mp,
-            layer: layer_idx,
-            norm_bias: 1.0,
-        };
+        let mut b = qwen35_paro_backend(self.source, gpu, self.mp, layer_idx);
         let moe = |bk: &mut ParoBackend, cfg: &Qwen35Config, li: usize| {
             crate::paro_moe::paro_load_moe_ffn(
                 bk.source,
@@ -1584,6 +1591,36 @@ impl WeightSource for ParoSource<'_> {
             )
         };
         crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
+    }
+}
+
+/// Construct an `HfqBackend` with qwen35's defaults baked in: `QWEN35_NORM_BIAS`,
+/// the qwen35 tensor-name resolver, and the standard pread+awq weight reader.
+fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> HfqBackend<'a> {
+    HfqBackend {
+        hfq,
+        gpu,
+        norm_bias: QWEN35_NORM_BIAS,
+        candidates: qwen35_tensor_name_candidates,
+        read_proj: load_weight_tensor,
+        layer,
+    }
+}
+
+/// Construct a `ParoBackend` with qwen35's `norm_bias` baked in. `mp` is the
+/// text-tower prefix from `paro_text_prefix`.
+fn qwen35_paro_backend<'a>(
+    source: &'a dyn ModelSource,
+    gpu: &'a mut Gpu,
+    mp: &'static str,
+    layer: usize,
+) -> ParoBackend<'a> {
+    ParoBackend {
+        source,
+        gpu,
+        mp,
+        layer,
+        norm_bias: QWEN35_NORM_BIAS,
     }
 }
 
@@ -1599,14 +1636,7 @@ fn load_layer_into(
     gpu: &mut Gpu,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
-    let mut b = HfqBackend {
-        hfq,
-        gpu,
-        norm_bias: 1.0,
-        candidates: qwen35_tensor_name_candidates,
-        read_proj: load_weight_tensor,
-        layer: layer_idx,
-    };
+    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
     };
