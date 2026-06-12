@@ -7114,6 +7114,14 @@ struct MoePrefillDtypes {
     expert_down: DType,
     expert_gate_up_uniform: bool,
     expert_down_uniform: bool,
+    /// Routed experts are dtype-mixed (graded) AND carry an `expert_dtype_tags`
+    /// table → served by the merged grouped-WMMA prefill kernel (per-expert
+    /// MQ6/MQ4/MQ3L/MQ2L). When true, the per-expert *uniform* requirement is
+    /// waived for the ROUTED experts; the router + shared expert still use their
+    /// own batched paths and are validated normally. Without this, a graded file
+    /// fails admission and silently drops to the per-token prefill fallback (the
+    /// merged kernel never fires — observed as ~decode-speed prefill).
+    routed_mixed_merged: bool,
 }
 
 impl MoePrefillDtypes {
@@ -7129,6 +7137,7 @@ impl MoePrefillDtypes {
             expert_down: dtype,
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
+            routed_mixed_merged: false,
         }
     }
 
@@ -7150,6 +7159,7 @@ impl MoePrefillDtypes {
                 .experts
                 .iter()
                 .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+            routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
         })
     }
 }
@@ -7168,9 +7178,28 @@ fn moe_ffn_batched_admissible_for_dtypes(
         dtypes.shared_expert_scalar_gate,
         DType::MQ4G256 | DType::Q8_0 | DType::F32
     );
-    if !(router_ok && shared_gate_ok && dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform)
-    {
+    // Graded (mixed-dtype) routed experts are served by the merged grouped-WMMA
+    // prefill kernel, so the per-expert *uniform* requirement is waived for the
+    // routed experts; the router + shared expert still go through their own
+    // batched paths and are validated below.
+    let routed_ok = dtypes.routed_mixed_merged
+        || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
+    if !(router_ok && shared_gate_ok && routed_ok) {
         return false;
+    }
+
+    if dtypes.routed_mixed_merged {
+        // Routed experts handled by the merged kernel (per-expert MQ6/MQ4/MQ3L/
+        // MQ2L). Only require the SHARED expert to be batchable on its dense
+        // path: MQ4 always, MQ6 when this arch admits MQ6 dense kernels.
+        let shared_gu_ok = (dtypes.shared_expert_gate == DType::MQ4G256
+            && dtypes.shared_expert_up == DType::MQ4G256)
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ6G256)
+                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
+        let shared_dn_ok = dtypes.shared_expert_down == DType::MQ4G256
+            || (admit_mq6 && dtypes.shared_expert_down == DType::MQ6G256);
+        return shared_gu_ok && shared_dn_ok;
     }
 
     if admit_paro
@@ -15514,6 +15543,24 @@ mod tests {
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+    }
+
+    #[test]
+    fn moe_prefill_admits_graded_mixed_experts_via_merged_kernel() {
+        // Graded T3-3L: routed experts dtype-mixed (hot MQ6 / mid MQ4 / cold
+        // MQ3-Lloyd), shared expert + router MQ4. The merged grouped-WMMA prefill
+        // kernel serves the routed experts, so this MUST be batched-admissible —
+        // otherwise it silently drops to the per-token prefill fallback at
+        // ~decode speed and the merged kernel never fires.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.routed_mixed_merged = true;
+        dtypes.expert_gate_up_uniform = false;
+        dtypes.expert_down_uniform = false;
+        dtypes.expert_down = DType::MQ3G256Lloyd; // representative cold-tier dtype
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        // The same mixed file WITHOUT the merged-kernel tag table is NOT admissible.
+        dtypes.routed_mixed_merged = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
     }
 
     #[test]
