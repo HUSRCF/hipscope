@@ -12948,6 +12948,88 @@ fn parse_cohere_action(buf: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Snap a hallucinated/verbose tool name back to a real tool from the request.
+/// North (driven by a non-Cohere agentic harness) sometimes emits the tool name
+/// with descriptive words glued on, e.g. `bash immediate return command` instead
+/// of `bash`. Match by exact name, then leading whitespace token, then any
+/// whitespace token, preferring the longest known match; pass through unchanged
+/// if nothing matches (the client then reports an unknown tool, as before).
+fn snap_tool_name(name: &str, known: &[String]) -> String {
+    if known.is_empty() || known.iter().any(|k| k == name) {
+        return name.to_string();
+    }
+    let toks: Vec<&str> = name.split_whitespace().collect();
+    let mut best: Option<&str> = None;
+    for k in known {
+        let hit = toks.first() == Some(&k.as_str()) || toks.iter().any(|t| *t == k.as_str());
+        if hit && best.map_or(true, |b| k.len() > b.len()) {
+            best = Some(k.as_str());
+        }
+    }
+    best.map(String::from).unwrap_or_else(|| name.to_string())
+}
+
+/// Normalize the `name` of each parsed tool_call against the known tool list.
+fn snap_call_names(calls: &mut [serde_json::Value], known: &[String]) {
+    for c in calls.iter_mut() {
+        if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
+            let snapped = snap_tool_name(name, known);
+            if snapped != name {
+                c["name"] = serde_json::Value::String(snapped);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod toolcall_robustness_tests {
+    use super::{parse_cohere_action, snap_call_names, snap_tool_name};
+
+    #[test]
+    fn snaps_verbose_hallucinated_name() {
+        let known = ["bash".to_string(), "read".to_string(), "write".to_string()];
+        // the exact failures observed driving North from the tb harness
+        assert_eq!(snap_tool_name("bash immediate return command", &known), "bash");
+        assert_eq!(snap_tool_name("bash immediate", &known), "bash");
+        // already-correct names pass through unchanged
+        assert_eq!(snap_tool_name("read", &known), "read");
+        // any-token match
+        assert_eq!(snap_tool_name("please write the file", &known), "write");
+        // no match → left as-is (client reports unknown, as before)
+        assert_eq!(snap_tool_name("frobnicate", &known), "frobnicate");
+        // prefer the longest known match
+        let k2 = ["bash".to_string(), "bash_script".to_string()];
+        assert_eq!(snap_tool_name("bash_script now", &k2), "bash_script");
+    }
+
+    #[test]
+    fn recovers_tool_call_written_as_text() {
+        // the exact JSON the model emitted as TEXT instead of <|START_ACTION|>
+        let text = r#"[
+    {"tool_call_id": "12", "tool_name": "read", "parameters": {"path": "/home/nick/CLionProjects/tb/.idea/.gitignore"}}
+]"#;
+        let mut calls = parse_cohere_action(text);
+        assert_eq!(calls.len(), 1);
+        snap_call_names(&mut calls, &["read".to_string()]);
+        assert_eq!(calls[0]["name"], "read");
+        assert_eq!(
+            calls[0]["arguments"]["path"],
+            "/home/nick/CLionProjects/tb/.idea/.gitignore"
+        );
+        // prose / incidental brackets are NOT mistaken for a tool call
+        assert!(parse_cohere_action("I'll read the file now.").is_empty());
+        assert!(parse_cohere_action("The result is [1, 2, 3].").is_empty());
+    }
+
+    #[test]
+    fn snaps_name_inside_recovered_call() {
+        let text = r#"[{"tool_name": "bash immediate return command", "parameters": {"command": "ls"}}]"#;
+        let mut calls = parse_cohere_action(text);
+        snap_call_names(&mut calls, &["bash".to_string()]);
+        assert_eq!(calls[0]["name"], "bash");
+    }
+}
+
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
 /// `generate_minimax`, plus: BATCHED `forward_batch` prefill (≈9×, see the
 /// prefill block) and a Cohere agentic-marker state machine in the decode loop
@@ -13305,6 +13387,26 @@ fn generate_cohere2moe(
     let mut think_force_closed = false;
     let mut forced_toks: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
+    // Tool-calling robustness against non-Cohere harnesses: known tool names (to
+    // snap a verbose/hallucinated name back to the real tool) and a buffer of the
+    // visible output (to recover a tool call the model wrote as TEXT instead of
+    // via <|START_ACTION|>). Handles both {function:{name}} (OpenAI) and {name}.
+    let known_tools: Vec<String> = tools
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| t.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut tool_calls_emitted = false;
+    let mut vis_buf = String::new();
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
@@ -13389,8 +13491,10 @@ fn generate_cohere2moe(
         } else if next_tok == mk_think1 || next_tok == mk_text1 {
             sec = Sec::Pre;
         } else if next_tok == mk_act1 {
-            // End of an action block → parse the JSON array into tool_calls.
-            let calls = parse_cohere_action(&action_buf);
+            // End of an action block → parse the JSON array into tool_calls,
+            // snapping any verbose/hallucinated tool name to a real tool.
+            let mut calls = parse_cohere_action(&action_buf);
+            snap_call_names(&mut calls, &known_tools);
             if !calls.is_empty() {
                 let _ = writeln!(
                     stdout,
@@ -13399,6 +13503,7 @@ fn generate_cohere2moe(
                 );
                 let _ = stdout.flush();
                 emitted_visible = true;
+                tool_calls_emitted = true;
             }
             sec = Sec::Pre;
         } else {
@@ -13436,6 +13541,7 @@ fn generate_cohere2moe(
                     think_count += 1;
                 }
                 Sec::Text | Sec::Pre => {
+                    vis_buf.push_str(&frag);
                     let _ = writeln!(
                         stdout,
                         "{}",
@@ -13467,6 +13573,28 @@ fn generate_cohere2moe(
     }
 
     m.seq_pos = m.cohere2moe_state.as_ref().unwrap().n_tokens;
+
+    // Tool-call-as-text recovery: if the model never emitted a <|START_ACTION|>
+    // block but wrote a tool-call JSON array (`[{tool_name, parameters}]`) as
+    // visible text — which happens when a non-Cohere harness primes it with a
+    // generic tool-call format — parse it out and emit it as a real tool_calls
+    // event so the harness can actually execute it.
+    if !tool_calls_emitted {
+        let mut recovered = parse_cohere_action(&vis_buf);
+        if !recovered.is_empty() {
+            snap_call_names(&mut recovered, &known_tools);
+            eprintln!(
+                "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
+                recovered.len()
+            );
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "tool_calls", "id": id, "calls": recovered}),
+            );
+            let _ = stdout.flush();
+        }
+    }
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
