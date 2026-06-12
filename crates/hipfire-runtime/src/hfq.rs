@@ -816,9 +816,24 @@ pub fn load_weights_hfq(
         // Q8F16: upload raw, use Q8 embedding lookup at inference
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
-    } else {
+    } else if matches!(embd_info.0.quant_type, 1 | 2 | 16) {
+        // F16 / F32 / BF16 source — dequantize to F32 and use the D2D lookup.
         (load_f16_tensor(hfq, gpu, "model.embed_tokens.weight",
             &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+    } else {
+        // Any other quant type (MQ4/MQ8/MQ6/HFQ6/HFQ2-3/MFP4/HFP4/…) has no
+        // embedding-lookup kernel — only F32/Q8_0/Q4K/HFQ4G256/HFQ4G128 do.
+        // The first-party packager never emits these for token_embd (it demotes
+        // embeddings to Q8/HFQ4), but an externally-produced .hfq can. Fail loud
+        // here instead of silently reinterpreting the bytes as F16 → garbage.
+        // Mirrors the qwen35 embed_classify guard (commit 715c9063).
+        return Err(HipError::new(0, &format!(
+            "token_embd has quant_type={} which has no embedding-lookup kernel. \
+             Embedding tables must be F32, Q8_0 (qt=3), Q4K (qt=4), \
+             HFQ4G256 (qt=6) or HFQ4G128 (qt=7). Re-quantize the model so \
+             embed_tokens lands in one of those formats.",
+            embd_info.0.quant_type
+        )));
     };
 
     eprintln!("  loading output_norm...");

@@ -42,6 +42,29 @@ arch-id integer namespaces (verified — see §3, the B1 finding). `probe(&self,
 already receives the whole source, so each carrier matches per-format and bridges the two
 namespaces itself. It must NOT be reduced to a single `src.arch_id()`.
 
+### Format coverage is per-role, not global (goal-2 precision)
+
+This refactor unifies *dispatch*, and the loader now accepts every format the registry
+knows. It does **not** widen *kernel* coverage. A model is runnable iff **every tensor's
+format lands in the kernel family for the role that tensor plays** — and the three families
+have very different coverage, so "all formats unlocked" is true only at the loader layer.
+Runnable = `(loader accepts) ∩ (a kernel exists for this tensor's role)`:
+
+| Role | Kernel family | Supported quant types | Source of truth |
+|------|---------------|-----------------------|-----------------|
+| `token_embd`, **tied** `lm_head` | embedding lookup | F32 (2), Q8_0 (3), Q4K (4), HFQ4G256 (6), HFQ4G128 (7) | `hfq.rs:805` classify, `llama.rs:641` `EmbeddingFormat`, `embedding_lookup_*` |
+| proj / attn / ffn weights, **untied** `lm_head`, per-token prefill | decode GEMV | ~everything (F32, F16, Q8, Q4K/Q6K, HFQ2-6, HFP4, MFP4, MQ2-8, Lloyd); only BF16 (vision) outside | `hipfire-dispatch/src/families/gemv.rs:383-409` |
+| DFlash draft target | WMMA batched prefill | Q8_0 (3), HFQ4G256 (6), MQ4G256 (13) all archs; MQ3G256 (17) gfx11 + dense-qwen35 only | gate at `lib.rs:528-588` |
+
+Implications: (a) an MQ4/MQ8/HFQ6/MFP4 **embedding table** (or tied lm_head in those
+formats) cannot run — no lookup kernel. The packager never emits this (it demotes
+embeddings to Q8/HFQ4, *"Q4 too lossy for embedding tables"* `main.rs:4063`), but an
+externally-produced `.hfq` can; both the qwen35 `embed_classify` guard (715c9063) and the
+`hfq.rs:805` classifier now fail loud instead of silently reinterpreting bytes as F16. (b)
+DFlash is the narrowest path — its gate already errors clearly for unsupported targets. So
+goal-2 reads precisely: **the loader is format-agnostic; runnable coverage is kernel-bounded
+per role**, not a single global format set.
+
 ## Design
 
 ### 1. Object-safe `Carrier`, impls top-of-DAG
