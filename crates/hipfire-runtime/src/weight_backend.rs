@@ -203,9 +203,8 @@ pub fn reupload_f16_as_f32(
     k: usize,
 ) -> HipResult<WeightTensor> {
     let f32_data = f16_bytes_to_f32(f16_bytes);
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
     Ok(WeightTensor {
         buf,
@@ -216,6 +215,69 @@ pub fn reupload_f16_as_f32(
         paro: None,
         awq_scale: None,
     })
+}
+
+/// Build a tied lm_head `WeightTensor` that ALIASES the embedding device
+/// buffer (`shallow_clone` — a non-owning view). The owning weights struct
+/// must record the alias (`lm_head_aliases_embd` / `tied_lm_head`) so the
+/// embedding buffer is freed exactly once and the view is never freed.
+/// Panics via `embedding_format_dtype` on Q4K (no tied-lm_head / GEMV weight
+/// path for Q4K).
+pub fn tied_lm_head_alias(
+    embd: &GpuTensor,
+    embd_fmt: EmbeddingFormat,
+    m: usize,
+    k: usize,
+) -> WeightTensor {
+    WeightTensor {
+        buf: embd.shallow_clone(),
+        gpu_dtype: embedding_format_dtype(embd_fmt),
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    }
+}
+
+/// Resolve the output / lm_head weight, returning `(output, aliases_embd)`.
+/// `aliases_embd == true` iff `output.buf` is a view of the embedding buffer
+/// and must NOT be freed by the owning struct.
+///
+/// - `has_separate`        → `(load_separate(gpu)?, false)` — a distinct
+///   `lm_head.weight` (or `output.weight`) tensor exists on disk.
+/// - else `can_alias`      → `(tied_lm_head_alias(...), true)` — single device:
+///   share the embedding buffer.
+/// - else (multi-GPU)      → `(reupload_tied(gpu)?, false)` — output lives on a
+///   different device than embed, so re-materialize it.
+///
+/// `gpu` is threaded into whichever closure runs (only one is called), so
+/// neither closure needs to capture `&mut Gpu`.
+pub fn resolve_lm_head<S, R>(
+    gpu: &mut Gpu,
+    has_separate: bool,
+    can_alias: bool,
+    embd: &GpuTensor,
+    embd_fmt: EmbeddingFormat,
+    m: usize,
+    k: usize,
+    load_separate: S,
+    reupload_tied: R,
+) -> HipResult<(WeightTensor, bool)>
+where
+    S: FnOnce(&mut Gpu) -> HipResult<WeightTensor>,
+    R: FnOnce(&mut Gpu) -> HipResult<WeightTensor>,
+{
+    if has_separate {
+        eprintln!("  loading output (separate lm_head)...");
+        Ok((load_separate(gpu)?, false))
+    } else if can_alias {
+        eprintln!("  loading output (tied embeddings, aliased)...");
+        Ok((tied_lm_head_alias(embd, embd_fmt, m, k), true))
+    } else {
+        eprintln!("  loading output (tied embeddings, reupload)...");
+        Ok((reupload_tied(gpu)?, false))
+    }
 }
 
 // ── Dequant primitives ───────────────────────────────────────────────
@@ -1237,5 +1299,31 @@ mod tests {
         // 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00 (little-endian byte pairs).
         let bytes = [0x00, 0x3C, 0x00, 0x40, 0x00, 0xBC];
         assert_eq!(f16_bytes_to_f32(&bytes), vec![1.0, 2.0, -1.0]);
+    }
+
+    #[test]
+    fn tied_alias_assembles_f32_view() {
+        let embd = GpuTensor::null_for_test();
+        let wt = tied_lm_head_alias(&embd, EmbeddingFormat::F32, 100, 64);
+        assert_eq!(wt.gpu_dtype, DType::F32);
+        assert_eq!(wt.m, 100);
+        assert_eq!(wt.k, 64);
+        assert_eq!(wt.row_stride, 0);
+        assert!(wt.paro.is_none());
+        assert!(wt.awq_scale.is_none());
+    }
+
+    #[test]
+    fn tied_alias_maps_hfq4g256_dtype() {
+        let embd = GpuTensor::null_for_test();
+        let wt = tied_lm_head_alias(&embd, EmbeddingFormat::HFQ4G256, 8, 8);
+        assert_eq!(wt.gpu_dtype, DType::HFQ4G256);
+    }
+
+    #[test]
+    #[should_panic(expected = "Q4K not valid for tied lm_head")]
+    fn tied_alias_q4k_panics() {
+        let embd = GpuTensor::null_for_test();
+        let _ = tied_lm_head_alias(&embd, EmbeddingFormat::Q4K, 8, 8);
     }
 }
