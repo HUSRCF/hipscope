@@ -585,6 +585,7 @@ fn dtypes_all_mq4() -> MoeDtypes {
         shared_gate: DType::MQ4G256,
         shared_expert_gate: DType::MQ4G256,
         shared_expert_up: DType::MQ4G256,
+        shared_expert_down: DType::MQ4G256,
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -900,6 +901,7 @@ fn moe_dtypes_mq4() -> MoeDtypes {
         shared_gate: DType::Q8_0,
         shared_expert_gate: DType::MQ4G256,
         shared_expert_up: DType::MQ4G256,
+        shared_expert_down: DType::MQ4G256,
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -953,6 +955,25 @@ fn moe_prefill_resolution_path2_gfx12_mq6() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "gfx12 should have Path 2 for MQ6");
     assert!(!r.paro_mode);
+}
+
+#[test]
+fn moe_prefill_resolution_gfx1151_mixed_mq6_fences_mq4_i8() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1151");
+
+    let pure_mq4 = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(pure_mq4.use_path2);
+    assert!(
+        !pure_mq4.force_mq4_grouped_fp16,
+        "pure MQ4 layers should keep gfx1151's existing grouped-i8 default"
+    );
+
+    let mixed_mq6 = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(mixed_mq6.use_path2);
+    assert!(
+        mixed_mq6.force_mq4_grouped_fp16,
+        "MQ6-promoted/mixed A3B layers must not run remaining MQ4 projections through grouped-i8 by default"
+    );
 }
 
 #[test]
@@ -1030,10 +1051,10 @@ fn moe_prefill_resolution_mq6_gfx11_falls_back_to_path1() {
 }
 
 #[test]
-fn moe_prefill_resolution_mq6_gfx1151_falls_back_to_path1() {
+fn moe_prefill_resolution_mq6_gfx1151_uses_path2() {
     let arch = crate::context::DispatchCtx::for_test("gfx1151");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(!r.use_path2, "MQ6 on gfx1151 should NOT use Path 2 (grouped WMMA is gfx12-only)");
+    assert!(r.use_path2, "MQ6 on gfx1151 should use Path 2 (grouped WMMA available)");
     assert!(!r.down_path0);
 }
 
@@ -1051,4 +1072,3 @@ fn moe_prefill_resolution_mq4_gfx11_still_path2() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "MQ4 on gfx11 should still use Path 2");
 }
-

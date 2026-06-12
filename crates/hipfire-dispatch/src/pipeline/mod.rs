@@ -927,6 +927,7 @@ fn dispatch_grouped_gemm(
     x_row_div: usize,
     m_total: usize,
     rows: usize,
+    force_mq4_fp16: bool,
     paro_i8: bool,
     paro_i8_k8: bool,
 ) -> Result<(), DispatchError> {
@@ -934,9 +935,17 @@ fn dispatch_grouped_gemm(
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
     }
     match dtype {
-        DType::MQ4G256 => hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
-            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
-        )),
+        DType::MQ4G256 => {
+            if force_mq4_fp16 {
+                hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2_fp16(
+                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                ))
+            } else {
+                hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                ))
+            }
+        }
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
@@ -982,6 +991,23 @@ pub fn run_moe_prefill(
     }
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
+    let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
+    if std::env::var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
+             path2={} force_mq4_fp16={} grouped_i8={:?}",
+            ctx.arch.arch(),
+            p.dtypes.shared_gate,
+            p.dtypes.shared_expert_gate,
+            p.dtypes.shared_expert_up,
+            p.dtypes.shared_expert_down,
+            p.dtypes.routed_gate_up,
+            p.dtypes.routed_down,
+            res.use_path2,
+            force_mq4_grouped_fp16,
+            ctx.flags.moe_grouped_i8,
+        );
+    }
     let (n, mi, k_top, n_exp) = (p.batch_size, p.mi, p.k_top, p.n_exp);
     let (down_m, down_k, gate_up_k) = (p.down_m, p.down_k, p.gate_up_k);
     let total_slots = n * k_top;
@@ -1033,6 +1059,7 @@ pub fn run_moe_prefill(
             p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
             p.x_rot_batch, p.y_gate_up_grouped,
             2 * mi, gate_up_k, k_top, path2_m_total, n,
+            force_mq4_grouped_fp16,
             res.use_paro_i8, res.use_paro_i8_k8,
         )?;
         // Stage 3 unscatter combine: Y_grouped → gate_batch + up_batch.
@@ -1115,6 +1142,7 @@ pub fn run_moe_prefill(
             p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
             p.rot_batch, p.y_down_grouped,
             down_m, down_k, 1 /* x_row_div */, path2_m_total, total_slots,
+            force_mq4_grouped_fp16,
             res.use_paro_i8, res.use_paro_i8_k8,
         )?;
         hip!(gpu.moe_down_combine_grouped_k8(
