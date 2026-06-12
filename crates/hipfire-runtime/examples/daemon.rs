@@ -12969,13 +12969,50 @@ fn snap_tool_name(name: &str, known: &[String]) -> String {
     best.map(String::from).unwrap_or_else(|| name.to_string())
 }
 
-/// Normalize the `name` of each parsed tool_call against the known tool list.
-fn snap_call_names(calls: &mut [serde_json::Value], known: &[String]) {
+/// Snap a glitched argument key (e.g. `path_`, `path_l`) to a real parameter of
+/// the tool. Match exact, then prefix either way, preferring the longest valid
+/// parameter; pass through unchanged if nothing matches.
+fn snap_param_name(key: &str, valid: &[String]) -> String {
+    if valid.is_empty() || valid.iter().any(|v| v == key) {
+        return key.to_string();
+    }
+    let mut best: Option<&str> = None;
+    for v in valid {
+        if key.starts_with(v.as_str()) || v.starts_with(key) {
+            if best.map_or(true, |b| v.len() > b.len()) {
+                best = Some(v.as_str());
+            }
+        }
+    }
+    best.map(String::from).unwrap_or_else(|| key.to_string())
+}
+
+/// Normalize each parsed tool_call against the request's tool schemas: snap the
+/// tool `name` to a known tool, then snap each argument key to a real parameter
+/// of that tool (`tool_params` maps tool name → its parameter names).
+fn snap_call_names(
+    calls: &mut [serde_json::Value],
+    known: &[String],
+    tool_params: &[(String, Vec<String>)],
+) {
     for c in calls.iter_mut() {
-        if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
-            let snapped = snap_tool_name(name, known);
-            if snapped != name {
-                c["name"] = serde_json::Value::String(snapped);
+        let name = match c.get("name").and_then(|v| v.as_str()) {
+            Some(n) => snap_tool_name(n, known),
+            None => continue,
+        };
+        c["name"] = serde_json::Value::String(name.clone());
+        if let Some((_, valid)) = tool_params.iter().find(|(tn, _)| *tn == name) {
+            if !valid.is_empty() {
+                if let Some(args) = c.get_mut("arguments").and_then(|a| a.as_object_mut()) {
+                    for k in args.keys().cloned().collect::<Vec<_>>() {
+                        let sk = snap_param_name(&k, valid);
+                        if sk != k && !args.contains_key(&sk) {
+                            if let Some(v) = args.remove(&k) {
+                                args.insert(sk, v);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -12983,7 +13020,16 @@ fn snap_call_names(calls: &mut [serde_json::Value], known: &[String]) {
 
 #[cfg(test)]
 mod toolcall_robustness_tests {
-    use super::{parse_cohere_action, snap_call_names, snap_tool_name};
+    use super::{parse_cohere_action, snap_call_names, snap_param_name, snap_tool_name};
+
+    #[test]
+    fn snaps_glitched_param_key() {
+        let valid = ["path".to_string()];
+        assert_eq!(snap_param_name("path_", &valid), "path"); // the retest glitch
+        assert_eq!(snap_param_name("path_l", &valid), "path");
+        assert_eq!(snap_param_name("path", &valid), "path"); // correct passes through
+        assert_eq!(snap_param_name("command", &valid), "command"); // no match → as-is
+    }
 
     #[test]
     fn snaps_verbose_hallucinated_name() {
@@ -13010,7 +13056,11 @@ mod toolcall_robustness_tests {
 ]"#;
         let mut calls = parse_cohere_action(text);
         assert_eq!(calls.len(), 1);
-        snap_call_names(&mut calls, &["read".to_string()]);
+        snap_call_names(
+            &mut calls,
+            &["read".to_string()],
+            &[("read".to_string(), vec!["path".to_string()])],
+        );
         assert_eq!(calls[0]["name"], "read");
         assert_eq!(
             calls[0]["arguments"]["path"],
@@ -13025,7 +13075,11 @@ mod toolcall_robustness_tests {
     fn snaps_name_inside_recovered_call() {
         let text = r#"[{"tool_name": "bash immediate return command", "parameters": {"command": "ls"}}]"#;
         let mut calls = parse_cohere_action(text);
-        snap_call_names(&mut calls, &["bash".to_string()]);
+        snap_call_names(
+            &mut calls,
+            &["bash".to_string()],
+            &[("bash".to_string(), vec!["command".to_string()])],
+        );
         assert_eq!(calls[0]["name"], "bash");
     }
 }
@@ -13404,6 +13458,24 @@ fn generate_cohere2moe(
                 .collect()
         })
         .unwrap_or_default();
+    // name -> [parameter names], for snapping glitched argument keys.
+    let tool_params: Vec<(String, Vec<String>)> = tools
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    let f = t.get("function").unwrap_or(t);
+                    let name = f.get("name").and_then(|n| n.as_str())?.to_string();
+                    let params = f
+                        .get("parameters")
+                        .and_then(|p| p.get("properties"))
+                        .and_then(|p| p.as_object())
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    Some((name, params))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut tool_calls_emitted = false;
     let mut vis_buf = String::new();
 
@@ -13431,19 +13503,24 @@ fn generate_cohere2moe(
         if next_tok == eos_tok {
             if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
                 // Reasoning-only turn in progress — the model is ending after
-                // <think> with nothing visible. Mask EOS and re-sample to force a
-                // <|START_TEXT|>/<|START_ACTION|> continuation.
+                // <think> with nothing visible. FORCE a <|START_TEXT|> continuation
+                // rather than re-sampling the EOS-masked distribution: re-sampling
+                // drew from the low-probability tail (where garbage / other-language
+                // tokens live), emitting a garbage first token that then derailed the
+                // turn (the "veen hier" / "ماعopilot" glitches). Injecting the marker
+                // puts the model in the response section so its NEXT token is sampled
+                // normally (same as the think-budget force-close, which is coherent).
+                // Close thinking first if we somehow took EOS while still inside it.
                 eos_suppressions += 1;
                 eprintln!(
-                    "[cohere2moe] empty-turn guard: suppressed EOS after thinking with no visible \
-                     output (#{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
+                    "[cohere2moe] empty-turn guard: forcing START_TEXT (EOS after thinking, no \
+                     visible output, #{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
                 );
-                last_logits[eos_tok as usize] = f32::NEG_INFINITY;
-                next_tok =
-                    deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-                if next_tok == eos_tok {
-                    break; // still EOS even masked — give up rather than loop
+                if sec == Sec::Think {
+                    forced_toks.push_back(mk_think1);
                 }
+                forced_toks.push_back(mk_text0);
+                next_tok = forced_toks.pop_front().unwrap();
             } else {
                 break;
             }
@@ -13494,7 +13571,7 @@ fn generate_cohere2moe(
             // End of an action block → parse the JSON array into tool_calls,
             // snapping any verbose/hallucinated tool name to a real tool.
             let mut calls = parse_cohere_action(&action_buf);
-            snap_call_names(&mut calls, &known_tools);
+            snap_call_names(&mut calls, &known_tools, &tool_params);
             if !calls.is_empty() {
                 let _ = writeln!(
                     stdout,
@@ -13582,7 +13659,7 @@ fn generate_cohere2moe(
     if !tool_calls_emitted {
         let mut recovered = parse_cohere_action(&vis_buf);
         if !recovered.is_empty() {
-            snap_call_names(&mut recovered, &known_tools);
+            snap_call_names(&mut recovered, &known_tools, &tool_params);
             eprintln!(
                 "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
                 recovered.len()
