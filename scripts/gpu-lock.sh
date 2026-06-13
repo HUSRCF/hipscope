@@ -21,6 +21,7 @@
 
 LOCKFILE="${HIPFIRE_GPU_LOCKFILE:-/tmp/hipfire-gpu.lock}"
 POLL_INTERVAL="${GPU_POLL_INTERVAL:-5}"          # cadence of "busy" messages (s)
+(( POLL_INTERVAL < 1 )) && POLL_INTERVAL=1        # 0 would make flock -w non-blocking → spin
 GPU_LOCK_TIMEOUT="${GPU_LOCK_TIMEOUT:-1800}"     # hard cap (s); 0 = wait forever
 GPU_LOCK_FD=""                                   # set by gpu_acquire (auto-alloc)
 

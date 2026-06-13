@@ -23,13 +23,26 @@ pass=0 fail=0
 ok()  { echo "  PASS: $1"; pass=$((pass+1)); }
 bad() { echo "  FAIL: $1"; fail=$((fail+1)); }
 
+# Wait (up to ~5s) for a holder to actually acquire — gpu_acquire writes the
+# agent name into the lockfile only AFTER flock succeeds, so this confirms the
+# lock is genuinely held before we try to race/kill it. Avoids a vacuous pass
+# on a loaded runner where a fixed sleep fires before acquisition.
+await_held() {
+    local name="$1" i
+    for i in $(seq 1 50); do
+        grep -q "$name" "$HIPFIRE_GPU_LOCKFILE" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 # ── 1. stale self-heal ────────────────────────────────────────────────────
 echo "[1] stale self-heal (kill -9 holder, next acquire must succeed fast)"
 # setsid → own process group so kill -9 takes the holder AND any children
 # (otherwise an inherited fd in a child would keep the flock alive).
 setsid bash -c "source '$LOCKSH'; gpu_acquire holder1 >/dev/null; sleep 60" &
 holder_pid=$!
-sleep 1
+await_held holder1 || bad "holder1 never acquired (test setup race)"
 kill -9 -"$holder_pid" 2>/dev/null || kill -9 "$holder_pid" 2>/dev/null
 sleep 1
 if timeout 8 bash -c "source '$LOCKSH'; GPU_LOCK_TIMEOUT=5 gpu_acquire holder2 >/dev/null 2>&1; gpu_release >/dev/null 2>&1"; then
@@ -42,7 +55,7 @@ fi
 echo "[2] genuine busy holder -> waiter times out with non-zero exit"
 setsid bash -c "source '$LOCKSH'; gpu_acquire busy1 >/dev/null; sleep 60" &
 busy_pid=$!
-sleep 1
+await_held busy1 || bad "busy1 never acquired (test setup race)"
 timeout 12 bash -c "source '$LOCKSH'; GPU_LOCK_TIMEOUT=2 GPU_POLL_INTERVAL=1 gpu_acquire waiter >/dev/null 2>&1"
 rc=$?
 kill -9 -"$busy_pid" 2>/dev/null || kill -9 "$busy_pid" 2>/dev/null
