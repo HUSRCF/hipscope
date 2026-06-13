@@ -1,9 +1,32 @@
-# ArchSpec + the `ArchInstance` dyn boundary
+# ArchSpec + the daemon↔model step contract
 
-**Date:** 2026-06-13
+**Date:** 2026-06-13 (N1 revised same day, post-adversarial-review + ADHD)
 **Branch:** `feature/paro-transparent-loading`
-**Status:** Design / proposal (no code yet, except the CarrierKit prototype tracked separately)
+**Status:** §2 (the unified step contract) is **SUPERSEDED** — kept as a documented dead-end per
+Rule 3. §3–§5 (the `ArchSpec` authoring surface) remain **live as BET 2** of the greenfield design.
 **Scope:** How to minimize the effort of adding a new model architecture to hipfire.
+
+> **⚠️ Supersession (2026-06-13).** A *third* review round found the `advance(ctx, cursor)` +
+> `Speculative<T,D>` contract below was still over-built and rested on a misread lifecycle (the
+> daemon rebuilds a transient `ModelSlot` per spec call). The conclusion: the unified-dispatch
+> contract is the wrong *first* move — the root problem is **ownership**, not the contract shape.
+> The shipping design is in **`2026-06-13-greenfield-engine-architecture.md`**: a `Runtime`
+> **enum** with **forward statically dispatched** (no per-token vtable), the ownership split, and
+> the spec/contract work deferred as gated BETs. Read §2 below as the rejected exploration that
+> motivated the greenfield doc; the `dyn ArchStep`/`advance(ctx, cursor)` form here is the
+> **deferred BET-1 (spec subsystem) / BET-3 (dyn boundary)** shape — *not* the shipping boundary,
+> and explicitly **perf-gated** (greenfield §9 R3 microbench) before it could ever land.
+
+> **N1 history (preserved per Rule 3):** this doc originally proposed a single
+> `ArchInstance::decode_step` dyn boundary. **Round 1** — adversarial review shot it down (RED:
+> two return contracts, a triple-`&mut` borrow, 6 spec signatures, big-bang); an ADHD pass
+> found the keystone (sampling behind a ctx) and a three-layer `StepCtx`/`Progress` contract.
+> **Round 2** — a second review found that contract still had three gaps (spec *accounting*
+> didn't fit `Progress`; the *two-model* state needed a downcast; nothing *validated* it short
+> of a big-bang); a second ADHD pass resolved all three into the `advance(ctx, cursor)` +
+> `Speculative<T,D>` design in §2 below. **Round 3** — superseded (see banner above): the
+> contract ships as gated BETs, not as the primary boundary. The naive sketch is kept as the
+> documented strawman.
 
 This doc is the written form of a 4-agent review of the unified-loading work on this
 branch. It is the source-of-truth reasoning behind todo items **N1–N6 + C1–C3** in the
@@ -73,56 +96,186 @@ across the layer stack — is unmeasurable. Nobody is proposing to dyn-dispatch 
 GEMVs; only the top-level entry point. The trait's own evidence for "measurable tok/s loss"
 is *inner-loop* (per-op) dispatch, which is a different thing.
 
-### The fix
+### The naive fix — and why it failed review
 
-Introduce an object-safe trait:
+The obvious fix is an object-safe trait with one forward entry point:
 
 ```rust
-/// Object-safe, hot-path entry points. One vtable lookup per token step.
+// NAIVE — does NOT survive contact with the call sites. Kept here as the
+// strawman the adversarial review (2026-06-13) shot down. See below.
 pub trait ArchInstance: Send {
     fn decode_step(&mut self, ctx: &mut DecodeCtx) -> Result<StepOut, String>;
     fn prefill(&mut self, ctx: &mut PrefillCtx) -> Result<PrefillOut, String>;
-
-    /// Exhaustive, compiler-enforced teardown. Closes the C2 silent-leak class.
     fn free(&mut self, gpu: &mut Gpu);
-
-    // Optional capabilities; default None so non-participating arches opt out cleanly.
     fn as_spec_decode(&mut self) -> Option<&mut dyn SpecDecode> { None }
     fn as_ep(&mut self) -> Option<&mut dyn EpServe> { None }
 }
 ```
 
-Then:
+An adversarial review of this sketch came back **RED**, with cited evidence:
+
+1. **Two irreconcilable *return* contracts.** Host-logit arches
+   (deepseek4/lfm2moe/minimax) return `Vec<f32>` and the daemon samples host-side
+   (`daemon.rs:9325,9660,10029`); qwen35 spec-decode samples **on-GPU inside the tree
+   step** and returns already-committed tokens (`SpecStepResult`). A single
+   `decode_step(ctx) -> StepOut` cannot be both "return logits, caller samples" and "I
+   already sampled and committed B tokens."
+2. **A concrete simultaneous-`&mut` borrow.** `daemon.rs:3837-3977` holds `target` (the
+   model) + `m.dflash` + `m.dflash_checkpoints` mutably **at the same time**. Move the model
+   behind `Box<dyn>` and the qwen35-only spec state must move inside the box — at which point
+   `seed_target_hidden_suffix` can no longer take them as separate `&mut` args. `Box<dyn>`
+   coarsens borrow granularity and breaks every spec site.
+3. **`as_spec_decode` swallows the win.** There are 6 flag-selected spec variants with
+   different signatures; one downcast object can't span them, so the per-arch matching the
+   trait claimed to delete reappears behind `Any`.
+4. **Big-bang.** `generate()` hard-branches on `arch_id` into 9 structurally different
+   pipelines *before* any unified call, so you cannot put one arch behind the trait and leave
+   the rest — untestable until 100% converted, against the byte-identical-token gate.
+
+The naive trait is the manifest trap (option d, §3) relocated onto the **borrow axis**.
+
+### The contract (resolved across two review rounds)
+
+The naive trait failed because the divergence is *four* problems, not one. A first divergent
+pass (`/adhd`) found the keystone — **move sampling behind a capability so models commit tokens
+instead of returning logits** — but a *second* adversarial review showed that keystone alone
+still left three gaps: the spec **accounting** return (`{accepted, bonus_token, drafted}`)
+didn't fit a uniform result; the spec **two-model** state (a draft model + rings) couldn't live
+in a generic ctx without a downcast; and nothing **validated** any of it short of a big-bang. A
+second ideation pass resolved all three. The settled contract:
 
 ```rust
-// before:  a 45-field god-struct with ~20 per-arch Option<…> fields
-// after:
-pub struct LoadedModel {
-    pub model: Box<dyn ArchInstance>,
-    pub tokenizer: Tokenizer,
-    pub chat_template: Option<&'static str>,
-    pub eos: EosSet,
-    // … only genuinely shared fields remain
+pub trait ArchStep {            // object-safe; one vtable lookup per *token step*
+    fn advance(&mut self, ctx: &mut StepCtx, cursor: &mut DaemonCursor) -> StepStatus;
 }
+pub struct StepStatus { pub hit_eos: bool }   // control flow only — never accounting
 ```
 
-The ~70 daemon ladders collapse to single calls:
+Two seams, deliberately split:
+
+- **`StepCtx` = inputs + capabilities** the model *reads* — `gpu`, plus sampling
+  (`sample_masked` / `validate_committed`, below).
+- **`DaemonCursor` = the effects sink** the model *writes* — `push_token(TokenId)`,
+  `advance_position(n)`, `set_seed(TokenId)`, `record_tau(drafts, accepted)` (default no-op).
+  The arch applies its **own** accounting to the cursor; the daemon never reads arch-shaped
+  result fields.
+
+The daemon is thus generic over **behaviour** (what gets pushed to the cursor), not over
+**shape** (a result struct). The four divergences become four rows, each resolving cleanly:
+
+| Divergence | How it resolves | Seam |
+|---|---|---|
+| **commit** (1 vs N tokens) | `cursor.push_token` × N — AR is the N=1 case | `DaemonCursor` |
+| **accounting** (position/seed/τ) | the step *self-applies* via `cursor.advance_position`/`set_seed`/`record_tau`; its fat result (`MtpSpecResult`/`SpecStepResult`) stays **private** | `DaemonCursor` |
+| **constraint** (grammar) | genuinely two-shaped: `ctx.sample_masked` (host pre-mask) vs `ctx.validate_committed` (spec post-hoc reject) | `StepCtx` |
+| **two-model state** | spec is its *own arch* (`Speculative<T,D>`), owning both models concretely — below | the arch, *not* the ctx |
+
+**Why not the prettier forms.** (a) An associated result `type Step: Commit` is **not
+object-safe** — you cannot `Box<dyn ArchStep>` when `advance` returns `Self::Step` by value. So
+the self-application is folded *into* `advance` via the passed-in `cursor`: zero per-token
+alloc, object-safe, arch crates stay out-of-tree. (b) A uniform `Progress { committed, accepted,
+bonus, rolled_back, … }` would grow a spec-shaped tail plain decode never uses — the fat struct
+the first review warned about, relocated. The cursor avoids both: accounting is a *sequence of
+effect calls*, not a returned shape. (Ergonomic escape hatch that survives: a blanket
+`impl<S: Commit> ArchStep for S` lets an arch author *write* a private `Step: Commit` and the
+blanket bridges it to the object-safe method — no alloc, no object-safety break.)
+
+#### Spec-decode is an arch, not a daemon mode (resolves the two-model knot)
+
+The second review's sharpest finding: putting spec state in `StepCtx` does **not** dissolve the
+borrow hazard — it makes `StepCtx` arch-specific or forces a `Box<dyn SpecState>` downcast, and
+the real hazard is a **four-way** borrow involving a **second model** (the draft) at
+`daemon.rs:4416`, partly in prefill/seeding. The resolution is composition:
 
 ```rust
-// before:
-if let Some(ref mut s) = m.deepseek4_weights { deepseek4::decode_step(s, &mut ctx)?; }
-else if let Some(ref mut s) = m.minimax_weights { minimax::decode_step(s, &mut ctx)?; }
-else if /* … 68 more … */
-
-// after:
-m.model.decode_step(&mut ctx)?;
+pub struct Speculative<T: TargetModel, D: DraftModel> {
+    target: T,            // CONCRETE, not dyn — verify needs target internals
+    draft:  D,
+    rings:  DflashState,  // the 11 ex-sibling fields, now wrapper-private
+}
+impl<T: TargetModel, D: DraftModel> ArchStep for Speculative<T, D> { /* advance = spec_step body */ }
 ```
 
-**Net effect:** adding an arch touches **zero shared files except one `REGISTRY` line.**
-`Carrier::load` returns `Box<dyn ArchInstance>`; the loader and daemon never name the arch.
+- `Speculative` **is** an `ArchStep`. It owns target + draft + rings as its own fields, so the
+  four-way borrow becomes **disjoint `&mut self.field` borrows** (legal Rust). The daemon holds
+  one `dyn ArchStep` and never sees the split — the dyn boundary sits at `Speculative` itself
+  (per-token, fine).
+- **`target` must be concrete, not `dyn`.** Verify reaches target internals a bare `ArchStep`
+  can't surface — `target.{scratch.logits, final_hidden, dn_snapshot/restore, kv_mut}` — so
+  `Speculative` is *generic* over a `TargetModel` super-surface. Making target `dyn` would push
+  per-op virtual calls into the verify inner loop (the banned cost). Monomorphised target/draft
+  *inside*; dyn boundary *outside*.
+- **Seeding is a `Speculative::seed()` method, not on `ArchStep`** — a one-shot pre-loop phase
+  on the same `TargetModel` surface, so it never co-occurs with the steady-state borrow.
 
-**Effort: L.** This reverses an explicit, commented design decision — the "beyond surgical"
-change. Everything else in this doc is smaller and partly enabled by it.
+hipfire already has the precedent (`SpecPair { target, draft }`, `speculative.rs:720`); this
+generalises it and folds `DflashState` in. **Consequence:** the ~70 `if m.dflash.is_some()`
+ladders, the ~10 spec entrypoints, and `generate_dflash` collapse into the *same*
+`while …advance(ctx, cursor)` loop as plain decode — spec-decode stops being a concept and
+becomes "an arch whose `advance` commits N and whose constructor took two models."
+
+#### Dispatch + the awkward 10% (manifest, stages)
+
+- **Dispatch by capability manifest, not `arch_id`.** Each arch publishes `Capabilities` at
+  load (`{ spec, samples_on_gpu, needs_vision_tower, is_ep, … }`); the 9 `generate_*` pipelines
+  collapse to one strategy-parameterised shell (`m.dflash.is_some() && temp<=eps && arch_id∈{5,6}`
+  → `m.caps.spec.is_dflash() && temp<=eps`). Prefer **capabilities-as-code** (`sampler: &dyn
+  SamplerStrategy` over a bool — declaring == implementing) + a `cargo test` conformance check
+  (`caps.spec==DFlash ⟹ dflash present`) to stop drift; `mut_state: &[StateKind]` is
+  documentation, *not* compile-time borrow safety (the actual `&mut` in `advance` is).
+- **The awkward 10% as DATA.** VL splice / EP gather become daemon-composed pre-forward
+  `Stage`s so `advance` always sees assembled hidden states; the ~10 spec entrypoints become a
+  `StepPlan` value over the **`execute_steps` op-list llama already runs** (N6). Novel kernels
+  (DeltaNet/MoE/MLA) stay hand-written, referenced by name — data wires, code does the math.
+
+#### Constraint is genuinely two-shaped — and must not be faked
+
+The one divergence that does **not** unify. Host path masks logits *before* sampling
+(`daemon.rs:3149-3151`, then matcher-advance `3177-3178`); the DFlash path **cannot** reach the
+verifier tree's per-slot logits and degrades to **post-hoc rejection** (`4127-4143`, mirror
+`res.retain_mask` `4216-4220`). A single `ctx.sample()` would hide this — risking a silent
+DFlash grammar-behaviour change (a coherence regression dressed as a refactor). So `StepCtx`
+names *both*: `sample_masked(logits, mask)` (host pre-mask) and `validate_committed(ids) ->
+RetainMask` (spec post-hoc); the cursor's `advance_position` already absorbs the rollback count.
+**The commit/accounting contracts unify; the constraint contract is honestly two-shaped — that
+distinction is the design, not a wart.**
+
+#### De-risking — two `cargo check` spikes before any big-bang
+
+The third gap was *validation*: the clean arches (lfm2moe/minimax) can't exercise variable-width
+commit, the two-model borrow, or the accounting, so a runtime prototype on them proves nothing.
+The cheap, informative tests are compile-/host-level and need **no GPU**:
+
+1. **Borrow spike (two-model knot).** Define `ArchStep` + `TargetModel` + `Speculative<T>` in
+   `hipfire-arch-qwen35`, paste the existing `spec_step_dflash` body into `advance` renaming
+   params to `self.*`, `cargo check`. The one question: do the four disjoint borrows +
+   `T::forward_hidden(&mut self.target)` coexist without `E0499`? (A returned `&GpuTensor`
+   colliding with a `&mut self.rings` write → fix is `forward_hidden_into(dst)`, found at
+   compile time — matches how the code already copies into `target_hidden_host`.)
+2. **Contract spike + property test (accounting).** A `#[allow(dead_code)]` fn that destructures
+   the real `SpecStepResult` and binds the real `spec_step_dflash` borrows (never runs, must
+   compile — so any future reshape fails CI). Plus a `#[cfg(test)]` cursor-mirror driven by a
+   **scripted** degenerate draft (fixed `drafted` vector) + scripted target oracle accepting the
+   first `k ∈ {0, 2, b-1}` — hitting rollback / partial / full-accept+bonus-seed, asserting
+   `position == Σ(accepted+1)` and `τ == Σaccepted/cycles`. **Trap:** `draft == target` trivially
+   accepts everything and proves nothing; the draft must be *scripted* so `accepted < drafted` is
+   reachable.
+
+Both can gate the pre-commit hook *before* a GPU boots, and become the permanent contract
+regression harness.
+
+### Net effect and effort
+
+Adding a *dense* arch touches **one `REGISTRY` line + one spec**; the daemon never names it. All
+four divergences resolve — commit/accounting via the cursor, constraint as two declared sampling
+methods, the two-model knot as a wrapper-arch — and spec-decode/VL/EP stop being daemon code
+paths.
+
+**Effort: L**, reversing an explicit commented decision. But it is **incremental and gated**:
+the two compile spikes prove the hard parts (borrow + accounting) with no GPU and no big-bang;
+the leak-driven `ModelState` fold (the plan's Phase 1) ships independently; only then does the
+contract land on a real arch. See the plan
+(`docs/superpowers/plans/2026-06-13-noncore-teardown-and-step-contract.md`).
 
 ---
 
@@ -298,7 +451,7 @@ Ordered by *cost-adjusted value* (do net-negative-cost items first):
 | # | Change | Effort | Note |
 |---|--------|:------:|------|
 | **N2** | **CarrierKit** — collapse the 5 byte-identical non-core carriers into a generic `HfqCarrier{id,name,load_fn}`; extract one `build_kv_cache()` for the ×4–7 KV-mode ladder (which has 3 *disagreeing* defaults) | S–M | **net-negative cost. Prototype first — validates the direction.** |
-| **N1** | **`ArchInstance` dyn boundary** — `Box<dyn>` replaces the god-struct, collapse ~70 daemon ladders, exhaustive `free()` closes C2 | L | root cause; highest payoff |
+| **N1** | **step contract** — `advance(&mut self, ctx, cursor) -> StepStatus` (sampling reads `StepCtx`, commits/accounting write `DaemonCursor` → unifies commit+accounting, no fat struct); `Speculative<T,D>` wrapper-arch owns the two-model state (no downcast); capability-manifest dispatch; stages/`StepPlan` for VL/EP; constraint honestly two-shaped (`sample_masked` vs `validate_committed`); two `cargo check` spikes de-risk it. Exhaustive `free()` closes C2 | L | root cause; highest payoff; incremental + gated |
 | **N3** | **`QuantCodec` registry** — one data table replaces the 3–4 lockstep `match quant_type` tables; extract `fwht256_inplace` (inlined **6×** in attractor-critical math, `weight_backend.rs:608,689,864,911,956,1032`) | L (+S for fwht) | do the fwht extraction first, independently |
 | **N4** | **`ConfigSchema`** rows replace the ×2 hand-walked config parsers | M | |
 | **N5** | **`ArchSpec`** aggregate + `Forward::DenseTransformer` over the Step interpreter | M | completes the declarative skin |
