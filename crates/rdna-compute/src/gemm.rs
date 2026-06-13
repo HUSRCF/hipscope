@@ -9209,6 +9209,25 @@ impl Gpu {
                         16,
                         32,
                     )
+                } else if self.arch_caps.is_rdna3_dgpu() {
+                    // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
+                    // overhead exceeds its coalescing gain here. Falsified in
+                    // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
+                    // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
+                    // on the 27B DFlash batched-verify gate_up the ldscoop variant
+                    // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
+                    // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
+                    // e3232034 ("ldscoop on others") tuned the default for gfx1151
+                    // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
+                    // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
+                    // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
+                    // its own measurement on hiptrx/gfx1201.
+                    (
+                        "gemm_gate_up_hfq4g256_wmma",
+                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                        16,
+                        32,
+                    )
                 } else {
                     (
                         "gemm_gate_up_hfq4g256_wmma_ldscoop",
