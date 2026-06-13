@@ -76,11 +76,23 @@ indexed-batched MoE structure of the existing AoS kernels:
   the gfx1151 SoA standalone stay as-is.
 
 ## Increments
-1. **gate_up only**: SoA-indexed gate_up kernel + transpose-on-load (gate_up experts) +
-   dispatch flag + decode A/B. Fastest path to a yes/no on the real-decode win.
-2. **down**: SoA-indexed `_down_expanded` + down experts SoA + combine.
-3. **Ship**: full E8 decode A/B + coherence gate; default-on iff ≥8%, else flag-off+doc.
-   Optional: quantizer-native SoA emit (drop the load-time transpose).
+1. **gate_up only** — DONE (commit 637341f5). SoA-indexed gate_up kernel + transpose-on-
+   load + dispatch (decode `_indexed` AND prefill `_indexed_batched`). Validated COHERENT
+   on gfx1100 (kernel + transpose correct). **RESULT: A3B decode WASH — 102.0 (SoA) vs
+   102.0 (AoS) tok/s.** The bench's +38-73% was on LARGE DENSE shapes (M=11008); A3B's
+   per-expert gate_up is small (M=2*moe_intermediate ~1536), in the bench WASH regime
+   (cf. qkv-kv M=512). SoA coalescing helps big dense GEMVs, not small per-expert MoE
+   GEMVs — the indexed-context dilution risk, realized. Kept opt-in (default OFF).
+   Gotchas: download+reupload transpose OOM'd -> in-place overwrite; decode uses the
+   non-batched `_indexed` launcher (not `_indexed_batched`) -> wire both.
+2. **down** — DO NOT PROCEED for A3B: same small per-expert shape, same wash expected.
+   Only revisit if a model has large per-expert FFN (mi >> 4096) where SoA pays.
+3. **Ship** — N/A (no win to ship). The kernel/transpose/dispatch remain as correct,
+   reusable infra behind HIPFIRE_E8_SOA_EXPERTS for any future large-expert MoE.
+
+**VERDICT: SoA coalescing is a dense-GEMV win that does NOT transfer to small-per-expert
+MoE decode. The E8 102-vs-mq4-150 gap is not closeable via expert-GEMV layout on A3B —
+it's the structural ceiling + g32 format (see [[project_gfx11_e8_port_2026_06_13]]).**
 
 Owner notes: bench tree (`bench_e8_soa_correctness`, 5 variants × shapes + strip/LUT) is
 the reusable measurement rig. See [[project_gfx11_e8_port_2026_06_13]] for the full
