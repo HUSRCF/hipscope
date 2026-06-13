@@ -255,8 +255,8 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
-    if !arch.starts_with("gfx1151") {
-        println!("  SKIP — arch {} is not gfx1151", arch);
+    if !gpu.arch_caps.has_wmma_w32() {
+        println!("  SKIP — arch {} lacks RDNA3 wave32-WMMA", arch);
         return true;
     }
 

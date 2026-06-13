@@ -11348,8 +11348,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            self.arch_caps.is_gfx1151(),
-            "gemm_mfp4g32_e8_moe_grouped_wmma is gfx1151-only (current arch = {})",
+            self.arch_caps.has_wmma_w32(),
+            "gemm_mfp4g32_e8_moe_grouped_wmma needs RDNA3 wave32-WMMA (current arch = {})",
             self.arch
         );
         let kernel_name = "gemm_mfp4g32_e8_moe_grouped_wmma";

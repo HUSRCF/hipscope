@@ -530,6 +530,14 @@ impl MoePrefillResolution {
         // FP16-WMMA grouped kernel (gemm_mfp4g32_e8_moe_grouped_wmma) amortizes
         // expert-weight reads, the memory-bound prefill/verify lever. Other archs
         // have no grouped E8 sister → force Path 1 (indexed batched GEMV).
+        // gfx11 E8 port finding: grouped-WMMA E8 prefill stays gfx1151-only. The
+        // kernel IS gfx1100-correct (test_moe_grouped_wmma_e8 passes all cases on
+        // gfx1100) and portable, BUT on the dGPU (GDDR6 ~960 GB/s, ~4x Strix Halo's
+        // unified LPDDR5) its weight-read amortization is a WASH: measured pp512 97.5
+        // (grouped) vs 97.6 (Path-1 indexed), within noise — A3B prefill is bound by
+        // the sequential DeltaNet scan, not the MoE GEMM. So keep Path-1 on gfx1100
+        // (equal perf, one fewer JIT kernel). Re-widen to has_wmma_w32 only if a future
+        // long-context profile or blended-E8 grouped path shows a real win on gfx11.
         let e8_no_grouped = d.routed_gate_up == DType::MFP4G32E8 && !arch.is_gfx1151();
         let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
