@@ -2332,14 +2332,14 @@ fn main() {
                     // cursors so the next prefill writes from slot 0. Same
                     // rationale as the qwen2/deepseek4 resets above — without
                     // it, prior-turn KV/conv residue leaks into the new turn.
-                    if let Some(ref mut s) = m.lfm2moe_state {
-                        let _ = s.reset(&mut gpu);
+                    if let Some(b) = m.lfm2moe_mut() {
+                        let _ = b.state.reset(&mut gpu);
                     }
                     // arch_id=10 (MiniMax-M2): clear the KV cursor between turns.
                     // No captured hipGraph on this path by default, so no graph
                     // invalidation needed. reset() takes no gpu (cursor-only).
-                    if let Some(ref mut s) = m.minimax_state {
-                        s.reset();
+                    if let Some(b) = m.minimax_mut() {
+                        b.state.reset();
                     }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
@@ -2598,9 +2598,10 @@ fn main() {
                     // RoPE + top-4 MoE kernel set before any user-facing
                     // generate. This IS the production prefill shape (no
                     // batched kernel).
-                    let config = m.lfm2moe_config.as_ref().unwrap();
-                    let weights = m.lfm2moe_weights.as_ref().unwrap();
-                    let state = m.lfm2moe_state.as_mut().unwrap();
+                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if lfm2moe::forward::decode_step(
@@ -2618,9 +2619,10 @@ fn main() {
                     // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
                     // MoE kernel set before any user-facing generate. This IS
                     // the production prefill shape (the eager per-token path).
-                    let config = m.minimax_config.as_ref().unwrap();
-                    let weights = m.minimax_weights.as_ref().unwrap();
-                    let state = m.minimax_state.as_mut().unwrap();
+                    let b = m.minimax_mut().expect("arch_id=10 requires minimax bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if minimax::forward::decode_step(
@@ -2674,13 +2676,13 @@ fn main() {
                 }
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
-                if let Some(ref mut s) = m.lfm2moe_state {
-                    let _ = s.reset(&mut gpu);
+                if let Some(b) = m.lfm2moe_mut() {
+                    let _ = b.state.reset(&mut gpu);
                 }
                 // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
                 // reset its cursor (no gpu) for a cold prefill on the next request.
-                if let Some(ref mut s) = m.minimax_state {
-                    s.reset();
+                if let Some(b) = m.minimax_mut() {
+                    b.state.reset();
                 }
 
                 if run_ok {
@@ -2915,7 +2917,9 @@ fn generate_ep(
         return;
     }
     let eos_tok = if m.arch_id == 10 {
-        m.minimax_eos_tok
+        m.minimax()
+            .expect("arch_id=10 requires minimax bundle")
+            .eos_tok
     } else {
         m.deepseek4_eos_tok
     };
@@ -9502,7 +9506,7 @@ fn generate_lfm2moe(
         let _ = stdout.flush();
         return;
     }
-    if m.lfm2moe_config.is_none() {
+    if m.lfm2moe().is_none() {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"lfm2moe_config missing on arch_id=11 generate"}}"#,
@@ -9599,21 +9603,21 @@ fn generate_lfm2moe(
         return;
     }
 
-    let eos_tok = m.lfm2moe_eos_tok;
+    let eos_tok = m.lfm2moe().unwrap().eos_tok;
 
     // Capacity guard. No eviction on arch_id=11 — reset the KV + conv-state
     // cursors when the requested run would overflow the budget.
     let overflow = {
-        let state = m.lfm2moe_state.as_ref().unwrap();
+        let state = &m.lfm2moe().unwrap().state;
         state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
     };
     if overflow {
         let (n, cap) = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = &m.lfm2moe().unwrap().state;
             (state.n_tokens, state.max_seq)
         };
         eprintln!("[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",);
-        let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
+        let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -9624,9 +9628,10 @@ fn generate_lfm2moe(
     // are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let cfg = m.lfm2moe_config.as_ref().unwrap();
-        let weights = m.lfm2moe_weights.as_ref().unwrap();
-        let state = m.lfm2moe_state.as_mut().unwrap();
+        let b = m.lfm2moe_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_ids {
             match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
@@ -9677,9 +9682,10 @@ fn generate_lfm2moe(
         generated_count += 1;
 
         let step = {
-            let cfg = m.lfm2moe_config.as_ref().unwrap();
-            let weights = m.lfm2moe_weights.as_ref().unwrap();
-            let state = m.lfm2moe_state.as_mut().unwrap();
+            let b = m.lfm2moe_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
             let position = state.n_tokens as u32;
             lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
         };
@@ -9692,7 +9698,7 @@ fn generate_lfm2moe(
         }
     }
 
-    m.seq_pos = m.lfm2moe_state.as_ref().unwrap().n_tokens;
+    m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -9749,7 +9755,7 @@ fn generate_minimax(
         let _ = stdout.flush();
         return;
     }
-    if m.minimax_config.is_none() {
+    if m.minimax().is_none() {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"minimax_config missing on arch_id=10 generate"}}"#,
@@ -9857,22 +9863,22 @@ fn generate_minimax(
         return;
     }
 
-    let eos_tok = m.minimax_eos_tok;
+    let eos_tok = m.minimax().unwrap().eos_tok;
 
     // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when the
     // FULL rendered conversation + generation would overflow. `prompt_ids` is
     // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
     let overflow = {
-        let state = m.minimax_state.as_ref().unwrap();
+        let state = &m.minimax().unwrap().state;
         prompt_ids.len() + max_tokens > state.max_seq
     };
     if overflow {
         let (n, cap) = {
-            let state = m.minimax_state.as_ref().unwrap();
+            let state = &m.minimax().unwrap().state;
             (state.n_tokens, state.max_seq)
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
-        m.minimax_state.as_mut().unwrap().reset();
+        m.minimax_mut().unwrap().state.reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -9911,7 +9917,7 @@ fn generate_minimax(
                 eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
-                m.minimax_state.as_ref().unwrap().n_tokens,
+                m.minimax().unwrap().state.n_tokens,
             );
             }
             if cache_hit {
@@ -9920,13 +9926,13 @@ fn generate_minimax(
                 // stale reasoning+answer tail. The prefill loop below reads
                 // `state.n_tokens` as its base position, so n_tokens is the only
                 // KV state the rewind must touch (plus the mirror token history).
-                m.minimax_state.as_mut().unwrap().n_tokens = lcp;
+                m.minimax_mut().unwrap().state.n_tokens = lcp;
                 m.conversation_tokens.truncate(lcp);
                 m.seq_pos = lcp;
                 prompt_ids[lcp..].to_vec()
             } else {
                 if prior_len > 0 {
-                    m.minimax_state.as_mut().unwrap().reset();
+                    m.minimax_mut().unwrap().state.reset();
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                 }
@@ -9942,9 +9948,10 @@ fn generate_minimax(
     // logits are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let cfg = m.minimax_config.as_ref().unwrap();
-        let weights = m.minimax_weights.as_ref().unwrap();
-        let state = m.minimax_state.as_mut().unwrap();
+        let b = m.minimax_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
         // Batched prefill: process the prompt in chunks of <=64 tokens through
         // the batched verify forward (one weight read per chunk vs one
         // decode_step per token) → much lower TTFT. Validated byte-identical to
@@ -10049,9 +10056,10 @@ fn generate_minimax(
 
         // Advance one step on the freshly sampled token.
         let step = {
-            let cfg = m.minimax_config.as_ref().unwrap();
-            let weights = m.minimax_weights.as_ref().unwrap();
-            let state = m.minimax_state.as_mut().unwrap();
+            let b = m.minimax_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
             let position = state.n_tokens as u32;
             // hipGraph decode (opt-in via HIPFIRE_MINIMAX_GRAPH=1, default eager
             // — measured only +1.0% on gfx1151). First call warms up eager, then
@@ -10067,7 +10075,7 @@ fn generate_minimax(
         }
     }
 
-    m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+    m.seq_pos = m.minimax().unwrap().state.n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);

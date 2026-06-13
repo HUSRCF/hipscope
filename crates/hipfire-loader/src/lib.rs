@@ -232,10 +232,34 @@ impl AsstTurnCache {
 
 /// Arch-specific core state, dispatched in `LoadedModel.state`.
 /// Shared fields (kv_cache, dn_state) stay on `LoadedModel` directly.
+///
+/// `unload_model` matches this exhaustively with NO wildcard: adding a variant
+/// without a teardown arm is a compile error, which is the whole point of
+/// folding self-contained arch state in here rather than leaving it as loose
+/// `Option<…>` fields that a reload can silently leak.
 pub enum ModelState {
     Qwen2(hipfire_arch_qwen2::Qwen2Bundle),
     Qwen35(hipfire_arch_qwen35::Qwen35Bundle),
     Llama(hipfire_arch_llama::LlamaBundle),
+    Lfm2Moe(Lfm2MoeBundle),
+    Minimax(MiniMaxBundle),
+}
+
+/// LFM2.5-MoE (arch_id=11) GPU bundle. `eos_tok` is resolved at load time and
+/// rides along so the generate path doesn't re-tokenize.
+pub struct Lfm2MoeBundle {
+    pub config: lfm2moe::config::Lfm2MoeConfig,
+    pub weights: lfm2moe::lfm2moe::Lfm2MoeWeights,
+    pub state: lfm2moe::lfm2moe::Lfm2MoeState,
+    pub eos_tok: u32,
+}
+
+/// MiniMax-M2 (arch_id=10) GPU bundle.
+pub struct MiniMaxBundle {
+    pub config: minimax::MiniMaxConfig,
+    pub weights: minimax::MiniMaxWeights,
+    pub state: minimax::MiniMaxState,
+    pub eos_tok: u32,
 }
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
@@ -259,16 +283,9 @@ pub struct LoadedModel {
     pub deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     pub deepseek4_eos_tok: u32,
-    // LFM2.5-8B-A1B state
-    pub lfm2moe_config: Option<lfm2moe::config::Lfm2MoeConfig>,
-    pub lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
-    pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
-    pub lfm2moe_eos_tok: u32,
-    // MiniMax-M2 state
-    pub minimax_config: Option<minimax::MiniMaxConfig>,
-    pub minimax_weights: Option<minimax::MiniMaxWeights>,
-    pub minimax_state: Option<minimax::MiniMaxState>,
-    pub minimax_eos_tok: u32,
+    // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
+    // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
+    // compiler-enforced (see ModelState).
     // MTP config
     pub mtp_mode: String,
     pub mtp_k: usize,
@@ -324,14 +341,6 @@ impl LoadedModel {
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
-            lfm2moe_config: None,
-            lfm2moe_weights: None,
-            lfm2moe_state: None,
-            lfm2moe_eos_tok: 0,
-            minimax_config: None,
-            minimax_weights: None,
-            minimax_state: None,
-            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -353,6 +362,36 @@ impl LoadedModel {
             model_path,
             dflash: None,
             chat_template,
+        }
+    }
+
+    /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
+    pub fn lfm2moe(&self) -> Option<&Lfm2MoeBundle> {
+        match &self.state {
+            Some(ModelState::Lfm2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn lfm2moe_mut(&mut self) -> Option<&mut Lfm2MoeBundle> {
+        match &mut self.state {
+            Some(ModelState::Lfm2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// MiniMax-M2 bundle if this model is arch_id=10, else None.
+    pub fn minimax(&self) -> Option<&MiniMaxBundle> {
+        match &self.state {
+            Some(ModelState::Minimax(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn minimax_mut(&mut self) -> Option<&mut MiniMaxBundle> {
+        match &mut self.state {
+            Some(ModelState::Minimax(b)) => Some(b),
+            _ => None,
         }
     }
 
@@ -834,10 +873,12 @@ fn load_lfm2moe(
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        lfm2moe_config: Some(config),
-        lfm2moe_weights: Some(weights),
-        lfm2moe_state: Some(state),
-        lfm2moe_eos_tok: eos_tok,
+        state: Some(ModelState::Lfm2Moe(Lfm2MoeBundle {
+            config,
+            weights,
+            state,
+            eos_tok,
+        })),
         ..LoadedModel::skeleton(
             hfq.arch_id,
             tokenizer,
@@ -878,10 +919,12 @@ fn load_minimax(
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        minimax_config: Some(config),
-        minimax_weights: Some(weights),
-        minimax_state: Some(state),
-        minimax_eos_tok: eos_tok,
+        state: Some(ModelState::Minimax(MiniMaxBundle {
+            config,
+            weights,
+            state,
+            eos_tok,
+        })),
         ..LoadedModel::skeleton(
             hfq.arch_id,
             tokenizer,
@@ -1180,6 +1223,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
                 b.kv.free_gpu(gpu);
             }
+            ModelState::Lfm2Moe(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Minimax(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
         }
     }
     // Non-core arch weights
@@ -1198,21 +1249,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
     }
-    // lfm2moe / minimax / dots_ocr had NO teardown wired here → every reload
-    // leaked all their VRAM. lfm2moe/minimax free_gpu added this change;
-    // dots_ocr already had one, it just wasn't called.
-    if let Some(s) = m.lfm2moe_state {
-        s.free_gpu(gpu);
-    }
-    if let Some(w) = m.lfm2moe_weights {
-        w.free_gpu(gpu);
-    }
-    if let Some(s) = m.minimax_state {
-        s.free_gpu(gpu);
-    }
-    if let Some(w) = m.minimax_weights {
-        w.free_gpu(gpu);
-    }
+    // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
+    // ModelState match above. dots_ocr already had a free_gpu, it just wasn't
+    // called here (still a loose Option — fold in a future pass).
     if let Some(w) = m.dots_ocr_weights {
         w.free_gpu(gpu);
     }
