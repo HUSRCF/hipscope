@@ -588,6 +588,25 @@ fn run_moe_decode_cpu_fallback(
         });
     }
 
+    // hipGraph capture safety. This fallback's per-expert dispatch loop is
+    // indexed by host-side `topk_indices` (downloaded from the device), so it is
+    // fundamentally non-capturable: even with the [k] D2H made capture-safe, a
+    // captured graph would bake in THIS token's expert selection and mis-route on
+    // every replay. Refuse loudly instead of corrupting output (or crashing with
+    // a cryptic hipError 906). Only reachable when `!use_gpu_topk` (k != 8 or
+    // non-indexable routed dtype); every shipping model (A3B k=8, indexable) takes
+    // the GPU-top-K fast path and never lands here. A future k!=8 / non-indexable
+    // MoE model must run with HIPFIRE_GRAPH_MOE=0 (or HIPFIRE_AR_GRAPH=0). This
+    // replaces "graph safety depends on model-config luck" with a hard guard.
+    if gpu.graphs.replay.capturing.is_some() {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH_MOE=0)",
+            arch: "",
+            quant: "",
+        });
+    }
+
     let k = p.k;
     let mi = p.mi;
     let n_exp = p.n_exp;
