@@ -1063,6 +1063,12 @@ pub const GEMV_MFP4G32_E8_STRIP_GFX1151_SRC: &str =
 /// (memory-level-parallelism lever). Bit-exact with gemv_mfp4g32_e8_gfx1151.
 pub const GEMV_MFP4G32_E8_LDSX_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_ldsx.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE gate_up (k8 indexed) — mq4-parity expert kernel.
+pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
+pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

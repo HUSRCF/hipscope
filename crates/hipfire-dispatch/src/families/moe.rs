@@ -98,7 +98,14 @@ pub struct MoeResolution {
 }
 
 impl MoeResolution {
+    /// Arch-agnostic entry. mfp4-E8 grouped experts are gfx1151-only (no E8
+    /// grouped kernel on other arches), so `is_gfx1151 = false` here routes E8
+    /// to the CPU-top-K fallback — preserving every existing caller + test.
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
+        Self::resolve_arch(d, k, false)
+    }
+
+    pub fn resolve_arch(d: &MoeDtypes, k: usize, is_gfx1151: bool) -> Self {
         use DType::*;
         let gate_side_mq4 = d.router == MQ4G256
             && d.shared_gate == MQ4G256
@@ -126,6 +133,12 @@ impl MoeResolution {
         // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
         // gate_up GEMV; the merged dtype-tag kernel serves the down step.
         let routed_indexable_mixed_per_expert = d.routed_has_mixed_experts;
+        // mfp4-E8 grouped experts (gfx1151-only): uniform E8 gate_up + down →
+        // the gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels. FWHT-rotated
+        // (FwhtG256), same as MQ4, so the shared silu+mul+rotate plumbing applies.
+        let routed_gate_up_e8 = d.routed_gate_up == MFP4G32E8;
+        let routed_indexable_e8 =
+            is_gfx1151 && routed_gate_up_e8 && d.routed_down == MFP4G32E8;
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq5
@@ -134,7 +147,8 @@ impl MoeResolution {
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
             || routed_indexable_mq3lloyd
-            || routed_indexable_paro;
+            || routed_indexable_paro
+            || routed_indexable_e8;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
@@ -144,7 +158,8 @@ impl MoeResolution {
             || routed_gate_up_mq6
             || routed_gate_up_mq2lloyd
             || routed_gate_up_mq3lloyd
-            || routed_gate_up_paro;
+            || routed_gate_up_paro
+            || routed_indexable_e8;
 
         Self {
             gate_side_mq4,

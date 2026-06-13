@@ -5337,6 +5337,125 @@ impl Gpu {
         result
     }
 
+    /// mfp4-E8 grouped MoE gate_up (k8 indexed), gfx1151-only. Launches the
+    /// batched kernel with N=1 (bid=0 collapses the K_TOP-stride terms), so the
+    /// gate_batch/up_batch output matches the hfq4g256 k8-indexed contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed is gfx1151-only");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = 8i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            [m as u32, 8, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded), gfx1151-only.
+    /// Writes expert_outputs[N × K_TOP × M]; caller folds via moe_down_combine_k8_batched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded is gfx1151-only");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC,
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.

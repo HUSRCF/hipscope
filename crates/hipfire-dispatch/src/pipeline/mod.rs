@@ -219,7 +219,7 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    let res = MoeResolution::resolve(&p.dtypes, p.k);
+    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.is_gfx1151());
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
@@ -428,6 +428,12 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MFP4G32E8 {
+        // mfp4-E8 grouped experts (gfx1151-only; gated in MoeResolution).
+        hip!(gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+        ))?;
     } else {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
@@ -497,6 +503,12 @@ pub fn run_moe_decode(
         ))?;
     } else if p.dtypes.routed_down == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+            down_m, down_k, p.k, 1,
+        ))?;
+    } else if p.dtypes.routed_down == DType::MFP4G32E8 {
+        // mfp4-E8 grouped expert down (atomic-free expanded; combine below).
+        hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
