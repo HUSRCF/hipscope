@@ -22,6 +22,34 @@ fn e8_ldsx_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_LDSX").map(|v| v == "1").unwrap_or(false))
 }
 
+/// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
+/// GEMVs to the 4-way-unroll gfx11_dgpu twin rather than the gfx1151 kernel.
+///
+/// Default OFF. Measured on gfx1100 (RX 7900 XTX) 2026-06-13: WASH — twin 101.6
+/// vs baseline 102.1 tok/s (-0.5%, within ±1-3% noise), coherent, 0 spill,
+/// gfx1151 byte-untouched. This is a DIAGNOSTIC, not just a null result: dropping
+/// occupancy 16→10 waves (62→94 VGPR) to buy 4-way ILP changed decode by ~0%, which
+/// proves E8 decode is NOT memory-latency-bound on this dGPU — the 96MB Infinity
+/// Cache keeps expert weights hot, so the baseline 16-wave occupancy already hides
+/// the (cache-resident) latency. Therefore load-scheduling levers (unroll, prefetch,
+/// multi-row) cannot move it. The real 102→150 gap vs uniform-mq4 (hfq4 *g256*) is
+/// the E8 *g32* format: a UE8M0 block scale every 32 elements vs mq4's every 256 =
+/// ~8x more scale bytes + ldexp per weight — extra memory traffic + dequant that is
+/// the inherent PRICE of E8's MQ6-class quality, addressable only at the format level
+/// (coarser groups / compacter scales), not by any decode kernel schedule.
+/// Twins preserved for future experiments (larger models, >1 token/step prefill
+/// batching) where the cache spills to GDDR6 and latency-hiding may pay off.
+/// Set =1 to route through the 4-way-unroll twin for A/B.
+fn e8_dgpu_twin_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_E8_DGPU_TWIN")
+            .map(|v| v == "1")
+            .unwrap_or(false) // default OFF — delta <5% on gfx1100 (see comment)
+    })
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -5337,9 +5365,13 @@ impl Gpu {
         result
     }
 
-    /// mfp4-E8 grouped MoE gate_up (k8 indexed), gfx1151-only. Launches the
-    /// batched kernel with N=1 (bid=0 collapses the K_TOP-stride terms), so the
-    /// gate_batch/up_batch output matches the hfq4g256 k8-indexed contract.
+    /// mfp4-E8 grouped MoE gate_up (k8 indexed). Launches the batched kernel
+    /// with N=1 (bid=0 collapses the K_TOP-stride terms), so the gate_batch/up_batch
+    /// output matches the hfq4g256 k8-indexed contract.
+    ///
+    /// On RDNA3 dGPU (gfx1100/1101/1102) with HIPFIRE_E8_DGPU_TWIN enabled (default ON),
+    /// dispatches the 4-way-unroll gfx11_dgpu twin for better latency-hiding on GDDR6.
+    /// Falls back to the gfx1151 kernel on all other RDNA3 arches (gfx1151 iGPU).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
         &mut self,
@@ -5354,11 +5386,21 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!(self.arch_caps.has_wmma_w32(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 wave32-WMMA");
-        self.ensure_kernel(
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
-            kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
-        )?;
+        let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let (kname, ksrc, kfn) = if use_dgpu_twin {
+            (
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
+                kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC,
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
+            )
+        } else {
+            (
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+                kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kfn)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -5378,7 +5420,7 @@ impl Gpu {
             &kt_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            kname,
             [m as u32, 8, 1],
             [32, 1, 1],
             0,
@@ -5398,11 +5440,13 @@ impl Gpu {
         )
     }
 
-    /// Batched mfp4-E8 grouped MoE gate_up (k8 indexed), gfx1151-only. Same kernel
-    /// as the decode wrapper but launched over `n` tokens (grid.z = n): the kernel
-    /// reads `topk_indices[bid*k_top + krank]` and `x + bid*K`, writing
+    /// Batched mfp4-E8 grouped MoE gate_up (k8 indexed). Same kernel as the decode
+    /// wrapper but launched over `n` tokens (grid.z = n): reads
+    /// `topk_indices[bid*k_top + krank]` and `x + bid*K`, writing
     /// `y_gate/y_up[bid*k_top*mi + krank*mi + ...]`. Used by `run_moe_prefill` Path 1
     /// for the batched verify / prefill of E8 A3B.
+    /// RDNA3 dGPU (gfx1100/1101/1102): dispatches the 4-way-unroll twin when
+    /// HIPFIRE_E8_DGPU_TWIN is enabled (default ON).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
         &mut self,
@@ -5419,11 +5463,21 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!(self.arch_caps.has_wmma_w32(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 wave32-WMMA");
-        self.ensure_kernel(
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
-            kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
-        )?;
+        let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let (kname, ksrc, kfn) = if use_dgpu_twin {
+            (
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
+                kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC,
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
+            )
+        } else {
+            (
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+                kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
+                "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kfn)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -5443,7 +5497,7 @@ impl Gpu {
             &kt_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            kname,
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
@@ -5463,8 +5517,10 @@ impl Gpu {
         )
     }
 
-    /// mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded), gfx1151-only.
+    /// mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
     /// Writes expert_outputs[N × K_TOP × M]; caller folds via moe_down_combine_k8_batched.
+    /// On RDNA3 dGPU (gfx1100/1101/1102) with HIPFIRE_E8_DGPU_TWIN (default ON),
+    /// dispatches the 4-way-unroll gfx11_dgpu twin.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
         &mut self,
@@ -5480,11 +5536,21 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!(self.arch_caps.has_wmma_w32(),
             "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 wave32-WMMA");
-        self.ensure_kernel(
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
-            kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC,
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
-        )?;
+        let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let (kname, ksrc, kfn) = if use_dgpu_twin {
+            (
+                "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded_dgpu",
+                kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX11_DGPU_SRC,
+                "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded_dgpu",
+            )
+        } else {
+            (
+                "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+                kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC,
+                "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kfn)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let rbp = rot_batch.buf.as_ptr();
@@ -5502,7 +5568,7 @@ impl Gpu {
             &kt_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            kname,
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,

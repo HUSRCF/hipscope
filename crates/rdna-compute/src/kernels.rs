@@ -1069,6 +1069,17 @@ pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
 /// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
 pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip");
+/// gfx11_dgpu (RDNA3 discrete, e.g. gfx1100 RX 7900 XTX) twin of the gfx1151 E8 MoE
+/// gate_up kernel. Uses a 4-way group unroll with 4 independent accumulators +
+/// __launch_bounds__(32,4) to raise VGPR budget to ~94 (10 waves/SIMD) and expose
+/// 4× independent load streams per iteration, hiding GDDR6 latency.
+/// Guard: arch_caps.is_rdna3_dgpu(); kill-switch: HIPFIRE_E8_DGPU_TWIN=0.
+pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx11_dgpu.hip");
+/// gfx11_dgpu twin of the gfx1151 E8 MoE down (k8 indexed, atomic-free expanded) kernel.
+/// Same 4-way unroll strategy as the gate_up twin. Guard + kill-switch: see gate_up twin.
+pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX11_DGPU_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx11_dgpu.hip");
 /// Batched sigmoid-scaled residual add (generic f32): y[t,:] += sigmoid(scalars[t]) * x[t,:].
 /// Folds the Q8 shared-expert down output into the residual in batched MoE prefill.
 pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
