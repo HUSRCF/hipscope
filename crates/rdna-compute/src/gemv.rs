@@ -5,6 +5,15 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+/// DIAGNOSTIC: when HIPFIRE_E8_STRIP=1, gemv_mfp4g32_e8 (gfx1151) launches the
+/// compute-stripped kernel instead of the real decode kernel — for measuring
+/// the memory-vs-compute bound (output is garbage). Cached once.
+fn e8_strip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_STRIP").map(|v| v == "1").unwrap_or(false))
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -3071,11 +3080,15 @@ impl Gpu {
         // 2 wave32 subgroups per block hide LPDDR5X latency better than 1 wave/block.
         // All other archs use the generic kernel (1 row/block, 32 threads) unchanged.
         if self.arch_caps.is_gfx1151() {
-            self.ensure_kernel(
-                "gemv_mfp4g32_e8_gfx1151",
-                kernels::GEMV_MFP4G32_E8_GFX1151_SRC,
-                "gemv_mfp4g32_e8_gfx1151",
-            )?;
+            // DIAGNOSTIC (HIPFIRE_E8_STRIP=1): swap in the compute-stripped kernel
+            // (same memory access, gutted decode) to measure the compute ceiling.
+            // Output is garbage — perf-probe only.
+            let (kname, ksrc) = if e8_strip_enabled() {
+                ("gemv_mfp4g32_e8_strip_gfx1151", kernels::GEMV_MFP4G32_E8_STRIP_GFX1151_SRC)
+            } else {
+                ("gemv_mfp4g32_e8_gfx1151", kernels::GEMV_MFP4G32_E8_GFX1151_SRC)
+            };
+            self.ensure_kernel(kname, ksrc, kname)?;
             let a_ptr = a_raw.buf.as_ptr();
             let x_ptr = x.buf.as_ptr();
             let y_ptr = y.buf.as_ptr();
@@ -3091,7 +3104,7 @@ impl Gpu {
             let grid_x = m as u32;
             return unsafe {
                 self.hip.launch_kernel(
-                    &self.functions["gemv_mfp4g32_e8_gfx1151"],
+                    &self.functions[kname],
                     [grid_x, 1, 1],
                     [32, 1, 1],
                     0,
