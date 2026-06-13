@@ -1198,6 +1198,24 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
     }
+    // lfm2moe / minimax / dots_ocr had NO teardown wired here → every reload
+    // leaked all their VRAM. lfm2moe/minimax free_gpu added this change;
+    // dots_ocr already had one, it just wasn't called.
+    if let Some(s) = m.lfm2moe_state {
+        s.free_gpu(gpu);
+    }
+    if let Some(w) = m.lfm2moe_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(s) = m.minimax_state {
+        s.free_gpu(gpu);
+    }
+    if let Some(w) = m.minimax_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(w) = m.dots_ocr_weights {
+        w.free_gpu(gpu);
+    }
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
