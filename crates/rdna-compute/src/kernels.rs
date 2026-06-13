@@ -1073,6 +1073,10 @@ pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str
 /// Folds the Q8 shared-expert down output into the residual in batched MoE prefill.
 pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/sigmoid_scaled_residual_add_batched.hip");
+/// gfx1151 mfp4-E8 grouped-WMMA-GEMM (Path 2 prefill). Amortizes expert-weight
+/// reads via the SGLang scatter pipeline + wave32 F16 WMMA with E8 lattice dequant.
+pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

@@ -515,11 +515,12 @@ impl MoePrefillResolution {
         let mq5_on_non_gfx12 = d.routed_gate_up == DType::MQ5G256
             && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq5_on_non_gfx12;
-        // mfp4-E8 routed experts (gfx1151-only) have no grouped-WMMA sister —
-        // force Path 1 (indexed batched GEMV) where the E8 gate_up/down indexed
-        // kernels live. Mirrors the mq5/mq6-on-non-gfx12 fall-throughs above.
-        let e8_routed = d.routed_gate_up == DType::MFP4G32E8;
-        let use_path2 = use_path2 && !e8_routed;
+        // mfp4-E8 routed experts: use Path 2 (grouped-WMMA) on gfx1151 — the
+        // FP16-WMMA grouped kernel (gemm_mfp4g32_e8_moe_grouped_wmma) amortizes
+        // expert-weight reads, the memory-bound prefill/verify lever. Other archs
+        // have no grouped E8 sister → force Path 1 (indexed batched GEMV).
+        let e8_no_grouped = d.routed_gate_up == DType::MFP4G32E8 && !arch.is_gfx1151();
+        let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();

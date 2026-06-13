@@ -1103,6 +1103,12 @@ fn dispatch_grouped_gemm(
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
+        // mfp4-E8 grouped-WMMA (gfx1151-only; MoePrefillResolution admits Path 2
+        // for E8 only on gfx1151). Amortizes expert-weight reads vs the indexed
+        // GEMV — the memory-bound prefill / batched-verify lever.
+        DType::MFP4G32E8 => hip!(gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
+            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        )),
         DType::ParoQ4G128 => {
             if paro_i8_k8 {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
