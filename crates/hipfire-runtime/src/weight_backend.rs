@@ -573,6 +573,41 @@ pub fn dequant_norm(
 
 /// Raw f16/f32 `data` → device `GpuTensor [n]` (no bias). Moved from
 /// `load_any_as_f32` (Task 2).
+/// Inverse FWHT-256 un-rotation applied per 256-element group during dequant of
+/// every FWHT-rotated format (MQ4/6, MQ3, MFP4, HFQ*-rotated, codebook 19/20/30):
+/// pre-multiply by `signs2`, in-place radix-2 Hadamard butterfly, then post-scale
+/// by `0.0625 * signs1` (0.0625 = 1/16 = the orthonormal 1/√256 normalization).
+///
+/// This is attractor-critical math — a sign/normalization error here is the
+/// "token soup" failure mode. It was previously inlined byte-for-byte in 6
+/// dequant arms; keep it single-source so any fix lands once. `signs1`/`signs2`
+/// come from `KvCache::gen_fwht_signs(42|1042, 256)` and are generated once per
+/// call site outside the group loop.
+fn fwht256_inplace(group: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    debug_assert_eq!(group.len(), 256);
+    for i in 0..256 {
+        group[i] *= signs2[i];
+    }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut j = 0;
+        while j < 256 {
+            for k in 0..stride {
+                let a = group[j + k];
+                let b = group[j + k + stride];
+                group[j + k] = a + b;
+                group[j + k + stride] = a - b;
+            }
+            j += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale_inv = 0.0625;
+    for i in 0..256 {
+        group[i] *= scale_inv * signs1[i];
+    }
+}
+
 pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
     let f32_data: Vec<f32> = match quant_type {
         1 => data
@@ -602,27 +637,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     out.push(scale * q as f32);
                 }
                 let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let inv_s = 0.0625;
-                for i in 0..256 {
-                    group[i] *= inv_s * signs1[i];
-                }
+                fwht256_inplace(group, &signs1, &signs2);
             }
             out
         }
@@ -683,27 +698,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     let s1 = signs1.as_ref().unwrap();
                     let s2 = signs2.as_ref().unwrap();
                     let group = &mut out[start..start + 256];
-                    for i in 0..256 {
-                        group[i] *= s2[i];
-                    }
-                    let mut stride = 1;
-                    while stride < 256 {
-                        let mut j = 0;
-                        while j < 256 {
-                            for k in 0..stride {
-                                let a = group[j + k];
-                                let b = group[j + k + stride];
-                                group[j + k] = a + b;
-                                group[j + k + stride] = a - b;
-                            }
-                            j += stride * 2;
-                        }
-                        stride <<= 1;
-                    }
-                    let scale_inv = 0.0625;
-                    for i in 0..256 {
-                        group[i] *= scale_inv * s1[i];
-                    }
+                    fwht256_inplace(group, s1, s2);
                 }
             }
             out
@@ -858,27 +853,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     out.push(cb[q7]);
                 }
                 let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
+                fwht256_inplace(group, &signs1, &signs2);
             }
             out
         }
@@ -905,27 +880,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     out.push(cb[(byte_val >> 6) & 3]);
                 }
                 let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
+                fwht256_inplace(group, &signs1, &signs2);
             }
             out
         }
@@ -950,27 +905,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     out.push(cb[(byte_val >> 4) & 0xF]);
                 }
                 let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
+                fwht256_inplace(group, &signs1, &signs2);
             }
             out
         }
@@ -1026,27 +961,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
                     }
                 }
                 let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
+                fwht256_inplace(group, &signs1, &signs2);
             }
             out
         }
@@ -1191,6 +1106,70 @@ impl<'a> WeightBackend for ParoBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fwht256_inplace` must be bit-identical to the per-arm inlined FWHT it
+    /// replaced (the version that shipped in 6 dequant arms). Pin it: run a
+    /// verbatim copy of the old inline sequence and the helper on the same
+    /// pseudo-random group + signs, assert exact f32 equality. A drift here is
+    /// the attractor / "token soup" failure mode, so equality must be exact.
+    #[test]
+    fn fwht256_inplace_matches_inlined_reference() {
+        // Deterministic pseudo-random inputs (no rand dep).
+        let mut x: u32 = 0x1234_5678;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 4.0 - 2.0
+        };
+        let group_init: Vec<f32> = (0..256).map(|_| next()).collect();
+        // signs are ±1 in practice; mirror that.
+        let signs1: Vec<f32> = (0..256)
+            .map(|_| if next() < 0.0 { -1.0 } else { 1.0 })
+            .collect();
+        let signs2: Vec<f32> = (0..256)
+            .map(|_| if next() < 0.0 { -1.0 } else { 1.0 })
+            .collect();
+
+        // Reference: verbatim old inline sequence.
+        let mut reference = group_init.clone();
+        {
+            let group = &mut reference[..];
+            for i in 0..256 {
+                group[i] *= signs2[i];
+            }
+            let mut stride = 1;
+            while stride < 256 {
+                let mut j = 0;
+                while j < 256 {
+                    for k in 0..stride {
+                        let a = group[j + k];
+                        let b = group[j + k + stride];
+                        group[j + k] = a + b;
+                        group[j + k + stride] = a - b;
+                    }
+                    j += stride * 2;
+                }
+                stride <<= 1;
+            }
+            let scale_inv = 0.0625;
+            for i in 0..256 {
+                group[i] *= scale_inv * signs1[i];
+            }
+        }
+
+        let mut got = group_init.clone();
+        fwht256_inplace(&mut got, &signs1, &signs2);
+
+        assert_eq!(got.len(), 256);
+        for i in 0..256 {
+            assert_eq!(
+                got[i].to_bits(),
+                reference[i].to_bits(),
+                "fwht256_inplace diverged from inlined reference at index {i}"
+            );
+        }
+    }
 
     #[test]
     fn nested_candidates_cover_both_layouts() {
