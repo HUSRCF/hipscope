@@ -3422,6 +3422,62 @@ impl Gpu {
         }
     }
 
+    /// Generic SoA E8 GEMV variant launcher (bench experiments). Same grid/block/
+    /// args as gemv_mfp4g32_e8_soa; only the kernel name + source differ.
+    pub fn gemv_mfp4g32_e8_soa_variant(
+        &mut self,
+        kname: &'static str,
+        src: &'static str,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "{kname} requires K%256==0, got K={k}");
+        self.ensure_kernel(kname, src, kname)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions[kname],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// SoA E8 GEMV, 4-way unroll (bench experiment — cache-roofline MLP sweep).
+    pub fn gemv_mfp4g32_e8_soa_u4(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_u4", kernels::GEMV_MFP4G32_E8_SOA_U4_SRC, a, x, y, m, k)
+    }
+    /// SoA E8 GEMV, 8-way unroll (bench experiment — cache-roofline MLP sweep).
+    pub fn gemv_mfp4g32_e8_soa_u8(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_u8", kernels::GEMV_MFP4G32_E8_SOA_U8_SRC, a, x, y, m, k)
+    }
+    /// SoA E8 GEMV, lattice-decode STRIPPED (bench probe — compute ceiling, garbage out).
+    pub fn gemv_mfp4g32_e8_soa_strip(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_strip", kernels::GEMV_MFP4G32_E8_SOA_STRIP_SRC, a, x, y, m, k)
+    }
+    /// SoA E8 GEMV, LUT-based coordinate decode (bench experiment).
+    pub fn gemv_mfp4g32_e8_soa_lut(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_lut", kernels::GEMV_MFP4G32_E8_SOA_LUT_SRC, a, x, y, m, k)
+    }
+
     /// mfp4-E8 SoA prerotated (x already FWHT-rotated by caller).
     pub fn gemv_mfp4g32_e8_soa_prerotated(
         &mut self,
