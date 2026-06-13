@@ -242,13 +242,24 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
         _ => {
+            // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
+            // carrier matches, so `load_model` fails cleanly with "no carrier for
+            // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
+            // deep in weight loading with a confusing error.
             eprintln!(
-                "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"
+                "warning: unrecognized model_type '{model_type}'; no carrier claims it \
+                 (add a carrier or extend derive_arch_id's model_type mapping)"
             );
-            5
+            UNCLAIMED_ARCH_ID
         }
     }
 }
+
+/// Sentinel `arch_id` emitted by [`derive_arch_id`] for an unrecognized
+/// `model_type`. No carrier's `claims_arch_id` matches it, so routing fails
+/// loudly with a clean "no carrier" error rather than silently defaulting to
+/// Qwen35. Far outside the assigned range (0..=64) the registry tests sweep.
+const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let qc = config.get("quantization_config")?;
@@ -299,4 +310,31 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
     }
 
     serde_json::to_string(&serde_json::Value::Object(meta)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn known_model_types_route_as_expected() {
+        assert_eq!(derive_arch_id(&json!({ "model_type": "llama" })), 0);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "mistral" })), 0);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen2" })), 1);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3.5" })), 5);
+        assert_eq!(
+            derive_arch_id(&json!({ "model_type": "qwen3.5", "num_experts": 8 })),
+            6
+        );
+    }
+
+    /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).
+    /// It returns the unclaimed sentinel so routing fails with a clean "no carrier".
+    #[test]
+    fn unrecognized_model_type_is_unclaimed_not_qwen35() {
+        let id = derive_arch_id(&json!({ "model_type": "totally_unknown_arch" }));
+        assert_eq!(id, UNCLAIMED_ARCH_ID);
+        assert_ne!(id, 5, "must not default to Qwen35");
+    }
 }
