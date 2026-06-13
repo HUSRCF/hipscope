@@ -557,90 +557,40 @@ impl Carrier for LlamaCarrier {
 
 // ─── Non-core carriers ───────────────────────────────────────────────
 
-pub struct Deepseek4Carrier;
-impl Carrier for Deepseek4Carrier {
-    fn name(&self) -> &'static str {
-        "deepseek4"
-    }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 9
-    }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        if ctx.pp > 1 {
-            return Err("deepseek4: pp>1 unsupported via registry".into());
-        }
-        let ModelSource::Hfq(hfq) = src else {
-            return Err("deepseek4: directory source unsupported".into());
-        };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-        crate::load_deepseek4(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
-    }
+/// Generic HFQ-only carrier: every non-core arch has the same load shape
+/// (pp>1 guard → `Hfq` destructure → tokenizer-from-metadata → delegate to
+/// a `crate::load_*` fn). Each concrete carrier differs only in its
+/// `arch_id`, `name`, and the load fn it calls — so they collapse into one
+/// struct parameterized by those three values.
+pub struct HfqCarrier {
+    pub arch_id: u32,
+    pub name: &'static str,
+    pub load: fn(
+        hipfire_runtime::hfq::HfqFile,
+        hipfire_runtime::tokenizer::Tokenizer,
+        &mut rdna_compute::Gpu,
+        usize,
+        &str,
+    ) -> Result<LoadedModel, String>,
 }
 
-pub struct DotsOcrCarrier;
-impl Carrier for DotsOcrCarrier {
+impl Carrier for HfqCarrier {
     fn name(&self) -> &'static str {
-        "dots_ocr"
+        self.name
     }
     fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 8
+        !is_dir && arch_id == self.arch_id
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("dots_ocr: pp>1 unsupported via registry".into());
+            return Err(format!("{}: pp>1 unsupported via registry", self.name));
         }
         let ModelSource::Hfq(hfq) = src else {
-            return Err("dots_ocr: directory source unsupported".into());
+            return Err(format!("{}: directory source unsupported", self.name));
         };
         let tokenizer =
             hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                 .map_err(|e| format!("tokenizer not found: {e}"))?;
-        crate::load_dots_ocr(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
-    }
-}
-
-pub struct Lfm2MoeCarrier;
-impl Carrier for Lfm2MoeCarrier {
-    fn name(&self) -> &'static str {
-        "lfm2moe"
-    }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 11
-    }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        if ctx.pp > 1 {
-            return Err("lfm2moe: pp>1 unsupported via registry".into());
-        }
-        let ModelSource::Hfq(hfq) = src else {
-            return Err("lfm2moe: directory source unsupported".into());
-        };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-        crate::load_lfm2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
-    }
-}
-
-pub struct MinimaxCarrier;
-impl Carrier for MinimaxCarrier {
-    fn name(&self) -> &'static str {
-        "minimax"
-    }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 10
-    }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        if ctx.pp > 1 {
-            return Err("minimax: pp>1 unsupported via registry".into());
-        }
-        let ModelSource::Hfq(hfq) = src else {
-            return Err("minimax: directory source unsupported".into());
-        };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-        crate::load_minimax(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+        (self.load)(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
     }
 }

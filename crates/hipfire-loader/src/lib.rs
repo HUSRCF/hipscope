@@ -54,10 +54,26 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
-    &DotsOcrCarrier,
-    &Deepseek4Carrier,
-    &MinimaxCarrier,
-    &Lfm2MoeCarrier,
+    &HfqCarrier {
+        arch_id: 8,
+        name: "dots_ocr",
+        load: load_dots_ocr,
+    },
+    &HfqCarrier {
+        arch_id: 9,
+        name: "deepseek4",
+        load: load_deepseek4,
+    },
+    &HfqCarrier {
+        arch_id: 10,
+        name: "minimax",
+        load: load_minimax,
+    },
+    &HfqCarrier {
+        arch_id: 11,
+        name: "lfm2moe",
+        load: load_lfm2moe,
+    },
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
