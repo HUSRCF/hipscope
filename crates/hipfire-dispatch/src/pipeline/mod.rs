@@ -219,7 +219,12 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.is_gfx1151());
+    // gfx11 E8 port: widen E8 grouped/GPU-topK admission from gfx1151-only to the
+    // whole RDNA3 wave32-WMMA family (has_wmma_w32 == is_rdna3, excludes gfx12/CDNA).
+    // gfx1100 (dGPU) shares the wave32 WMMA + scalar-E8 indexed-GEMV ISA with gfx1151
+    // (iGPU); routing it onto use_gpu_topk also removes the host-side router-logits
+    // D2H that crashes hipGraph capture on the dGPU.
+    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.has_wmma_w32());
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any

@@ -98,14 +98,14 @@ pub struct MoeResolution {
 }
 
 impl MoeResolution {
-    /// Arch-agnostic entry. mfp4-E8 grouped experts are gfx1151-only (no E8
-    /// grouped kernel on other arches), so `is_gfx1151 = false` here routes E8
-    /// to the CPU-top-K fallback — preserving every existing caller + test.
+    /// Arch-agnostic entry. The E8 indexed/grouped kernels exist on the RDNA3
+    /// wave32-WMMA family (gfx11; `arch_has_e8_wmma`); passing `false` here routes
+    /// E8 to the CPU-top-K fallback — preserving every existing caller + test.
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
         Self::resolve_arch(d, k, false)
     }
 
-    pub fn resolve_arch(d: &MoeDtypes, k: usize, is_gfx1151: bool) -> Self {
+    pub fn resolve_arch(d: &MoeDtypes, k: usize, arch_has_e8_wmma: bool) -> Self {
         use DType::*;
         let gate_side_mq4 = d.router == MQ4G256
             && d.shared_gate == MQ4G256
@@ -133,12 +133,12 @@ impl MoeResolution {
         // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
         // gate_up GEMV; the merged dtype-tag kernel serves the down step.
         let routed_indexable_mixed_per_expert = d.routed_has_mixed_experts;
-        // mfp4-E8 grouped experts (gfx1151-only): uniform E8 gate_up + down →
+        // mfp4-E8 grouped experts (RDNA3 wave32-WMMA): uniform E8 gate_up + down →
         // the gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels. FWHT-rotated
         // (FwhtG256), same as MQ4, so the shared silu+mul+rotate plumbing applies.
         let routed_gate_up_e8 = d.routed_gate_up == MFP4G32E8;
         let routed_indexable_e8 =
-            is_gfx1151 && routed_gate_up_e8 && d.routed_down == MFP4G32E8;
+            arch_has_e8_wmma && routed_gate_up_e8 && d.routed_down == MFP4G32E8;
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq5

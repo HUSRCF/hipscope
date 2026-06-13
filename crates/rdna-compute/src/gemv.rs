@@ -5352,8 +5352,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.is_gfx1151(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed is gfx1151-only");
+        debug_assert!(self.arch_caps.has_wmma_w32(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 wave32-WMMA");
         self.ensure_kernel(
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
             kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
@@ -5417,8 +5417,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.is_gfx1151(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched is gfx1151-only");
+        debug_assert!(self.arch_caps.has_wmma_w32(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 wave32-WMMA");
         self.ensure_kernel(
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
             kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
@@ -5478,8 +5478,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.is_gfx1151(),
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded is gfx1151-only");
+        debug_assert!(self.arch_caps.has_wmma_w32(),
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 wave32-WMMA");
         self.ensure_kernel(
             "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
             kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC,
