@@ -1069,6 +1069,10 @@ pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
 /// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
 pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip");
+/// Batched sigmoid-scaled residual add (generic f32): y[t,:] += sigmoid(scalars[t]) * x[t,:].
+/// Folds the Q8 shared-expert down output into the residual in batched MoE prefill.
+pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_scaled_residual_add_batched.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

@@ -1234,6 +1234,14 @@ pub fn run_moe_prefill(
                     p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
                     p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
                 )),
+                // mfp4-E8 grouped experts (gfx1151-only; forced to Path 1 in
+                // MoePrefillResolution since E8 has no grouped-WMMA sister). The
+                // indexed kernel batches over N via grid.z — x_rot_batch is the
+                // plain-FWHT rotation (E8 carries no AWQ; matches the decode path).
+                DType::MFP4G32E8 => hip!(gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                )),
                 _other => return Err(DispatchError::UnsupportedVariant {
                     family: "moe", variant: "prefill-gate-up-path1-dtype",
                     arch: "", quant: "other",
@@ -1256,7 +1264,9 @@ pub fn run_moe_prefill(
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
         // activations, not weight data). AWQ-aware variant when down has AWQ.
         match p.dtypes.routed_down {
-            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 => {
+            // MFP4G32E8 reuses the weight-agnostic silu+FWHT-rotate (E8 down expects
+            // FWHT(silu(g)*u), same as MQ4 — see the decode E8 path).
+            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 | DType::MFP4G32E8 => {
                 if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
                     // Route A MoE-AWQ (per-routed-expert, indexed by topk slot).
                     // total_slots rows = N·k_top; each slot's expert is
@@ -1334,6 +1344,10 @@ pub fn run_moe_prefill(
                 down_m, down_k, k_top, n,
             )),
             DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            DType::MFP4G32E8 => hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
                 down_m, down_k, k_top, n,
             )),
