@@ -527,6 +527,80 @@ impl MiniMaxWeights {
     }
 }
 
+// ──────────────────────────── Teardown ────────────────────────────
+// Exhaustive-destructure frees so a future added GPU-bearing field is a
+// compile error, not a silent VRAM leak. WeightTensors use `free_all`
+// (buf + non-aliased ParoQuant rotation + AWQ sidecar).
+//
+// SHARD=None (single-GPU) LAYOUT ONLY. The only caller that reaches this via
+// unload_model is `load_minimax` (shard=None, MiniMaxWeights::load → arch.rs
+// `..None`), where every expert is a distinct allocation. The EP packed-blob
+// path (shard=Some) aliases non-owned experts onto a shared zeroed buffer and
+// lives only in the standalone ep_minimax example, which manages its own
+// teardown and never builds a LoadedModel — so per-expert free is double-free
+// safe here.
+
+impl MiniMaxExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxExpertWeights { gate_up, down } = self;
+        gate_up.free_all(gpu);
+        down.free_all(gpu);
+    }
+}
+
+impl MiniMaxLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxLayerWeights {
+            attn_norm,
+            ffn_norm,
+            q_norm,
+            k_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            router,
+            routing_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+        } = self;
+        let _ = gpu.free_tensor(attn_norm);
+        let _ = gpu.free_tensor(ffn_norm);
+        let _ = gpu.free_tensor(q_norm);
+        let _ = gpu.free_tensor(k_norm);
+        wq.free_all(gpu);
+        wk.free_all(gpu);
+        wv.free_all(gpu);
+        wo.free_all(gpu);
+        router.free_all(gpu);
+        let _ = gpu.free_tensor(routing_bias);
+        for e in experts {
+            e.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(expert_down_ptrs);
+    }
+}
+
+impl MiniMaxWeights {
+    /// Return all weight GPU buffers to the pool. Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxWeights {
+            embed,
+            final_norm,
+            lm_head,
+            layers,
+        } = self;
+        let _ = gpu.free_tensor(embed);
+        let _ = gpu.free_tensor(final_norm);
+        lm_head.free_all(gpu);
+        for layer in layers {
+            layer.free_gpu(gpu);
+        }
+    }
+}
+
 // ──────────────────────────── State ────────────────────────────
 
 /// Per-decode GPU scratch + KV cache. Buffers are eager-allocated (the model
@@ -578,6 +652,67 @@ pub struct MiniMaxState {
 }
 
 impl MiniMaxState {
+    /// Return all decode-scratch + KV-cache GPU buffers to the pool. Consumes
+    /// self. Exhaustive destructure: a future added buffer field fails to
+    /// compile here. `pos_host` is host memory (Box) — no GPU free.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxState {
+            kv,
+            pos_buf,
+            pos_host: _,
+            max_seq: _,
+            n_tokens: _,
+            ar_warmed_up: _,
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        } = self;
+        kv.free_gpu(gpu);
+        // pos_buf is a raw DeviceBuffer (no Drop impl) — free explicitly.
+        let _ = gpu.hip.free(pos_buf);
+        for t in [
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &MiniMaxConfig) -> Result<Self, String> {
         // Cap the KV cache so the real 204800-ctx config doesn't OOM; callers
         // that need a specific window use `new_with_max_seq`.
