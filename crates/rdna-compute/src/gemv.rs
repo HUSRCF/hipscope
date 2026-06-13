@@ -50,6 +50,28 @@ fn e8_dgpu_twin_enabled() -> bool {
     })
 }
 
+/// HIPFIRE_E8_SOA_EXPERTS: route E8 MoE gate_up decode to the SoA-coalesced kernel
+/// (reads SoA-laid-out expert weights). MUST be consistent with the load path: when
+/// set, routed E8 gate_up experts are transposed AoS->SoA at load, and the dispatch
+/// uses the SoA kernel. Read once (cached) — never per launch.
+///
+/// Default OFF. Validated COHERENT on gfx1100 (q36a3b.mfp4e8-gptq-v2) — kernel +
+/// transpose-on-load correct. But A3B decode = WASH: 102.0 (SoA) vs 102.0 (AoS) tok/s.
+/// The standalone GEMV bench's +38-73% was on LARGE DENSE shapes (M=11008); A3B's
+/// per-expert gate_up is small (M=2*moe_intermediate ~1536), which sits in the bench's
+/// WASH regime (cf. qkv-kv M=512). So SoA coalescing helps big dense GEMVs, not the
+/// small per-expert MoE GEMVs. Far below the +8% ship bar — kept opt-in + documented.
+/// (Increment-1 yes/no per docs/plans/e8-soa-indexed-moe-decode.md: answer = no win.)
+pub(crate) fn e8_soa_experts_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_E8_SOA_EXPERTS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -5442,8 +5464,18 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!(self.arch_caps.has_wmma_w32(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 wave32-WMMA");
-        let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
-        let (kname, ksrc, kfn) = if use_dgpu_twin {
+        // SoA path (decode): when experts were transposed AoS->SoA at load. Same
+        // batched kernel interface (this launcher runs it with batch=1).
+        let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
+        let use_dgpu_twin =
+            !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let (kname, ksrc, kfn) = if use_soa {
+            (
+                "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
+                kernels::GEMV_MFP4G32_E8_SOA_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+                "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
+            )
+        } else if use_dgpu_twin {
             (
                 "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
                 kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC,
@@ -5519,8 +5551,19 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!(self.arch_caps.has_wmma_w32(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 wave32-WMMA");
-        let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
-        let (kname, ksrc, kfn) = if use_dgpu_twin {
+        // SoA-coalesced path takes priority when experts were transposed AoS->SoA at
+        // load (RDNA3 dGPU + HIPFIRE_E8_SOA_EXPERTS=1). Same params/grid as the AoS
+        // kernel; only the in-weight addressing differs.
+        let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
+        let use_dgpu_twin =
+            !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let (kname, ksrc, kfn) = if use_soa {
+            (
+                "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
+                kernels::GEMV_MFP4G32_E8_SOA_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+                "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
+            )
+        } else if use_dgpu_twin {
             (
                 "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched_dgpu",
                 kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC,

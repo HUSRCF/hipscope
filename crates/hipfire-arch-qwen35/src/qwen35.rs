@@ -4659,6 +4659,42 @@ fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
 ///
+/// HIPFIRE_E8_SOA_EXPERTS (cached): transpose routed E8 gate_up experts AoS->SoA at
+/// load so the SoA-coalesced indexed kernel can read them. Must match the dispatch
+/// flag in rdna-compute (same env). Default OFF.
+fn e8_soa_experts() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_E8_SOA_EXPERTS").map(|v| v == "1").unwrap_or(false))
+}
+
+/// AoS mfp4-E8 -> SoA byte transform (exact port of `aos_to_soa_full` in
+/// bench_e8_soa_correctness). AoS row: [16B hdr][n_blocks×(1B scale + 16B cw)].
+/// SoA row: [16B hdr (flag=0x06)][n_blocks scales, pad16][n_blocks×16B cw]. Same size.
+fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
+    let n_blocks = k / 32;
+    let aos_row = 16 + n_blocks * 17;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row];
+    for r in 0..m {
+        let src = &aos[r * aos_row..(r + 1) * aos_row];
+        let dst = &mut out[r * soa_row..(r + 1) * soa_row];
+        dst[..16].copy_from_slice(&src[..16]);
+        dst[6] = 0x06; // SoA flag
+        for b in 0..n_blocks {
+            dst[16 + b] = src[16 + b * 17]; // E4M3 scales -> contiguous
+        }
+        let cw0 = 16 + scale_padded;
+        for b in 0..n_blocks {
+            let s = 16 + b * 17 + 1;
+            let d = cw0 + b * 16;
+            dst[d..d + 16].copy_from_slice(&src[s..s + 16]); // 16B codewords -> contiguous
+        }
+    }
+    out
+}
+
 /// EP streaming-shard mode: when [`current_ep_expert_shard`] is `Some`, only the
 /// rank's owned experts are read/allocated; the pointer tables are built global
 /// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
@@ -4744,6 +4780,34 @@ fn load_moe_ffn(
             mi,
         )?;
         experts.push(ExpertWeights { gate_up, down });
+    }
+
+    // gfx11 E8 SoA experts: transpose routed gate_up E8 weights AoS->SoA at load so the
+    // SoA-coalesced indexed kernel reads coalesced; the ptr table below picks up the new
+    // SoA bufs. Down experts stay AoS (down SoA = increment 2). RDNA3 dGPU +
+    // HIPFIRE_E8_SOA_EXPERTS=1, full-load only (EP shard builds its table separately).
+    if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
+        let mut converted = 0usize;
+        for ew in experts.iter_mut() {
+            if ew.gate_up.gpu_dtype == DType::MFP4G32E8 {
+                let (m, k) = (ew.gate_up.m, ew.gate_up.k);
+                let nbytes = ew.gate_up.buf.buf.size();
+                let mut aos = vec![0u8; nbytes];
+                gpu.hip.memcpy_dtoh(&mut aos, &ew.gate_up.buf.buf)?;
+                let soa = e8_aos_to_soa(&aos, m, k);
+                // In-place overwrite — SoA == AoS byte size when n_blocks%16==0 (true for
+                // K=2048: 16+64+64*16 == 16+64*17 == 1104). No new alloc → no VRAM growth.
+                if soa.len() == nbytes {
+                    gpu.hip.memcpy_htod(&ew.gate_up.buf.buf, &soa)?;
+                    converted += 1;
+                } else if layer_idx == 0 {
+                    eprintln!("  [e8-soa] SKIP: SoA size {} != AoS {} (n_blocks%16!=0) — keeping AoS", soa.len(), nbytes);
+                }
+            }
+        }
+        if converted > 0 && layer_idx == 0 {
+            eprintln!("  [e8-soa] transposed {converted} gate_up experts AoS->SoA (per layer)");
+        }
     }
 
     // Build the device-side pointer tables consumed by the indexed MoE

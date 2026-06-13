@@ -1089,6 +1089,13 @@ pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str
 /// Guard: arch_caps.is_rdna3_dgpu(); kill-switch: HIPFIRE_E8_DGPU_TWIN=0.
 pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx11_dgpu.hip");
+/// SoA-coalesced E8 MoE gate_up (k8 indexed). Reads SoA-laid-out expert weights
+/// (scales contiguous, codewords contiguous 16B-aligned) — +38-73% on the GEMV
+/// bench by killing the AoS 17B-block cache-line over-fetch on the gfx1100 dGPU.
+/// Dispatched iff experts were transposed AoS->SoA at load (HIPFIRE_E8_SOA_EXPERTS=1)
+/// on an RDNA3 dGPU. 2-way unroll (max wave32 occupancy).
+pub const GEMV_MFP4G32_E8_SOA_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched.hip");
 /// gfx11_dgpu twin of the gfx1151 E8 MoE down (k8 indexed, atomic-free expanded) kernel.
 /// Same 4-way unroll strategy as the gate_up twin. Guard + kill-switch: see gate_up twin.
 pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX11_DGPU_SRC: &str =
