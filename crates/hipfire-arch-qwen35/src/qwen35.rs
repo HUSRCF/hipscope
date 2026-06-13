@@ -5659,13 +5659,15 @@ pub fn forward_scratch(
     // change between forward calls; cache once and read atomically.
     static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for the MoE
-    // forward path. Default-off until a follow-up makes the CPU-topK
-    // fallback's `download_f32(router_logits)` D2H sync capture-safe —
-    // mixed-kmap A3B (post-PR #199) routes through that fallback and crashes
-    // with hipError 906 under graph capture. The atomicAdd-determinism fix in
-    // this commit removes the use_gpu_topk path's drift, which is the necessary
-    // first step, but is not sufficient to enable MoE+graph by default.
+    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for MoE models.
+    // Default-off pending cross-arch A/B validation. Both root causes of the
+    // previous crash/drift are now fixed:
+    //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
+    //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
+    //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
+    //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
+    //      crashes with hipError 906 under HIPFIRE_AR_GRAPH=1.
+    // Once arch A/B validated, flip default to `true`.
     let allow_moe = *ALLOW_MOE_ENV
         .get_or_init(|| std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1"));
     // hipGraph per-forward-pass capture/replay default policy:
@@ -5731,8 +5733,11 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
     }
-    let use_graph = ar_graph_test && graph_enabled && graph_eligible;
-    let _ = (allow_moe, gpu.graphs.ar_forward_replay_enabled); // suppress unused warnings
+    // MoE models require allow_moe (HIPFIRE_GRAPH_MOE=1) in addition to the
+    // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    let use_graph = ar_graph_test && graph_enabled && graph_eligible
+        && (config.num_experts == 0 || allow_moe);
+    let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {

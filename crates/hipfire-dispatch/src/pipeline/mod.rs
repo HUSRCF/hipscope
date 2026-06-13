@@ -601,24 +601,45 @@ fn run_moe_decode_cpu_fallback(
         });
     }
 
-    // ── 1+2. softmax → CPU top-K + renorm (verbatim from master) ──────────────
+    // ── 1+2. softmax → top-K + renorm ─────────────────────────────────────────
+    // For k==8 we use the same two GPU kernels as the fast path
+    // (`softmax_f32` + `moe_topk_renorm_k8`) so this code is capture-safe
+    // under hipGraph.  Only a tiny [k] D2H follows (32 bytes for A3B k=8)
+    // to get the selected indices/weights for the CPU expert loop below.
+    // For k != 8 (no current production model) we fall back to the original
+    // [n_exp] D2H path — that case cannot reach a graph capture site anyway
+    // because `use_gpu_topk` requires `k == 8`.
     hip!(gpu.softmax_f32(p.router_logits))?;
-    let probs = hip!(gpu.download_f32(p.router_logits))?;
-    let mut indices: Vec<usize> = (0..n_exp).collect();
-    indices.select_nth_unstable_by(k - 1, |&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-    topk_indices.sort_by(|&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-    if p.norm_topk_prob {
-        let sum: f32 = topk_weights.iter().sum();
-        if sum > 0.0 {
-            for w in topk_weights.iter_mut() { *w /= sum; }
+    let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
+        hip!(gpu.moe_topk_renorm_k8(p.router_logits, p.topk_indices, p.topk_weights, n_exp, p.norm_topk_prob))?;
+        // topk_indices is i32 values stored in an F32 GpuTensor (same 4 B/elem);
+        // download as f32 bits and reinterpret.
+        let idx_f32 = hip!(gpu.download_f32(p.topk_indices))?;
+        let wts     = hip!(gpu.download_f32(p.topk_weights))?;
+        let idx_usize: Vec<usize> = idx_f32.iter()
+            .map(|&f| i32::from_ne_bytes(f.to_ne_bytes()) as usize)
+            .collect();
+        (idx_usize, wts)
+    } else {
+        // Original [n_exp] D2H path for non-k8 models (not capture-eligible).
+        let probs = hip!(gpu.download_f32(p.router_logits))?;
+        let mut indices: Vec<usize> = (0..n_exp).collect();
+        indices.select_nth_unstable_by(k - 1, |&a, &b| {
+            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut sel: Vec<usize> = indices.into_iter().take(k).collect();
+        sel.sort_by(|&a, &b| {
+            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut wts: Vec<f32> = sel.iter().map(|&i| probs[i]).collect();
+        if p.norm_topk_prob {
+            let sum: f32 = wts.iter().sum();
+            if sum > 0.0 {
+                for w in wts.iter_mut() { *w /= sum; }
+            }
         }
-    }
+        (sel, wts)
+    };
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
     if p.shared_down_w.dtype == DType::MQ4G256 {
