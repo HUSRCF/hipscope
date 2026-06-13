@@ -14,6 +14,14 @@ fn e8_strip_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_STRIP").map(|v| v == "1").unwrap_or(false))
 }
 
+/// EXPERIMENT: HIPFIRE_E8_LDSX=1 routes gemv_mfp4g32_e8 (gfx1151) to the
+/// LDS-staged-x + 4-rows/block variant (memory-level-parallelism lever).
+fn e8_ldsx_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_LDSX").map(|v| v == "1").unwrap_or(false))
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -3080,6 +3088,39 @@ impl Gpu {
         // 2 wave32 subgroups per block hide LPDDR5X latency better than 1 wave/block.
         // All other archs use the generic kernel (1 row/block, 32 threads) unchanged.
         if self.arch_caps.is_gfx1151() {
+            // EXPERIMENT (HIPFIRE_E8_LDSX=1): LDS-staged x + 4 rows/block. Distinct
+            // launch geometry (grid=ceil(M/4), block=128, dynamic LDS=K*4 bytes).
+            if e8_ldsx_enabled() {
+                self.ensure_kernel(
+                    "gemv_mfp4g32_e8_ldsx_gfx1151",
+                    kernels::GEMV_MFP4G32_E8_LDSX_GFX1151_SRC,
+                    "gemv_mfp4g32_e8_ldsx_gfx1151",
+                )?;
+                let a_ptr = a_raw.buf.as_ptr();
+                let x_ptr = x.buf.as_ptr();
+                let y_ptr = y.buf.as_ptr();
+                let m_val = m as i32;
+                let k_val = k as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &a_ptr as *const _ as *mut c_void,
+                    &x_ptr as *const _ as *mut c_void,
+                    &y_ptr as *const _ as *mut c_void,
+                    &m_val as *const _ as *mut c_void,
+                    &k_val as *const _ as *mut c_void,
+                ];
+                let grid_x = ((m + 3) / 4) as u32;
+                let lds_bytes = (k * 4) as u32;
+                return unsafe {
+                    self.hip.launch_kernel(
+                        &self.functions["gemv_mfp4g32_e8_ldsx_gfx1151"],
+                        [grid_x, 1, 1],
+                        [128, 1, 1],
+                        lds_bytes,
+                        self.stream_ref(),
+                        &mut params,
+                    )
+                };
+            }
             // DIAGNOSTIC (HIPFIRE_E8_STRIP=1): swap in the compute-stripped kernel
             // (same memory access, gutted decode) to measure the compute ceiling.
             // Output is garbage — perf-probe only.

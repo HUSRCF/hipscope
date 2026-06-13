@@ -1059,6 +1059,10 @@ pub const FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC: &str =
 /// Output is garbage; for tok/s probing the memory-vs-compute bound only.
 pub const GEMV_MFP4G32_E8_STRIP_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_strip.gfx1151.hip");
+/// EXPERIMENT (env HIPFIRE_E8_LDSX=1): E8 GEMV with LDS-staged x + 4 rows/block
+/// (memory-level-parallelism lever). Bit-exact with gemv_mfp4g32_e8_gfx1151.
+pub const GEMV_MFP4G32_E8_LDSX_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_ldsx.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.
