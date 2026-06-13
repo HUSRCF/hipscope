@@ -129,15 +129,17 @@ impl Carrier for Qwen35Carrier {
                         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                         .collect();
                     let kv = match kv_mode.as_str() {
-                        "q8" => hipfire_runtime::llama::KvCache::new_gpu_q8_capped_multi_filtered(
-                            &mut gpus,
-                            &is_kv_layer,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            ctx.max_seq,
-                            ctx.max_seq,
-                        ),
-                        "asym3" | "turbo3" | "turbo" | "auto" | "" => {
+                        "q8" | "auto" | "" => {
+                            hipfire_runtime::llama::KvCache::new_gpu_q8_capped_multi_filtered(
+                                &mut gpus,
+                                &is_kv_layer,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                ctx.max_seq,
+                                ctx.max_seq,
+                            )
+                        }
+                        "asym3" | "turbo3" | "turbo" => {
                             hipfire_runtime::llama::KvCache::new_gpu_asym3_capped_multi_filtered(
                                 &mut gpus,
                                 &is_kv_layer,
@@ -169,10 +171,10 @@ impl Carrier for Qwen35Carrier {
                         }
                         _ => {
                             eprintln!(
-                                "  KV cache: unrecognized '{}', defaulting to asym3 for pp>1",
+                                "  KV cache: unrecognized '{}', defaulting to q8 for pp>1",
                                 kv_mode
                             );
-                            hipfire_runtime::llama::KvCache::new_gpu_asym3_capped_multi_filtered(
+                            hipfire_runtime::llama::KvCache::new_gpu_q8_capped_multi_filtered(
                                 &mut gpus,
                                 &is_kv_layer,
                                 config.n_kv_heads,
@@ -374,7 +376,7 @@ impl Carrier for Qwen35Carrier {
                         ctx.max_seq,
                         ctx.max_seq,
                     ),
-                    _ => hipfire_runtime::llama::KvCache::new_gpu_asym3_capped_filtered(
+                    _ => hipfire_runtime::llama::KvCache::new_gpu_q8_capped_filtered(
                         ctx.gpu,
                         &is_kv_layer,
                         config.n_kv_heads,
