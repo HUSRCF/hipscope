@@ -1027,6 +1027,56 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
 /// Block: per-row 16 B header (row_scale_a:f16, row_scale_b:f16, block_count, flags),
 /// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
 pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
+pub const GEMV_MFP4G32_LLOYD_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_lloyd.hip");
+pub const GEMV_MFP4G32_P_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_p.hip");
+pub const GEMV_MFP4G32_E8_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8.hip");
+/// gfx1151-specific mfp4-E8 GEMV with coalesced LDS-staged group loads.
+/// ONLY dispatched on gfx1151 (Strix Halo); all other archs use GEMV_MFP4G32_E8_SRC.
+pub const GEMV_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8.gfx1151.hip");
+/// mfp4-E8 SoA GEMV — generic fallback for non-gfx1151 arches.
+/// Reads the SoA layout (flag=0x06); bit-exact output vs AoS.
+pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.hip");
+/// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
+/// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
+pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
+/// gfx1151-specific fused gate+up mfp4-E8 decode GEMV (2-way launch-fusion).
+/// ONLY dispatched on gfx1151 (Strix Halo) via the steps.rs guard; embeds the
+/// byte-identical gemv_mfp4g32_e8_gfx1151 per-row body. No bleed to other archs.
+pub const FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_mfp4g32_e8.gfx1151.hip");
+/// gfx1151-specific fused QKVZA mfp4-E8 decode GEMV (4-way launch-fusion) for
+/// the Qwen3.5 DeltaNet LA preamble. ONLY dispatched on gfx1151.
+pub const FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_mfp4g32_e8.gfx1151.hip");
+/// DIAGNOSTIC ONLY (env HIPFIRE_E8_STRIP=1): compute-stripped E8 GEMV that keeps
+/// the exact memory access but guts the decode — measures the compute ceiling.
+/// Output is garbage; for tok/s probing the memory-vs-compute bound only.
+pub const GEMV_MFP4G32_E8_STRIP_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_strip.gfx1151.hip");
+/// EXPERIMENT (env HIPFIRE_E8_LDSX=1): E8 GEMV with LDS-staged x + 4 rows/block
+/// (memory-level-parallelism lever). Bit-exact with gemv_mfp4g32_e8_gfx1151.
+pub const GEMV_MFP4G32_E8_LDSX_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_ldsx.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE gate_up (k8 indexed) — mq4-parity expert kernel.
+pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
+pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip");
+/// Batched sigmoid-scaled residual add (generic f32): y[t,:] += sigmoid(scalars[t]) * x[t,:].
+/// Folds the Q8 shared-expert down output into the residual in batched MoE prefill.
+pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_scaled_residual_add_batched.hip");
+/// gfx1151 mfp4-E8 grouped-WMMA-GEMM (Path 2 prefill). Amortizes expert-weight
+/// reads via the SGLang scatter pipeline + wave32 F16 WMMA with E8 lattice dequant.
+pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.
@@ -1743,6 +1793,12 @@ pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_lloyd_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_P_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_p_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_E8_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_e8_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for

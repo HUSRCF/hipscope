@@ -219,7 +219,7 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    let res = MoeResolution::resolve(&p.dtypes, p.k);
+    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.is_gfx1151());
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
@@ -428,6 +428,12 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MFP4G32E8 {
+        // mfp4-E8 grouped experts (gfx1151-only; gated in MoeResolution).
+        hip!(gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+        ))?;
     } else {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
@@ -497,6 +503,12 @@ pub fn run_moe_decode(
         ))?;
     } else if p.dtypes.routed_down == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+            down_m, down_k, p.k, 1,
+        ))?;
+    } else if p.dtypes.routed_down == DType::MFP4G32E8 {
+        // mfp4-E8 grouped expert down (atomic-free expanded; combine below).
+        hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
             down_m, down_k, p.k, 1,
         ))?;
@@ -699,6 +711,28 @@ fn run_moe_decode_cpu_fallback(
     static GEMV_FB: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV_FB.get_or_init(GemvFamily::new);
 
+    // GPTQ-on-E8 native Hessian capture (gpu.hessian_capture is Some only
+    // under the collect_e8_hessian_native calibration driver; None == zero
+    // overhead in production). x_norm is the RAW pre-rotation gate_up input
+    // (post-rmsnorm hidden, pre-FWHT) and is identical for every top-k expert
+    // of this token, so download it ONCE here. Keyed by the FULL safetensors
+    // name == hipfire-quantize::main::hessian_key.
+    let hess_x_norm: Option<Vec<f32>> = if gpu.hessian_capture.is_some() {
+        Some(hip!(gpu.download_f32(p.x_norm))?)
+    } else {
+        None
+    };
+    // GPTQ-on-E8 capture staging: gather this token's per-expert down activations
+    // (silu(g)*u) so the per-(tensor,expert) XX^T accumulate — the capture
+    // bottleneck (single-threaded f64 rank-1 over a ~30 GB cold working set while
+    // the GPU sits idle) — runs ONCE, in PARALLEL across the token's disjoint
+    // accumulators, after the expert loop. `hid_host` Vecs must outlive the
+    // batched call, hence the owning stash. Zero overhead when capture is off.
+    let mut hess_down_keys: Vec<(String, Vec<f32>)> =
+        if hess_x_norm.is_some() { Vec::with_capacity(topk_indices.len()) } else { Vec::new() };
+    let mut hess_gate_keys: Vec<String> =
+        if hess_x_norm.is_some() { Vec::with_capacity(topk_indices.len()) } else { Vec::new() };
+
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
 
@@ -712,10 +746,45 @@ fn run_moe_decode_cpu_fallback(
         // silu(gate)·up → ffn_hidden, then down GEMV, then weighted residual add.
         let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
+        // GPTQ-on-E8 Hessian capture: hid_view = silu(g)*u is the RAW
+        // PRE-rotation down input (run_auto below applies the FWHT internally),
+        // so download it NOW, before the down GEMV, and STAGE it (gate_up shares
+        // the single pre-downloaded x_norm). The actual XX^T accumulate is
+        // deferred to one parallel `accumulate_token` after the loop.
+        if hess_x_norm.is_some() {
+            let hid_host = hip!(gpu.download_f32(&hid_view))?;
+            let l = p.layer_idx;
+            let e = expert_idx;
+            hess_gate_keys.push(format!(
+                "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj.weight"
+            ));
+            hess_down_keys.push((
+                format!("model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"),
+                hid_host,
+            ));
+        }
         {
             gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
         }
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
+    }
+
+    // GPTQ-on-E8: one batched, rayon-parallel accumulate over the token's
+    // disjoint (tensor,expert) accumulators (distinct expert ids + distinct
+    // gate_up/down tensors ⇒ disjoint targets ⇒ bit-identical to the per-expert
+    // serial accumulate; see `accumulate_token`).
+    if let Some(ref xn) = hess_x_norm {
+        let mut items: Vec<(String, &[f32], usize)> =
+            Vec::with_capacity(hess_gate_keys.len() + hess_down_keys.len());
+        for gk in &hess_gate_keys {
+            items.push((gk.clone(), xn.as_slice(), p.hidden));
+        }
+        for (dk, hid) in &hess_down_keys {
+            items.push((dk.clone(), hid.as_slice(), mi));
+        }
+        if let Some(cap) = gpu.hessian_capture.as_mut() {
+            cap.accumulate_token(&items);
+        }
     }
 
     Ok(())
@@ -1082,6 +1151,12 @@ fn dispatch_grouped_gemm(
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
+        // mfp4-E8 grouped-WMMA (gfx1151-only; MoePrefillResolution admits Path 2
+        // for E8 only on gfx1151). Amortizes expert-weight reads vs the indexed
+        // GEMV — the memory-bound prefill / batched-verify lever.
+        DType::MFP4G32E8 => hip!(gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
+            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        )),
         DType::ParoQ4G128 => {
             if paro_i8_k8 {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
@@ -1216,6 +1291,14 @@ pub fn run_moe_prefill(
                     p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
                     p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
                 )),
+                // mfp4-E8 grouped experts (gfx1151-only; forced to Path 1 in
+                // MoePrefillResolution since E8 has no grouped-WMMA sister). The
+                // indexed kernel batches over N via grid.z — x_rot_batch is the
+                // plain-FWHT rotation (E8 carries no AWQ; matches the decode path).
+                DType::MFP4G32E8 => hip!(gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                )),
                 _other => return Err(DispatchError::UnsupportedVariant {
                     family: "moe", variant: "prefill-gate-up-path1-dtype",
                     arch: "", quant: "other",
@@ -1248,7 +1331,9 @@ pub fn run_moe_prefill(
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
         // activations, not weight data). AWQ-aware variant when down has AWQ.
         match p.dtypes.routed_down {
-            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 => {
+            // MFP4G32E8 reuses the weight-agnostic silu+FWHT-rotate (E8 down expects
+            // FWHT(silu(g)*u), same as MQ4 — see the decode E8 path).
+            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 | DType::MFP4G32E8 => {
                 if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
                     // Route A MoE-AWQ (per-routed-expert, indexed by topk slot).
                     // total_slots rows = N·k_top; each slot's expert is
@@ -1326,6 +1411,10 @@ pub fn run_moe_prefill(
                 down_m, down_k, k_top, n,
             )),
             DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            DType::MFP4G32E8 => hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
                 down_m, down_k, k_top, n,
             )),

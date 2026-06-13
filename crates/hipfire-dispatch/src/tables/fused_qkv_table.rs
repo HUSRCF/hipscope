@@ -99,6 +99,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         // NO scalar/dp4a fallback. Mirrors the FusedQkvHfp4G32 row above.
         // HasWmma (includes gfx12).
         (KernelKey::FusedQkvzaHfp4G32,      ArchPredicate::HasWmma),
+        // MFP4G32E8 fused QKVZA — decode-only, gfx1151 (Strix Halo) launch-fusion.
+        // `Always` here because the gfx1151 firewall lives in the producing GUARD
+        // (`guard_qkvza_mfp4g32e8` in pipeline/steps.rs checks
+        // `ctx.arch.is_gfx1151()`); this key is ONLY ever produced by that decode
+        // guard — no prefill site emits it — so resolve() never sees it on another
+        // arch. The run-arm (`gpu.fused_qkvza_mfp4g32_e8`) launches the
+        // gfx1151-only kernel. No bleed to gfx1100/942/1201.
+        (KernelKey::FusedQkvzaMfp4G32E8,    ArchPredicate::Always),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
@@ -154,6 +162,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
         // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
         (KernelKey::FusedGateUpQ8_0,         ArchPredicate::Always),
+        // MFP4G32E8 gate+up — decode-only, gfx1151 (Strix Halo) launch-fusion.
+        // `Always` for the same reason as the FusedQkvzaMfp4G32E8 row above: the
+        // gfx1151 firewall is in the producing GUARD (`guard_gate_up_mfp4g32e8`),
+        // the sole emitter of this key, so resolve() never sees it elsewhere.
+        (KernelKey::FusedGateUpMfp4G32E8,    ArchPredicate::Always),
     ];
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {

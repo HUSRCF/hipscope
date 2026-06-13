@@ -5,6 +5,23 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+/// DIAGNOSTIC: when HIPFIRE_E8_STRIP=1, gemv_mfp4g32_e8 (gfx1151) launches the
+/// compute-stripped kernel instead of the real decode kernel — for measuring
+/// the memory-vs-compute bound (output is garbage). Cached once.
+fn e8_strip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_STRIP").map(|v| v == "1").unwrap_or(false))
+}
+
+/// EXPERIMENT: HIPFIRE_E8_LDSX=1 routes gemv_mfp4g32_e8 (gfx1151) to the
+/// LDS-staged-x + 4-rows/block variant (memory-level-parallelism lever).
+fn e8_ldsx_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_LDSX").map(|v| v == "1").unwrap_or(false))
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -2259,7 +2276,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             "rotate_with_rms_gfx942",
             [groups, batch_size as u32, 1],
-            [64, 1, 1],
+            [128, 1, 1],
             0,
             &mut params_b,
             || {
@@ -2943,6 +2960,453 @@ impl Gpu {
         self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
     }
 
+    /// MFP4G32-Lloyd GEMV. Uses the per-tensor 16-entry Lloyd codebook stored
+    /// as a 32-B prefix before row 0. x must already be FWHT-rotated.
+    pub fn gemv_mfp4g32_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_lloyd requires K%256==0, got K={k}");
+        self.ensure_kernel(
+            "gemv_mfp4g32_lloyd",
+            kernels::GEMV_MFP4G32_LLOYD_SRC,
+            "gemv_mfp4g32_lloyd",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_lloyd"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// MFP4G32-Lloyd prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_lloyd_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// mfp4+P GEMV. mfp4 byte layout (NO prefix) but the per-32-block scale byte
+    /// is E4M3 (FP8, non-power-of-2). x must already be FWHT-rotated. Uses the
+    /// hard-coded E2M1 lattice (like gemv_hfp4g32), decoding the scale as E4M3.
+    pub fn gemv_mfp4g32_p(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_p requires K%256==0, got K={k}");
+        self.ensure_kernel(
+            "gemv_mfp4g32_p",
+            kernels::GEMV_MFP4G32_P_SRC,
+            "gemv_mfp4g32_p",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_p"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4+P prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_p_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_p(a_raw, x_rot, y, m, k)
+    }
+
+
+    /// mfp4-E8 GEMV. mfp4+P byte layout (NO prefix) but the 16-B data region per block
+    /// contains 4x32-bit E8 lattice codewords (8 weights/codeword), not E2M1 nibbles.
+    /// x must already be FWHT-rotated. Decodes block scale as E4M3, then E8 coords * 0.88.
+    pub fn gemv_mfp4g32_e8(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_e8 requires K%256==0, got K={k}");
+
+        // gfx1151 (Strix Halo): 2-rows-per-block variant for better occupancy.
+        // 2 wave32 subgroups per block hide LPDDR5X latency better than 1 wave/block.
+        // All other archs use the generic kernel (1 row/block, 32 threads) unchanged.
+        if self.arch_caps.is_gfx1151() {
+            // EXPERIMENT (HIPFIRE_E8_LDSX=1): LDS-staged x + 4 rows/block. Distinct
+            // launch geometry (grid=ceil(M/4), block=128, dynamic LDS=K*4 bytes).
+            if e8_ldsx_enabled() {
+                self.ensure_kernel(
+                    "gemv_mfp4g32_e8_ldsx_gfx1151",
+                    kernels::GEMV_MFP4G32_E8_LDSX_GFX1151_SRC,
+                    "gemv_mfp4g32_e8_ldsx_gfx1151",
+                )?;
+                let a_ptr = a_raw.buf.as_ptr();
+                let x_ptr = x.buf.as_ptr();
+                let y_ptr = y.buf.as_ptr();
+                let m_val = m as i32;
+                let k_val = k as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &a_ptr as *const _ as *mut c_void,
+                    &x_ptr as *const _ as *mut c_void,
+                    &y_ptr as *const _ as *mut c_void,
+                    &m_val as *const _ as *mut c_void,
+                    &k_val as *const _ as *mut c_void,
+                ];
+                let grid_x = ((m + 3) / 4) as u32;
+                let lds_bytes = (k * 4) as u32;
+                return unsafe {
+                    self.hip.launch_kernel(
+                        &self.functions["gemv_mfp4g32_e8_ldsx_gfx1151"],
+                        [grid_x, 1, 1],
+                        [128, 1, 1],
+                        lds_bytes,
+                        self.stream_ref(),
+                        &mut params,
+                    )
+                };
+            }
+            // DIAGNOSTIC (HIPFIRE_E8_STRIP=1): swap in the compute-stripped kernel
+            // (same memory access, gutted decode) to measure the compute ceiling.
+            // Output is garbage — perf-probe only.
+            let (kname, ksrc) = if e8_strip_enabled() {
+                ("gemv_mfp4g32_e8_strip_gfx1151", kernels::GEMV_MFP4G32_E8_STRIP_GFX1151_SRC)
+            } else {
+                ("gemv_mfp4g32_e8_gfx1151", kernels::GEMV_MFP4G32_E8_GFX1151_SRC)
+            };
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            let grid_x = m as u32;
+            return unsafe {
+                self.hip.launch_kernel(
+                    &self.functions[kname],
+                    [grid_x, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        self.ensure_kernel("gemv_mfp4g32_e8", kernels::GEMV_MFP4G32_E8_SRC, "gemv_mfp4g32_e8")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_e8"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4-E8 prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_e8_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_e8(a_raw, x_rot, y, m, k)
+    }
+
+    /// Fused gate+up mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
+    /// Two GEMVs (gate, up) in one launch over [gate_m + up_m] blocks. x must
+    /// already be FWHT-rotated (the execute_steps RmsnormAutomatic producer does
+    /// it). Bit-exact with two sequential gemv_mfp4g32_e8 calls — only the launch
+    /// count shrinks (the gfx1151 launch-fusion lever). Reached ONLY via the
+    /// gfx1151-gated guard in pipeline/steps.rs, so it never runs on other archs.
+    pub fn fused_gate_up_mfp4g32_e8(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "fused_gate_up_mfp4g32_e8 requires K%256==0, got K={k}");
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "fused_gate_up_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        self.ensure_kernel(
+            "fused_gate_up_mfp4g32_e8_gfx1151",
+            kernels::FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC,
+            "fused_gate_up_mfp4g32_e8_gfx1151",
+        )?;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let total = (gate_m + up_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["fused_gate_up_mfp4g32_e8_gfx1151"],
+                [total, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Fused QKVZA mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
+    /// Four DeltaNet LA-preamble GEMVs (qkv, z, beta, alpha) in one launch. x
+    /// must already be FWHT-rotated. Bit-exact with four sequential
+    /// gemv_mfp4g32_e8 calls. gfx1151-gated via the steps.rs guard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_mfp4g32_e8(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "fused_qkvza_mfp4g32_e8 requires K%256==0, got K={k}");
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "fused_qkvza_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        self.ensure_kernel(
+            "fused_qkvza_mfp4g32_e8_gfx1151",
+            kernels::FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC,
+            "fused_qkvza_mfp4g32_e8_gfx1151",
+        )?;
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let mqkv = qkv_m as i32;
+        let mz = z_m as i32;
+        let mb = beta_m as i32;
+        let ma = alpha_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &mqkv as *const _ as *mut c_void,
+            &mz as *const _ as *mut c_void,
+            &mb as *const _ as *mut c_void,
+            &ma as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["fused_qkvza_mfp4g32_e8_gfx1151"],
+                [total, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4-E8 SoA GEMV. Same E8 data as AoS but in structure-of-arrays layout
+    /// (flag=0x06) for fully-coalesced codeword reads on gfx1151.
+    /// x must already be FWHT-rotated. Output is bit-exact with gemv_mfp4g32_e8.
+    pub fn gemv_mfp4g32_e8_soa(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}");
+
+        if self.arch_caps.is_gfx1151() {
+            self.ensure_kernel(
+                "gemv_mfp4g32_e8_soa_gfx1151",
+                kernels::GEMV_MFP4G32_E8_SOA_GFX1151_SRC,
+                "gemv_mfp4g32_e8_soa_gfx1151",
+            )?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            return unsafe {
+                self.hip.launch_kernel(
+                    &self.functions["gemv_mfp4g32_e8_soa_gfx1151"],
+                    [m as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        // Generic fallback for non-gfx1151
+        self.ensure_kernel("gemv_mfp4g32_e8_soa", kernels::GEMV_MFP4G32_E8_SOA_SRC, "gemv_mfp4g32_e8_soa")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemv_mfp4g32_e8_soa"],
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// mfp4-E8 SoA prerotated (x already FWHT-rotated by caller).
+    pub fn gemv_mfp4g32_e8_soa_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_mfp4g32_e8_soa(a_raw, x_rot, y, m, k)
+    }
+
     /// Fused FWHT rotation + FP8 pack for the decode FP8 path.
     /// Writes both F32 (into `x_rot`) and FP8 (into `mq_x_rot_fp8`
     /// sibling scratch) in one kernel launch. Returns the FP8 buffer's
@@ -3501,7 +3965,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [grid, 1, 1],
-                    [64, 1, 1],
+                    [32, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -3576,7 +4040,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [grid, 1, 1],
-                    [64, 1, 1],
+                    [32, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -3882,7 +4346,7 @@ impl Gpu {
             self.launch_maybe_blob(
                 "gemv_hfq4g256_wide",
                 [grid, 1, 1],
-                [64, 1, 1],
+                [32, 1, 1],
                 0,
                 &mut params,
                 blob_builder,
@@ -4022,7 +4486,7 @@ impl Gpu {
                 };
                 self.ensure_kernel(kname, ksrc, kname)?;
                 let grid = ((m as u32) + 1) / 2;
-                self.launch_maybe_blob(kname, [grid, 1, 1], [64, 1, 1], 0, &mut params, || {
+                self.launch_maybe_blob(kname, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(a_ptr);
                     b.push_ptr(x_ptr);
@@ -4873,6 +5337,190 @@ impl Gpu {
         result
     }
 
+    /// mfp4-E8 grouped MoE gate_up (k8 indexed), gfx1151-only. Launches the
+    /// batched kernel with N=1 (bid=0 collapses the K_TOP-stride terms), so the
+    /// gate_batch/up_batch output matches the hfq4g256 k8-indexed contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed is gfx1151-only");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = 8i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            [m as u32, 8, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// Batched mfp4-E8 grouped MoE gate_up (k8 indexed), gfx1151-only. Same kernel
+    /// as the decode wrapper but launched over `n` tokens (grid.z = n): the kernel
+    /// reads `topk_indices[bid*k_top + krank]` and `x + bid*K`, writing
+    /// `y_gate/y_up[bid*k_top*mi + krank*mi + ...]`. Used by `run_moe_prefill` Path 1
+    /// for the batched verify / prefill of E8 A3B.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched is gfx1151-only");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC,
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded), gfx1151-only.
+    /// Writes expert_outputs[N × K_TOP × M]; caller folds via moe_down_combine_k8_batched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1151(),
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded is gfx1151-only");
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC,
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
@@ -5245,7 +5893,7 @@ impl Gpu {
             )?;
             (
                 "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
-                [64, 1, 1],
+                [32, 1, 1],
                 2,
             )
         } else {
@@ -5338,7 +5986,7 @@ impl Gpu {
             )?;
             (
                 "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
-                [64, 1, 1],
+                [32, 1, 1],
                 2,
             )
         } else {
