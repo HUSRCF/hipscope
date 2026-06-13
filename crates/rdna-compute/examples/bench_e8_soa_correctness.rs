@@ -22,14 +22,15 @@ fn main() {
     eprintln!();
 
     let shapes: Vec<(usize, usize, &str)> = vec![
-        // FFN shapes (the MoE-relevant ones, cache-resident at these sizes)
-        (11008, 2048,  "gate_up   M=11008  K=2048 "),
-        (2048,  11008, "w_down    M=2048   K=11008"),
-        // size sweep at K=2048 — crosses the 96 MB L3 boundary (~91k rows) to
-        // expose the cache-resident (MLP-bound) vs VRAM-streaming (BW-bound) regimes
-        (8192,   2048, "sweep     M=8192   K=2048  (L3)"),
-        (32768,  2048, "sweep     M=32768  K=2048  (L3)"),
-        (131072, 2048, "sweep     M=131072 K=2048  (VRAM)"),
+        // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
+        //     moe_intermediate=512 — qwen35.rs:170,204) ---
+        (1024, 2048, "A3B gate_up M=1024 K=2048 (expert)"), // M=2*moe_int, K=hidden, groups=8
+        (2048,  512, "A3B down    M=2048 K=512  (expert)"), // M=hidden, K=moe_int, groups=2
+        // --- large-dense reference (where the SoA-coalescing wins showed up;
+        //     crosses the 96 MB L3 boundary at ~91k rows) ---
+        (11008,  2048, "dense gate_up M=11008 K=2048"),
+        (32768,  2048, "sweep        M=32768  K=2048  (L3)"),
+        (131072, 2048, "sweep        M=131072 K=2048  (VRAM)"),
     ];
 
     let warmup = 20usize;
@@ -81,13 +82,15 @@ fn main() {
     eprintln!();
 
     // ---- PERF BENCH: MLP sweep (cache-roofline) ----
-    eprintln!("--- Perf bench: AoS-2w vs SoA-2w vs SoA-strip(decode off) vs SoA-LUT — GB/s (% of {:.0} VRAM) ---", VRAM_GBPS);
+    eprintln!("--- Perf bench: MQ4(E8 AoS) vs E8-SoA-2w vs SoA-strip(decode off) vs SoA-LUT — GB/s (% of {:.0} VRAM) ---", VRAM_GBPS);
+    eprintln!("  MQ4 = plain uniform HFQ4-G256 (136 B/group, gemv_hfq4g256); E8 columns = mfp4-G32 (17 B/block).");
+    eprintln!("  Same-shape, weight-bytes-only denominator → MQ4 GB/s is directly comparable to the E8 AoS column.");
     eprintln!("  L3-resident rows (weights < 96MB) read from Infinity Cache (~3500 GB/s) after warmup.");
     eprintln!(
-        "  {:<30}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
-        "shape", "AoS-2w", "SoA-2w", "SoA-strip", "SoA-LUT", "resid"
+        "  {:<34}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
+        "shape", "MQ4", "E8-AoS", "E8-SoA-2w", "E8-strip", "E8-LUT", "resid"
     );
-    eprintln!("  {}", "-".repeat(94));
+    eprintln!("  {}", "-".repeat(108));
 
     for (m, k, label) in &shapes {
         let (m, k) = (*m, *k);
@@ -118,6 +121,14 @@ fn main() {
             }};
         }
 
+        // MQ4 (plain uniform HFQ4-G256) standalone — same shape, weight-only bytes.
+        // gemv_hfq4g256 has the identical (a_raw,x,y,m,k) signature so it slots
+        // straight into the gbps! macro. Buffer is separate; x/y are reused.
+        let mq4_data = synth_hfq4g256(m, k, 0x4D51 ^ m as u64 ^ k as u64); // "MQ"
+        let mq4_total = mq4_data.len(); // == profile::hfq4g256_weight_bytes(m,k)
+        let mq4_w = gpu.upload_raw(&mq4_data, &[mq4_total]).unwrap();
+
+        let mq4   = gbps!(gemv_hfq4g256, &mq4_w, mq4_total);
         let aos   = gbps!(gemv_mfp4g32_e8, &aos_w, aos_total);
         let soa2  = gbps!(gemv_mfp4g32_e8_soa, &soa_w, soa_total);
         let strip = gbps!(gemv_mfp4g32_e8_soa_strip, &soa_w, soa_total);
@@ -125,15 +136,22 @@ fn main() {
 
         let cell = |g: f64| format!("{:4.0}({:3.0}%)", g, g / VRAM_GBPS * 100.0);
         eprintln!(
-            "  {:<30}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
-            label, cell(aos), cell(soa2), cell(strip), cell(lut), resid
+            "  {:<34}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
+            label, cell(mq4), cell(aos), cell(soa2), cell(strip), cell(lut), resid
         );
     }
 
     eprintln!();
     eprintln!("  cells = GB/s (% of {:.0} GB/s VRAM). L3-resident rows: true ceiling ~3500 GB/s.", VRAM_GBPS);
-    eprintln!("  SoA-strip = lattice-decode REMOVED (garbage out) = loads+scale+reduce ceiling.");
+    eprintln!("  E8-strip = lattice-decode REMOVED (garbage out) = loads+scale+reduce ceiling.");
     eprintln!("  strip >> SoA-2w on L3 → decode-compute-bound; SoA-LUT≈strip → LUT is the win; LUT≈SoA-2w → parity/extract is the wall.");
+    eprintln!();
+    eprintln!("  H1 keystone (mq4 vs E8, weight bytes / row, from profile.rs):");
+    eprintln!("    A3B gate_up K=2048: MQ4 8*136=1088 B/row  vs  E8 16+64*17=1104 B/row  (E8 +1.5%)");
+    eprintln!("    A3B down    K=512 : MQ4 2*136= 272 B/row  vs  E8 16+16*17= 288 B/row  (E8 +5.9%)");
+    eprintln!("    If decode is memory-bound, MQ4 and E8-AoS GB/s should track within ~2-6% at the");
+    eprintln!("    A3B rows → the 150-vs-102 tok/s spread is NOT raw format bytes (it's layout/indexed");
+    eprintln!("    -context dilution for E8, and the graded MQ6-on-hot-experts traffic for mq4p).");
 
     // LUT decode must be bit-exact with the scalar SoA decode (same coordinates).
     {
@@ -213,6 +231,40 @@ fn synth_e8_aos(m: usize, k: usize, seed: u64) -> Vec<u8> {
             for w in 0..4 {
                 let cw = rng();
                 out[bp + 1 + w * 4..bp + 1 + w * 4 + 4].copy_from_slice(&cw.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Synthesize a standalone HFQ4-G256 weight buffer (mq4 = plain uniform format).
+/// Per row: `groups = K/256` groups of exactly 136 bytes each:
+///   [0..4]  f32 scale
+///   [4..8]  f32 zero-point
+///   [8..136] 32 × uint32 packed nibbles (256 4-bit weights)
+/// Matches the layout `gemv_hfq4g256` reads (gemv_hfq4g256.gfx1100.hip:23-66) and
+/// `profile::hfq4g256_weight_bytes` (== m * groups * 136). RNG mirrors
+/// `synth_e8_aos` byte-for-byte so the two formats are seeded identically.
+fn synth_hfq4g256(m: usize, k: usize, seed: u64) -> Vec<u8> {
+    assert!(k % 256 == 0, "hfq4g256 requires K%256==0 (groups = K/256)");
+    let groups = k / 256;
+    let row_bytes = groups * 136; // == hfq4g256_weight_bytes(m,k) / m
+    let mut out = vec![0u8; m * row_bytes];
+    let mut state = seed;
+    let mut rng = || -> u32 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    for row in 0..m {
+        for g in 0..groups {
+            let off = row * row_bytes + g * 136;
+            let sc: f32 = 0.003 + (rng() & 0x3F) as f32 * 1e-4;
+            out[off..off + 4].copy_from_slice(&sc.to_bits().to_le_bytes());
+            let zp: f32 = -0.02;
+            out[off + 4..off + 8].copy_from_slice(&zp.to_bits().to_le_bytes());
+            for w in 0..32 {
+                let pk = rng();
+                out[off + 8 + w * 4..off + 8 + w * 4 + 4].copy_from_slice(&pk.to_le_bytes());
             }
         }
     }
