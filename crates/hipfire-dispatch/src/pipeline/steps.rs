@@ -201,12 +201,17 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
 
 // ── mfp4-E8 decode launch-fusion guards (gfx1151 / Strix Halo ONLY) ──
 // These are the SOLE producers of the FusedGateUpMfp4G32E8 / FusedQkvzaMfp4G32E8
-// keys. The `is_gfx1151()` check is the firewall that keeps the gfx1151-only
-// fused kernels from ever bleeding to gfx1100/942/1201 — on every other arch
-// these return false and the projections fall through to the per-projection
-// gemv_mfp4g32_e8 path unchanged. The fused kernels embed the byte-identical
-// gemv_mfp4g32_e8_gfx1151 per-row body, so the fused output equals N sequential
-// GEMVs bit-for-bit (only the launch count shrinks).
+// keys. The `is_gfx1151()` check firewalls the fused kernels to gfx1151 — on every
+// other arch these return false and the projections fall through to the
+// per-projection gemv_mfp4g32_e8 path unchanged. The fused kernels embed the
+// byte-identical gemv_mfp4g32_e8 per-row body, so the fused output equals N
+// sequential GEMVs bit-for-bit (only the launch count shrinks).
+//
+// gfx11 E8 port finding: the fusion (launch-overhead reduction, +5.8% on the Strix
+// Halo APU) does NOT transfer to the gfx1100 dGPU — measured decode 101.7 (fused)
+// vs 102.6 (unfused) tok/s, a ~1% LOSS, bit-identical output. The dGPU's faster
+// compute + the (32,7) launch_bounds tuned for gfx1151 occupancy leave no launch
+// win to capture. Kept gfx1151-only; revisit only with a gfx1100 occupancy retune.
 pub(crate) fn guard_gate_up_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused { return false; }
     if !ctx.arch.is_gfx1151() { return false; }
