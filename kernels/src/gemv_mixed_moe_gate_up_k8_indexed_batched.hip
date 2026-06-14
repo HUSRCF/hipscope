@@ -67,44 +67,44 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
     // cb_lds: 32 B shared, used only by tag==3 (MQ3-Lloyd); harmless to other branches.
     __shared__ float cb_lds[8];
 
+    // Per-group dot (8 MACs) as a value, so the hot MQ6/MQ4 branches can carry
+    // 4 INDEPENDENT accumulators across groups — restoring the quad-unroll ILP
+    // the uniform gemv has (the single-`acc` chain serialized the FMA latency).
+    // Self-contained: derives row_ptr from A/row/groups_per_row, offsets from tid.
+#define _MQ6G(gg) ({ \
+        const char* _gp = (const char*)A + ((long long)row * groups_per_row + (gg)) * 200; \
+        float _s = __builtin_bit_cast(float, *(const unsigned int*)(_gp)); \
+        float _z = __builtin_bit_cast(float, *(const unsigned int*)(_gp + 4)); \
+        const unsigned char* _d = (const unsigned char*)(_gp + 8) + tid * 6; \
+        int _bi = (gg) * 256 + tid * 8; \
+        unsigned char _b0=_d[0],_b1=_d[1],_b2=_d[2],_b3=_d[3],_b4=_d[4],_b5=_d[5]; \
+        int _q0=_b0&63,_q1=(_b0>>6)|((_b1&0xF)<<2),_q2=(_b1>>4)|((_b2&3)<<4),_q3=_b2>>2, \
+            _q4=_b3&63,_q5=(_b3>>6)|((_b4&0xF)<<2),_q6=(_b4>>4)|((_b5&3)<<4),_q7=_b5>>2; \
+        (_s*(float)_q0+_z)*x_row[_bi]   +(_s*(float)_q1+_z)*x_row[_bi+1] \
+       +(_s*(float)_q2+_z)*x_row[_bi+2] +(_s*(float)_q3+_z)*x_row[_bi+3] \
+       +(_s*(float)_q4+_z)*x_row[_bi+4] +(_s*(float)_q5+_z)*x_row[_bi+5] \
+       +(_s*(float)_q6+_z)*x_row[_bi+6] +(_s*(float)_q7+_z)*x_row[_bi+7]; })
+#define _MQ4G(gg) ({ \
+        const char* _gp = (const char*)A + ((long long)row * groups_per_row + (gg)) * 136; \
+        float _s = __builtin_bit_cast(float, *(const unsigned int*)(_gp)); \
+        float _z = __builtin_bit_cast(float, *(const unsigned int*)(_gp + 4)); \
+        unsigned int _pk = *(const unsigned int*)(_gp + 8 + tid * 4); \
+        int _b = (gg) * 256 + tid * 8; \
+        (_s*(float)(_pk&0xFu)+_z)*x_row[_b]        +(_s*(float)((_pk>>4)&0xFu)+_z)*x_row[_b+1] \
+       +(_s*(float)((_pk>>8)&0xFu)+_z)*x_row[_b+2] +(_s*(float)((_pk>>12)&0xFu)+_z)*x_row[_b+3] \
+       +(_s*(float)((_pk>>16)&0xFu)+_z)*x_row[_b+4]+(_s*(float)((_pk>>20)&0xFu)+_z)*x_row[_b+5] \
+       +(_s*(float)((_pk>>24)&0xFu)+_z)*x_row[_b+6]+(_s*(float)((_pk>>28)&0xFu)+_z)*x_row[_b+7]; })
+
     if (tag == 0) {
-        // ---- MQ6 branch (200 B/group affine dequant) ----
-        const int row_bytes = groups_per_row * 200;
-        const char* row_ptr = A + (long long)row * row_bytes;
-        for (int g = 0; g < groups_per_row; g++) {
-            const char* gptr = row_ptr + g * 200;
-            float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
-            float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
-            const unsigned char* data = (const unsigned char*)(gptr + 8);
-
-            int base_idx = g * 256 + tid * 8;
-            int byte_off = tid * 6;
-
-            unsigned char b0 = data[byte_off];
-            unsigned char b1 = data[byte_off + 1];
-            unsigned char b2 = data[byte_off + 2];
-            unsigned char b3 = data[byte_off + 3];
-            unsigned char b4 = data[byte_off + 4];
-            unsigned char b5 = data[byte_off + 5];
-
-            int q0 = b0 & 63;
-            int q1 = (b0 >> 6) | ((b1 & 0xF) << 2);
-            int q2 = (b1 >> 4) | ((b2 & 3) << 4);
-            int q3 = b2 >> 2;
-            int q4 = b3 & 63;
-            int q5 = (b3 >> 6) | ((b4 & 0xF) << 2);
-            int q6 = (b4 >> 4) | ((b5 & 3) << 4);
-            int q7 = b5 >> 2;
-
-            acc += (scale * (float)q0 + zero) * x_row[base_idx]
-                 + (scale * (float)q1 + zero) * x_row[base_idx + 1]
-                 + (scale * (float)q2 + zero) * x_row[base_idx + 2]
-                 + (scale * (float)q3 + zero) * x_row[base_idx + 3]
-                 + (scale * (float)q4 + zero) * x_row[base_idx + 4]
-                 + (scale * (float)q5 + zero) * x_row[base_idx + 5]
-                 + (scale * (float)q6 + zero) * x_row[base_idx + 6]
-                 + (scale * (float)q7 + zero) * x_row[base_idx + 7];
+        // ---- MQ6 branch (200 B/group affine dequant), 4-accumulator unroll ----
+        float _a0=0.f,_a1=0.f,_a2=0.f,_a3=0.f;
+        int g = 0;
+        for (; g + 3 < groups_per_row; g += 4) {
+            _a0 += _MQ6G(g);   _a1 += _MQ6G(g+1);
+            _a2 += _MQ6G(g+2); _a3 += _MQ6G(g+3);
         }
+        for (; g < groups_per_row; g++) _a0 += _MQ6G(g);
+        acc = (_a0 + _a1) + (_a2 + _a3);
     } else if (tag == 1) {
         // ---- MQ2-Lloyd branch (72 B/group 2-bit codebook) ----
         const int row_bytes = groups_per_row * 72;
@@ -134,25 +134,15 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
                 +  cb[b1 >> 6]       * x_row[base + 7];
         }
     } else if (tag == 2) {
-        // ---- MQ4 branch (136 B/group: [0..4) f32 scale, [4..8) f32 zero, [8..136) 128 B 4-bit) ----
-        const int row_bytes = groups_per_row * 136;
-        const char* row_ptr = A + (long long)row * row_bytes;
-        const int boff = tid * 4;
-        for (int g = 0; g < groups_per_row; g++) {
-            const char* gptr = row_ptr + g * 136;
-            float sc = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
-            float zp = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
-            unsigned int pk = *(const unsigned int*)(gptr + 8 + boff);
-            const int base = g * 256 + tid * 8;
-            acc += (sc * (float)( pk        & 0xFu) + zp) * x_row[base]
-                 + (sc * (float)((pk >>  4) & 0xFu) + zp) * x_row[base + 1]
-                 + (sc * (float)((pk >>  8) & 0xFu) + zp) * x_row[base + 2]
-                 + (sc * (float)((pk >> 12) & 0xFu) + zp) * x_row[base + 3]
-                 + (sc * (float)((pk >> 16) & 0xFu) + zp) * x_row[base + 4]
-                 + (sc * (float)((pk >> 20) & 0xFu) + zp) * x_row[base + 5]
-                 + (sc * (float)((pk >> 24) & 0xFu) + zp) * x_row[base + 6]
-                 + (sc * (float)((pk >> 28) & 0xFu) + zp) * x_row[base + 7];
+        // ---- MQ4 branch (136 B/group), 4-accumulator unroll ----
+        float _a0=0.f,_a1=0.f,_a2=0.f,_a3=0.f;
+        int g = 0;
+        for (; g + 3 < groups_per_row; g += 4) {
+            _a0 += _MQ4G(g);   _a1 += _MQ4G(g+1);
+            _a2 += _MQ4G(g+2); _a3 += _MQ4G(g+3);
         }
+        for (; g < groups_per_row; g++) _a0 += _MQ4G(g);
+        acc = (_a0 + _a1) + (_a2 + _a3);
     } else if (tag == 3) {
         // ---- MQ3-Lloyd branch (112 B/group: [0..16) 8xfp16 codebook, [16..112) 96 B 3-bit) ----
         const int row_bytes = groups_per_row * 112;
@@ -178,6 +168,8 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
             __syncthreads();   // protect cb_lds before next group reload
         }
     }
+#undef _MQ6G
+#undef _MQ4G
 
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
