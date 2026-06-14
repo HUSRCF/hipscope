@@ -141,9 +141,15 @@ fn main() -> ExitCode {
     // decode BW floor. Produces a lighter "speed" redline (MQ4 hot/mid + MQ3-
     // Lloyd cold) at a hot-expert quality cost. Off by default.
     let demote_mq6 = std::env::var("HIPFIRE_DEMOTE_MQ6").is_ok();
+    // HIPFIRE_UNIFORM_GATE_UP=1: pull ALL routed-expert gate_up_proj from the
+    // donor (uniform MQ4), leaving down_proj graded. → uniform MQ4 gate_up GEMV
+    // (fast) + merged kernel only for down. Removes the merged kernel from the
+    // dominant gate_up step at a hot-expert gate_up quality cost.
+    let uniform_gate_up = std::env::var("HIPFIRE_UNIFORM_GATE_UP").is_ok();
     for (i, bt) in base_p.tensors.iter().enumerate() {
         let demote = demote_mq6 && bt.quant_type == 15 && bt.name.contains(".mlp.experts.");
-        if is_attn_proj(&bt.name) || demote {
+        let ug = uniform_gate_up && bt.name.contains(".mlp.experts.") && bt.name.contains("gate_up_proj");
+        if is_attn_proj(&bt.name) || demote || ug {
             if let Some(dt) = donor_by_name.get(bt.name.as_str()) {
                 if dt.shape == bt.shape {
                     if bt.quant_type == 3 { swap_q8 += 1; } else { swap_other += 1; }

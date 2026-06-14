@@ -423,6 +423,17 @@ pub fn run_moe_decode(
             p.expert_gate_up_ptrs, p.topk_indices, xr,
             p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
         ))?;
+    } else if p.expert_dtype_tags.is_some() && p.dtypes.experts_all_gate_up_mq4 {
+        // Graded DOWN but UNIFORM MQ4 gate_up (down-only-graded redline): the
+        // tag table is needed only for the down step, so run the fast uniform
+        // MQ4 gate_up GEMV here instead of the merged dtype-tag kernel (which is
+        // ~5us/layer slower). The merged kernel still serves the graded down via
+        // the down dispatch below (it reads the same tag table). Byte-identical
+        // gate_up to the all-MQ4 arm.
+        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            p.expert_gate_up_ptrs, p.topk_indices, xr,
+            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+        ))?;
     } else if let Some(tags) = p.expert_dtype_tags {
         // Per-expert mixed gate_up (N-tier graded: MQ6 hot / MQ4 mid / MQ2-Lloyd
         // or MQ3-Lloyd cold). One merged kernel; block-per-(row,krank,token)
@@ -1278,8 +1289,18 @@ pub fn run_moe_prefill(
                 n, gate_up_k /* hidden dim */, paro.krot,
             ))?;
         }
+        // Down-only-graded redline: the tag table describes the DOWN dtypes, so
+        // for a UNIFORM MQ4 gate_up it must NOT be passed here (the mixed grouped
+        // kernel would read MQ4 gate_up bytes with the down's MQ6/MQ3L tags →
+        // garbage). Pass None → the uniform MQ4 grouped kernel. The down dispatch
+        // below keeps the tags (graded). Mirrors the decode gate_up fix.
+        let gate_up_tags = if p.dtypes.experts_all_gate_up_mq4 {
+            None
+        } else {
+            p.expert_dtype_tags
+        };
         dispatch_grouped_gemm(
-            gpu, p.dtypes.routed_gate_up, p.expert_dtype_tags,
+            gpu, p.dtypes.routed_gate_up, gate_up_tags,
             p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
             p.x_rot_batch, p.y_gate_up_grouped,
             2 * mi, gate_up_k, k_top, path2_m_total, n,
