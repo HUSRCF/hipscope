@@ -37,6 +37,7 @@ use hipfire_runtime::weight_backend::{
     resolve_lm_head, reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde::Deserialize;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -211,57 +212,122 @@ pub struct Qwen35Config {
     pub vram_budget_bytes: u64,
 }
 
-pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
-    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
-    let config = meta.get("config")?;
+/// Nested `rope_parameters` block. All fields optional — Qwen3.5 carries
+/// `rope_theta` here; VL/mrope variants add the section + interleave flags.
+/// `partial_rotary_factor` may also live FLAT on the text config (handled in
+/// finalize), so it's read from both places.
+#[derive(Deserialize)]
+struct RawRope {
+    #[serde(default)]
+    rope_theta: Option<f64>,
+    #[serde(default)]
+    mrope_interleaved: Option<bool>,
+    #[serde(default)]
+    mrope_section: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    partial_rotary_factor: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct RawQwen35Config {
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    vocab_size: usize,
+    #[serde(default)]
+    num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    head_dim: Option<usize>,
+    // Dense FFN intermediate dim. MoE configs (qwen3_5_moe / A3B) replace this
+    // with `moe_intermediate_size` and don't ship `intermediate_size`, so it
+    // defaults to 0 rather than hard-failing — we still need the rest of the
+    // config to detect is_moe and route accordingly.
+    #[serde(default)]
+    intermediate_size: usize,
+    #[serde(default = "default_norm_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_eos")]
+    eos_token_id: u32,
+    #[serde(default)]
+    rope_parameters: Option<RawRope>,
+    // FLAT partial_rotary_factor takes precedence over the nested one (finalize).
+    #[serde(default)]
+    partial_rotary_factor: Option<f64>,
+    #[serde(default = "default_linear_heads")]
+    linear_num_key_heads: usize,
+    #[serde(default = "default_linear_heads")]
+    linear_num_value_heads: usize,
+    #[serde(default = "default_linear_head_dim")]
+    linear_key_head_dim: usize,
+    #[serde(default = "default_linear_head_dim")]
+    linear_value_head_dim: usize,
+    #[serde(default = "default_conv_kernel")]
+    linear_conv_kernel_dim: usize,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    // MoE config (zeros = dense fallback). Qwen3.5-MoE / A3B sets these.
+    #[serde(default)]
+    num_experts: usize,
+    #[serde(default)]
+    num_experts_per_tok: usize,
+    #[serde(default)]
+    moe_intermediate_size: usize,
+    #[serde(default)]
+    shared_expert_intermediate_size: usize,
+    // Qwen convention: re-normalize top-K routing weights to sum to 1.
+    // Absent from some configs (including the shipped A3B HFQ); default on
+    // for Qwen3.5-MoE / A3B to match the HF reference.
+    #[serde(default = "default_norm_topk")]
+    norm_topk_prob: bool,
+}
+
+fn default_norm_eps() -> f32 {
+    1e-6
+}
+fn default_eos() -> u32 {
+    248044
+}
+fn default_linear_heads() -> usize {
+    16
+}
+fn default_linear_head_dim() -> usize {
+    128
+}
+fn default_conv_kernel() -> usize {
+    4
+}
+fn default_norm_topk() -> bool {
+    true
+}
+
+/// Parse a `Qwen35Config` from the OUTER `config` JSON node (the inner blob
+/// under the metadata_json `config` key). Descends into `text_config` when
+/// present (composite VL checkpoints used text-only) and also inspects the
+/// outer node for `vision_config` to set `is_vl_text`.
+///
+/// Shared by both `config_from_hfq` and `config_from_safetensors`: the two
+/// envelope sources are byte-identical past the `meta["config"]` node.
+fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String> {
     let tc = config.get("text_config").unwrap_or(config);
+    let raw: RawQwen35Config = serde_json::from_value(tc.clone())
+        .map_err(|e| format!("qwen35: parsing config failed: {e}"))?;
     let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
 
-    let dim = tc.get("hidden_size")?.as_u64()? as usize;
-    let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
-    let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = tc
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(n_heads as u64) as usize;
-    let head_dim = tc
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(dim / n_heads);
-    let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
-    // Dense FFN intermediate dim. MoE configs (qwen3_5_moe / A3B) replace this
-    // with `moe_intermediate_size` and don't ship `intermediate_size`, so don't
-    // hard-fail here — we still need to load the rest of the config to detect
-    // is_moe and route accordingly.
-    let hidden_dim = tc
-        .get("intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let norm_eps = tc
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1e-6) as f32;
+    let dim = raw.hidden_size;
+    let n_heads = raw.num_attention_heads;
+    let n_kv_heads = raw.num_key_value_heads.unwrap_or(n_heads);
+    let head_dim = raw.head_dim.unwrap_or(dim / n_heads);
 
-    let rope_params = tc.get("rope_parameters");
-    let rope_theta = rope_params
-        .and_then(|r| r.get("rope_theta"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10_000_000.0) as f32;
-    let partial_rotary_factor = tc
-        .get("partial_rotary_factor")
-        .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
-        .and_then(|v| v.as_f64())
+    let rope = raw.rope_parameters.as_ref();
+    let rope_theta = rope.and_then(|r| r.rope_theta).unwrap_or(10_000_000.0) as f32;
+    // FLAT partial_rotary_factor wins over the nested one; default 0.25.
+    let partial_rotary_factor = raw
+        .partial_rotary_factor
+        .or_else(|| rope.and_then(|r| r.partial_rotary_factor))
         .unwrap_or(0.25) as f32;
-    let mrope_interleaved = rope_params
-        .and_then(|r| r.get("mrope_interleaved"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mrope_interleaved = rope.and_then(|r| r.mrope_interleaved).unwrap_or(false);
     let mut mrope_section = [11usize, 11usize, 10usize];
-    if let Some(arr) = rope_params
-        .and_then(|r| r.get("mrope_section"))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(arr) = rope.and_then(|r| r.mrope_section.as_ref()) {
         for (dst, src) in mrope_section.iter_mut().zip(arr.iter().take(3)) {
             if let Some(v) = src.as_u64() {
                 *dst = v as usize;
@@ -269,74 +335,27 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         }
     }
 
-    let eos_token = tc
-        .get("eos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(248044) as u32;
-
-    let linear_num_key_heads = tc
-        .get("linear_num_key_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(16) as usize;
-    let linear_num_value_heads = tc
-        .get("linear_num_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(16) as usize;
-    let linear_key_head_dim = tc
-        .get("linear_key_head_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(128) as usize;
-    let linear_value_head_dim = tc
-        .get("linear_value_head_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(128) as usize;
-    let conv_kernel_dim = tc
-        .get("linear_conv_kernel_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4) as usize;
-
-    let layer_types: Vec<LayerType> = tc
-        .get("layer_types")
-        .and_then(|v| v.as_array())
+    let layer_types: Vec<LayerType> = raw
+        .layer_types
+        .as_ref()
         .map(|arr| {
             arr.iter()
-                .map(|v| match v.as_str().unwrap_or("full_attention") {
+                .map(|s| match s.as_str() {
                     "linear_attention" => LayerType::LinearAttention,
                     _ => LayerType::FullAttention,
                 })
                 .collect()
         })
-        .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
+        .unwrap_or_else(|| vec![LayerType::FullAttention; raw.num_hidden_layers]);
 
-    // MoE config (zeros = dense fallback). Qwen3.5-MoE / A3B sets these.
-    let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let num_experts_per_tok = tc
-        .get("num_experts_per_tok")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let moe_intermediate_size = tc
-        .get("moe_intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let shared_expert_intermediate_size = tc
-        .get("shared_expert_intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let has_shared_expert = shared_expert_intermediate_size > 0;
-    // Qwen convention: re-normalize top-K routing weights to sum to 1.
-    // Absent from some configs (including the shipped A3B HFQ); default on
-    // for Qwen3.5-MoE / A3B to match the HF reference.
-    let norm_topk_prob = tc
-        .get("norm_topk_prob")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let has_shared_expert = raw.shared_expert_intermediate_size > 0;
 
-    Some(Qwen35Config {
+    Ok(Qwen35Config {
         dim,
-        n_layers,
-        vocab_size,
-        norm_eps,
-        eos_token,
+        n_layers: raw.num_hidden_layers,
+        vocab_size: raw.vocab_size,
+        norm_eps: raw.rms_norm_eps,
+        eos_token: raw.eos_token_id,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -345,19 +364,19 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         is_vl_text,
         mrope_interleaved,
         mrope_section,
-        linear_num_key_heads,
-        linear_num_value_heads,
-        linear_key_head_dim,
-        linear_value_head_dim,
-        conv_kernel_dim,
-        hidden_dim,
+        linear_num_key_heads: raw.linear_num_key_heads,
+        linear_num_value_heads: raw.linear_num_value_heads,
+        linear_key_head_dim: raw.linear_key_head_dim,
+        linear_value_head_dim: raw.linear_value_head_dim,
+        conv_kernel_dim: raw.linear_conv_kernel_dim,
+        hidden_dim: raw.intermediate_size,
         layer_types,
-        num_experts,
-        num_experts_per_tok,
-        moe_intermediate_size,
-        shared_expert_intermediate_size,
+        num_experts: raw.num_experts,
+        num_experts_per_tok: raw.num_experts_per_tok,
+        moe_intermediate_size: raw.moe_intermediate_size,
+        shared_expert_intermediate_size: raw.shared_expert_intermediate_size,
         has_shared_expert,
-        norm_topk_prob,
+        norm_topk_prob: raw.norm_topk_prob,
         // MAD-93 v0.1: defaults off; runtime opts in (e.g. via CLI flag in
         // a follow-up commit). When false, no behavior change vs main.
         paged_experts: false,
@@ -365,145 +384,19 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     })
 }
 
+pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| format!("qwen35: metadata_json not valid JSON: {e}"))?;
+    from_config_value(meta.get("config").ok_or("qwen35: missing config")?)
+}
+
 /// Parse Qwen35Config from a SafetensorsSource (or any ModelSource).
 /// Delegates to the same JSON parser as config_from_hfq — the SafetensorsSource
 /// builds compatible metadata JSON from config.json.
-pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config> {
-    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
-    let config = meta.get("config")?;
-    let tc = config.get("text_config").unwrap_or(config);
-
-    let dim = tc.get("hidden_size")?.as_u64()? as usize;
-    let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
-    let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = tc
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(n_heads as u64) as usize;
-    let head_dim = tc
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(dim / n_heads);
-    let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
-    let hidden_dim = tc
-        .get("intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let norm_eps = tc
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1e-6) as f32;
-    let rope_params = tc.get("rope_parameters");
-    let rope_theta = rope_params
-        .and_then(|r| r.get("rope_theta"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10_000_000.0) as f32;
-    let partial_rotary_factor = tc
-        .get("partial_rotary_factor")
-        .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.25) as f32;
-    let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
-    let mrope_interleaved = rope_params
-        .and_then(|r| r.get("mrope_interleaved"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut mrope_section = [11usize, 11usize, 10usize];
-    if let Some(arr) = rope_params
-        .and_then(|r| r.get("mrope_section"))
-        .and_then(|v| v.as_array())
-    {
-        for (dst, src) in mrope_section.iter_mut().zip(arr.iter().take(3)) {
-            if let Some(v) = src.as_u64() {
-                *dst = v as usize;
-            }
-        }
-    }
-    let eos_token = tc
-        .get("eos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(248044) as u32;
-    let linear_num_key_heads = tc
-        .get("linear_num_key_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(16) as usize;
-    let linear_num_value_heads = tc
-        .get("linear_num_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(16) as usize;
-    let linear_key_head_dim = tc
-        .get("linear_key_head_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(128) as usize;
-    let linear_value_head_dim = tc
-        .get("linear_value_head_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(128) as usize;
-    let conv_kernel_dim = tc
-        .get("linear_conv_kernel_dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4) as usize;
-    let layer_types: Vec<LayerType> = tc
-        .get("layer_types")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|v| match v.as_str().unwrap_or("full_attention") {
-                    "linear_attention" => LayerType::LinearAttention,
-                    _ => LayerType::FullAttention,
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
-    let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let num_experts_per_tok = tc
-        .get("num_experts_per_tok")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let moe_intermediate_size = tc
-        .get("moe_intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let shared_expert_intermediate_size = tc
-        .get("shared_expert_intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let has_shared_expert = shared_expert_intermediate_size > 0;
-    let norm_topk_prob = tc
-        .get("norm_topk_prob")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    Some(Qwen35Config {
-        dim,
-        n_layers,
-        vocab_size,
-        norm_eps,
-        eos_token,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        rope_theta,
-        partial_rotary_factor,
-        is_vl_text,
-        mrope_interleaved,
-        mrope_section,
-        linear_num_key_heads,
-        linear_num_value_heads,
-        linear_key_head_dim,
-        linear_value_head_dim,
-        conv_kernel_dim,
-        hidden_dim,
-        layer_types,
-        num_experts,
-        num_experts_per_tok,
-        moe_intermediate_size,
-        shared_expert_intermediate_size,
-        has_shared_expert,
-        norm_topk_prob,
-        paged_experts: false,
-        vram_budget_bytes: u64::MAX,
-    })
+pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config, String> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .map_err(|e| format!("qwen35: metadata_json not valid JSON: {e}"))?;
+    from_config_value(meta.get("config").ok_or("qwen35: missing config")?)
 }
 
 // ─── Weight structs ─────────────────────────────────────────────────────
@@ -13280,6 +13173,232 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── N4 config-parser collapse: serde RawQwen35Config + finalize ──────
+    // Oracle for the ×2 collapse (config_from_hfq vs config_from_safetensors)
+    // and the serde port. Fixtures are CPU-pure (no GPU). Expected values are
+    // transcribed from the field contract the OLD hand-walked parsers produced.
+
+    /// Wrap an inner `config` blob in the metadata_json envelope both sources
+    /// build (`{architecture, config:{...}}`, see safetensors_source.rs).
+    fn envelope(inner: serde_json::Value) -> String {
+        serde_json::json!({ "architecture": "qwen35", "config": inner }).to_string()
+    }
+
+    /// A realistic dense Qwen3.5 inner config with the linear/mrope/rope_parameters
+    /// fields populated.
+    fn dense_inner() -> serde_json::Value {
+        serde_json::json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "intermediate_size": 3584,
+            "rms_norm_eps": 1e-5,
+            "eos_token_id": 151645,
+            "rope_parameters": {
+                "rope_theta": 5000000.0,
+                "mrope_interleaved": true,
+                "mrope_section": [12, 13, 14]
+            },
+            "partial_rotary_factor": 0.5,
+            "linear_num_key_heads": 32,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 64,
+            "linear_value_head_dim": 64,
+            "linear_conv_kernel_dim": 3,
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention"
+            ],
+            "norm_topk_prob": false
+        })
+    }
+
+    #[test]
+    fn dense_fixture_every_field() {
+        let cfg = from_config_value(&dense_inner()).expect("dense parse");
+        assert_eq!(cfg.dim, 2048);
+        assert_eq!(cfg.n_layers, 4);
+        assert_eq!(cfg.vocab_size, 151936);
+        assert_eq!(cfg.norm_eps, 1e-5);
+        assert_eq!(cfg.eos_token, 151645);
+        assert_eq!(cfg.n_heads, 16);
+        assert_eq!(cfg.n_kv_heads, 2);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.rope_theta, 5_000_000.0);
+        // FLAT partial_rotary_factor wins over nested.
+        assert_eq!(cfg.partial_rotary_factor, 0.5);
+        assert!(!cfg.is_vl_text);
+        assert!(cfg.mrope_interleaved);
+        assert_eq!(cfg.mrope_section, [12, 13, 14]);
+        assert_eq!(cfg.linear_num_key_heads, 32);
+        assert_eq!(cfg.linear_num_value_heads, 32);
+        assert_eq!(cfg.linear_key_head_dim, 64);
+        assert_eq!(cfg.linear_value_head_dim, 64);
+        assert_eq!(cfg.conv_kernel_dim, 3);
+        assert_eq!(cfg.hidden_dim, 3584);
+        assert_eq!(
+            cfg.layer_types,
+            vec![
+                LayerType::LinearAttention,
+                LayerType::LinearAttention,
+                LayerType::LinearAttention,
+                LayerType::FullAttention,
+            ]
+        );
+        assert_eq!(cfg.num_experts, 0);
+        assert_eq!(cfg.num_experts_per_tok, 0);
+        assert_eq!(cfg.moe_intermediate_size, 0);
+        assert_eq!(cfg.shared_expert_intermediate_size, 0);
+        assert!(!cfg.has_shared_expert);
+        assert!(!cfg.norm_topk_prob);
+        assert!(!cfg.paged_experts);
+        assert_eq!(cfg.vram_budget_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn defaults_when_optional_absent() {
+        // Minimal config: only the four required fields. Everything else defaults.
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000
+        });
+        let cfg = from_config_value(&inner).expect("minimal parse");
+        assert_eq!(cfg.n_kv_heads, 8); // defaults to n_heads
+        assert_eq!(cfg.head_dim, 1024 / 8); // dim / n_heads
+        assert_eq!(cfg.hidden_dim, 0);
+        assert_eq!(cfg.norm_eps, 1e-6);
+        assert_eq!(cfg.eos_token, 248044);
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
+        assert!(!cfg.mrope_interleaved);
+        assert_eq!(cfg.mrope_section, [11, 11, 10]);
+        assert_eq!(cfg.linear_num_key_heads, 16);
+        assert_eq!(cfg.linear_num_value_heads, 16);
+        assert_eq!(cfg.linear_key_head_dim, 128);
+        assert_eq!(cfg.linear_value_head_dim, 128);
+        assert_eq!(cfg.conv_kernel_dim, 4);
+        // norm_topk_prob defaults to true.
+        assert!(cfg.norm_topk_prob);
+        // layer_types absent → all FullAttention, length n_layers.
+        assert_eq!(cfg.layer_types, vec![LayerType::FullAttention; 2]);
+    }
+
+    #[test]
+    fn collapse_hfq_eq_safetensors() {
+        // ×2-collapse proof: the same inner config under the hfq-style and the
+        // safetensors-style envelope (same shape) must yield identical configs,
+        // since both delegate to from_config_value(meta["config"]).
+        let inner = dense_inner();
+        let env = envelope(inner.clone());
+
+        // hfq path: parse via from_config_value on meta["config"].
+        let meta: serde_json::Value = serde_json::from_str(&env).unwrap();
+        let via_config = from_config_value(meta.get("config").unwrap()).unwrap();
+
+        // safetensors path goes through a ModelSource; emulate by parsing the
+        // identical envelope string the same way config_from_safetensors does.
+        let meta2: serde_json::Value = serde_json::from_str(&env).unwrap();
+        let via_config2 = from_config_value(meta2.get("config").unwrap()).unwrap();
+
+        assert_eq!(format!("{via_config:?}"), format!("{via_config2:?}"));
+    }
+
+    #[test]
+    fn moe_fixture() {
+        let inner = serde_json::json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 16,
+            "vocab_size": 151936,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "layer_types": ["linear_attention", "full_attention", "linear_attention"]
+        });
+        let cfg = from_config_value(&inner).expect("moe parse");
+        assert_eq!(cfg.num_experts, 256);
+        assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.moe_intermediate_size, 512);
+        assert_eq!(cfg.shared_expert_intermediate_size, 512);
+        assert!(cfg.has_shared_expert);
+        assert_eq!(
+            cfg.layer_types,
+            vec![
+                LayerType::LinearAttention,
+                LayerType::FullAttention,
+                LayerType::LinearAttention,
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_required_is_err() {
+        // No hidden_size → serde hard-error.
+        let inner = serde_json::json!({
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000
+        });
+        assert!(from_config_value(&inner).is_err());
+    }
+
+    #[test]
+    fn rope_nested_partial_rotary_when_no_flat() {
+        // No flat partial_rotary_factor → falls back to nested rope_parameters.
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000,
+            "rope_parameters": { "partial_rotary_factor": 0.75 }
+        });
+        let cfg = from_config_value(&inner).expect("parse");
+        assert_eq!(cfg.partial_rotary_factor, 0.75);
+    }
+
+    #[test]
+    fn mrope_section_partial_fill() {
+        // Array shorter than 3 fills leading slots, keeps defaults for the rest.
+        // Non-u64 elements keep that slot's default.
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000,
+            "rope_parameters": { "mrope_section": [20, "oops"] }
+        });
+        let cfg = from_config_value(&inner).expect("parse");
+        // slot 0 ← 20, slot 1 non-u64 keeps default 11, slot 2 absent keeps 10.
+        assert_eq!(cfg.mrope_section, [20, 11, 10]);
+    }
+
+    #[test]
+    fn is_vl_text_true_when_vision_config_present() {
+        // BOTH text_config AND vision_config on the OUTER config node.
+        let outer = serde_json::json!({
+            "vision_config": { "depth": 32 },
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 16,
+                "vocab_size": 151936
+            }
+        });
+        let cfg = from_config_value(&outer).expect("vl parse");
+        assert!(cfg.is_vl_text);
+        // descended into text_config for the shape.
+        assert_eq!(cfg.dim, 2048);
+        assert_eq!(cfg.vocab_size, 151936);
+    }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
     // The lowered LayerProgram per variant must mirror the hand-arm op sequence

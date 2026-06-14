@@ -78,7 +78,7 @@ impl Carrier for Qwen35Carrier {
                     let arch_id = hfq_file.arch_id;
                     let pp = ctx.pp;
                     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
-                        .ok_or("failed to read Qwen3.5 config")?;
+                        .map_err(|_| "failed to read Qwen3.5 config")?;
                     let kv_mode = ctx
                         .kv_mode_override
                         .filter(|s| !s.is_empty())
@@ -313,7 +313,7 @@ impl Carrier for Qwen35Carrier {
                 let chat_template = source.chat_template();
 
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
-                    .ok_or("failed to parse Qwen3.5 config from config.json")?;
+                    .map_err(|_| "failed to parse Qwen3.5 config from config.json")?;
                 let mut paro_source =
                     hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
                         .map_err(|e| format!("ParoSource::new: {e:?}"))?;

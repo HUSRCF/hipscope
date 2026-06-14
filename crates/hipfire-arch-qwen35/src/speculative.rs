@@ -559,7 +559,7 @@ impl ModelSlot {
         let mut hfq = HfqFile::open(path).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("open {} ({}): {}", path.display(), name, e))
         })?;
-        let config = qwen35::config_from_hfq(&hfq).ok_or_else(|| {
+        let config = qwen35::config_from_hfq(&hfq).map_err(|_| {
             hip_bridge::HipError::new(
                 0,
                 &format!("invalid Qwen3.5 config in {} ({})", path.display(), name),

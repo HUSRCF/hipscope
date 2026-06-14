@@ -97,7 +97,7 @@ fn run(path: &str) -> Result<String, Outcome> {
     #[cfg(feature = "deltanet")]
     {
         let q35_config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq)
-            .ok_or_else(|| Outcome::Fail("failed to parse qwen35 config".to_string()))?;
+            .map_err(|_| Outcome::Fail("failed to parse qwen35 config".to_string()))?;
         let linear_layers = q35_config
             .layer_types
             .iter()

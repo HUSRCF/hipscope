@@ -64,7 +64,6 @@ impl Architecture for Qwen35 {
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
         qwen35_config_from_hfq(hfq)
-            .ok_or_else(|| "qwen35: failed to parse config from HFQ metadata".to_string())
     }
 
     fn load_weights(
