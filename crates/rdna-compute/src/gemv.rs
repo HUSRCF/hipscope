@@ -5464,8 +5464,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 wave32-WMMA");
+        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 or RDNA4");
         // SoA path (decode): when experts were transposed AoS->SoA at load. Same
         // batched kernel interface (this launcher runs it with batch=1).
         let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
@@ -5551,8 +5551,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 wave32-WMMA");
+        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 or RDNA4");
         // SoA-coalesced path takes priority when experts were transposed AoS->SoA at
         // load (RDNA3 dGPU + HIPFIRE_E8_SOA_EXPERTS=1). Same params/grid as the AoS
         // kernel; only the in-weight addressing differs.
@@ -5635,8 +5635,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32(),
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 wave32-WMMA");
+        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 or RDNA4");
         let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
         let (kname, ksrc, kfn) = if use_dgpu_twin {
             (

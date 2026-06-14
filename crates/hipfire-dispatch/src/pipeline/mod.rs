@@ -219,12 +219,15 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    // gfx11 E8 port: widen E8 grouped/GPU-topK admission from gfx1151-only to the
-    // whole RDNA3 wave32-WMMA family (has_wmma_w32 == is_rdna3, excludes gfx12/CDNA).
-    // gfx1100 (dGPU) shares the wave32 WMMA + scalar-E8 indexed-GEMV ISA with gfx1151
-    // (iGPU); routing it onto use_gpu_topk also removes the host-side router-logits
-    // D2H that crashes hipGraph capture on the dGPU.
-    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.has_wmma_w32());
+    // gfx11 E8 port: widen E8 GPU-topK admission to the whole RDNA3 wave32-WMMA family
+    // (has_wmma_w32 == is_rdna3, excludes CDNA). gfx1100 (dGPU) shares the scalar-E8
+    // indexed-GEMV ISA with gfx1151; routing it onto use_gpu_topk removes the
+    // host-side router-logits D2H that crashes hipGraph capture on the dGPU.
+    // gfx12 (RDNA4) port: widen further to has_wmma() (is_rdna3 || is_rdna4) so that
+    // gfx1200/gfx1201 also get use_gpu_topk + needs_x_rot_local for E8 experts.
+    // arch_has_e8_wmma ONLY gates routed_indexable_e8 in resolve_arch — no other dtype
+    // path is affected, so widening here is safe for all non-E8 models.
+    let res = MoeResolution::resolve_arch(&p.dtypes, p.k, ctx.arch.has_wmma());
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
@@ -1198,9 +1201,11 @@ fn dispatch_grouped_gemm(
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),
-        // mfp4-E8 grouped-WMMA (gfx1151-only; MoePrefillResolution admits Path 2
-        // for E8 only on gfx1151). Amortizes expert-weight reads vs the indexed
-        // GEMV — the memory-bound prefill / batched-verify lever.
+        // mfp4-E8 grouped-WMMA (gfx1151 + gfx12/RDNA4; MoePrefillResolution admits
+        // Path 2 for E8 on gfx1151 and gfx1200/gfx1201). The launcher selects the
+        // correct WMMA intrinsic variant (gfx1151 vs _gfx12) internally.
+        // Amortizes expert-weight reads vs the indexed GEMV — the memory-bound
+        // prefill / batched-verify lever.
         DType::MFP4G32E8 => hip!(gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
             ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
         )),

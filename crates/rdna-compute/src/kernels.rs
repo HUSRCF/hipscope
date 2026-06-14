@@ -1108,6 +1108,11 @@ pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
 /// reads via the SGLang scatter pipeline + wave32 F16 WMMA with E8 lattice dequant.
 pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip");
+/// gfx12 (RDNA4) sister of GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC. Same
+/// dispatch contract and kernarg layout; differs in WMMA intrinsic
+/// (`wmma_f32_16x16x16_f16` → `_w32_gfx12` variant) required on gfx1200/gfx1201.
+pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx12.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.

@@ -11348,16 +11348,26 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            self.arch_caps.has_wmma_w32(),
-            "gemm_mfp4g32_e8_moe_grouped_wmma needs RDNA3 wave32-WMMA (current arch = {})",
+            self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemm_mfp4g32_e8_moe_grouped_wmma needs RDNA3 wave32-WMMA or RDNA4 (current arch = {})",
             self.arch
         );
-        let kernel_name = "gemm_mfp4g32_e8_moe_grouped_wmma";
-        self.ensure_kernel(
-            kernel_name,
-            kernels::GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC,
-            kernel_name,
-        )?;
+        // gfx12 (RDNA4) uses the _gfx12 WMMA intrinsic sister; gfx1151 (and the
+        // rest of RDNA3) use the original gfx1151 kernel — both carry the same
+        // kernarg layout and grid formula so nothing else changes.
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        let (kernel_name, kernel_src) = if is_gfx12 {
+            (
+                "gemm_mfp4g32_e8_moe_grouped_wmma_gfx12",
+                kernels::GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_mfp4g32_e8_moe_grouped_wmma",
+                kernels::GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC,
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
 
         let ep = expert_weight_ptrs.buf.as_ptr();
