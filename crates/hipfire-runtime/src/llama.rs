@@ -3144,6 +3144,419 @@ pub fn forward_scratch_embed(
 }
 
 /// Layer loop + final norm + logits + sampling. Graph-capturable.
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle for the llama-family decode path
+/// (N5 Phase A). Default ON; `HIPFIRE_FORWARD_LOWERED=0` forces the legacy
+/// hand-rolled [`forward_scratch_layers`] body as a byte-exact reference +
+/// escape hatch. Mirrors qwen2's `qwen2_forward_lowered_enabled` and qwen35's
+/// `forward_lowered_enabled`.
+fn llama_forward_lowered_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// KV-cache write + single-token attention, extracted verbatim from the hand
+/// [`forward_scratch_layers`] 7-way KV-tier ladder so the lowered path (N5
+/// Phase A3a) can reuse it unchanged. The hand body keeps its own inline copy
+/// (left untouched as the byte-exact reference). Phase A3b replaces this
+/// helper's body with `attention_family()` + `KvTierPlan`; until then it is a
+/// pure extraction (same kernels, same order → byte-identical).
+fn llama_kv_write_attend(
+    gpu: &mut Gpu,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    layer_idx: usize,
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+) -> HipResult<()> {
+    if kv_cache.quant_hfq4 {
+        gpu.kv_cache_write_hfq4(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_hfq4(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_hfq4_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized
+        && !kv_cache.k_scales.is_empty()
+        && !kv_cache.quant_int8
+        && !kv_cache.quant_q8
+    {
+        // HFQ8 flat layout
+        gpu.kv_cache_write_hfq8(
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.k_scales[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_hfq8(
+            &kv_cache.v_gpu[layer_idx],
+            &kv_cache.v_scales[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_hfq8_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.k_scales[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &kv_cache.v_scales[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quant_int8 {
+        gpu.kv_cache_write_int8c_f16(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_int8c_f16(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_int8c_f16_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized && kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_q8_0_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized {
+        gpu.kv_cache_write_q4(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_q4(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_q4kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else {
+        gpu.kv_cache_write(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            kv_dim,
+        )?;
+        gpu.kv_cache_write(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            kv_dim,
+        )?;
+        gpu.attention_f32(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    }
+    Ok(())
+}
+
+/// Lowered llama-family decode loop (N5 Phase A3a). Behaviorally equivalent to
+/// the hand [`forward_scratch_layers`] loop: projections (QKV / o_proj / gate-up
+/// / down / lm_head) go through `hipfire_dispatch::execute_steps` (which selects
+/// FusedQkvQ4K / fused-MQ / per-op + handles FWHT rotation + residual fusion),
+/// while qk_norm, RoPE, the KV ladder (via [`llama_kv_write_attend`]), final
+/// norm and sampling stay the same bare `gpu.*` calls. Validated against the
+/// hand path via the `HIPFIRE_FORWARD_LOWERED=0`-vs-default committed-token md5
+/// A/B (`scripts/forward-lowered-parity.sh`).
+///
+/// Note: like the dead `arch-llama` port this came from, the lowered QKV/gate-up
+/// `RmsnormAutomatic` always normalizes — including the Q4K branch the hand path
+/// previously skipped (the "F1 rmsnorm bug" fix). So Q4K output is intentionally
+/// *more correct* and may legitimately differ from the hand bytes; gate Q4K via
+/// coherence-gate, not byte-parity. MQ paths are expected byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_layers_lowered(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
+) -> HipResult<(u32, u32)> {
+    use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+
+    let ctx = DispatchCtx::new(gpu);
+
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // ── Attention QKV (rmsnorm-rotate + 3× Gemv via execute_steps) ──
+        let qkv_rot = dtype_rotation_plan(layer.wq.gpu_dtype);
+        let wrq = layer.wq.dispatch_ref();
+        let wrk = layer.wk.dispatch_ref();
+        let wrv = layer.wv.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &scratch.x,
+                    norm_weight: &layer.attn_norm,
+                    x_plain: &scratch.tmp,
+                    out: &scratch.x_rot,
+                    awq_scale: layer.wq.awq_scale.as_ref(),
+                    k: layer.wq.k,
+                    eps: config.norm_eps,
+                    rotation: qkv_rot,
+                },
+                Step::Gemv {
+                    w: &wrq,
+                    input: GemvInput::Prerotated(&scratch.x_rot),
+                    out: &scratch.q,
+                },
+                Step::Gemv {
+                    w: &wrk,
+                    input: GemvInput::Prerotated(&scratch.x_rot),
+                    out: &scratch.k,
+                },
+                Step::Gemv {
+                    w: &wrv,
+                    input: GemvInput::Prerotated(&scratch.x_rot),
+                    out: &scratch.v,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+        // ── QK norm (optional per config; same bare gpu call as hand) ──
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.q,
+                    qn,
+                    &scratch.q,
+                    n_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.k,
+                    kn,
+                    &scratch.k,
+                    n_kv_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+        }
+
+        // ── RoPE (same bare gpu call as hand) ──
+        gpu.rope_f32(
+            &scratch.q,
+            &scratch.k,
+            &scratch.pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            config.rope_freq_base,
+        )?;
+
+        // ── KV write + attention (verbatim ladder, Phase A3b unifies it) ──
+        llama_kv_write_attend(
+            gpu, kv_cache, scratch, layer_idx, pos, n_heads, n_kv_heads, head_dim, kv_dim,
+        )?;
+
+        // ── Attention output projection + residual (GemvResidual) ──
+        let wro = layer.wo.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wro,
+                input: GemvInput::Raw(&scratch.attn_out),
+                residual: &scratch.x,
+                out: &scratch.o,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+        // ── FFN (rmsnorm-rotate + gate/up via execute_steps) ──
+        let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
+        let wrg = layer.w_gate.dispatch_ref();
+        let wru = layer.w_up.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &scratch.x,
+                    norm_weight: &layer.ffn_norm,
+                    x_plain: &scratch.tmp,
+                    out: &scratch.x_rot,
+                    awq_scale: layer.w_gate.awq_scale.as_ref(),
+                    k: layer.w_gate.k,
+                    eps: config.norm_eps,
+                    rotation: ffn_rot,
+                },
+                Step::Gemv {
+                    w: &wrg,
+                    input: GemvInput::Prerotated(&scratch.x_rot),
+                    out: &scratch.gate,
+                },
+                Step::Gemv {
+                    w: &wru,
+                    input: GemvInput::Prerotated(&scratch.x_rot),
+                    out: &scratch.up,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+        // ── SwiGLU + down projection + residual ──
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        let wrd = layer.w_down.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wrd,
+                input: GemvInput::Raw(&scratch.ffn_hidden),
+                residual: &scratch.x,
+                out: &scratch.ffn_out,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+
+    // ── Final norm + logits + sampling ──
+    gpu.rmsnorm_f32(
+        &scratch.x,
+        &weights.output_norm,
+        &scratch.tmp,
+        config.norm_eps,
+    )?;
+    let wr_out = weights.output.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+    gpu.sample_top_p(
+        &scratch.logits,
+        &scratch.sample_buf,
+        &scratch.repeat_buf,
+        config.vocab_size,
+        temperature,
+        top_p,
+        rng_state,
+        repeat_window,
+        repeat_penalty,
+    )
+}
+
 pub fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
@@ -3157,6 +3570,22 @@ pub fn forward_scratch_layers(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
+    if llama_forward_lowered_enabled() {
+        return forward_scratch_layers_lowered(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            scratch,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+        );
+    }
+
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;

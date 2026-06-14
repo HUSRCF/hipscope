@@ -97,6 +97,11 @@ DENSE_PROMPT="Write a short Python function called fib that returns the nth Fibo
 SHEEP_PROMPT="A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number."
 
 ROWS=(
+    # llama-family dense (arch_id 0/1) — N5 Phase A: validates the new llama
+    # forward_scratch_layers_lowered (execute_steps projections) vs the legacy
+    # hand path. MQ4 → expected byte-identical (the F1 rmsnorm fix only changes
+    # the Q4K branch, which MQ4 doesn't take).
+    "qwen3-0.6b-llama.mq4|llama-0.6b-mq4|$DENSE_PROMPT"
     "qwen3.5-9b.mq4|qwen35-9b-mq4|$DENSE_PROMPT"
     "qwen3.5-9b.q8f16|qwen35-9b-q8|$DENSE_PROMPT"
     "qwen3.6-35b-a3b-paro.hfq|qwen36-a3b-paro|$SHEEP_PROMPT"
