@@ -279,8 +279,8 @@ pub fn run_moe_decode(
     // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
     let shared_up   = unsafe { slice_moe_f32_view(p.up_buf,   0, p.smi) };
-    if res.gate_side_mq4 {
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+    if res.gate_fusable {
+        let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
         hip!(gpu.fused_qkvza_hfq4g256(
             &p.router.buf, &p.shared_expert_gate.buf,
             &p.shared_gate_w.buf, &p.shared_up_w.buf,

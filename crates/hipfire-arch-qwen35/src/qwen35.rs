@@ -5146,14 +5146,26 @@ fn moe_ffn_decode(
 /// the prerotated fast path where the caller can fuse rmsnorm+FWHT via
 /// `fused_rmsnorm_rotate_mq` and call `moe_ffn_decode_with_scratch_prerotated`.
 pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+    ffn_gate_side_mq4_for_moe(ffn)
         && ffn
             .experts
             .iter()
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+}
+
+/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
+/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
+/// applicable even on a graded file: the MQ4 router routes on the rotated x via
+/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
+/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
+/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
+/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
+/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
+pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
+    ffn.router.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -13165,7 +13177,7 @@ fn moe_ffn_dispatch(
     config: &Qwen35Config,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
-    let r = if ffn_all_mq4_for_moe(ffn) {
+    let r = if ffn_gate_side_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
             x, ffn_norm,
             s.moe_x_rot.as_ref().expect("MoE scratch"),
