@@ -307,7 +307,13 @@ pub fn run_moe_decode(
             && p.shared_gate_w.awq_scale.is_none()
             && p.shared_up_w.awq_scale.is_none()
             && matches!(crate::types::dtype_post_rotation_variant(p.shared_gate_w.dtype), crate::types::GemvVariant::Prerotated)
-            && matches!(crate::types::dtype_post_rotation_variant(p.shared_up_w.dtype), crate::types::GemvVariant::Prerotated);
+            && matches!(crate::types::dtype_post_rotation_variant(p.shared_up_w.dtype), crate::types::GemvVariant::Prerotated)
+            // The prerotated MQ GEMV must actually exist for this arch. MQ6/HFQ6
+            // prerotated is HasMmq (gfx906/RDNA3/RDNA4) → ABSENT on gfx942/CDNA, so
+            // taking this shortcut there hits MissingImpl. When unavailable, fall
+            // through to run_auto (the pre-2f38a16e gfx942 path that worked).
+            && crate::types::KernelKey::dtype_arch_predicate(p.shared_gate_w.dtype).eval_arch(ctx)
+            && crate::types::KernelKey::dtype_arch_predicate(p.shared_up_w.dtype).eval_arch(ctx);
         if shared_prerot {
             let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
             gemv.run(ctx, gpu, &crate::families::gemv::GemvParams {
