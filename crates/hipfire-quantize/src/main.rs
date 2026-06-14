@@ -5869,9 +5869,10 @@ fn main() {
                     "MQ4" => QuantType::MQ4G256,
                     "MQ3L" => QuantType::MQ3G256Lloyd,
                     "MQ2L" => QuantType::MQ2G256Lloyd,
+                    "E8" | "MFP4E8" => QuantType::MFP4G32E8,
                     other => {
                         eprintln!(
-                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L)",
+                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8)",
                             lineno + 1, other
                         );
                         std::process::exit(2);
@@ -7611,6 +7612,13 @@ fn main() {
                                 quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2),
                                 QuantType::MQ2G256Lloyd,
                                 256u32,
+                            ),
+                            // T3-3L-E8 experiment: mfp4-E8 mid tier (4.25 bpw,
+                            // MQ6-class quality) in place of MQ4. group_size 32.
+                            QuantType::MFP4G32E8 => (
+                                quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                QuantType::MFP4G32E8,
+                                32u32,
                             ),
                             // Any other QuantType in the map → MQ4 safe fallback
                             _ => (
