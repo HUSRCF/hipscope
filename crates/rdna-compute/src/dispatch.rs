@@ -113,7 +113,9 @@ impl GpuTensor {
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0)
+            },
             shape: vec![0],
             dtype: crate::DType::F32,
         }
@@ -285,6 +287,27 @@ impl DType {
                 | DType::MQ3G256Lloyd
                 | DType::MQ2G256Lloyd
         )
+    }
+
+    /// Per-row byte stride for split-metadata layouts. Q8HFQ packs `n_groups*2`
+    /// scale bytes + `k` value bytes per row, padded to a 128-byte boundary; all
+    /// other dtypes are contiguous (the kernel derives their stride) -> 0.
+    /// Single source of truth for the formula previously inlined at hfq.rs:748.
+    pub fn row_stride(self, k: usize) -> usize {
+        match self {
+            DType::Q8HFQ => {
+                let raw_row = (k / 32) * 2 + k;
+                (raw_row + 127) & !127
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
+    /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
+    /// dispatch. Centralizes the guard previously inlined at the qt 21/24 arms.
+    pub fn requires_k_mod_256(self) -> bool {
+        matches!(self, DType::HFP4G32 | DType::MFP4G32)
     }
 }
 
@@ -2036,6 +2059,47 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::DType;
+
+    #[test]
+    fn q8hfq_row_stride_matches_legacy_formula() {
+        // Legacy formula (hfq.rs:748-750): n_groups = k/32; raw = n_groups*2 + k; (raw+127)&!127
+        for k in [4096usize, 11008, 5120, 14336, 256, 96] {
+            let raw_row = (k / 32) * 2 + k;
+            let want = (raw_row + 127) & !127;
+            assert_eq!(DType::Q8HFQ.row_stride(k), want, "Q8HFQ stride k={k}");
+        }
+    }
+
+    #[test]
+    fn non_q8hfq_row_stride_is_zero() {
+        for dt in [
+            DType::HFQ4G256,
+            DType::MQ4G256,
+            DType::Q8_0,
+            DType::F16,
+            DType::HFP4G32,
+            DType::MFP4G32,
+        ] {
+            assert_eq!(dt.row_stride(4096), 0, "{dt:?} must have stride 0");
+        }
+    }
+
+    #[test]
+    fn only_hfp4_family_requires_k_mod_256() {
+        assert!(DType::HFP4G32.requires_k_mod_256());
+        assert!(DType::MFP4G32.requires_k_mod_256());
+        for dt in [
+            DType::HFQ4G256,
+            DType::MQ4G256,
+            DType::Q8HFQ,
+            DType::Q8_0,
+            DType::F16,
+            DType::F32,
+        ] {
+            assert!(!dt.requires_k_mod_256(), "{dt:?} must NOT require k%256");
+        }
+    }
 
     #[test]
     fn mq_signs_128_deterministic() {
