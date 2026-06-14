@@ -2326,7 +2326,9 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             "rotate_with_rms_gfx942",
             [groups, batch_size as u32, 1],
-            [128, 1, 1],
+            // kernel is __launch_bounds__(64) — 1 wave64 (lanes 0..31 work).
+            // Launching 128 violates the bound → hipErrorLaunchFailure (719) on gfx942.
+            [64, 1, 1],
             0,
             &mut params_b,
             || {
