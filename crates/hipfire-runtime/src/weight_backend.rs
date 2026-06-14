@@ -300,7 +300,6 @@ where
 // DType::supports_awq_sidecar.
 
 /// One passthrough quant format: upload bytes verbatim, tag `dtype`.
-#[allow(dead_code)] // consumers wired in Tasks 4/5
 pub(crate) struct RawCodec {
     pub quant_type: u8,
     pub dtype: DType,
@@ -308,7 +307,6 @@ pub(crate) struct RawCodec {
 
 /// The registry. Order is irrelevant (lookup is by quant_type); ascending for
 /// readability. qt 1/2/16 are intentionally absent (host-decode, see consumers).
-#[allow(dead_code)] // consumers wired in Tasks 4/5
 pub(crate) const RAW_CODECS: &[RawCodec] = &[
     RawCodec {
         quant_type: 0,
@@ -398,7 +396,6 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
-#[allow(dead_code)] // consumers wired in Tasks 4/5
 pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
     RAW_CODECS.iter().find(|c| c.quant_type == quant_type)
 }
@@ -407,7 +404,6 @@ pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
 /// upload bytes verbatim, build the `WeightTensor` with the dtype + its
 /// DType-derived row_stride. `name` is the caller context for the guard panic.
 /// AWQ sidecars are attached by the caller (hfq), never here.
-#[allow(dead_code)] // consumers wired in Tasks 4/5
 pub(crate) fn decode_raw_codec(
     gpu: &Gpu,
     codec: &RawCodec,
@@ -444,208 +440,11 @@ pub fn dequant_weight_raw(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
+    // Host-decode formats stay explicit (NOT passthrough table rows):
     match quant_type {
-        6 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        7 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        8 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ6G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        11 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        12 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        13 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        14 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        15 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ6G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        17 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        18 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        19 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        20 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        30 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        21 => {
-            assert!(
-                k % 256 == 0,
-                "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0"
-            );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        24 => {
-            assert!(
-                k % 256 == 0,
-                "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0"
-            );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        3 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8_0,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
         1 => {
+            // F16 — keep as F16 bytes (the HFQ path host-decodes qt 1 to F32 instead;
+            // this divergence is why qt 1 is not a RAW_CODECS row).
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -658,6 +457,7 @@ pub fn dequant_weight_raw(
             })
         }
         2 => {
+            // F32 — upload as [m, k].
             let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
@@ -686,7 +486,10 @@ pub fn dequant_weight_raw(
                 awq_scale: None,
             })
         }
-        _ => panic!("unsupported quant_type {quant_type} for dequant_weight_raw"),
+        other => match raw_codec(other) {
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw"),
+            None => panic!("unsupported quant_type {other} for dequant_weight_raw"),
+        },
     }
 }
 
