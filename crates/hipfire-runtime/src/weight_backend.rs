@@ -403,6 +403,38 @@ pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
     RAW_CODECS.iter().find(|c| c.quant_type == quant_type)
 }
 
+/// Decode a passthrough quant format: enforce the K%256 guard (via DType),
+/// upload bytes verbatim, build the `WeightTensor` with the dtype + its
+/// DType-derived row_stride. `name` is the caller context for the guard panic.
+/// AWQ sidecars are attached by the caller (hfq), never here.
+#[allow(dead_code)] // consumers wired in Tasks 4/5
+pub(crate) fn decode_raw_codec(
+    gpu: &Gpu,
+    codec: &RawCodec,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> HipResult<WeightTensor> {
+    if codec.dtype.requires_k_mod_256() {
+        assert!(
+            k % 256 == 0,
+            "{:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})",
+            codec.dtype
+        );
+    }
+    let buf = gpu.upload_raw(data, &[data.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: codec.dtype,
+        m,
+        k,
+        row_stride: codec.dtype.row_stride(k),
+        paro: None,
+        awq_scale: None,
+    })
+}
+
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
 pub fn dequant_weight_raw(
