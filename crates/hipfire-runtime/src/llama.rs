@@ -3163,7 +3163,7 @@ fn llama_forward_lowered_enabled() -> bool {
 /// pure extraction (same kernels, same order → byte-identical).
 fn llama_kv_write_attend(
     gpu: &mut Gpu,
-    kv_cache: &mut KvCache,
+    kv_cache: &KvCache,
     scratch: &ForwardScratch,
     layer_idx: usize,
     pos: usize,
@@ -3377,153 +3377,26 @@ fn forward_scratch_layers_lowered(
 
     let ctx = DispatchCtx::new(gpu);
 
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
-
-    for layer_idx in 0..config.n_layers {
-        let layer = &weights.layers[layer_idx];
-
-        // ── Attention QKV (rmsnorm-rotate + 3× Gemv via execute_steps) ──
-        let qkv_rot = dtype_rotation_plan(layer.wq.gpu_dtype);
-        let wrq = layer.wq.dispatch_ref();
-        let wrk = layer.wk.dispatch_ref();
-        let wrv = layer.wv.dispatch_ref();
-        execute_steps(
-            gpu,
-            &ctx,
-            &[
-                Step::RmsnormAutomatic {
-                    x: &scratch.x,
-                    norm_weight: &layer.attn_norm,
-                    x_plain: &scratch.tmp,
-                    out: &scratch.x_rot,
-                    awq_scale: layer.wq.awq_scale.as_ref(),
-                    k: layer.wq.k,
-                    eps: config.norm_eps,
-                    rotation: qkv_rot,
-                },
-                Step::Gemv {
-                    w: &wrq,
-                    input: GemvInput::Prerotated(&scratch.x_rot),
-                    out: &scratch.q,
-                },
-                Step::Gemv {
-                    w: &wrk,
-                    input: GemvInput::Prerotated(&scratch.x_rot),
-                    out: &scratch.k,
-                },
-                Step::Gemv {
-                    w: &wrv,
-                    input: GemvInput::Prerotated(&scratch.x_rot),
-                    out: &scratch.v,
-                },
-            ],
-        )
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-
-        // ── QK norm (optional per config; same bare gpu call as hand) ──
-        if config.has_qk_norm {
-            if let Some(ref qn) = layer.q_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.q,
-                    qn,
-                    &scratch.q,
-                    n_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-            if let Some(ref kn) = layer.k_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.k,
-                    kn,
-                    &scratch.k,
-                    n_kv_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-        }
-
-        // ── RoPE (same bare gpu call as hand) ──
-        gpu.rope_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
-
-        // ── KV write + attention (verbatim ladder, Phase A3b unifies it) ──
-        llama_kv_write_attend(
-            gpu, kv_cache, scratch, layer_idx, pos, n_heads, n_kv_heads, head_dim, kv_dim,
-        )?;
-
-        // ── Attention output projection + residual (GemvResidual) ──
-        let wro = layer.wo.dispatch_ref();
-        execute_steps(
-            gpu,
-            &ctx,
-            &[Step::GemvResidual {
-                w: &wro,
-                input: GemvInput::Raw(&scratch.attn_out),
-                residual: &scratch.x,
-                out: &scratch.o,
-            }],
-        )
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-
-        // ── FFN (rmsnorm-rotate + gate/up via execute_steps) ──
-        let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
-        let wrg = layer.w_gate.dispatch_ref();
-        let wru = layer.w_up.dispatch_ref();
-        execute_steps(
-            gpu,
-            &ctx,
-            &[
-                Step::RmsnormAutomatic {
-                    x: &scratch.x,
-                    norm_weight: &layer.ffn_norm,
-                    x_plain: &scratch.tmp,
-                    out: &scratch.x_rot,
-                    awq_scale: layer.w_gate.awq_scale.as_ref(),
-                    k: layer.w_gate.k,
-                    eps: config.norm_eps,
-                    rotation: ffn_rot,
-                },
-                Step::Gemv {
-                    w: &wrg,
-                    input: GemvInput::Prerotated(&scratch.x_rot),
-                    out: &scratch.gate,
-                },
-                Step::Gemv {
-                    w: &wru,
-                    input: GemvInput::Prerotated(&scratch.x_rot),
-                    out: &scratch.up,
-                },
-            ],
-        )
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-
-        // ── SwiGLU + down projection + residual ──
-        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        let wrd = layer.w_down.dispatch_ref();
-        execute_steps(
-            gpu,
-            &ctx,
-            &[Step::GemvResidual {
-                w: &wrd,
-                input: GemvInput::Raw(&scratch.ffn_hidden),
-                residual: &scratch.x,
-                out: &scratch.ffn_out,
-            }],
-        )
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-    }
+    let knobs = crate::arch_spec::DenseKnobs {
+        attn_bias: false,
+        qk_norm: config.has_qk_norm,
+        rope_theta: config.rope_freq_base,
+        norm_eps: config.norm_eps,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        q_dim: config.n_heads * config.head_dim,
+        kv_dim: config.n_kv_heads * config.head_dim,
+    };
+    let arch = LlamaDense {
+        weights,
+        config,
+        scratch,
+        kv_cache: &*kv_cache,
+        knobs,
+        pos,
+    };
+    crate::arch_spec::dense_forward(gpu, &ctx, &arch)?;
 
     // ── Final norm + logits + sampling ──
     gpu.rmsnorm_f32(
@@ -3555,6 +3428,85 @@ fn forward_scratch_layers_lowered(
         repeat_window,
         repeat_penalty,
     )
+}
+
+/// Per-forward [`crate::arch_spec::DenseArch`] wrapper for llama-family models.
+/// Borrows the layer weights + scratch + KV cache and routes the projection/FFN
+/// body through the shared `dense_forward`; attention stays llama's 7-tier KV
+/// ladder via [`llama_kv_write_attend`].
+struct LlamaDense<'a> {
+    weights: &'a LlamaWeights,
+    config: &'a LlamaConfig,
+    scratch: &'a ForwardScratch,
+    kv_cache: &'a KvCache,
+    knobs: crate::arch_spec::DenseKnobs,
+    pos: usize,
+}
+
+impl crate::arch_spec::DenseArch for LlamaDense<'_> {
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn knobs(&self) -> &crate::arch_spec::DenseKnobs {
+        &self.knobs
+    }
+    fn scratch(&self) -> crate::arch_spec::DenseScratch<'_> {
+        let s = self.scratch;
+        crate::arch_spec::DenseScratch {
+            x: &s.x,
+            tmp: &s.tmp,
+            x_rot: &s.x_rot,
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            attn_out: &s.attn_out,
+            o: &s.o,
+            gate: &s.gate,
+            up: &s.up,
+            ffn_hidden: &s.ffn_hidden,
+            ffn_out: &s.ffn_out,
+            pos_buf: &s.pos_buf,
+        }
+    }
+    fn layer(&self, l: usize) -> crate::arch_spec::DenseLayer<'_> {
+        let layer = &self.weights.layers[l];
+        crate::arch_spec::DenseLayer {
+            attn_norm: &layer.attn_norm,
+            ffn_norm: &layer.ffn_norm,
+            wq: layer.wq.dispatch_ref(),
+            wk: layer.wk.dispatch_ref(),
+            wv: layer.wv.dispatch_ref(),
+            wo: layer.wo.dispatch_ref(),
+            w_gate: layer.w_gate.dispatch_ref(),
+            w_up: layer.w_up.dispatch_ref(),
+            w_down: layer.w_down.dispatch_ref(),
+            wq_bias: None,
+            wk_bias: None,
+            wv_bias: None,
+            q_norm: layer.q_norm.as_ref(),
+            k_norm: layer.k_norm.as_ref(),
+            qkv_rot: dtype_rotation_plan(layer.wq.gpu_dtype),
+            ffn_rot: dtype_rotation_plan(layer.w_gate.gpu_dtype),
+            qkv_awq: layer.wq.awq_scale.as_ref(),
+            ffn_awq: layer.w_gate.awq_scale.as_ref(),
+            qkv_k: layer.wq.k,
+            ffn_k: layer.w_gate.k,
+        }
+    }
+    fn attend(&self, gpu: &mut Gpu, l: usize) -> HipResult<()> {
+        let c = self.config;
+        llama_kv_write_attend(
+            gpu,
+            self.kv_cache,
+            self.scratch,
+            l,
+            self.pos,
+            c.n_heads,
+            c.n_kv_heads,
+            c.head_dim,
+            c.n_kv_heads * c.head_dim,
+        )
+    }
 }
 
 pub fn forward_scratch_layers(

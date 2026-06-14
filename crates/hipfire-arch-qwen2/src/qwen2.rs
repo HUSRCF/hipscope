@@ -28,6 +28,7 @@
 //! crate shares one implementation. Marked individually below.
 
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_runtime::weight_backend::{
@@ -1303,12 +1304,20 @@ fn forward_step_after_x_lowered(
     pos: usize,
 ) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
-    let program = qwen2_lower_program();
-    for (l, layer) in weights.layers.iter().enumerate() {
-        let mut bind = Qwen2Bindings { cfg, layer, state, l, seq_len: pos + 1 };
-        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-    }
+    let knobs = DenseKnobs {
+        attn_bias: true,
+        qk_norm: false,
+        rope_theta: cfg.rope_theta,
+        norm_eps: cfg.rms_norm_eps,
+        n_heads: cfg.num_attention_heads,
+        n_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        q_dim: cfg.num_attention_heads * cfg.head_dim,
+        kv_dim: cfg.num_key_value_heads * cfg.head_dim,
+    };
+    let arch = Qwen2Dense { weights, state: &*state, knobs, seq_len: pos + 1 };
+    dense_forward(gpu, &ctx, &arch)?;
+
     // Final RMSNorm + lm_head (outside layer loop).
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
@@ -1317,6 +1326,100 @@ fn forward_step_after_x_lowered(
     ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     state.next_pos = pos + 1;
     Ok(())
+}
+
+/// Per-forward [`DenseArch`] wrapper for qwen2-family models (qwen2 / qwen2.5 /
+/// dots-ocr text). Routes the projection/FFN body through the shared
+/// `dense_forward`; attention stays qwen2's plain-F32 KV write + flash/gqa
+/// selector via [`Self::attend`]. Replaces the SuperOp lowered path
+/// (`qwen2_lower_program` + `Qwen2Bindings`), which is now unused.
+struct Qwen2Dense<'a> {
+    weights: &'a Qwen2Weights,
+    state: &'a Qwen2State,
+    knobs: DenseKnobs,
+    seq_len: usize,
+}
+
+impl DenseArch for Qwen2Dense<'_> {
+    fn n_layers(&self) -> usize {
+        self.weights.layers.len()
+    }
+    fn knobs(&self) -> &DenseKnobs {
+        &self.knobs
+    }
+    fn scratch(&self) -> DenseScratch<'_> {
+        let s = self.state;
+        DenseScratch {
+            x: &s.x,
+            tmp: &s.tmp,
+            x_rot: &s.x_rot,
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            attn_out: &s.attn_out,
+            o: &s.o,
+            gate: &s.gate,
+            up: &s.up,
+            ffn_hidden: &s.ffn_hidden,
+            ffn_out: &s.ffn_out,
+            pos_buf: &s.pos_buf,
+        }
+    }
+    fn layer(&self, l: usize) -> DenseLayer<'_> {
+        let lw = &self.weights.layers[l];
+        DenseLayer {
+            attn_norm: &lw.attn_norm,
+            ffn_norm: &lw.ffn_norm,
+            wq: lw.wq.dispatch_ref(),
+            wk: lw.wk.dispatch_ref(),
+            wv: lw.wv.dispatch_ref(),
+            wo: lw.wo.dispatch_ref(),
+            w_gate: lw.w_gate.dispatch_ref(),
+            w_up: lw.w_up.dispatch_ref(),
+            w_down: lw.w_down.dispatch_ref(),
+            wq_bias: Some(&lw.wq_bias),
+            wk_bias: Some(&lw.wk_bias),
+            wv_bias: Some(&lw.wv_bias),
+            q_norm: None,
+            k_norm: None,
+            qkv_rot: dtype_rotation_plan(lw.wq.gpu_dtype),
+            ffn_rot: dtype_rotation_plan(lw.w_gate.gpu_dtype),
+            qkv_awq: lw.wq.awq_scale.as_ref(),
+            ffn_awq: lw.w_gate.awq_scale.as_ref(),
+            qkv_k: lw.wq.k,
+            ffn_k: lw.w_gate.k,
+        }
+    }
+    fn attend(&self, gpu: &mut Gpu, l: usize) -> HipResult<()> {
+        let st = self.state;
+        let k = &self.knobs;
+        // KV write (plain F32) — bias + RoPE already applied by dense_forward.
+        gpu.kv_cache_write(&st.k_cache[l], &st.k, &st.pos_buf, k.kv_dim)?;
+        gpu.kv_cache_write(&st.v_cache[l], &st.v, &st.pos_buf, k.kv_dim)?;
+        // Attention — 4-way select (exact mirror of the SuperOp run_attend path).
+        let use_fused = std::env::var("HIPFIRE_GQA_FUSED").map(|v| v == "1").unwrap_or(false);
+        if use_fused && k.n_kv_heads < k.n_heads {
+            gpu.attention_flash_gqa_fused(
+                &st.q, &st.k_cache[l], &st.v_cache[l], &st.attn_out,
+                self.seq_len, k.n_heads, k.n_kv_heads, k.head_dim, st.max_seq,
+            )
+        } else if k.n_kv_heads < k.n_heads && k.head_dim == 128 && self.seq_len >= 4096 {
+            gpu.attention_gqa_warp(
+                &st.q, &st.k_cache[l], &st.v_cache[l], &st.attn_out, &st.attn_partials,
+                self.seq_len, k.n_heads, k.n_kv_heads, k.head_dim, st.max_seq,
+            )
+        } else if k.n_kv_heads < k.n_heads && self.seq_len >= 4096 {
+            Gpu::attention_flash_gqa(
+                gpu, &st.q, &st.k_cache[l], &st.v_cache[l], &st.attn_out, &st.attn_partials,
+                self.seq_len, k.n_heads, k.n_kv_heads, k.head_dim, st.max_seq,
+            )
+        } else {
+            Gpu::attention_flash(
+                gpu, &st.q, &st.k_cache[l], &st.v_cache[l], &st.attn_out, &st.attn_partials,
+                self.seq_len, k.n_heads, k.n_kv_heads, k.head_dim, st.max_seq,
+            )
+        }
+    }
 }
 
 #[cfg(test)]

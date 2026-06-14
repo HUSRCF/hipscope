@@ -102,6 +102,10 @@ ROWS=(
     # hand path. MQ4 → expected byte-identical (the F1 rmsnorm fix only changes
     # the Q4K branch, which MQ4 doesn't take).
     "qwen3-0.6b-llama.mq4|llama-0.6b-mq4|$DENSE_PROMPT"
+    # qwen2-family dense (arch_id 7) — N5 Phase B: validates the qwen2 lowered
+    # path now routes through the shared dense_forward (was the SuperOp
+    # interpreter). Byte-identical by construction (same kernel sequences).
+    "qwen25-0.5b-instruct.mq4|qwen25-0.5b-mq4|$DENSE_PROMPT"
     "qwen3.5-9b.mq4|qwen35-9b-mq4|$DENSE_PROMPT"
     "qwen3.5-9b.q8f16|qwen35-9b-q8|$DENSE_PROMPT"
     "qwen3.6-35b-a3b-paro.hfq|qwen36-a3b-paro|$SHEEP_PROMPT"
@@ -141,7 +145,17 @@ for line in sys.stdin:
         ids.append(str(json.loads(line)["tok_id"]))
     except Exception:
         pass
-print(",".join(ids))'
+print("\n".join(ids))'
+}
+
+# Per-token visible text, json-encoded one token per line (newlines/commas in a
+# token survive). Used as the parity stream when the daemon emits no `committed`
+# events for an arch (e.g. the qwen2 decode loop) — for a same-daemon greedy A/B
+# identical token text is equivalent to identical token ids.
+token_text_stream() {
+    grep -a '"type":"token"' "$1" | python3 -c '
+import sys, json
+print("\n".join(json.dumps(json.loads(l).get("text","")) for l in sys.stdin if "token" in l))'
 }
 
 # Decoded visible text (for the human-eyeball requirement in the report).
@@ -187,8 +201,16 @@ for entry in "${rows[@]}"; do
 
     hand_ids="$(committed_ids "$hand_out")"
     low_ids="$(committed_ids "$low_out")"
-    hand_n=$(awk -F, '{print ($0=="")?0:NF}' <<< "$hand_ids")
-    low_n=$(awk -F, '{print ($0=="")?0:NF}' <<< "$low_ids")
+    cmp_basis="committed token-id"
+    if [ -z "$hand_ids" ] && [ -z "$low_ids" ]; then
+        # No committed events emitted for this arch — gate on the token-text
+        # stream instead (e.g. qwen2's daemon decode loop doesn't emit them).
+        hand_ids="$(token_text_stream "$hand_out")"
+        low_ids="$(token_text_stream "$low_out")"
+        cmp_basis="token-text"
+    fi
+    hand_n=$(printf '%s' "$hand_ids" | grep -c .)
+    low_n=$(printf '%s' "$low_ids" | grep -c .)
     hand_md5=$(printf '%s' "$hand_ids" | md5sum | awk '{print $1}')
     low_md5=$(printf '%s' "$low_ids"  | md5sum | awk '{print $1}')
     panic=$(grep -aE 'panicked|thread.*panicked|FATAL|error: ' "$hand_out" "$low_out" | head -1)
@@ -198,7 +220,7 @@ for entry in "${rows[@]}"; do
         status="HARD_ERROR (exit hand=$ec_hand low=$ec_low; tokens hand=$hand_n low=$low_n; panic=${panic:+yes})"
         hard_errors=$((hard_errors + 1))
     elif [ "$hand_md5" != "$low_md5" ]; then
-        status="HARD_ERROR (PARITY MISMATCH — hand≠lowered committed token streams)"
+        status="HARD_ERROR (PARITY MISMATCH — hand≠lowered $cmp_basis streams)"
         hard_errors=$((hard_errors + 1))
     fi
     echo "   $status"
@@ -207,6 +229,7 @@ for entry in "${rows[@]}"; do
         echo "## $model_file — $prompt_id"
         echo
         echo "- status: **$status**"
+        echo "- basis: $cmp_basis"
         echo "- hand   (FORWARD_LOWERED=0): $hand_n tokens, md5 \`$hand_md5\`"
         echo "- lowered(default ON):        $low_n tokens, md5 \`$low_md5\`"
         echo
@@ -214,8 +237,8 @@ for entry in "${rows[@]}"; do
             echo '**FIRST DIVERGENCE (hand | lowered):**'
             echo
             echo '```'
-            paste -d'\n' <(tr ',' '\n' <<< "$hand_ids") <(tr ',' '\n' <<< "$low_ids") \
-                | awk 'NR%2{h=$0; next}{i=(NR/2); if(h!=$0){print "pos "i": hand="h" lowered="$0; c++} if(c>=8) exit}'
+            paste -d'|' <(printf '%s\n' "$hand_ids") <(printf '%s\n' "$low_ids") \
+                | awk -F'|' '$1!=$2{print "pos "NR": hand="$1" lowered="$2; c++} c>=8{exit}'
             echo '```'
             echo
         fi
