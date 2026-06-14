@@ -9,7 +9,8 @@ use crate::llama::{
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::weight_backend::{
-    flat_name_candidates, resolve_lm_head, reupload_f16_as_f32, HfqBackend, WeightBackend,
+    decode_raw_codec, flat_name_candidates, raw_codec, resolve_lm_head, reupload_f16_as_f32,
+    HfqBackend, WeightBackend,
 };
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
@@ -704,287 +705,9 @@ fn load_weight_tensor(
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
 
     let mut wt = match info.quant_type {
-        0 => {
-            // Q4F16G64
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok::<WeightTensor, HipError>(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q4F16G64,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        3 => {
-            // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8_0,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        4 => {
-            // Q4_K — GGML-compatible Q4_K blocks (144 bytes per 256 elements)
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q4K,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        5 => {
-            // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
-            let n_groups = k / 32;
-            let raw_row = n_groups * 2 + k;
-            let row_stride = (raw_row + 127) & !127;
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8HFQ,
-                m,
-                k,
-                row_stride,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        6 => {
-            // HFQ4-G256 — flat 4-bit, 136 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        7 => {
-            // HFQ4-G128 — flat 4-bit, 72 bytes per 128 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        8 => {
-            // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ6G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        9 => {
-            // HFQ2-G256 — flat 2-bit, 72 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ2G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        10 => {
-            // HFQ2-G128 — flat 2-bit, 40 bytes per 128 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ2G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        11 => {
-            // HFQ3-G256 — flat 3-bit, 104 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        12 => {
-            // HFQ3-G128 — flat 3-bit, 56 bytes per 128 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        13 => {
-            // MQ4-G256 — MagnumQuant FWHT-rotated 4-bit
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        14 => {
-            // MQ8-G256 — MagnumQuant FWHT-rotated symmetric INT8, dp4a
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        17 => {
-            // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit, 104 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        18 => {
-            // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit, 72 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        19 => {
-            // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook, 72 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        20 => {
-            // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook, 112 bytes per 256 elements
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        21 => {
-            // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale.
-            // Per-row hdr 16 B + (K/32) blocks × 17 B. See docs/quant-formats/hfp4.md.
-            // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs);
-            // refuse here so a stale or externally-quantized file fails at
-            // load instead of panicking on first dispatch.
-            assert!(
-                k % 256 == 0,
-                "HFP4G32 v1 weight {st_name} has K={k} but kernel requires K%256==0"
-            );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        24 => {
-            // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement).
-            // Same byte layout as qtype 21; format_flags=0x05 in row hdr.
-            // See docs/quant-formats/hfp4.md.
-            assert!(
-                k % 256 == 0,
-                "MFP4G32 weight {st_name} has K={k} but kernel + FWHT both require K%256==0"
-            );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        30 => {
-            // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook, 160 bytes per 256 elements.
-            // Renumbered from qtype 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-            // Models quantized pre-renumber MUST be re-quantized.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
         1 => {
-            // F16 — dequant to F32 for F32 GEMV
+            // F16 — the HFQ path host-decodes to F32 for the F32 GEMV (NOT a
+            // verbatim upload, so not a RAW_CODECS row; dequant_weight_raw keeps F16).
             let f32_data: Vec<f32> = data
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -993,7 +716,7 @@ fn load_weight_tensor(
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
+            Ok::<WeightTensor, HipError>(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -1003,10 +726,10 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
-        _ => panic!(
-            "unsupported quant_type {} for weight {st_name}",
-            info.quant_type
-        ),
+        other => match raw_codec(other) {
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name),
+            None => panic!("unsupported quant_type {other} for weight {st_name}"),
+        },
     }?;
     // Centralized AWQ sidecar attachment. Replaces the prior per-arm
     // inline `load_awq_scale()` calls at the qt=13 / qt=17 arms — those
