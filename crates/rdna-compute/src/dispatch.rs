@@ -291,7 +291,7 @@ impl DType {
 
     /// Per-row byte stride for split-metadata layouts. Q8HFQ packs `n_groups*2`
     /// scale bytes + `k` value bytes per row, padded to a 128-byte boundary; all
-    /// other dtypes are contiguous (the kernel derives their stride) -> 0.
+    /// other dtypes encode their layout internally and ignore this value (returns 0).
     /// Single source of truth for the formula previously inlined at hfq.rs:748.
     pub fn row_stride(self, k: usize) -> usize {
         match self {
@@ -305,7 +305,7 @@ impl DType {
 
     /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
     /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
-    /// dispatch. Centralizes the guard previously inlined at the qt 21/24 arms.
+    /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
     pub fn requires_k_mod_256(self) -> bool {
         matches!(self, DType::HFP4G32 | DType::MFP4G32)
     }
@@ -2063,12 +2063,14 @@ mod tests {
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
-        // Legacy formula (hfq.rs:748-750): n_groups = k/32; raw = n_groups*2 + k; (raw+127)&!127
-        for k in [4096usize, 11008, 5120, 14336, 256, 96] {
-            let raw_row = (k / 32) * 2 + k;
-            let want = (raw_row + 127) & !127;
-            assert_eq!(DType::Q8HFQ.row_stride(k), want, "Q8HFQ stride k={k}");
-        }
+        // Hard-coded expected stride (128B-aligned) — independent oracle, NOT the
+        // formula re-run. raw_row = (k/32)*2 + k, then padded up to a 128B boundary.
+        assert_eq!(DType::Q8HFQ.row_stride(4096), 4352); // raw 4352, already aligned
+        assert_eq!(DType::Q8HFQ.row_stride(11008), 11776); // raw 11696 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(5120), 5504); // raw 5440 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(14336), 15232); // raw 15232, already aligned
+        assert_eq!(DType::Q8HFQ.row_stride(256), 384); // raw 272 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(96), 128); // raw 102 → padded
     }
 
     #[test]
