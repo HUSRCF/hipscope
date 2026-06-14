@@ -282,6 +282,127 @@ where
 
 // ── Dequant primitives ───────────────────────────────────────────────
 
+// ── Raw-passthrough quant codec registry ─────────────────────────────────────
+//
+// Single source of truth mapping the `.hfq` wire byte `quant_type` → compute
+// `DType`, for formats whose load is a verbatim byte upload
+// (`upload_raw(data, &[data.len()])`) + a dtype tag. Consumed by both
+// `dequant_weight_raw` and `hfq::load_weight_tensor`. Layout facts (row_stride,
+// K%256 guard) live on `DType`, not here. Formats that host-decode (qt 1, 2, 16)
+// are deliberately absent — they stay explicit in their consumer.
+//
+// WEIGHT-DECODE ONLY. Embedding tables are NOT routed here (different output
+// type + Q4K divergence); see embed_classify / load_embedding_llama.
+//
+// Adding a passthrough format = one row here, plus (if it has a non-trivial
+// stride or K constraint) the matching arm in DType::row_stride /
+// DType::requires_k_mod_256, plus (if the quantizer emits sidecars) one line in
+// DType::supports_awq_sidecar.
+
+/// One passthrough quant format: upload bytes verbatim, tag `dtype`.
+#[allow(dead_code)] // consumers wired in Tasks 4/5
+pub(crate) struct RawCodec {
+    pub quant_type: u8,
+    pub dtype: DType,
+}
+
+/// The registry. Order is irrelevant (lookup is by quant_type); ascending for
+/// readability. qt 1/2/16 are intentionally absent (host-decode, see consumers).
+#[allow(dead_code)] // consumers wired in Tasks 4/5
+pub(crate) const RAW_CODECS: &[RawCodec] = &[
+    RawCodec {
+        quant_type: 0,
+        dtype: DType::Q4F16G64,
+    },
+    RawCodec {
+        quant_type: 3,
+        dtype: DType::Q8_0,
+    },
+    RawCodec {
+        quant_type: 4,
+        dtype: DType::Q4K,
+    },
+    RawCodec {
+        quant_type: 5,
+        dtype: DType::Q8HFQ,
+    },
+    RawCodec {
+        quant_type: 6,
+        dtype: DType::HFQ4G256,
+    },
+    RawCodec {
+        quant_type: 7,
+        dtype: DType::HFQ4G128,
+    },
+    RawCodec {
+        quant_type: 8,
+        dtype: DType::HFQ6G256,
+    },
+    RawCodec {
+        quant_type: 9,
+        dtype: DType::HFQ2G256,
+    },
+    RawCodec {
+        quant_type: 10,
+        dtype: DType::HFQ2G128,
+    },
+    RawCodec {
+        quant_type: 11,
+        dtype: DType::HFQ3G256,
+    },
+    RawCodec {
+        quant_type: 12,
+        dtype: DType::HFQ3G128,
+    },
+    RawCodec {
+        quant_type: 13,
+        dtype: DType::MQ4G256,
+    },
+    RawCodec {
+        quant_type: 14,
+        dtype: DType::MQ8G256,
+    },
+    RawCodec {
+        quant_type: 15,
+        dtype: DType::MQ6G256,
+    },
+    RawCodec {
+        quant_type: 17,
+        dtype: DType::MQ3G256,
+    },
+    RawCodec {
+        quant_type: 18,
+        dtype: DType::MQ2G256,
+    },
+    RawCodec {
+        quant_type: 19,
+        dtype: DType::MQ2G256Lloyd,
+    },
+    RawCodec {
+        quant_type: 20,
+        dtype: DType::MQ3G256Lloyd,
+    },
+    RawCodec {
+        quant_type: 21,
+        dtype: DType::HFP4G32,
+    },
+    RawCodec {
+        quant_type: 24,
+        dtype: DType::MFP4G32,
+    },
+    RawCodec {
+        quant_type: 30,
+        dtype: DType::MQ4G256Lloyd,
+    },
+];
+
+/// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
+/// (1/2/16) or genuinely unsupported.
+#[allow(dead_code)] // consumers wired in Tasks 4/5
+pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
+    RAW_CODECS.iter().find(|c| c.quant_type == quant_type)
+}
+
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
 pub fn dequant_weight_raw(
@@ -1304,5 +1425,67 @@ mod tests {
     fn tied_alias_q4k_panics() {
         let embd = GpuTensor::null_for_test();
         let _ = tied_lm_head_alias(&embd, EmbeddingFormat::Q4K, 8, 8);
+    }
+
+    /// Pins every RAW_CODECS row against the dtype the *production* arms produced,
+    /// transcribed with source citations so the oracle is independent of the table.
+    /// A drift here mis-tags a quant format → "token soup"; equality must be exact.
+    #[test]
+    fn raw_codecs_golden_against_production_arms() {
+        // (quant_type, dtype) — RHS copied from the pre-refactor arms:
+        //   wb = weight_backend.rs (dequant_weight_raw), hfq = hfq.rs (load_weight_tensor)
+        let expected: &[(u8, DType)] = &[
+            (0, DType::Q4F16G64),      // hfq:712
+            (3, DType::Q8_0),          // wb:487 / hfq:725
+            (4, DType::Q4K),           // hfq:738
+            (5, DType::Q8HFQ),         // hfq:754
+            (6, DType::HFQ4G256),      // wb:299 / hfq:767
+            (7, DType::HFQ4G128),      // wb:311 / hfq:780
+            (8, DType::HFQ6G256),      // wb:323 / hfq:793
+            (9, DType::HFQ2G256),      // hfq:807
+            (10, DType::HFQ2G128),     // hfq:819
+            (11, DType::HFQ3G256),     // wb:335 / hfq:832
+            (12, DType::HFQ3G128),     // wb:347 / hfq:845
+            (13, DType::MQ4G256),      // wb:359 / hfq:858
+            (14, DType::MQ8G256),      // wb:371 / hfq:871
+            (15, DType::MQ6G256),      // wb:383
+            (17, DType::MQ3G256),      // wb:395 / hfq:884
+            (18, DType::MQ2G256),      // wb:407 / hfq:897
+            (19, DType::MQ2G256Lloyd), // wb:419 / hfq:910
+            (20, DType::MQ3G256Lloyd), // wb:431 / hfq:923
+            (21, DType::HFP4G32),      // wb:459 / hfq:944
+            (24, DType::MFP4G32),      // wb:475 / hfq:963
+            (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
+        ];
+        for &(qt, dt) in expected {
+            let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
+            assert_eq!(c.dtype, dt, "qt={qt} dtype");
+        }
+        assert_eq!(
+            RAW_CODECS.len(),
+            expected.len(),
+            "RAW_CODECS has unlisted rows"
+        );
+        // Host-decode formats must NOT be in the passthrough table:
+        for qt in [1u8, 2, 16] {
+            assert!(
+                raw_codec(qt).is_none(),
+                "qt={qt} is host-decode, must not be a raw codec"
+            );
+        }
+    }
+
+    /// No two rows may claim the same quant_type (find() is first-match-wins).
+    #[test]
+    fn raw_codecs_unique_quant_types() {
+        for (i, a) in RAW_CODECS.iter().enumerate() {
+            for b in &RAW_CODECS[i + 1..] {
+                assert_ne!(
+                    a.quant_type, b.quant_type,
+                    "duplicate quant_type {}",
+                    a.quant_type
+                );
+            }
+        }
     }
 }
