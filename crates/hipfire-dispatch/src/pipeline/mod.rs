@@ -295,8 +295,33 @@ pub fn run_moe_decode(
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
         gemv.run_auto(ctx, gpu, &p.router,            p.x_norm, p.router_logits).map_err(|e| DispatchError::Hip(e.to_string()))?;
         gemv.run_auto(ctx, gpu, &p.shared_expert_gate,p.x_norm, p.scalar_buf).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_gate_w,     p.x_norm, &shared_gate).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_up_w,       p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
+        // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
+        // the router is Q8. But the dense shared gate/up are still MQ-family, and
+        // `x_rot_local` has ALREADY been FWHT-rotated once for the routed experts.
+        // `run_auto` here would re-rotate x_norm per call (+2 mq_rotate_x/layer);
+        // instead reuse the existing rotation via the Prerotated path. Numerically
+        // identical (same rotated activation). Q8/HFQ shared weights (no rotation)
+        // or AWQ-scaled shared weights fall through to run_auto unchanged.
+        let shared_prerot = x_rot_local.is_some()
+            && p.shared_gate_w.awq_scale.is_none()
+            && p.shared_up_w.awq_scale.is_none()
+            && matches!(crate::types::dtype_post_rotation_variant(p.shared_gate_w.dtype), crate::types::GemvVariant::Prerotated)
+            && matches!(crate::types::dtype_post_rotation_variant(p.shared_up_w.dtype), crate::types::GemvVariant::Prerotated);
+        if shared_prerot {
+            let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
+            gemv.run(ctx, gpu, &crate::families::gemv::GemvParams {
+                w: &p.shared_gate_w, x: xr, y: &shared_gate, variant: crate::types::GemvVariant::Prerotated,
+                residual: None, gate: None, up: None,
+            }).map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run(ctx, gpu, &crate::families::gemv::GemvParams {
+                w: &p.shared_up_w, x: xr, y: &shared_up, variant: crate::types::GemvVariant::Prerotated,
+                residual: None, gate: None, up: None,
+            }).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        } else {
+            gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate).map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run_auto(ctx, gpu, &p.shared_up_w,   p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────

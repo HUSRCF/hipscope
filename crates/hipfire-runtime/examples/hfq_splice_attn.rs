@@ -35,12 +35,23 @@ struct ParsedHfq {
     tensors: Vec<TensorEntry>,
 }
 
-/// Attention PROJECTION tensors (the big GEMV weights that fuse + dominate
-/// attention bytes). NOT conv1d / norm / A_log / dt_bias.
+/// Tensors to pull from the (uniform-MQ4) donor for the `mq4r` redline build:
+/// attention projections AND the MoE gate-side (router + shared expert). Taking
+/// the router + shared expert as MQ4 makes `gate_side_mq4` true, so the graded
+/// MoE decode uses the FUSED gate path (fused_qkvza_hfq4g256 on one rotated x)
+/// instead of separate per-component gemvs+rotates. The donor's MQ4 router is
+/// FWHT-rotated (coherent — it's the shipping uniform-MQ4 SKU); "redline" trades
+/// the Q8 router's precision for speed. NOT swapped: routed experts
+/// (`mlp.experts.*`, kept graded from base), conv1d, norms, A_log, dt_bias,
+/// embed/lm_head.
 fn is_attn_proj(name: &str) -> bool {
     name.contains(".linear_attn.in_proj_")     // qkv, z, b, a (DeltaNet)
         || name.contains(".linear_attn.out_proj")
         || (name.contains(".self_attn.") && name.contains("_proj")) // full-attn q/k/v/o
+        // MoE gate-side (NOT routed experts) → MQ4 to enable the fused gate path
+        || name.ends_with(".mlp.gate.weight")              // router
+        || name.ends_with(".mlp.shared_expert_gate.weight") // shared-expert scalar gate
+        || name.contains(".mlp.shared_expert.")            // shared expert gate/up/down
 }
 
 fn parse_hfq(path: &PathBuf) -> std::io::Result<(File, ParsedHfq)> {
