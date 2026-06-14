@@ -120,8 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("[2/5] parsing Qwen2Config");
-    let cfg = qwen2::config_from_hfq(&hfq)
-        .ok_or("qwen2: failed to parse config from HFQ metadata")?;
+    let cfg = qwen2::config_from_hfq(&hfq)?;
     eprintln!(
         "      hidden={}, layers={}, n_heads={}, n_kv_heads={}, \
          head_dim={}, vocab={}, attention_bias={}, tie_word_embeddings={}, \

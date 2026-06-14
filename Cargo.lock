@@ -204,6 +204,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
+ "serde",
  "serde_json",
 ]
 

@@ -41,6 +41,7 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde::Deserialize;
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
 ///
@@ -87,68 +88,112 @@ pub struct Qwen2Config {
     pub eos_token_ids: Vec<u32>,
 }
 
+/// Serde mirror of the Qwen2 `config` (or nested `text_config`) blob.
+///
+/// Required model-shape fields are non-`Option` so serde hard-errors on a
+/// missing or wrong-typed key. Derived fields (`num_key_value_heads`,
+/// `head_dim`) are `Option` and finalized below. The multi-source EOS
+/// resolution needs the root `meta`, so it is NOT a field here — it runs in
+/// [`from_config_value`] / [`config_from_metadata_json`].
+#[derive(Deserialize)]
+struct RawQwen2Config {
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    intermediate_size: usize,
+    vocab_size: usize,
+    #[serde(default)]
+    num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    head_dim: Option<usize>,
+    #[serde(default = "default_max_pos")]
+    max_position_embeddings: usize,
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f32,
+    #[serde(default = "default_rms_norm_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_attention_bias")]
+    attention_bias: bool,
+    #[serde(default)]
+    tie_word_embeddings: bool,
+}
+
+fn default_max_pos() -> usize {
+    32768
+}
+fn default_rope_theta() -> f32 {
+    1_000_000.0
+}
+fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+fn default_attention_bias() -> bool {
+    true
+}
+
 /// Parse a Qwen2 config out of an HFQ file's metadata.
-pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen2Config> {
+pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen2Config, String> {
     config_from_metadata_json(&hfq.metadata_json)
 }
 
-/// Inner parser, decoupled from `HfqFile` for unit testability.
-pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
-    let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
-    let config = meta.get("config")?;
-    let tc = config.get("text_config").unwrap_or(config);
+/// `eos_token_id` may be a scalar Number or an Array of numbers; both
+/// flatten to a `Vec<u32>` (Array→`filter_map` as_u64, Number→single).
+fn parse_eos(val: &serde_json::Value) -> Vec<u32> {
+    match val {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|e| e.as_u64().map(|n| n as u32))
+            .collect(),
+        serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
 
-    let hidden_size = tc.get("hidden_size")?.as_u64()? as usize;
-    let num_hidden_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
-    let num_attention_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let num_key_value_heads = tc.get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(num_attention_heads as u64) as usize;
-    let head_dim = tc.get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(hidden_size / num_attention_heads);
-    let intermediate_size = tc.get("intermediate_size")?.as_u64()? as usize;
-    let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
-    let max_position_embeddings = tc.get("max_position_embeddings")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32768) as usize;
-    let rope_theta = tc.get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1_000_000.0) as f32;
-    let rms_norm_eps = tc.get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1e-6) as f32;
-    let attention_bias = tc.get("attention_bias")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let tie_word_embeddings = tc.get("tie_word_embeddings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    // Build the full EOS set first, then the scalar accessor is its
-    // first element. Both array and scalar config layouts are accepted.
-    //
-    // Lookup order:
-    //   1. text_config.eos_token_id / config.eos_token_id (Qwen2-1.5B carries this)
-    //   2. generation_config.eos_token_id (dots.ocr's [151643, 151673]
-    //      lives only here per R5 — the quantiser now packs this sibling
-    //      JSON into HFQ metadata so this fallback is reachable)
-    //   3. Default [151645] (ChatML `<|im_end|>`)
-    let parse_eos = |val: &serde_json::Value| -> Vec<u32> {
-        match val {
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .filter_map(|e| e.as_u64().map(|n| n as u32))
-                .collect(),
-            serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
-            _ => Vec::new(),
-        }
-    };
-    let mut eos_token_ids: Vec<u32> = tc.get("eos_token_id")
-        .map(parse_eos)
-        .unwrap_or_default();
+/// Inner parser, decoupled from `HfqFile` for unit testability.
+///
+/// Unwraps the `{config}` envelope, descends into `text_config` if present,
+/// then delegates to [`from_config_value`] with the root `meta` (needed for
+/// the `generation_config.eos_token_id` fallback).
+pub fn config_from_metadata_json(metadata_json: &str) -> Result<Qwen2Config, String> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("qwen2: metadata_json not valid JSON: {e}"))?;
+    let config = meta
+        .get("config")
+        .ok_or_else(|| "qwen2: metadata_json missing `config` wrapper".to_string())?;
+    let tc = config.get("text_config").unwrap_or(config);
+    from_config_value(tc, Some(&meta))
+}
+
+/// Parse from a raw config Value (the inner `config` / `text_config` node).
+///
+/// `meta` is the root envelope, consulted only for the
+/// `generation_config.eos_token_id` fallback; pass `None` when no envelope
+/// exists (EOS then resolves from `inner` + default).
+///
+/// EOS lookup order:
+///   1. `inner.eos_token_id` (scalar or array)
+///   2. root `generation_config.eos_token_id` (dots.ocr's [151643, 151673]
+///      lives only here per R5 — the quantiser packs this sibling JSON into
+///      HFQ metadata so this fallback is reachable)
+///   3. Default [151645] (ChatML `<|im_end|>`)
+pub fn from_config_value(
+    inner: &serde_json::Value,
+    meta: Option<&serde_json::Value>,
+) -> Result<Qwen2Config, String> {
+    let raw: RawQwen2Config = serde_json::from_value(inner.clone())
+        .map_err(|e| format!("qwen2: parsing config failed: {e}"))?;
+
+    let num_key_value_heads = raw.num_key_value_heads.unwrap_or(raw.num_attention_heads);
+    let head_dim = raw
+        .head_dim
+        .unwrap_or(raw.hidden_size / raw.num_attention_heads);
+
+    let mut eos_token_ids: Vec<u32> = inner.get("eos_token_id").map(parse_eos).unwrap_or_default();
     if eos_token_ids.is_empty() {
-        if let Some(gc_eos) = meta.get("generation_config").and_then(|gc| gc.get("eos_token_id")) {
+        if let Some(gc_eos) = meta
+            .and_then(|m| m.get("generation_config"))
+            .and_then(|gc| gc.get("eos_token_id"))
+        {
             eos_token_ids = parse_eos(gc_eos);
         }
     }
@@ -159,29 +204,28 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
     };
     let eos_token_id = eos_token_ids[0];
 
-    Some(Qwen2Config {
-        hidden_size,
-        num_hidden_layers,
-        num_attention_heads,
+    Ok(Qwen2Config {
+        hidden_size: raw.hidden_size,
+        num_hidden_layers: raw.num_hidden_layers,
+        num_attention_heads: raw.num_attention_heads,
         num_key_value_heads,
         head_dim,
-        intermediate_size,
-        vocab_size,
-        max_position_embeddings,
-        rope_theta,
-        rms_norm_eps,
-        attention_bias,
-        tie_word_embeddings,
+        intermediate_size: raw.intermediate_size,
+        vocab_size: raw.vocab_size,
+        max_position_embeddings: raw.max_position_embeddings,
+        rope_theta: raw.rope_theta,
+        rms_norm_eps: raw.rms_norm_eps,
+        attention_bias: raw.attention_bias,
+        tie_word_embeddings: raw.tie_word_embeddings,
         eos_token_id,
         eos_token_ids,
     })
 }
 
 impl Qwen2Config {
-    /// Convenience: parse and lift `Option` into `Result`.
+    /// Convenience wrapper around [`config_from_hfq`].
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
         config_from_hfq(hfq)
-            .ok_or_else(|| "qwen2: failed to parse config from HFQ metadata".to_string())
     }
 }
 
@@ -1343,7 +1387,7 @@ mod tests {
     #[test]
     fn parses_qwen2_1p5b_instruct_config() {
         let cfg = config_from_metadata_json(QWEN2_1P5B_METADATA)
-            .expect("parser returned None on a valid Qwen2-1.5B-Instruct config");
+            .expect("parser errored on a valid Qwen2-1.5B-Instruct config");
         assert_eq!(cfg.hidden_size, 1536);
         assert_eq!(cfg.num_hidden_layers, 28);
         assert_eq!(cfg.num_attention_heads, 12);
@@ -1363,7 +1407,7 @@ mod tests {
     #[test]
     fn parses_dots_ocr_text_config() {
         let cfg = config_from_metadata_json(DOTS_OCR_TEXT_METADATA)
-            .expect("parser returned None on a valid dots.ocr text config");
+            .expect("parser errored on a valid dots.ocr text config");
         assert!(cfg.attention_bias);
         assert!(!cfg.tie_word_embeddings);
         // The array form is preserved; scalar is the first element.
@@ -1379,9 +1423,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_field_returns_none() {
+    fn missing_required_field_returns_err() {
         let bad = r#"{"config": {"hidden_size": 1536}}"#;
-        assert!(config_from_metadata_json(bad).is_none());
+        assert!(config_from_metadata_json(bad).is_err());
     }
 
     #[test]

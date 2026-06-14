@@ -29,8 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  arch_id (from HFQ header): {}", hfq.arch_id);
     println!("  metadata_json length: {} bytes", hfq.metadata_json.len());
 
-    let cfg = qwen2::config_from_hfq(&hfq)
-        .ok_or("config_from_hfq returned None")?;
+    let cfg = qwen2::config_from_hfq(&hfq)?;
 
     println!("\nparsed Qwen2Config:");
     println!("  hidden_size:             {}", cfg.hidden_size);
