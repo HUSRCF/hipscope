@@ -15,6 +15,7 @@ use crate::weight_backend::{
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -530,76 +531,94 @@ impl crate::model_source::ModelSource for HfqFile {
     }
 }
 
-// ─── Config from HFQ metadata ───────────────────────────────────────────────
+// ─── Config from HFQ / safetensors metadata ─────────────────────────────────
 
-pub fn config_from_hfq(hfq: &HfqFile) -> Option<LlamaConfig> {
-    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
-    let config = meta.get("config")?;
+#[derive(Deserialize)]
+struct RawLlamaConfig {
+    model_type: String,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    #[serde(default)]
+    num_key_value_heads: Option<usize>,
+    intermediate_size: usize,
+    vocab_size: usize,
+    #[serde(default)]
+    head_dim: Option<usize>,
+    #[serde(default = "default_llama_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_llama_max_pos")]
+    max_position_embeddings: usize,
+    #[serde(default = "default_llama_rope")]
+    rope_theta: f32,
+    #[serde(default = "default_bos")]
+    bos_token_id: u32,
+    #[serde(default = "default_eos")]
+    eos_token_id: u32,
+}
 
-    let arch_str = config.get("model_type")?.as_str()?;
-    let arch = match arch_str {
-        "llama" => ModelArch::Llama,
+fn default_llama_eps() -> f32 {
+    1e-5
+}
+fn default_llama_max_pos() -> usize {
+    2048
+}
+fn default_llama_rope() -> f32 {
+    10000.0
+}
+fn default_bos() -> u32 {
+    1
+}
+fn default_eos() -> u32 {
+    2
+}
+
+/// Shared finalize for the LLaMA-family config parsers. `has_qk_norm` is a
+/// tensor-presence probe that can't go through a `&str`-only deserializer, so
+/// the caller supplies it.
+fn llama_config_from_value(
+    config: &serde_json::Value,
+    has_qk_norm: bool,
+) -> Result<LlamaConfig, String> {
+    let raw: RawLlamaConfig = serde_json::from_value(config.clone())
+        .map_err(|e| format!("llama: parsing config failed: {e}"))?;
+    let arch = match raw.model_type.as_str() {
+        "llama" | "mistral" => ModelArch::Llama,
         "qwen3" | "qwen2" => ModelArch::Qwen3,
         _ => ModelArch::Llama,
     };
+    let n_kv_heads = raw.num_key_value_heads.unwrap_or(raw.num_attention_heads);
+    let head_dim = raw
+        .head_dim
+        .unwrap_or(raw.hidden_size / raw.num_attention_heads);
+    Ok(LlamaConfig {
+        arch,
+        dim: raw.hidden_size,
+        hidden_dim: raw.intermediate_size,
+        n_layers: raw.num_hidden_layers,
+        n_heads: raw.num_attention_heads,
+        n_kv_heads,
+        vocab_size: raw.vocab_size,
+        head_dim,
+        norm_eps: raw.rms_norm_eps,
+        max_seq_len: raw.max_position_embeddings,
+        rope_freq_base: raw.rope_theta,
+        bos_token: raw.bos_token_id,
+        eos_token: raw.eos_token_id,
+        has_qk_norm,
+    })
+}
 
-    let dim = config.get("hidden_size")?.as_u64()? as usize;
-    let n_layers = config.get("num_hidden_layers")?.as_u64()? as usize;
-    let n_heads = config.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = config
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(n_heads as u64) as usize;
-    let hidden_dim = config.get("intermediate_size")?.as_u64()? as usize;
-    let vocab_size = config.get("vocab_size")?.as_u64()? as usize;
-    let norm_eps = config
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1e-5) as f32;
-    let max_seq_len = config
-        .get("max_position_embeddings")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2048) as usize;
-    let rope_freq_base = config
-        .get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10000.0) as f32;
-
+pub fn config_from_hfq(hfq: &HfqFile) -> Result<LlamaConfig, String> {
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| format!("llama: metadata_json invalid: {e}"))?;
+    let config = meta
+        .get("config")
+        .ok_or_else(|| "llama: metadata_json missing `config`".to_string())?;
     let has_qk_norm = hfq
         .find_tensor("model.layers.0.self_attn.q_norm.weight")
         .is_some();
-
-    let head_dim = config
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(dim / n_heads);
-
-    let bos_token = config
-        .get("bos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let eos_token = config
-        .get("eos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2) as u32;
-
-    Some(LlamaConfig {
-        arch,
-        dim,
-        hidden_dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        vocab_size,
-        head_dim,
-        norm_eps,
-        max_seq_len,
-        rope_freq_base,
-        bos_token,
-        eos_token,
-        has_qk_norm,
-    })
+    llama_config_from_value(config, has_qk_norm)
 }
 
 // ─── Weight Loading ─────────────────────────────────────────────────────────
@@ -955,75 +974,16 @@ pub(crate) fn load_layer<B: WeightBackend>(
 /// The metadata JSON has structure: `{ "config": { ...config.json... } }`.
 pub fn config_from_safetensors_llama(
     source: &dyn crate::model_source::ModelSource,
-) -> Option<LlamaConfig> {
-    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
-    let config = meta.get("config")?;
-
-    let arch_str = config.get("model_type")?.as_str()?;
-    let arch = match arch_str {
-        "llama" | "mistral" => ModelArch::Llama,
-        "qwen3" | "qwen2" => ModelArch::Qwen3,
-        _ => ModelArch::Llama,
-    };
-
-    let dim = config.get("hidden_size")?.as_u64()? as usize;
-    let n_layers = config.get("num_hidden_layers")?.as_u64()? as usize;
-    let n_heads = config.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = config
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(n_heads as u64) as usize;
-    let hidden_dim = config.get("intermediate_size")?.as_u64()? as usize;
-    let vocab_size = config.get("vocab_size")?.as_u64()? as usize;
-    let norm_eps = config
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1e-5) as f32;
-    let max_seq_len = config
-        .get("max_position_embeddings")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2048) as usize;
-    let rope_freq_base = config
-        .get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10000.0) as f32;
-
-    let head_dim = config
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(dim / n_heads);
-
-    let bos_token = config
-        .get("bos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let eos_token = config
-        .get("eos_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2) as u32;
-
-    // Detect QK norm from tensor names
+) -> Result<LlamaConfig, String> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .map_err(|e| format!("llama: metadata_json invalid: {e}"))?;
+    let config = meta
+        .get("config")
+        .ok_or_else(|| "llama: metadata_json missing `config`".to_string())?;
     let has_qk_norm = source
         .tensor_info("model.layers.0.self_attn.q_norm.weight")
         .is_some();
-
-    Some(LlamaConfig {
-        arch,
-        dim,
-        hidden_dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        vocab_size,
-        head_dim,
-        norm_eps,
-        max_seq_len,
-        rope_freq_base,
-        bos_token,
-        eos_token,
-        has_qk_norm,
-    })
+    llama_config_from_value(config, has_qk_norm)
 }
 
 /// Load a ParoQuant-quantized weight tensor from a safetensors source.
@@ -1254,4 +1214,108 @@ pub fn load_weights_paroquant_llama(
         layers,
         lm_head_aliases_embd,
     })
+}
+
+#[cfg(test)]
+mod llama_config_tests {
+    use super::*;
+
+    fn config_value(model_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "architecture": "llama",
+            "config": {
+                "model_type": model_type,
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "intermediate_size": 11008,
+                "vocab_size": 32000,
+                "head_dim": 128,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 8192,
+                "rope_theta": 500000.0,
+                "bos_token_id": 128000,
+                "eos_token_id": 128001
+            }
+        })
+    }
+
+    #[test]
+    fn full_envelope_every_field() {
+        let envelope = config_value("llama");
+        let config = envelope.get("config").unwrap();
+        let c = llama_config_from_value(config, false).unwrap();
+        assert_eq!(c.arch, ModelArch::Llama);
+        assert_eq!(c.dim, 4096);
+        assert_eq!(c.hidden_dim, 11008);
+        assert_eq!(c.n_layers, 32);
+        assert_eq!(c.n_heads, 32);
+        assert_eq!(c.n_kv_heads, 8);
+        assert_eq!(c.vocab_size, 32000);
+        assert_eq!(c.head_dim, 128);
+        assert_eq!(c.norm_eps, 1e-6);
+        assert_eq!(c.max_seq_len, 8192);
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.bos_token, 128000);
+        assert_eq!(c.eos_token, 128001);
+        assert!(!c.has_qk_norm);
+    }
+
+    #[test]
+    fn arch_enum_mapping() {
+        let cases = [
+            ("llama", ModelArch::Llama),
+            ("mistral", ModelArch::Llama),
+            ("qwen3", ModelArch::Qwen3),
+            ("qwen2", ModelArch::Qwen3),
+            ("something_else", ModelArch::Llama),
+        ];
+        for (mt, expect) in cases {
+            let envelope = config_value(mt);
+            let config = envelope.get("config").unwrap();
+            let c = llama_config_from_value(config, false).unwrap();
+            assert_eq!(c.arch, expect, "model_type {mt:?}");
+        }
+    }
+
+    #[test]
+    fn defaults_when_optional_absent() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000
+        });
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.norm_eps, 1e-5);
+        assert_eq!(c.max_seq_len, 2048);
+        assert_eq!(c.rope_freq_base, 10000.0);
+        assert_eq!(c.bos_token, 1);
+        assert_eq!(c.eos_token, 2);
+        assert_eq!(c.n_kv_heads, 32); // defaults to n_heads
+        assert_eq!(c.head_dim, 128); // dim / n_heads = 4096 / 32
+    }
+
+    #[test]
+    fn missing_required_is_err() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000
+        });
+        assert!(llama_config_from_value(&config, false).is_err());
+    }
+
+    #[test]
+    fn has_qk_norm_passthrough() {
+        let envelope = config_value("qwen3");
+        let config = envelope.get("config").unwrap();
+        let c = llama_config_from_value(config, true).unwrap();
+        assert!(c.has_qk_norm);
+    }
 }

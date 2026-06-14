@@ -64,7 +64,6 @@ impl Architecture for Llama {
         // variant. See arch-llama/src/lib.rs for the colocation
         // rationale.
         hfq::config_from_hfq(hfq)
-            .ok_or_else(|| "llama: failed to parse config from HFQ metadata".to_string())
     }
 
     fn load_weights(

@@ -55,7 +55,7 @@ fn main() {
     let est_layers_hidden = if is_hybrid {
         let c = qwen35::config_from_hfq(&drafter_hfq_peek).expect("hybrid config");
         ("hybrid", c.n_layers, c.hidden_dim)
-    } else if let Some(c) = hipfire_runtime::hfq::config_from_hfq(&drafter_hfq_peek) {
+    } else if let Ok(c) = hipfire_runtime::hfq::config_from_hfq(&drafter_hfq_peek) {
         ("plain", c.n_layers, c.hidden_dim)
     } else {
         ("unknown", 0, 0)

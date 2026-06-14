@@ -475,8 +475,10 @@ impl Carrier for LlamaCarrier {
                 };
                 let chat_template = source.chat_template();
 
-                let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-                    .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
+                let config =
+                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
+                        format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
+                    })?;
                 let weights =
                     hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                         .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;

@@ -649,8 +649,8 @@ pub fn load_drafter(
         }
     }
 
-    let config = hfq::config_from_hfq(&hfq).ok_or_else(|| hip_bridge::HipError::new(0,
-        "pflash: drafter HFQ has no recoverable config (neither qwen35 hybrid nor plain LlamaConfig)",
+    let config = hfq::config_from_hfq(&hfq).map_err(|e| hip_bridge::HipError::new(0,
+        &format!("pflash: drafter HFQ has no recoverable config (neither qwen35 hybrid nor plain LlamaConfig): {e}"),
     ))?;
     let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
     let scratch = ForwardScratch::new(gpu, &config)?;
