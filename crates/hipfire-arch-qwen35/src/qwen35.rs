@@ -246,8 +246,12 @@ struct RawQwen35Config {
     intermediate_size: usize,
     #[serde(default = "default_norm_eps")]
     rms_norm_eps: f32,
-    #[serde(default = "default_eos")]
-    eos_token_id: u32,
+    // Real safetensors configs ship `eos_token_id` as either a scalar
+    // (Qwen3.5 dense) or an array (some Qwen3.5 MoE / chat checkpoints). Keep
+    // it as a raw Value and resolve to the FIRST element in finalize (uniform
+    // with qwen2's `eos_token_id = eos_token_ids[0]`).
+    #[serde(default)]
+    eos_token_id: Option<serde_json::Value>,
     #[serde(default)]
     rope_parameters: Option<RawRope>,
     // FLAT partial_rotary_factor takes precedence over the nested one (finalize).
@@ -284,8 +288,18 @@ struct RawQwen35Config {
 fn default_norm_eps() -> f32 {
     1e-6
 }
-fn default_eos() -> u32 {
-    248044
+/// Resolve a scalar-or-array `eos_token_id` to a single token, using the first
+/// element of an array (uniform with qwen2). Absent/null/unexpected → default.
+fn first_token_or(v: Option<&serde_json::Value>, default: u32) -> u32 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|x| x as u32).unwrap_or(default),
+        Some(serde_json::Value::Array(a)) => a
+            .first()
+            .and_then(|e| e.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or(default),
+        _ => default,
+    }
 }
 fn default_linear_heads() -> usize {
     16
@@ -355,7 +369,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         n_layers: raw.num_hidden_layers,
         vocab_size: raw.vocab_size,
         norm_eps: raw.rms_norm_eps,
-        eos_token: raw.eos_token_id,
+        eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
         n_heads,
         n_kv_heads,
         head_dim,
@@ -13297,6 +13311,23 @@ mod tests {
         assert!(cfg.norm_topk_prob);
         // layer_types absent → all FullAttention, length n_layers.
         assert_eq!(cfg.layer_types, vec![LayerType::FullAttention; 2]);
+    }
+
+    #[test]
+    fn array_eos_token_id_uses_first_element() {
+        // Real Qwen3.5 / chat checkpoints ship `eos_token_id` as an array. The
+        // OLD hand-walked parser silently fell back to the default on an array;
+        // the serde port (scalar u32) would HARD-ERROR. We now take the first
+        // element (uniform with qwen2's `eos_token_id = eos_token_ids[0]`).
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000,
+            "eos_token_id": [151645, 151643]
+        });
+        let cfg = from_config_value(&inner).expect("array-eos parse");
+        assert_eq!(cfg.eos_token, 151645);
     }
 
     #[test]

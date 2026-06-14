@@ -551,10 +551,14 @@ struct RawLlamaConfig {
     max_position_embeddings: usize,
     #[serde(default = "default_llama_rope")]
     rope_theta: f32,
-    #[serde(default = "default_bos")]
-    bos_token_id: u32,
-    #[serde(default = "default_eos")]
-    eos_token_id: u32,
+    // Real safetensors configs ship `bos_token_id`/`eos_token_id` as either a
+    // scalar (most LLaMA/Mistral) or an array (Llama-3.1: `[128001, 128009]`).
+    // Keep them as raw Values and resolve to the FIRST element in finalize
+    // (uniform with qwen2's `eos_token_id = eos_token_ids[0]`).
+    #[serde(default)]
+    bos_token_id: Option<serde_json::Value>,
+    #[serde(default)]
+    eos_token_id: Option<serde_json::Value>,
 }
 
 fn default_llama_eps() -> f32 {
@@ -566,11 +570,19 @@ fn default_llama_max_pos() -> usize {
 fn default_llama_rope() -> f32 {
     10000.0
 }
-fn default_bos() -> u32 {
-    1
-}
-fn default_eos() -> u32 {
-    2
+/// Resolve a scalar-or-array `bos_token_id`/`eos_token_id` to a single token,
+/// using the first element of an array (uniform with qwen2). Absent/null/
+/// unexpected → default.
+fn first_token_or(v: Option<&serde_json::Value>, default: u32) -> u32 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|x| x as u32).unwrap_or(default),
+        Some(serde_json::Value::Array(a)) => a
+            .first()
+            .and_then(|e| e.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or(default),
+        _ => default,
+    }
 }
 
 /// Shared finalize for the LLaMA-family config parsers. `has_qk_norm` is a
@@ -603,8 +615,8 @@ fn llama_config_from_value(
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
         rope_freq_base: raw.rope_theta,
-        bos_token: raw.bos_token_id,
-        eos_token: raw.eos_token_id,
+        bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
+        eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
         has_qk_norm,
     })
 }
@@ -1297,6 +1309,27 @@ mod llama_config_tests {
         assert_eq!(c.eos_token, 2);
         assert_eq!(c.n_kv_heads, 32); // defaults to n_heads
         assert_eq!(c.head_dim, 128); // dim / n_heads = 4096 / 32
+    }
+
+    #[test]
+    fn array_eos_token_id_uses_first_element() {
+        // Llama-3.1 ships `eos_token_id` as an array `[128001, 128009]`. The OLD
+        // hand-walked parser silently fell back to the default on an array; the
+        // serde port (scalar u32) would HARD-ERROR. We now take the first
+        // element (uniform with qwen2's `eos_token_id = eos_token_ids[0]`).
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "intermediate_size": 11008,
+            "vocab_size": 32000,
+            "bos_token_id": 128000,
+            "eos_token_id": [128001, 128009]
+        });
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.eos_token, 128001);
+        assert_eq!(c.bos_token, 128000);
     }
 
     #[test]
