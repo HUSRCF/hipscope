@@ -384,19 +384,27 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     })
 }
 
-pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
-    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+/// Inner parser, decoupled from `HfqFile` / `ModelSource` for unit testability.
+///
+/// Parses the metadata JSON string, unwraps the `{config}` envelope both
+/// sources build, then delegates to [`from_config_value`]. Both
+/// `config_from_hfq` and `config_from_safetensors` call this, so the ×2
+/// collapse is at the string→config boundary.
+pub fn config_from_metadata_json(metadata_json: &str) -> Result<Qwen35Config, String> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|e| format!("qwen35: metadata_json not valid JSON: {e}"))?;
     from_config_value(meta.get("config").ok_or("qwen35: missing config")?)
+}
+
+pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
+    config_from_metadata_json(&hfq.metadata_json)
 }
 
 /// Parse Qwen35Config from a SafetensorsSource (or any ModelSource).
 /// Delegates to the same JSON parser as config_from_hfq — the SafetensorsSource
 /// builds compatible metadata JSON from config.json.
 pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config, String> {
-    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
-        .map_err(|e| format!("qwen35: metadata_json not valid JSON: {e}"))?;
-    from_config_value(meta.get("config").ok_or("qwen35: missing config")?)
+    config_from_metadata_json(source.metadata_json())
 }
 
 // ─── Weight structs ─────────────────────────────────────────────────────
@@ -13293,22 +13301,35 @@ mod tests {
 
     #[test]
     fn collapse_hfq_eq_safetensors() {
-        // ×2-collapse proof: the same inner config under the hfq-style and the
-        // safetensors-style envelope (same shape) must yield identical configs,
-        // since both delegate to from_config_value(meta["config"]).
-        let inner = dense_inner();
-        let env = envelope(inner.clone());
+        // ×2-collapse proof at the wrapper boundary: both `config_from_hfq` and
+        // `config_from_safetensors` now delegate to `config_from_metadata_json`,
+        // so exercising the string→config path that both share — and confirming
+        // it matches the underlying `from_config_value` on the `config` node —
+        // covers the collapse end-to-end (not just `from_config_value`
+        // determinism).
+        let env = envelope(dense_inner());
 
-        // hfq path: parse via from_config_value on meta["config"].
-        let meta: serde_json::Value = serde_json::from_str(&env).unwrap();
-        let via_config = from_config_value(meta.get("config").unwrap()).unwrap();
+        // Shared wrapper path: full envelope string → config.
+        let via_wrapper = config_from_metadata_json(&env).expect("metadata_json parse");
 
-        // safetensors path goes through a ModelSource; emulate by parsing the
-        // identical envelope string the same way config_from_safetensors does.
-        let meta2: serde_json::Value = serde_json::from_str(&env).unwrap();
-        let via_config2 = from_config_value(meta2.get("config").unwrap()).unwrap();
+        // Oracle: parse the envelope and run from_config_value on meta["config"]
+        // directly. Qwen35Config has no PartialEq, so assert the key fields.
+        let parsed: serde_json::Value = serde_json::from_str(&env).unwrap();
+        let via_inner = from_config_value(parsed.get("config").unwrap()).unwrap();
 
-        assert_eq!(format!("{via_config:?}"), format!("{via_config2:?}"));
+        assert_eq!(via_wrapper.dim, via_inner.dim);
+        assert_eq!(via_wrapper.n_layers, via_inner.n_layers);
+        assert_eq!(via_wrapper.n_heads, via_inner.n_heads);
+        assert_eq!(via_wrapper.head_dim, via_inner.head_dim);
+        assert_eq!(via_wrapper.rope_theta, via_inner.rope_theta);
+        assert_eq!(
+            via_wrapper.partial_rotary_factor,
+            via_inner.partial_rotary_factor
+        );
+        assert_eq!(via_wrapper.mrope_section, via_inner.mrope_section);
+        assert_eq!(via_wrapper.layer_types, via_inner.layer_types);
+        assert_eq!(via_wrapper.num_experts, via_inner.num_experts);
+        assert_eq!(via_wrapper.is_vl_text, via_inner.is_vl_text);
     }
 
     #[test]

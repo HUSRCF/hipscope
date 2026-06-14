@@ -579,10 +579,10 @@ pub fn load_drafter(
     #[cfg(feature = "deltanet")]
     {
         if is_hybrid {
-            let q35_cfg = qwen35::config_from_hfq(&hfq).map_err(|_| {
+            let q35_cfg = qwen35::config_from_hfq(&hfq).map_err(|e| {
                 hip_bridge::HipError::new(
                     0,
-                    "pflash: hybrid tensors detected but qwen35 config parse failed",
+                    &format!("pflash: hybrid tensors detected but qwen35 config parse failed: {e}"),
                 )
             })?;
             let mut src = qwen35::HfqSource::new(&mut hfq, &q35_cfg);
