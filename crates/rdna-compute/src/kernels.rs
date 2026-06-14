@@ -2563,6 +2563,18 @@ pub const FUSED_GATE_UP_HFQ4G256_SRC: &str =
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_q8_0.hip");
 
+/// 4-way fused QKVZA for Q8_0 weights (DECODE, n=1). Mirrors
+/// fused_qkvza_hfq4g256 but with Q8_0 dequant. Grid=[total_m], block=[32].
+/// Bit-exact with four sequential gemv_q8_0 calls.
+pub const FUSED_QKVZA_Q8_0_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_q8_0.hip");
+
+/// 3-way fused QKV for Q8_0 weights (DECODE, n=1). Mirrors
+/// fused_qkv_hfq4g256 but with Q8_0 dequant. Grid=[q_m+k_m+v_m], block=[32].
+/// Bit-exact with three sequential gemv_q8_0 calls.
+pub const FUSED_QKV_Q8_0_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkv_q8_0.hip");
+
 /// Wave64-native counterpart to FUSED_GATE_UP_HFQ4G256_SRC for CDNA1/3.
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
 /// gate_m + up_m to (total + 1) / 2. Byte-exact with the wave32 base.

@@ -23,17 +23,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         // gfx906 dp4a decode fast-path, cross-arch gemm (n=1) decode elsewhere.
         (KernelKey::FusedQkvHfq6G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
-        // Q8_0 fused QKV (#397 Ship 5.2 slice 3). WMMA-only: the run-arm calls
-        // `gpu.gemm_qkv_q8_0_wmma`, which routes to the gfx12 WMMA sibling on
-        // RDNA4 else the gfx11 `_w32` WMMA kernel — there is NO scalar/dp4a
-        // fallback body (UNLIKE the gate+up Q8 row, which is `Always` because it
-        // ALSO has a non-WMMA decode method `fused_gate_up_q8_0`; no such
-        // `fused_qkv_q8_0` decode method exists). The qwen35 prefill site reaches
-        // this arm only when `q8_wmma_arch = has_wmma()`; the non-WMMA arch case
-        // stays as three plain GemmQ8_0BatchedChunked GEMMs (slice 1). HasWmma
-        // (= has_wmma(), includes gfx12) is the correct gate; the gfx12 sibling
-        // is reached INSIDE the method, so HasWmmaW32 (gfx12-excluding) is wrong.
-        (KernelKey::FusedQkvQ8_0,         ArchPredicate::HasWmma),
+        // Q8_0 fused QKV. Decode (None) → scalar `fused_qkv_q8_0` (cross-arch,
+        // added 2026-06-14 for Qwen3.5-A3B .mq4p). Prefill (Some(n)) →
+        // WMMA-only `gemm_qkv_q8_0_wmma` (gfx12 sibling on RDNA4 else gfx11);
+        // the non-WMMA prefill case stays as three plain GemmQ8_0BatchedChunked
+        // GEMMs at the call site (slice 1). `Always`: scalar decode covers all
+        // non-WMMA archs; WMMA prefill is guarded inside the dispatch arm by
+        // the call site's own `q8_wmma_arch = has_wmma()` check.
+        (KernelKey::FusedQkvQ8_0,         ArchPredicate::Always),
         // HFQ3G256 fused QKV (#397 Ship 5.2 slice 3). Always — the qwen35 prefill
         // site picks `gpu.gemm_qkv_hfq3g256_wmma` on has_wmma() archs and the base
         // `gpu.gemm_qkv_hfq3g256` otherwise, and the base method itself carries a
@@ -84,11 +81,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         // the run-arm keeps the gfx906 dp4a decode fast-path and falls to the
         // cross-arch gemm (n=1) for decode on other archs.
         (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::Always),
-        // Q8_0 fused QKVZA (#397 Ship 5.2 slice 3). WMMA-only — the run-arm calls
-        // `gpu.gemm_qkvza_q8_0_wmma` (gfx12 sibling on RDNA4 else gfx11 `_w32`
-        // WMMA), no scalar/dp4a fallback; no `fused_qkvza_q8_0` decode method
-        // exists. Mirrors the FusedQkvQ8_0 row above. HasWmma (includes gfx12).
-        (KernelKey::FusedQkvzaQ8_0,         ArchPredicate::HasWmma),
+        // Q8_0 fused QKVZA. Decode (None) → scalar `fused_qkvza_q8_0` (cross-arch,
+        // added 2026-06-14 for Qwen3.5-A3B .mq4p DeltaNet layers). Prefill
+        // (Some(n)) → WMMA-only `gemm_qkvza_q8_0_wmma`. `Always` — scalar decode
+        // covers all non-WMMA archs; WMMA prefill guard is inside the dispatch arm.
+        (KernelKey::FusedQkvzaQ8_0,         ArchPredicate::Always),
         // HFQ3G256 fused QKVZA (#397 Ship 5.2 slice 3). Always — base
         // `gpu.gemm_qkvza_hfq3g256` carries the full cross-arch ladder
         // (MMQ → dot2 → fp16 → scalar); the run-arm picks `_wmma` vs base by arch.

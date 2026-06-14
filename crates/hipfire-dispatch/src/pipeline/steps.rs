@@ -132,9 +132,12 @@ pub(crate) fn guard_qkv_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
         && gemv_steps_uniform(steps, dt, true)
 }
 
-/// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
+/// Covers both DType::HFQ6G256 and DType::MQ6G256.
+/// Fusion is safe on RDNA (fused_qkv.rs None arm falls back to gemm n=1)
+/// and beneficial on RDNA3+ even without dp4a; dp4a is handled per-arm
+/// in fused_qkv.rs dispatch.
 pub(crate) fn guard_qkv_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if !dp4a_eligible(ctx) { return false; }
+    if ctx.flags.force_unfused { return false; }
     if steps.len() != 4 { return false; }
     let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
     matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
@@ -162,9 +165,12 @@ pub(crate) fn guard_qkvza_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
         && gemv_steps_uniform(steps, dt, true)
 }
 
-/// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
+/// Covers both DType::HFQ6G256 and DType::MQ6G256.
+/// Fusion is safe on RDNA (fused_qkv.rs None arm falls back to gemm n=1)
+/// and beneficial on RDNA3+ even without dp4a; dp4a is handled per-arm
+/// in fused_qkv.rs dispatch.
 pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if !dp4a_eligible(ctx) { return false; }
+    if ctx.flags.force_unfused { return false; }
     if steps.len() != 5 { return false; }
     let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
     matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
@@ -252,6 +258,19 @@ pub(crate) fn guard_gate_up_q4k(steps: &[Step], ctx: &DispatchCtx) -> bool {
 pub(crate) fn guard_gate_up_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused { return false; }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::Q8_0, true)
+}
+
+/// Fused 4-way QKVZA with Q8_0 weights (DECODE path, n=1). Used by
+/// Qwen3.5/A3B .mq4p DeltaNet layers (qt=3). No dp4a required.
+pub(crate) fn guard_qkvza_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 5 && gemv_steps_uniform(steps, DType::Q8_0, true)
+}
+
+/// Fused 3-way QKV with Q8_0 weights (DECODE path, n=1). No dp4a required.
+pub(crate) fn guard_qkv_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 4 && gemv_steps_uniform(steps, DType::Q8_0, true)
 }
 
 pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -370,8 +389,10 @@ const FUSED_TABLE: &[FusedPattern] = &[
     // mfp4-E8 decode launch-fusion — gfx1151-ONLY (guard firewalls the arch).
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMfp4G32E8,    guard: guard_gate_up_mfp4g32e8    },
     // ── Q8_0 / Q4K fused entries (non-rotated, Always arch gate) ─────────
-    // No FusedQkvQ8_0 entry: neither qwen2 (QKV is HFQ4G256) nor llama (QKV is
-    // Q4K/MQ/plain) uses Q8_0 for QKV — only gate+up.
+    // Q8_0 QKV/QKVZA: Qwen3.5-A3B .mq4p uses Q8_0 for all linear-attention
+    // projections (qt=3). Scalar decode kernels added 2026-06-14.
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaQ8_0,       guard: guard_qkvza_q8_0       },
+    FusedPattern { ops: QKV3,   key: KernelKey::FusedQkvQ8_0,          guard: guard_qkv_q8_0         },
     FusedPattern { ops: QKV3,     key: KernelKey::FusedQkvQ4K,          guard: guard_qkv_q4k          },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ4K,       guard: guard_gate_up_q4k      },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ8_0,       guard: guard_gate_up_q8_0     },
@@ -553,7 +574,8 @@ fn launch_fused(
         | KernelKey::FusedQkvMq3G256Lloyd
         | KernelKey::FusedQkvHfq4G256
         | KernelKey::FusedQkvHfq6G256
-        | KernelKey::FusedQkvQ4K => {
+        | KernelKey::FusedQkvQ4K
+        | KernelKey::FusedQkvQ8_0 => {
             let (wq, q) = gemv_weight_out(&steps[1]);
             let (wk, k) = gemv_weight_out(&steps[2]);
             let (wv, v) = gemv_weight_out(&steps[3]);
@@ -593,7 +615,8 @@ fn launch_fused(
         | KernelKey::FusedQkvzaMq3G256Lloyd
         | KernelKey::FusedQkvzaMq4G256Lloyd
         | KernelKey::FusedQkvzaHfq6G256
-        | KernelKey::FusedQkvzaMfp4G32E8 => {
+        | KernelKey::FusedQkvzaMfp4G32E8
+        | KernelKey::FusedQkvzaQ8_0 => {
             let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
             let (wz, z)       = gemv_weight_out(&steps[2]);
             let (wb, beta)    = gemv_weight_out(&steps[3]);
