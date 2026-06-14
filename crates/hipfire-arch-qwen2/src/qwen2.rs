@@ -37,10 +37,7 @@ use hipfire_runtime::weight_backend::{
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::pipeline::superop::{
-    self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
-};
-use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -1061,223 +1058,6 @@ pub fn forward_prefill_batch_embeds(
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────
-// #397 Ship 6 — forward-as-pipeline: Qwen2 lowered decode.
-//
-// Qwen2 has a single, uniform layer shape (dense-only, no MoE/DeltaNet/conv).
-// Every layer lowers to the same 5-op LayerProgram:
-//   [Proj(QKV), Attend, ResidualGemv(wo), Proj(GateUp), ResidualGemv(down)]
-//
-// The super-op handlers call the SAME helper fns and `execute_steps` sequences
-// the hand path uses, so the lowered path is a behavioral clone by construction.
-// The hand loop in `forward_step_after_x` is left UNTOUCHED; the default
-// (flag off) is byte-identical to the current code by construction. The lowered
-// path is validated via the FORWARD_LOWERED=0-vs-=1 committed-token md5 A/B
-// before the default is flipped.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// qwen2-local super-op opcodes. Values are scoped per `SuperOpKind` —
-/// `PROJ_QKV=0` and `RESID_WO=0` can share the same number because they live
-/// in different handler methods. Same convention as qwen35's `q35_op` and
-/// lfm2moe's `lfm2_op`.
-mod q2_op {
-    // Proj
-    pub const PROJ_QKV: u32 = 0;
-    pub const PROJ_GATE_UP: u32 = 1;
-    // ResidualGemv
-    pub const RESID_WO: u32 = 0;
-    pub const RESID_DOWN: u32 = 1;
-}
-
-#[inline]
-fn q2_superop(kind: SuperOpKind, code: u32) -> SuperOp {
-    SuperOp {
-        kind,
-        binding: OpBinding {
-            key: None,
-            weights: vec![WeightSlot(code)],
-            scratch: Vec::new(),
-            flavor: OpFlavor::None,
-        },
-    }
-}
-
-#[inline]
-fn op_code(op: &OpBinding) -> u32 {
-    op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
-}
-
-/// Lower one qwen2 decoder layer to a coarse-super-op `LayerProgram`. qwen2
-/// has a single, uniform layer shape (dense-only), so every layer gets the
-/// same program. Pure → unit-testable.
-fn qwen2_lower_program() -> superop::LayerProgram {
-    use q2_op::*;
-    use SuperOpKind::*;
-    vec![
-        q2_superop(Proj, PROJ_QKV),
-        q2_superop(Attend, 0),
-        q2_superop(ResidualGemv, RESID_WO),
-        q2_superop(Proj, PROJ_GATE_UP),
-        q2_superop(ResidualGemv, RESID_DOWN),
-    ]
-}
-
-/// Per-layer execution context for the lowered decode path. Holds the current
-/// layer's weights + shared scratch/state by reference; rebuilt each layer
-/// iteration so the borrows stay scoped. Uses shared `&Qwen2State` — GpuTensor
-/// writes go through interior mutability; `next_pos` is written in the driver
-/// after the layer loop.
-struct Qwen2Bindings<'a> {
-    cfg: &'a Qwen2Config,
-    layer: &'a Qwen2LayerWeights,
-    state: &'a Qwen2State,
-    l: usize,
-    seq_len: usize,
-}
-
-impl<'a> ForwardBindings for Qwen2Bindings<'a> {
-    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
-        match op_code(op) {
-            q2_op::PROJ_QKV => {
-                // Hand-path: rmsnorm + QKV projection via execute_steps.
-                let qkv_rot = dtype_rotation_plan(self.layer.wq.gpu_dtype);
-                let wrq = self.layer.wq.dispatch_ref();
-                let wrk = self.layer.wk.dispatch_ref();
-                let wrv = self.layer.wv.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.attn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.wq.awq_scale.as_ref(),
-                        k: self.layer.wq.k, eps: self.cfg.rms_norm_eps, rotation: qkv_rot,
-                    },
-                    Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.q },
-                    Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.k },
-                    Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.v },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: qkv proj: {e}", self.l)))
-            }
-            q2_op::PROJ_GATE_UP => {
-                // Hand-path: ffn norm + gate/up projection via execute_steps.
-                let ffn_rot = dtype_rotation_plan(self.layer.w_gate.gpu_dtype);
-                let wrg = self.layer.w_gate.dispatch_ref();
-                let wru = self.layer.w_up.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.ffn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.w_gate.awq_scale.as_ref(),
-                        k: self.layer.w_gate.k, eps: self.cfg.rms_norm_eps, rotation: ffn_rot,
-                    },
-                    Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.gate },
-                    Step::Gemv { w: &wru, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.up },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: gate_up proj: {e}", self.l)))
-            }
-            c => Err(DispatchError::Hip(format!("qwen2: run_proj bad opcode {c}"))),
-        }
-    }
-
-    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        let l = self.l;
-        let n_heads = self.cfg.num_attention_heads;
-        let n_kv_heads = self.cfg.num_key_value_heads;
-        let head_dim = self.cfg.head_dim;
-        let q_dim = n_heads * head_dim;
-        let kv_dim = n_kv_heads * head_dim;
-
-        // (3) QKV bias
-        gpu.bias_add_f32(&self.state.q, &self.layer.wq_bias, 1, q_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: q bias: {e:?}")))?;
-        gpu.bias_add_f32(&self.state.k, &self.layer.wk_bias, 1, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: k bias: {e:?}")))?;
-        gpu.bias_add_f32(&self.state.v, &self.layer.wv_bias, 1, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: v bias: {e:?}")))?;
-
-        // (4) RoPE
-        gpu.rope_f32(&self.state.q, &self.state.k, &self.state.pos_buf,
-                     n_heads, n_kv_heads, head_dim, self.cfg.rope_theta)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: rope: {e:?}")))?;
-
-        // (5) KV write
-        gpu.kv_cache_write(&self.state.k_cache[l], &self.state.k, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write k: {e:?}")))?;
-        gpu.kv_cache_write(&self.state.v_cache[l], &self.state.v, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write v: {e:?}")))?;
-
-        // (6) Attention — 4-way select (exact hand-path mirror)
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED").map(|v| v == "1").unwrap_or(false);
-        if use_fused && n_kv_heads < n_heads {
-            gpu.attention_flash_gqa_fused(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
-            )
-        } else if n_kv_heads < n_heads && head_dim == 128 && self.seq_len >= 4096 {
-            gpu.attention_gqa_warp(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
-            )
-        } else if n_kv_heads < n_heads && self.seq_len >= 4096 {
-            Gpu::attention_flash_gqa(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
-            )
-        } else {
-            Gpu::attention_flash(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
-            )
-        }.map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
-
-        Ok(())
-    }
-
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
-        match op_code(op) {
-            q2_op::RESID_WO => {
-                let wro = self.layer.wo.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wro, input: GemvInput::Raw(&self.state.attn_out),
-                        residual: &self.state.x, out: &self.state.o,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: wo: {e}", self.l)))
-            }
-            q2_op::RESID_DOWN => {
-                // silu_mul + w_down residual (always paired in qwen2).
-                gpu.silu_mul_f32(&self.state.gate, &self.state.up, &self.state.ffn_hidden)
-                    .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: silu_mul: {e:?}", self.l)))?;
-                let wrd = self.layer.w_down.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wrd, input: GemvInput::Raw(&self.state.ffn_hidden),
-                        residual: &self.state.x, out: &self.state.ffn_out,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: down: {e}", self.l)))
-            }
-            c => Err(DispatchError::Hip(format!("qwen2: run_residual_gemv bad opcode {c}"))),
-        }
-    }
-
-    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no standalone Norm super-op".into()))
-    }
-    fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no MoE".into()))
-    }
-    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no Recurrent super-op".into()))
-    }
-    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no Conv super-op".into()))
-    }
-    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, _kind: EscapeKind) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no Escape super-op".into()))
-    }
-}
-
 /// Lowered decode is DEFAULT ON (fleet-standard `!= Some("0")`, same
 /// convention as qwen35/minimax/deepseek4/lfm2moe); opt out with
 /// HIPFIRE_FORWARD_LOWERED=0. Byte-parity validated on gfx1100 (Kevin:
@@ -1331,8 +1111,8 @@ fn forward_step_after_x_lowered(
 /// Per-forward [`DenseArch`] wrapper for qwen2-family models (qwen2 / qwen2.5 /
 /// dots-ocr text). Routes the projection/FFN body through the shared
 /// `dense_forward`; attention stays qwen2's plain-F32 KV write + flash/gqa
-/// selector via [`Self::attend`]. Replaces the SuperOp lowered path
-/// (`qwen2_lower_program` + `Qwen2Bindings`), which is now unused.
+/// selector via [`Self::attend`]. Replaced the SuperOp lowered path
+/// (`qwen2_lower_program` + `Qwen2Bindings`), now removed.
 struct Qwen2Dense<'a> {
     weights: &'a Qwen2Weights,
     state: &'a Qwen2State,
@@ -1419,28 +1199,6 @@ impl DenseArch for Qwen2Dense<'_> {
                 self.seq_len, k.n_heads, k.n_kv_heads, k.head_dim, st.max_seq,
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod ship6_lower_tests {
-    use super::*;
-    use SuperOpKind::{Attend, Proj, ResidualGemv};
-
-    #[test]
-    fn qwen2_program_shape() {
-        let p = qwen2_lower_program();
-        assert_eq!(p.len(), 5);
-        assert_eq!(p[0].kind, Proj);
-        assert_eq!(p[1].kind, Attend);
-        assert_eq!(p[2].kind, ResidualGemv);
-        assert_eq!(p[3].kind, Proj);
-        assert_eq!(p[4].kind, ResidualGemv);
-        // Opcode round-trip.
-        assert_eq!(op_code(&p[0].binding), q2_op::PROJ_QKV);
-        assert_eq!(op_code(&p[2].binding), q2_op::RESID_WO);
-        assert_eq!(op_code(&p[3].binding), q2_op::PROJ_GATE_UP);
-        assert_eq!(op_code(&p[4].binding), q2_op::RESID_DOWN);
     }
 }
 
