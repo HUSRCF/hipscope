@@ -136,8 +136,14 @@ fn main() -> ExitCode {
     let mut plan: Vec<Src> = Vec::with_capacity(base_p.tensors.len());
     let mut swapped = 0usize;
     let (mut swap_q8, mut swap_other) = (0usize, 0usize);
+    // HIPFIRE_DEMOTE_MQ6=1: also pull the MQ6 (qt=15) ROUTED experts from the
+    // donor (uniform MQ4) — demotes the hot tier MQ6->MQ4 to remove the MQ6-hot
+    // decode BW floor. Produces a lighter "speed" redline (MQ4 hot/mid + MQ3-
+    // Lloyd cold) at a hot-expert quality cost. Off by default.
+    let demote_mq6 = std::env::var("HIPFIRE_DEMOTE_MQ6").is_ok();
     for (i, bt) in base_p.tensors.iter().enumerate() {
-        if is_attn_proj(&bt.name) {
+        let demote = demote_mq6 && bt.quant_type == 15 && bt.name.contains(".mlp.experts.");
+        if is_attn_proj(&bt.name) || demote {
             if let Some(dt) = donor_by_name.get(bt.name.as_str()) {
                 if dt.shape == bt.shape {
                     if bt.quant_type == 3 { swap_q8 += 1; } else { swap_other += 1; }
