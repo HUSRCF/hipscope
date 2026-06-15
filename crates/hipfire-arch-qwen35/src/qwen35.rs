@@ -5,7 +5,6 @@
 //! Qwen3.5 model: hybrid DeltaNet (linear attention) + standard attention.
 //! Feature-gated behind `deltanet`.
 
-use crate::paro_moe::paro_load_moe_ffn;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
@@ -18,7 +17,6 @@ use hipfire_dispatch::pipeline::superop::{
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::{DispatchError, RotationPlan};
-use hipfire_runtime::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
@@ -28,13 +26,11 @@ use hipfire_runtime::llama::{
 use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::paro::{
-    load_fp16_weight_from_source, paro_load_f32, paro_load_norm, paro_text_prefix,
-};
+use hipfire_runtime::paro::{paro_load_norm, paro_text_prefix};
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding,
-    resolve_lm_head, reupload_f16_as_f32, HfqBackend, ParoBackend,
+    dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
+    reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
@@ -1086,15 +1082,6 @@ fn qwen35_tensor_data_vec<'a>(
 ) -> Option<(&'a HfqTensorInfo, Vec<u8>)> {
     for candidate in qwen35_tensor_name_candidates(name) {
         if let Some(found) = hfq.tensor_data_vec(&candidate) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn qwen35_tensor_data<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensorInfo, &'a [u8])> {
-    for candidate in qwen35_tensor_name_candidates(name) {
-        if let Some(found) = hfq.tensor_data(&candidate) {
             return Some(found);
         }
     }

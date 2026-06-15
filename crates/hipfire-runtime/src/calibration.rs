@@ -32,8 +32,9 @@
 //!   `hfhs_writer::write_hfhs`).
 //! - The BF16 forward pass + linear-layer capture hook wiring
 //!   (subagent C — `dispatch.rs` capture-handler call sites).
-//! - The BF16 safetensors loader implementation (subagent D —
-//!   `bf16_loader::load_bf16_model` body).
+//! - The BF16 safetensors loader implementation (subagent D — the
+//!   `bf16_loader::load_bf16_model` scaffold was removed 2026-06-15 as
+//!   unimplemented dead code; recover from git history if revived).
 //!
 //! When those APIs land, the `unimplemented!()` stubs marked
 //! `TODO(subagent-X)` below are the single-line wire-in points.

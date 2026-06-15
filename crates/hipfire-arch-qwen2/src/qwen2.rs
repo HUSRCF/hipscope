@@ -30,9 +30,9 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_runtime::weight_backend::{
-    dequant_f32, dequant_norm, dequant_weight_raw, flat_name_candidates,
+    dequant_norm, dequant_weight_raw, flat_name_candidates,
     HfqBackend, load_embedding, resolve_lm_head, WeightBackend,
 };
 use hipfire_dispatch::context::DispatchCtx;
