@@ -7902,18 +7902,43 @@ fn main() {
                             ),
                             // [NaN-CRITICAL] mfp3-E8 cold tier: 3-bit lattice, 13 B/blk, 3.25 bpw.
                             // Drop-in for MQ3G256Lloyd (tag 3 → tag 5 in the kernel tag table).
-                            QuantType::MFP3G32E8 => (
-                                quantize_mfp3g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
-                                QuantType::MFP3G32E8,
-                                32u32,
-                            ),
+                            QuantType::MFP3G32E8 => {
+                                // GPTQ/LDLQ when a Hessian is available (graded cold
+                                // tier), else RTN. Same per-tensor key + fallback
+                                // accounting as the uniform mfp3e8-gptq path.
+                                let q = if let Some(hdir) = hessian_dir_ref {
+                                    let tname = format!("{parent_owned}{x}.{base_owned}.weight");
+                                    let hblk = load_hessian_blocks(hdir, &tname);
+                                    if hblk.is_empty() {
+                                        GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    quantize_mfp3g32_e8_gptq_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk)
+                                } else {
+                                    quantize_mfp3g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
+                                };
+                                (q, QuantType::MFP3G32E8, 32u32)
+                            },
                             // [NaN-CRITICAL] mfp2-E8 cold tier: 2-bit lattice, 9 B/blk, 2.25 bpw.
                             // Drop-in for MQ2G256Lloyd (tag 1 → tag 6 in the kernel tag table).
-                            QuantType::MFP2G32E8 => (
-                                quantize_mfp2g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
-                                QuantType::MFP2G32E8,
-                                32u32,
-                            ),
+                            QuantType::MFP2G32E8 => {
+                                // GPTQ/LDLQ when a Hessian is available (graded cold
+                                // tier), else RTN.
+                                let q = if let Some(hdir) = hessian_dir_ref {
+                                    let tname = format!("{parent_owned}{x}.{base_owned}.weight");
+                                    let hblk = load_hessian_blocks(hdir, &tname);
+                                    if hblk.is_empty() {
+                                        GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    quantize_mfp2g32_e8_gptq_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk)
+                                } else {
+                                    quantize_mfp2g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
+                                };
+                                (q, QuantType::MFP2G32E8, 32u32)
+                            },
                             // Any other QuantType in the map → MQ4 safe fallback
                             _ => (
                                 quantize_mq4g256(&f32_slice, &signs1, &signs2),
