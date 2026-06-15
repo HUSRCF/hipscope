@@ -7906,7 +7906,11 @@ fn main() {
                                 // GPTQ/LDLQ when a Hessian is available (graded cold
                                 // tier), else RTN. Same per-tensor key + fallback
                                 // accounting as the uniform mfp3e8-gptq path.
-                                let q = if let Some(hdir) = hessian_dir_ref {
+                                // Use the RAW --hessian-dir (not the format-gated
+                                // hessian_dir_ref): graded base --format is mq4, so
+                                // the gptq-format flags are off, but a passed Hessian
+                                // still means "GPTQ the E8 cold tier".
+                                let q = if let Some(hdir) = hessian_dir.as_deref() {
                                     let tname = format!("{parent_owned}{x}.{base_owned}.weight");
                                     let hblk = load_hessian_blocks(hdir, &tname);
                                     if hblk.is_empty() {
@@ -7924,8 +7928,8 @@ fn main() {
                             // Drop-in for MQ2G256Lloyd (tag 1 → tag 6 in the kernel tag table).
                             QuantType::MFP2G32E8 => {
                                 // GPTQ/LDLQ when a Hessian is available (graded cold
-                                // tier), else RTN.
-                                let q = if let Some(hdir) = hessian_dir_ref {
+                                // tier), else RTN. Raw --hessian-dir (see MFP3 arm).
+                                let q = if let Some(hdir) = hessian_dir.as_deref() {
                                     let tname = format!("{parent_owned}{x}.{base_owned}.weight");
                                     let hblk = load_hessian_blocks(hdir, &tname);
                                     if hblk.is_empty() {
