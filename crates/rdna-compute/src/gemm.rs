@@ -11662,10 +11662,17 @@ impl Gpu {
                 ),
             ));
         }
+        // 4-warp LDS-tiled variant (gfx11/RDNA3 only). Env-gated; default OFF.
+        let use_4w = !is_gfx12 && self.flags.moe_grouped_4w;
         let (kernel_name, kernel_src) = if is_gfx12 {
             (
                 "gemm_mixed_moe_grouped_wmma_gfx12",
                 kernels::GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else if use_4w {
+            (
+                "gemm_mixed_moe_grouped_wmma_4w_k2",
+                kernels::GEMM_MIXED_MOE_GROUPED_WMMA_4W_K2_SRC,
             )
         } else {
             (
@@ -11700,7 +11707,11 @@ impl Gpu {
             &mt_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = ((m + 15) / 16) as u32;
+        // 4w computes 64 rows/block (4 warps × 16) in a 128-thread block;
+        // single-warp computes 16 rows/block in a 32-thread block.
+        let row_tile_stride = if use_4w { 64 } else { 16 };
+        let block_threads: u32 = if use_4w { 128 } else { 32 };
+        let row_tiles = ((m + row_tile_stride - 1) / row_tile_stride) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         // BW estimate: mixed row footprint — use MQ4 as a conservative middle estimate.
         let bytes =
@@ -11710,7 +11721,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
-            [32, 1, 1],
+            [block_threads, 1, 1],
             0,
             &mut params,
             || {

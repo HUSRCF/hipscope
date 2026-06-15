@@ -1604,6 +1604,13 @@ pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma_k2.hip");
 
+/// 4-warp LDS-tiled variant of the mixed grouped kernel (gfx11/RDNA3 only).
+/// Stages the 16-slot X tile in LDS and shares it across 4 warps → ~4× less X
+/// re-read (the load-bound prefill lever). Env-gated via HIPFIRE_MOE_GROUPED_4W;
+/// default OFF (single-warp `_k2` remains production). Same kernarg layout.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma_4w_k2.hip");
+
 /// gfx12 (RDNA4) merged dtype-tag MoE grouped-WMMA prefill kernel.
 /// Same four-tag dispatch as `GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC` but
 /// uses the gfx12 _w32_gfx12 WMMA intrinsic, half8_t operands, K4-unroll,
