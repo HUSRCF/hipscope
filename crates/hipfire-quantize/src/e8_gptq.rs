@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — GPTQ/LDLQ-on-E8 (Hessian-aware sequential rounding for mfp4-E8).
+// hipfire — GPTQ/LDLQ-on-E8 (Hessian-aware sequential rounding for mfp{4,3,2}-E8).
 //
-// Completes the QuIP# recipe for the MFP4G32E8 wire format:
+// Completes the QuIP# recipe for the MFP{4,3,2}G32E8 wire formats:
 //   (1) incoherence rotation = offline FWHT (already in quantize_mfp4g32_e8_2d)
 //   (2) E8 lattice codebook   (e8.rs)
 //   (3) Hessian-aware rounding = THIS module (vector-LDLQ, block-diagonal-256)
 //
-// Output bytes are BIT-IDENTICAL in format to the RTN path
-// (`quantize_mfp4g32_e8_row` / `_2d`): same 16-byte header, same per-32-block
-// 1-byte E4M3 scale + 4 E8 u32 codewords. Scales are computed from the data
-// FIRST and FROZEN; GPTQ ONLY changes which lattice point each 8-group picks,
-// so the existing gemv_mfp4g32_e8 kernel + dequant_mfp4g32_e8 reference are
-// UNCHANGED. With H = I (after damping) the assignment collapses exactly to RTN.
+// Output bytes are BIT-IDENTICAL in format to the RTN path for each n:
+//   n=4: 16-byte header + per-32-block (1-byte E4M3 scale + 4 u32 codewords = 17 B)
+//   n=3: 16-byte header + per-32-block (1-byte E4M3 scale + 4 u24 codewords = 13 B)
+//   n=2: 16-byte header + per-32-block (1-byte E4M3 scale + 4 u16 codewords =  9 B)
+// Scales are computed from the data FIRST and FROZEN; GPTQ ONLY changes which
+// lattice point each 8-group picks, so the existing kernel decoders are UNCHANGED.
+// With H = I (after damping) the assignment collapses exactly to RTN.
 //
 // All linear algebra is FP64. The per-256-block Cholesky is hand-rolled
 // (256×256 is trivial — no external dependency needed; this keeps the quantize
@@ -231,20 +232,39 @@ pub fn block_feedback(hp_rot: &[f64]) -> Option<Vec<f64>> {
     None
 }
 
-/// LDLQ-on-E8 for a single output row over one 256-block.
+/// LDLQ-on-E8 for a single output row over one 256-block, parameterized on `n`.
 ///
 /// `w_rot_block`  : the FWHT-rotated weights for this row's 256-block (f32[256]).
-/// `block_scales` : the 8 frozen (row_scale * block_scale) products, one per
-///                  32-weight sub-block (a 256-block contains 8 sub-blocks).
+/// `row_scale_a`  : the frozen row scale (exact, unrounded) — used to reconstruct
+///                  the (row*block) product for the feedback residual.
+/// `inv_row_scale`: the frozen 1/row_scale_a (exact) — the FIRST reciprocal of the
+///                  normalization, byte-matching the RTN row encoder.
+/// `block_scale`  : the 8 frozen DECODED E4M3 block scales (one per 32-weight
+///                  sub-block, a 256-block contains 8 sub-blocks).
 /// `fb`           : the 256×256 OBS feedback matrix from `block_feedback`, or
 ///                  None to run pure RTN (degenerate-Hessian fallback).
-/// Writes 32 E8 u32 codewords (4 per 32-block × 8 sub-blocks) into `out_idx`.
+/// `n`            : lattice bit-width (2, 3, or 4). Controls which E8 codec is used.
+/// `quant_step`   : QUANT_STEP constant for the chosen n (QUANT_STEP for n=4,
+///                  QUANT_STEP_MFP3 for n=3, QUANT_STEP_MFP2 for n=2).
+/// Writes 32 E8 codewords (4 per 32-block × 8 sub-blocks) into `out_idx`.
+/// For n=4 each codeword occupies 32 bits; for n=3 24 bits; for n=2 16 bits
+/// (upper 32-8n bits are zero, guaranteed by encode_index_n — see e8.rs).
 ///
-/// Returns byte-identical codewords to RTN when fb is None or all-diagonal.
+/// NORMALIZATION PARITY: the normalized target is computed as
+///   v = w * inv_row_scale * inv_block_scale   (TWO separate reciprocals)
+/// — byte-identical to the RTN encoder `quantize_mfpn_e8_row` (main.rs), NOT the
+/// pre-multiplied `w / (row_scale*block_scale)` form (which differs by ≤1 ULP and
+/// would make the fb=None == RTN parity gate seed-fragile). With fb=None this
+/// yields byte-identical codewords to RTN; with fb=Some the same two-reciprocal
+/// normalization is applied to the error-compensated target.
 fn ldlq_row_block(
     w_rot_block: &[f32],
-    block_scales: &[f32; 8],
+    row_scale_a: f32,
+    inv_row_scale: f32,
+    block_scale: &[f32; 8],
     fb: Option<&[f64]>,
+    n: u32,
+    quant_step: f32,
     out_idx: &mut [u32; 32],
 ) {
     const N: usize = 256;
@@ -257,15 +277,19 @@ fn ldlq_row_block(
     for g in 0..32 {
         let col0 = g * 8;
         let sub = g / 4; // which 32-weight sub-block (8 sub-blocks per 256)
-        let s = block_scales[sub]; // row_scale * block_scale for this sub-block
-        let inv_s = if s > 0.0 { 1.0 / s } else { 0.0 };
+        let bs = block_scale[sub]; // decoded E4M3 block scale for this sub-block
+        // TWO-reciprocal normalization, byte-matching RTN (main.rs:1556).
+        let inv_block_scale = if bs > 0.0 { 1.0 / bs } else { 0.0 };
+        // (row_scale*block_scale) product — used ONLY for the feedback residual
+        // (rotated-weight-domain reconstruction) and the per-column push cap.
+        let s = (row_scale_a as f64) * (bs as f64);
 
         // Form the error-compensated, normalized 8-vector.
         let mut v = [0.0f32; 8];
         let mut over = false;
         for i in 0..8 {
-            let wc = w_res[col0 + i];
-            let vn = (wc as f32) * inv_s; // ≈[-6,6]
+            let wc = w_res[col0 + i] as f32;
+            let vn = wc * inv_row_scale * inv_block_scale; // ≈[-6,6]
             v[i] = vn;
             if vn.abs() > V_CLAMP {
                 over = true;
@@ -276,15 +300,16 @@ fn ldlq_row_block(
         // rotated weight (never worse than RTN by more than a lattice quantum).
         if over {
             for i in 0..8 {
-                v[i] = (w_rot_block[col0 + i]) * inv_s;
+                v[i] = w_rot_block[col0 + i] * inv_row_scale * inv_block_scale;
             }
         }
 
-        let idx = e8::quantize8(&v, e8::QUANT_STEP);
+        // n-bit E8 nearest-point search: shared path for n=2,3,4.
+        let idx = e8::quantize8_n(&v, quant_step, n);
         out_idx[g] = idx;
 
         // Dequant back to normalized then to rotated-weight domain.
-        let dq = e8::dequantize8(idx, e8::QUANT_STEP);
+        let dq = e8::dequantize8_n(idx, quant_step, n);
         // Per-column residual in rotated-weight space, propagate via feedback.
         if let Some(fbm) = fb {
             // Quantized value in rotated-weight space = dq * s.
@@ -293,15 +318,18 @@ fn ldlq_row_block(
             // lattice could not absorb.
             for i in 0..8 {
                 let c = col0 + i;
-                let wq = dq[i] as f64 * s as f64;
+                let wq = dq[i] as f64 * s;
                 let r = w_res[c] - wq; // rotated-weight-domain residual
                 if r == 0.0 {
                     continue;
                 }
                 // Propagate to all later columns of THIS 256-block.
                 let row = &fbm[c * N..c * N + N];
-                // cap |E| push per column at 6*s (lattice full-scale).
-                let cap = 6.0 * s as f64;
+                // cap |E| push per column at 6*s (matches the validated n=4 GPTQ
+                // path; |normalized v|<=6 by the /6.0 scale convention, so 6*s is
+                // the rotated-domain lattice full-scale — n-loose but empirically
+                // a no-op at n=3/2 per adversarial review, see module header).
+                let cap = 6.0 * s;
                 for j in (c + 1)..N {
                     let coeff = row[j];
                     if coeff == 0.0 {
@@ -355,9 +383,9 @@ fn freeze_row_scales(
 }
 
 /// Full GPTQ-E8 quantize of one weight matrix W[m, k] (row-major), already in
-/// the ORIGINAL (un-rotated) domain. Mirrors quantize_mfp4g32_e8_2d byte-for-
-/// byte EXCEPT the lattice assignment uses block-diagonal-256 vector-LDLQ
-/// against the provided per-256-block Hessians.
+/// the ORIGINAL (un-rotated) domain. Generic on `n` (2, 3, or 4 bits).
+/// Mirrors quantize_mfpn_e8_2d byte-for-byte EXCEPT the lattice assignment uses
+/// block-diagonal-256 vector-LDLQ against the provided per-256-block Hessians.
 ///
 /// `h_blocks[b]` is the captured 256×256 (pre-rotation) Hessian for input
 /// 256-block b (b in 0..k/256). If `h_blocks` is empty OR a block's Hessian is
@@ -366,24 +394,35 @@ fn freeze_row_scales(
 ///
 /// `cpu_fwht`, `e4m3_encode`, `e4m3_decode`, `f32_to_f16` are passed in from
 /// main.rs so this module reuses the EXACT production helpers (no drift).
+///
+/// Per-block layout (per-32-block payload):
+///   n=4: 1 scale byte + 4 × 4-byte codewords = 17 B
+///   n=3: 1 scale byte + 4 × 3-byte codewords = 13 B
+///   n=2: 1 scale byte + 4 × 2-byte codewords =  9 B
+/// This matches `quantize_mfpn_e8_row` (RTN) exactly.
 #[allow(clippy::too_many_arguments)]
-pub fn quantize_mfp4g32_e8_gptq_2d(
+fn quantize_mfpn_e8_gptq_2d(
     f32_data: &[f32],
     m: usize,
     k: usize,
     signs1: &[f32],
     signs2: &[f32],
     h_blocks: &[HBlock],
+    n: u32,
+    quant_step: f32,
     cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
     e4m3_encode: &dyn Fn(f32) -> u8,
     e4m3_decode: &dyn Fn(u8) -> f32,
     f32_to_f16: &dyn Fn(f32) -> u16,
 ) -> Vec<u8> {
+    assert!(n == 2 || n == 3 || n == 4, "n must be 2, 3, or 4; got n={}", n);
     assert_eq!(f32_data.len(), m * k);
-    assert!(k % 256 == 0, "mfp4-E8 requires k%256==0, got k={}", k);
+    assert!(k % 256 == 0, "mfpN-E8 requires k%256==0, got k={}", k);
     let n_256 = k / 256;
     let n_32 = k / 32;
-    let row_bytes = 16 + 17 * n_32;
+    // Per-block payload: 1 E4M3 scale byte + 4 codewords of n bytes each.
+    let block_bytes = 1 + 4 * n as usize;
+    let row_bytes = 16 + block_bytes * n_32;
 
     // Precompute per-256-block feedback ONCE (shared across all m rows).
     // None means RTN for that block.
@@ -415,39 +454,117 @@ pub fn quantize_mfp4g32_e8_gptq_2d(
         out[base..base + 2].copy_from_slice(&f32_to_f16(fs.row_scale_a).to_le_bytes());
         out[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
         out[base + 4..base + 6].copy_from_slice(&(n_32 as u16).to_le_bytes());
-        out[base + 6] = 0x05;
+        out[base + 6] = 0x05; // same FWHT flag as RTN path
         out[base + 7] = 0u8;
 
         // Per 256-block LDLQ.
         for b256 in 0..n_256 {
             let w_rot_block = &row_buf[b256 * 256..b256 * 256 + 256];
-            // 8 sub-blocks of 32; their frozen (row*block) scale products.
-            let mut block_scales = [0.0f32; 8];
+            // 8 sub-blocks of 32; their frozen DECODED E4M3 block scales.
+            // The row scale + the two reciprocals are derived inside
+            // ldlq_row_block to byte-match the RTN normalization exactly.
+            let mut block_scale = [0.0f32; 8];
             for sub in 0..8 {
                 let blk = b256 * 8 + sub;
-                block_scales[sub] = fs.row_scale_a * fs.block_scale[blk];
+                block_scale[sub] = fs.block_scale[blk];
             }
             let mut idx32 = [0u32; 32];
             ldlq_row_block(
                 w_rot_block,
-                &block_scales,
+                fs.row_scale_a,
+                fs.inv_row_scale,
+                &block_scale,
                 block_fb[b256].as_deref(),
+                n,
+                quant_step,
                 &mut idx32,
             );
-            // Emit: 8 sub-blocks × (1 scale byte + 4 u32 codewords).
+            // Emit: 8 sub-blocks × (1 scale byte + 4 n-byte codewords).
+            // Packing: encode_index_n guarantees the upper 32-8n bits of each
+            // u32 codeword are ZERO — only the low n bytes are written, exactly
+            // mirroring quantize_mfpn_e8_row (RTN path in main.rs).
             for sub in 0..8 {
                 let blk = b256 * 8 + sub;
-                let po = base + 16 + blk * 17;
+                let po = base + 16 + blk * block_bytes;
                 out[po] = fs.scale_bytes[blk];
                 for gg in 0..4 {
                     let idx = idx32[sub * 4 + gg];
-                    out[po + 1 + gg * 4..po + 1 + gg * 4 + 4]
-                        .copy_from_slice(&idx.to_le_bytes());
+                    let bytes = idx.to_le_bytes();
+                    let cw_off = po + 1 + gg * n as usize;
+                    out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
                 }
             }
         }
     }
     out
+}
+
+/// GPTQ-E8 entry point for n=4 (mfp4-E8). Byte-layout identical to
+/// `quantize_mfp4g32_e8_2d` (RTN). Delegates to the generic `_mfpn_` path.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_mfp4g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[HBlock],
+    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
+    e4m3_encode: &dyn Fn(f32) -> u8,
+    e4m3_decode: &dyn Fn(u8) -> f32,
+    f32_to_f16: &dyn Fn(f32) -> u16,
+) -> Vec<u8> {
+    quantize_mfpn_e8_gptq_2d(
+        f32_data, m, k, signs1, signs2, h_blocks,
+        4, e8::QUANT_STEP,
+        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+    )
+}
+
+/// GPTQ-E8 entry point for n=3 (mfp3-E8, 3.25 bpw). Byte-layout identical to
+/// `quantize_mfp3g32_e8_2d` (RTN): 16-byte header + 13 B per 32-block.
+/// With h_blocks empty (or degenerate Hessians) degrades to byte-identical RTN.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_mfp3g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[HBlock],
+    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
+    e4m3_encode: &dyn Fn(f32) -> u8,
+    e4m3_decode: &dyn Fn(u8) -> f32,
+    f32_to_f16: &dyn Fn(f32) -> u16,
+) -> Vec<u8> {
+    quantize_mfpn_e8_gptq_2d(
+        f32_data, m, k, signs1, signs2, h_blocks,
+        3, e8::QUANT_STEP_MFP3,
+        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+    )
+}
+
+/// GPTQ-E8 entry point for n=2 (mfp2-E8, 2.25 bpw). Byte-layout identical to
+/// `quantize_mfp2g32_e8_2d` (RTN): 16-byte header + 9 B per 32-block.
+/// With h_blocks empty (or degenerate Hessians) degrades to byte-identical RTN.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_mfp2g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[HBlock],
+    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
+    e4m3_encode: &dyn Fn(f32) -> u8,
+    e4m3_decode: &dyn Fn(u8) -> f32,
+    f32_to_f16: &dyn Fn(f32) -> u16,
+) -> Vec<u8> {
+    quantize_mfpn_e8_gptq_2d(
+        f32_data, m, k, signs1, signs2, h_blocks,
+        2, e8::QUANT_STEP_MFP2,
+        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+    )
 }
 
 // =====================================================================
@@ -515,8 +632,9 @@ mod tests {
         sign | ((exp as u16) << 10) | mant16
     }
 
-    // RTN E8 reference (mirrors quantize_mfp4g32_e8_row exactly).
-    fn rtn_row_codewords(row_rot: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    // RTN E8 reference (mirrors quantize_mfpn_e8_row). For n=4 uses the dedicated
+    // quantize8/dequantize8 wrappers; for n=2,3 uses quantize8_n/dequantize8_n.
+    fn rtn_row_codewords_n(row_rot: &[f32], n: u32, quant_step: f32) -> (Vec<u32>, Vec<f32>) {
         let k = row_rot.len();
         let n_blocks = k / 32;
         let row_max_abs = row_rot.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -536,27 +654,36 @@ mod tests {
             for g in 0..4 {
                 let mut v = [0.0f32; 8];
                 for i in 0..8 { v[i] = block[g * 8 + i] * inv_row_scale * inv_block_scale; }
-                let idx = e8::quantize8(&v, e8::QUANT_STEP);
+                let idx = e8::quantize8_n(&v, quant_step, n);
                 codes.push(idx);
-                let dq = e8::dequantize8(idx, e8::QUANT_STEP);
+                let dq = e8::dequantize8_n(idx, quant_step, n);
                 for i in 0..8 { recon[b * 32 + g * 8 + i] = dq[i] * scale; }
             }
         }
         (codes, recon)
     }
 
-    // GPTQ-E8 single-tensor wrapper returning codewords + rotated recon.
-    fn gptq_codewords(
+    // RTN E8 reference for n=4 (convenience wrapper kept for existing tests).
+    fn rtn_row_codewords(row_rot: &[f32]) -> (Vec<u32>, Vec<f32>) {
+        rtn_row_codewords_n(row_rot, 4, e8::QUANT_STEP)
+    }
+
+    // GPTQ-E8 single-tensor wrapper (generic on n), returning codewords + rotated recon.
+    fn gptq_codewords_n(
         f32_data: &[f32], m: usize, k: usize,
         signs1: &[f32], signs2: &[f32], h_blocks: &[HBlock],
+        n: u32, quant_step: f32,
     ) -> (Vec<u32>, Vec<f32>) {
-        let bytes = quantize_mfp4g32_e8_gptq_2d(
+        let bytes = quantize_mfpn_e8_gptq_2d(
             f32_data, m, k, signs1, signs2, h_blocks,
+            n, quant_step,
             &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
         );
-        // decode codewords + rotated recon from bytes
+        // Decode codewords + rotated recon from bytes.
+        // Per-block payload: 1 E4M3 scale + 4 codewords of n bytes.
         let n_32 = k / 32;
-        let row_bytes = 16 + 17 * n_32;
+        let block_bytes = 1 + 4 * n as usize;
+        let row_bytes = 16 + block_bytes * n_32;
         let mut codes = Vec::with_capacity(m * n_32 * 4);
         let mut recon = vec![0.0f32; m * k];
         for r in 0..m {
@@ -566,20 +693,29 @@ mod tests {
                 f16_to_f32(b)
             };
             for b in 0..n_32 {
-                let po = base + 16 + b * 17;
+                let po = base + 16 + b * block_bytes;
                 let scale = row_scale_a * e4m3_scale_decode(bytes[po]);
                 for g in 0..4 {
-                    let idx = u32::from_le_bytes([
-                        bytes[po + 1 + g * 4], bytes[po + 2 + g * 4],
-                        bytes[po + 3 + g * 4], bytes[po + 4 + g * 4],
-                    ]);
+                    // Read n bytes and assemble u32 (upper bits are zero per encode_index_n).
+                    let cw_off = po + 1 + g * n as usize;
+                    let mut raw = [0u8; 4];
+                    raw[..n as usize].copy_from_slice(&bytes[cw_off..cw_off + n as usize]);
+                    let idx = u32::from_le_bytes(raw);
                     codes.push(idx);
-                    let dq = e8::dequantize8(idx, e8::QUANT_STEP);
+                    let dq = e8::dequantize8_n(idx, quant_step, n);
                     for i in 0..8 { recon[r * k + b * 32 + g * 8 + i] = dq[i] * scale; }
                 }
             }
         }
         (codes, recon)
+    }
+
+    // GPTQ-E8 n=4 convenience wrapper (used by existing tests).
+    fn gptq_codewords(
+        f32_data: &[f32], m: usize, k: usize,
+        signs1: &[f32], signs2: &[f32], h_blocks: &[HBlock],
+    ) -> (Vec<u32>, Vec<f32>) {
+        gptq_codewords_n(f32_data, m, k, signs1, signs2, h_blocks, 4, e8::QUANT_STEP)
     }
 
     fn f16_to_f32(bits: u16) -> f32 {
@@ -845,7 +981,7 @@ mod tests {
             "H=I must collapse to RTN exactly, but {changed} codewords differ (feedback firing on uncorrelated H)");
     }
 
-    // ------- TEST 3: byte-format / output validity -------
+    // ------- TEST 3: byte-format / output validity (n=4) -------
     #[test]
     fn output_bytes_valid_format() {
         let signs1 = gen_fwht_signs(42, 256);
@@ -860,11 +996,306 @@ mod tests {
             &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
         );
         let n_32 = k / 32;
-        let row_bytes = 16 + 17 * n_32;
-        assert_eq!(bytes.len(), m * row_bytes, "wrong output byte length");
+        let block_bytes = 1 + 4 * 4usize; // n=4: 17 B
+        let row_bytes = 16 + block_bytes * n_32;
+        assert_eq!(bytes.len(), m * row_bytes, "wrong output byte length (n=4)");
         // Every block header flag must be 0x05.
         for r in 0..m {
             assert_eq!(bytes[r * row_bytes + 6], 0x05);
+        }
+    }
+
+    // ------- TEST 4: PARITY GATE — GPTQ-mfp3 (fb=None) == RTN-mfp3 byte-for-byte -------
+    //
+    // CRITICAL INVARIANT: with an empty Hessian (h_blocks=[]), ldlq_row_block runs
+    // pure RTN (fb=None path), so the GPTQ entry-point must produce byte-identical
+    // output to the RTN path for the same weights. This guards against any divergence
+    // between the GPTQ and RTN scale derivation or codeword packing for n=3.
+    #[test]
+    fn gptq_mfp3_none_hessian_matches_rtn_bytes() {
+        let signs1 = gen_fwht_signs(17, 256);
+        let signs2 = gen_fwht_signs(117, 256);
+        let m = 16usize;
+        let k = 512usize; // 2 × 256 blocks
+        let mut state = 0x1234_abcd_ef01_2345u64;
+        let mut w = vec![0.0f32; m * k];
+        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+
+        // GPTQ with no Hessian — must degrade to RTN.
+        let gptq_bytes = quantize_mfp3g32_e8_gptq_2d(
+            &w, m, k, &signs1, &signs2, &[], // empty h_blocks
+            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+        );
+
+        // RTN reference: manually apply FWHT then call rtn_row_codewords_n.
+        // We replicate what quantize_mfp3g32_e8_2d does (FWHT + row encode).
+        let n_32 = k / 32;
+        let block_bytes_n3 = 1 + 4 * 3usize; // 13 B
+        let row_bytes_n3 = 16 + block_bytes_n3 * n_32;
+        let mut rtn_bytes = vec![0u8; m * row_bytes_n3];
+        {
+            // Build RTN output by re-implementing quantize_mfpn_e8_row inline.
+            let mut row_buf = vec![0.0f32; k];
+            for r in 0..m {
+                row_buf.copy_from_slice(&w[r * k..(r + 1) * k]);
+                for seg in 0..(k / 256) {
+                    cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], &signs1, &signs2);
+                }
+                let (codes, _) = rtn_row_codewords_n(&row_buf, 3, e8::QUANT_STEP_MFP3);
+                // Re-emit to bytes using the same scale derivation.
+                let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+                let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+                let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+                let base = r * row_bytes_n3;
+                rtn_bytes[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+                rtn_bytes[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
+                rtn_bytes[base + 4..base + 6].copy_from_slice(&(n_32 as u16).to_le_bytes());
+                rtn_bytes[base + 6] = 0x05;
+                rtn_bytes[base + 7] = 0u8;
+                let mut code_idx = 0usize;
+                for b in 0..n_32 {
+                    let block = &row_buf[b * 32..b * 32 + 32];
+                    let bmax = block.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+                    let bmax_n = bmax * inv_rs;
+                    let s = if bmax_n > 0.0 { bmax_n / 6.0 } else { 0.0 };
+                    let sb = e4m3_scale_encode_roundup(s);
+                    let po = base + 16 + b * block_bytes_n3;
+                    rtn_bytes[po] = sb;
+                    for g in 0..4 {
+                        let idx = codes[code_idx]; code_idx += 1;
+                        let bytes = idx.to_le_bytes();
+                        let cw_off = po + 1 + g * 3;
+                        rtn_bytes[cw_off..cw_off + 3].copy_from_slice(&bytes[..3]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(gptq_bytes.len(), rtn_bytes.len(),
+            "GPTQ-mfp3 (fb=None) output length mismatch: {} vs {}", gptq_bytes.len(), rtn_bytes.len());
+        // Byte-exact comparison — any difference is a packing or scale divergence bug.
+        let diffs: usize = gptq_bytes.iter().zip(rtn_bytes.iter()).filter(|(a, b)| a != b).count();
+        assert_eq!(diffs, 0,
+            "GPTQ-mfp3 (fb=None) is NOT byte-identical to RTN-mfp3: {diffs} byte(s) differ. \
+             Layout parity BROKEN — the GPTQ path uses a different scale or codeword packing than RTN.");
+    }
+
+    // Build the full RTN-mfpN-E8 byte stream for `f32_data`, mirroring the
+    // production `quantize_mfpn_e8_2d` (FWHT + per-row encode via the
+    // two-reciprocal `rtn_row_codewords_n` normalization).  Used by the
+    // multi-seed parity sweep below so it compares against the EXACT RTN bytes.
+    fn rtn_mfpn_e8_2d_bytes(
+        f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+        n: u32, quant_step: f32,
+    ) -> Vec<u8> {
+        let n_32 = k / 32;
+        let block_bytes = 1 + 4 * n as usize;
+        let row_bytes = 16 + block_bytes * n_32;
+        let mut out = vec![0u8; m * row_bytes];
+        let mut row_buf = vec![0.0f32; k];
+        for r in 0..m {
+            row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+            for seg in 0..(k / 256) {
+                cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+            }
+            let (codes, _) = rtn_row_codewords_n(&row_buf, n, quant_step);
+            let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+            let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+            let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+            let base = r * row_bytes;
+            out[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+            out[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
+            out[base + 4..base + 6].copy_from_slice(&(n_32 as u16).to_le_bytes());
+            out[base + 6] = 0x05;
+            out[base + 7] = 0u8;
+            let mut code_idx = 0usize;
+            for b in 0..n_32 {
+                let block = &row_buf[b * 32..b * 32 + 32];
+                let bmax = block.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+                let bmax_n = bmax * inv_rs;
+                let s = if bmax_n > 0.0 { bmax_n / 6.0 } else { 0.0 };
+                let sb = e4m3_scale_encode_roundup(s);
+                let po = base + 16 + b * block_bytes;
+                out[po] = sb;
+                for g in 0..4 {
+                    let idx = codes[code_idx]; code_idx += 1;
+                    let bytes = idx.to_le_bytes();
+                    let cw_off = po + 1 + g * n as usize;
+                    out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
+                }
+            }
+        }
+        out
+    }
+
+    // ------- TEST 5b: PARITY GATE (MULTI-SEED) — fb=None == RTN across MANY seeds -------
+    //
+    // The single-seed gates (TEST 4/5) catch a *structural* layout/scale bug but
+    // pass by seed luck against a ~1e-7-per-group ULP normalization drift (a prior
+    // GPTQ build used the combined `w/(row_scale*block_scale)` reciprocal which
+    // differs from RTN's two-reciprocal `w*inv_row*inv_block` by <=1 ULP, flipping
+    // ~3-in-10,000 random seeds). This sweep makes the parity gate DETERMINISTIC:
+    // with the correct two-reciprocal normalization, EVERY seed is byte-identical.
+    // If anyone reintroduces the combined form, this test reds (it found 8/2000
+    // failing-seed deltas empirically against the broken arithmetic).
+    #[test]
+    fn gptq_mfp3_mfp2_none_hessian_matches_rtn_multiseed() {
+        let signs1 = gen_fwht_signs(31, 256);
+        let signs2 = gen_fwht_signs(131, 256);
+        let m = 16usize;
+        let k = 512usize;
+        for &(n, qs) in &[(3u32, e8::QUANT_STEP_MFP3), (2u32, e8::QUANT_STEP_MFP2)] {
+            let mut total_diffs = 0usize;
+            let mut failing_seeds: Vec<u64> = Vec::new();
+            for seed in 0u64..2000 {
+                let mut state = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0x1234_5678);
+                let mut w = vec![0.0f32; m * k];
+                for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+
+                let gptq = if n == 3 {
+                    quantize_mfp3g32_e8_gptq_2d(
+                        &w, m, k, &signs1, &signs2, &[],
+                        &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+                    )
+                } else {
+                    quantize_mfp2g32_e8_gptq_2d(
+                        &w, m, k, &signs1, &signs2, &[],
+                        &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+                    )
+                };
+                let rtn = rtn_mfpn_e8_2d_bytes(&w, m, k, &signs1, &signs2, n, qs);
+                let d = gptq.iter().zip(rtn.iter()).filter(|(a, b)| a != b).count();
+                if d > 0 {
+                    total_diffs += d;
+                    if failing_seeds.len() < 8 { failing_seeds.push(seed); }
+                }
+            }
+            assert_eq!(total_diffs, 0,
+                "GPTQ-mfp{n} (fb=None) diverged from RTN-mfp{n} on {} seed(s) ({} total byte diffs); \
+                 examples: {:?}. Normalization parity BROKEN — the fb=None path must use the SAME \
+                 two-reciprocal `w*inv_row*inv_block` form as the RTN encoder, NOT a combined reciprocal.",
+                failing_seeds.len(), total_diffs, failing_seeds);
+        }
+    }
+
+    // ------- TEST 5: PARITY GATE — GPTQ-mfp2 (fb=None) == RTN-mfp2 byte-for-byte -------
+    #[test]
+    fn gptq_mfp2_none_hessian_matches_rtn_bytes() {
+        let signs1 = gen_fwht_signs(21, 256);
+        let signs2 = gen_fwht_signs(121, 256);
+        let m = 16usize;
+        let k = 512usize;
+        let mut state = 0xdead_beef_cafe_f00du64;
+        let mut w = vec![0.0f32; m * k];
+        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+
+        let gptq_bytes = quantize_mfp2g32_e8_gptq_2d(
+            &w, m, k, &signs1, &signs2, &[], // empty h_blocks
+            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+        );
+
+        let n_32 = k / 32;
+        let block_bytes_n2 = 1 + 4 * 2usize; // 9 B
+        let row_bytes_n2 = 16 + block_bytes_n2 * n_32;
+        let mut rtn_bytes = vec![0u8; m * row_bytes_n2];
+        {
+            let mut row_buf = vec![0.0f32; k];
+            for r in 0..m {
+                row_buf.copy_from_slice(&w[r * k..(r + 1) * k]);
+                for seg in 0..(k / 256) {
+                    cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], &signs1, &signs2);
+                }
+                let (codes, _) = rtn_row_codewords_n(&row_buf, 2, e8::QUANT_STEP_MFP2);
+                let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+                let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+                let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+                let base = r * row_bytes_n2;
+                rtn_bytes[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+                rtn_bytes[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
+                rtn_bytes[base + 4..base + 6].copy_from_slice(&(n_32 as u16).to_le_bytes());
+                rtn_bytes[base + 6] = 0x05;
+                rtn_bytes[base + 7] = 0u8;
+                let mut code_idx = 0usize;
+                for b in 0..n_32 {
+                    let block = &row_buf[b * 32..b * 32 + 32];
+                    let bmax = block.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
+                    let bmax_n = bmax * inv_rs;
+                    let s = if bmax_n > 0.0 { bmax_n / 6.0 } else { 0.0 };
+                    let sb = e4m3_scale_encode_roundup(s);
+                    let po = base + 16 + b * block_bytes_n2;
+                    rtn_bytes[po] = sb;
+                    for g in 0..4 {
+                        let idx = codes[code_idx]; code_idx += 1;
+                        let bytes = idx.to_le_bytes();
+                        let cw_off = po + 1 + g * 2;
+                        rtn_bytes[cw_off..cw_off + 2].copy_from_slice(&bytes[..2]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(gptq_bytes.len(), rtn_bytes.len(),
+            "GPTQ-mfp2 (fb=None) output length mismatch: {} vs {}", gptq_bytes.len(), rtn_bytes.len());
+        let diffs: usize = gptq_bytes.iter().zip(rtn_bytes.iter()).filter(|(a, b)| a != b).count();
+        assert_eq!(diffs, 0,
+            "GPTQ-mfp2 (fb=None) is NOT byte-identical to RTN-mfp2: {diffs} byte(s) differ.");
+    }
+
+    // ------- TEST 6: GPTQ-mfp3/mfp2 decode via decode_index_n gives finite values -------
+    //
+    // Verifies that GPTQ output with a real Hessian decodes to finite f32 via the
+    // SAME decode_index_n path the kernels use, and that the layout (header + n-byte
+    // codeword packing) is readable identically to the RTN format.
+    #[test]
+    fn gptq_mfp3_mfp2_decode_finite() {
+        let signs1 = gen_fwht_signs(99, 256);
+        let signs2 = gen_fwht_signs(199, 256);
+        let m = 8usize;
+        let k = 256usize;
+        let mut state = 0x5555_aaaa_5555_aaaau64;
+        let mut w = vec![0.0f32; m * k];
+        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.7; }
+
+        // Build a mildly correlated H (same form as TEST 1).
+        let rho = 0.5f64;
+        let mut hp = vec![0.0f64; 256 * 256];
+        for a in 0..256 { for b in 0..256 { hp[a * 256 + b] = rho.powi((a as i32 - b as i32).abs()); } }
+        // H = R^T H' R.
+        let mut rmat = vec![0.0f64; 256 * 256];
+        for j in 0..256 {
+            let mut col = [0.0f64; 256]; col[j] = 1.0;
+            fwht_256_f64(&mut col, &signs1, &signs2);
+            for i in 0..256 { rmat[i * 256 + j] = col[i]; }
+        }
+        let mut rth = vec![0.0f64; 256 * 256];
+        for i in 0..256 { for j in 0..256 {
+            let mut s = 0.0f64;
+            for kk in 0..256 { s += rmat[kk * 256 + i] * hp[kk * 256 + j]; }
+            rth[i * 256 + j] = s;
+        }}
+        let mut hcap = vec![0.0f32; 256 * 256];
+        for i in 0..256 { for j in 0..256 {
+            let mut s = 0.0f64;
+            for kk in 0..256 { s += rth[i * 256 + kk] * rmat[kk * 256 + j]; }
+            hcap[i * 256 + j] = s as f32;
+        }}
+        let h_blocks = vec![hcap];
+
+        for &(n, qs) in &[(3u32, e8::QUANT_STEP_MFP3), (2u32, e8::QUANT_STEP_MFP2)] {
+            let (codes, recon) = gptq_codewords_n(&w, m, k, &signs1, &signs2, &h_blocks, n, qs);
+            // All codewords must decode via decode_index_n without NaN/Inf.
+            for (i, &idx) in codes.iter().enumerate() {
+                let p = e8::decode_index_n(idx, n);
+                for (j, &c) in p.iter().enumerate() {
+                    assert!(c.is_finite(), "n={n} code[{i}] coord[{j}] not finite: {c}");
+                }
+            }
+            // Recon must also be finite (scale * lattice point).
+            for (i, &v) in recon.iter().enumerate() {
+                assert!(v.is_finite(), "n={n} recon[{i}] not finite: {v}");
+            }
         }
     }
 }

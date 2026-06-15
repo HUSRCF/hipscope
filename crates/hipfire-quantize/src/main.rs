@@ -1774,6 +1774,54 @@ fn quantize_mfp4g32_e8_gptq_2d(
     )
 }
 
+/// GPTQ-mfp3-E8 wrapper. `h_blocks` empty -> RTN fallback (byte-identical to
+/// quantize_mfp3g32_e8_2d). Output layout: 16-byte header + 13 B per 32-block.
+fn quantize_mfp3g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[e8_gptq::HBlock],
+) -> Vec<u8> {
+    e8_gptq::quantize_mfp3g32_e8_gptq_2d(
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        &cpu_fwht_256,
+        &e4m3_scale_encode_roundup,
+        &e4m3_scale_decode,
+        &f32_to_f16,
+    )
+}
+
+/// GPTQ-mfp2-E8 wrapper. `h_blocks` empty -> RTN fallback (byte-identical to
+/// quantize_mfp2g32_e8_2d). Output layout: 16-byte header + 9 B per 32-block.
+fn quantize_mfp2g32_e8_gptq_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    h_blocks: &[e8_gptq::HBlock],
+) -> Vec<u8> {
+    e8_gptq::quantize_mfp2g32_e8_gptq_2d(
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        &cpu_fwht_256,
+        &e4m3_scale_encode_roundup,
+        &e4m3_scale_decode,
+        &f32_to_f16,
+    )
+}
+
 fn quantize_mfp4g32_e8_2d(
     f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
 ) -> Vec<u8> {
@@ -6368,10 +6416,17 @@ fn main() {
     let use_mfp4e8 = format == "mfp4e8" || format == "mfp4-e8" || format == "mfp4l8"
         || use_gptq_e8;
     let use_mfp4e8soa = format == "mfp4e8soa" || format == "mfp4-e8-soa" || format == "mfp4e8-soa";
+    // mfp3-E8 and mfp2-E8: 3-bit and 2-bit narrowed E8 lattice variants.
+    // The `-gptq` suffix activates LDLQ — output bytes are IDENTICAL format to
+    // the corresponding RTN paths; GPTQ only changes the lattice-point assignment.
+    let use_gptq_mfp3e8 = format == "mfp3e8-gptq" || format == "mfp3-e8-gptq";
+    let use_mfp3e8_gptq_fmt = format == "mfp3e8" || format == "mfp3-e8" || use_gptq_mfp3e8;
+    let use_gptq_mfp2e8 = format == "mfp2e8-gptq" || format == "mfp2-e8-gptq";
+    let use_mfp2e8_gptq_fmt = format == "mfp2e8" || format == "mfp2-e8" || use_gptq_mfp2e8;
     // GPTQ-E8 Hessian directory: per-(tensor,expert) 256-block XX^T captured by
     // the collect_e8_hessian binary. Missing/degenerate Hessians silently fall
     // back to RTN per-block (never worse than baseline). REQUIRED when --format
-    // mfp4e8-gptq is set.
+    // mfp{2,3,4}e8-gptq is set.
     let hessian_dir: Option<PathBuf> = args
         .iter()
         .position(|a| a == "--hessian-dir")
@@ -6379,6 +6434,12 @@ fn main() {
         .map(PathBuf::from);
     if use_gptq_e8 && hessian_dir.is_none() {
         eprintln!("warning: --format mfp4e8-gptq without --hessian-dir; every tensor falls back to RTN E8 (== plain mfp4e8). Pass --hessian-dir <dir> to enable GPTQ.");
+    }
+    if use_gptq_mfp3e8 && hessian_dir.is_none() {
+        eprintln!("warning: --format mfp3e8-gptq without --hessian-dir; every tensor falls back to RTN mfp3-E8. Pass --hessian-dir <dir> to enable GPTQ.");
+    }
+    if use_gptq_mfp2e8 && hessian_dir.is_none() {
+        eprintln!("warning: --format mfp2e8-gptq without --hessian-dir; every tensor falls back to RTN mfp2-E8. Pass --hessian-dir <dir> to enable GPTQ.");
     }
     if let Some(hd) = &hessian_dir {
         if !hd.exists() {
@@ -7784,8 +7845,8 @@ fn main() {
             let base_owned = base_name.to_string();
             // GPTQ-E8: borrow the Hessian dir into the rayon closure. Each
             // expert reads its own per-(tensor,expert) 256-block file; missing
-            // -> RTN fallback. None unless --format mfp4e8-gptq + --hessian-dir.
-            let hessian_dir_ref: Option<&Path> = if use_gptq_e8 {
+            // -> RTN fallback. None unless --format mfp{2,3,4}e8-gptq + --hessian-dir.
+            let hessian_dir_ref: Option<&Path> = if use_gptq_e8 || use_gptq_mfp3e8 || use_gptq_mfp2e8 {
                 hessian_dir.as_deref()
             } else {
                 None
@@ -7962,6 +8023,40 @@ fn main() {
                             quantize_mfp4g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
                         };
                         (q, QuantType::MFP4G32E8, 32u32)
+                    } else if use_mfp3e8_gptq_fmt && supports_g256 {
+                        // mfp3e8-gptq: 3-bit E8 with LDLQ. Falls back to RTN if no Hessian.
+                        let q = if let Some(hdir) = hessian_dir_ref {
+                            let tname = format!("{parent_owned}{x}.{base_owned}.weight");
+                            let hblk = load_hessian_blocks(hdir, &tname);
+                            if hblk.is_empty() {
+                                GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            quantize_mfp3g32_e8_gptq_2d(
+                                &f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk,
+                            )
+                        } else {
+                            quantize_mfp3g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
+                        };
+                        (q, QuantType::MFP3G32E8, 32u32)
+                    } else if use_mfp2e8_gptq_fmt && supports_g256 {
+                        // mfp2e8-gptq: 2-bit E8 with LDLQ. Falls back to RTN if no Hessian.
+                        let q = if let Some(hdir) = hessian_dir_ref {
+                            let tname = format!("{parent_owned}{x}.{base_owned}.weight");
+                            let hblk = load_hessian_blocks(hdir, &tname);
+                            if hblk.is_empty() {
+                                GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            quantize_mfp2g32_e8_gptq_2d(
+                                &f32_slice, inner_m, inner_k_e, &signs1, &signs2, &hblk,
+                            )
+                        } else {
+                            quantize_mfp2g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2)
+                        };
+                        (q, QuantType::MFP2G32E8, 32u32)
                     } else if use_mfp4e8soa && supports_g256 {
                         let q = quantize_mfp4g32_e8_soa_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MFP4G32E8SOA, 32u32)
@@ -8037,7 +8132,11 @@ fn main() {
             } else if use_mfp4p && supports_g256 {
                 "MFP4G32P"
             } else if use_mfp4e8 && supports_g256 {
-                "MFP4G32E8"
+                if use_gptq_e8 { "MFP4E8-GPTQ" } else { "MFP4G32E8" }
+            } else if use_mfp3e8_gptq_fmt && supports_g256 {
+                if use_gptq_mfp3e8 { "MFP3E8-GPTQ" } else { "MFP3G32E8" }
+            } else if use_mfp2e8_gptq_fmt && supports_g256 {
+                if use_gptq_mfp2e8 { "MFP2E8-GPTQ" } else { "MFP2G32E8" }
             } else if use_mfp4e8soa && supports_g256 {
                 "MFP4G32E8SOA"
             } else if supports_g256 {
@@ -8747,8 +8846,9 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if (use_mfp4e8 || use_mfp4e8soa) && is_embed {
-                        // mfp4-E8 / mfp4-E8-SoA embeddings stay Q8F16.
+                    } else if (use_mfp4e8 || use_mfp4e8soa || use_mfp3e8_gptq_fmt || use_mfp2e8_gptq_fmt) && is_embed {
+                        // mfp{2,3,4}-E8 embeddings stay Q8F16 (embedding lookup is accuracy-
+                        // sensitive; matches the mfp4 / mfp4L pattern).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mfp4e8 {
@@ -8784,6 +8884,64 @@ fn main() {
                             (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                         } else {
                             // Ragged dim fallback — matches mfp4+P (HFQ4-G128, no rotation).
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp3e8_gptq_fmt {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            // GPTQ-mfp3-E8 for dense tensors. Missing Hessian -> RTN fallback.
+                            let q = if use_gptq_mfp3e8 {
+                                if let Some(hdir) = hessian_dir.as_deref() {
+                                    let hblk = load_hessian_blocks(hdir, name);
+                                    if hblk.is_empty() {
+                                        GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    quantize_mfp3g32_e8_gptq_2d(
+                                        &f32_data, m, k_dim, &signs1, &signs2, &hblk,
+                                    )
+                                } else {
+                                    quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                            };
+                            (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp2e8_gptq_fmt {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            // GPTQ-mfp2-E8 for dense tensors. Missing Hessian -> RTN fallback.
+                            let q = if use_gptq_mfp2e8 {
+                                if let Some(hdir) = hessian_dir.as_deref() {
+                                    let hblk = load_hessian_blocks(hdir, name);
+                                    if hblk.is_empty() {
+                                        GPTQ_E8_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        GPTQ_E8_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    quantize_mfp2g32_e8_gptq_2d(
+                                        &f32_data, m, k_dim, &signs1, &signs2, &hblk,
+                                    )
+                                } else {
+                                    quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                            };
+                            (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+                        } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
