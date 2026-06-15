@@ -20,6 +20,8 @@
 //                                             + 128 B of 4-bit packed quants)
 //   dtype_tags[expert_id] == 3 → MQ3-Lloyd  (112 B/group: 8×fp16 codebook
 //                                             + 96 B of 3-bit packed quants)
+//   dtype_tags[expert_id] == 4 → mfp4-E8    (16 B row hdr + (K/32)*17 B;
+//                                             136 B/256-group, E8 lattice VQ)
 //
 // All branches accumulate into a SINGLE `acc` and share one wave32 reduce
 // + one gate/up split write (M = 2*MI: first half → y_gate, second half →
@@ -37,6 +39,111 @@
 //   y_up        : [N × K_TOP × MI]
 //
 // Grid: (M, K_TOP, N). Block = 32 threads.
+
+// ───────────────────────── mfp4-E8 (tag 4) decode ─────────────────────────
+// Ported byte-identical from the proven uniform-E8 kernel
+// (gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx11_dgpu.hip). `e8_row_partial`
+// returns the PER-THREAD partial (NO wave reduce) so this kernel's shared wave32
+// reduce folds it, exactly like the MQ tag branches. E8 row layout: 16 B header
+// (fp16 row scale) + (K/32)*17 B blocks; one 256-group = 8 blocks = 136 B.
+__device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
+    const int exp = (b >> 3) & 0xF;
+    const unsigned mant = (unsigned)(b & 0x7);
+    if (exp == 0) return 0.015625f * ((float)mant) * 0.125f;
+    if (exp == 0xF && mant == 7u) return 448.0f;
+    const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
+    return pow2 * (1.0f + ((float)mant) * 0.125f);
+}
+__device__ __forceinline__ void e8_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 31) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(4 * i)) & 0xFu; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 28) & 0x7u;
+    const unsigned int p7 = e7_high << 1;
+    const unsigned int lsb = (sl + p7) & 1u;
+    e[7] = p7 | lsb;
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 7); p[i] = coset ? c + 0.5f : c; }
+}
+__device__ __forceinline__ float e8_row_partial(
+    const char* __restrict__ A, const float* __restrict__ x, int row, int K, int tid
+) {
+    const int groups_per_row  = K / 256;
+    const int row_block_bytes = (K / 32) * 17;
+    const long long row_off   = (long long)row * (16 + (long long)row_block_bytes);
+    const char* hdr     = A + row_off;
+    const char* row_ptr = hdr + 16;
+    const float row_scale_f = (float)__builtin_bit_cast(_Float16, *(const unsigned short*)hdr);
+    const int block_in_iter    = tid >> 2;
+    const int cw_off           = (tid & 3) * 4;
+    const int thread_block_off = block_in_iter * 17;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    const int quads = groups_per_row >> 2;
+    const int tail  = groups_per_row & 3;
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + (long long)g       * 136 + thread_block_off;
+        const char* gp1 = row_ptr + (long long)(g + 1) * 136 + thread_block_off;
+        const char* gp2 = row_ptr + (long long)(g + 2) * 136 + thread_block_off;
+        const char* gp3 = row_ptr + (long long)(g + 3) * 136 + thread_block_off;
+        const float ssc0 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp0) * 0.88f;
+        const float ssc1 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp1) * 0.88f;
+        const float ssc2 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp2) * 0.88f;
+        const float ssc3 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp3) * 0.88f;
+        const unsigned int ew0 = *(const unsigned int*)(gp0 + 1 + cw_off);
+        const unsigned int ew1 = *(const unsigned int*)(gp1 + 1 + cw_off);
+        const unsigned int ew2 = *(const unsigned int*)(gp2 + 1 + cw_off);
+        const unsigned int ew3 = *(const unsigned int*)(gp3 + 1 + cw_off);
+        const int base0 = g * 256 + tid * 8;
+        const int base1 = base0 + 256;
+        const int base2 = base0 + 512;
+        const int base3 = base0 + 768;
+        float pe[8];
+        e8_decode_index(ew0, pe);
+        acc0 += ssc0*pe[0]*x[base0  ] + ssc0*pe[1]*x[base0+1] + ssc0*pe[2]*x[base0+2] + ssc0*pe[3]*x[base0+3]
+              + ssc0*pe[4]*x[base0+4] + ssc0*pe[5]*x[base0+5] + ssc0*pe[6]*x[base0+6] + ssc0*pe[7]*x[base0+7];
+        e8_decode_index(ew1, pe);
+        acc1 += ssc1*pe[0]*x[base1  ] + ssc1*pe[1]*x[base1+1] + ssc1*pe[2]*x[base1+2] + ssc1*pe[3]*x[base1+3]
+              + ssc1*pe[4]*x[base1+4] + ssc1*pe[5]*x[base1+5] + ssc1*pe[6]*x[base1+6] + ssc1*pe[7]*x[base1+7];
+        e8_decode_index(ew2, pe);
+        acc2 += ssc2*pe[0]*x[base2  ] + ssc2*pe[1]*x[base2+1] + ssc2*pe[2]*x[base2+2] + ssc2*pe[3]*x[base2+3]
+              + ssc2*pe[4]*x[base2+4] + ssc2*pe[5]*x[base2+5] + ssc2*pe[6]*x[base2+6] + ssc2*pe[7]*x[base2+7];
+        e8_decode_index(ew3, pe);
+        acc3 += ssc3*pe[0]*x[base3  ] + ssc3*pe[1]*x[base3+1] + ssc3*pe[2]*x[base3+2] + ssc3*pe[3]*x[base3+3]
+              + ssc3*pe[4]*x[base3+4] + ssc3*pe[5]*x[base3+5] + ssc3*pe[6]*x[base3+6] + ssc3*pe[7]*x[base3+7];
+    }
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
+        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; e8_decode_index(ew, pe);
+        acc0 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
+        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; e8_decode_index(ew, pe);
+        acc1 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + (long long)g * 136 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * 0.88f;
+        const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; e8_decode_index(ew, pe);
+        acc2 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    return (acc0 + acc1) + (acc2 + acc3);
+}
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
@@ -167,6 +274,10 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
                  + cb_lds[(pk >> 21) & 7u] * x_row[base + 7];
             __syncthreads();   // protect cb_lds before next group reload
         }
+    } else if (tag == 4) {
+        // ---- mfp4-E8 branch (16 B row hdr + (K/32)*17 B; 136 B / 256-group) ----
+        // block-uniform → no syncthreads/LDS; per-thread partial, shared reduce folds.
+        acc = e8_row_partial(A, x_row, row, K, tid);
     }
 #undef _MQ6G
 #undef _MQ4G

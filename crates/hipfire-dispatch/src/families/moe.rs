@@ -542,14 +542,16 @@ impl MoePrefillResolution {
         //   gfx1151 → gemm_mfp4g32_e8_moe_grouped_wmma (gfx1151.hip)
         //   gfx12   → gemm_mfp4g32_e8_moe_grouped_wmma_gfx12 (gfx12.hip)
         // Other archs (gfx1100 dGPU, gfx9*/CDNA) have no grouped E8 sister → Path 1.
-        // gfx11 E8 port finding: grouped-WMMA E8 prefill stays gfx1151-only on RDNA3.
-        // The kernel IS gfx1100-correct but on the dGPU (GDDR6 ~960 GB/s, ~4× Strix
-        // Halo unified LPDDR5) weight-read amortization is a WASH: measured pp512 97.5
-        // (grouped) vs 97.6 (Path-1 indexed) — A3B prefill is DeltaNet-scan-bound, not
-        // MoE-GEMM-bound. So keep Path-1 on gfx1100; re-evaluate if a future profile or
-        // blended-E8 grouped path shows a real win on gfx11.
-        let e8_no_grouped = d.routed_gate_up == DType::MFP4G32E8
-            && !(arch.is_gfx1151() || arch.is_gfx1200() || arch.is_gfx1201());
+        // mfp4-E8 grouped-WMMA prefill on ALL WMMA arches (RDNA3 gfx11 + RDNA4
+        // gfx12). The gfx1151 kernel uses the RDNA3 wave32-WMMA builtin and runs
+        // correctly on gfx1100/1101/1102; gfx12 uses its .gfx12 sister. The prior
+        // "gfx1151-only / gfx1100 wash" call rested on pp512 97.5-vs-97.6 — which is
+        // DECODE tok/s, not prefill throughput (a prefill change can't move decode
+        // tok/s). Real prefill throughput is what bench_sweep measures, so route
+        // gfx1100 through Path 2 and re-measure. Only ever active under the
+        // HIPFIRE_E8_GFX12 batched-prefill gate.
+        let e8_no_grouped =
+            d.routed_gate_up == DType::MFP4G32E8 && !(arch.is_rdna3() || arch.is_rdna4());
         let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.

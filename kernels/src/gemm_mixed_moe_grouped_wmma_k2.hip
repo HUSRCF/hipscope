@@ -13,6 +13,7 @@
 //   1 = MQ2-Lloyd-G256   —  72 B/group, 4-entry fp16 codebook (2-bit)
 //   2 = MQ4 / HFQ4-G256  — 136 B/group, 4-bit affine (sc*q+zp)
 //   3 = MQ3-Lloyd-G256   — 112 B/group, 8-entry fp16 codebook (3-bit)
+//   4 = mfp4-E8          — 16 B row hdr + (K/32)*17 B; 136 B/group, E8 VQ
 //
 // CRITICAL (MQ2L/MQ3L tags 1 & 3): Per-lane REGISTER bilinear/trilinear
 // decomposition — never LDS broadcast. Each lane handles a different M-row
@@ -35,6 +36,28 @@
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
+
+// mfp4-E8 (tag 4) decode helpers — byte-identical to
+// gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip.
+__device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
+    const int exp = (b >> 3) & 0xF;
+    const unsigned mant = (unsigned)(b & 0x7);
+    if (exp == 0) return 0.015625f * ((float)mant) * 0.125f;
+    if (exp == 0xF && mant == 7u) return 448.0f;
+    const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
+    return pow2 * (1.0f + ((float)mant) * 0.125f);
+}
+__device__ __forceinline__ void e8_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 31) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(4 * i)) & 0xFu; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 28) & 0x7u;
+    const unsigned int p7 = e7_high << 1;
+    const unsigned int lsb = (sl + p7) & 1u;
+    e[7] = p7 | lsb;
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 7); p[i] = coset ? c + 0.5f : c; }
+}
 
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
@@ -258,8 +281,8 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
             }
         }
 
-    } else {
-        // ----- MQ3-Lloyd-G256 (112 B/group, tag == 3) -----------------------
+    } else if (tag == 3) {
+        // ----- MQ3-Lloyd-G256 (112 B/group) ---------------------------------
         // Source: gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip, lines 96–166.
         // Layout: 16 B (8×fp16 codebook) + 96 B 3-bit packed (6 B per K-tile).
         // Per-lane REGISTER 3D bilinear decomposition — NOT LDS broadcast.
@@ -328,6 +351,44 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                 DQ3(a_a, 12, p1b, 12);DQ3(a_a, 13, p1b, 15);DQ3(a_a, 14, p1b, 18); DQ3(a_a, 15, p1b, 21);
                 #undef DQ3
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);
+            }
+        }
+    } else if (tag == 4) {
+        // ----- mfp4-E8 (16 B row hdr + (K/32)*17 B; 136 B/group) ------------
+        // Source: gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip (lines 101–131).
+        // E8 carries a 16-byte row header (f16 row_scale) before the groups, so
+        // it computes its own row/block pointers (shared row_base/group_bytes
+        // assume a header-less group-major layout). half16: each 16-K WMMA tile
+        // is two E8 codewords (cw0 → a[0..8), cw1 → a[8..16)).
+        const int row_block_bytes = (K / 32) * 17;
+        const char* e8_row_ptr =
+            A + (long long)safe_row * (16 + (long long)row_block_bytes);
+        const float row_scale_f =
+            (float)__builtin_bit_cast(_Float16, *(const unsigned short*)e8_row_ptr);
+        const char* blocks_ptr = e8_row_ptr + 16;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* group_ptr = blocks_ptr + (long long)g * 136;
+            const _Float16* xg = (x_base != nullptr) ? (x_base + (long long)g * 256) : nullptr;
+            for (int kt = 0; kt < 16; kt++) {
+                const int k_off = kt * 16;
+                const int block_idx = k_off >> 5;            // 0..7
+                const char* block_ptr = group_ptr + (long long)block_idx * 17;
+                const float ssc = row_scale_f
+                    * cvt_e4m3_scale_to_f32(*(const unsigned char*)block_ptr) * 0.88f;
+                const int cw_base = (k_off & 31) >> 3;        // 0 or 2
+                const unsigned int cw0 = *(const unsigned int*)(block_ptr + 1 + cw_base * 4);
+                const unsigned int cw1 = *(const unsigned int*)(block_ptr + 1 + (cw_base + 1) * 4);
+                float p0[8], p1[8];
+                e8_decode_index(cw0, p0);
+                e8_decode_index(cw1, p1);
+                half16_t a_a;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    a_a[i]     = (_Float16)(p0[i] * ssc);
+                    a_a[8 + i] = (_Float16)(p1[i] * ssc);
+                }
+                half16_t b = (xg != nullptr) ? *(const half16_t*)(xg + k_off) : zero_b;
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
             }
         }
     }

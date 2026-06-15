@@ -255,8 +255,11 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
-    if !gpu.arch_caps.has_wmma_w32() {
-        println!("  SKIP — arch {} lacks RDNA3 wave32-WMMA", arch);
+    // gfx1151 RDNA3 (wave32-WMMA builtin) + gfx1200/1201 RDNA4 (the .gfx12
+    // sibling kernel, selected by the launcher on is_rdna4()). Skip elsewhere.
+    let is_rdna4 = matches!(arch.as_str(), "gfx1200" | "gfx1201");
+    if !gpu.arch_caps.has_wmma_w32() && !is_rdna4 {
+        println!("  SKIP — arch {} lacks RDNA3/RDNA4 wave32-WMMA", arch);
         return true;
     }
 

@@ -4909,7 +4909,11 @@ fn load_moe_ffn(
     //   1 = MQ2G256Lloyd ( 72 B/group codebook)
     //   2 = MQ4G256      (136 B/group affine)
     //   3 = MQ3G256Lloyd (112 B/group codebook)
+    //   4 = MFP4G32E8    (16 B row hdr + (K/32)*17 B; E8 lattice VQ, 4.25 bpw)
     // Uniform files see gu0==gu_n and dn0==dn_n → None (byte-identical).
+    // NOTE: tag 4 is decoded by the per-token mixed gemv kernels only; the
+    // batched grouped-WMMA kernel does NOT yet carry an E8 branch, so graded-E8
+    // must run per-token (HIPFIRE_PREFILL_BATCHED=0) until that lands.
     // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
     // lever); for the existing down-only graded binary the gate_up types are
     // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
@@ -4953,6 +4957,10 @@ fn load_moe_ffn(
                         }
                     }
                     DType::MQ3G256Lloyd => 3u8,
+                    // mfp4-E8 (4.25 bpw) graded tier — gate_up AND down are E8
+                    // for these experts (tier applies to both); the mixed gemv
+                    // kernels decode tag 4 via e8_row_partial.
+                    DType::MFP4G32E8 => 4u8,
                     _ => 2u8,  // default: treat unknown tiers as MQ4
                 })
                 .collect();
@@ -7496,6 +7504,27 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
+    // MFP4G32E8 on gfx11/gfx1151/gfx12: the mfp4-E8 A3B model takes the
+    // batched-prefill path (FWHT-rotated activations + dequant→F16 GEMM for
+    // the shared expert, indexed E8 kernels for the routed experts). Admission
+    // is behind the HIPFIRE_E8_GFX12 gate because the shared-expert dequant
+    // path is validated on gfx1151 only; other arches are opt-in for now.
+    // The LA matchers (wqkv/wz/wo/etc.) for an MFP4G32E8 A3B model are
+    // still MQ4/Q8 (only the FFN expert weights are E8), so reaching here
+    // with DType::MFP4G32E8 means a weight was quantized to E8 dtype at the
+    // LA level — admitting it keeps the eligibility gate from rejecting the
+    // whole model when an attention tensor is E8 (unlikely today, but correct
+    // defensively). The real admission gate for the FFN body is
+    // `moe_ffn_batched_admissible`.
+    let e8_with_wmma = matches!(dt, DType::MFP4G32E8)
+        && matches!(
+            arch,
+            "gfx1100" | "gfx1101" | "gfx1102"
+            | "gfx1150" | "gfx1151" | "gfx1152"
+            | "gfx1200" | "gfx1201"
+        )
+        && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
+
     mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_gfx11_wmma
@@ -7503,6 +7532,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx11_wmma
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
+        || e8_with_wmma
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -7693,18 +7723,42 @@ fn moe_ffn_batched_admissible_for_dtypes(
         return shared_gu_ok && shared_dn_ok;
     }
 
-    // mfp4-E8 routed experts (gfx1151-only; `admit_e8` is arch-gated by the
-    // caller). Shared expert is Q8 (gate/up/down) and router/scalar-gate are Q8
-    // (already validated by router_ok/shared_gate_ok above). The batched body
-    // runs a dedicated Q8 shared-expert path (two plain Q8 GEMMs + silu_mul +
-    // sigmoid-scaled residual add) and routes the E8 experts through
-    // `run_moe_prefill` Path 1 (indexed batched GEMV). Matches the decode E8 path.
+    // mfp4-E8 routed experts with Q8 shared expert (original arm):
+    // gfx1151-native A3B checkpoint. Shared expert is Q8 (gate/up/down);
+    // router/scalar-gate are Q8 (validated by router_ok/shared_gate_ok above).
+    // The batched body runs a dedicated Q8 shared-expert path (two plain Q8
+    // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
+    // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
     if admit_e8
         && dtypes.shared_expert_gate == DType::Q8_0
         && dtypes.shared_expert_up == DType::Q8_0
         && dtypes.shared_expert_down == DType::Q8_0
         && dtypes.expert_gate_up == DType::MFP4G32E8
         && dtypes.expert_down == DType::MFP4G32E8
+    {
+        return true;
+    }
+
+    // Uniform mfp4-E8: BOTH shared AND routed experts are MFP4G32E8 (Option B
+    // from the implementation spec). Router + shared_expert_gate (scalar) remain
+    // Q8 (validated above). The batched body dequants the shared expert E8→F16
+    // transiently and runs `gemm_f16_wmma_mb8` against `x_rot_batch` (FWHT-
+    // rotated activations), then the routed experts go through the indexed E8
+    // batched GEMV path. The dequant→F16 path requires has_wmma_w32 (gfx11+),
+    // which `admit_e8` already gates on arch, so no additional arch check here.
+    if admit_e8
+        && dtypes.expert_gate_up == DType::MFP4G32E8
+        && dtypes.expert_down == DType::MFP4G32E8
+        // Shared expert may be per-projection MIXED — this checkpoint has
+        // gate/up=E8 with down=Q8 on some layers. gate+up are dispatched
+        // together (one match on gate's dtype) so they must share a dtype;
+        // down is matched independently. The batched body handles Q8
+        // (un-rotated) and E8 (dequant→f16, x_rot) per projection and keys
+        // the SwiGLU rotate on the down dtype, so any {Q8,E8} combination of
+        // (gate==up, down) is correct.
+        && dtypes.shared_expert_gate == dtypes.shared_expert_up
+        && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8)
+        && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8)
     {
         return true;
     }
@@ -7770,7 +7824,40 @@ pub fn prefill_batch_pbs_eligible(
         std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
         arch,
     );
-    !force_fallback
+    let has_dn = weights.layers.iter().any(|lw| matches!(
+        lw,
+        LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
+    ));
+    let all_dtypes_ok = weights.layers.iter().all(|lw| match lw {
+        LayerWeights::DeltaNet(l) =>
+            is_batchable_la(l.wqkv.gpu_dtype, arch)
+                && is_batchable_la(l.wz.gpu_dtype, arch)
+                && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                && is_batchable_la(l.w_up.gpu_dtype, arch)
+                && is_batchable_la(l.w_down.gpu_dtype, arch),
+        LayerWeights::FullAttn(_) => true,
+        LayerWeights::DeltaNetMoe(l) =>
+            moe_topk_ok
+                && moe_router_logits_present
+                && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                && is_batchable_la(l.wz.gpu_dtype, arch)
+                && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
+        LayerWeights::FullAttnMoe(l) =>
+            moe_topk_ok
+                && moe_router_logits_present
+                && is_batchable_la(l.wq.gpu_dtype, arch)
+                && is_batchable_la(l.wk.gpu_dtype, arch)
+                && is_batchable_la(l.wv.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
+    });
+    let result = !force_fallback
         && n >= MIN_BATCH
         // State quant no longer gates batched prefill: forward_prefill_chunk
         // dispatches the GDN recurrence by dn_state.quant on the non-tree path
@@ -7778,53 +7865,45 @@ pub fn prefill_batch_pbs_eligible(
         // so FP32/Q4 state is fully batchable here. Was hard-gated to Q8 when
         // the batched GDN was Q8-only; that's the seed + per-cycle-commit
         // per-token fallback that made FP32 DFlash ~4.5× slower + 10× TTFT.
-        && weights.layers.iter().any(|lw| matches!(
-            lw,
-            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-        ))
+        && has_dn
         // LA/FA/MoE projection + MoE-FFN weight dtypes must all be batchable;
         // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
-        && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch),
-            LayerWeights::FullAttn(_) => true,
-            LayerWeights::DeltaNetMoe(l) =>
-                moe_topk_ok
-                    && moe_router_logits_present
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
-            LayerWeights::FullAttnMoe(l) =>
-                moe_topk_ok
-                    && moe_router_logits_present
-                    && is_batchable_la(l.wq.gpu_dtype, arch)
-                    && is_batchable_la(l.wk.gpu_dtype, arch)
-                    && is_batchable_la(l.wv.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
-        })
+        && all_dtypes_ok;
+    // HIPFIRE_DEBUG_BATCH=1: print per-component eligibility to stderr.
+    if std::env::var("HIPFIRE_DEBUG_BATCH").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[hipfire::batch_eligible] result={result} \
+             arch={arch} n={n} n>={MIN_BATCH}={} \
+             force_fallback={force_fallback} \
+             has_dn={has_dn} \
+             moe_topk_ok={moe_topk_ok} \
+             moe_router_logits_present={moe_router_logits_present} \
+             all_dtypes_ok={all_dtypes_ok}",
+            n >= MIN_BATCH,
+        );
+    }
+    result
 }
 
-/// Whether MQ6 MoE FFN projections can enter batched prefill. After the
-/// grouped tile-bound fix, gfx12 defaults to admit because its HFQ6
-/// grouped-WMMA path is present and production-smoked; gfx11 and older stay
-/// default-off because the MQ6 grouped sister is not implemented there and the
-/// indexed fallback still lacks an MQ6 gate_up batched kernel.
+/// Whether MQ6 MoE FFN projections can enter batched prefill. Default-on for
+/// gfx11 (RDNA3/3.5) AND gfx12 (RDNA4): the MQ6 grouped-WMMA decode is present
+/// on both (tag 0 of the merged `gemm_mixed_moe_grouped_wmma{_k2,.gfx12}` kernel,
+/// plus the standalone `gemm_hfq6g256_moe_grouped_wmma{_k2,.gfx12}` ported
+/// 2026-06-11), and the graded shared-MQ6 expert runs the dense-GEMM batched
+/// path. Validated on gfx1100: graded T3-3L-E8 (MQ6 hot / E8 mid / MQ3L cold,
+/// MQ6 shared) batches coherently, KLD 0.038964, and gfx11 prefill is ~10× the
+/// per-token fallback (1012 vs 106 tok/s pp512). UNIFORM-MQ6 OOMs on gfx11
+/// (>24 GB) so it never reaches this gate there — only graded MQ6 models do.
+/// The original gfx12-only default predated the gfx11 MQ6 grouped port and
+/// silently forced per-token prefill on every graded-MQ6 model on gfx11.
+/// Override per-arch with `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
 fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     match value {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
-        _ => arch.starts_with("gfx12"),
+        // RDNA3/3.5 (gfx11xx) + RDNA4 (gfx12xx). RDNA1/2 (gfx10xx, no WMMA)
+        // stay off.
+        _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
     }
 }
 
@@ -7832,10 +7911,18 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
     let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
         return false;
     };
-    // mfp4-E8 routed experts only exist on gfx1151 (Strix Halo) checkpoints, and
-    // the E8 indexed kernels debug_assert gfx1151 — gate the E8 admit on arch so
-    // it can never fire on another GPU.
-    let admit_e8 = arch.starts_with("gfx1151");
+    // mfp4-E8 routed experts: originally gfx1151-only, now widened to all
+    // gfx11 + gfx12 arches behind the HIPFIRE_E8_GFX12 gate. The shared-expert
+    // dequant→F16 GEMM path uses `dequantize_mfp4g32_e8_to_f16` + `gemm_f16_wmma_mb8`
+    // which are available on all WMMA-capable arches. The indexed E8 GEMV kernels
+    // for the routed experts are also present on gfx11 (shipped in the MoE-AWQ
+    // branch). Gate on HIPFIRE_E8_GFX12 to allow safe opt-in rollout.
+    let admit_e8 = matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102"
+        | "gfx1150" | "gfx1151" | "gfx1152"
+        | "gfx1200" | "gfx1201"
+    ) && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
     // fallback path while bisecting or debugging.
@@ -8395,6 +8482,60 @@ fn prefill_moe_ffn_body_batched(
                 n,
             )?;
         }
+        // Uniform mfp4-E8 shared expert (Option B): shared expert gate/up are both
+        // MFP4G32E8. We dequant each to F16 transiently (E8→F16 gives W_rot in the
+        // FWHT-rotated domain), then run GemmF16WmmaMb8 against x_rot_batch (F32).
+        // Math: GEMM(W_rot, x_rot) = W·x_norm = correct forward pass.
+        // The F16 scratch tensors are allocated per call and freed after use; they
+        // are small (smi × dim × 2 bytes each) relative to VRAM.
+        DType::MFP4G32E8 => {
+            let gate_m = ffn.shared_expert.gate.m;
+            let gate_k = ffn.shared_expert.gate.k;
+            let up_m = ffn.shared_expert.up.m;
+            let up_k = ffn.shared_expert.up.k;
+            // Dequantize gate and up weights: E8 → F16 (in-rotated domain)
+            let gate_f16 = gpu.alloc_tensor(&[gate_m * gate_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.gate.buf.buf,
+                &gate_f16.buf,
+                gate_m,
+                gate_k,
+            )?;
+            let up_f16 = gpu.alloc_tensor(&[up_m * up_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.up.buf.buf,
+                &up_f16.buf,
+                up_m,
+                up_k,
+            )?;
+            // GemmF16WmmaMb8: W(F16) × x_rot_batch(F32) → shared_gate / shared_up (F32)
+            // x_rot_batch is F32; gemm_f16_wmma_mb8 accepts F32 activations directly.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &gate_f16,
+                DType::F16,
+                &pbs.x_rot_batch,
+                shared_gate,
+                gate_m,
+                gate_k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &up_f16,
+                DType::F16,
+                &pbs.x_rot_batch,
+                shared_up,
+                up_m,
+                up_k,
+                n,
+            )?;
+            // Free the transient F16 weight buffers
+            gpu.free_tensor(gate_f16)?;
+            gpu.free_tensor(up_f16)?;
+        }
         other => panic!(
             "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"
@@ -8509,10 +8650,10 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.down.k,
             n,
         )?,
-        // Q8 shared down (A3B mfp4-E8): plain batched Q8 GEMM W_down · hidden into
-        // a [N × dim] temp, then fold into the residual with the per-token
-        // sigmoid(shared_scalar) gate. The temp aliases the first N×dim of
-        // `down_expanded` (the routed down-expanded scratch), which is FREE here —
+        // Q8 shared down (A3B mfp4-E8, Q8-shared variant): plain batched Q8 GEMM
+        // W_down · hidden into a [N × dim] temp, then fold into the residual with
+        // the per-token sigmoid(shared_scalar) gate. The temp aliases the first N×dim
+        // of `down_expanded` (the routed down-expanded scratch), which is FREE here —
         // the routed experts (step 6) overwrite it only after this completes, and
         // the HIP stream is in-order so the add reads before that. Batched analog
         // of the decode sigmoid_f32 + scaled_add_inplace shared-down arm.
@@ -8533,6 +8674,43 @@ fn prefill_moe_ffn_body_batched(
                 ffn.shared_expert.down.k,
                 n,
             )?;
+            gpu.sigmoid_scaled_residual_add_batched_f32(
+                &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
+            )?;
+        }
+        // Uniform mfp4-E8 shared expert down (Option B): dequant the E8 down weight
+        // to F16, run GemmF16WmmaMb8 against shared_rot (FWHT-rotated SwiGLU hidden)
+        // into a [N × dim] temp, then sigmoid-scale-add into the residual. The temp
+        // aliases the first N×dim of `down_expanded` (safe: step 6 routed experts
+        // run after this, and the stream is in-order). Mirrors the Q8_0 arm above
+        // except the GEMM is F16 weight × F32 activation = F32 output.
+        DType::MFP4G32E8 => {
+            let down_m = ffn.shared_expert.down.m;
+            let down_k = ffn.shared_expert.down.k;
+            let down_f16 = gpu.alloc_tensor(&[down_m * down_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.down.buf.buf,
+                &down_f16.buf,
+                down_m,
+                down_k,
+            )?;
+            let down_tmp = GpuTensor {
+                buf: unsafe { down_expanded.buf.alias() },
+                shape: vec![n * dim],
+                dtype: DType::F32,
+            };
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &down_f16,
+                DType::F16,
+                shared_rot,
+                &down_tmp,
+                down_m,
+                down_k,
+                n,
+            )?;
+            gpu.free_tensor(down_f16)?;
             gpu.sigmoid_scaled_residual_add_batched_f32(
                 &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
             )?;
