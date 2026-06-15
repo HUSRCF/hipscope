@@ -1395,7 +1395,8 @@ pub fn run_moe_prefill(
         match p.dtypes.routed_down {
             // MFP4G32E8 reuses the weight-agnostic silu+FWHT-rotate (E8 down expects
             // FWHT(silu(g)*u), same as MQ4 — see the decode E8 path).
-            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256 | DType::MFP4G32E8 => {
+            DType::MQ4G256 | DType::MQ5G256 | DType::MQ6G256
+            | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => {
                 if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
                     // Route A MoE-AWQ (per-routed-expert, indexed by topk slot).
                     // total_slots rows = N·k_top; each slot's expert is

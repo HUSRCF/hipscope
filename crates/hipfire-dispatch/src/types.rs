@@ -113,7 +113,8 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA => RotationPlan::FwhtG256,
+        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -671,7 +672,9 @@ impl KernelKey {
             // is gfx906-only. The two are unrelated ISA features.
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
-            | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+            | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
+            | MFP4G32E8 | MFP4G32E8SOA
+            | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             MQ3G256 => ArchPredicate::HasWmma,
@@ -727,6 +730,7 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
         dtype,
         MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
             | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-            | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | ParoQ4G128
+            | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+            | MFP3G32E8 | MFP2G32E8 | ParoQ4G128
     )
 }

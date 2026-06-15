@@ -28,6 +28,8 @@
 //   2 = MQ4/HFQ4-G256  — 136 B/group, 4-bit affine
 //   3 = MQ3-Lloyd-G256 — 112 B/group, 8-entry fp16 codebook
 //   4 = mfp4-E8        — 16 B row hdr + (K/32)*17 B; 136 B/group, E8 VQ
+//   5 = mfp3-E8        — 16 B row hdr + (K/32)*13 B; 104 B/group, 3-bit E8 VQ
+//   6 = mfp2-E8        — 16 B row hdr + (K/32)* 9 B;  72 B/group, 2-bit E8 VQ
 //
 // Per-block geometry: 128 threads (4 warps x 32 lanes), 64 M-rows x 16 slots.
 //   warp_id w owns M-rows [block_m + w*16, +16); the 16 X-slots are LDS-shared.
@@ -64,6 +66,35 @@ __device__ __forceinline__ void e8_decode_index(unsigned int idx, float p[8]) {
     for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 7); p[i] = coset ? c + 0.5f : c; }
 }
 
+// mfpN-E8 narrow-nibble decode + QUANT_STEP — byte-identical to
+// gemm_mixed_moe_grouped_wmma_k2.hip. QUANT_STEP MUST match e8.rs.
+#define QUANT_STEP_MFP3 1.8f
+#define QUANT_STEP_MFP2 3.8f
+// mfp3-E8 (tag 5): 3-bit nibbles, center 4, coset bit 23, e7_high 2b @ bit 21.
+// Center 4 (box [-4,3]) matches coord_bias_n(3)=4 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp3_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 23) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(3 * i)) & 0x7u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 21) & 0x3u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 4); p[i] = coset ? c + 0.5f : c; }
+}
+// mfp2-E8 (tag 6): 2-bit nibbles, center 2, coset bit 15, e7_high 1b @ bit 14.
+// Center 2 (box [-2,1]) matches coord_bias_n(2)=2 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp2_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 15) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(2 * i)) & 0x3u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 14) & 0x1u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 2); p[i] = coset ? c + 0.5f : c; }
+}
+
 __launch_bounds__(128, 2)
 extern "C" __global__ void gemm_mixed_moe_grouped_wmma_4w_k2(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E] u64
@@ -85,7 +116,9 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_4w_k2(
 
     // BLOCK-UNIFORM tag (all 128 threads share one expert) -> no divergence.
     const unsigned char tag = dtype_tags[expert_id];
-    // group_bytes for tags 0-3 (E8 computes its own header-aware pointer).
+    // group_bytes for tags 0-3 (the E8 family — tags 4/5/6 — computes its own
+    // header-aware pointer below and never consumes this value, so the tag>3
+    // fallthrough to 112 is harmless/unused for them).
     const int group_bytes = (tag == 0) ? 200 : (tag == 1) ? 72 : (tag == 2) ? 136 : 112;
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
@@ -325,6 +358,72 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_4w_k2(
                 float p0[8], p1[8];
                 e8_decode_index(cw0, p0);
                 e8_decode_index(cw1, p1);
+                half16_t a_a;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    a_a[i]     = (_Float16)(p0[i] * ssc);
+                    a_a[8 + i] = (_Float16)(p1[i] * ssc);
+                }
+                half16_t b = *(const half16_t*)(lds_slot + k_off);
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
+            }
+        } else if (tag == 5) {
+            // ----- mfp3-E8 (16 B row hdr + (K/32)*13 B; 104 B/group) -----
+            // Same header-aware layout as tag 4; narrow 3-byte codeword reads
+            // (last cw of last block reads bytes [10..12] within the 13-B block).
+            const int row_block_bytes = (K / 32) * 13;
+            const char* e8_row_ptr =
+                A + (long long)safe_row * (16 + (long long)row_block_bytes);
+            const float row_scale_f =
+                (float)__builtin_bit_cast(_Float16, *(const unsigned short*)e8_row_ptr);
+            const char* group_ptr = e8_row_ptr + 16 + (long long)g * 104;
+            for (int kt = 0; kt < 16; kt++) {
+                const int k_off = kt * 16;
+                const int block_idx = k_off >> 5;            // 0..7
+                const char* block_ptr = group_ptr + (long long)block_idx * 13;
+                const float ssc = row_scale_f
+                    * cvt_e4m3_scale_to_f32(*(const unsigned char*)block_ptr) * QUANT_STEP_MFP3;
+                const int cw_base = (k_off & 31) >> 3;        // 0 or 2
+                const unsigned char* w0 = (const unsigned char*)(block_ptr + 1 + cw_base * 3);
+                const unsigned char* w1 = (const unsigned char*)(block_ptr + 1 + (cw_base + 1) * 3);
+                const unsigned int cw0 = (unsigned)w0[0] | ((unsigned)w0[1] << 8) | ((unsigned)w0[2] << 16);
+                const unsigned int cw1 = (unsigned)w1[0] | ((unsigned)w1[1] << 8) | ((unsigned)w1[2] << 16);
+                float p0[8], p1[8];
+                mfp3_decode_index(cw0, p0);
+                mfp3_decode_index(cw1, p1);
+                half16_t a_a;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    a_a[i]     = (_Float16)(p0[i] * ssc);
+                    a_a[8 + i] = (_Float16)(p1[i] * ssc);
+                }
+                half16_t b = *(const half16_t*)(lds_slot + k_off);
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
+            }
+        } else if (tag == 6) {
+            // ----- mfp2-E8 (16 B row hdr + (K/32)*9 B; 72 B/group) -----
+            // Same header-aware layout as tag 4; narrow 2-byte codeword reads
+            // (last cw of last block reads bytes [7..8] within the 9-B block).
+            const int row_block_bytes = (K / 32) * 9;
+            const char* e8_row_ptr =
+                A + (long long)safe_row * (16 + (long long)row_block_bytes);
+            const float row_scale_f =
+                (float)__builtin_bit_cast(_Float16, *(const unsigned short*)e8_row_ptr);
+            const char* group_ptr = e8_row_ptr + 16 + (long long)g * 72;
+            for (int kt = 0; kt < 16; kt++) {
+                const int k_off = kt * 16;
+                const int block_idx = k_off >> 5;            // 0..7
+                const char* block_ptr = group_ptr + (long long)block_idx * 9;
+                const float ssc = row_scale_f
+                    * cvt_e4m3_scale_to_f32(*(const unsigned char*)block_ptr) * QUANT_STEP_MFP2;
+                const int cw_base = (k_off & 31) >> 3;        // 0 or 2
+                const unsigned char* w0 = (const unsigned char*)(block_ptr + 1 + cw_base * 2);
+                const unsigned char* w1 = (const unsigned char*)(block_ptr + 1 + (cw_base + 1) * 2);
+                const unsigned int cw0 = (unsigned)w0[0] | ((unsigned)w0[1] << 8);
+                const unsigned int cw1 = (unsigned)w1[0] | ((unsigned)w1[1] << 8);
+                float p0[8], p1[8];
+                mfp2_decode_index(cw0, p0);
+                mfp2_decode_index(cw1, p1);
                 half16_t a_a;
                 #pragma unroll
                 for (int i = 0; i < 8; i++) {

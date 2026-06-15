@@ -42,6 +42,16 @@
 // `e8_row_partial` returns the PER-THREAD partial (NO wave reduce) so this
 // kernel's shared wave32 reduce folds it, like the MQ tag branches. E8 row
 // layout: 16 B header (fp16 row scale) + (K/32)*17 B blocks; 256-group = 136 B.
+//
+//   dtype_tags[expert_id] == 5 → mfp3-E8   (16 B row hdr + (K/32)*13 B;
+//                                             104 B/256-group, 3-bit E8 VQ)
+//   dtype_tags[expert_id] == 6 → mfp2-E8   (16 B row hdr + (K/32)* 9 B;
+//                                              72 B/256-group, 2-bit E8 VQ)
+//
+// QUANT_STEP constants MUST match crates/hipfire-quantize/src/e8.rs.
+#define QUANT_STEP_MFP3 1.8f
+#define QUANT_STEP_MFP2 3.8f
+
 __device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
     const unsigned mant = (unsigned)(b & 0x7);
@@ -135,6 +145,218 @@ __device__ __forceinline__ float e8_row_partial(
         const unsigned int ew = *(const unsigned int*)(gp + 1 + cw_off);
         const int base = g * 256 + tid * 8;
         float pe[8]; e8_decode_index(ew, pe);
+        acc2 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    return (acc0 + acc1) + (acc2 + acc3);
+}
+
+// ─────────────── mfp3-E8 (tag 5): 3-bit nibbles, center 4 ───────────────
+// Bit layout (24 bits = 3 bytes LE):
+//   e[i], i=0..6 → bits [3i, 3i+3)      (nibble mask 0x7)
+//   e7_high (2 bits) → bits [21, 23)
+//   coset           → bit 23
+// Center 4 (box [-4,3]) matches coord_bias_n(3)=4 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp3_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 23) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(3 * i)) & 0x7u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 21) & 0x3u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 4); p[i] = coset ? c + 0.5f : c; }
+}
+
+// mfp3-E8 row partial (down variant: takes `x` not `x_row`).
+// Block stride 13 B, group stride 104 B, cw_off = (tid&3)*3.
+__device__ __forceinline__ float mfp3e8_row_partial(
+    const char* __restrict__ A, const float* __restrict__ x, int row, int K, int tid
+) {
+    const int groups_per_row  = K / 256;
+    const int row_block_bytes = (K / 32) * 13;
+    const long long row_off   = (long long)row * (16 + (long long)row_block_bytes);
+    const char* hdr     = A + row_off;
+    const char* row_ptr = hdr + 16;
+    const float row_scale_f = (float)__builtin_bit_cast(_Float16, *(const unsigned short*)hdr);
+    const int block_in_iter    = tid >> 2;
+    const int cw_off           = (tid & 3) * 3;
+    const int thread_block_off = block_in_iter * 13;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    const int quads = groups_per_row >> 2;
+    const int tail  = groups_per_row & 3;
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + (long long)g       * 104 + thread_block_off;
+        const char* gp1 = row_ptr + (long long)(g + 1) * 104 + thread_block_off;
+        const char* gp2 = row_ptr + (long long)(g + 2) * 104 + thread_block_off;
+        const char* gp3 = row_ptr + (long long)(g + 3) * 104 + thread_block_off;
+        const float ssc0 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp0) * QUANT_STEP_MFP3;
+        const float ssc1 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp1) * QUANT_STEP_MFP3;
+        const float ssc2 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp2) * QUANT_STEP_MFP3;
+        const float ssc3 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp3) * QUANT_STEP_MFP3;
+        const unsigned char* w0 = (const unsigned char*)(gp0 + 1 + cw_off);
+        const unsigned char* w1 = (const unsigned char*)(gp1 + 1 + cw_off);
+        const unsigned char* w2 = (const unsigned char*)(gp2 + 1 + cw_off);
+        const unsigned char* w3 = (const unsigned char*)(gp3 + 1 + cw_off);
+        const unsigned int ew0 = (unsigned)w0[0] | ((unsigned)w0[1] << 8) | ((unsigned)w0[2] << 16);
+        const unsigned int ew1 = (unsigned)w1[0] | ((unsigned)w1[1] << 8) | ((unsigned)w1[2] << 16);
+        const unsigned int ew2 = (unsigned)w2[0] | ((unsigned)w2[1] << 8) | ((unsigned)w2[2] << 16);
+        const unsigned int ew3 = (unsigned)w3[0] | ((unsigned)w3[1] << 8) | ((unsigned)w3[2] << 16);
+        const int base0 = g * 256 + tid * 8;
+        const int base1 = base0 + 256;
+        const int base2 = base0 + 512;
+        const int base3 = base0 + 768;
+        float pe[8];
+        mfp3_decode_index(ew0, pe);
+        acc0 += ssc0*pe[0]*x[base0  ] + ssc0*pe[1]*x[base0+1] + ssc0*pe[2]*x[base0+2] + ssc0*pe[3]*x[base0+3]
+              + ssc0*pe[4]*x[base0+4] + ssc0*pe[5]*x[base0+5] + ssc0*pe[6]*x[base0+6] + ssc0*pe[7]*x[base0+7];
+        mfp3_decode_index(ew1, pe);
+        acc1 += ssc1*pe[0]*x[base1  ] + ssc1*pe[1]*x[base1+1] + ssc1*pe[2]*x[base1+2] + ssc1*pe[3]*x[base1+3]
+              + ssc1*pe[4]*x[base1+4] + ssc1*pe[5]*x[base1+5] + ssc1*pe[6]*x[base1+6] + ssc1*pe[7]*x[base1+7];
+        mfp3_decode_index(ew2, pe);
+        acc2 += ssc2*pe[0]*x[base2  ] + ssc2*pe[1]*x[base2+1] + ssc2*pe[2]*x[base2+2] + ssc2*pe[3]*x[base2+3]
+              + ssc2*pe[4]*x[base2+4] + ssc2*pe[5]*x[base2+5] + ssc2*pe[6]*x[base2+6] + ssc2*pe[7]*x[base2+7];
+        mfp3_decode_index(ew3, pe);
+        acc3 += ssc3*pe[0]*x[base3  ] + ssc3*pe[1]*x[base3+1] + ssc3*pe[2]*x[base3+2] + ssc3*pe[3]*x[base3+3]
+              + ssc3*pe[4]*x[base3+4] + ssc3*pe[5]*x[base3+5] + ssc3*pe[6]*x[base3+6] + ssc3*pe[7]*x[base3+7];
+    }
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = row_ptr + (long long)g * 104 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP3;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8) | ((unsigned)w[2] << 16);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp3_decode_index(ew, pe);
+        acc0 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + (long long)g * 104 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP3;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8) | ((unsigned)w[2] << 16);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp3_decode_index(ew, pe);
+        acc1 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + (long long)g * 104 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP3;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8) | ((unsigned)w[2] << 16);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp3_decode_index(ew, pe);
+        acc2 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    return (acc0 + acc1) + (acc2 + acc3);
+}
+
+// ─────────────── mfp2-E8 (tag 6): 2-bit nibbles, center 2 ───────────────
+// Bit layout (16 bits = 2 bytes LE):
+//   e[i], i=0..6 → bits [2i, 2i+2)      (nibble mask 0x3)
+//   e7_high (1 bit) → bit 14
+//   coset           → bit 15
+// Center 2 (box [-2,1]) matches coord_bias_n(2)=2 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp2_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 15) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(2 * i)) & 0x3u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 14) & 0x1u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 2); p[i] = coset ? c + 0.5f : c; }
+}
+
+// mfp2-E8 row partial (down variant: takes `x` not `x_row`).
+// Block stride 9 B, group stride 72 B, cw_off = (tid&3)*2.
+__device__ __forceinline__ float mfp2e8_row_partial(
+    const char* __restrict__ A, const float* __restrict__ x, int row, int K, int tid
+) {
+    const int groups_per_row  = K / 256;
+    const int row_block_bytes = (K / 32) * 9;
+    const long long row_off   = (long long)row * (16 + (long long)row_block_bytes);
+    const char* hdr     = A + row_off;
+    const char* row_ptr = hdr + 16;
+    const float row_scale_f = (float)__builtin_bit_cast(_Float16, *(const unsigned short*)hdr);
+    const int block_in_iter    = tid >> 2;
+    const int cw_off           = (tid & 3) * 2;
+    const int thread_block_off = block_in_iter * 9;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    const int quads = groups_per_row >> 2;
+    const int tail  = groups_per_row & 3;
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + (long long)g       * 72 + thread_block_off;
+        const char* gp1 = row_ptr + (long long)(g + 1) * 72 + thread_block_off;
+        const char* gp2 = row_ptr + (long long)(g + 2) * 72 + thread_block_off;
+        const char* gp3 = row_ptr + (long long)(g + 3) * 72 + thread_block_off;
+        const float ssc0 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp0) * QUANT_STEP_MFP2;
+        const float ssc1 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp1) * QUANT_STEP_MFP2;
+        const float ssc2 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp2) * QUANT_STEP_MFP2;
+        const float ssc3 = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp3) * QUANT_STEP_MFP2;
+        const unsigned char* w0 = (const unsigned char*)(gp0 + 1 + cw_off);
+        const unsigned char* w1 = (const unsigned char*)(gp1 + 1 + cw_off);
+        const unsigned char* w2 = (const unsigned char*)(gp2 + 1 + cw_off);
+        const unsigned char* w3 = (const unsigned char*)(gp3 + 1 + cw_off);
+        const unsigned int ew0 = (unsigned)w0[0] | ((unsigned)w0[1] << 8);
+        const unsigned int ew1 = (unsigned)w1[0] | ((unsigned)w1[1] << 8);
+        const unsigned int ew2 = (unsigned)w2[0] | ((unsigned)w2[1] << 8);
+        const unsigned int ew3 = (unsigned)w3[0] | ((unsigned)w3[1] << 8);
+        const int base0 = g * 256 + tid * 8;
+        const int base1 = base0 + 256;
+        const int base2 = base0 + 512;
+        const int base3 = base0 + 768;
+        float pe[8];
+        mfp2_decode_index(ew0, pe);
+        acc0 += ssc0*pe[0]*x[base0  ] + ssc0*pe[1]*x[base0+1] + ssc0*pe[2]*x[base0+2] + ssc0*pe[3]*x[base0+3]
+              + ssc0*pe[4]*x[base0+4] + ssc0*pe[5]*x[base0+5] + ssc0*pe[6]*x[base0+6] + ssc0*pe[7]*x[base0+7];
+        mfp2_decode_index(ew1, pe);
+        acc1 += ssc1*pe[0]*x[base1  ] + ssc1*pe[1]*x[base1+1] + ssc1*pe[2]*x[base1+2] + ssc1*pe[3]*x[base1+3]
+              + ssc1*pe[4]*x[base1+4] + ssc1*pe[5]*x[base1+5] + ssc1*pe[6]*x[base1+6] + ssc1*pe[7]*x[base1+7];
+        mfp2_decode_index(ew2, pe);
+        acc2 += ssc2*pe[0]*x[base2  ] + ssc2*pe[1]*x[base2+1] + ssc2*pe[2]*x[base2+2] + ssc2*pe[3]*x[base2+3]
+              + ssc2*pe[4]*x[base2+4] + ssc2*pe[5]*x[base2+5] + ssc2*pe[6]*x[base2+6] + ssc2*pe[7]*x[base2+7];
+        mfp2_decode_index(ew3, pe);
+        acc3 += ssc3*pe[0]*x[base3  ] + ssc3*pe[1]*x[base3+1] + ssc3*pe[2]*x[base3+2] + ssc3*pe[3]*x[base3+3]
+              + ssc3*pe[4]*x[base3+4] + ssc3*pe[5]*x[base3+5] + ssc3*pe[6]*x[base3+6] + ssc3*pe[7]*x[base3+7];
+    }
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = row_ptr + (long long)g * 72 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP2;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp2_decode_index(ew, pe);
+        acc0 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + (long long)g * 72 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP2;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp2_decode_index(ew, pe);
+        acc1 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
+              + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + (long long)g * 72 + thread_block_off;
+        const float ssc = row_scale_f * cvt_e4m3_scale_to_f32(*(const unsigned char*)gp) * QUANT_STEP_MFP2;
+        const unsigned char* w = (const unsigned char*)(gp + 1 + cw_off);
+        const unsigned int ew = (unsigned)w[0] | ((unsigned)w[1] << 8);
+        const int base = g * 256 + tid * 8;
+        float pe[8]; mfp2_decode_index(ew, pe);
         acc2 += ssc*pe[0]*x[base  ] + ssc*pe[1]*x[base+1] + ssc*pe[2]*x[base+2] + ssc*pe[3]*x[base+3]
               + ssc*pe[4]*x[base+4] + ssc*pe[5]*x[base+5] + ssc*pe[6]*x[base+6] + ssc*pe[7]*x[base+7];
     }
@@ -285,6 +507,12 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
         // ---- mfp4-E8 branch (16 B row hdr + (K/32)*17 B; 136 B / 256-group) ----
         // block-uniform → no syncthreads/LDS; per-thread partial, shared reduce folds.
         acc = e8_row_partial(A, x, row, K, tid);
+    } else if (tag == 5) {
+        // ---- mfp3-E8 branch (16 B row hdr + (K/32)*13 B; 104 B / 256-group) ----
+        acc = mfp3e8_row_partial(A, x, row, K, tid);
+    } else if (tag == 6) {
+        // ---- mfp2-E8 branch (16 B row hdr + (K/32)* 9 B;  72 B / 256-group) ----
+        acc = mfp2e8_row_partial(A, x, row, K, tid);
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

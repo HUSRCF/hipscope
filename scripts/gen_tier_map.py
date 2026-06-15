@@ -120,7 +120,15 @@ if __name__ == "__main__":
     print("Generating T3-3L (MQ6/MQ4/MQ3L) ...")
     emit("/workspace/tier_map_T3-3L.txt", "MQ3L", agn, wtn)
 
+    print("Generating T3-3L-mfp3 (MQ6/MQ4/MFP3E8) ...")
+    emit("/workspace/tier_map_T3-3L-mfp3.txt", "MFP3E8", agn, wtn)
+
+    print("Generating T3-2L-mfp2 (MQ6/MQ4/MFP2E8) ...")
+    emit("/workspace/tier_map_T3-2L-mfp2.txt", "MFP2E8", agn, wtn)
+
     report_histogram("/workspace/tier_map_T3-2L.txt", "T3-2L")
     report_histogram("/workspace/tier_map_T3-3L.txt", "T3-3L")
+    report_histogram("/workspace/tier_map_T3-3L-mfp3.txt", "T3-3L-mfp3")
+    report_histogram("/workspace/tier_map_T3-2L-mfp2.txt", "T3-2L-mfp2")
 
     print("\nDone.")

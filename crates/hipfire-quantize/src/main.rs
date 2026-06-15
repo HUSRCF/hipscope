@@ -1518,6 +1518,175 @@ fn quantize_mfp4g32_e8_row(row: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Generic mfpN-E8 row encoder (n=2 or n=3). Same outer container as mfp4-E8
+/// (16 B row header + (K/32) blocks) but each block is 1 + 4*n bytes:
+///   - 1 B: E4M3 block scale
+///   - 4 × n B: codewords (low 8n bits of u32, LE)
+/// Row bytes = 16 + (1 + 4*n) * (K/32). Callers use the thin wrappers below.
+fn quantize_mfpn_e8_row(row: &[f32], n: u32, quant_step: f32) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "mfpN-E8 requires K%32==0, got K={}", row.len());
+    assert!(n == 2 || n == 3, "only n=2 or n=3 supported by this helper");
+    let k = row.len();
+    let n_blocks = k / 32;
+    let block_bytes = 1 + 4 * n as usize;
+    let row_bytes = 16 + n_blocks * block_bytes;
+    let mut out = vec![0u8; row_bytes];
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+    out[6] = 0x05; // same FWHT flag as mfp4-E8
+    out[7] = 0u8;
+    for b in 0..n_blocks {
+        let block = &row[b * 32..b * 32 + 32];
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+        let s = if block_max_normalized > 0.0 { block_max_normalized / 6.0 } else { 0.0 };
+        let scale_byte = e4m3_scale_encode_roundup(s);
+        let block_scale_factor = e4m3_scale_decode(scale_byte);
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let payload_off = 16 + b * block_bytes;
+        out[payload_off] = scale_byte;
+        // 4 codewords per block, 8 weights each, packed into low 8n bits (LE).
+        for g in 0..4 {
+            let mut v = [0.0f32; 8];
+            for i in 0..8 {
+                v[i] = block[g * 8 + i] * inv_row_scale * inv_block_scale;
+            }
+            let idx = e8::quantize8_n(&v, quant_step, n);
+            // Write only the low n bytes (upper bits of u32 are guaranteed zero
+            // by encode_index_n — see e8.rs high-bit-zero invariant).
+            let bytes = idx.to_le_bytes();
+            let cw_off = payload_off + 1 + g * n as usize;
+            out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
+        }
+    }
+    out
+}
+
+fn quantize_mfp3g32_e8_row(row: &[f32]) -> Vec<u8> {
+    quantize_mfpn_e8_row(row, 3, e8::QUANT_STEP_MFP3)
+}
+
+fn quantize_mfp2g32_e8_row(row: &[f32]) -> Vec<u8> {
+    quantize_mfpn_e8_row(row, 2, e8::QUANT_STEP_MFP2)
+}
+
+/// mfpN-E8 2D: FWHT-rotate (same signs as mfp4-E8), then per-row encode.
+fn quantize_mfpn_e8_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+    n: u32, quant_step: f32,
+) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k);
+    assert!(k % 256 == 0, "mfpN-E8 requires k%256==0, got k={}", k);
+    let block_bytes = 1 + 4 * n as usize;
+    let row_bytes = 16 + block_bytes * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        out.extend_from_slice(&quantize_mfpn_e8_row(&row_buf, n, quant_step));
+    }
+    out
+}
+
+pub fn quantize_mfp3g32_e8_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mfpn_e8_2d(f32_data, m, k, signs1, signs2, 3, e8::QUANT_STEP_MFP3)
+}
+
+pub fn quantize_mfp2g32_e8_2d(
+    f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mfpn_e8_2d(f32_data, m, k, signs1, signs2, 2, e8::QUANT_STEP_MFP2)
+}
+
+/// CPU reference dequant for mfp3-E8. Returns row-major f32 in the ROTATED domain.
+/// Mirrors the kernel mfp3_decode_index decode exactly (3-bit nibbles, center 3,
+/// coset bit 23, e7_high 2b at bit 21).
+#[allow(dead_code)]
+fn dequant_mfp3g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let block_bytes = 13usize; // 1 + 4*3
+    let row_bytes = 16 + block_bytes * (k / 32);
+    assert_eq!(packed.len(), m * row_bytes, "mfp3-E8 size mismatch");
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = r * row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+        for b in 0..(k / 32) {
+            let po = base + 16 + b * block_bytes;
+            let scale_byte = packed[po];
+            let scale = row_scale_a * e4m3_scale_decode(scale_byte) * e8::QUANT_STEP_MFP3;
+            for g in 0..4usize {
+                let cw_off = po + 1 + g * 3;
+                // 3-byte LE narrow read (safe — block is 13 B, max cw_off = po+1+3*3=po+10, reads to po+12)
+                let idx: u32 = (packed[cw_off] as u32)
+                    | ((packed[cw_off + 1] as u32) << 8)
+                    | ((packed[cw_off + 2] as u32) << 16);
+                // mfp3_decode_index: 3-bit nibbles, center 3, coset bit 23, e7_high @21 (2b)
+                let coset = (idx >> 23) & 1;
+                let mut e = [0u32; 8];
+                let mut sl: u32 = 0;
+                for i in 0..7 { e[i] = (idx >> (3 * i as u32)) & 0x7; sl += e[i]; }
+                let e7_high = (idx >> 21) & 0x3;
+                let p7 = e7_high << 1;
+                e[7] = p7 | ((sl + p7) & 1);
+                for i in 0..8usize {
+                    let c = (e[i] as i32 - 3) as f32;
+                    let coord = if coset == 1 { c + 0.5 } else { c };
+                    out[r * k + b * 32 + g * 8 + i] = scale * coord;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// CPU reference dequant for mfp2-E8. Returns row-major f32 in the ROTATED domain.
+/// Mirrors the kernel mfp2_decode_index decode exactly (2-bit nibbles, center 1,
+/// coset bit 15, e7_high 1b at bit 14).
+#[allow(dead_code)]
+fn dequant_mfp2g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let block_bytes = 9usize; // 1 + 4*2
+    let row_bytes = 16 + block_bytes * (k / 32);
+    assert_eq!(packed.len(), m * row_bytes, "mfp2-E8 size mismatch");
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let base = r * row_bytes;
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+        for b in 0..(k / 32) {
+            let po = base + 16 + b * block_bytes;
+            let scale_byte = packed[po];
+            let scale = row_scale_a * e4m3_scale_decode(scale_byte) * e8::QUANT_STEP_MFP2;
+            for g in 0..4usize {
+                let cw_off = po + 1 + g * 2;
+                // 2-byte LE narrow read (safe — block is 9 B, max cw_off = po+1+3*2=po+7, reads to po+8)
+                let idx: u32 = (packed[cw_off] as u32) | ((packed[cw_off + 1] as u32) << 8);
+                // mfp2_decode_index: 2-bit nibbles, center 1, coset bit 15, e7_high @14 (1b)
+                let coset = (idx >> 15) & 1;
+                let mut e = [0u32; 8];
+                let mut sl: u32 = 0;
+                for i in 0..7 { e[i] = (idx >> (2 * i as u32)) & 0x3; sl += e[i]; }
+                let e7_high = (idx >> 14) & 0x1;
+                let p7 = e7_high << 1;
+                e[7] = p7 | ((sl + p7) & 1);
+                for i in 0..8usize {
+                    let c = (e[i] as i32 - 1) as f32;
+                    let coord = if coset == 1 { c + 0.5 } else { c };
+                    out[r * k + b * 32 + g * 8 + i] = scale * coord;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// mfp4-E8 2D: FWHT-rotate the tensor (same signs as mfp4+P), then per-row
 /// quantize_mfp4g32_e8_row. Byte layout identical to mfp4+P (NO prefix).
 /// On-disk per-256-block Hessian magic ("E8H1").
@@ -3913,6 +4082,10 @@ enum QuantType {
                        // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
                        // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
+    MFP3G32E8 = 36,    // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
+                       // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
+    MFP2G32E8 = 37,    // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
+                       // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -3957,6 +4130,8 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4P => GgufFormat::Mfp4P,
         GgufFormat::Mfp4E8 => GgufFormat::Mfp4E8,
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
+        GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
+        GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
     }
 }
 
@@ -5149,6 +5324,8 @@ enum GgufFormat {
     Mfp4P, // mfp4+P — mfp4 with E4M3 (non-power-of-2) per-block scale
     Mfp4E8, // mfp4-E8 — mfp4+P container with E8-lattice vector quantization (4 codewords/32 weights)
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
+    Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
+    Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
 }
 
 impl GgufFormat {
@@ -5170,6 +5347,8 @@ impl GgufFormat {
             "mfp4p" | "mfp4+p" | "mfp4-p" => Some(Self::Mfp4P),
             "mfp4e8" | "mfp4-e8" | "mfp4l8" => Some(Self::Mfp4E8),
             "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
+            "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
+            "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
             _ => None,
         }
     }
@@ -5192,6 +5371,8 @@ impl GgufFormat {
             Self::Mfp4P => "MFP4G32P",
             Self::Mfp4E8 => "MFP4G32E8",
             Self::Mfp4E8Soa => "MFP4G32E8SOA",
+            Self::Mfp3E8 => "MFP3G32E8",
+            Self::Mfp2E8 => "MFP2G32E8",
         }
     }
 }
@@ -5270,6 +5451,8 @@ fn run_gguf_pipeline(
             | GgufFormat::Mfp4
             | GgufFormat::Mfp4P
             | GgufFormat::Mfp4E8
+            | GgufFormat::Mfp3E8
+            | GgufFormat::Mfp2E8
     );
     let signs1 = if needs_signs {
         gen_fwht_signs(42, 256)
@@ -5434,6 +5617,18 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
+                GgufFormat::Mfp3E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp3g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+                }
+                GgufFormat::Mfp2E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+                }
                 // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
                 // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
                 // as the Base arm below; just dispatched via the promote target.
@@ -5551,6 +5746,16 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
+                GgufFormat::Mfp3E8 => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+                }
+                GgufFormat::Mfp2E8 => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -5632,6 +5837,18 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                }
+                GgufFormat::Mfp3E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp3g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+                }
+                GgufFormat::Mfp2E8 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
             }
         } else {
@@ -5869,10 +6086,12 @@ fn main() {
                     "MQ4" => QuantType::MQ4G256,
                     "MQ3L" => QuantType::MQ3G256Lloyd,
                     "MQ2L" => QuantType::MQ2G256Lloyd,
-                    "E8" | "MFP4E8" => QuantType::MFP4G32E8,
+                    "E8" | "MFP4E8" | "MFP4G32E8" => QuantType::MFP4G32E8,
+                    "MFP3E8" | "MFP3G32E8" => QuantType::MFP3G32E8,
+                    "MFP2E8" | "MFP2G32E8" => QuantType::MFP2G32E8,
                     other => {
                         eprintln!(
-                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8)",
+                            "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8/MFP3E8/MFP2E8)",
                             lineno + 1, other
                         );
                         std::process::exit(2);
@@ -7620,6 +7839,20 @@ fn main() {
                                 QuantType::MFP4G32E8,
                                 32u32,
                             ),
+                            // [NaN-CRITICAL] mfp3-E8 cold tier: 3-bit lattice, 13 B/blk, 3.25 bpw.
+                            // Drop-in for MQ3G256Lloyd (tag 3 → tag 5 in the kernel tag table).
+                            QuantType::MFP3G32E8 => (
+                                quantize_mfp3g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                QuantType::MFP3G32E8,
+                                32u32,
+                            ),
+                            // [NaN-CRITICAL] mfp2-E8 cold tier: 2-bit lattice, 9 B/blk, 2.25 bpw.
+                            // Drop-in for MQ2G256Lloyd (tag 1 → tag 6 in the kernel tag table).
+                            QuantType::MFP2G32E8 => (
+                                quantize_mfp2g32_e8_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                QuantType::MFP2G32E8,
+                                32u32,
+                            ),
                             // Any other QuantType in the map → MQ4 safe fallback
                             _ => (
                                 quantize_mq4g256(&f32_slice, &signs1, &signs2),
@@ -8219,6 +8452,24 @@ fn main() {
                                 };
                                 let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
                                 (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                            }
+                            GgufFormat::Mfp3E8 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+                            }
+                            GgufFormat::Mfp2E8 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                             }
                             GgufFormat::Hfp4 => {
                                 let m = if meta.shape.len() == 2 {
@@ -10826,6 +11077,10 @@ mod hfq_block_diag {
             20 => "MQ3G256Lloyd",
             21 => "HFP4G32",
             24 => "MFP4G32",
+            34 => "MFP4G32E8",
+            35 => "MFP4G32E8SOA",
+            36 => "MFP3G32E8",
+            37 => "MFP2G32E8",
             _ => "?",
         }
     }

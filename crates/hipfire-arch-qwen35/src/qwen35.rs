@@ -1523,6 +1523,36 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        36 => {
+            // MFP3G32E8: mfp4-E8 frame with 3-bit lattice, 13 B/blk, 3.25 bpw.
+            // Drop-in cold tier for MQ3G256Lloyd (kernel tag 5).
+            assert!(k % 256 == 0, "MFP3G32E8 has K={k} but FWHT requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP3G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        37 => {
+            // MFP2G32E8: mfp4-E8 frame with 2-bit lattice, 9 B/blk, 2.25 bpw.
+            // Drop-in cold tier for MQ2G256Lloyd (kernel tag 6).
+            assert!(k % 256 == 0, "MFP2G32E8 has K={k} but FWHT requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP2G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
@@ -2931,6 +2961,104 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                         ]);
                         for i in 0..8usize {
                             out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode_soa(idx, i);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        36 => {
+            // MFP3G32E8 (qt 36): mfp4-E8 frame with 3-bit lattice, 13 B/blk, center 4.
+            // Decode mirrors kernel mfp3_decode_index: nibbles 3b, coset bit 23, e7_high 2b@21.
+            #[inline]
+            fn e4m3_mfp3(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            const MFP3_BLOCK: usize = 13; // 1 + 4*3
+            const MFP3_STEP: f32 = 1.8; // MSE-tuned; matches QUANT_STEP_MFP3 in e8.rs + kernels
+            let row_bytes = 16 + MFP3_BLOCK * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * MFP3_BLOCK);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * MFP3_BLOCK;
+                    let scale = row_scale_a * e4m3_mfp3(data[po]) * MFP3_STEP;
+                    for g in 0..4usize {
+                        let cw_off = po + 1 + g * 3;
+                        // 3-byte narrow read (mfp3 codeword is only 24 bits)
+                        let idx: u32 = (data[cw_off] as u32)
+                            | ((data[cw_off + 1] as u32) << 8)
+                            | ((data[cw_off + 2] as u32) << 16);
+                        // mfp3_decode_index: 3-bit nibbles, center 4, coset bit 23, e7_high @21 (2b)
+                        let coset = (idx >> 23) & 1;
+                        let mut e = [0u32; 8];
+                        let mut sl: u32 = 0;
+                        for i in 0..7 { e[i] = (idx >> (3 * i as u32)) & 0x7; sl += e[i]; }
+                        let e7_high = (idx >> 21) & 0x3;
+                        let p7 = e7_high << 1;
+                        e[7] = p7 | ((sl + p7) & 1);
+                        for i in 0..8usize {
+                            let c = (e[i] as i32 - 4) as f32;
+                            let coord = if coset == 1 { c + 0.5 } else { c };
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
+                        }
+                    }
+                }
+            }
+            out
+        }
+        37 => {
+            // MFP2G32E8 (qt 37): mfp4-E8 frame with 2-bit lattice, 9 B/blk, center 2.
+            // Decode mirrors kernel mfp2_decode_index: nibbles 2b, coset bit 15, e7_high 1b@14.
+            #[inline]
+            fn e4m3_mfp2(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            const MFP2_BLOCK: usize = 9; // 1 + 4*2
+            const MFP2_STEP: f32 = 3.8; // MSE-tuned; matches QUANT_STEP_MFP2 in e8.rs + kernels
+            let row_bytes = 16 + MFP2_BLOCK * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * MFP2_BLOCK);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * MFP2_BLOCK;
+                    let scale = row_scale_a * e4m3_mfp2(data[po]) * MFP2_STEP;
+                    for g in 0..4usize {
+                        let cw_off = po + 1 + g * 2;
+                        // 2-byte narrow read (mfp2 codeword is only 16 bits)
+                        let idx: u32 = (data[cw_off] as u32) | ((data[cw_off + 1] as u32) << 8);
+                        // mfp2_decode_index: 2-bit nibbles, center 2, coset bit 15, e7_high @14 (1b)
+                        let coset = (idx >> 15) & 1;
+                        let mut e = [0u32; 8];
+                        let mut sl: u32 = 0;
+                        for i in 0..7 { e[i] = (idx >> (2 * i as u32)) & 0x3; sl += e[i]; }
+                        let e7_high = (idx >> 14) & 0x1;
+                        let p7 = e7_high << 1;
+                        e[7] = p7 | ((sl + p7) & 1);
+                        for i in 0..8usize {
+                            let c = (e[i] as i32 - 2) as f32;
+                            let coord = if coset == 1 { c + 0.5 } else { c };
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
                         }
                     }
                 }
@@ -4910,10 +5038,11 @@ fn load_moe_ffn(
     //   2 = MQ4G256      (136 B/group affine)
     //   3 = MQ3G256Lloyd (112 B/group codebook)
     //   4 = MFP4G32E8    (16 B row hdr + (K/32)*17 B; E8 lattice VQ, 4.25 bpw)
+    //   5 = MFP3G32E8    (16 B row hdr + (K/32)*13 B; 3-bit E8 lattice, 3.25 bpw)
+    //   6 = MFP2G32E8    (16 B row hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
     // Uniform files see gu0==gu_n and dn0==dn_n → None (byte-identical).
-    // NOTE: tag 4 is decoded by the per-token mixed gemv kernels only; the
-    // batched grouped-WMMA kernel does NOT yet carry an E8 branch, so graded-E8
-    // must run per-token (HIPFIRE_PREFILL_BATCHED=0) until that lands.
+    // All E8 tags (4, 5, 6) are decoded by BOTH the per-token mixed gemv kernels
+    // AND the batched grouped-WMMA kernels (gfx11 _k2 and gfx12 .gfx12).
     // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
     // lever); for the existing down-only graded binary the gate_up types are
     // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
@@ -4952,7 +5081,9 @@ fn load_moe_ffn(
                         match e.down.gpu_dtype {
                             DType::MQ6G256 => 0u8,       // hot (gu4 dn6 mixed)
                             DType::MQ2G256Lloyd => 1u8,  // cold MQ2L
+                            DType::MFP2G32E8 => 6u8,     // cold mfp2-E8
                             DType::MQ3G256Lloyd => 3u8,  // cold MQ3L
+                            DType::MFP3G32E8 => 5u8,     // cold mfp3-E8
                             _ => 2u8,                    // default MQ4
                         }
                     }
@@ -4961,6 +5092,14 @@ fn load_moe_ffn(
                     // for these experts (tier applies to both); the mixed gemv
                     // kernels decode tag 4 via e8_row_partial.
                     DType::MFP4G32E8 => 4u8,
+                    // [NaN-CRITICAL] mfp3-E8 graded cold tier (tag 5).
+                    // Both gate_up AND down carry MFP3G32E8; the merged gemv kernels
+                    // decode tag 5 via mfp3e8_row_partial (3-bit lattice, 13 B/blk).
+                    DType::MFP3G32E8 => 5u8,
+                    // [NaN-CRITICAL] mfp2-E8 graded cold tier (tag 6).
+                    // Both gate_up AND down carry MFP2G32E8; the merged gemv kernels
+                    // decode tag 6 via mfp2e8_row_partial (2-bit lattice, 9 B/blk).
+                    DType::MFP2G32E8 => 6u8,
                     _ => 2u8,  // default: treat unknown tiers as MQ4
                 })
                 .collect();
@@ -7516,7 +7655,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // whole model when an attention tensor is E8 (unlikely today, but correct
     // defensively). The real admission gate for the FFN body is
     // `moe_ffn_batched_admissible`.
-    let e8_with_wmma = matches!(dt, DType::MFP4G32E8)
+    let e8_with_wmma = matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
         && matches!(
             arch,
             "gfx1100" | "gfx1101" | "gfx1102"
@@ -7729,36 +7868,38 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // The batched body runs a dedicated Q8 shared-expert path (two plain Q8
     // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
     // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
+    // E8-family match helper: MFP4, MFP3, MFP2 lattice types.
+    let is_e8_family = |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
+
     if admit_e8
         && dtypes.shared_expert_gate == DType::Q8_0
         && dtypes.shared_expert_up == DType::Q8_0
         && dtypes.shared_expert_down == DType::Q8_0
-        && dtypes.expert_gate_up == DType::MFP4G32E8
-        && dtypes.expert_down == DType::MFP4G32E8
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
     {
         return true;
     }
 
-    // Uniform mfp4-E8: BOTH shared AND routed experts are MFP4G32E8 (Option B
-    // from the implementation spec). Router + shared_expert_gate (scalar) remain
-    // Q8 (validated above). The batched body dequants the shared expert E8→F16
-    // transiently and runs `gemm_f16_wmma_mb8` against `x_rot_batch` (FWHT-
-    // rotated activations), then the routed experts go through the indexed E8
-    // batched GEMV path. The dequant→F16 path requires has_wmma_w32 (gfx11+),
-    // which `admit_e8` already gates on arch, so no additional arch check here.
+    // Uniform mfp4/mfp3/mfp2-E8: BOTH shared AND routed experts are E8-family
+    // (Option B from the implementation spec). Router + shared_expert_gate
+    // (scalar) remain Q8 (validated above). The batched body dequants the shared
+    // expert E8→F16 transiently and runs `gemm_f16_wmma_mb8` against
+    // `x_rot_batch` (FWHT-rotated activations), then the routed experts go
+    // through the indexed E8 batched GEMV path. The dequant→F16 path requires
+    // has_wmma_w32 (gfx11+), which `admit_e8` already gates on arch.
     if admit_e8
-        && dtypes.expert_gate_up == DType::MFP4G32E8
-        && dtypes.expert_down == DType::MFP4G32E8
-        // Shared expert may be per-projection MIXED — this checkpoint has
-        // gate/up=E8 with down=Q8 on some layers. gate+up are dispatched
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
+        // Shared expert may be per-projection MIXED — gate+up are dispatched
         // together (one match on gate's dtype) so they must share a dtype;
-        // down is matched independently. The batched body handles Q8
-        // (un-rotated) and E8 (dequant→f16, x_rot) per projection and keys
-        // the SwiGLU rotate on the down dtype, so any {Q8,E8} combination of
-        // (gate==up, down) is correct.
+        // down is matched independently. The batched body handles Q8 (un-rotated)
+        // and E8 (dequant→f16, x_rot) per projection and keys the SwiGLU rotate
+        // on the down dtype, so any {Q8,E8-family} combination of (gate==up,down)
+        // is correct.
         && dtypes.shared_expert_gate == dtypes.shared_expert_up
-        && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8)
-        && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8)
+        && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+        && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
     {
         return true;
     }

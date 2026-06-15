@@ -48,14 +48,17 @@ pub struct MoeDtypes {
     pub routed_down: DType,          // ffn.experts[0].down
     /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
     /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
-    /// or MQ3L cold), so `routed_gate_up` / `routed_down` (= experts[0])
-    /// are NOT representative. Built by the model as
+    /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
+    /// (= experts[0]) are NOT representative. Built by the model as
     /// `ffn.expert_dtype_tags.is_some()` — the tag table is built iff any
     /// expert's gate_up or down dtype differs from experts[0]. Tags:
-    ///   0 = MQ6G256 (200 B/grp affine)
-    ///   1 = MQ2G256Lloyd (72 B/grp codebook)
-    ///   2 = MQ4G256 (136 B/grp affine)
-    ///   3 = MQ3G256Lloyd (112 B/grp codebook)
+    ///   0 = MQ6G256       (200 B/grp affine)
+    ///   1 = MQ2G256Lloyd  ( 72 B/grp codebook)
+    ///   2 = MQ4G256       (136 B/grp affine)
+    ///   3 = MQ3G256Lloyd  (112 B/grp codebook)
+    ///   4 = MFP4G32E8     (16 B hdr + (K/32)*17 B; 4-bit E8 lattice, 4.25 bpw)
+    ///   5 = MFP3G32E8     (16 B hdr + (K/32)*13 B; 3-bit E8 lattice, 3.25 bpw)
+    ///   6 = MFP2G32E8     (16 B hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
     /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
@@ -143,12 +146,14 @@ impl MoeResolution {
         // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
         // gate_up GEMV; the merged dtype-tag kernel serves the down step.
         let routed_indexable_mixed_per_expert = d.routed_has_mixed_experts;
-        // mfp4-E8 grouped experts (RDNA3 wave32-WMMA): uniform E8 gate_up + down →
-        // the gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels. FWHT-rotated
-        // (FwhtG256), same as MQ4, so the shared silu+mul+rotate plumbing applies.
-        let routed_gate_up_e8 = d.routed_gate_up == MFP4G32E8;
-        let routed_indexable_e8 =
-            arch_has_e8_wmma && routed_gate_up_e8 && d.routed_down == MFP4G32E8;
+        // mfp4/mfp3/mfp2-E8 grouped experts (RDNA3 wave32-WMMA): uniform E8-family
+        // gate_up + down → the gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels
+        // (for uniform E8 models). FWHT-rotated (FwhtG256), same as MQ4, so the
+        // shared silu+mul+rotate plumbing applies. Graded mixed-E8 uses the tag-table
+        // path (routed_indexable_mixed_per_expert) rather than this uniform arm.
+        let routed_gate_up_e8 = matches!(d.routed_gate_up, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
+        let routed_indexable_e8 = arch_has_e8_wmma && routed_gate_up_e8
+            && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq5
@@ -551,7 +556,8 @@ impl MoePrefillResolution {
         // gfx1100 through Path 2 and re-measure. Only ever active under the
         // HIPFIRE_E8_GFX12 batched-prefill gate.
         let e8_no_grouped =
-            d.routed_gate_up == DType::MFP4G32E8 && !(arch.is_rdna3() || arch.is_rdna4());
+            matches!(d.routed_gate_up, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+            && !(arch.is_rdna3() || arch.is_rdna4());
         let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.

@@ -178,6 +178,8 @@ pub enum DType {
     //   + [n_blocks B: E4M3 scales, pad to 16B boundary]
     //   + [n_blocks*16 B: 4xu32 E8 codewords/block, 16B-aligned].
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
+    MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
+    MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -222,6 +224,8 @@ impl DType {
             | DType::MFP4G32P
             | DType::MFP4G32E8
             | DType::MFP4G32E8SOA
+            | DType::MFP3G32E8
+            | DType::MFP2G32E8
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }

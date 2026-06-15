@@ -35,6 +35,15 @@ typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
 // mfp4-E8 (tag 4) decode helpers — byte-identical to
 // gemm_mfp4g32_e8_moe_grouped_wmma.gfx12.hip.
+//
+// Tags 5 and 6 extend the E8 family to narrower nibble widths:
+//   tag 5 = mfp3-E8: 3-bit nibbles, 13 B/block, 104 B/group, center 4, coset bit 23
+//   tag 6 = mfp2-E8: 2-bit nibbles,  9 B/block,  72 B/group, center 2, coset bit 15
+//
+// QUANT_STEP constants MUST match crates/hipfire-quantize/src/e8.rs.
+#define QUANT_STEP_MFP3 1.8f
+#define QUANT_STEP_MFP2 3.8f
+
 __device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
     const unsigned mant = (unsigned)(b & 0x7);
@@ -53,6 +62,32 @@ __device__ __forceinline__ void e8_decode_index(unsigned int idx, float p[8]) {
     const unsigned int lsb = (sl + p7) & 1u;
     e[7] = p7 | lsb;
     for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 7); p[i] = coset ? c + 0.5f : c; }
+}
+
+// mfp3-E8 (tag 5): 3-bit nibbles, center 4, coset bit 23, e7_high 2b @ bit 21.
+// Center 4 (box [-4,3]) matches coord_bias_n(3)=4 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp3_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 23) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(3 * i)) & 0x7u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 21) & 0x3u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 4); p[i] = coset ? c + 0.5f : c; }
+}
+
+// mfp2-E8 (tag 6): 2-bit nibbles, center 2, coset bit 15, e7_high 1b @ bit 14.
+// Center 2 (box [-2,1]) matches coord_bias_n(2)=2 in e8.rs (MSE-tuned recenter).
+__device__ __forceinline__ void mfp2_decode_index(unsigned int idx, float p[8]) {
+    const int coset = (int)((idx >> 15) & 1u);
+    unsigned int e[8];
+    unsigned int sl = 0u;
+    for (int i = 0; i < 7; i++) { e[i] = (idx >> (unsigned)(2 * i)) & 0x3u; sl += e[i]; }
+    const unsigned int e7_high = (idx >> 14) & 0x1u;
+    const unsigned int p7 = e7_high << 1;
+    e[7] = p7 | ((sl + p7) & 1u);
+    for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 2); p[i] = coset ? c + 0.5f : c; }
 }
 
 __launch_bounds__(32, 2)
@@ -401,6 +436,77 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
                     *(const unsigned int*)(block_ptr + 1 + (cw_base + k_grp) * 4);
                 float p[8];
                 e8_decode_index(cw, p);
+                half8_t a_reg;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) a_reg[i] = (_Float16)(p[i] * ssc);
+                half8_t b = (xg != nullptr)
+                    ? *(const half8_t*)(xg + k_off + k_grp * 8) : zero_b;
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b, acc);
+            }
+        }
+    } else if (tag == 5) {
+        // ----- mfp3-E8 (16 B row hdr + (K/32)*13 B; 104 B/group) ------------
+        // Same structure as tag 4 but block_stride=13, group_stride=104, 3-byte codewords.
+        // k_grp selects which of the two 3-byte codewords to decode:
+        //   offset = block_ptr + 1 + (cw_base + k_grp) * 3  (narrow 3-byte read).
+        // The last cw (cw_base+1, k_grp=1) of the last block of the last group
+        // sits at block_ptr+1+(2+1)*3=+10 within a 13-byte block → no over-read.
+        const int row_block_bytes = (K / 32) * 13;
+        const char* e8_row_ptr =
+            A + (long long)safe_row * (16 + (long long)row_block_bytes);
+        const float row_scale_f =
+            (float)__builtin_bit_cast(_Float16, *(const unsigned short*)e8_row_ptr);
+        const char* blocks_ptr = e8_row_ptr + 16;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* group_ptr = blocks_ptr + (long long)g * 104;
+            const _Float16* xg = (x_base != nullptr) ? (x_base + (long long)g * 256) : nullptr;
+            for (int kt = 0; kt < 16; kt++) {
+                const int k_off = kt * 16;
+                const int block_idx = k_off >> 5;            // 0..7
+                const char* block_ptr = group_ptr + (long long)block_idx * 13;
+                const float ssc = row_scale_f
+                    * cvt_e4m3_scale_to_f32(*(const unsigned char*)block_ptr) * QUANT_STEP_MFP3;
+                const int cw_base = (k_off & 31) >> 3;        // 0 or 2
+                // Narrow 3-byte read — safe for all positions including last block.
+                const unsigned char* w = (const unsigned char*)(block_ptr + 1 + (cw_base + k_grp) * 3);
+                const unsigned int cw = (unsigned)w[0] | ((unsigned)w[1] << 8) | ((unsigned)w[2] << 16);
+                float p[8];
+                mfp3_decode_index(cw, p);
+                half8_t a_reg;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) a_reg[i] = (_Float16)(p[i] * ssc);
+                half8_t b = (xg != nullptr)
+                    ? *(const half8_t*)(xg + k_off + k_grp * 8) : zero_b;
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b, acc);
+            }
+        }
+    } else if (tag == 6) {
+        // ----- mfp2-E8 (16 B row hdr + (K/32)*9 B; 72 B/group) -------------
+        // Same structure as tag 4 but block_stride=9, group_stride=72, 2-byte codewords.
+        // k_grp selects which 2-byte codeword: offset = (cw_base + k_grp) * 2.
+        // Last cw (cw_base=2, k_grp=1) sits at block_ptr+1+3*2=+7 within 9-byte block
+        // and reads 2 bytes (+7,+8) → exactly within the block, no over-read.
+        const int row_block_bytes = (K / 32) * 9;
+        const char* e8_row_ptr =
+            A + (long long)safe_row * (16 + (long long)row_block_bytes);
+        const float row_scale_f =
+            (float)__builtin_bit_cast(_Float16, *(const unsigned short*)e8_row_ptr);
+        const char* blocks_ptr = e8_row_ptr + 16;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* group_ptr = blocks_ptr + (long long)g * 72;
+            const _Float16* xg = (x_base != nullptr) ? (x_base + (long long)g * 256) : nullptr;
+            for (int kt = 0; kt < 16; kt++) {
+                const int k_off = kt * 16;
+                const int block_idx = k_off >> 5;            // 0..7
+                const char* block_ptr = group_ptr + (long long)block_idx * 9;
+                const float ssc = row_scale_f
+                    * cvt_e4m3_scale_to_f32(*(const unsigned char*)block_ptr) * QUANT_STEP_MFP2;
+                const int cw_base = (k_off & 31) >> 3;        // 0 or 2
+                // Narrow 2-byte read — safe for all positions.
+                const unsigned char* w = (const unsigned char*)(block_ptr + 1 + (cw_base + k_grp) * 2);
+                const unsigned int cw = (unsigned)w[0] | ((unsigned)w[1] << 8);
+                float p[8];
+                mfp2_decode_index(cw, p);
                 half8_t a_reg;
                 #pragma unroll
                 for (int i = 0; i < 8; i++) a_reg[i] = (_Float16)(p[i] * ssc);
