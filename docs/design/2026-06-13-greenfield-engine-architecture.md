@@ -73,6 +73,8 @@ Runtime (enum)                          // per-arch mutable state lives INSIDE e
                       pager:  Option<WeightPager>,   // HOISTED out of Qwen35Weights; plain &mut, no RefCell
                       spec:   Option<Spec>,           // draft+rings+tape NESTED here, not a sibling
                       vision: Option<VisionState> })
+//                    ep:     Option<EpRanks>         ← FUTURE (rehome C, §6.1): folds today's sibling
+//                                                       EpState/EpArch (lib.rs:431-449) in; gated on THIS core
 
 Spec  └─ { draft: DraftModel, rings: DflashRings, tape: GdnTape }   // ex-DflashState, co-located
 ```
@@ -237,6 +239,50 @@ by what it can touch **today**:
 Selection replaces the `arch_id ==` ladder with a pure function of the load-time `Capabilities` +
 request (`arch_id == 7/9/10/11` vanish — those arches just want plain AR).
 
+### 6.1 EP rehome — current state and staged future steps (qwen35 `Forward::Custom` prerequisite)
+
+`qwen35` can't be declared `Forward::Custom` (§7 / BET 2) while EP is a sibling ownership universe.
+Correcting the record before the work:
+
+**Shape (correction).** EP is **not** a pre-forward `Stage`. Its collective is a **per-MoE-layer
+all-reduce interleaved in the layer loop** (`hipfire-runtime/src/ep.rs:73` `run_layer_program_ep`:
+zero → owned experts → `all_reduce_sum_f32` → add-back, per `Moe` op). Layer *N+1*'s replicated
+attention must read the cross-rank-summed residual from layer *N*, so it cannot be hoisted. EP is a
+**multi-rank transport variant wrapping the per-layer program loop** — same bucket as PP, not as VL
+splice. (The companion doc's "awkward 10%" bullet is corrected to match.)
+
+**Current state (verified).**
+- The per-layer collective seam is **already shared**: `run_layer_program_ep<B: ForwardBindings>`
+  owns the whole zero/experts/all-reduce/add lifecycle; qwen35/ds4/minimax each supply only a
+  `ForwardBindings` impl. Not duplicated.
+- What **is** duplicated 3× is the **outer driver** (embed-per-rank → loop layers building N
+  bindings + call the shared executor → rank-0 norm+lm_head → sync): `qwen35.rs:11087`
+  (`forward_ep`) + `forward_prefill_batch_ep`, deepseek4 `forward.rs:~2187`, minimax
+  `forward.rs:~1144`.
+- **qwen35 EP is substrate-only — not reachable from the daemon.** `EpArch` (`lib.rs:436`) has only
+  `Ds4`/`Minimax`; qwen35's EP functions are exercised only by `ep_decode_parity.rs`.
+- EP weights are **replicated**, only MoE experts sharded; the only cross-rank divergence is at
+  `Moe` (ep.rs:19-23) — which is why EP needs no attention-sharding seam.
+
+**Staged steps (only C unblocks `Forward::Custom`).**
+- **A — generic EP driver dedup (doable NOW, no core dependency).** Extract the duplicated outer
+  driver from qwen35/ds4/minimax into one generic driver in `hipfire-runtime` over a small per-arch
+  trait, reusing `run_layer_program_ep`. Shrinks the future-C surface (3 drivers → 1). Lifetime-heavy
+  (per-layer `Vec<Bindings>` borrowing `kv_per_rank.iter_mut()`); touches live ds4/minimax EP → must
+  hold byte-parity (`ep_decode_parity.rs` + multi-GPU coherence on hiptrx).
+- **B — wire qwen35 EP to the daemon (orthogonal product value).** Add `EpArch::Qwen35` +
+  `load_model_ep`/`generate_ep` arms so qwen35-A3B EP is usable across hiptrx (4×gfx1201).
+  Mechanical, but **adds** EP surface — moves *away* from C; validate on hiptrx (ssh), not locally.
+- **C — full rehome (the actual unblock; gated on the core Runtime-enum refactor).** Fold
+  `EpState`/`EpArch` into `Runtime::Qwen35Rt.ep` (§2) so EP becomes one *transport mode* of the
+  arch's own runtime; delete the sibling state + `generate_ep` fork. Only then is "the qwen35
+  forward" one thing that `Forward::Custom(qwen35_forward)` can name. Large; can't start until the
+  core lands (and its unified-contract form was already rejected 3× — see
+  `archspec-and-dyn-boundary.md` §2).
+
+**Dependency:** core Runtime-enum (NOT landed) → C → coherent qwen35 `Forward::Custom` (BET 2).
+A is independent prep; B is orthogonal.
+
 ---
 
 ## 7. BET 2 (deferred) — `ArchSpec` authoring surface
@@ -302,7 +348,9 @@ a vLLM-style rewrite.
    arch on both paths past one merge (CI gate: fail if a `generate_*` and its `Runtime` arm coexist for
    the same `arch_id`). This bounds the two-path window *per arch*, not globally.
 4. **Migrate arch-by-arch** (qwen2 → qwen35 dense → qwen35 hybrid → ds4/minimax/lfm2moe → VL),
-   deleting each old path on green. Grammar stays per-arch.
+   deleting each old path on green. Grammar stays per-arch. **EP folds in here (§6.1 rework C):
+   `EpState`/`EpArch` collapse into the arch's `Runtime` variant as the ds4/minimax/qwen35 arms
+   migrate; the §6.1 step-A driver dedup may land independently beforehand to shrink that fold.**
 5. **BET 1 — spec unification** (own doc): `Speculative<T>` + `SpecForm` selector + linear/tree verify
    + `proposer/verifier/staging/cache`. After ≥2 arches on `Runtime`.
 6. **BET 2 — `ArchSpec`** (companion doc). After ≥2 dense arches validate `DenseTransformer`.

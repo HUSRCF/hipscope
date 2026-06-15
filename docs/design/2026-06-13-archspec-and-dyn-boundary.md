@@ -223,10 +223,15 @@ becomes "an arch whose `advance` commits N and whose constructor took two models
   SamplerStrategy` over a bool — declaring == implementing) + a `cargo test` conformance check
   (`caps.spec==DFlash ⟹ dflash present`) to stop drift; `mut_state: &[StateKind]` is
   documentation, *not* compile-time borrow safety (the actual `&mut` in `advance` is).
-- **The awkward 10% as DATA.** VL splice / EP gather become daemon-composed pre-forward
-  `Stage`s so `advance` always sees assembled hidden states; the ~10 spec entrypoints become a
-  `StepPlan` value over the **`execute_steps` op-list llama already runs** (N6). Novel kernels
-  (DeltaNet/MoE/MLA) stay hand-written, referenced by name — data wires, code does the math.
+- **The awkward 10% as DATA — but VL and EP are different shapes.** *VL splice* genuinely *is*
+  pre-forward: the vision tower runs once and embeddings are spliced in before any layer, so a
+  daemon-composed pre-forward `Stage` fits and `advance` sees assembled hidden states. *EP is
+  NOT pre-forward* — its all-reduce is a **per-MoE-layer collective interleaved inside the layer
+  loop** (`hipfire-runtime/src/ep.rs:73`), so it is a **multi-rank transport variant wrapping the
+  per-layer program loop**, not a gather. See the greenfield doc §6.1 for the EP-rehome staging.
+  The ~10 spec entrypoints become a `StepPlan` value over the **`execute_steps` op-list llama
+  already runs** (N6); novel kernels (DeltaNet/MoE/MLA) stay hand-written, referenced by name —
+  data wires, code does the math.
 
 #### Constraint is genuinely two-shaped — and must not be faked
 
