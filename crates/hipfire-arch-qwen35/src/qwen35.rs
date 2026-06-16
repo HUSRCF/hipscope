@@ -6140,17 +6140,18 @@ pub fn forward_scratch(
     // change between forward calls; cache once and read atomically.
     static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for MoE models.
-    // Default-off pending cross-arch A/B validation. Both root causes of the
-    // previous crash/drift are now fixed:
+    // Default-ON (2026-06-16): cross-arch A/B validated — gfx12 +4.2% A3B mq4
+    // decode, coherence-gate clean (fluent at decode pos 1-4 on current ROCm).
+    // Opt-out via HIPFIRE_GRAPH_MOE=0. Both root causes of the prior
+    // crash/drift are fixed:
     //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
     //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
     //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
     //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
     //      crashes with hipError 906 under HIPFIRE_AR_GRAPH=1.
-    // Once arch A/B validated, flip default to `true`.
+    // Validated + flipped to default-on 2026-06-16 (was opt-in HIPFIRE_GRAPH_MOE=1).
     let allow_moe = *ALLOW_MOE_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1"));
+        .get_or_init(|| std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"));
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -6178,7 +6179,10 @@ pub fn forward_scratch(
         });
     let graph_arch_default = gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
     let graph_enabled = graph_override.unwrap_or(graph_arch_default);
-    // AR-forward hipGraph DISABLED (2026-05-15) — this disable SUPERSEDES the
+    // AR-forward hipGraph RE-ENABLED (2026-06-16) — the kernarg-snapshot attractor
+    // is re-verified GONE on current ROCm (HIP 7.x, coherence-gate clean, fluent at
+    // decode pos 1-4 on gfx12 A3B mq4). Opt-out via HIPFIRE_AR_GRAPH=0. The prior
+    // 2026-05-15 disable rationale is retained below; it SUPERSEDED the
     // arch-default re-enable merged from master (`graph_enabled` above is kept
     // live so the HIPFIRE_GRAPH parse and kill switch stay wired for when the
     // path is flipped back on). Empirically on ROCm 7.2.2 + gfx11 +
@@ -6202,7 +6206,7 @@ pub fn forward_scratch(
     // `graph_enabled`.
     static AR_GRAPH_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ar_graph_test = *AR_GRAPH_TEST
-        .get_or_init(|| std::env::var("HIPFIRE_AR_GRAPH").ok().as_deref() == Some("1"));
+        .get_or_init(|| std::env::var("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"));
     // AR-forward hipGraph eligibility. Plain sequential single-token AR decode
     // is eligible BY DEFAULT (the consume below resets to true); spec-decode /
     // MTP re-seed and the verify/prefill batch path explicitly set this FALSE
