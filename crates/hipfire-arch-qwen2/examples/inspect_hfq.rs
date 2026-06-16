@@ -21,7 +21,9 @@ use rdna_compute::Gpu;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().ok_or("usage: inspect_hfq <path.hfq> [--load]")?;
+    let path = args
+        .first()
+        .ok_or("usage: inspect_hfq <path.hfq> [--load]")?;
     let do_load = args.iter().any(|a| a == "--load");
 
     let mut hfq = HfqFile::open(Path::new(path))?;
@@ -56,9 +58,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  embd_format:   {:?}", weights.embd_format);
         // Sanity: the first layer's WQ weight should match config dims.
         let l0 = &weights.layers[0];
-        println!("  layer 0 wq:    m={}, k={}, dtype={:?}", l0.wq.m, l0.wq.k, l0.wq.gpu_dtype);
-        println!("  layer 0 wk:    m={}, k={}, dtype={:?}", l0.wk.m, l0.wk.k, l0.wk.gpu_dtype);
-        println!("  output:        m={}, k={}, dtype={:?}", weights.output.m, weights.output.k, weights.output.gpu_dtype);
+        println!(
+            "  layer 0 wq:    m={}, k={}, dtype={:?}",
+            l0.wq.m, l0.wq.k, l0.wq.gpu_dtype
+        );
+        println!(
+            "  layer 0 wk:    m={}, k={}, dtype={:?}",
+            l0.wk.m, l0.wk.k, l0.wk.gpu_dtype
+        );
+        println!(
+            "  output:        m={}, k={}, dtype={:?}",
+            weights.output.m, weights.output.k, weights.output.gpu_dtype
+        );
     }
 
     Ok(())

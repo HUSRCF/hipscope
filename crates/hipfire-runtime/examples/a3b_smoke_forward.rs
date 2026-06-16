@@ -66,7 +66,8 @@ fn main() {
         );
         eprintln!("Loading weights via safetensors (ParoQuant path) ...");
         let weights = {
-            let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
+            let mut paro_source =
+                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
             let paro_layout = qwen35::Layout::single(config.n_layers);
             qwen35::load_weights(
                 &mut paro_source,

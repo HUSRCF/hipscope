@@ -133,12 +133,8 @@ fn main() {
     assert_eq!(config.vocab_size, ref_n_vocab, "oracle vocab != ref vocab");
     let mut src_o = qwen35::HfqSource::new(&mut hfq_o, &config);
     let layout_o = qwen35::Layout::single(config.n_layers);
-    let weights_o = qwen35::load_weights(
-        &mut src_o,
-        std::slice::from_mut(&mut gpu),
-        &layout_o,
-    )
-    .expect("load oracle");
+    let weights_o = qwen35::load_weights(&mut src_o, std::slice::from_mut(&mut gpu), &layout_o)
+        .expect("load oracle");
     eprintln!("loaded oracle ({} layers)", weights_o.layers.len());
 
     let (cfg_c, weights_c) = if candidate.is_dir() {
@@ -147,24 +143,16 @@ fn main() {
         let cfg_c = qwen35::config_from_safetensors(&source).expect("cand config");
         let mut paro_c = qwen35::ParoSource::new(&source, &cfg_c).expect("ParoSource::new");
         let layout_c = qwen35::Layout::single(cfg_c.n_layers);
-        let w = qwen35::load_weights(
-            &mut paro_c,
-            std::slice::from_mut(&mut gpu),
-            &layout_c,
-        )
-        .expect("load_weights");
+        let w = qwen35::load_weights(&mut paro_c, std::slice::from_mut(&mut gpu), &layout_c)
+            .expect("load_weights");
         (cfg_c, w)
     } else {
         let mut hfq_c = HfqFile::open(&candidate).expect("open candidate");
         let cfg_c = qwen35::config_from_hfq(&hfq_c).expect("cand config");
         let mut src_c = qwen35::HfqSource::new(&mut hfq_c, &cfg_c);
         let layout_c = qwen35::Layout::single(cfg_c.n_layers);
-        let w = qwen35::load_weights(
-            &mut src_c,
-            std::slice::from_mut(&mut gpu),
-            &layout_c,
-        )
-        .expect("load cand");
+        let w = qwen35::load_weights(&mut src_c, std::slice::from_mut(&mut gpu), &layout_c)
+            .expect("load cand");
         (cfg_c, w)
     };
     assert_eq!(

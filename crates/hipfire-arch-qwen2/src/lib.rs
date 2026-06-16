@@ -77,4 +77,4 @@ pub mod carrier;
 pub mod qwen2;
 
 pub use arch::Qwen2;
-pub use carrier::{Qwen2Bundle, load_bundle as load_qwen2_bundle};
+pub use carrier::{load_bundle as load_qwen2_bundle, Qwen2Bundle};

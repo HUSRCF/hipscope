@@ -13804,8 +13804,16 @@ mod tests {
         assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1151", true));
         assert!(!q8_prefill_wmma_enabled_from_env(None, "gfx1030", false));
         assert!(q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1151", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(Some("0"), "gfx1201", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1030", false));
+        assert!(!q8_prefill_wmma_enabled_from_env(
+            Some("0"),
+            "gfx1201",
+            true
+        ));
+        assert!(!q8_prefill_wmma_enabled_from_env(
+            Some("1"),
+            "gfx1030",
+            false
+        ));
     }
 
     #[test]

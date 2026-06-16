@@ -70,8 +70,8 @@ fn main() {
     // Stage 1: weights via load_weights (multi-GPU)
     let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
-    let weights = qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout)
-        .expect("load_weights");
+    let weights =
+        qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout).expect("load_weights");
     let after_weights = used_gb(&gpus, &baseline_free);
     let weights_delta: Vec<f64> = after_weights
         .iter()

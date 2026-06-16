@@ -129,9 +129,8 @@ fn main() {
         );
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
         let layout = qwen35::Layout::single(config.n_layers);
-        let weights =
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-                .expect("load weights");
+        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+            .expect("load weights");
         (config, weights, bytes)
     };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());

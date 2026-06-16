@@ -142,11 +142,7 @@ fn main() {
         let weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &q35_config);
             let layout = qwen35::Layout::single(q35_config.n_layers);
-            qwen35::load_weights(
-                &mut src,
-                std::slice::from_mut(&mut gpu),
-                &layout,
-            )
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
         }
         .expect("failed to load weights");
         eprintln!("Loaded {} layers", weights.layers.len());

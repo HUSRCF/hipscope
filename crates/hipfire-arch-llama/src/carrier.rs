@@ -1,7 +1,7 @@
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
-use hipfire_runtime::loader_api::{ModelSource, LoadCtx};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct LlamaBundle {
     pub config: LlamaConfig,
@@ -26,5 +26,10 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         ctx.max_seq,
     )
     .map_err(|e| format!("llama: KvCache::new_gpu_q8 failed: {e}"))?;
-    Ok(LlamaBundle { config, weights, scratch, kv })
+    Ok(LlamaBundle {
+        config,
+        weights,
+        scratch,
+        kv,
+    })
 }

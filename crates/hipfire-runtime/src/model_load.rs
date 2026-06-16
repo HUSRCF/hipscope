@@ -19,7 +19,10 @@ pub struct Layout {
 }
 impl Layout {
     pub fn single(n_layers: usize) -> Self {
-        Self { output_device: 0, layer_to_device: vec![0; n_layers] }
+        Self {
+            output_device: 0,
+            layer_to_device: vec![0; n_layers],
+        }
     }
     pub fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
         Self {
