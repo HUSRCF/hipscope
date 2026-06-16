@@ -730,10 +730,10 @@ fn load_weight_tensor(
     let st_name = candidates(name)
         .into_iter()
         .find(|c| hfq.find_tensor_info(c).is_some())
-        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
     let (info, data) = hfq
         .tensor_data(&st_name)
-        .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {st_name}")))?;
 
     let mut wt = match info.quant_type {
         1 => {
@@ -759,7 +759,10 @@ fn load_weight_tensor(
         }
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name),
-            None => panic!("unsupported quant_type {other} for weight {st_name}"),
+            None => Err(HipError::new(
+                0,
+                &format!("unsupported quant_type {other} for weight {st_name}"),
+            )),
         },
     }?;
     // Centralized AWQ sidecar attachment. Replaces the prior per-arm

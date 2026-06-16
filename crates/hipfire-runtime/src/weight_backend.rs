@@ -96,17 +96,20 @@ pub enum EmbedPlan {
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
 /// qt 1|2|16 → HostF32, else → panic with the supported-format list.
-pub fn embed_classify(quant_type: u8) -> EmbedPlan {
+pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
-        6 => EmbedPlan::Raw(EmbeddingFormat::HFQ4G256),
-        7 => EmbedPlan::Raw(EmbeddingFormat::HFQ4G128),
-        3 => EmbedPlan::Raw(EmbeddingFormat::Q8_0),
-        1 | 2 | 16 => EmbedPlan::HostF32,
-        other => panic!(
-            "unsupported embedding quant_type {other}; \
-             handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
-             Add the format to embed_classify to support it."
-        ),
+        6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
+        7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
+        3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
+        1 | 2 | 16 => Ok(EmbedPlan::HostF32),
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "unsupported embedding quant_type {other}; \
+                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
+                 Add the format to embed_classify to support it."
+            ),
+        )),
     }
 }
 
@@ -119,7 +122,7 @@ pub fn load_embedding(
     vocab: usize,
     dim: usize,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-    match embed_classify(quant_type) {
+    match embed_classify(quant_type)? {
         EmbedPlan::Raw(fmt) => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok((buf, fmt))
@@ -412,12 +415,14 @@ pub(crate) fn decode_raw_codec(
     k: usize,
     name: &str,
 ) -> HipResult<WeightTensor> {
-    if codec.dtype.requires_k_mod_256() {
-        assert!(
-            k % 256 == 0,
-            "{:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})",
-            codec.dtype
-        );
+    if codec.dtype.requires_k_mod_256() && k % 256 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})",
+                codec.dtype
+            ),
+        ));
     }
     let buf = gpu.upload_raw(data, &[data.len()])?;
     Ok(WeightTensor {
@@ -488,7 +493,10 @@ pub fn dequant_weight_raw(
         }
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw"),
-            None => panic!("unsupported quant_type {other} for dequant_weight_raw"),
+            None => Err(hip_bridge::HipError::new(
+                0,
+                &format!("unsupported quant_type {other} for dequant_weight_raw"),
+            )),
         },
     }
 }
@@ -1177,21 +1185,21 @@ mod tests {
 
     #[test]
     fn embed_classify_raw_hfq4g256() {
-        match embed_classify(6) {
+        match embed_classify(6).unwrap() {
             EmbedPlan::Raw(EmbeddingFormat::HFQ4G256) => {}
             other => panic!("expected Raw(HFQ4G256), got {other:?}"),
         }
     }
     #[test]
     fn embed_classify_raw_hfq4g128() {
-        match embed_classify(7) {
+        match embed_classify(7).unwrap() {
             EmbedPlan::Raw(EmbeddingFormat::HFQ4G128) => {}
             other => panic!("expected Raw(HFQ4G128), got {other:?}"),
         }
     }
     #[test]
     fn embed_classify_raw_q8_0() {
-        match embed_classify(3) {
+        match embed_classify(3).unwrap() {
             EmbedPlan::Raw(EmbeddingFormat::Q8_0) => {}
             other => panic!("expected Raw(Q8_0), got {other:?}"),
         }
@@ -1199,16 +1207,16 @@ mod tests {
     #[test]
     fn embed_classify_host_f32() {
         for qt in [1, 2, 16] {
-            match embed_classify(qt) {
+            match embed_classify(qt).unwrap() {
                 EmbedPlan::HostF32 => {}
                 other => panic!("qt={qt}: expected HostF32, got {other:?}"),
             }
         }
     }
     #[test]
-    #[should_panic(expected = "unsupported embedding quant_type")]
-    fn embed_classify_panics_on_unknown() {
-        embed_classify(99);
+    fn embed_classify_errors_on_unknown() {
+        let err = embed_classify(99).unwrap_err();
+        assert!(err.message.contains("unsupported embedding quant_type"));
     }
     #[test]
     fn embedding_format_dtype_mapping() {

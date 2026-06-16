@@ -1172,11 +1172,23 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
-        if let Some(ModelState::Qwen35(b)) = m.state.take() {
-            b.kv_cache.free_gpu_multi(&mut gpus);
-            let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
-            b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
-            b.weights.free_gpu_multi(&mut gpus);
+        match m.state.take() {
+            Some(ModelState::Qwen35(b)) => {
+                b.kv_cache.free_gpu_multi(&mut gpus);
+                let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
+                b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
+                b.weights.free_gpu_multi(&mut gpus);
+            }
+            // Only Qwen35 supports pp>1 today, so the other carriers can never
+            // reach this arm with multi-GPU state to free — dropping is correct.
+            // Listing them explicitly (rather than `_`) makes that a
+            // compiler-enforced invariant: adding a pp>1-capable carrier without
+            // a teardown arm here is a build error, not a silent VRAM leak.
+            Some(ModelState::Qwen2(_))
+            | Some(ModelState::Llama(_))
+            | Some(ModelState::Lfm2Moe(_))
+            | Some(ModelState::Minimax(_))
+            | None => {}
         }
         for g in gpus.devices.iter_mut() {
             g.invalidate_weight_caches();
