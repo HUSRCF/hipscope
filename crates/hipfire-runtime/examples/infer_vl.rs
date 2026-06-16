@@ -145,7 +145,7 @@ fn main() {
     let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &text_config, &mut gpu)
         .expect("failed to load text weights");
 
-    let kv_seq = 2048usize;
+    let kv_seq = 4096usize;
     let mut kv_cache = llama::KvCache::new_gpu(
         &mut gpu,
         text_config.n_layers,
