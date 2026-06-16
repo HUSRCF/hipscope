@@ -40,6 +40,26 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── rustfmt-changed gate (every commit, GPU-free, ~instant) ─────────────
+# Mirror CI's changed-file rustfmt check (scripts/ci-rustfmt-changed.sh) on
+# the staged Rust files. The repo carries historical format debt so we only
+# check files in THIS commit, not the workspace. Fix with:
+#   scripts/fmt-changed.sh
+# Bypass (e.g. mid-rebase) with: SKIP_FMT_CHECK=1 git commit ...
+if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
+    mapfile -t fmt_files < <(echo "$CHANGED" | grep -E '\.rs$' || true)
+    if [[ "${#fmt_files[@]}" -gt 0 ]]; then
+        if ! rustfmt --edition 2021 --check --config skip_children=true "${fmt_files[@]}"; then
+            echo "" >&2
+            echo "✗ rustfmt: staged Rust file(s) are not formatted (CI's changed-file gate will flag this)." >&2
+            echo "  Fix:    scripts/fmt-changed.sh && git add -u" >&2
+            echo "  Bypass: SKIP_FMT_CHECK=1 git commit ..." >&2
+            echo "  Do NOT run 'cargo fmt' — it reformats the whole workspace's format debt." >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Hotspots that can affect forward-pass output or speed.
 #
 # Updated for post-0.1.20 modular topology (PR 7+):
