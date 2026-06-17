@@ -22,6 +22,7 @@ use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use rdna_compute::Gpu;
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
@@ -1415,7 +1416,14 @@ impl DeepseekV4 {
             .tensor_data(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
-        gpu.upload_raw(bytes, &shape)
+        // BF16 and F16 share the same element size, but the GPU only
+        // understands F16.  Decode BF16 → F16 on the host first.
+        let upload_bytes = if info.dtype == "BF16" {
+            bf16_bytes_to_f16(bytes)
+        } else {
+            bytes.to_vec()
+        };
+        gpu.upload_raw(&upload_bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
     }
 
@@ -1769,8 +1777,12 @@ impl DeepseekV4 {
                     info.shape
                 ));
             }
-            let scale =
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let scale = if info.dtype == "BF16" {
+                bf16_to_f32(raw)
+            } else {
+                hipfire_runtime::llama::f16_to_f32(raw)
+            };
             weights.hc_head_scale = scale;
         }
 
