@@ -1327,7 +1327,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             }
             ModelState::Lfm2Moe(b) => {
                 b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
             }
             ModelState::Minimax(b) => {
                 b.state.free_gpu(gpu);

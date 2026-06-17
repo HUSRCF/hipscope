@@ -40,7 +40,7 @@ use hipfire_runtime::weight_backend::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::model_source::ModelSource;
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -481,7 +481,7 @@ fn load_weight_tensor(
 
 /// Parse Qwen2Config from a ModelSource (safetensors or HFQ).
 pub fn config_from_source(source: &dyn ModelSource) -> Option<Qwen2Config> {
-    config_from_metadata_json(source.metadata_json())
+    config_from_metadata_json(source.metadata_json()).ok()
 }
 
 /// Convert BF16 bytes to a vector of F32 values.

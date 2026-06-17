@@ -1121,4 +1121,33 @@ impl Lfm2MoeState {
         }
         Ok(())
     }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.kv.free_gpu(gpu);
+        for t in self.conv_states {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.h);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.fa_q);
+        let _ = gpu.free_tensor(self.fa_k);
+        let _ = gpu.free_tensor(self.fa_v);
+        let _ = gpu.free_tensor(self.fa_attn_out);
+        let _ = gpu.free_tensor(self.conv_bcx);
+        let _ = gpu.free_tensor(self.conv_y);
+        let _ = gpu.free_tensor(self.ffn_tmp);
+        let _ = gpu.free_tensor(self.ffn_x_rot);
+        let _ = gpu.free_tensor(self.dense_gate);
+        let _ = gpu.free_tensor(self.dense_up);
+        let _ = gpu.free_tensor(self.dense_act);
+        let _ = gpu.free_tensor(self.router_logits);
+        let _ = gpu.free_tensor(self.topk_indices);
+        let _ = gpu.free_tensor(self.topk_weights);
+        let _ = gpu.free_tensor(self.gate_batch);
+        let _ = gpu.free_tensor(self.up_batch);
+        let _ = gpu.free_tensor(self.rot_batch);
+        let _ = gpu.free_tensor(self.down_expanded);
+        let _ = gpu.free_tensor(self.final_norm_buf);
+        let _ = gpu.free_tensor(self.logits);
+    }
 }
