@@ -1023,7 +1023,11 @@ impl MiniMaxState {
 
 /// Determine whether a tensor's bytes represent F16 values or a quantized
 /// format by comparing the byte count against the expected sizes.
-fn classify_tensor_bytes(bytes: &[u8], numel: usize) -> (bool, bool) {
+fn classify_tensor_bytes(bytes: &[u8], numel: usize, dtype: &str) -> (bool, bool) {
+    // BF16 has 2 bytes/element same as F16, so it must be explicitly excluded.
+    if dtype == "BF16" {
+        return (false, false);
+    }
     let is_f16 = bytes.len() == numel * 2;
     // Q8_0: 34 bytes per block of 32 elements:
     //   [f16 scale (2 bytes)] [32 × i8 (32 bytes)]
@@ -1044,7 +1048,7 @@ fn load_norm_from_source(
         .tensor_data(name)
         .ok_or_else(|| format!("minimax: norm '{name}' missing in source"))?;
     let numel: usize = info.shape.iter().product();
-    let (is_f16, _) = classify_tensor_bytes(bytes, numel);
+    let (is_f16, _) = classify_tensor_bytes(bytes, numel, info.dtype.as_str());
     let f32_data: Vec<f32> = if is_f16 {
         bytes
             .chunks_exact(2)
@@ -1076,7 +1080,7 @@ fn load_mm_awq_scale_from_source(
 ) -> Option<GpuTensor> {
     let (info, bytes) = source.tensor_data(name)?;
     let numel: usize = info.shape.iter().product();
-    let (is_f16, _) = classify_tensor_bytes(bytes, numel);
+    let (is_f16, _) = classify_tensor_bytes(bytes, numel, info.dtype.as_str());
     if !is_f16 {
         return None;
     }
@@ -1109,7 +1113,7 @@ fn load_wt_from_source(
         .tensor_data(name)
         .ok_or_else(|| format!("minimax: tensor '{name}' missing in source"))?;
     let numel: usize = info.shape.iter().product();
-    let (is_f16, is_q8_0) = classify_tensor_bytes(bytes, numel);
+    let (is_f16, is_q8_0) = classify_tensor_bytes(bytes, numel, info.dtype.as_str());
 
     let dtype = if is_f16 {
         DType::F16
