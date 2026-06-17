@@ -128,62 +128,30 @@ impl Carrier for Qwen35Carrier {
                         .iter()
                         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                         .collect();
-                    let kv = match kv_mode.as_str() {
-                        "q8" | "auto" | "" => {
-                            hipfire_runtime::llama::KvCache::new_gpu_q8_capped_multi_filtered(
-                                &mut gpus,
-                                &is_kv_layer,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                ctx.max_seq,
-                                ctx.max_seq,
-                            )
-                        }
-                        "asym3" | "turbo3" | "turbo" => {
-                            hipfire_runtime::llama::KvCache::new_gpu_asym3_capped_multi_filtered(
-                                &mut gpus,
-                                &is_kv_layer,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                ctx.max_seq,
-                                ctx.max_seq,
-                            )
-                        }
-                        "fwht3" => {
-                            hipfire_runtime::llama::KvCache::new_gpu_fwht3_capped_multi_filtered(
-                                &mut gpus,
-                                &is_kv_layer,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                ctx.max_seq,
-                                ctx.max_seq,
-                            )
-                        }
-                        "fwht2" => {
-                            hipfire_runtime::llama::KvCache::new_gpu_fwht2_capped_multi_filtered(
-                                &mut gpus,
-                                &is_kv_layer,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                ctx.max_seq,
-                                ctx.max_seq,
-                            )
-                        }
-                        _ => {
-                            eprintln!(
-                                "  KV cache: unrecognized '{}', defaulting to q8 for pp>1",
-                                kv_mode
-                            );
-                            hipfire_runtime::llama::KvCache::new_gpu_q8_capped_multi_filtered(
-                                &mut gpus,
-                                &is_kv_layer,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                ctx.max_seq,
-                                ctx.max_seq,
-                            )
-                        }
+                    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+                        hipfire_runtime::kv_mode::resolve(
+                            &kv_mode,
+                            &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
+                            config.head_dim,
+                        );
+                    if let Some(w) = warning {
+                        eprintln!(
+                            "  KV cache: {w} (site {})",
+                            hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
+                        );
                     }
+                    let dims = hipfire_runtime::llama::KvDims {
+                        layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
+                        n_kv_heads: config.n_kv_heads,
+                        head_dim: config.head_dim,
+                        max_seq: ctx.max_seq,
+                        physical_cap: Some(ctx.max_seq),
+                    };
+                    let kv = hipfire_runtime::llama::KvCache::from_mode(
+                        mode,
+                        hipfire_runtime::llama::KvTarget::Multi(&mut gpus),
+                        &dims,
+                    )
                     .map_err(|e| format!("{e}"))?;
                     let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
                         .map_err(|e| format!("{e}"))?;
