@@ -330,61 +330,30 @@ impl Carrier for Qwen35Carrier {
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
                 let kv_mode = qwen35_kv_mode(ctx);
-                let kv_cache = match kv_mode.as_str() {
-                    "q8" => hipfire_runtime::llama::KvCache::new_gpu_q8_capped_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
+                let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+                    hipfire_runtime::kv_mode::resolve(
+                        &kv_mode,
+                        &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
                         config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    "asym4" | "turbo4" => hipfire_runtime::llama::KvCache::new_gpu_asym4_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                    ),
-                    "asym2" | "turbo2" => hipfire_runtime::llama::KvCache::new_gpu_asym2_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                    ),
-                    "fwht4" => hipfire_runtime::llama::KvCache::new_gpu_fwht4_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                    ),
-                    "fwht3" => hipfire_runtime::llama::KvCache::new_gpu_fwht3_capped_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    "fwht2" => hipfire_runtime::llama::KvCache::new_gpu_fwht2_capped_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    _ => hipfire_runtime::llama::KvCache::new_gpu_q8_capped_filtered(
-                        ctx.gpu,
-                        &is_kv_layer,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
+                    );
+                if let Some(w) = warning {
+                    eprintln!(
+                        "  KV cache: {w} (site {})",
+                        hipfire_runtime::kv_mode::QWEN35_PARO_POLICY.site
+                    );
                 }
+                let dims = hipfire_runtime::llama::KvDims {
+                    layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
+                    n_kv_heads: config.n_kv_heads,
+                    head_dim: config.head_dim,
+                    max_seq: ctx.max_seq,
+                    physical_cap: Some(ctx.max_seq),
+                };
+                let kv_cache = hipfire_runtime::llama::KvCache::from_mode(
+                    mode,
+                    hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
+                    &dims,
+                )
                 .map_err(|e| format!("KvCache: {e}"))?;
 
                 let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new(ctx.gpu, &config)
