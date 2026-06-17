@@ -1390,7 +1390,12 @@ impl DeepseekV4 {
     /// Determine whether a tensor's bytes represent F16 values or a
     /// quantized format by comparing the byte count against the
     /// expected sizes. Returns `(is_f16, is_q8_0)`.
-    fn classify_tensor_bytes(bytes: &[u8], numel: usize) -> (bool, bool) {
+    fn classify_tensor_bytes(bytes: &[u8], numel: usize, dtype: &str) -> (bool, bool) {
+        // BF16 has 2 bytes/element just like F16, so explicitly exclude it
+        // from the heuristic — the caller already knows the dtype.
+        if dtype == "BF16" {
+            return (false, false);
+        }
         let is_f16 = bytes.len() == numel * 2;
         // Q8_0: 34 bytes per block of 32 elements:
         //   [f16 scale (2 bytes)] [32 × i8 (32 bytes)]
@@ -1427,7 +1432,7 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
         let numel: usize = shape.iter().product();
-        let (is_f16, is_q8_0) = Self::classify_tensor_bytes(bytes, numel);
+        let (is_f16, is_q8_0) = Self::classify_tensor_bytes(bytes, numel, info.dtype.as_str());
 
         if is_f16 {
             if bytes.len() != numel * 2 {
@@ -1496,7 +1501,7 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
         let numel: usize = shape.iter().product();
-        let (is_f16, _) = Self::classify_tensor_bytes(bytes, numel);
+        let (is_f16, _) = Self::classify_tensor_bytes(bytes, numel, info.dtype.as_str());
         if !is_f16 {
             return Err(format!(
                 "deepseek4: '{name}' not F16 ({} bytes for {numel} elems); cannot upload as F16 native",
