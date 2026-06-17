@@ -6,6 +6,7 @@
 //! Supports loading from GGUF files and running inference.
 
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use crate::kv_mode::KvMode;
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -4792,6 +4793,38 @@ pub struct KvCache {
     pub compact_offset: usize,
 }
 
+/// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
+/// full-attention layer" mask (→ `_filtered` family) OR a flat layer count
+/// (→ plain / flat-`_capped` family).
+pub enum KvLayers {
+    /// `is_kv_layer` mask — sites 1, 2, 6.
+    Mask(Vec<bool>),
+    /// `n_layers` — sites 3, 4, 5.
+    Flat(usize),
+}
+
+/// Geometry + cap inputs shared by every `new_gpu_*` constructor.
+pub struct KvDims {
+    pub layers: KvLayers,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// For minimax (site 5a) this MUST be the CLAMPED value (12288), not the
+    /// raw `ctx.max_seq`, or the allocation size changes.
+    pub max_seq: usize,
+    /// `Some(cap)` → request a `_capped` form. HONORED ONLY for modes that have
+    /// one (q8/asym3/fwht2/fwht3 on Mask sites; q8/asym3/asym4 on Flat sites);
+    /// silently DROPPED for asym2/asym4/fwht4 on Mask sites — faithful to today.
+    pub physical_cap: Option<usize>,
+}
+
+/// Single- vs multi-GPU dispatch for [`KvCache::from_mode`].
+pub enum KvTarget<'a> {
+    /// pp == 1: one GPU. Sites 1–5.
+    Single(&'a mut Gpu),
+    /// pp > 1: pipeline-parallel. Site 6 only (qwen35 HFQ pp>1).
+    Multi(&'a mut Gpus),
+}
+
 impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
@@ -4816,6 +4849,86 @@ impl KvCache {
             gpu.hip.memset(&t.buf, 0, t.buf.size())?;
         }
         Ok(())
+    }
+
+    /// The single dispatcher over the `new_gpu_*` constructor family. Each
+    /// non-error arm corresponds 1:1 to a line that exists in a load-site ladder
+    /// today (the byte-identical contract). Unreachable `(mode × layers × cap ×
+    /// target)` cells return `Err` rather than panic, so a future policy mis-wire
+    /// surfaces as a clean load failure.
+    pub fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self> {
+        debug_assert_ne!(mode, KvMode::Asym3Auto, "from_mode received unresolved sentinel");
+        match target {
+            KvTarget::Single(gpu) => Self::from_mode_single(mode, gpu, dims),
+            KvTarget::Multi(gpus) => Self::from_mode_multi(mode, gpus, dims),
+        }
+    }
+
+    fn from_mode_single(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        use KvLayers::*;
+        let nh = dims.n_kv_heads;
+        let hd = dims.head_dim;
+        let ms = dims.max_seq;
+        match (mode, &dims.layers, dims.physical_cap) {
+            // Mask + Some(cap): _capped_filtered (only q8/asym3/fwht2/fwht3 have it).
+            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
+            (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht4, Mask(m), _) => Self::new_gpu_fwht4_filtered(gpu, m, nh, hd, ms),
+            // Mask + None for the capped-capable modes: plain _filtered.
+            (KvMode::Q8, Mask(m), None) => Self::new_gpu_q8_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym3, Mask(m), None) => Self::new_gpu_asym3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht2, Mask(m), None) => Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
+            // Flat + Some(cap): _capped (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym3, Flat(n), Some(cap)) => Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym4, Flat(n), Some(cap)) => Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap),
+            // Flat + None: plain (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
+            (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
+            (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
+            // No constructor exists for this combination.
+            (m, l, c) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KvCache::from_mode_single: no constructor for (mode={m:?}, layers={}, cap={c:?}); \
+                     unreachable under current policies — a policy/accepted-set mis-wire, not a user error",
+                    match l {
+                        Mask(_) => "Mask",
+                        Flat(_) => "Flat",
+                    },
+                ),
+            )),
+        }
+    }
+
+    fn from_mode_multi(mode: KvMode, gpus: &mut Gpus, dims: &KvDims) -> HipResult<Self> {
+        use KvLayers::*;
+        let nh = dims.n_kv_heads;
+        let hd = dims.head_dim;
+        let ms = dims.max_seq;
+        // Site 6 only: Mask + Some(cap) + {q8,asym3,fwht3,fwht2} → _capped_multi_filtered.
+        match (mode, &dims.layers, dims.physical_cap) {
+            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (m, l, c) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KvCache::from_mode_multi: no multi constructor for (mode={m:?}, layers={}, cap={c:?})",
+                    match l {
+                        Mask(_) => "Mask",
+                        Flat(_) => "Flat",
+                    },
+                ),
+            )),
+        }
     }
 }
 
