@@ -1051,8 +1051,19 @@ impl Lfm2MoeState {
 
         // KV cache: one slot per ATTENTION layer (conv layers carry no KV).
         let n_attn = cfg.num_attention_layers().max(1);
-        let kv = KvCache::new_gpu_q8(gpu, n_attn, cfg.num_key_value_heads, cfg.head_dim, max_seq)
-            .map_err(|e| format!("lfm2moe: kv cache: {e:?}"))?;
+        let dims = hipfire_runtime::llama::KvDims {
+            layers: hipfire_runtime::llama::KvLayers::Flat(n_attn),
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            max_seq,
+            physical_cap: None,
+        };
+        let kv = hipfire_runtime::llama::KvCache::from_mode(
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, cfg.head_dim).mode,
+            hipfire_runtime::llama::KvTarget::Single(gpu),
+            &dims,
+        )
+        .map_err(|e| format!("lfm2moe: kv cache: {e:?}"))?;
 
         // Conv-state cache: one [hidden,(K-1)] f32 ring buffer per CONV layer.
         let conv_hist = hidden * (k_conv - 1);
