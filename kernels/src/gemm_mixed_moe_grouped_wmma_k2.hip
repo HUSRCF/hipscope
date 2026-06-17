@@ -322,7 +322,16 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
         // ----- MQ3-Lloyd-G256 (112 B/group) ---------------------------------
         // Source: gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip, lines 96–166.
         // Layout: 16 B (8×fp16 codebook) + 96 B 3-bit packed (6 B per K-tile).
-        // Per-lane REGISTER 3D bilinear decomposition — NOT LDS broadcast.
+        //
+        // DIRECT-LUT REGISTER SELECT (replaces the 7-FMA multilinear decode).
+        // The codebook (cb0..cb7) is already in registers; the 3-bit index just
+        // selects one of them. A per-lane REGISTER select tree (v_cndmask, no
+        // memory) is ~1 op vs the multilinear's 7 FMAs AND is strictly more
+        // accurate (it returns cb[idx] exactly, with zero fp16 rounding — the
+        // multilinear equals cb[idx] in REAL arithmetic but accumulates fp16
+        // rounding over 7 FMAs). The select tree keeps each lane's value in a
+        // register, so the half16_t WMMA A-fragment stays vectorized (an
+        // LDS-indexed LUT would suppress WMMA — verified 2026-05-22).
         for (int g = 0; g < groups_per_row; g++) {
             const char* gp = row_base + g * 112;
             const __half* cb_h = reinterpret_cast<const __half*>(gp);
@@ -334,16 +343,6 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
             _Float16 cb5 = (_Float16)__half2float(cb_h[5]);
             _Float16 cb6 = (_Float16)__half2float(cb_h[6]);
             _Float16 cb7 = (_Float16)__half2float(cb_h[7]);
-
-            // 3D bilinear coefficients (exact for any 8-entry table).
-            const _Float16 coA = cb0;
-            const _Float16 coB = cb1 - cb0;
-            const _Float16 coC = cb2 - cb0;
-            const _Float16 coD = cb4 - cb0;
-            const _Float16 coE = cb3 - cb2 - cb1 + cb0;
-            const _Float16 coF = cb5 - cb4 - cb1 + cb0;
-            const _Float16 coG = cb6 - cb4 - cb2 + cb0;
-            const _Float16 coH = cb7 - cb6 - cb5 + cb4 - cb3 + cb2 + cb1 - cb0;
 
             const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
 
@@ -368,11 +367,19 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                     b_b = zero_b;
                 }
 
+                // Direct LUT via register select tree → lowers to v_cndmask,
+                // no scratch / no LDS, keeps the A-fragment vectorized.
                 #define DQ3(reg, i, pk, sh) do { \
-                    _Float16 b0 = (_Float16)(int)(((pk) >> (sh))     & 1u); \
-                    _Float16 b1 = (_Float16)(int)(((pk) >> ((sh)+1)) & 1u); \
-                    _Float16 b2 = (_Float16)(int)(((pk) >> ((sh)+2)) & 1u); \
-                    (reg)[i] = coA + b0*coB + b1*coC + b2*coD + (b0*b1)*coE + (b0*b2)*coF + (b1*b2)*coG + (b0*b1*b2)*coH; \
+                    unsigned int b0 = ((pk) >> (sh))     & 1u; \
+                    unsigned int b1 = ((pk) >> ((sh)+1)) & 1u; \
+                    unsigned int b2 = ((pk) >> ((sh)+2)) & 1u; \
+                    _Float16 s0 = b0 ? cb1 : cb0; \
+                    _Float16 s1 = b0 ? cb3 : cb2; \
+                    _Float16 s2 = b0 ? cb5 : cb4; \
+                    _Float16 s3 = b0 ? cb7 : cb6; \
+                    _Float16 t0 = b1 ? s1 : s0; \
+                    _Float16 t1 = b1 ? s3 : s2; \
+                    (reg)[i] = b2 ? t1 : t0; \
                 } while (0)
 
                 half16_t a_a;
