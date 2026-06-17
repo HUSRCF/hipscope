@@ -451,57 +451,35 @@ impl Carrier for LlamaCarrier {
                 let weights =
                     hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                         .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                let kv_mode = {
-                    ctx.kv_mode_override
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
-                };
-                let asym3_auto = matches!(kv_mode.as_str(), "turbo3" | "turbo" | "auto" | "");
-                let kv = match kv_mode.as_str() {
-                    "q8" => hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
-                        ctx.gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
+                let kv_mode = ctx
+                    .kv_mode_override
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+                let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+                    hipfire_runtime::kv_mode::resolve(
+                        &kv_mode,
+                        &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
                         config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    "asym4" | "turbo4" => hipfire_runtime::llama::KvCache::new_gpu_asym4_capped(
-                        ctx.gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    "asym3" => hipfire_runtime::llama::KvCache::new_gpu_asym3_capped(
-                        ctx.gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
-                    _ if asym3_auto && config.head_dim == 256 => {
-                        hipfire_runtime::llama::KvCache::new_gpu_asym3_capped(
-                            ctx.gpu,
-                            config.n_layers,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            ctx.max_seq,
-                            ctx.max_seq,
-                        )
-                    }
-                    _ => hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
-                        ctx.gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                    ),
+                    );
+                if let Some(w) = warning {
+                    eprintln!(
+                        "  KV cache: {w} (site {})",
+                        hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
+                    );
                 }
+                let dims = hipfire_runtime::llama::KvDims {
+                    layers: hipfire_runtime::llama::KvLayers::Flat(config.n_layers),
+                    n_kv_heads: config.n_kv_heads,
+                    head_dim: config.head_dim,
+                    max_seq: ctx.max_seq,
+                    physical_cap: Some(ctx.max_seq),
+                };
+                let kv = hipfire_runtime::llama::KvCache::from_mode(
+                    mode,
+                    hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
+                    &dims,
+                )
                 .map_err(|e| format!("KvCache: {e}"))?;
                 let scratch = hipfire_runtime::llama::ForwardScratch::new(ctx.gpu, &config)
                     .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
