@@ -7013,10 +7013,14 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
             }
         }
     }
-    let arch_has_wmma = matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-    );
+    // ANTIBLEED admit-vs-select fix: this guard rejects MQ3-in-dense when the
+    // arch lacks the WMMA builtin. The old ad-hoc string list OMITTED gfx1103
+    // (Phoenix APU) and gfx1152, yet both ARE wave32-WMMA archs (is_rdna3) and
+    // are ADMITTED by is_batchable_la's mq3_uniform_with_wmma — so a gfx1103 /
+    // gfx1152 box would be wrongly rejected here. Derive from the has_wmma
+    // capability molecule instead (rdna3 incl 1103/1152, + rdna4), matching the
+    // sibling `arch_has_wmma = gpu.arch_caps.has_wmma()` in forward_prefill_chunk.
+    let arch_has_wmma = gpu.arch_caps.has_wmma();
     if mq3_in_moe {
         return Err(hip_bridge::HipError::new(
             0,
@@ -7034,8 +7038,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
             &format!(
                 "forward_prefill_batch_single_chunk_captured: model contains MQ3G256 \
              weights but arch {arch} lacks the gfx11 wave32 WMMA builtin. The MQ3 \
-             prefill kernels (gemm_*_hfq3g256_wmma) only compile on \
-             gfx1100/1101/1102/1150/1151. Caller must use the non-captured \
+             prefill kernels (gemm_*_hfq3g256_wmma) only compile on the wave32-WMMA \
+             archs (rdna3: gfx1100/1101/1102/1103/1150/1151/1152, + rdna4 gfx12). \
+             Caller must use the non-captured \
              forward_prefill_batch path (which falls back to per-token \
              forward_scratch on this arch). gfx12 K4 variant for MQ3 is \
              a planned follow-up."
@@ -7636,11 +7641,17 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // Uses the gemm_*_mq4g256_lloyd_wmma family; group stride differs
     // (160 B Lloyd vs 136 B HFQ4) so dispatch routes through the
     // Lloyd-specific arms in forward_prefill_chunk.
+    // ANTIBLEED admit-vs-select fix: the MQ4-Lloyd batched-prefill GEMM source
+    // selectors (gemm_*_mq4g256_lloyd_wmma_for_arch in rdna-compute/kernels.rs)
+    // ship a kernel only for gfx1100/1101/1102/1151 and PANIC on any other arch
+    // (160 B Lloyd stride mismatches the default). gfx1150 was admitted here but
+    // has no MQ4-Lloyd source (intentionally excluded to stay symmetric with the
+    // MQ4-Lloyd GEMV/fused-decode path — see kernels.rs:195), so a gfx1150 box
+    // doing MQ4-Lloyd batched prefill would crash at source lookup. Drop gfx1150
+    // from the admit set so admit == select. (MQ3-Lloyd DOES ship a gfx1150
+    // source, hence its admit set below keeps gfx1150.)
     let lloyd_mq4_with_gfx11_wmma = matches!(dt, DType::MQ4G256Lloyd)
-        && matches!(
-            arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-        );
+        && matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
 
     // Lloyd-MQ4 on gfx12 (RDNA4): same opt-in gate as Lloyd-MQ3.
     let lloyd_mq4_with_gfx12_wmma = matches!(dt, DType::MQ4G256Lloyd)
@@ -16416,12 +16427,22 @@ mod tests {
 
     #[test]
     fn qwen35_is_batchable_la_lloyd_mq3_only_on_gfx11_with_opt_in_gfx12() {
-        // gfx11 always admits Lloyd MQ3
+        // MQ3-Lloyd admits gfx1100/1101/1102/1150/1151 — the MQ3-Lloyd GEMM
+        // source selectors DO ship a gfx1150 kernel.
         for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
             assert!(is_batchable_la(DType::MQ3G256Lloyd, arch), "MQ3G256Lloyd should batch on {arch}");
+        }
+        // MQ4-Lloyd admits gfx1100/1101/1102/1151 ONLY (NOT gfx1150). ANTIBLEED
+        // admit-vs-select fix: the MQ4-Lloyd GEMM source selectors panic on
+        // gfx1150 (no kernel), so admitting it upstream would crash at lookup.
+        for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1151"] {
             assert!(is_batchable_la(DType::MQ4G256Lloyd, arch), "MQ4G256Lloyd should batch on {arch}");
         }
-        // gfx1152 not in admit list
+        assert!(
+            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1150"),
+            "gfx1150 must NOT admit Lloyd MQ4 (no MQ4-Lloyd kernel source → panic)"
+        );
+        // gfx1152 not in either admit list
         assert!(!is_batchable_la(DType::MQ3G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ3");
         assert!(!is_batchable_la(DType::MQ4G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ4");
         // gfx12 requires env gate

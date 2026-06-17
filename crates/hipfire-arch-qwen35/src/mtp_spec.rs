@@ -126,18 +126,23 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 }
 
 /// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
-/// the low-confidence tail of the K-chain — a UNIVERSAL win on gfx11 (2026-06-16
-/// sweep: lifts every domain, even high-τ code +11%; 0.6 is the sweet spot,
-/// >0.7 over-truncates). DEFAULT-ON for RDNA3 (gfx11), the validated arch; other
-/// archs default 0.0 (off) until validated in their lever-on serve path (gfx12
-/// W3v durability was measured at p_min=0). Override on any arch via
-/// HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable elsewhere, =0 to disable). An explicit
-/// `set_p_min` call still overrides this default.
+/// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
+/// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
+/// sweet spot, >0.7 over-truncates). DEFAULT-ON for the RDNA3 dGPU
+/// (gfx1100/1101/1102), the ONLY validated arch class. ANTIBLEED: the prior
+/// `starts_with("gfx11")` test also defaulted the RDNA3.5 iGPUs (gfx1150/1151/
+/// 1152) and the gfx1103 APU to 0.6, but p_min was NEVER validated there — they
+/// inherited a dGPU-tuned cutoff. They now default 0.0 (off) until validated in
+/// their own serve path (same as gfx12, whose W3v durability was measured at
+/// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
+/// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
 fn default_mtp_p_min(arch: &str) -> f32 {
     if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
         return v.trim().parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x)).unwrap_or(0.0);
     }
-    if arch.starts_with("gfx11") { 0.6 } else { 0.0 }
+    // is_rdna3_dgpu arch set (wide-BW GDDR6 dGPU); the iGPUs + gfx1103 APU are
+    // deliberately excluded — p_min there is unvalidated.
+    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") { 0.6 } else { 0.0 }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

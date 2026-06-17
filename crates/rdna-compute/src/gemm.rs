@@ -267,11 +267,7 @@ impl Gpu {
         // small shapes regress (4× WG reduction + 106 VGPR leaves CUs idle).
         // Threshold tuning open — see Phase D plan §"Open questions" #3.
         // Env override: HIPFIRE_LLOYD_MB4=1 force-on, =0 force-off.
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && matches!(
-                self.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151"
-            );
+        let arch_supports_mb4 = self.arch_caps.supports_mq4_lloyd_mb4();
         let use_mb4 = match self.flags.lloyd_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
@@ -498,11 +494,7 @@ impl Gpu {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         // Phase D-B path selector — same gate as residual_mb4.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && matches!(
-                self.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151"
-            );
+        let arch_supports_mb4 = self.arch_caps.supports_mq4_lloyd_mb4();
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -610,11 +602,7 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && matches!(
-                self.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151"
-            );
+        let arch_supports_mb4 = self.arch_caps.supports_mq4_lloyd_mb4();
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -709,11 +697,7 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && matches!(
-                self.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151"
-            );
+        let arch_supports_mb4 = self.arch_caps.supports_mq4_lloyd_mb4();
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -1104,9 +1088,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // mb4 path selector — same gate as MQ4-Lloyd's mb4 family.
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
@@ -1258,9 +1240,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -1467,9 +1447,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -1651,9 +1629,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -7598,9 +7574,7 @@ impl Gpu {
         // HFQ3 mb4 path selector. Only triggers on gfx11; gfx12 keeps its
         // existing fast path (line below) since mb4 sibling not ported.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -8204,9 +8178,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -9202,7 +9174,13 @@ impl Gpu {
                 64,
             ),
             _ => {
-                let def = if self.arch.starts_with("gfx1151") || self.arch.starts_with("gfx1150") {
+                let def = if self.arch_caps.is_rdna3p5() {
+                    // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
+                    // ldscoop_nosync variant wins here. gfx1152 previously fell
+                    // through to the RDNA4 `else` ldscoop arm because the old
+                    // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
+                    // not match "gfx1152" — that was a misroute, now fixed by
+                    // gating on the is_rdna3p5 capability molecule.
                     (
                         "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
                         kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
@@ -9406,9 +9384,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -13837,9 +13813,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3()
-            && !self.arch_caps.is_gfx1152()
-            && !self.arch_caps.is_gfx1103();
+        let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,

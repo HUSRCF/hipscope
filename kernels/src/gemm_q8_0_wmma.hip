@@ -33,13 +33,16 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
-// Arch-split occupancy: gfx1151 (RDNA3.5 iGPU, 3 SIMDs × 32 waves/SIMD = 96
-// max waves/CU) benefits from (32, 8) — at 70 VGPRs fits 8 waves comfortably.
-// gfx1100/gfx1101 (RDNA3 dGPU) has a tighter VGPR budget: keep the validated
-// (32, 2) that gemm_q8_0_residual_wmma uses and that the existing gfx11
-// parity tests (test_gemm_q8_residual_wmma.rs) confirm correct.
+// Arch-split occupancy: RDNA3.5 iGPUs (gfx1150/1151/1152, 3 SIMDs × 32
+// waves/SIMD = 96 max waves/CU) benefit from (32, 8) — at 70 VGPRs fits 8
+// waves comfortably. The dGPUs (gfx1100/1101/1102, incl the gfx1103 APU
+// orphan) have a tighter VGPR budget: keep the validated (32, 2) that
+// gemm_q8_0_residual_wmma uses and that the existing gfx11 parity tests
+// (test_gemm_q8_residual_wmma.rs) confirm correct.
+// ANTIBLEED: the (32,8) iGPU arm was previously `__gfx1151__` only, so the
+// gfx1150 and gfx1152 iGPUs under-covered to (32,2). Extend to all gfx115x.
 // gfx12 is a separate file (gemm_q8_0_wmma.gfx12.hip) — untouched.
-#if defined(__gfx1151__)
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
 __launch_bounds__(32, 8)
 #else
 __launch_bounds__(32, 2)
