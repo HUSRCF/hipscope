@@ -958,12 +958,17 @@ impl MiniMaxState {
         gpu.ensure_mq_signs()
             .map_err(|e| format!("minimax: ensure_mq_signs: {e:?}"))?;
 
-        let kv = KvCache::new_gpu_q8(
-            gpu,
-            cfg.num_hidden_layers,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            max_seq,
+        let dims = hipfire_runtime::llama::KvDims {
+            layers: hipfire_runtime::llama::KvLayers::Flat(cfg.num_hidden_layers),
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            max_seq, // already clamped to MINIMAX_ATTN_LDS_MAX_SEQ above
+            physical_cap: None,
+        };
+        let kv = hipfire_runtime::llama::KvCache::from_mode(
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, cfg.head_dim).mode,
+            hipfire_runtime::llama::KvTarget::Single(gpu),
+            &dims,
         )
         .map_err(|e| format!("minimax: kv cache: {e:?}"))?;
         let pos_buf = gpu
