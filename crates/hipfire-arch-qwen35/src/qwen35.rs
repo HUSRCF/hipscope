@@ -7969,8 +7969,22 @@ pub fn prefill_batch_pbs_eligible(
     // (HIPFIRE_MTP_VERIFY_DECOUPLE=1) until the batched verify is validated
     // coherent + τ-preserving per-arch (the gfx11 batched *seed* corrupts; whether
     // the small-B *verify* also corrupts is exactly what this gate tests).
+    // DEFAULT-ON for RDNA3 (gfx11) — the small-B verify BATCHED is validated
+    // coherent + τ-preserving there (W3x 2026-06-16: byte-identical output vs
+    // per-token at 240-tok ctx; +20% mq4; the scalar→WMMA + MQ3L-LUT kernel
+    // wins lift all STRUCTURED domains >AR on both mq4/mq4p; fresh default-config
+    // re-validated mq4 code 1.26× / mq4p chat 1.07×). Opt-out
+    // HIPFIRE_MTP_VERIFY_DECOUPLE=0. Other archs opt-in (=1) until validated;
+    // gfx12 batches the whole prefill already so it is moot there. The seed
+    // stays per-token for LONG prompts (n>32 fails this gate → force_fallback
+    // when PREFILL_BATCHED=0); a short seed (n≤32) batches, fine for mq4/mq4p
+    // (E8 short-seed batched-prefill can OOM, but E8 admission is itself opt-in
+    // via HIPFIRE_E8_GFX12 so the default config never reaches it).
+    let decouple_env = std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
+    let is_rdna3_decouple = arch.starts_with("gfx11");
     let verify_decouple = n <= 32
-        && std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok().as_deref() == Some("1");
+        && decouple_env.as_deref() != Some("0")
+        && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
     let force_fallback = !verify_decouple
         && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and

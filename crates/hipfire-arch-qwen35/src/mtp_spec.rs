@@ -125,6 +125,21 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
+/// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
+/// the low-confidence tail of the K-chain — a UNIVERSAL win on gfx11 (2026-06-16
+/// sweep: lifts every domain, even high-τ code +11%; 0.6 is the sweet spot,
+/// >0.7 over-truncates). DEFAULT-ON for RDNA3 (gfx11), the validated arch; other
+/// archs default 0.0 (off) until validated in their lever-on serve path (gfx12
+/// W3v durability was measured at p_min=0). Override on any arch via
+/// HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable elsewhere, =0 to disable). An explicit
+/// `set_p_min` call still overrides this default.
+fn default_mtp_p_min(arch: &str) -> f32 {
+    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+        return v.trim().parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x)).unwrap_or(0.0);
+    }
+    if arch.starts_with("gfx11") { 0.6 } else { 0.0 }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MtpProposalGraphPolicy {
     Off,
@@ -632,7 +647,7 @@ impl MtpSpecState {
             mtp_gather_prob_verify,
             gpu_rng_state: 42,
             max_n,
-            p_min: 0.0,
+            p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
         })
