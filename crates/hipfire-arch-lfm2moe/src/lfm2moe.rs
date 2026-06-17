@@ -266,6 +266,79 @@ pub struct Lfm2MoeWeights {
     pub layers: Vec<Lfm2MoeLayerWeights>,
 }
 
+impl ExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.gate_up.free_all(gpu);
+        self.down.free_all(gpu);
+    }
+}
+
+impl ConvWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.in_proj.free_all(gpu);
+        let _ = gpu.free_tensor(self.conv_weight);
+        self.out_proj.free_all(gpu);
+    }
+}
+
+impl AttnWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.q_norm);
+        let _ = gpu.free_tensor(self.k_norm);
+    }
+}
+
+impl Mixer {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Mixer::Conv(c) => c.free_gpu(gpu),
+            Mixer::Attention(a) => a.free_gpu(gpu),
+        }
+    }
+}
+
+impl DenseFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.w1.free_all(gpu);
+        self.w3.free_all(gpu);
+        self.w2.free_all(gpu);
+    }
+}
+
+impl MoeFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.router.free_all(gpu);
+        let _ = gpu.free_tensor(self.expert_bias);
+        for e in self.experts {
+            e.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(self.expert_down_ptrs);
+    }
+}
+
+impl Ffn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Ffn::Dense(d) => d.free_gpu(gpu),
+            Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+}
+
+impl Lfm2MoeLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.operator_norm);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.mixer.free_gpu(gpu);
+        self.ffn.free_gpu(gpu);
+    }
+}
+
 impl Lfm2MoeWeights {
     pub fn load(hfq: &mut HfqFile, cfg: &Lfm2MoeConfig, gpu: &mut Gpu) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
@@ -561,6 +634,15 @@ impl Lfm2MoeWeights {
             lm_head,
             layers,
         })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed);
+        let _ = gpu.free_tensor(self.embedding_norm);
+        self.lm_head.free_all(gpu);
+        for layer in self.layers {
+            layer.free_gpu(gpu);
+        }
     }
 }
 
