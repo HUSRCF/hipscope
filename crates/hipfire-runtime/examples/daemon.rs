@@ -3121,11 +3121,19 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
 const LFM2_TEMPLATE: &str = include_str!("../templates/eval/lfm2-liquidai.jinja");
 
 fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) -> Option<String> {
-    // 1. Env-var override.
+    // 1. Env-var override — the documented global escape hatch. KEPT, but if
+    //    it overrides a qwen3* model (arch 5/6) it is fighting the froggeric
+    //    structural pillar (step 2 below), so warn LOUDLY before honoring it.
     if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
         if !env_path.is_empty() {
             match std::fs::read_to_string(&env_path) {
                 Ok(s) => {
+                    if matches!(hfq.arch_id, 5 | 6) {
+                        eprintln!(
+                            "[chat_template] WARNING: HIPFIRE_CHAT_TEMPLATE_FILE={env_path} is overriding the qwen3 froggeric pillar (arch_id={}); this is an explicit escape hatch — unset it to restore froggeric",
+                            hfq.arch_id
+                        );
+                    }
                     eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
                     return Some(s);
                 }
@@ -3136,7 +3144,23 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
         }
     }
 
-    // 2. Per-model file at ~/.hipfire/templates/<basename>.j2.
+    // 2. STRUCTURAL PILLAR: every qwen3* model (arch_id 5 = qwen3.5/3.6 dense,
+    //    6 = qwen3.5/3.6 MoE incl. A3B) resolves the froggeric template,
+    //    period. Placed BEFORE the per-model .j2 / embedded / ChatML-fallback
+    //    sources so a stray ~/.hipfire/templates/<name>.j2, a dropped embedded
+    //    chat_template, or the never-bare ChatML default can NEVER beat
+    //    froggeric for a qwen3 model. The only thing that wins is the explicit
+    //    HIPFIRE_CHAT_TEMPLATE_FILE escape hatch above (which warns loudly).
+    if matches!(hfq.arch_id, 5 | 6) {
+        eprintln!(
+            "[chat_template] qwen3* arch {} -> froggeric (pillar)",
+            hfq.arch_id
+        );
+        return Some(FROGGERIC_QWEN35_TEMPLATE.to_string());
+    }
+
+    // 3. Per-model file at ~/.hipfire/templates/<basename>.j2 (non-qwen in
+    //    practice — qwen3* already returned above).
     if let Some(home) = std::env::var_os("HOME") {
         let basename = std::path::Path::new(model_path)
             .file_name()
@@ -3165,22 +3189,18 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
         }
     }
 
-    // 3. Arch-default bundled templates (production defaults, flipped ON
-    //    2026-06-09): Qwen3.5/3.6 (arch 5/6) → froggeric; LFM2.5 (arch 11) →
-    //    LiquidAI (embedded if present — the 350M carries one — else the bundled
-    //    copy, which is what the A1B export needs). Env / per-model overrides
-    //    (steps 1–2) still win.
-    match hfq.arch_id {
-        5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
-        11 => {
-            if let Some(t) = hfq.chat_template() {
-                return Some(t);
-            }
-            return Some(LFM2_TEMPLATE.to_string());
+    // 4. Arch-default bundled templates (production defaults, flipped ON
+    //    2026-06-09): LFM2.5 (arch 11) → LiquidAI (embedded if present — the
+    //    350M carries one — else the bundled copy, which is what the A1B export
+    //    needs). Qwen3.5/3.6 (arch 5/6) is handled earlier by the structural
+    //    pillar (step 2) and can never reach here.
+    if hfq.arch_id == 11 {
+        if let Some(t) = hfq.chat_template() {
+            return Some(t);
         }
-        _ => {}
+        return Some(LFM2_TEMPLATE.to_string());
     }
-    // 4. HFQ-embedded (all other arches).
+    // 5. HFQ-embedded (all other arches).
     if let Some(t) = hfq.chat_template() {
         return Some(t);
     }

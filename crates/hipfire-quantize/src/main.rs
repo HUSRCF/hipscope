@@ -180,6 +180,30 @@ fn parse_arch_id_override() -> Option<u32> {
     }
 }
 
+/// `--force-arch-id` escape hatch for the qwen3*-pillar override guard. When
+/// the auto-detected arch is qwen3* (5/6) and a `--arch-id` override moves it
+/// OFF {5,6}, the quantizer refuses unless this flag is also present.
+fn force_arch_id_flag() -> bool {
+    std::env::args().any(|a| a == "--force-arch-id")
+}
+
+/// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
+/// arch 5 or 6) off the pillar arches, unless `--force-arch-id` is given.
+/// Keeps the froggeric chat-template pillar + qwen35-crate dispatch intact by
+/// construction. No-op for non-qwen models or overrides that stay in {5,6}.
+fn guard_qwen3_arch_override(auto_arch_id: u32, arch_id: u32) {
+    let auto_is_qwen3 = matches!(auto_arch_id, 5 | 6);
+    let override_off_pillar = !matches!(arch_id, 5 | 6);
+    if auto_is_qwen3 && arch_id != auto_arch_id && override_off_pillar && !force_arch_id_flag() {
+        eprintln!(
+            "error: --arch-id {arch_id} moves an auto-detected qwen3* model (arch {auto_arch_id}) \
+             OFF the pillar arches {{5,6}}; this would break the froggeric chat-template pillar \
+             and the qwen35-crate dispatch. Pass --force-arch-id to override anyway."
+        );
+        std::process::exit(1);
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
@@ -5453,8 +5477,22 @@ fn run_gguf_pipeline(
     let auto_arch_id: u32 = match arch_str.as_str() {
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
+        "qwen3_5" | "qwen3_5_text" => 5,
         "qwen3moe" => 6,
         other => {
+            // Structural-pillar guard: a qwen3* GGUF that doesn't match an
+            // explicit arm above must NOT be silently stamped arch_id=0
+            // (llama). That would route it off the qwen35 crate AND off the
+            // froggeric chat-template pillar at serve time. Loud-fail so the
+            // operator stamps it explicitly with --arch-id 5 or 6.
+            if other.to_lowercase().contains("qwen3") {
+                eprintln!(
+                    "error: GGUF architecture '{other}' looks like a qwen3* family model but maps to no known arch_id; \
+                     refusing to silently stamp arch_id=0 (would break the froggeric pillar). \
+                     Re-run with an explicit --arch-id 5 (dense) or 6 (MoE)."
+                );
+                std::process::exit(1);
+            }
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
             0
         }
@@ -5466,6 +5504,7 @@ fn run_gguf_pipeline(
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
     // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
+    guard_qwen3_arch_override(auto_arch_id, arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
     } else {
@@ -6739,6 +6778,7 @@ fn main() {
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
     // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
+    guard_qwen3_arch_override(auto_arch_id, arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
     } else {
