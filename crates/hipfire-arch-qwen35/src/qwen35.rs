@@ -680,6 +680,10 @@ pub struct Qwen35Weights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    /// True when any MoE FFN projection in the loaded model is MQ6. gfx1151's
+    /// grouped-i8 MQ4 shortcut is model-level unsafe for these promoted A3B
+    /// checkpoints, even in layers whose local routed experts remain MQ4.
+    pub moe_has_mq6: bool,
 
     /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
     /// with `Qwen35Config::paged_experts == true`. The forward path uses
@@ -3641,6 +3645,7 @@ pub fn load_weights(
         embd_format: embd_fmt,
         output_norm,
         output,
+        moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
         // MAD-93: paged construction goes through `load_weights_paged` (added
         // alongside the moe_ffn_decode_impl wiring in a follow-up commit).
@@ -4196,6 +4201,7 @@ pub fn load_weights_paroquant(
         embd_format: embd_fmt,
         output_norm,
         output,
+        moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
         pager: None,
     })
@@ -4244,6 +4250,7 @@ pub fn load_weights_multi(
         embd_format: embd_fmt,
         output_norm,
         output,
+        moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
         pager: None,
     })
@@ -5349,6 +5356,27 @@ fn moe_ffn_has_mq3_experts_uniform(ffn: &MoeFfnWeights) -> bool {
             .any(|e| is_mq3_any(e.gate_up.gpu_dtype) || is_mq3_any(e.down.gpu_dtype))
 }
 
+fn moe_ffn_has_mq6(ffn: &MoeFfnWeights) -> bool {
+    let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256);
+    is_mq6(ffn.router.gpu_dtype)
+        || is_mq6(ffn.shared_expert_gate.gpu_dtype)
+        || is_mq6(ffn.shared_expert.gate.gpu_dtype)
+        || is_mq6(ffn.shared_expert.up.gpu_dtype)
+        || is_mq6(ffn.shared_expert.down.gpu_dtype)
+        || ffn
+            .experts
+            .iter()
+            .any(|e| is_mq6(e.gate_up.gpu_dtype) || is_mq6(e.down.gpu_dtype))
+}
+
+fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
+    layers.iter().any(|layer| match layer {
+        LayerWeights::DeltaNetMoe(l) => moe_ffn_has_mq6(&l.ffn),
+        LayerWeights::FullAttnMoe(l) => moe_ffn_has_mq6(&l.ffn),
+        _ => false,
+    })
+}
+
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
 /// be populated (done automatically by `Qwen35Scratch::new` when config
 /// indicates a MoE model). Safe to call under hipGraph stream capture.
@@ -5471,6 +5499,7 @@ fn moe_ffn_decode_impl(
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
         experts_all_gate_up_mq4: ffn
             .experts
             .iter()
@@ -8070,23 +8099,53 @@ pub fn prefill_batch_pbs_eligible(
 /// Whether MQ6 MoE FFN projections can enter batched prefill. Default-on for
 /// gfx11 (RDNA3/3.5) AND gfx12 (RDNA4): the MQ6 grouped-WMMA decode is present
 /// on both (tag 0 of the merged `gemm_mixed_moe_grouped_wmma{_k2,.gfx12}` kernel,
-/// plus the standalone `gemm_hfq6g256_moe_grouped_wmma{_k2,.gfx12}` ported
-/// 2026-06-11), and the graded shared-MQ6 expert runs the dense-GEMM batched
+/// plus the standalone `gemm_hfq6g256_moe_grouped_wmma{_k2,.gfx12,_gfx1151}` ported
+/// 2026-06-11/12), and the graded shared-MQ6 expert runs the dense-GEMM batched
 /// path. Validated on gfx1100: graded T3-3L-E8 (MQ6 hot / E8 mid / MQ3L cold,
 /// MQ6 shared) batches coherently, KLD 0.038964, and gfx11 prefill is ~10× the
 /// per-token fallback (1012 vs 106 tok/s pp512). UNIFORM-MQ6 OOMs on gfx11
 /// (>24 GB) so it never reaches this gate there — only graded MQ6 models do.
 /// The original gfx12-only default predated the gfx11 MQ6 grouped port and
 /// silently forced per-token prefill on every graded-MQ6 model on gfx11.
-/// Override per-arch with `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
+/// gfx1151 (RDNA3.5, Strix Halo) additionally has master's channel-tested
+/// routed grouped-WMMA MQ6 fast-path (its unrelated Q8 WMMA prefill family is
+/// gated separately by `q8_prefill_wmma_enabled`). Override per-arch with
+/// `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
 fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     match value {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
-        // RDNA3/3.5 (gfx11xx) + RDNA4 (gfx12xx). RDNA1/2 (gfx10xx, no WMMA)
-        // stay off.
+        // RDNA3/3.5 (gfx11xx, includes gfx1151) + RDNA4 (gfx12xx). RDNA1/2
+        // (gfx10xx, no WMMA) stay off. The gfx11 widen (8d555fc6) subsumes
+        // master's narrower gfx12||gfx1151 default; gfx1151 still picks up its
+        // channel-tested grouped-WMMA fast-path inside the kernel dispatcher.
         _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
     }
+}
+
+/// Qwen3.5 batched prefill can run Q8 projections through fused WMMA kernels
+/// or through the older chunked-Q8 substrate. gfx12 has a separate WMMA ABI;
+/// gfx11/gfx1151 use the gfx11 wave32 WMMA ABI. The low-level Q8 channel tests
+/// cover the fused, residual, and generic chunked drop-in paths, so default on
+/// for every arch that advertises wave32 WMMA while preserving the env opt-out.
+fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: bool) -> bool {
+    let _ = arch;
+    if !has_wmma {
+        return false;
+    }
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => true,
+    }
+}
+
+fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
+    q8_prefill_wmma_enabled_from_env(
+        std::env::var("HIPFIRE_Q8_PREFILL_WMMA").ok().as_deref(),
+        gpu.arch.as_str(),
+        gpu.arch_caps.has_wmma(),
+    )
 }
 
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) -> bool {
@@ -8383,6 +8442,7 @@ fn prefill_moe_ffn_body_batched(
     pbs: &PrefillBatchScratch,
     n: usize,
     ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
     // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
     // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
     // driver all-reduce-sums it across ranks and adds into x_batch). The shared
@@ -8915,6 +8975,7 @@ fn prefill_moe_ffn_body_batched(
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
         experts_all_gate_up_mq4: ffn
             .experts
             .iter()
@@ -8960,6 +9021,9 @@ fn prefill_moe_ffn_body_batched(
         k_top,
         n_exp,
         m_total_max,
+        force_mq4_grouped_fp16: model_has_mq6_moe
+            && gpu.arch_caps.is_gfx1151()
+            && gpu.flags.moe_grouped_i8.is_none(),
         topk_indices,
         topk_weights,
         x_batch: &pbs.x_batch,
@@ -9313,7 +9377,7 @@ fn forward_prefill_chunk(
     // (silicon-validated on R9700, 2026-05-14, 4/4 unit tests PASS). Each
     // call site below selects the right variant via an `arch.starts_with`
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = gpu.arch_caps.has_wmma();
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     // MQ3 dispatch arch gate (same predicate, separate name for clarity at
     // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
     // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
@@ -11221,7 +11285,7 @@ fn forward_prefill_chunk(
                 // outputs as the Q8/MQ4 paths (dn_qkv_batch, dn_z_batch,
                 // dn_alpha_batch, dn_beta_batch).
                 let is_paro = matches!(layer.wqkv.gpu_dtype, DType::ParoQ4G128);
-                let q8_wmma_arch = gpu.arch_caps.has_wmma();
+                let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
                 if is_mq {
                     // AWQ-aware: next linear is LA's fused wqkv.
@@ -11800,7 +11864,17 @@ fn forward_prefill_chunk(
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
                 // accumulates the FFN output residual back into it via the
                 // batched indexed down kernel's atomicAdd path.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    n,
+                    &ctx,
+                    weights.moe_has_mq6,
+                    routed_out,
+                )?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -11841,7 +11915,7 @@ fn forward_prefill_chunk(
                 let qkv_is_paro = matches!(layer.wq.gpu_dtype, DType::ParoQ4G128);
                 // Fused QKV requires uniform dtype — see issue #249 for
                 // the dense FA variant. Gate the same way here.
-                let q8_wmma_arch = gpu.arch_caps.has_wmma();
+                let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
                     && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
@@ -12327,7 +12401,17 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched MoE FFN.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    n,
+                    &ctx,
+                    weights.moe_has_mq6,
+                    routed_out,
+                )?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -16577,13 +16661,35 @@ mod tests {
     }
 
     #[test]
-    fn mq6_batched_admit_defaults_to_gfx12_only() {
+    fn mq6_batched_admit_defaults_to_gfx11_and_gfx12() {
+        // Post-merge resolved default (gfx11 widen 8d555fc6 ∪ master's gfx1151
+        // fast-path): every WMMA arch — all gfx11 (RDNA3/3.5, incl. gfx1100 and
+        // gfx1151) and all gfx12 (RDNA4) — default-admits MQ6 batched prefill.
+        // Non-WMMA archs (gfx942 CDNA, gfx1030 RDNA2) stay default-off.
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1201"));
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1200"));
-        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1100"));
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1151"));
+        // gfx1100 is now ADMITTED by default (the gfx11 widen), where master
+        // had it default-off pending channel testing.
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1100"));
         assert!(!mq6_batched_admit_enabled_from_env(None, "gfx942"));
+        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1030"));
+        // Explicit env overrides still win on every arch.
+        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1151"));
         assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1100"));
         assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1201"));
+        assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1100"));
+    }
+
+    #[test]
+    fn q8_prefill_wmma_defaults_on_for_wave32_wmma_arches() {
+        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1201", true));
+        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1100", true));
+        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1151", true));
+        assert!(!q8_prefill_wmma_enabled_from_env(None, "gfx1030", false));
+        assert!(q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1151", true));
+        assert!(!q8_prefill_wmma_enabled_from_env(Some("0"), "gfx1201", true));
+        assert!(!q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1030", false));
     }
 
     #[test]

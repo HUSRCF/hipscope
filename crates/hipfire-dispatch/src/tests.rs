@@ -586,6 +586,7 @@ fn dtypes_all_mq4() -> MoeDtypes {
         shared_gate: DType::MQ4G256,
         shared_expert_gate: DType::MQ4G256,
         shared_expert_up: DType::MQ4G256,
+        shared_expert_down: DType::MQ4G256,
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -859,7 +860,13 @@ fn guard_qkv_hfq4g256_covers_hfq4g256() {
 }
 
 #[test]
-fn guard_qkv_hfq6g256_dp4a_gated() {
+fn guard_qkv_hfq6g256_dp4a_decoupled() {
+    // Post-merge: 458's commit f478d9b6 ("MQ6 dp4a-decouple") removed the
+    // `dp4a_eligible` gate from `guard_qkv_hfq6g256` — HFQ6/MQ6 QKV fusion is
+    // safe + beneficial on RDNA3+ even without dp4a (the None arm falls back to
+    // gemm n=1). So RDNA3 (gfx1100) now FIRES the guard where master had it
+    // blocked. Only `force_unfused` or a non-uniform / wrong-length step window
+    // suppresses it now.
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr_hfq6 = WeightRef { buf: &dummy, dtype: DType::HFQ6G256,
                                m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
@@ -868,13 +875,15 @@ fn guard_qkv_hfq6g256_dp4a_gated() {
     let steps_hfq6 = make_qkv3_steps(&dummy, &wr_hfq6, RotationPlan::FwhtG256);
     let steps_mq6  = make_qkv3_steps(&dummy, &wr_mq6,  RotationPlan::FwhtG256);
 
-    // gfx906 has gemv_dp4a enabled → fires
+    // gfx906 (dp4a) still fires.
     assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_gfx906()));
     assert!(guard_qkv_hfq6g256(&steps_mq6,  &ctx_gfx906()));
-    // RDNA1 (gfx1010) has no dp4a → blocked
-    assert!(!guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna1()));
-    // RDNA3 (gfx1100) has no gemv_dp4a → blocked
-    assert!(!guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna3()));
+    // RDNA3 (gfx1100) now ALSO fires (dp4a decoupled).
+    assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna3()));
+    assert!(guard_qkv_hfq6g256(&steps_mq6,  &ctx_rdna3()));
+    // RDNA1 (gfx1010) fires too — the guard no longer gates on dp4a; the
+    // fused_qkv None arm safely lowers to gemm n=1 on any arch.
+    assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna1()));
 }
 
 #[test]
@@ -914,6 +923,7 @@ fn moe_dtypes_mq4() -> MoeDtypes {
         shared_gate: DType::Q8_0,
         shared_expert_gate: DType::MQ4G256,
         shared_expert_up: DType::MQ4G256,
+        shared_expert_down: DType::MQ4G256,
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -968,6 +978,25 @@ fn moe_prefill_resolution_path2_gfx12_mq6() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "gfx12 should have Path 2 for MQ6");
     assert!(!r.paro_mode);
+}
+
+#[test]
+fn moe_prefill_resolution_gfx1151_mixed_mq6_fences_mq4_i8() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1151");
+
+    let pure_mq4 = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(pure_mq4.use_path2);
+    assert!(
+        !pure_mq4.force_mq4_grouped_fp16,
+        "pure MQ4 layers should keep gfx1151's existing grouped-i8 default"
+    );
+
+    let mixed_mq6 = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(mixed_mq6.use_path2);
+    assert!(
+        mixed_mq6.force_mq4_grouped_fp16,
+        "MQ6-promoted/mixed A3B layers must not run remaining MQ4 projections through grouped-i8 by default"
+    );
 }
 
 #[test]
@@ -1037,18 +1066,21 @@ fn moe_prefill_resolution_paro_i8_opt_out() {
 }
 
 #[test]
-fn moe_prefill_resolution_mq6_gfx11_falls_back_to_path1() {
+fn moe_prefill_resolution_mq6_gfx11_uses_path2() {
+    // Post-merge: the gfx11 MQ6 grouped-WMMA `_k2` kernel now exists, so the
+    // 458 widen (8d555fc6) admits Path 2 on any wmma_w32 gfx11 arch (gfx1100
+    // included), superseding master's earlier gfx12-only fallback assertion.
     let arch = crate::context::DispatchCtx::for_test("gfx1100");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(!r.use_path2, "MQ6 on gfx11 should NOT use Path 2 (grouped WMMA is gfx12-only)");
+    assert!(r.use_path2, "MQ6 on gfx11 should use Path 2 (gfx11 `_k2` grouped WMMA exists)");
     assert!(!r.down_path0, "gfx11 is not Path 0");
 }
 
 #[test]
-fn moe_prefill_resolution_mq6_gfx1151_falls_back_to_path1() {
+fn moe_prefill_resolution_mq6_gfx1151_uses_path2() {
     let arch = crate::context::DispatchCtx::for_test("gfx1151");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(!r.use_path2, "MQ6 on gfx1151 should NOT use Path 2 (grouped WMMA is gfx12-only)");
+    assert!(r.use_path2, "MQ6 on gfx1151 should use Path 2 (grouped WMMA available)");
     assert!(!r.down_path0);
 }
 
@@ -1066,4 +1098,3 @@ fn moe_prefill_resolution_mq4_gfx11_still_path2() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "MQ4 on gfx11 should still use Path 2");
 }
-

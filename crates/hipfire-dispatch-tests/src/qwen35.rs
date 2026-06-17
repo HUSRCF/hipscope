@@ -100,6 +100,7 @@ fn mq4_dtypes() -> MoeDtypes {
         shared_gate: DType::MQ4G256,
         shared_expert_gate: DType::MQ4G256,
         shared_expert_up: DType::MQ4G256,
+        shared_expert_down: DType::MQ4G256,
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,

@@ -21,10 +21,10 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms,
-    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -119,10 +119,16 @@ impl Gpus {
     pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
         if n_devices == 0 {
-            return Err(HipError::new(0, "init_layers: per_device must be non-empty"));
+            return Err(HipError::new(
+                0,
+                "init_layers: per_device must be non-empty",
+            ));
         }
         if per_device.contains(&0) {
-            return Err(HipError::new(0, "init_layers: each device must own ≥1 layer"));
+            return Err(HipError::new(
+                0,
+                "init_layers: each device must own ≥1 layer",
+            ));
         }
         let n_layers: usize = per_device.iter().sum();
         let device_ids = resolve_device_ids(n_devices)?;
@@ -254,7 +260,10 @@ impl Gpus {
                     all_ok = false;
                     continue;
                 }
-                match self.devices[i].hip.enable_peer_access(self.devices[j].device_id) {
+                match self.devices[i]
+                    .hip
+                    .enable_peer_access(self.devices[j].device_id)
+                {
                     Ok(()) => {}
                     // ffi.rs already converts 704 → Ok(()); this arm is
                     // belt-and-suspenders against ROCm versions where the
@@ -325,12 +334,15 @@ impl Gpus {
         let dst_dev_id = self.devices[dst_dev].device_id;
         match src_gpu.active_stream.as_ref() {
             Some(stream) => {
-                src_gpu.hip.memcpy_peer_async(
-                    dst, dst_dev_id, src, src_dev_id, n_bytes, stream,
-                )?;
+                src_gpu
+                    .hip
+                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, stream)?;
                 let event = src_gpu.hip.event_create()?;
                 match src_gpu.hip.event_record(&event, Some(stream)) {
-                    Ok(()) => Ok(BoundaryEvent { dst_dev, completion: Some(event) }),
+                    Ok(()) => Ok(BoundaryEvent {
+                        dst_dev,
+                        completion: Some(event),
+                    }),
                     Err(e) => {
                         let _ = src_gpu.hip.event_destroy(event);
                         Err(e)
@@ -342,8 +354,13 @@ impl Gpus {
                 // lands. No event needed — recording into the HIP null
                 // stream is fragile across ROCm versions; skip it and
                 // signal "already done" via completion: None.
-                src_gpu.hip.memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
-                Ok(BoundaryEvent { dst_dev, completion: None })
+                src_gpu
+                    .hip
+                    .memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
+                Ok(BoundaryEvent {
+                    dst_dev,
+                    completion: None,
+                })
             }
         }
     }
@@ -380,11 +397,7 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
-    fn from_parts(
-        devices: Vec<Gpu>,
-        per_device: Vec<usize>,
-        n_layers: usize,
-    ) -> HipResult<Self> {
+    fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
         let n_devices = devices.len();
@@ -464,11 +477,7 @@ impl Gpus {
     /// immediately; the buffers are valid only after a subsequent
     /// `stream_synchronize` (or a downstream dispatch that's already
     /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(
-        &mut self,
-        buffers: &[&DeviceBuffer],
-        count: usize,
-    ) -> HipResult<()> {
+    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
         if buffers.len() != self.devices.len() {
             return Err(HipError::new(
                 0,
@@ -509,13 +518,17 @@ impl Gpus {
                     ),
                 )
             })?;
-            rccl.all_reduce_sum_f32(
-                r,
-                buf.as_ptr() as *const f32,
-                buf.as_ptr() as *mut f32,
-                count,
-                stream.raw_ptr(),
-            )
+            // SAFETY: `buf` is a live device buffer of `count` f32 on device
+            // `r`, and `stream` is that device's active stream.
+            unsafe {
+                rccl.all_reduce_sum_f32(
+                    r,
+                    buf.as_ptr() as *const f32,
+                    buf.as_ptr() as *mut f32,
+                    count,
+                    stream.raw_ptr(),
+                )
+            }
             .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
         }
         rccl.group_end()
@@ -536,7 +549,10 @@ impl Gpus {
         }
         // Free the old (too-small) set on its owning devices before regrowing.
         if !self.peer_ar_tmp.is_empty() {
-            for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+            for (r, row) in std::mem::take(&mut self.peer_ar_tmp)
+                .into_iter()
+                .enumerate()
+            {
                 let _ = self.devices[r].bind_thread();
                 for buf in row {
                     let _ = self.devices[r].hip.free(buf);
@@ -581,7 +597,10 @@ impl Gpus {
         if buffers.len() != n {
             return Err(HipError::new(
                 0,
-                &format!("all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}", buffers.len()),
+                &format!(
+                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
             ));
         }
         if n == 1 {
@@ -598,7 +617,8 @@ impl Gpus {
                 if j == r {
                     continue;
                 }
-                let evt = self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                let evt =
+                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
                 evts.push(evt);
                 slot += 1;
             }
@@ -711,7 +731,8 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = crate::config::get().uniform_vram_tolerance_gb
+    let tol_gb = crate::config::get()
+        .uniform_vram_tolerance_gb
         .map(|t| t as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
     if delta_gb > tol_gb {

@@ -240,6 +240,7 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             shared_gate: Q8_0,
             shared_expert_gate: Q8_0,
             shared_expert_up: Q8_0,
+            shared_expert_down: Q8_0,
             experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
@@ -294,7 +295,7 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     // (op=moe, dtype=MQ4G256, k=4) → resolves to the CPU fallback, NOT GPU-top-K.
     let mq4_k4 = MoeDtypes {
         router: Q8_0, shared_gate: Q8_0,
-        shared_expert_gate: Q8_0, shared_expert_up: Q8_0,
+        shared_expert_gate: Q8_0, shared_expert_up: Q8_0, shared_expert_down: Q8_0,
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256, routed_down: MQ4G256,
         routed_has_mixed_experts: false,

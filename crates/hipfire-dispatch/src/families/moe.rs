@@ -43,6 +43,7 @@ pub struct MoeDtypes {
     pub shared_gate: DType,          // ffn.shared_expert_gate
     pub shared_expert_gate: DType,   // ffn.shared_expert.gate
     pub shared_expert_up: DType,     // ffn.shared_expert.up
+    pub shared_expert_down: DType,   // ffn.shared_expert.down
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType,       // ffn.experts[0].gate_up
     pub routed_down: DType,          // ffn.experts[0].down
@@ -62,6 +63,20 @@ pub struct MoeDtypes {
     /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
+}
+
+impl MoeDtypes {
+    pub fn has_mq6_projection(&self) -> bool {
+        [
+            self.shared_expert_gate,
+            self.shared_expert_up,
+            self.shared_expert_down,
+            self.routed_gate_up,
+            self.routed_down,
+        ]
+        .iter()
+        .any(|dt| matches!(*dt, DType::MQ6G256))
+    }
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -438,6 +453,11 @@ pub struct MoePrefillParams<'a> {
     /// `moe_grouped_m_total_bound(total_slots, n_exp)`. Used by Path 2
     /// scatter + grouped GEMM for grid sizing.
     pub m_total_max: usize,
+    /// Model-level safety fence for promoted/mixed MQ6 checkpoints. When true,
+    /// MQ4 grouped prefill calls use FP16 WMMA even for layers whose local
+    /// routed dtype snapshot is pure MQ4. This keeps pure MQ4 models on the
+    /// existing i8 default while avoiding mixed-checkpoint corruption.
+    pub force_mq4_grouped_fp16: bool,
     // routing inputs (model-produced)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
@@ -508,6 +528,11 @@ pub struct MoePrefillResolution {
     pub use_paro_i8_k8: bool,
     /// Routed experts use ParoQ4G128 (determines SwiGLU+rotate kernel selection).
     pub paro_mode: bool,
+    /// gfx1151's HFQ4 grouped-i8 path is correct for pure MQ4, but corrupts
+    /// MQ6-promoted A3B MTP prefill when the same MoE layer mixes MQ4 and MQ6
+    /// projections. Default mixed layers back to FP16 WMMA; explicit
+    /// HIPFIRE_MOE_GROUPED_I8=1 still opts into the research path.
+    pub force_mq4_grouped_fp16: bool,
 }
 
 impl MoePrefillResolution {
@@ -526,6 +551,9 @@ impl MoePrefillResolution {
         // gfx12 `_gfx12` kernel). Only suppress Path 2 for MQ6 on archs that
         // have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and not
         // gfx12. gfx1100/1101/1102/1103/1150/1151/1152 all have wmma_w32.
+        // (Master's narrower gfx1151-only MQ6 admit (dfed8cc6) is subsumed by
+        // this wider gfx11 widen (8d555fc6); master's mixed-checkpoint safety
+        // is preserved separately via `force_mq4_grouped_fp16` below.)
         let mq6_on_non_wmma = d.routed_gate_up == DType::MQ6G256
             && !arch.has_wmma_w32()
             && !(arch.is_gfx1200() || arch.is_gfx1201());
@@ -567,7 +595,18 @@ impl MoePrefillResolution {
             && flags.moe_paro_i8.unwrap_or(true);
         let use_paro_i8_k8 = use_paro_i8
             && flags.moe_paro_i8_k8.unwrap_or(true);
-        Self { use_path2, down_path0, use_paro_i8, use_paro_i8_k8, paro_mode }
+        let force_mq4_grouped_fp16 = use_path2
+            && is_gfx1151
+            && d.has_mq6_projection()
+            && flags.moe_grouped_i8.is_none();
+        Self {
+            use_path2,
+            down_path0,
+            use_paro_i8,
+            use_paro_i8_k8,
+            paro_mode,
+            force_mq4_grouped_fp16,
+        }
     }
 }
 
