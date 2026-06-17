@@ -3181,8 +3181,69 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
         _ => {}
     }
     // 4. HFQ-embedded (all other arches).
-    hfq.chat_template()
+    if let Some(t) = hfq.chat_template() {
+        return Some(t);
+    }
+
+    // 5. Bulletproof never-bare fallback — a default ChatML frame.
+    //
+    // Sources 1-4 are the model's "real" template; they win whenever
+    // present, so this is strictly behavior-preserving for any model that
+    // resolves one (qwen3.5/3.6 → froggeric, LFM2.5 → LiquidAI, every
+    // other arch with an embedded `tokenizer_config.chat_template`).
+    //
+    // The gap this closes: an arch in the `_` bucket whose .hfq carries no
+    // embedded chat_template (e.g. a re-quantized checkpoint whose pipeline
+    // dropped `tokenizer_config.chat_template`) used to resolve to `None`.
+    // `None` makes `try_jinja = jinja_enabled && chat_template.is_some()`
+    // false at EVERY generate call site, so the never-bare guarantee then
+    // rests entirely on each site's hand-rolled `ChatFrame::Plain`
+    // else-branch. Any path that trusts the template to be present (or a
+    // future jinja-only caller) would instead send the user's RAW,
+    // UNFRAMED prompt — which collapses a fragile (heavily-quantized)
+    // build into a token attractor (a bare, `<|im_start|>assistant`-less
+    // prompt has no decode anchor). A served engine must NEVER send a bare
+    // prompt; guarantee the frame here at the resolution layer rather than
+    // depending on every downstream site.
+    //
+    // The default template reproduces the engine's own `ChatScaffold`
+    // framing (<|im_start|>{role}\n{content}<|im_end|>\n per turn, then
+    // <|im_start|>assistant\n[<think>\n]? when add_generation_prompt), so
+    // a templateless model frames identically whether or not
+    // HIPFIRE_JINJA_CHAT is on. Opt out (back to raw None / Plain-only)
+    // with HIPFIRE_DEFAULT_CHATML=0.
+    if std::env::var("HIPFIRE_DEFAULT_CHATML").ok().as_deref() == Some("0") {
+        eprintln!(
+            "[chat_template] no template resolved + HIPFIRE_DEFAULT_CHATML=0 → None (Plain-only framing)"
+        );
+        return None;
+    }
+    eprintln!(
+        "[chat_template] no model/bundled/embedded template resolved → default ChatML fallback (never-bare)"
+    );
+    Some(DEFAULT_CHATML_TEMPLATE.to_string())
 }
+
+/// Default ChatML chat template — the bulletproof never-bare fallback used
+/// when a model carries no resolvable `chat_template` (env / per-model file
+/// / arch-bundled / HFQ-embedded all None). Renders the same frame the
+/// hand-rolled `prompt_frame::ChatScaffold` produces, so switching a
+/// templateless model onto this path is framing-equivalent to the Plain
+/// scaffold while ALSO satisfying the `chat_template.is_some()` gate the
+/// jinja serve path keys off — the daemon frames identically with or
+/// without `HIPFIRE_JINJA_CHAT`. The `<think>\n` opener is gated on
+/// `enable_thinking` to mirror the OpenThink prefix the Plain scaffold
+/// emits for thinking models.
+const DEFAULT_CHATML_TEMPLATE: &str = "\
+{%- for message in messages -%}\
+{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' -}}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{{- '<|im_start|>assistant\n' -}}\
+{%- if enable_thinking is defined and enable_thinking -%}\
+{{- '<think>\n' -}}\
+{%- endif -%}\
+{%- endif -%}";
 
 fn parse_state_quant(
     mode: Option<&str>,
