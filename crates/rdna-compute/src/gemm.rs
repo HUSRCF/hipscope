@@ -17289,7 +17289,17 @@ impl Gpu {
         self.bind_thread()?;
         static USE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_legacy = *USE_LEGACY.get_or_init(|| self.flags.q8_batched_legacy);
-        if !use_legacy && self.arch_caps.is_rdna4() && k % 32 == 0 && n > 0 {
+        // Route to WMMA on ALL wave32-WMMA arches (gfx11 RDNA3, gfx1151
+        // RDNA3.5, gfx12 RDNA4), not just RDNA4. `gemm_q8_0_wmma` selects the
+        // RDNA3 vs RDNA4 kernel internally and asserts `has_wmma()`, so this is
+        // exactly its own precondition. The former `is_rdna4()` gate left gfx11
+        // falling back to the scalar 1-wave-per-row `gemm_q8_0_batched` even
+        // though the RDNA3 WMMA kernel is validated (parity test +
+        // stale-fp16-cache fix, 49881383). On A3B mq4p this scalar path was
+        // ~31% of the gfx11 MTP verify GPU time (rocprofv3 2026-06-16: 260ms /
+        // 80 cycles); mq4 never hit it (4-bit hfq4 projections). Mirrors the
+        // W3i MTP-head lm_head fix (5ac96a8f, +47% gfx12).
+        if !use_legacy && self.arch_caps.has_wmma() && k % 32 == 0 && n > 0 {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
 
