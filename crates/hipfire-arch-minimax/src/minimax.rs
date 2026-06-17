@@ -1059,6 +1059,8 @@ fn load_norm_from_source(
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()
+    } else if info.dtype == "BF16" {
+        hipfire_runtime::safetensors_source::bf16_bytes_to_f32(bytes)
     } else {
         return Err(format!(
             "minimax: expected F16 norm for {name}, got {} bytes (numel={})",
