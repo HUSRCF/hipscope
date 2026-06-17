@@ -312,6 +312,81 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
     serde_json::to_string(&serde_json::Value::Object(meta)).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// BF16 (bfloat16) decode helpers
+// ---------------------------------------------------------------------------
+
+/// Widen a BF16 (bfloat16) value to F32.
+/// BF16 is the upper 16 bits of an IEEE-754 F32 number — widening is left-shifting by 16.
+#[inline]
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert BF16 byte slice to F16 byte vector (owned).
+/// Each BF16 value is widened to F32, then narrowed to F16.
+pub fn bf16_bytes_to_f16(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(2)
+        .map(|c| {
+            let bf16 = u16::from_le_bytes([c[0], c[1]]);
+            let f32_val = f32::from_bits((bf16 as u32) << 16);
+            crate::llama::f32_to_f16(f32_val).to_le_bytes()
+        })
+        .flatten()
+        .collect()
+}
+
+/// Convert BF16 byte slice to F32 vector.
+pub fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(2)
+        .map(|c| {
+            let bf16 = u16::from_le_bytes([c[0], c[1]]);
+            f32::from_bits((bf16 as u32) << 16)
+        })
+        .collect()
+}
+
+/// Convert tensor bytes to F16 bytes based on dtype string.
+/// Handles F16 (passthrough), BF16 (decode), F32 (narrow).
+/// Panics on unknown dtype (fail-fast over silent wrong results).
+/// NOTE: n_elements validation removed — caller responsibility.
+pub fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8]) -> Vec<u8> {
+    match source_dtype {
+        "F16" => data.to_vec(),
+        "BF16" => bf16_bytes_to_f16(data),
+        "F32" => data
+            .chunks_exact(4)
+            .map(|c| {
+                let f32_val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                crate::llama::f32_to_f16(f32_val).to_le_bytes()
+            })
+            .flatten()
+            .collect(),
+        other => panic!(
+            "unsupported source dtype '{other}' for fp-to-f16 conversion (expected F16/BF16/F32)"
+        ),
+    }
+}
+
+/// Convert tensor bytes to F32 vector based on dtype string.
+/// Panics on unknown dtype.
+pub fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8]) -> Vec<f32> {
+    match source_dtype {
+        "F16" => data
+            .chunks_exact(2)
+            .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "BF16" => bf16_bytes_to_f32(data),
+        "F32" => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        other => panic!(
+            "unsupported source dtype '{other}' for fp-to-f32 conversion (expected F16/BF16/F32)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +411,46 @@ mod tests {
         let id = derive_arch_id(&json!({ "model_type": "totally_unknown_arch" }));
         assert_eq!(id, UNCLAIMED_ARCH_ID);
         assert_ne!(id, 5, "must not default to Qwen35");
+    }
+
+    #[test]
+    fn bf16_to_f32_basic_values() {
+        assert_eq!(bf16_to_f32(0x3F80), 1.0f32); // normal
+        assert_eq!(bf16_to_f32(0xC000), -2.0f32); // normal negative
+        assert_eq!(bf16_to_f32(0x0000), 0.0f32); // zero
+        assert_eq!(bf16_to_f32(0x8000).to_bits(), (-0.0f32).to_bits()); // neg zero
+        assert!(bf16_to_f32(0x0001) > 0.0); // subnormal
+        assert!(bf16_to_f32(0x7FC0).is_nan()); // NaN (quiet)
+        assert!(bf16_to_f32(0x7F81).is_nan()); // NaN (signaling)
+        assert!(bf16_to_f32(0xFFC0).is_nan()); // negative NaN
+    }
+
+    #[test]
+    fn source_bytes_roundtrip() {
+        // F16 passthrough: F16 1.0 → stays F16 1.0
+        let f16_data = vec![0x00u8, 0x3C];
+        let result = source_bytes_to_f16_stream("F16", &f16_data);
+        assert_eq!(result, f16_data);
+
+        // BF16→F16: BF16 1.0 (0x3F80 LE) → F16 1.0 (0x3C00 LE)
+        let bf16_data = vec![0x80u8, 0x3F];
+        let result = source_bytes_to_f16_stream("BF16", &bf16_data);
+        assert_eq!(result, vec![0x00, 0x3C]);
+
+        // F32→F16: F32 1.0 → F16 1.0
+        let f32_data = vec![0x00u8, 0x00, 0x80, 0x3F];
+        let result = source_bytes_to_f16_stream("F32", &f32_data);
+        assert_eq!(result, vec![0x00, 0x3C]);
+
+        // BF16→F32: BF16 -2.0 (0xC000 LE) → -2.0 F32
+        let bf16_data = vec![0x00u8, 0xC0];
+        let result = source_bytes_to_f32_vec("BF16", &bf16_data);
+        assert_eq!(result, vec![-2.0f32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported source dtype")]
+    fn source_bytes_to_f16_unknown_dtype_panics() {
+        source_bytes_to_f16_stream("FP8", &[0u8; 4]);
     }
 }
