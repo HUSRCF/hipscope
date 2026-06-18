@@ -96,27 +96,58 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(tabs, chunks[1]);
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let help = match app.tab {
-        Tab::Dashboard => "Tab switch  live serve telemetry (auto-refresh ~1.5s)  r refresh now  q quit",
+/// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
+/// the global `Tab/BackTab switch · q quit` suffix is appended for non-edit
+/// states. Kept here (not in App) so the hint text lives next to the renderer.
+fn footer_hints(app: &App) -> String {
+    let global = "Tab/BackTab switch · q quit";
+    match app.tab {
+        Tab::Home => format!("r refresh · {global}"),
+        Tab::Dashboard => format!("r refresh now (auto ~1.5s) · {global}"),
         Tab::Chat => {
-            "Tab switch  Enter send/start serve  Ctrl+O newline  Up/Down scroll  Esc blur/quit"
+            // Chat owns q/r as text input, so it has its own exit hints.
+            "Enter send / start serve · Ctrl+O newline · Up/Down scroll · Esc blur".to_string()
         }
-        Tab::Models => {
-            "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
-        }
+        Tab::Models => format!("Up/Down select · Enter/Right expand · Enter select · Left fold · r refresh · {global}"),
         Tab::Settings => {
             if app.settings_edit.is_some() {
-                "Editing: type value  Enter save  Backspace delete  Esc cancel"
+                "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
             } else {
-                "e easy  a advanced  Up/Down select  Left/Right/Space cycle enum  Enter edit num/text  r refresh"
+                format!("e easy · a advanced · Up/Down select · Left/Right/Space cycle · Enter edit · r refresh · {global}")
             }
         }
-        _ => "Tab switch  r refresh  q quit",
-    };
+        Tab::System => format!("live diagnostics (auto ~1.5s) · r refresh · {global}"),
+    }
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // A live toast takes over the footer line entirely (colored by severity);
+    // otherwise show the per-tab hints + the last persistent status line.
+    if let Some(toast) = &app.toast {
+        let (fg, tag) = match toast.level {
+            crate::app::ToastLevel::Error => (RED, "!"),
+            crate::app::ToastLevel::Info => (GREEN, "·"),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {tag} "),
+                    Style::default().fg(BG).bg(fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", toast.text),
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .style(Style::default().bg(BG)),
+            area,
+        );
+        return;
+    }
+
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(help, Style::default().fg(MUTED)),
+            Span::styled(footer_hints(app), Style::default().fg(MUTED)),
             Span::styled(
                 format!("    {}", app.last_reload),
                 Style::default().fg(Color::DarkGray),
@@ -481,6 +512,34 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let visible_items = app.registry.visible_items();
+    if visible_items.is_empty() {
+        // Empty-state guidance: no registry entries and no local downloads.
+        let lines = vec![
+            Line::from(Span::styled(
+                "No models found.",
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Pull a model with:"),
+            Line::from(Span::styled(
+                "    hipfire pull <id>",
+                Style::default().fg(GREEN),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "The registry (cli/registry.json) lists available ids; downloads land in ~/.hipfire/models.",
+                Style::default().fg(MUTED),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block("Registry browser"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(TEXT).bg(PANEL)),
+            chunks[1],
+        );
+        return;
+    }
     let rows = visible_items
         .iter()
         .enumerate()
@@ -713,38 +772,64 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
         left[1],
     );
 
-    let mut diagnostic_lines = vec![
-        Line::from(Span::styled(
-            "Diagnostics roadmap",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from("Prototype 1 is intentionally read-only here."),
-        Line::from("Next slice should wrap hipfire diag, kernel cache status, ROCm version,"),
-        Line::from("serve logs, model checksums, and first-run setup checks."),
+    let mut diagnostic_lines = vec![Line::from(Span::styled(
+        "Live diagnostics",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    match app.dashboard.as_ref().and_then(|d| d.system.as_ref()) {
+        Some(sys) => {
+            diagnostic_lines.push(probe_line("GPU", &sys.gpu_name));
+            diagnostic_lines.push(probe_line("Arch", &sys.gpu_arch));
+            diagnostic_lines.push(probe_line("HIP/ROCm", &sys.hip_version));
+            diagnostic_lines.push(probe_line("Kernel cache", &sys.kernel_cache));
+            diagnostic_lines.push(probe_line("Loaded model", &sys.loaded_model));
+            diagnostic_lines.push(probe_line("Checksum", &sys.model_checksum));
+        }
+        None => {
+            // Worker has not produced a snapshot yet (first frame on this tab).
+            diagnostic_lines.push(Line::from(Span::styled(
+                "Probing GPU / HIP / kernel cache…",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    diagnostic_lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "Local model files:",
             Style::default().fg(MUTED),
         )),
-    ];
+    ]);
     if app.registry.local_files.is_empty() {
-        diagnostic_lines.push(Line::from("No local models under ~/.hipfire/models."));
+        // Empty-state guidance: tell the user how to get a model.
+        diagnostic_lines.push(Line::from(Span::styled(
+            "No local models under ~/.hipfire/models.",
+            Style::default().fg(YELLOW),
+        )));
+        diagnostic_lines.push(Line::from(Span::styled(
+            "Pull one with `hipfire pull <id>` (see the Models tab for ids).",
+            Style::default().fg(YELLOW),
+        )));
     } else {
         diagnostic_lines.extend(
             app.registry
                 .local_files
                 .iter()
-                .take(7)
+                .take(6)
                 .map(|m| Line::from(format!("{}  {}", m.size, m.file))),
         );
     }
     diagnostic_lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "Current health response:",
+            "Serve /health response:",
             Style::default().fg(MUTED),
         )),
-        Line::from(app.status.health_text.chars().take(500).collect::<String>()),
+        Line::from(if app.status.health_text.is_empty() {
+            "serve offline — start with `hipfire serve -d`".to_string()
+        } else {
+            app.status.health_text.chars().take(300).collect::<String>()
+        }),
     ]);
     frame.render_widget(
         Paragraph::new(Text::from(diagnostic_lines))
@@ -753,6 +838,20 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(TEXT).bg(PANEL)),
         cols[1],
     );
+}
+
+/// Render one `label: value` diagnostic line, coloring an honest "unavailable"
+/// probe yellow and a real value green-tinted text.
+fn probe_line(label: &str, probe: &crate::hipfire::dashboard::Probe) -> Line<'static> {
+    let value_style = if probe.is_available() {
+        Style::default().fg(TEXT)
+    } else {
+        Style::default().fg(YELLOW)
+    };
+    Line::from(vec![
+        Span::styled(format!("{label:<13}"), Style::default().fg(MUTED)),
+        Span::styled(probe.display().to_string(), value_style),
+    ])
 }
 
 fn card(title: &str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
@@ -820,6 +919,7 @@ mod render_tests {
         let dash = Dashboard {
             serve_up: true,
             endpoint: "127.0.0.1:11435".into(),
+            health_text: r#"{"status":"ok","model":"qwen3.5:9b"}"#.into(),
             model: Some("qwen3.5:9b".into()),
             stats: Some(ServeStats {
                 model: Some("qwen3.5:9b".into()),
@@ -835,6 +935,7 @@ mod render_tests {
                 total_bytes: 24_000_000_000,
             }]),
             offline_hint: None,
+            system: None,
         };
         let text = render_dashboard(Some(dash));
         assert!(text.contains("online"), "expected online marker");
@@ -869,5 +970,137 @@ mod render_tests {
         // not a crash and not zeros-as-data.
         let text = render_dashboard(None);
         assert!(text.contains("Probing serve"), "expected probing placeholder");
+    }
+
+    use crate::hipfire::dashboard::{Probe, SystemInfo};
+
+    /// Render any tab and return flattened buffer text. Mutates `app` via the
+    /// passed closure first (set tab / inject dashboard / toast). CPU-only, no
+    /// TTY, no GPU, no serve.
+    fn render_with(setup: impl FnOnce(&mut App)) -> String {
+        let mut app = App::load().expect("App::load");
+        setup(&mut app);
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn dash_with_system(system: SystemInfo) -> Dashboard {
+        let mut d = Dashboard::offline(
+            "127.0.0.1:11435".into(),
+            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
+        );
+        d.system = Some(system);
+        d
+    }
+
+    #[test]
+    fn system_tab_renders_live_diagnostics() {
+        let sys = SystemInfo {
+            gpu_name: Probe::Value("Radeon RX 7900 XTX".into()),
+            gpu_arch: Probe::Value("gfx1100".into()),
+            hip_version: Probe::Value("HIP 6.2.41134".into()),
+            kernel_cache: Probe::Value("/home/u/.hipfire_kernels (present, 12 entries)".into()),
+            loaded_model: Probe::Value("/home/u/.hipfire/models/q.mq4".into()),
+            model_checksum: Probe::Value("deadbeefdeadbeef (4.20 GB)".into()),
+        };
+        let text = render_with(|app| {
+            app.tab = Tab::System;
+            app.dashboard = Some(dash_with_system(sys.clone()));
+        });
+        assert!(text.contains("Live diagnostics"), "expected live header");
+        assert!(text.contains("Radeon RX 7900 XTX"), "expected gpu name");
+        assert!(text.contains("gfx1100"), "expected gpu arch");
+        assert!(text.contains("HIP 6.2"), "expected HIP version");
+        assert!(text.contains(".hipfire_kernels"), "expected kernel cache path");
+        assert!(text.contains("deadbeef"), "expected model checksum");
+        // Must NOT show the old static placeholder.
+        assert!(
+            !text.contains("Diagnostics roadmap"),
+            "System tab must be live, not the static placeholder"
+        );
+    }
+
+    #[test]
+    fn system_tab_renders_unavailable_states_honestly() {
+        let sys = SystemInfo {
+            gpu_name: Probe::Unavailable("unavailable: rocm-smi not installed".into()),
+            gpu_arch: Probe::Unavailable("unavailable: rocminfo not installed".into()),
+            hip_version: Probe::Unavailable("unavailable: hipconfig absent".into()),
+            kernel_cache: Probe::Unavailable("/home/u/.hipfire_kernels (absent — populated on first run)".into()),
+            loaded_model: Probe::Unavailable("no model loaded".into()),
+            model_checksum: Probe::Unavailable("no model loaded".into()),
+        };
+        let text = render_with(|app| {
+            app.tab = Tab::System;
+            app.dashboard = Some(dash_with_system(sys));
+        });
+        assert!(text.contains("unavailable"), "expected honest unavailable");
+        assert!(text.contains("no model loaded"), "expected idle model state");
+        // No fabricated gfx string when the probe failed.
+        assert!(!text.contains("gfx1"), "must not invent a gfx target");
+    }
+
+    #[test]
+    fn system_tab_before_first_probe_shows_probing() {
+        let text = render_with(|app| {
+            app.tab = Tab::System;
+            app.dashboard = None;
+        });
+        assert!(
+            text.contains("Probing GPU"),
+            "expected probing placeholder before first snapshot"
+        );
+    }
+
+    #[test]
+    fn footer_hints_are_per_tab() {
+        let settings = render_with(|app| app.tab = Tab::Settings);
+        assert!(settings.contains("cycle"), "settings footer mentions cycle");
+        assert!(settings.contains("easy"), "settings footer mentions easy");
+
+        let models = render_with(|app| app.tab = Tab::Models);
+        assert!(models.contains("select"), "models footer mentions select");
+        assert!(models.contains("expand"), "models footer mentions expand");
+
+        let dash = render_with(|app| app.tab = Tab::Dashboard);
+        assert!(dash.contains("refresh"), "dashboard footer mentions refresh");
+
+        let chat = render_with(|app| app.tab = Tab::Chat);
+        assert!(chat.contains("send"), "chat footer mentions send");
+
+        let system = render_with(|app| app.tab = Tab::System);
+        assert!(system.contains("diagnostics"), "system footer mentions diagnostics");
+        // Global hints present on a non-chat tab.
+        assert!(dash.contains("quit"), "global quit hint present");
+    }
+
+    #[test]
+    fn error_toast_overrides_footer() {
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.toast_error("save failed: permission denied");
+        });
+        assert!(
+            text.contains("save failed: permission denied"),
+            "expected error toast text in footer"
+        );
+    }
+
+    #[test]
+    fn models_empty_state_guides_to_pull() {
+        // App::load with no registry / no local models yields empty visible
+        // items; the Models tab must render pull guidance, not an empty table.
+        let text = render_with(|app| {
+            app.tab = Tab::Models;
+            app.registry.models.clear();
+            app.registry.local_files.clear();
+        });
+        assert!(text.contains("No models found"), "expected empty-state header");
+        assert!(text.contains("hipfire pull"), "expected pull guidance");
     }
 }

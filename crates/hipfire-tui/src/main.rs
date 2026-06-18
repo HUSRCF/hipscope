@@ -114,6 +114,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         // is focused — never any synchronous network / rocm-smi call, so a hung
         // probe cannot block render or input.
         app.sync_dashboard();
+        app.expire_toast();
 
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         app.drain_chat_events();
@@ -152,8 +153,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The chat input only captures global keys (q/r/Esc) while the Chat tab is
+    // focused AND its input is focused. On every other tab the input is not on
+    // screen, so q/r/Esc act as global shortcuts immediately from startup
+    // (chat input defaults focused, but that must not gate other tabs).
+    let chat_capturing = app.tab == app::Tab::Chat && app.chat.is_input_focused();
+
     match key.code {
-        KeyCode::Char('q') if !app.chat.is_input_focused() => return true,
+        KeyCode::Char('q') if !chat_capturing => return true,
         KeyCode::Esc => {
             // While editing a settings value, Esc cancels the edit instead of
             // quitting / blurring chat.
@@ -161,7 +168,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.handle_tab_key(key);
             } else if app.chat.sending {
                 app.chat.status = "stream abort is not wired in prototype 1".into();
-            } else if app.chat.is_input_focused() {
+            } else if chat_capturing {
+                // Only blur the chat input when the Chat tab is the one focused;
+                // on other tabs Esc quits as before.
                 app.chat.blur_input();
             } else {
                 return true;
@@ -169,7 +178,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
-        KeyCode::Char('r') if !app.chat.is_input_focused() => app.reload(),
+        KeyCode::Char('r') if !chat_capturing => app.reload(),
         KeyCode::Char('e') if app.tab == app::Tab::Settings => app.settings_easy = true,
         KeyCode::Char('a') if app.tab == app::Tab::Settings => app.settings_easy = false,
         _ => app.handle_tab_key(key),

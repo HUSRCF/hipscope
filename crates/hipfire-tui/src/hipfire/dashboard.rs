@@ -14,7 +14,9 @@
 //! fabricate placeholder numbers and present them as live.
 
 use std::{
+    env, fs,
     io::Read,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -83,6 +85,10 @@ pub struct ServeStats {
 pub struct Dashboard {
     pub serve_up: bool,
     pub endpoint: String,
+    /// Raw GET /health body (or the transport-error string when serve is down).
+    /// Mirrored into `StatusState.health_text` for the System tab so the UI
+    /// thread never re-probes /health synchronously.
+    pub health_text: String,
     /// Loaded model tag, from /stats or /health (None when idle / serve down).
     pub model: Option<String>,
     pub stats: Option<ServeStats>,
@@ -91,6 +97,9 @@ pub struct Dashboard {
     pub vram: VramState,
     /// When serve is down: an honest hint, e.g. how to start it.
     pub offline_hint: Option<String>,
+    /// Live system diagnostics (GPU/HIP/kernel-cache/loaded-model). Probed off
+    /// the UI thread by the worker. `None` until the first probe completes.
+    pub system: Option<SystemInfo>,
 }
 
 impl Dashboard {
@@ -100,13 +109,300 @@ impl Dashboard {
         Self {
             serve_up: false,
             endpoint,
+            health_text: String::new(),
             model: None,
             stats: None,
             model_ids: Vec::new(),
             vram,
             offline_hint: Some("serve offline — start it with `hipfire serve -d`".into()),
+            system: None,
         }
     }
+}
+
+/// A single live system-diagnostic field. Each is either a real probed value
+/// or an explicit honest `Unavailable(reason)` — we never fabricate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Value(String),
+    Unavailable(String),
+}
+
+impl Probe {
+    pub fn display(&self) -> &str {
+        match self {
+            Probe::Value(s) => s,
+            Probe::Unavailable(s) => s,
+        }
+    }
+    pub fn is_available(&self) -> bool {
+        matches!(self, Probe::Value(_))
+    }
+}
+
+/// Live system diagnostics for the System tab. Probed OFF the UI thread (by the
+/// DashboardWorker) so a slow `rocm-smi` / `hipcc` invocation never blocks
+/// render or input. Every field is an honest [`Probe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemInfo {
+    /// GPU product name(s) from `rocm-smi --showproductname`.
+    pub gpu_name: Probe,
+    /// GPU arch / gfx target (e.g. `gfx1100`) from `rocm-smi --showhw`/gcnArch.
+    pub gpu_arch: Probe,
+    /// HIP / ROCm runtime version (`hipconfig --version` or /opt/rocm/.info).
+    pub hip_version: Probe,
+    /// Kernel-cache directory presence + path.
+    pub kernel_cache: Probe,
+    /// Currently loaded serve model (from the live snapshot, None when idle).
+    pub loaded_model: Probe,
+    /// Checksum of the loaded model file when readable (size-based fast hash).
+    pub model_checksum: Probe,
+}
+
+impl SystemInfo {
+    /// Probe everything that is platform-static (GPU, HIP, kernel cache). The
+    /// loaded-model + checksum are filled in separately from the live serve
+    /// snapshot via [`SystemInfo::with_loaded_model`].
+    pub fn probe() -> Self {
+        if !cfg!(target_os = "linux") {
+            let na = || Probe::Unavailable("unavailable: Linux-only probe".into());
+            return Self {
+                gpu_name: na(),
+                gpu_arch: na(),
+                hip_version: na(),
+                kernel_cache: probe_kernel_cache(),
+                loaded_model: Probe::Unavailable("no model loaded".into()),
+                model_checksum: Probe::Unavailable("no model loaded".into()),
+            };
+        }
+        let (gpu_name, gpu_arch) = probe_gpu();
+        Self {
+            gpu_name,
+            gpu_arch,
+            hip_version: probe_hip_version(),
+            kernel_cache: probe_kernel_cache(),
+            loaded_model: Probe::Unavailable("no model loaded".into()),
+            model_checksum: Probe::Unavailable("no model loaded".into()),
+        }
+    }
+
+    /// Fold the live loaded-model (from the serve snapshot) into the static
+    /// probe, computing a cheap file checksum when the path is readable.
+    pub fn with_loaded_model(mut self, model: Option<&str>) -> Self {
+        match model {
+            Some(m) if !m.is_empty() => {
+                self.loaded_model = Probe::Value(m.to_string());
+                self.model_checksum = probe_model_checksum(m);
+            }
+            _ => {
+                self.loaded_model = Probe::Unavailable("no model loaded".into());
+                self.model_checksum = Probe::Unavailable("no model loaded".into());
+            }
+        }
+        self
+    }
+}
+
+/// Probe GPU product name + arch via `rocm-smi`. Bounded so a hung rocm-smi
+/// cannot wedge the worker. Returns honest unavailable reasons on failure.
+fn probe_gpu() -> (Probe, Probe) {
+    let mut cmd = Command::new("rocm-smi");
+    cmd.args(["--showproductname", "--json"]);
+    let name = match run_bounded(cmd, ROCM_SMI_TIMEOUT) {
+        RocmSmiRun::Output(text) => parse_rocm_product_name(&text),
+        RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocm-smi not installed".into()),
+        RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocm-smi timed out".into()),
+        RocmSmiRun::SpawnError(e) => Probe::Unavailable(format!("unavailable: rocm-smi error: {e}")),
+    };
+
+    let cmd = Command::new("rocminfo");
+    let arch = match run_bounded(cmd, ROCM_SMI_TIMEOUT) {
+        RocmSmiRun::Output(text) => parse_rocminfo_arch(&text),
+        RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocminfo not installed".into()),
+        RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocminfo timed out".into()),
+        RocmSmiRun::SpawnError(e) => Probe::Unavailable(format!("unavailable: rocminfo error: {e}")),
+    };
+    (name, arch)
+}
+
+/// Parse `rocm-smi --showproductname --json`: ROCm emits per-card objects with
+/// a `"Card Series"` / `"Card Model"` / `"Card SKU"` string field (key varies
+/// by ROCm version). Returns the first non-empty product string found.
+pub fn parse_rocm_product_name(body: &str) -> Probe {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Probe::Unavailable("unavailable: rocm-smi product JSON unparseable".into());
+    };
+    let Some(obj) = v.as_object() else {
+        return Probe::Unavailable("unavailable: rocm-smi product JSON not an object".into());
+    };
+    let keys = [
+        "Card Series",
+        "Card Model",
+        "Card SKU",
+        "Device Name",
+        "GPU ID",
+    ];
+    let mut names: Vec<String> = Vec::new();
+    let mut cards: Vec<(u32, &Value)> = obj
+        .iter()
+        .filter_map(|(k, val)| {
+            k.strip_prefix("card")
+                .and_then(|n| n.parse::<u32>().ok())
+                .map(|idx| (idx, val))
+        })
+        .collect();
+    cards.sort_by_key(|(idx, _)| *idx);
+    for (_, card) in cards {
+        for key in keys {
+            if let Some(Value::String(s)) = card.get(key) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    names.push(s.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        Probe::Unavailable("unavailable: no product name in rocm-smi output".into())
+    } else {
+        names.dedup();
+        Probe::Value(names.join(", "))
+    }
+}
+
+/// Parse `rocminfo` text output for the first GPU agent's `gfx` name (the
+/// `Name:` line under an Agent of Device Type GPU). Returns the gfx target.
+pub fn parse_rocminfo_arch(body: &str) -> Probe {
+    // rocminfo lists agents; the GPU agent has a `Name:  gfxNNNN` line.
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Name:") {
+            let name = rest.trim();
+            if name.starts_with("gfx") {
+                return Probe::Value(name.to_string());
+            }
+        }
+        // Some builds use "gfx Name:" / "Marketing Name:" — catch the gfx token.
+        if let Some(idx) = t.find("gfx") {
+            let tok: String = t[idx..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if tok.len() > 3 && tok[3..].chars().any(|c| c.is_ascii_digit()) {
+                return Probe::Value(tok);
+            }
+        }
+    }
+    Probe::Unavailable("unavailable: no gfx target in rocminfo output".into())
+}
+
+/// Probe the HIP/ROCm version. Prefers `hipconfig --version`, falls back to the
+/// `/opt/rocm/.info/version` file.
+fn probe_hip_version() -> Probe {
+    let mut cmd = Command::new("hipconfig");
+    cmd.arg("--version");
+    if let RocmSmiRun::Output(text) = run_bounded(cmd, ROCM_SMI_TIMEOUT) {
+        let v = text.trim();
+        if !v.is_empty() {
+            return Probe::Value(format!("HIP {v}"));
+        }
+    }
+    // Fallback: ROCm version info file.
+    for path in ["/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"] {
+        if let Ok(v) = fs::read_to_string(path) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Probe::Value(format!("ROCm {v}"));
+            }
+        }
+    }
+    Probe::Unavailable("unavailable: hipconfig absent and /opt/rocm/.info missing".into())
+}
+
+/// Resolve the kernel-cache directory the engine uses and report its presence.
+/// Honors `HIPFIRE_KERNEL_CACHE` then falls back to `~/.hipfire_kernels` and the
+/// HIP default `~/.cache/hip`.
+fn kernel_cache_dir() -> Option<PathBuf> {
+    if let Some(v) = env::var_os("HIPFIRE_KERNEL_CACHE") {
+        return Some(PathBuf::from(v));
+    }
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let primary = home.join(".hipfire_kernels");
+    if primary.exists() {
+        return Some(primary);
+    }
+    Some(home.join(".cache").join("hip"))
+}
+
+fn probe_kernel_cache() -> Probe {
+    match kernel_cache_dir() {
+        Some(dir) => {
+            let exists = dir.exists();
+            let count = if exists {
+                fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0)
+            } else {
+                0
+            };
+            let disp = dir.display();
+            if exists {
+                Probe::Value(format!("{disp} (present, {count} entries)"))
+            } else {
+                Probe::Unavailable(format!("{disp} (absent — populated on first run)"))
+            }
+        }
+        None => Probe::Unavailable("unavailable: cannot resolve cache dir (no HOME)".into()),
+    }
+}
+
+/// Compute a cheap, stable checksum for the loaded model file. The model field
+/// is often an absolute path; when it is and the file is readable we emit a
+/// size + FNV-1a hash of the first/last 64 KiB (full hashing a multi-GB weight
+/// file on the worker thread would be wasteful). Honest unavailable otherwise.
+fn probe_model_checksum(model: &str) -> Probe {
+    let path = PathBuf::from(model);
+    if !path.is_absolute() || !path.exists() {
+        return Probe::Unavailable("unavailable: model path not a readable file".into());
+    }
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return Probe::Unavailable(format!("unavailable: stat failed: {e}")),
+    };
+    if !meta.is_file() {
+        return Probe::Unavailable("unavailable: model path is not a file".into());
+    }
+    let size = meta.len();
+    match fnv_head_tail(&path, size) {
+        Some(hash) => Probe::Value(format!("{hash:016x} ({:.2} GB)", size as f64 / 1e9)),
+        None => Probe::Unavailable("unavailable: model file unreadable".into()),
+    }
+}
+
+/// FNV-1a over (size ++ first 64 KiB ++ last 64 KiB) — fast, deterministic,
+/// good enough to distinguish loaded weights without reading gigabytes.
+fn fnv_head_tail(path: &std::path::Path, size: u64) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
+    let mut f = fs::File::open(path).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let fold = |bytes: &[u8], hash: &mut u64| {
+        for b in bytes {
+            *hash ^= *b as u64;
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    fold(&size.to_le_bytes(), &mut hash);
+    let mut head = vec![0u8; CHUNK.min(size) as usize];
+    f.read_exact(&mut head).ok()?;
+    fold(&head, &mut hash);
+    if size > CHUNK {
+        let tail_len = CHUNK.min(size - CHUNK);
+        f.seek(SeekFrom::End(-(tail_len as i64))).ok()?;
+        let mut tail = vec![0u8; tail_len as usize];
+        f.read_exact(&mut tail).ok()?;
+        fold(&tail, &mut hash);
+    }
+    Some(hash)
 }
 
 // ── Pure parse helpers (no I/O) ─────────────────────────────────────────────
@@ -361,11 +657,13 @@ pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
     Dashboard {
         serve_up: true,
         endpoint,
+        health_text: health,
         model,
         stats,
         model_ids,
         vram,
         offline_hint: None,
+        system: None,
     }
 }
 
@@ -482,6 +780,11 @@ fn worker_loop(
     wake_rx: mpsc::Receiver<()>,
 ) {
     let mut last_fetch: Option<Instant> = None;
+    // Static system diagnostics (GPU/HIP/kernel-cache) are probed once and
+    // cached — they don't change within a session and re-running rocm-smi /
+    // rocminfo every 1.5s would be wasteful. The loaded-model + checksum
+    // overlay IS refreshed each cycle from the live serve snapshot.
+    let mut system_base: Option<SystemInfo> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -489,9 +792,13 @@ fn worker_loop(
 
         let is_active = active.load(Ordering::SeqCst);
         let forced = force.swap(false, Ordering::SeqCst);
-        let due = is_active
-            && (forced
-                || last_fetch
+        // A forced refresh (manual `r`) ALWAYS fetches, even when the live tab
+        // is not focused — otherwise the force flag is swapped-then-dropped and
+        // the snapshot goes stale until Dashboard/System is next opened. The
+        // time-based cadence still only fires while active.
+        let due = forced
+            || (is_active
+                && last_fetch
                     .map(|t| t.elapsed() >= WORKER_REFRESH)
                     .unwrap_or(true));
 
@@ -499,7 +806,10 @@ fn worker_loop(
             // Clone the config out of the lock so the (potentially slow) fetch
             // never holds it.
             let cfg = config.lock().unwrap().clone();
-            let dash = fetch_dashboard(&cfg);
+            let mut dash = fetch_dashboard(&cfg);
+            // Probe static system info on first need; reuse thereafter.
+            let base = system_base.get_or_insert_with(SystemInfo::probe).clone();
+            dash.system = Some(base.with_loaded_model(dash.model.as_deref()));
             *snapshot.lock().unwrap() = Some(dash);
             last_fetch = Some(Instant::now());
         }

@@ -5,6 +5,7 @@
 use std::{
     sync::mpsc::{self, Receiver},
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -25,6 +26,30 @@ use crate::hipfire::{
 pub struct EditState {
     pub key: String,
     pub buffer: String,
+}
+
+/// Severity of a transient toast, drives its color in the footer overlay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToastLevel {
+    Info,
+    Error,
+}
+
+/// A transient status line shown over the footer for a few seconds after an
+/// action (a write failure, a serve-unreachable action, a save confirmation).
+/// Expires on its own — the UI checks [`Toast::is_live`] each frame.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub text: String,
+    pub level: ToastLevel,
+    born: Instant,
+    ttl: Duration,
+}
+
+impl Toast {
+    pub fn is_live(&self) -> bool {
+        self.born.elapsed() < self.ttl
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +96,9 @@ pub struct App {
     pub settings_edit: Option<EditState>,
     pub chat: ChatState,
     pub last_reload: String,
+    /// Transient over-footer status toast (action failures + confirmations).
+    /// `None` when nothing recent; the UI clears it once it expires.
+    pub toast: Option<Toast>,
     /// Latest live-serve Dashboard snapshot mirrored from the background fetch
     /// thread each frame (None until the worker's first fetch completes). The
     /// UI thread ONLY reads this — it never calls fetch_dashboard / rocm-smi /
@@ -86,7 +114,7 @@ impl App {
         let paths = HipfirePaths::discover();
         let config = ConfigState::load(&paths);
         let registry = RegistryState::load(&paths);
-        let status = StatusState::load(&paths, &config);
+        let status = StatusState::load_local(&paths);
         let active_model = config.default_model.clone();
         let dashboard_worker = DashboardWorker::spawn(config.clone());
         Ok(Self {
@@ -101,9 +129,39 @@ impl App {
             settings_edit: None,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
+            toast: None,
             dashboard: None,
             dashboard_worker,
         })
+    }
+
+    /// Raise a transient error toast (3.5s) over the footer.
+    pub fn toast_error(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            level: ToastLevel::Error,
+            born: Instant::now(),
+            ttl: Duration::from_millis(3500),
+        });
+    }
+
+    /// Raise a transient info/confirmation toast (2.5s) over the footer.
+    pub fn toast_info(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            level: ToastLevel::Info,
+            born: Instant::now(),
+            ttl: Duration::from_millis(2500),
+        });
+    }
+
+    /// Drop the toast once it has expired. Called each frame before render.
+    pub fn expire_toast(&mut self) {
+        if let Some(t) = &self.toast {
+            if !t.is_live() {
+                self.toast = None;
+            }
+        }
     }
 
     /// Mirror the latest snapshot produced by the background fetch thread into
@@ -112,22 +170,39 @@ impl App {
     /// tells the worker whether the Dashboard tab is currently focused so the
     /// worker only fetches while the tab is visible.
     pub fn sync_dashboard(&mut self) {
+        // The worker feeds both the Dashboard tab (serve/VRAM telemetry) and
+        // the System tab (live GPU/HIP/kernel-cache/loaded-model diagnostics),
+        // so it must run while either is focused.
         self.dashboard_worker
-            .set_active(self.tab == Tab::Dashboard);
+            .set_active(self.tab == Tab::Dashboard || self.tab == Tab::System);
         if let Some(snap) = self.dashboard_worker.snapshot() {
+            // Fold the worker's off-thread /health + rocm-smi results into the
+            // live status fields (serve_http_ok / health_text / gpu_lines) so the
+            // Home + System tabs render live data without any synchronous probe.
+            self.status.overlay_live(&snap);
             self.dashboard = Some(snap);
         }
     }
 
     pub fn reload(&mut self) {
+        // Reload ONLY the fast local data synchronously (config / registry /
+        // local-models / serve.pid — all file I/O). The live serve health, VRAM
+        // and system diagnostics come from the background DashboardWorker, so we
+        // never run /health or lspci/rocm-smi on the UI thread here.
         self.config = ConfigState::load(&self.paths);
         self.registry = RegistryState::load(&self.paths);
-        self.status = StatusState::load(&self.paths, &self.config);
+        // Preserve the live overlay (serve_http_ok / health_text / gpu_lines)
+        // already mirrored from the worker; only the local fields are refreshed.
+        let mut status = StatusState::load_local(&self.paths);
+        if let Some(snap) = self.dashboard.as_ref() {
+            status.overlay_live(snap);
+        }
+        self.status = status;
         // Keep the worker pointed at the (possibly changed) host/port and kick
-        // an immediate re-fetch; the snapshot updates on a later frame.
+        // an immediate non-blocking re-fetch; the snapshot updates on a later frame.
         self.dashboard_worker.update_config(self.config.clone());
         self.dashboard_worker.force_refresh();
-        self.last_reload = "reloaded config, registry, models, and serve status".into();
+        self.last_reload = "reloaded config, registry, models; refreshing serve status".into();
     }
 
     pub fn next_tab(&mut self) {
@@ -185,9 +260,11 @@ impl App {
                                     self.config.loaded_from_disk = true;
                                     self.last_reload =
                                         format!("default_model = {tag} saved to ~/.hipfire/config.json");
+                                    self.toast_info(format!("default model → {tag}"));
                                 }
                                 Err(err) => {
                                     self.last_reload = format!("default_model save failed: {err}");
+                                    self.toast_error(format!("default_model save failed: {err}"));
                                 }
                             }
                         }
@@ -280,6 +357,7 @@ impl App {
         if self.status.serve_pid_alive {
             self.chat.status =
                 "serve process exists; waiting for HTTP health, press r to refresh".into();
+            self.toast_info("serve offline — process exists, waiting for HTTP; press r to refresh");
             return;
         }
 
@@ -288,10 +366,20 @@ impl App {
                 self.chat.status =
                     "starting serve -d; keep your prompt and retry after health is online".into();
                 self.last_reload = "requested background serve start".into();
-                self.status = StatusState::load(&self.paths, &self.config);
+                self.toast_info("serve offline — starting `hipfire serve -d`; retry when online");
+                // Refresh only the fast local serve.pid status (the just-spawned
+                // pid). Live HTTP health arrives via the worker's next fetch — no
+                // synchronous /health probe on the UI thread here.
+                let mut status = StatusState::load_local(&self.paths);
+                if let Some(snap) = self.dashboard.as_ref() {
+                    status.overlay_live(snap);
+                }
+                self.status = status;
+                self.dashboard_worker.force_refresh();
             }
             Err(err) => {
                 self.chat.status = format!("{err}");
+                self.toast_error(format!("serve start failed: {err}"));
             }
         }
     }
@@ -332,9 +420,15 @@ impl App {
                 }
                 self.config.values.insert(key.to_string(), as_str.clone());
                 self.config.loaded_from_disk = true;
+                self.toast_info(format!("{key} saved"));
                 format!("{key} = {as_str} saved to ~/.hipfire/config.json")
             }
-            Err(err) => format!("{err}"),
+            Err(err) => {
+                // Surface config-write failures as a loud transient toast in
+                // addition to the persistent footer line.
+                self.toast_error(format!("save failed: {err}"));
+                format!("{err}")
+            }
         }
     }
 
