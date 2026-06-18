@@ -188,6 +188,54 @@ export class BoundedLock {
     const i = this.queue.indexOf(w);
     if (i >= 0) this.queue.splice(i, 1);
   }
+
+  // Total in-flight load: the held slot (if busy) plus everyone queued behind it.
+  // This is the number the Dashboard wants ("how many requests are in the
+  // serve right now"), distinct from `queueDepth` (waiters only).
+  get inflight(): number { return (this.busy ? 1 : 0) + this.queue.length; }
+}
+
+// ─── O3c-1: live serve /stats body (pure, side-effect-free) ─────────────────
+// Inputs the serve fetch handler gathers from its own state; output is the
+// exact JSON shape returned by GET /stats. Kept here (not in index.ts) so it
+// is unit-testable without importing the CLI's side-effectful module.
+//
+// Contract:
+//   - `model` is the loaded-model tag or null (serve idle / no model) — never
+//     a fabricated placeholder.
+//   - `uptime_s` is whole seconds since the serve process started.
+//   - `queue_depth` is the BoundedLock in-flight count (held + queued).
+//   - `requests_served` is the cumulative count of admitted chat requests.
+//   - `recent_tok_s` is OMITTED unless a finite, positive decode rate was
+//     observed on the most recent completed generation (honest: absent until
+//     real data exists).
+export interface ServeStatsInput {
+  model: string | null;
+  startMs: number;
+  nowMs: number;
+  queueDepth: number;
+  requestsServed: number;
+  recentTokS?: number | null;
+}
+export interface ServeStatsBody {
+  model: string | null;
+  uptime_s: number;
+  queue_depth: number;
+  requests_served: number;
+  recent_tok_s?: number;
+}
+export function buildStatsBody(s: ServeStatsInput): ServeStatsBody {
+  const uptimeMs = Math.max(0, s.nowMs - s.startMs);
+  const body: ServeStatsBody = {
+    model: s.model ?? null,
+    uptime_s: Math.floor(uptimeMs / 1000),
+    queue_depth: Number.isFinite(s.queueDepth) && s.queueDepth > 0 ? Math.floor(s.queueDepth) : 0,
+    requests_served: Number.isFinite(s.requestsServed) && s.requestsServed > 0 ? Math.floor(s.requestsServed) : 0,
+  };
+  if (typeof s.recentTokS === "number" && Number.isFinite(s.recentTokS) && s.recentTokS > 0) {
+    body.recent_tok_s = Math.round(s.recentTokS * 100) / 100;
+  }
+  return body;
 }
 
 // ─── BUG pid-reuse: pidfile record + ownership validation ───────────────────

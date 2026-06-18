@@ -62,7 +62,7 @@ fn print_help() {
                               render loop, then exit 0 on success (headless smoke)\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
-         Tabs: Home, Chat, Models, Settings, System. Tab/BackTab to switch, q to quit."
+         Tabs: Home, Dashboard, Chat, Models, Settings, System. Tab/BackTab to switch, q to quit."
     );
 }
 
@@ -108,6 +108,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
 
     loop {
+        // Live-serve Dashboard: the fetch (HTTP + rocm-smi) runs on a dedicated
+        // background thread. Here on the UI thread we ONLY mirror its latest
+        // snapshot (a cheap lock+clone) and tell it whether the Dashboard tab
+        // is focused — never any synchronous network / rocm-smi call, so a hung
+        // probe cannot block render or input.
+        app.sync_dashboard();
+
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         app.drain_chat_events();
 

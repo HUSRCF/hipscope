@@ -12,6 +12,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Tab},
+    hipfire::dashboard::VramState,
     hipfire::registry::ModelListItem,
 };
 
@@ -40,6 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, root[0]);
     match app.tab {
         Tab::Home => draw_home(frame, app, root[1]),
+        Tab::Dashboard => draw_dashboard(frame, app, root[1]),
         Tab::Chat => draw_chat(frame, app, root[1]),
         Tab::Models => draw_models(frame, app, root[1]),
         Tab::Settings => draw_settings(frame, app, root[1]),
@@ -96,6 +98,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
+        Tab::Dashboard => "Tab switch  live serve telemetry (auto-refresh ~1.5s)  r refresh now  q quit",
         Tab::Chat => {
             "Tab switch  Enter send/start serve  Ctrl+O newline  Up/Down scroll  Esc blur/quit"
         }
@@ -260,6 +263,147 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(Style::default().bg(PANEL_2)),
         right[1],
     );
+}
+
+fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(pad(area, 1, 0));
+
+    // ── Serve panel ─────────────────────────────────────────────────────
+    let mut serve_lines: Vec<Line> = Vec::new();
+    let dash = app.dashboard.as_ref();
+    let serve_up = dash.map(|d| d.serve_up).unwrap_or(false);
+
+    if dash.is_none() {
+        serve_lines.push(Line::from(Span::styled(
+            "Probing serve…",
+            Style::default().fg(MUTED),
+        )));
+    } else if !serve_up {
+        let d = dash.unwrap();
+        serve_lines.push(Line::from(vec![
+            Span::raw("Serve      "),
+            Span::styled("offline", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+        ]));
+        serve_lines.push(Line::from(format!("Endpoint   {}", d.endpoint)));
+        serve_lines.push(Line::from(""));
+        serve_lines.push(Line::from(Span::styled(
+            d.offline_hint
+                .clone()
+                .unwrap_or_else(|| "serve offline — start it with `hipfire serve -d`".into()),
+            Style::default().fg(YELLOW),
+        )));
+        serve_lines.push(Line::from(Span::styled(
+            "(Chat tab Enter also starts a background serve)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        let d = dash.unwrap();
+        serve_lines.push(Line::from(vec![
+            Span::raw("Serve      "),
+            Span::styled("online", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+        ]));
+        serve_lines.push(Line::from(format!("Endpoint   {}", d.endpoint)));
+        serve_lines.push(Line::from(format!(
+            "Model      {}",
+            d.model.clone().unwrap_or_else(|| "(none loaded)".into())
+        )));
+        if let Some(s) = &d.stats {
+            serve_lines.push(Line::from(format!("Uptime     {}", fmt_uptime(s.uptime_s))));
+            serve_lines.push(Line::from(vec![
+                Span::raw("Queue      "),
+                Span::styled(
+                    s.queue_depth.to_string(),
+                    Style::default().fg(if s.queue_depth > 0 { YELLOW } else { TEXT }),
+                ),
+                Span::raw("  in-flight"),
+            ]));
+            serve_lines.push(Line::from(format!("Requests   {} served", s.requests_served)));
+            serve_lines.push(Line::from(match s.recent_tok_s {
+                Some(t) => format!("Recent     {t:.1} tok/s"),
+                None => "Recent     — (no completed generation yet)".into(),
+            }));
+        } else {
+            serve_lines.push(Line::from(Span::styled(
+                "stats unavailable (older serve build, /stats not present)",
+                Style::default().fg(YELLOW),
+            )));
+        }
+        if !d.model_ids.is_empty() {
+            serve_lines.push(Line::from(format!(
+                "Available  {} model(s)",
+                d.model_ids.len()
+            )));
+        }
+    }
+    frame.render_widget(card("Live serve", serve_lines), cols[0]);
+
+    // ── VRAM panel ──────────────────────────────────────────────────────
+    let mut vram_lines: Vec<Line> = Vec::new();
+    match dash.map(|d| &d.vram) {
+        Some(VramState::Available(gpus)) => {
+            for g in gpus {
+                let pct = if g.total_bytes > 0 {
+                    (g.used_bytes as f64 / g.total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let color = if pct > 90.0 {
+                    RED
+                } else if pct > 70.0 {
+                    YELLOW
+                } else {
+                    GREEN
+                };
+                vram_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("GPU {}  ", g.index),
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{:.1} / {:.1} GB used ({pct:.0}%)",
+                            g.used_gb(),
+                            g.total_gb()
+                        ),
+                        Style::default().fg(color),
+                    ),
+                ]));
+                vram_lines.push(Line::from(Span::styled(
+                    format!("        {:.1} GB free", g.free_gb()),
+                    Style::default().fg(MUTED),
+                )));
+            }
+        }
+        Some(VramState::Unavailable(reason)) => {
+            vram_lines.push(Line::from(Span::styled(
+                reason.clone(),
+                Style::default().fg(YELLOW),
+            )));
+        }
+        None => {
+            vram_lines.push(Line::from(Span::styled(
+                "Probing rocm-smi…",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    frame.render_widget(card("VRAM (rocm-smi)", vram_lines), cols[1]);
+}
+
+fn fmt_uptime(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
@@ -645,4 +789,85 @@ fn visible_rows(height: u16, chrome: u16) -> usize {
 fn scroll_start(selected: usize, height: u16, chrome: u16) -> usize {
     let visible = visible_rows(height, chrome);
     selected.saturating_sub(visible.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::hipfire::dashboard::{Dashboard, GpuMem, ServeStats, VramState};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Render the whole UI for the Dashboard tab with the given snapshot and
+    /// return the flattened buffer text. App::load() reads ~/.hipfire but is
+    /// tolerant of missing files (same path as `--check`); the Dashboard panel
+    /// itself draws purely from `app.dashboard`, which we inject here.
+    fn render_dashboard(dash: Option<Dashboard>) -> String {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Dashboard;
+        app.dashboard = dash;
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn renders_online_with_stats_and_vram() {
+        let dash = Dashboard {
+            serve_up: true,
+            endpoint: "127.0.0.1:11435".into(),
+            model: Some("qwen3.5:9b".into()),
+            stats: Some(ServeStats {
+                model: Some("qwen3.5:9b".into()),
+                uptime_s: 3725, // 1h 2m 5s
+                queue_depth: 1,
+                requests_served: 7,
+                recent_tok_s: Some(151.2),
+            }),
+            model_ids: vec!["qwen3.5:9b".into(), "qwen3.5:27b".into()],
+            vram: VramState::Available(vec![GpuMem {
+                index: 0,
+                used_bytes: 8_000_000_000,
+                total_bytes: 24_000_000_000,
+            }]),
+            offline_hint: None,
+        };
+        let text = render_dashboard(Some(dash));
+        assert!(text.contains("online"), "expected online marker");
+        assert!(text.contains("qwen3.5:9b"), "expected model name");
+        assert!(text.contains("127.0.0.1:11435"), "expected endpoint");
+        assert!(text.contains("1h 2m 5s"), "expected uptime");
+        assert!(text.contains("served"), "expected requests served");
+        assert!(text.contains("tok/s"), "expected recent tok/s");
+        assert!(text.contains("GPU 0"), "expected per-GPU VRAM");
+    }
+
+    #[test]
+    fn renders_offline_state_without_panic_or_stale_numbers() {
+        let dash = Dashboard::offline(
+            "127.0.0.1:11435".into(),
+            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
+        );
+        let text = render_dashboard(Some(dash));
+        assert!(text.contains("offline"), "expected offline marker");
+        assert!(text.contains("hipfire serve"), "expected start hint");
+        assert!(
+            text.contains("VRAM unavailable"),
+            "expected honest VRAM-unavailable line"
+        );
+        // No fabricated telemetry: offline must not invent a tok/s or queue.
+        assert!(!text.contains("tok/s"), "offline must not show tok/s");
+    }
+
+    #[test]
+    fn renders_before_first_probe() {
+        // dashboard == None (initial frame) must render honest "probing" text,
+        // not a crash and not zeros-as-data.
+        let text = render_dashboard(None);
+        assert!(text.contains("Probing serve"), "expected probing placeholder");
+    }
 }

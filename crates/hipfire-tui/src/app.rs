@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     config::ConfigState,
+    dashboard::{Dashboard, DashboardWorker},
     registry::{RegistryAction, RegistryState},
     status::{start_background_serve, StatusState},
     writer::{self, FieldKind},
@@ -29,6 +30,7 @@ pub struct EditState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tab {
     Home,
+    Dashboard,
     Chat,
     Models,
     Settings,
@@ -36,8 +38,9 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Home,
+        Tab::Dashboard,
         Tab::Chat,
         Tab::Models,
         Tab::Settings,
@@ -47,6 +50,7 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Tab::Home => "Home",
+            Tab::Dashboard => "Dashboard",
             Tab::Chat => "Chat",
             Tab::Models => "Models",
             Tab::Settings => "Settings",
@@ -67,6 +71,14 @@ pub struct App {
     pub settings_edit: Option<EditState>,
     pub chat: ChatState,
     pub last_reload: String,
+    /// Latest live-serve Dashboard snapshot mirrored from the background fetch
+    /// thread each frame (None until the worker's first fetch completes). The
+    /// UI thread ONLY reads this — it never calls fetch_dashboard / rocm-smi /
+    /// HTTP synchronously, so a hung probe cannot block render or input.
+    pub dashboard: Option<Dashboard>,
+    /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
+    /// thread. Dropped (joined) when the App is dropped.
+    dashboard_worker: DashboardWorker,
 }
 
 impl App {
@@ -76,6 +88,7 @@ impl App {
         let registry = RegistryState::load(&paths);
         let status = StatusState::load(&paths, &config);
         let active_model = config.default_model.clone();
+        let dashboard_worker = DashboardWorker::spawn(config.clone());
         Ok(Self {
             paths,
             config,
@@ -88,13 +101,32 @@ impl App {
             settings_edit: None,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
+            dashboard: None,
+            dashboard_worker,
         })
+    }
+
+    /// Mirror the latest snapshot produced by the background fetch thread into
+    /// `self.dashboard`. Called every render frame from the UI thread — this is
+    /// a cheap lock + clone and performs NO network / rocm-smi I/O. It also
+    /// tells the worker whether the Dashboard tab is currently focused so the
+    /// worker only fetches while the tab is visible.
+    pub fn sync_dashboard(&mut self) {
+        self.dashboard_worker
+            .set_active(self.tab == Tab::Dashboard);
+        if let Some(snap) = self.dashboard_worker.snapshot() {
+            self.dashboard = Some(snap);
+        }
     }
 
     pub fn reload(&mut self) {
         self.config = ConfigState::load(&self.paths);
         self.registry = RegistryState::load(&self.paths);
         self.status = StatusState::load(&self.paths, &self.config);
+        // Keep the worker pointed at the (possibly changed) host/port and kick
+        // an immediate re-fetch; the snapshot updates on a later frame.
+        self.dashboard_worker.update_config(self.config.clone());
+        self.dashboard_worker.force_refresh();
         self.last_reload = "reloaded config, registry, models, and serve status".into();
     }
 

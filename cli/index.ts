@@ -17,6 +17,7 @@ import {
   BoundedBodyReader,
   BoundedLock,
   LockSaturatedError,
+  buildStatsBody,
   parseServePidFile,
   serializeServePidRecord,
   validatePidOwnership,
@@ -2348,6 +2349,14 @@ async function serve(port: number, host: string) {
   // next tick re-evaluates and evicts cleanly if the connection has
   // since gone idle.
   let lastRequestTime = Date.now();
+  // O3c-1 live-serve observability (consumed by GET /stats + the TUI Dashboard):
+  //   serveStartMs    — process start, for uptime_s
+  //   requestsServed  — cumulative admitted /v1/chat/completions count
+  //   recentTokS      — decode tok/s from the most recent `done` event, or null
+  //                     until a real generation has completed (never faked)
+  const serveStartMs = Date.now();
+  let requestsServed = 0;
+  let recentTokS: number | null = null;
   // Env override (set by `hipfire serve --idle-timeout <secs>`) wins over the
   // persisted config, and — unlike a cfg mutation — propagates to the detached
   // child (which re-loads cfg from disk but inherits the parent's env).
@@ -2519,6 +2528,22 @@ async function serve(port: number, host: string) {
       }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
+      // O3c-1: live serve telemetry for the TUI Dashboard. Pure-TS (no daemon
+      // round-trip), so it answers instantly and works even with NO model
+      // loaded / serve idle (model:null, queue_depth 0). `current` is the
+      // real loaded-model path or null; recent_tok_s is omitted until a real
+      // generation has completed (no fabricated numbers).
+      if (url.pathname === "/stats") {
+        return Response.json(buildStatsBody({
+          model: current,
+          startMs: serveStartMs,
+          nowMs: Date.now(),
+          queueDepth: serveLock.inflight,
+          requestsServed,
+          recentTokS,
+        }));
+      }
+
       if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
 
@@ -2615,6 +2640,10 @@ async function serve(port: number, host: string) {
       // lock flag already blocks eviction for the whole lock-held window
       // (incl. the reload window where e.generating is still false).
       lastRequestTime = Date.now();
+      // O3c-1: count an admitted chat request (one per accepted /v1/chat/completions
+      // turn that holds the serve lock). Rejected (503) / bad-body requests above
+      // are intentionally not counted.
+      requestsServed++;
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
@@ -3946,6 +3975,12 @@ async function serve(port: number, host: string) {
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // O3c-1: record the real decode rate for GET /stats. Prefer
+                    // the spec-decode-aware decode_tok_s; fall back to tok_s.
+                    {
+                      const r = (msg as any).decode_tok_s ?? (msg as any).tok_s;
+                      if (typeof r === "number" && Number.isFinite(r) && r > 0) recentTokS = r;
+                    }
                     // Daemon-authoritative finish_reason (V4F sets it
                     // from the decode-loop exit condition). Falls back
                     // to "stop" when an older daemon build didn't carry
@@ -4170,6 +4205,12 @@ async function serve(port: number, host: string) {
             if (typeof msg.text === "string") reasoningContent += msg.text;
           }
           else if (msg.type === "done") {
+            // O3c-1: record the real decode rate for GET /stats (see streaming
+            // path). Prefer decode_tok_s, fall back to tok_s.
+            {
+              const r = (msg as any).decode_tok_s ?? (msg as any).tok_s;
+              if (typeof r === "number" && Number.isFinite(r) && r > 0) recentTokS = r;
+            }
             // `prompt_tokens` is the full client-visible prompt size
             // (V4F emits it). When absent, derive as `cached + prefill`
             // — i.e. the total of cached-hit tokens plus the new tokens

@@ -4,6 +4,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod dashboard;
 pub mod registry;
 pub mod status;
 pub mod writer;
