@@ -262,6 +262,12 @@ pub struct MiniMaxLayerWeights {
     pub experts: Vec<MiniMaxExpertWeights>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
+    /// pointers index into (→ 0 silu output ⇒ 0 contribution). Owned here so it
+    /// is reclaimed by `free_gpu` on unload and by the staging guard on a
+    /// mid-load failure; `None` for single-GPU / fully-owned shards. Must
+    /// outlive the device pointer table that bakes its address.
+    pub dummy_gate_up: Option<GpuTensor>,
 }
 
 pub struct MiniMaxExpertWeights {
@@ -458,16 +464,23 @@ impl MiniMaxWeights {
             // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
             // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
             // input is 0, so it reuses the compact down base).
-            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+            // Owned (not forgotten): held in `dummy_gate_up` on the layer below
+            // so the staging guard reclaims it if a later layer fails to load,
+            // and `free_gpu` reclaims it on a successful EP unload. GpuTensor has
+            // no Drop, so leaving it on the stack here would leak its buffer; we
+            // must thread it into the layer struct.
+            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
                     .zeros(&[gu_stride / 4], DType::F32)
                     .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
-                let p = z.buf.as_ptr() as u64;
-                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
-                p
+                Some(z)
             } else {
-                gu_base
+                None
             };
+            let dummy_gu = dummy_gate_up
+                .as_ref()
+                .map(|z| z.buf.as_ptr() as u64)
+                .unwrap_or(gu_base);
             let gu_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
@@ -515,6 +528,7 @@ impl MiniMaxWeights {
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                dummy_gate_up,
             });
         }
 
@@ -524,6 +538,39 @@ impl MiniMaxWeights {
             lm_head,
             layers,
         })
+    }
+
+    /// Release every GPU buffer these weights own back to the pool. Consumes
+    /// self. Walked by the daemon's `unload_model` EP-free branch so a served
+    /// MiniMax-M2 EP model's per-rank VRAM is actually returned on unload
+    /// (previously leaked — there was no free path for MiniMax). Mirrors
+    /// `DeepseekV4Weights::free_gpu`. `free_tensor` returns buffers to the
+    /// per-device pool; the caller follows with `drain_pool` to `hipFree`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed);
+        let _ = gpu.free_tensor(self.final_norm);
+        self.lm_head.free_all(gpu);
+        for l in self.layers {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            let _ = gpu.free_tensor(l.q_norm);
+            let _ = gpu.free_tensor(l.k_norm);
+            l.wq.free_all(gpu);
+            l.wk.free_all(gpu);
+            l.wv.free_all(gpu);
+            l.wo.free_all(gpu);
+            l.router.free_all(gpu);
+            let _ = gpu.free_tensor(l.routing_bias);
+            let _ = gpu.free_tensor(l.expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(l.expert_down_ptrs);
+            if let Some(dummy) = l.dummy_gate_up {
+                let _ = gpu.free_tensor(dummy);
+            }
+            for e in l.experts {
+                e.gate_up.free_all(gpu);
+                e.down.free_all(gpu);
+            }
+        }
     }
 }
 
@@ -681,5 +728,39 @@ impl MiniMaxState {
 
     pub fn reset(&mut self) {
         self.n_tokens = 0;
+    }
+
+    /// Release every GPU buffer this per-decode state owns (KV cache + all
+    /// attention/MoE/head scratch + the device position scalar). Consumes self.
+    /// Walked by the daemon's `unload_model` EP-free branch alongside
+    /// `MiniMaxWeights::free_gpu` — without it a served MiniMax EP unload leaked
+    /// the per-rank KV cache + scratch. Mirrors `Qwen2State::free_gpu`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.kv.free_gpu(gpu);
+        for t in [
+            self.tmp,
+            self.x_rot,
+            self.fa_q,
+            self.fa_k,
+            self.fa_v,
+            self.fa_attn_out,
+            self.flash_partials,
+            self.h,
+            self.ffn_tmp,
+            self.ffn_x_rot,
+            self.router_logits,
+            self.topk_indices,
+            self.topk_weights,
+            self.gate_batch,
+            self.up_batch,
+            self.rot_batch,
+            self.down_expanded,
+            self.final_norm_buf,
+            self.final_rot,
+            self.logits,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }

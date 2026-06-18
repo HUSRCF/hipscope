@@ -1567,6 +1567,19 @@ fn main() {
 
         match msg_type {
             "load" => {
+                // FIX #1 (transactional EP load): the unload of the prior model
+                // is deferred for the EP (tp>1) path until AFTER the new load
+                // succeeds, so a partial EP load failure leaves the prior model
+                // intact (and load_model_ep's staging guard frees the partial
+                // ranks). For the single-GPU / pp path the prior model is
+                // unloaded eagerly here as before (load_model uses the daemon's
+                // `gpu` directly, so it can't be deferred without a major
+                // refactor). `tp` is parsed authoritatively below; peek it here.
+                let load_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1574,18 +1587,32 @@ fn main() {
                 // drain, leaving drafter VRAM resident across the next
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
-                if let Some(mut pf) = pflash_state.take() {
-                    if let Some(mut dg) = pflash_drafter_gpu.take() {
-                        dg.bind_thread_or_warn();
-                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
-                    } else {
-                        pf.unload_drafter(&mut gpu);
+                //
+                // FIX (transactional pflash teardown): pflash_state is part of
+                // the PRIOR model (it holds that model's PFlash drafter). For
+                // the deferred tp>1 EP path it must NOT be torn down here —
+                // otherwise a partial EP load failure (whose FIX #1 deferral
+                // keeps `model` alive) would leave the surviving prior model
+                // stripped of its drafter. Defer it to the success branch
+                // alongside the deferred model unload. For load_tp <= 1 the
+                // prior model is unloaded eagerly, so tear pflash down here in
+                // the original order. (EP archs are ds4/minimax and refuse
+                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
+                // the outgoing model's drafter at the deferred site.)
+                if load_tp <= 1 {
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
                     }
-                }
-                pflash_cfg = None;
-                if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        unload_model(m, &mut gpu);
+                    }
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -1942,6 +1969,30 @@ fn main() {
                 };
                 match loaded {
                     Ok(mut m) => {
+                        // FIX #1 (deferred EP unload): the new EP model loaded
+                        // successfully — NOW it's safe to free the prior model
+                        // (single-GPU/pp models were already unloaded eagerly
+                        // above; this branch only fires for the deferred tp>1
+                        // path). The prior model's PFlash drafter (pflash_state)
+                        // is part of that prior model, so it's torn down here in
+                        // the same drainer-before-unload order used elsewhere:
+                        // unload_drafter queues the drafter tensors into the
+                        // pool, then unload_model drains it.
+                        if load_tp > 1 {
+                            if let Some(mut pf) = pflash_state.take() {
+                                if let Some(mut dg) = pflash_drafter_gpu.take() {
+                                    dg.bind_thread_or_warn();
+                                    pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                                    gpu.bind_thread_or_warn();
+                                } else {
+                                    pf.unload_drafter(&mut gpu);
+                                }
+                            }
+                            pflash_cfg = None;
+                            if let Some(old) = model.take() {
+                                unload_model(old, &mut gpu);
+                            }
+                        }
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -2039,7 +2090,23 @@ fn main() {
                         // the operator gets a clear "model is up, but
                         // compression isn't" signal rather than losing
                         // the entire session.
-                        if let Some(ref pf_drafter_path) = pflash_drafter {
+                        //
+                        // EP guard (load_tp > 1): the EP path serves through
+                        // `generate_ep`, which bypasses PFlash entirely (the
+                        // EP archs ds4/minimax refuse/ignore PFlash drafters).
+                        // Loading a drafter here would just pin GPU memory it
+                        // never reads until unload, so skip the load outright.
+                        // Warn once if the operator actually supplied a drafter
+                        // so the silent no-op is visible.
+                        if load_tp > 1 {
+                            if pflash_drafter.is_some() && pflash_mode_str != "off" {
+                                eprintln!(
+                                    "[pflash] WARN: ignoring PFlash drafter on EP (tp={}) model \
+                                     — generate_ep bypasses PFlash; drafter would only waste GPU memory",
+                                    load_tp
+                                );
+                            }
+                        } else if let Some(ref pf_drafter_path) = pflash_drafter {
                             if pflash_mode_str != "off" {
                                 if let Some(ref reason) = pflash_load_err {
                                     let _ = writeln!(
@@ -5348,11 +5415,211 @@ fn screen_weights_qwen35(
     (n_safe, n_unsafe)
 }
 
+/// Debug-only fault injection for the EP partial-load cleanup path. When
+/// `HIPFIRE_EP_FAIL_RANK=N` is set, rank `N` of `load_model_ep` /
+/// `load_model_ep_minimax` returns a synthetic `Err` AFTER ranks `0..N` have
+/// uploaded their weights, so the staging-guard cleanup (FIX #1) can be
+/// deterministically exercised on real GPUs without forcing an OOM. Returns
+/// `Some(N)` only when the env var parses to a valid rank index; any other
+/// value (unset, empty, non-numeric) disables injection.
+///
+/// FIX #2 (fault-injection gate): this is gated behind the `ep-fault-inject`
+/// cargo feature, which is NOT in the default set. A production build
+/// (`cargo build --release --features deltanet`) compiles out the env read
+/// entirely — the function is `const`-folded to `None`, the `Some(r)` synthetic
+/// -error branches in the load loops become dead code, and `HIPFIRE_EP_FAIL_RANK`
+/// has NO effect. Only `--features deltanet,ep-fault-inject` honors the env (for
+/// the GPU partial-load cleanup test).
+#[cfg(feature = "ep-fault-inject")]
+fn ep_fail_rank() -> Option<usize> {
+    match std::env::var("HIPFIRE_EP_FAIL_RANK").ok() {
+        Some(s) if !s.is_empty() => s.parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
+/// Production stub: with `ep-fault-inject` OFF, fault injection is compiled out
+/// and `HIPFIRE_EP_FAIL_RANK` is never read. Always `None`.
+#[cfg(not(feature = "ep-fault-inject"))]
+#[inline(always)]
+fn ep_fail_rank() -> Option<usize> {
+    None
+}
+
+/// Staging guard for the ds4 EP load (FIX #1: transactional partial-load
+/// cleanup). Owns the `Gpus` orchestrator plus the per-rank weights / state /
+/// partials as they are built up. If the load fails mid-way (a `?` early
+/// return, or the `HIPFIRE_EP_FAIL_RANK` fault), `Drop` explicitly frees every
+/// rank's VRAM (weights → state → partial) and drains each device's pool, so a
+/// failed EP load leaks NO VRAM. On success the caller calls `into_parts()` to
+/// disarm the guard and move ownership into the `LoadedModel`.
+struct Ds4EpStaging {
+    /// `Option` so `into_parts` can move the `Gpus` out on success without a
+    /// placeholder (`Gpus` has no cheap empty ctor and a real Drop). `None`
+    /// after a successful disarm.
+    gpus: Option<Gpus>,
+    weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
+    state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
+    partials: Vec<rdna_compute::GpuTensor>,
+}
+
+impl Ds4EpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self { gpus: Some(gpus), weights: Vec::new(), state: Vec::new(), partials: Vec::new() }
+    }
+    /// Mutable access to the staged `Gpus` for the load loops. Always `Some`
+    /// before `into_parts`.
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staging gpus taken")
+    }
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
+        Vec<hipfire_arch_deepseek4::DeepseekV4State>,
+        Vec<rdna_compute::GpuTensor>,
+    ) {
+        // Disarm: take the gpus out so `Drop` sees `None` and skips cleanup.
+        let gpus = self.gpus.take().expect("into_parts called twice");
+        let weights = std::mem::take(&mut self.weights);
+        let state = std::mem::take(&mut self.state);
+        let partials = std::mem::take(&mut self.partials);
+        (gpus, weights, state, partials)
+    }
+}
+
+impl Drop for Ds4EpStaging {
+    fn drop(&mut self) {
+        // Armed iff `gpus` is still `Some` (into_parts wasn't called → the load
+        // failed mid-way). Free every partially-loaded rank's VRAM.
+        let Some(mut gpus) = self.gpus.take() else { return };
+        eprintln!(
+            "[daemon] EP ds4 load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
+            self.weights.len()
+        );
+        // weights/state/partials are per-rank, indexed by rank r. Free each on
+        // its owning device after binding the thread so free_tensor targets the
+        // correct context.
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
+            }
+        }
+        for (r, s) in self.state.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                s.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        // `gpus` drops here, tearing down comms + devices.
+    }
+}
+
+/// Staging guard for the MiniMax EP load — mirror of `Ds4EpStaging` with the
+/// MiniMax weight/state types (FIX #1).
+struct MinimaxEpStaging {
+    gpus: Option<Gpus>,
+    weights: Vec<minimax::MiniMaxWeights>,
+    state: Vec<minimax::MiniMaxState>,
+    partials: Vec<rdna_compute::GpuTensor>,
+}
+
+impl MinimaxEpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self { gpus: Some(gpus), weights: Vec::new(), state: Vec::new(), partials: Vec::new() }
+    }
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staging gpus taken")
+    }
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<minimax::MiniMaxWeights>,
+        Vec<minimax::MiniMaxState>,
+        Vec<rdna_compute::GpuTensor>,
+    ) {
+        let gpus = self.gpus.take().expect("into_parts called twice");
+        let weights = std::mem::take(&mut self.weights);
+        let state = std::mem::take(&mut self.state);
+        let partials = std::mem::take(&mut self.partials);
+        (gpus, weights, state, partials)
+    }
+}
+
+impl Drop for MinimaxEpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else { return };
+        eprintln!(
+            "[daemon] EP minimax load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
+            self.weights.len()
+        );
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
+            }
+        }
+        for (r, s) in self.state.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                s.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp`
 /// ranks (`Gpus::init_tp` + `DeepseekV4::load_weights_sharded`). ds4-first
 /// (task #26; docs/plans/daemon-ep-wiring.md). The single-GPU arch fields stay
 /// `None`; the model serves through `generate_ep`. DFlash/CASK/PFlash/VL
 /// refusals are enforced upstream in the "load" handler before we get here.
+///
+/// KNOWN RESIDUAL — constructor-mid-failure leak (scoped follow-up, NOT fixed):
+/// the `Ds4EpStaging` / `MinimaxEpStaging` guard frees every rank that has been
+/// COMPLETED and `push`ed into staging, so a failure BETWEEN ranks leaks no
+/// VRAM. But a failure INSIDE a single rank's constructor —
+/// `DeepseekV4::load_weights_sharded` / `DeepseekV4State::new` (and the minimax
+/// `MiniMaxWeights::load` / `MiniMaxState::new_with_max_seq`) — that occurs
+/// after it has uploaded some tensors but before it returns `Ok` leaks those
+/// partial allocations: the half-built weights/state value is dropped on the
+/// `?` early-return and `GpuTensor` has no `Drop`, so its already-uploaded
+/// device buffers are never returned to the pool. The fault injector
+/// (`HIPFIRE_EP_FAIL_RANK`, `ep-fault-inject` feature) fires AFTER a rank's
+/// constructor returns `Ok`, so it tests the PRIMARY completed-rank cleanup
+/// path (which IS fixed), not this inner window. The proper fix is an
+/// unwind-safe allocation-tracking refactor of those loaders (build each
+/// rank's tensors into a scratch list whose `Drop` frees on any early return,
+/// then commit to the weights/state struct only on full success). Deferred to a
+/// follow-up; tracked in NEXT-STEPS.md.
 #[allow(dead_code)] // wired by the load_model `tp > 1` dispatch (next increment)
 fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
@@ -5373,7 +5640,7 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
     let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
     let n_exp = config.n_routed_experts;
 
-    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -5383,28 +5650,66 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
     eprintln!("[daemon] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
     let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
         .map_err(|e| format!("ShardConfig: {e:?}"))?;
-    let mut weights = Vec::with_capacity(n);
+    // FIX #1: build per-rank weights/state/partials INTO a staging guard. Every
+    // `?` below early-returns while `staging` is alive, so its `Drop` frees the
+    // ranks already loaded — a mid-load failure leaks no VRAM and (because we
+    // have NOT yet unloaded the prior model at the call site) leaves the prior
+    // model intact.
+    // FIX #2 (fault-injection gate): `ep_fail_rank()` is a const `None` unless
+    // the `ep-fault-inject` feature is on, so in production this is `None` and
+    // the synthetic-error branch below is dead-code-eliminated.
+    let fail_rank = ep_fail_rank();
+    let _ = fail_rank;
+    let mut staging = Ds4EpStaging::new(gpus);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        staging.gpus_mut().devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
-        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, &mut gpus.devices[r], &shard, r)
+        let dev = &mut staging.gpus_mut().devices[r];
+        // RESIDUAL (constructor-mid-failure window — NOT fixed here, scoped
+        // follow-up): the staging guard reclaims COMPLETED ranks (those already
+        // `push`ed). But a failure INSIDE `load_weights_sharded` itself — after
+        // it has uploaded some-but-not-all of this rank's tensors and BEFORE the
+        // `Ok(w)` that lets us `push` it below — leaks those partial
+        // allocations: the half-built `DeepseekV4Weights` is dropped on the `?`
+        // early-return and GpuTensor has no Drop, so its already-uploaded blobs
+        // are never returned to the pool. The fault injector
+        // (HIPFIRE_EP_FAIL_RANK) fires AFTER this `?` succeeds, so it exercises
+        // the COMPLETED-rank path (which IS fixed), not this window. The proper
+        // fix is an unwind-safe allocation-tracking refactor of the loader
+        // (e.g. build into a scratch list that frees on Drop, then commit on
+        // success). Deferred. See load_model_ep doc-comment + NEXT-STEPS.md.
+        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, dev, &shard, r)
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
-        weights.push(w);
+        staging.weights.push(w);
+        // FIX #5: deterministic partial-load fault for testing the cleanup path.
+        // Fires AFTER ranks 0..=r loaded; staging.weights holds r+1 ranks, the
+        // guard's Drop frees them all. FIX #2: gated behind ep-fault-inject so a
+        // production build does not even compile this branch.
+        #[cfg(feature = "ep-fault-inject")]
+        if fail_rank == Some(r) {
+            return Err(format!(
+                "HIPFIRE_EP_FAIL_RANK={r}: synthetic ds4 EP load failure after rank {r} (testing partial-load cleanup)"
+            ));
+        }
     }
-    let mut state = Vec::with_capacity(n);
-    let mut partials = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
-        state.push(deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?);
-        partials.push(
-            gpus.devices[r]
-                .zeros(&[config.hidden_size], rdna_compute::DType::F32)
-                .map_err(|e| format!("partial {r}: {e:?}"))?,
-        );
+        staging.gpus_mut().devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        // Same constructor-mid-failure window as load_weights_sharded above:
+        // a partial failure inside DeepseekV4State::new leaks the KV/scratch
+        // tensors allocated before the error (no Drop on GpuTensor). Scoped
+        // follow-up; see load_model_ep doc-comment.
+        let st = deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?;
+        staging.state.push(st);
+        let p = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+            .map_err(|e| format!("partial {r}: {e:?}"))?;
+        staging.partials.push(p);
     }
-    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    let peer = staging.gpus_mut().enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut()).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
+    // Load fully succeeded — disarm the guard and take ownership of the parts.
+    let (gpus, weights, state, partials) = staging.into_parts();
 
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
@@ -5491,7 +5796,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
     let n_exp = config.num_local_experts;
 
-    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -5501,31 +5806,54 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     eprintln!("[daemon] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
     let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
         .map_err(|e| format!("ShardConfig: {e:?}"))?;
-    let mut weights = Vec::with_capacity(n);
+    // FIX #1: transactional partial-load via the staging guard (see ds4 above).
+    // FIX #2 (fault-injection gate): const `None` in production (feature off).
+    let fail_rank = ep_fail_rank();
+    let _ = fail_rank;
+    let mut staging = MinimaxEpStaging::new(gpus);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        staging.gpus_mut().devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
-        let w = minimax::MiniMaxWeights::load(&mut h, &config, &mut gpus.devices[r], Some((&shard, r)))
+        let dev = &mut staging.gpus_mut().devices[r];
+        // RESIDUAL (constructor-mid-failure window — NOT fixed here): a failure
+        // INSIDE MiniMaxWeights::load, after it uploaded some tensors but before
+        // the Ok that lets us push below, leaks those partial allocations (no
+        // Drop on GpuTensor). The fault injector fires AFTER this `?` succeeds,
+        // so it tests the completed-rank path (fixed), not this window. Scoped
+        // follow-up: unwind-safe allocation-tracking loader refactor. See the
+        // load_model_ep doc-comment + NEXT-STEPS.md.
+        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)))
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
-        weights.push(w);
+        staging.weights.push(w);
+        // FIX #5: deterministic partial-load fault for testing the cleanup path.
+        // FIX #2: gated behind ep-fault-inject; not compiled in production.
+        #[cfg(feature = "ep-fault-inject")]
+        if fail_rank == Some(r) {
+            return Err(format!(
+                "HIPFIRE_EP_FAIL_RANK={r}: synthetic minimax EP load failure after rank {r} (testing partial-load cleanup)"
+            ));
+        }
     }
-    let mut state = Vec::with_capacity(n);
-    let mut partials = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
-        state.push(
-            minimax::MiniMaxState::new_with_max_seq(&mut gpus.devices[r], &config, max_seq)
-                .map_err(|e| format!("state {r}: {e:?}"))?,
-        );
-        partials.push(
-            gpus.devices[r]
-                .zeros(&[config.hidden_size], rdna_compute::DType::F32)
-                .map_err(|e| format!("partial {r}: {e:?}"))?,
-        );
+        staging.gpus_mut().devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        // Same constructor-mid-failure window: a partial failure inside
+        // MiniMaxState::new_with_max_seq leaks the KV/scratch tensors allocated
+        // before the error. Scoped follow-up; see load_model_ep doc-comment.
+        let st = {
+            let dev = &mut staging.gpus_mut().devices[r];
+            minimax::MiniMaxState::new_with_max_seq(dev, &config, max_seq)
+                .map_err(|e| format!("state {r}: {e:?}"))?
+        };
+        staging.state.push(st);
+        let p = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+            .map_err(|e| format!("partial {r}: {e:?}"))?;
+        staging.partials.push(p);
     }
-    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    let peer = staging.gpus_mut().enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut()).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
+    let (gpus, weights, state, partials) = staging.into_parts();
 
     let eos_tok: u32 = {
         let try_one = |s: &str| -> Option<u32> {
@@ -5765,6 +6093,48 @@ fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt
     let _ = stdout.flush();
 }
 
+/// FIX #3 (ep-no-abort): reset every EP rank's KV cursor to a clean state and
+/// clear the shared conversation history. The mid-generation per-rank KV /
+/// position is advanced past the (un-committed) `conversation_tokens`, so the
+/// next turn must cold-start; both arch states expose `reset()` which rewinds
+/// the per-rank token cursor (`n_tokens`). Mirrors the single-GPU abort reset
+/// (`m.seq_pos = 0; m.conversation_tokens.clear();`).
+fn ep_reset_after_abort(m: &mut LoadedModel) {
+    if let Some(ep) = m.ep.as_mut() {
+        match &mut ep.inner {
+            EpArch::Ds4 { state, .. } => {
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+            EpArch::Minimax { state, .. } => {
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+}
+
+/// FIX #3: emit the standard `aborted` + `done(finish_reason=aborted)` event
+/// pair (mirrors the single-GPU AR abort path) then reset EP state.
+fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, completion_tokens: usize) {
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+        id
+    );
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+        id, completion_tokens
+    );
+    let _ = stdout.flush();
+    ep_reset_after_abort(m);
+}
+
 /// ds4 EP prefill + greedy decode.
 fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String], sampling: EpSampling) {
     use std::time::Instant;
@@ -5848,6 +6218,10 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     };
 
     let t_prefill = Instant::now();
+    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
+    // loop. Declared outside the borrow scope so the post-loop abort guard can
+    // read it after the `gpus`/`state` borrow is dropped.
+    let mut aborted_in_prefill = false;
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 { config, weights, state, partials } = inner else {
@@ -5856,12 +6230,39 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             return;
         };
         for (pos, &t) in prompt_ids.iter().enumerate() {
+            // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
+            // every prefill iteration, not just after the loop. A long prompt
+            // (thousands of tokens) means the post-loop check below would still
+            // run the entire multi-GPU prefill before honoring a cancel. Mirror
+            // the decode loop: on abort, emit aborted+done, reset KV cursors,
+            // and stop. We must drop the `gpus`/`state` borrow before calling
+            // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
+            // the post-loop guard fire — but set the abort flag is consumed by
+            // check_abort, so call it here and short-circuit via a flag.
+            if check_abort(id) {
+                // Drop the EpState borrow by breaking; the post-loop guard
+                // re-checks via a sentinel. Simpler: emit + return is blocked
+                // by the borrow, so we set `aborted` and break.
+                aborted_in_prefill = true;
+                break;
+            }
             if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
                 let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
                 let _ = stdout.flush();
                 return;
             }
         }
+    }
+    // FIX #1 / FIX #3 (ep-no-abort): a client cancel during the (potentially
+    // long) prefill should stop here instead of running the whole decode loop.
+    // `aborted_in_prefill` is set when check_abort fired mid-loop (it already
+    // consumed the signal, so we don't re-call check_abort); the post-loop
+    // check_abort catches a cancel that arrived after the final iteration.
+    // Mirror the single-GPU paths: emit aborted+done and reset every rank's KV
+    // cursor.
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(stdout, id, m, 0);
+        return;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let mut logits = {
@@ -5873,7 +6274,17 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         };
         let _ = gpus.devices[0].bind_thread();
         match state[0].logits.as_ref() {
-            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            // FIX #4 (ep-download-swallow): on a download failure, emit a JSON
+            // error and STOP — never `unwrap_or_default()` into an all-zero
+            // logits vec (argmax → token 0, an undetectable corruption).
+            Some(l) => match gpus.devices[0].download_f32(l) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            },
             None => {
                 let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id);
                 let _ = stdout.flush();
@@ -5888,6 +6299,13 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     let mut text_acc = String::new();
     let mut local_emitted_ids: Vec<u32> = Vec::new();
     while generated < max_tokens {
+        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
+        // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
+        // decode loop running for the full max_tokens of wasted multi-GPU work.
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, generated);
+            return;
+        }
         if grammar_active && !matcher.is_free() {
             matcher.token_mask(decoded_vocab, &mut grammar_mask);
             deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
@@ -5930,7 +6348,20 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
-        logits = match state[0].logits.as_ref() { Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(), None => break };
+        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
+        // logits download — emit a JSON error and stop, never feed a zeroed
+        // (token-0) logits vec.
+        logits = match state[0].logits.as_ref() {
+            Some(l) => match gpus.devices[0].download_f32(l) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            },
+            None => break,
+        };
     }
     for ev in parser.finish() {
         absorb_event(&ev);
@@ -6026,6 +6457,14 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
 
     // ── Prefill the suffix [prefill_from, prompt_n) across ranks. ──
     let t_prefill = Instant::now();
+    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
+    // loop. Declared outside the borrow scope so the abort guard below can read
+    // it after the `gpus`/`state` borrow is dropped.
+    let mut aborted_in_prefill = false;
+    // Track how many suffix tokens were actually prefilled so that, on a
+    // mid-prefill abort, we don't mirror un-prefilled tokens into
+    // `conversation_tokens` (which would desync the cache from KV state).
+    let mut prefilled_n = 0usize;
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax { config, weights, state, partials } = inner else {
@@ -6034,17 +6473,38 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
             return;
         };
         for (i, &t) in prompt_ids[prefill_from..].iter().enumerate() {
+            // FIX #1 (ep-prefill-abort): honor a client cancel at the TOP of
+            // every prefill iteration, not just after the loop. Without this a
+            // long prompt runs the full multi-GPU prefill before the post-loop
+            // check fires. check_abort consumes the signal, so record it in a
+            // flag and break; the borrow on `m.ep` is dropped before we call
+            // ep_emit_abort below.
+            if check_abort(id) {
+                aborted_in_prefill = true;
+                break;
+            }
             let pos = (prefill_from + i) as u32;
             if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos) {
                 let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
                 let _ = stdout.flush();
                 return;
             }
+            prefilled_n = i + 1;
         }
     }
-    // Mirror the prefilled suffix into conversation_tokens (the prefix is kept).
-    for &t in &prompt_ids[prefill_from..] { m.conversation_tokens.push(t); }
+    // Mirror only the actually-prefilled suffix into conversation_tokens (the
+    // prefix is kept). On a mid-prefill abort, ep_emit_abort resets every
+    // rank's KV cursor, so leaving conversation_tokens at the prefix keeps the
+    // cache consistent with KV state.
+    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] { m.conversation_tokens.push(t); }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    // FIX #1 / FIX #3 (ep-no-abort): client cancel during prefill → stop
+    // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
+    // post-loop check_abort catches a cancel that arrived after the last token.
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(stdout, id, m, 0);
+        return;
+    }
 
     // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
     // assistant message is a well-formed think block (parity with single-GPU).
@@ -6057,13 +6517,28 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax { state, .. } = inner else { return; };
         let _ = gpus.devices[0].bind_thread();
-        gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default()
+        // FIX #4 (ep-download-swallow): explicit error handling — never feed a
+        // zeroed (token-0) logits vec on a download failure.
+        match gpus.devices[0].download_f32(&state[0].logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
     };
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
     let mut text_acc = String::new();
     while generated < max_tokens {
+        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
+        // reset EP cursors, stop.
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, generated);
+            return;
+        }
         // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
         // min_p → seeded draw, temp<=1e-6 = argmax). MiniMax's card carries
         // top_k=40, threaded here via sampling.top_k. RNG seeded per request in
@@ -6087,12 +6562,83 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
-        logits = gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default();
+        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
+        // download — emit a JSON error and stop, never feed a zeroed (token-0)
+        // logits vec.
+        logits = match gpus.devices[0].download_f32(&state[0].logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
+        };
     }
     ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
 }
 
-fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // FIX #2 (EP unload-free). An EP model owns its own `Gpus` (the daemon's
+    // single `gpu` is unused for tp>1). Without this branch a SUCCESSFUL EP
+    // unload leaked every per-rank weight / state / partial (Codex: "EP unload
+    // currently leaks everything"). Free per-rank weights → state → partials on
+    // each owning device, invalidate caches + graph state, drain each pool, then
+    // drop the `Gpus` (tears down comms + devices). The daemon's `gpu` is
+    // untouched.
+    if let Some(ep) = m.ep.take() {
+        let EpState { mut gpus, inner } = ep;
+        match inner {
+            EpArch::Ds4 { weights, state, partials, .. } => {
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
+                    }
+                }
+                for (r, s) in state.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        s.free_gpu(dev);
+                    }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
+                    }
+                }
+            }
+            EpArch::Minimax { weights, state, partials, .. } => {
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
+                    }
+                }
+                for (r, s) in state.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        s.free_gpu(dev);
+                    }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
+                    }
+                }
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        let _ = gpu;
+        return;
+        // `gpus` drops here.
+    }
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order

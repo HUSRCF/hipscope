@@ -299,16 +299,25 @@ impl DeepseekV4 {
             let base_ptr = combined_tensor.buf.as_ptr() as u64;
             // Non-owned gate_up ptr → a shared zeroed dummy (only when actually
             // sharding with some experts non-owned); else the compact base.
-            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+            // Owned (not mem::forget-leaked): the zeroed buffer is threaded into
+            // `layer.expert_gate_up_dummy` so the staging guard reclaims it if a
+            // later layer/global fails to load, and `free_gpu` reclaims it on a
+            // successful EP unload. GpuTensor has no Drop, so leaving it on the
+            // stack here would leak its buffer. Must outlive the device pointer
+            // table built just below that bakes its address. Mirrors the
+            // minimax `dummy_gate_up` fix.
+            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
                     .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
                     .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
-                let p = z.buf.as_ptr() as u64;
-                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
-                p
+                Some(z)
             } else {
-                base_ptr
+                None
             };
+            let dummy_gu = dummy_gate_up
+                .as_ref()
+                .map(|z| z.buf.as_ptr() as u64)
+                .unwrap_or(base_ptr);
             let ptrs: Vec<u64> = (0..n_exp)
                 .map(|e| {
                     if owns(e) {
@@ -328,6 +337,9 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            // Store the owning handle (None on single-GPU / fully-owned shards).
+            // Its device pointer is already baked into `ptr_tensor` above.
+            layer.expert_gate_up_dummy = dummy_gate_up;
         }
         Ok(())
     }
