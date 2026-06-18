@@ -219,6 +219,11 @@ if (Get-Command bun -ErrorAction SilentlyContinue) {
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
 
+# INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
+# run. When source changed, a repo-side target\release\examples\daemon.exe from
+# a prior build is STALE and must not be reused — we force a rebuild.
+$SourceUpdated = $false
+
 if (-not (Test-Path "$SrcDir\.git")) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Host "  ERROR: git is required. Install from https://git-scm.com and re-run." -ForegroundColor Red
@@ -228,6 +233,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
     try {
         git clone --depth 1 --branch $GithubBranch "https://github.com/$GithubRepo.git" $SrcDir
         Write-Host "  Cloned ✓" -ForegroundColor Green
+        $SourceUpdated = $true
     } catch {
         Write-Host "  Clone failed: $_" -ForegroundColor Red
         Write-Host "  Try manually: git clone https://github.com/$GithubRepo.git $SrcDir"
@@ -244,6 +250,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
                 & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
                 & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
                 Write-Host "  Updated ✓" -ForegroundColor Green
+                $SourceUpdated = $true
             } catch {
                 Write-Host "  Update failed (non-fatal)." -ForegroundColor Yellow
             }
@@ -257,6 +264,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
             & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
             & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
             Write-Host "  Updated ✓" -ForegroundColor Green
+            $SourceUpdated = $true
         } catch {
             Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
         }
@@ -289,10 +297,17 @@ if (Get-Command cargo -ErrorAction SilentlyContinue) {
 # paths (only meaningful when running install.ps1 from a checkout) are
 # treated as developer-authoritative and used if present; everyone else
 # always pulls the latest release asset.
-$PreBuilt = @(
-    "$TargetDir\release\examples\daemon.exe",
-    "$RepoDir\bin\daemon.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+# INSTALL-F1: when the source tree was updated this run, any repo-side build
+# artifact is stale — drop those candidates so we rebuild (or pull a release).
+if ($SourceUpdated) {
+    Write-Host "  Source updated — ignoring any prior repo build artifact (will rebuild)." -ForegroundColor Yellow
+    $PreBuilt = $null
+} else {
+    $PreBuilt = @(
+        "$TargetDir\release\examples\daemon.exe",
+        "$RepoDir\bin\daemon.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 if (-not $PreBuilt) {
     # Query the latest GitHub release dynamically — never pin to an old tag.

@@ -1262,26 +1262,54 @@ const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
 // single named flag's value from an argv slice and removes the consumed tokens
 // IN PLACE so the positional host/port loop never sees them. Returns the value
 // string, or null when the flag is absent. Errors out on a missing value.
-function takeFlagValue(args: string[], name: string): string | null {
+// Pure core of takeFlagValue (no process.exit, no I/O) so the dash-value
+// acceptance/rejection decision is unit-testable (HF-CLI-005). Returns:
+//   { kind: "absent" }                  flag not present
+//   { kind: "value", value, splice }    value found; `splice` = [index, count]
+//   { kind: "missing" }                 flag present but no usable value
+// allowDashValue=true permits a value that starts with "-" (free-form string
+// flags like --system/--image); otherwise a dash-leading value is "missing".
+export type FlagValueResult =
+  | { kind: "absent" }
+  | { kind: "value"; value: string; splice: [number, number] }
+  | { kind: "missing" };
+export function peekFlagValue(args: string[], name: string, opts?: { allowDashValue?: boolean }): FlagValueResult {
+  const allowDash = opts?.allowDashValue === true;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === name) {
       const v = args[i + 1];
-      if (v === undefined || v.startsWith("-")) {
-        console.error(`Error: ${name} requires a value`);
-        process.exit(1);
-      }
-      args.splice(i, 2);
-      return v;
+      if (v === undefined || (!allowDash && v.startsWith("-"))) return { kind: "missing" };
+      return { kind: "value", value: v, splice: [i, 2] };
     }
     if (a.startsWith(name + "=")) {
       const v = a.slice(name.length + 1);
-      if (!v) { console.error(`Error: ${name} requires a value`); process.exit(1); }
-      args.splice(i, 1);
-      return v;
+      if (!v) return { kind: "missing" };
+      return { kind: "value", value: v, splice: [i, 1] };
     }
   }
-  return null;
+  return { kind: "absent" };
+}
+
+// Small, scoped `--flag value` / `--flag=value` reader for the handful of
+// serve passthrough flags. NOT a general parser rewrite (W2) — it extracts a
+// single named flag's value from an argv slice and removes the consumed tokens
+// IN PLACE so the positional host/port loop never sees them. Returns the value
+// string, or null when the flag is absent. Errors out on a missing value.
+// HF-CLI-005: by default a value starting with "-" is rejected (catches a
+// dangling flag like `--temp --json`). Free-form STRING flags (--system,
+// --image) legitimately take dash-leading values (`--system "- terse"`,
+// a path like `-img.png`), so they pass { allowDashValue: true }. Enum /
+// numeric flags keep the strict dash-rejection.
+export function takeFlagValue(args: string[], name: string, opts?: { allowDashValue?: boolean }): string | null {
+  const r = peekFlagValue(args, name, opts);
+  if (r.kind === "absent") return null;
+  if (r.kind === "missing") {
+    console.error(`Error: ${name} requires a value`);
+    process.exit(1);
+  }
+  args.splice(r.splice[0], r.splice[1]);
+  return r.value;
 }
 
 // Boolean `--flag` reader: removes the token in place and reports presence.
@@ -1304,6 +1332,87 @@ function rejectUnknownFlags(rest: string[], cmd: string): void {
     console.error(`hipfire: unknown flag ${unknown} (see hipfire ${cmd} --help)`);
     process.exit(EXIT.USAGE);
   }
+}
+
+// HF-CLI-002: resolve the port `hipfire restart` should free/poll, the SAME
+// way `runServe` does. A naive `for (a of args)` scan treated FLAG VALUES as
+// ports — `restart -d --tp 2` parsed port=2, then pid-validated against port 2
+// and unlinked the real pidfile. We consume the serve VALUE-flags (and their
+// values) from a COPY first (so the real `args` forwarded to runServe is
+// untouched), then only a bare host/port positional sets the port. Pure (no
+// process.exit / I/O) so it is unit-testable; uses peekFlagValue to splice
+// known value-flags without erroring on a dangling value.
+export function parseRestartPort(args: string[], defaultPort: number): number {
+  let port = defaultPort;
+  const scan = args.slice();
+  for (const f of ["--kv-mode", "--idle-timeout", "--tp"]) {
+    const r = peekFlagValue(scan, f);
+    if (r.kind === "value") scan.splice(r.splice[0], r.splice[1]);
+    // "missing" (dangling --flag) / "absent": leave it — it is not a port.
+  }
+  for (const a of scan) {
+    if (a === "-d" || a === "--detach" || a === "--background" || a === "--no-prewarm") continue;
+    if (a.startsWith("-")) continue; // any other flag is not a port positional
+    if (/^\d+$/.test(a)) { const n = parseInt(a, 10); if (n >= 1 && n <= 65535) port = n; }
+    else if (/^\[[^\]]+\]:\d+$/.test(a)) port = parseInt(a.match(/:(\d+)$/)![1], 10);
+    else if (/^[^:]+:\d+$/.test(a)) port = parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
+  }
+  return port;
+}
+
+// HF-CLI-003: pure predicate mirroring runServe's dangling-`--tp` end-state —
+// true iff a space-form `--tp` was given with no consumable value. That happens
+// when `--tp` is the final token, OR when the token AFTER `--tp` starts with
+// "-" (a flag like `-d`, which is NOT a TP value — the runServe loop refuses to
+// consume it). The `--tp=` form never dangles (handled separately).
+// Unit-testable.
+export function serveTpDangling(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== "--tp") continue;
+    const next = args[i + 1];
+    if (next === undefined || next.startsWith("-")) return true;
+  }
+  return false;
+}
+
+// HF-CLI-004: validate the args that follow a `config` action verb. Rejects
+// stray dash-flags (e.g. the `--josn` typo that previously made `config list
+// --josn` exit 0 with human output) and over-arity. `set`/`cask-profile` take
+// free-form VALUE tokens that may start with "-", so only their <key> slot is
+// flag-checked; list/get/reset reject any dash token in their tail. Pure: it
+// returns a verdict instead of exiting, so it is unit-testable.
+export type ConfigArgsVerdict = { ok: true } | { ok: false; error: string };
+export function validateConfigActionArgs(action: string, tail: string[], key: string | undefined): ConfigArgsVerdict {
+  const badFlag = tail.find(a => a.startsWith("-") && a !== "-");
+  if (action === "list") {
+    if (badFlag !== undefined) return { ok: false, error: `unknown flag ${badFlag}` };
+    if (tail.some(a => !a.startsWith("-"))) return { ok: false, error: "config list takes no positional args" };
+    return { ok: true };
+  }
+  if (action === "get" || action === "reset") {
+    if (badFlag !== undefined) return { ok: false, error: `unknown flag ${badFlag}` };
+    // Exactly one positional (the <key>). `config get temperature extra`
+    // previously exited 0 ignoring `extra`; reject the extra positional tail.
+    const positionals = tail.filter(a => !a.startsWith("-"));
+    if (positionals.length > 1) {
+      return { ok: false, error: `config ${action} takes exactly one key (unexpected: ${positionals.slice(1).join(" ")})` };
+    }
+    return { ok: true };
+  }
+  if (action === "cask-profile") {
+    // `set`/`cask-profile` allow free-form (dash-leading) VALUE tokens, so only
+    // the <key>/<name> slot is flag-checked. cask-profile takes 0 or 1 name.
+    if (key !== undefined && key.startsWith("-")) return { ok: false, error: `unknown flag ${key}` };
+    if (tail.length > 1) {
+      return { ok: false, error: `config cask-profile takes at most one profile name (unexpected: ${tail.slice(1).join(" ")})` };
+    }
+    return { ok: true };
+  }
+  if (action === "set") {
+    if (key !== undefined && key.startsWith("-")) return { ok: false, error: `unknown flag ${key}` };
+    return { ok: true };
+  }
+  return { ok: true };
 }
 
 // Reap ORPHAN daemon / quantize processes and free a serve port. Mirrors
@@ -2719,15 +2828,20 @@ async function serve(port: number, host: string) {
         // Prefer the daemon's advertised `cache_capable` flag (source of
         // truth, next to the cache impl). Fall back to the arch-string
         // allowlist only for older daemons that don't send the flag.
-        const cacheCapable = currentCacheCapable !== null
+        // PRE-reload capability: decides whether to reset the CURRENTLY-loaded
+        // model's KV before any reload. The reset must reflect the model that
+        // is loaded RIGHT NOW (a stateless arch loaded now needs its KV cleared
+        // regardless of what the request will reload to). Prompt shaping below
+        // uses the POST-reload `activeCacheCapable` instead — see HF-CLI-001.
+        const cacheCapableForArch = (arch: string | null) =>
+          arch === "deepseek4" || arch === "qwen3_5" || arch === "qwen3_5_moe";
+        const preReloadCacheCapable = currentCacheCapable !== null
           ? currentCacheCapable
-          : (currentArch === "deepseek4"
-            || currentArch === "qwen3_5"
-            || currentArch === "qwen3_5_moe");
+          : cacheCapableForArch(currentArch);
         if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
-          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
+          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} preReloadCacheCapable=${preReloadCacheCapable} -> ${preReloadCacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
         }
-        if (!cacheCapable) {
+        if (!preReloadCacheCapable) {
           await e.send({ type: "reset" }); await e.recv();
         }
 
@@ -3053,6 +3167,13 @@ async function serve(port: number, host: string) {
         // Now that currentArch reflects the model we're ACTUALLY sending
         // to (post-reload), apply the arch-conditional prompt shaping.
         //
+        // HF-CLI-001: recompute cache-capability AGAINST THE NOW-LOADED model.
+        // `preReloadCacheCapable` was the old model's flag and is stale once a
+        // request triggered a reload; prompt shaping must use this active value.
+        const activeCacheCapable = currentCacheCapable !== null
+          ? currentCacheCapable
+          : cacheCapableForArch(currentArch);
+        //
         // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
         //    (Qwen2 generate) only see tools through prompt text and rely
         //    on this block. V4F (`generate_deepseek4`) builds its own
@@ -3109,7 +3230,7 @@ async function serve(port: number, host: string) {
         //    Legacy arches (Qwen2 in particular) ignore the structured
         //    `messages` field and ONLY read `prompt` — they NEED the
         //    full ChatML rebuild for multi-turn to survive. Don't touch.
-        if (cacheCapable) {
+        if (activeCacheCapable) {
           const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
           if (last && last.role === "user") {
             const lastContent = extractContent(last.content);
@@ -4525,6 +4646,7 @@ async function runServe(args: string[]) {
   // buildLoadMessage forwards as params.tp so the daemon loads via
   // load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
   let tpPending = false;
+  let tpDangling = false;
   const setTp = (raw: string) => {
     const n = parseInt(raw, 10);
     if (!Number.isInteger(n) || n < 1 || n > 64) {
@@ -4546,7 +4668,13 @@ async function runServe(args: string[]) {
     modelArg = raw;
   };
   for (const a of args) {
-    if (tpPending) { setTp(a); tpPending = false; continue; }
+    // HF-CLI-003: the `--tp` value consumer must NOT swallow a following flag.
+    // `serve --tp -d` previously consumed `-d` as the TP value → setTp parsed
+    // NaN → rc1 "Invalid --tp value". A next-token that starts with "-" is not
+    // a value: leave tpPending set so the end-of-loop check below fires a
+    // MISSING-VALUE USAGE error, and let the flag itself be parsed this pass.
+    if (tpPending && !a.startsWith("-")) { setTp(a); tpPending = false; continue; }
+    if (tpPending) { tpPending = false; tpDangling = true; }
     if (a === "--tp") { tpPending = true; continue; }
     else if (a.startsWith("--tp=")) setTp(a.slice(5));
     else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
@@ -4591,6 +4719,13 @@ async function runServe(args: string[]) {
       setModel(a);
     }
     else setHost(a);
+  }
+  // HF-CLI-003: `--tp` was the last token (no value) — tpPending never consumed.
+  // Without this, serve silently starts EP-off instead of erroring. (The pure
+  // `serveTpDangling` predicate is the unit-tested equivalent of this state.)
+  if (tpPending || tpDangling) {
+    console.error(`--tp requires a value (expected 1..64, e.g. --tp 2)`);
+    process.exit(EXIT.USAGE);
   }
   if (modelArg !== null) {
     // Resolve via the shared resolver so a tag, alias, filename, or path all work.
@@ -6972,6 +7107,14 @@ function syncCliRuntimePayload(repoDir: string): void {
 
 // ─── Main ───────────────────────────────────────────────
 
+// import.meta.main guard: the executable CLI dispatch below runs ONLY when this
+// file is the entrypoint (`bun run index.ts ...`). When index.ts is `import`ed
+// (e.g. by serve_ux_parse.test.ts to reach the exported pure helpers
+// parseRestartPort / serveTpDangling / validateConfigActionArgs / peekFlagValue),
+// import.meta.main is false, so main() never runs — no help text, no argv parse,
+// no process.exit on import. All those helpers are module-level exports defined
+// above, so they remain importable regardless of this guard.
+async function main() {
 // Dynamic registry first: refreshModelsCatalog() and every command below
 // read REGISTRY/ALIASES, so the swap must land before any of them run.
 // Cache-fresh path is one small file read; the network path is bounded by
@@ -7026,12 +7169,12 @@ switch (cmd) {
       process.exit(0);
     }
     // Resolve the port the same way serve does so we free/poll the right one.
-    let restartPort = cfg.port;
-    for (const a of args) {
-      if (/^\d+$/.test(a)) { const n = parseInt(a, 10); if (n >= 1 && n <= 65535) restartPort = n; }
-      else if (/^\[[^\]]+\]:\d+$/.test(a)) restartPort = parseInt(a.match(/:(\d+)$/)![1], 10);
-      else if (/^[^:]+:\d+$/.test(a)) restartPort = parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
-    }
+    // HF-CLI-002: a bare `for (a of args)` scan treated FLAG VALUES as ports —
+    // `restart -d --tp 2` parsed restartPort=2, then pid-validated against port
+    // 2 and unlinked the real pidfile. Consume the SAME serve value-flags serve
+    // does (and their values) from a COPY first (args itself is forwarded to
+    // runServe untouched), so only a real host/port positional sets the port.
+    const restartPort = parseRestartPort(args, cfg.port);
     // Graceful stop of the tracked pid first (mirrors `hipfire stop`).
     // BUG pid-reuse: validate ownership before SIGTERM/SIGKILL — NEVER kill a
     // pid that fails validation (it was reused by an unrelated process); just
@@ -7148,8 +7291,8 @@ switch (cmd) {
     const runJson = takeFlag(rest, "-j", "--json");
     const runNoStream = takeFlag(rest, "--no-stream");
     const kvModeVal = takeFlagValue(rest, "--kv-mode");
-    const imageVal = takeFlagValue(rest, "--image");
-    const systemVal = takeFlagValue(rest, "--system");
+    const imageVal = takeFlagValue(rest, "--image", { allowDashValue: true });
+    const systemVal = takeFlagValue(rest, "--system", { allowDashValue: true });
     // Short aliases: -t/--temp, -n/--max-tokens. takeFlagValue returns the
     // first matching name found; we OR the short and long forms so either
     // works in any position.
@@ -7462,6 +7605,16 @@ Examples:
     break;
   }
   case "update": {
+    // INSTALL-F3: the update flow builds the ROCm/sysfs-specific daemon from
+    // source (cargo build --features deltanet …) and copies Linux binaries.
+    // It is Linux-only; on macOS/Windows it would fetch+build then fail
+    // cryptically. Gate cleanly and point at the right path.
+    if (process.platform !== "linux") {
+      console.error("hipfire update is Linux-only (it builds the ROCm/AMD-GPU daemon from source).");
+      console.error("  • On Windows: re-run the platform installer (scripts/install.ps1).");
+      console.error("  • Otherwise: build from source manually — cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
+      process.exit(EXIT.USAGE);
+    }
     console.error("Updating hipfire...");
     const srcDir = join(HIPFIRE_DIR, "src");
     const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
@@ -7577,7 +7730,9 @@ Examples:
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
-    const exe = process.platform === "win32" ? ".exe" : "";
+    // INSTALL-F3: this command is Linux-only (gated at the top of the case), so
+    // binaries never carry a `.exe` suffix here.
+    const exe = "";
     const binDir = join(HIPFIRE_DIR, "bin");
     // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
     // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
@@ -7623,8 +7778,13 @@ Examples:
     // projects), otherwise the conventional <repo>/target. Hardcoding
     // repoDir/target/release silently skips the copy on those setups, leaving
     // the user with a freshly-built-but-never-installed binary.
+    // INSTALL-F2: cargo resolves a RELATIVE CARGO_TARGET_DIR against the BUILD
+    // cwd (repoDir, where we spawned `cargo build`), NOT the user's launch cwd.
+    // `resolve(env)` alone anchored it to process.cwd() → the copy phase looked
+    // in the wrong directory. resolve(repoDir, env) joins relative values to
+    // repoDir while passing absolute values through unchanged.
     const targetDir = process.env.CARGO_TARGET_DIR && process.env.CARGO_TARGET_DIR.length > 0
-      ? resolve(process.env.CARGO_TARGET_DIR)
+      ? resolve(repoDir, process.env.CARGO_TARGET_DIR)
       : join(repoDir, "target");
     const releaseDir = join(targetDir, "release");
     // Example binaries live under <target>/release/examples/
@@ -8485,6 +8645,11 @@ Examples:
     // Pull --json/-j out first (works for `config list --json` and
     // `config get <key> --json`); harmless elsewhere.
     const cfgJson = takeFlag(rest, "-j", "--json");
+    // HF-CLI-004: track the args that REMAIN after the optional model scope so
+    // we can reject leftover unknown flags / extra positionals per action.
+    // Without this, `config list --josn` exits 0 with human output (the typo'd
+    // flag is silently swallowed as an ignored `maybeKey`).
+    let scoped = rest;
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
@@ -8492,12 +8657,25 @@ Examples:
       const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
       if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
         modelScope = catalogId ?? resolved;
-        [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
+        scoped = rest.slice(1);
+        [firstArg, maybeKey, ...valueArgs] = scoped;
       }
     }
     const action = firstArg;
     const key = maybeKey;
     const value = valueArgs.join(" ") || undefined;
+
+    // HF-CLI-004: validate per-action arity + reject stray dash-flags via the
+    // pure (unit-tested) verdict helper. `set`/`cask-profile` allow free-form
+    // (dash-leading) VALUE tokens, so only their <key> slot is flag-checked;
+    // list/get/reset reject any dash token in their tail.
+    if (action) {
+      const verdict = validateConfigActionArgs(action, scoped.slice(1), key);
+      if (!verdict.ok) {
+        console.error(`hipfire: ${verdict.error} (see hipfire config --help)`);
+        process.exit(EXIT.USAGE);
+      }
+    }
 
     const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
 
@@ -8884,4 +9062,10 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
     process.stderr.write((err.stack ?? String(err)) + "\n");
   }
   dieClean(err);
+}
+} // end main()
+
+// Run the CLI only as the entrypoint; importing this module (tests) is a no-op.
+if (import.meta.main) {
+  await main();
 }

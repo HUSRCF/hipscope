@@ -305,6 +305,11 @@ mkdir -p "$BIN_DIR" "$MODELS_DIR"
 # Remote: running via curl|bash — clone the repo
 INSTALL_MODE="remote"
 REPO_DIR=""
+# INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
+# run. When source changed, an existing target/release/examples/daemon is STALE
+# and MUST NOT be trusted — we rebuild. Only a genuinely fresh prebuilt binary
+# (no source update this run) is allowed to short-circuit the build.
+SOURCE_UPDATED=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd 2>/dev/null)" || true
 if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
@@ -333,6 +338,7 @@ else
             exit 1
         }
         echo "  Cloned ✓"
+        SOURCE_UPDATED=1
     else
         echo "  Existing clone found at $SRC_DIR"
         # Stash any local modifications (Cargo.lock rewritten by cargo build,
@@ -352,10 +358,13 @@ else
         echo "  Updating..."
         # Fetch + hard-reset is safe now (tree is clean post-stash). Reset
         # handles both fast-forward and diverged-history cases uniformly.
-        git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
-        git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null || {
+        if git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
+           git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null; then
+            # Source was reset to origin — any prior build artifact is now stale.
+            SOURCE_UPDATED=1
+        else
             echo "  Update failed (non-fatal). Using existing checkout."
-        }
+        fi
     fi
     REPO_DIR="$SRC_DIR"
 fi
@@ -372,10 +381,18 @@ fi
 
 TARGET_DIR=$(cd "$REPO_DIR" && cargo metadata --format-version 1 | grep -oE '"target_directory" *: *"[^"]+"' | cut -d ':' -f 2- | tr -d '"')
 
-if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
+# INSTALL-F1: only short-circuit on a prebuilt daemon when the source tree did
+# NOT change this run (SOURCE_UPDATED=0). A leftover binary from a prior build
+# against now-updated source is stale and must be rebuilt. HIPFIRE_FORCE_REBUILD=1
+# (set by `hipfire update`) always forces a rebuild.
+if [ -f "$TARGET_DIR/release/examples/daemon" ] && [ "$SOURCE_UPDATED" = "0" ] && [ "${HIPFIRE_FORCE_REBUILD:-0}" = "0" ]; then
     echo "  Pre-built binaries found ✓"
 else
-    echo "  No pre-built binaries. Building from source..."
+    if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
+        echo "  Source updated — rebuilding (existing binary is stale)..."
+    else
+        echo "  No pre-built binaries. Building from source..."
+    fi
     # MANDATORY build (daemon + inference examples). Stays inside the fatal
     # &&-chain: under `set -e` a failure here aborts the install, which is
     # correct — without the daemon there is nothing to install.
