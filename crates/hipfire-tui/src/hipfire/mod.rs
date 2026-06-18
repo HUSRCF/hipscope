@@ -6,6 +6,7 @@ pub mod chat;
 pub mod config;
 pub mod registry;
 pub mod status;
+pub mod writer;
 
 use std::{
     env,

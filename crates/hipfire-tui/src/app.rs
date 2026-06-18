@@ -15,8 +15,16 @@ use crate::hipfire::{
     config::ConfigState,
     registry::{RegistryAction, RegistryState},
     status::{start_background_serve, StatusState},
+    writer::{self, FieldKind},
     HipfirePaths,
 };
+
+/// In-progress numeric/string edit of a settings field (Enter to commit,
+/// Esc to cancel). Enum fields are cycled in place and never enter this state.
+pub struct EditState {
+    pub key: String,
+    pub buffer: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tab {
@@ -56,6 +64,7 @@ pub struct App {
     pub tab: Tab,
     pub settings_easy: bool,
     pub settings_selected: usize,
+    pub settings_edit: Option<EditState>,
     pub chat: ChatState,
     pub last_reload: String,
 }
@@ -76,6 +85,7 @@ impl App {
             tab: Tab::Home,
             settings_easy: true,
             settings_selected: 0,
+            settings_edit: None,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
         })
@@ -128,8 +138,26 @@ impl App {
                         RegistryAction::SelectedModel { tag } => {
                             self.active_model = tag.clone();
                             self.chat.status = format!("model selected: {tag}");
-                            self.last_reload =
-                                "selected model for this TUI session; config unchanged".into();
+                            // Persist default_model to ~/.hipfire/config.json
+                            // (read-modify-write, atomic). Was session-only.
+                            match writer::write_raw_value(
+                                &self.paths.config,
+                                "default_model",
+                                serde_json::Value::String(tag.clone()),
+                            ) {
+                                Ok(()) => {
+                                    self.config.default_model = tag.clone();
+                                    self.config
+                                        .values
+                                        .insert("default_model".into(), tag.clone());
+                                    self.config.loaded_from_disk = true;
+                                    self.last_reload =
+                                        format!("default_model = {tag} saved to ~/.hipfire/config.json");
+                                }
+                                Err(err) => {
+                                    self.last_reload = format!("default_model save failed: {err}");
+                                }
+                            }
                         }
                     }
                 }
@@ -236,7 +264,55 @@ impl App {
         }
     }
 
+    /// Resolve the currently-selected settings row to a config key, if any.
+    /// In easy mode this maps through `ConfigState::easy_keys`; in advanced
+    /// mode the row IS a `(key, value)` pair from the raw config map.
+    fn selected_setting_key(&self) -> Option<String> {
+        if self.settings_easy {
+            self.config
+                .easy_keys()
+                .get(self.settings_selected)
+                .and_then(|k| k.map(|s| s.to_string()))
+        } else {
+            self.config
+                .values
+                .iter()
+                .nth(self.settings_selected)
+                .map(|(k, _)| k.clone())
+        }
+    }
+
+    fn current_setting_value(&self, key: &str) -> String {
+        self.config.values.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Persist a validated value for `key` and reflect it in the in-memory
+    /// config so the UI updates immediately. Returns the status string.
+    fn persist_setting(&mut self, key: &str, raw: &str) -> String {
+        match writer::write_value(&self.paths.config, key, raw) {
+            Ok(value) => {
+                let as_str = match &value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if key == "default_model" {
+                    self.config.default_model = as_str.clone();
+                }
+                self.config.values.insert(key.to_string(), as_str.clone());
+                self.config.loaded_from_disk = true;
+                format!("{key} = {as_str} saved to ~/.hipfire/config.json")
+            }
+            Err(err) => format!("{err}"),
+        }
+    }
+
     fn handle_settings_key(&mut self, key: KeyEvent) {
+        // If a numeric/string edit is in progress, keystrokes feed the buffer.
+        if self.settings_edit.is_some() {
+            self.handle_settings_edit_key(key);
+            return;
+        }
+
         let len = if self.settings_easy {
             self.config.easy_rows().len()
         } else {
@@ -249,6 +325,85 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
+            }
+            // Cycle an enum field forward/back; persist immediately.
+            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Left => {
+                let forward = !matches!(key.code, KeyCode::Left);
+                let Some(k) = self.selected_setting_key() else {
+                    self.last_reload = "this row is not inline-editable".into();
+                    return;
+                };
+                match writer::field_spec(&k).map(|s| s.kind) {
+                    Some(FieldKind::Enum(_)) | Some(FieldKind::Bool) => {
+                        let cur = self.current_setting_value(&k);
+                        // Bool is modeled as a two-value cycle.
+                        let next = if let Some(n) = writer::cycle_enum(&k, &cur, forward) {
+                            n
+                        } else {
+                            match cur.as_str() {
+                                "true" => "false".into(),
+                                _ => "true".into(),
+                            }
+                        };
+                        self.last_reload = self.persist_setting(&k, &next);
+                    }
+                    Some(_) => {
+                        self.last_reload =
+                            format!("{k} is numeric/text; press Enter to edit");
+                    }
+                    None => {
+                        self.last_reload = format!("{k} is not editable from the TUI");
+                    }
+                }
+            }
+            // Begin editing a numeric/free-string field.
+            KeyCode::Enter => {
+                let Some(k) = self.selected_setting_key() else {
+                    self.last_reload = "this row is not inline-editable".into();
+                    return;
+                };
+                match writer::field_spec(&k).map(|s| s.kind) {
+                    Some(FieldKind::Int { .. })
+                    | Some(FieldKind::Float { .. })
+                    | Some(FieldKind::FreeStr { .. }) => {
+                        let buffer = self.current_setting_value(&k);
+                        self.settings_edit = Some(EditState { key: k.clone(), buffer });
+                        self.last_reload =
+                            format!("editing {k}: type a value, Enter to save, Esc to cancel");
+                    }
+                    Some(FieldKind::Enum(_)) | Some(FieldKind::Bool) => {
+                        self.last_reload =
+                            format!("{k} is an enum; use Left/Right/Space to cycle");
+                    }
+                    None => {
+                        self.last_reload = format!("{k} is not editable from the TUI");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_settings_edit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.settings_edit = None;
+                self.last_reload = "edit cancelled".into();
+            }
+            KeyCode::Enter => {
+                if let Some(edit) = self.settings_edit.take() {
+                    self.last_reload = self.persist_setting(&edit.key, edit.buffer.trim());
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.buffer.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.buffer.push(c);
+                }
             }
             _ => {}
         }

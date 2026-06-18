@@ -137,10 +137,22 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // While a settings value is being edited, keystrokes (including q/e/a/r)
+    // feed the edit buffer rather than triggering global shortcuts.
+    let editing_setting = app.tab == app::Tab::Settings && app.settings_edit.is_some();
+    if editing_setting && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     match key.code {
         KeyCode::Char('q') if !app.chat.is_input_focused() => return true,
         KeyCode::Esc => {
-            if app.chat.sending {
+            // While editing a settings value, Esc cancels the edit instead of
+            // quitting / blurring chat.
+            if app.tab == app::Tab::Settings && app.settings_edit.is_some() {
+                app.handle_tab_key(key);
+            } else if app.chat.sending {
                 app.chat.status = "stream abort is not wired in prototype 1".into();
             } else if app.chat.is_input_focused() {
                 app.chat.blur_input();

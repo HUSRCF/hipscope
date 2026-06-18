@@ -77,6 +77,21 @@ impl ConfigState {
         }
     }
 
+    /// Config keys behind each easy-mode row, in display order. `None` marks a
+    /// row that is composite/non-editable inline (e.g. the `host:port` serve
+    /// row, or the Model row which is set from the Models tab). The TUI editor
+    /// uses this to resolve a selected easy row to a writable config key.
+    pub fn easy_keys(&self) -> Vec<Option<&'static str>> {
+        vec![
+            None,            // Model (set via Models tab)
+            Some("max_seq"), // Context
+            Some("dflash_mode"),
+            Some("kv_cache"),
+            Some("thinking"),
+            None, // Serve host:port (composite)
+        ]
+    }
+
     pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
         vec![
             (

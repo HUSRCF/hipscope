@@ -102,7 +102,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Models => {
             "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
         }
-        Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
+        Tab::Settings => {
+            if app.settings_edit.is_some() {
+                "Editing: type value  Enter save  Backspace delete  Esc cancel"
+            } else {
+                "e easy  a advanced  Up/Down select  Left/Right/Space cycle enum  Enter edit num/text  r refresh"
+            }
+        }
         _ => "Tab switch  r refresh  q quit",
     };
     frame.render_widget(
@@ -193,7 +199,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     let actions = vec![
         ListItem::new("Chat: use the Chat tab; it streams through existing hipfire serve."),
         ListItem::new("Models: browse registry and local downloads."),
-        ListItem::new("Settings: easy/advanced split, read-only in prototype 1."),
+        ListItem::new("Settings: easy/advanced split, writable (persists to ~/.hipfire/config.json)."),
         ListItem::new("System: hardware and path checks."),
     ];
     frame.render_widget(
@@ -435,10 +441,13 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Advanced settings"
     };
-    let note = if app.settings_easy {
-        "Read-only prototype. Press a for advanced."
+    let note = if let Some(edit) = &app.settings_edit {
+        // Show the live edit buffer.
+        format!("editing {} = {}_  (Enter save, Esc cancel)", edit.key, edit.buffer)
+    } else if app.settings_easy {
+        "Writable. Left/Right cycle, Enter edits numbers. Press a for advanced.".to_string()
     } else {
-        "Raw config view. Press e for easy."
+        "Writable raw config. Left/Right cycle, Enter edits. Press e for easy.".to_string()
     };
     frame.render_widget(
         Paragraph::new(format!("{mode}    {note}"))
