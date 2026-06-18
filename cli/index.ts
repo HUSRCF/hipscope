@@ -1603,7 +1603,14 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
+interface RunExtra {
+  kvMode?: string;
+  // --seed: awaits engine sampler-seed support (GenerateRequest has none; engine nondeterministic at temp0)
+  jsonOut?: boolean;
+  noStream?: boolean;
+}
+
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string, extra: RunExtra = {}) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1625,7 +1632,14 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // If a serve daemon is already running on this port, proxy through its HTTP
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
-  const useLocal = process.env.HIPFIRE_LOCAL === "1";
+  //
+  // BUT: --kv-mode is a load-time knob that a long-lived serve (model already
+  // loaded with a fixed kv_mode) can't honor per-request, and --json /
+  // --no-stream change how WE collect output. So when any of those are set,
+  // force the local daemon so they actually apply.
+  const wantsLocalControl = extra.kvMode !== undefined
+    || extra.jsonOut === true || extra.noStream === true;
+  const useLocal = process.env.HIPFIRE_LOCAL === "1" || wantsLocalControl;
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
     const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
@@ -1644,11 +1658,16 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
 
   applyConfigEnv(cfg, model);
+  // --kv-mode override: the daemon prefers params.kv_mode over the env var, so
+  // also export HIPFIRE_KV_MODE for any code path that reads the env.
+  if (extra.kvMode !== undefined) process.env.HIPFIRE_KV_MODE = extra.kvMode;
   const e = new Engine();
   e.oneShot = true; // hunt3 H-B: one-shot run — recv() may exit on daemon EOF
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send(buildLoadMessage(path, model));
+  const loadMsg = buildLoadMessage(path, model);
+  if (extra.kvMode !== undefined) loadMsg.params.kv_mode = extra.kvMode;
+  await e.send(loadMsg);
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -1688,6 +1707,12 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
   if (system) genMsg.system = system;
 
+  // --json / --no-stream: accumulate the (think-stripped) content instead of
+  // streaming it to stdout token-by-token, then emit a single object/blob.
+  const collect = extra.jsonOut === true || extra.noStream === true;
+  let acc = "";
+  let doneTokens = 0;
+  let doneTokS = 0;
   let inThink = false;
   let stripNextLeadingNl = false;
   for await (const msg of e.generate(genMsg)) {
@@ -1704,17 +1729,29 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
       text = text.replace(/<\|im_end\|>/g, "");
       if (!text) continue;
       if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-      process.stdout.write(text);
+      if (collect) acc += text;
+      else process.stdout.write(text);
     }
-    else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    else if (msg.type === "done") {
+      doneTokens = msg.tokens; doneTokS = msg.tok_s;
+      if (!collect) console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    }
     else if (msg.type === "error") {
       // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
       // exiting 0 with no visible output. Sets exitCode so downstream shell
       // pipelines can detect the failure.
       process.stderr.write(`\n[hipfire] ${msg.message || "generation failed"}\n`);
       process.exitCode = 1;
-      break;
+      await e.stop();
+      return;
     }
+  }
+  if (extra.jsonOut) {
+    console.log(JSON.stringify({ content: acc, tokens: doneTokens, tok_s: doneTokS }));
+  } else if (extra.noStream) {
+    process.stdout.write(acc);
+    if (!acc.endsWith("\n")) process.stdout.write("\n");
+    console.error(`[${doneTokens} tok, ${doneTokS} tok/s]`);
   }
   await e.stop();
 }
@@ -4704,7 +4741,7 @@ async function benchPrefill(e: Engine, tokens: number, timeoutMs = 60_000): Prom
   }
 }
 
-async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
+async function bench(model: string, runs: number, experimental: boolean, prompt: string, jsonOut = false) {
   let modelPath = findModel(model);
   if (!modelPath) {
     const resolved = resolveModelTag(model);
@@ -4962,6 +4999,24 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     const p = stats(prefills);
     const t = stats(ttfts);
     const w = stats(walls);
+
+    if (jsonOut) {
+      // Machine-readable: user-prompt prefill + decode means, plus the
+      // synthetic pp-scaling table (pp128/pp512/...) and per-run samples.
+      const prefillTokS = p.mean > 0 ? p.mean : (ppResults[0] ? stats(ppResults[0].samples).mean : 0);
+      console.log(JSON.stringify({
+        model: basename(modelPath!),
+        arch: loaded.arch ?? null,
+        prefill_tok_s: Number(prefillTokS.toFixed(2)),
+        gen_tok_s: Number(d.mean.toFixed(2)),
+        ttft_ms: t.mean > 0 ? Number(t.mean.toFixed(1)) : null,
+        runs,
+        decode_samples: decodes.map(x => Number(x.toFixed(2))),
+        prefill_scaling: ppResults.map(pp => ({ size: pp.size, tok_s: Number(stats(pp.samples).mean.toFixed(1)) })),
+      }, null, 2));
+      await e.stop();
+      return;
+    }
 
     console.log("");
 
@@ -6308,46 +6363,55 @@ switch (cmd) {
     break;
   }
   case "run": {
+    // Consume ALL flags FIRST via the W1 helpers (takeFlag / takeFlagValue),
+    // splicing them out of `rest` in place — so flags work in ANY position
+    // (before OR after the model). What survives is purely positional:
+    // rest[0] = model, rest[1..] = prompt. This replaces the old "read model
+    // as rest[0] BEFORE a legacy --key value loop" design, which failed when a
+    // value-flag (e.g. --temp) was placed before the model (rest[0] became the
+    // flag name → "Model not found: --temp").
+    const wantHelp = takeFlag(rest, "-h", "--help");
+    const runJson = takeFlag(rest, "--json");
+    const runNoStream = takeFlag(rest, "--no-stream");
+    const kvModeVal = takeFlagValue(rest, "--kv-mode");
+    const imageVal = takeFlagValue(rest, "--image");
+    const systemVal = takeFlagValue(rest, "--system");
+    const tempVal = takeFlagValue(rest, "--temp");
+    const topPVal = takeFlagValue(rest, "--top-p");
+    const repeatPenaltyVal = takeFlagValue(rest, "--repeat-penalty");
+    const maxTokensVal = takeFlagValue(rest, "--max-tokens");
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
-    // Parse --key value flags
-    const flagDefs: Record<string, { default: number | string | undefined }> = {
-      "--image": { default: undefined }, "--temp": { default: 0.3 },
-      "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 4096 },
-      "--system": { default: undefined },
-    };
-    const stringFlags = new Set(["--image", "--system"]);
-    const flags: Record<string, string> = {};
-    const flagIndices = new Set<number>();
-    for (const key of Object.keys(flagDefs)) {
-      const idx = rest.indexOf(key);
-      if (idx >= 0 && idx + 1 < rest.length) {
-        const val = rest[idx + 1];
-        // Reject flag values that look like other flags
-        if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
-        // Validate numeric flags
-        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
-        flags[key] = val;
-        flagIndices.add(idx); flagIndices.add(idx + 1);
-      } else if (idx >= 0) {
-        console.error(`Error: ${key} requires a value`); process.exit(1);
-      }
+    if (wantHelp || !model) {
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --json                   Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\"");
+      process.exit(wantHelp ? 0 : 1);
     }
-    const image = flags["--image"];
-    const system = flags["--system"];
+    // Validate --kv-mode against the same allowlist config validation uses.
+    if (kvModeVal !== null && !validateConfigValue("kv_cache", kvModeVal)) {
+      console.error(`Error: invalid --kv-mode '${kvModeVal}'. Valid: auto, q8, asym4, asym3, asym2, fwht4, fwht3, fwht2, turbo, turbo4, turbo3, turbo2`);
+      process.exit(1);
+    }
+    // Validate numeric value-flags (takeFlagValue already rejected dangling /
+    // dash-looking values; here we enforce numeric-ness).
+    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal]] as const) {
+      if (val !== null && isNaN(Number(val))) { console.error(`Error: ${name} requires a number, got '${val}'`); process.exit(1); }
+    }
+    const image = imageVal ?? undefined;
+    const system = systemVal ?? undefined;
     const runCfg = resolveModelConfig(model);
-    const temp = Number(flags["--temp"] ?? runCfg.temperature);
-    const topP = Number(flags["--top-p"] ?? runCfg.top_p);
-    const repeatPenalty = Number(flags["--repeat-penalty"] ?? runCfg.repeat_penalty);
-    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? runCfg.max_tokens));
+    const temp = Number(tempVal ?? runCfg.temperature);
+    const topP = Number(topPVal ?? runCfg.top_p);
+    const repeatPenalty = Number(repeatPenaltyVal ?? runCfg.repeat_penalty);
+    const maxTokens = Math.floor(Number(maxTokensVal ?? runCfg.max_tokens));
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
-    const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
-    const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
+    const prompt = rest.slice(1).join(" ") || (image ? "Describe this image." : "Hello");
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, {
+      kvMode: kvModeVal ?? undefined,
+      jsonOut: runJson,
+      noStream: runNoStream,
+    });
     break;
   }
   case "chat": {
@@ -6369,8 +6433,42 @@ switch (cmd) {
     break;
   }
   case "list": {
+    const asJson = takeFlag(rest, "--json");
     const showRemote = rest.includes("--remote") || rest.includes("-r");
     const local = listLocal();
+    if (asJson) {
+      // Machine-readable: every local model + every registry entry (with a
+      // `downloaded` flag). `quant` is the file extension (mq4/hf6/q8/...) when
+      // recognizable, else null.
+      const catalog = loadModelsCatalog();
+      const byId = new Map(Object.values(catalog.models).map(m => [m.id, m]));
+      const quantOf = (file: string): string | null => {
+        const m = file.match(/\.([A-Za-z0-9]+)$/);
+        return m ? m[1].toLowerCase() : null;
+      };
+      const localFiles = new Set(local.map(m => m.name));
+      const models = local.map(m => {
+        const rec = byId.get(m.name);
+        return {
+          tag: m.tag || (rec?.registry_tag ?? null),
+          name: m.name,
+          path: rec?.path ?? null,
+          size_bytes: rec?.size_bytes ?? 0,
+          quant: quantOf(m.name),
+          downloaded: true,
+        };
+      });
+      const registry = Object.entries(REGISTRY).map(([tag, entry]) => ({
+        tag,
+        name: entry.file,
+        path: null as string | null,
+        size_bytes: Math.round((entry.size_gb || 0) * 1e9),
+        quant: quantOf(entry.file),
+        downloaded: localFiles.has(entry.file),
+      }));
+      console.log(JSON.stringify({ models, registry }, null, 2));
+      break;
+    }
     if (local.length > 0) {
       console.log("Local models:\n");
       for (const m of local) {
@@ -6402,6 +6500,7 @@ switch (cmd) {
   }
   case "ps": {
     // List running hipfire-related processes: serve daemons, quantize jobs, uploads.
+    const psJson = takeFlag(rest, "--json");
     const sh = (cmd: string) => {
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
@@ -6419,6 +6518,10 @@ switch (cmd) {
       { label: "Quantize jobs", pattern: "quantize", entries: [] },
       { label: "HF uploads", pattern: "hf upload", entries: [] },
     ];
+    // Structured records (for --json) collected alongside the human entries.
+    const daemonRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
+    const quantizeRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
+    const uploadRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
     const lines = sh(`ps -eo pid,etime,rss,args | grep -E '${grepPatterns.join("|")}' | grep -v grep`).split("\n").filter(Boolean);
     for (const line of lines) {
       const m = line.match(/^\s*(\d+)\s+(\S+)\s+(\d+)\s+(.+)$/);
@@ -6427,9 +6530,28 @@ switch (cmd) {
       const rssMb = (parseInt(rss) / 1024).toFixed(0);
       const shortArgs = args.length > 140 ? args.slice(0, 140) + "…" : args;
       const entry = `  ${pid.padStart(7)}  ${etime.padStart(10)}  ${rssMb.padStart(6)}M  ${shortArgs}`;
-      if (/daemon/.test(args)) groups[0].entries.push(entry);
-      else if (/quantize/.test(args)) groups[1].entries.push(entry);
-      else if (/hf upload/.test(args)) groups[2].entries.push(entry);
+      const rec = { pid: parseInt(pid), etime, rss_mb: Math.round(parseInt(rss) / 1024), args };
+      if (/daemon/.test(args)) { groups[0].entries.push(entry); daemonRecs.push(rec); }
+      else if (/quantize/.test(args)) { groups[1].entries.push(entry); quantizeRecs.push(rec); }
+      else if (/hf upload/.test(args)) { groups[2].entries.push(entry); uploadRecs.push(rec); }
+    }
+    if (psJson) {
+      const port0 = cfg.port;
+      const portInUse0 = sh(`ss -tlnp 2>/dev/null | grep :${port0}`);
+      const detachedPid0 = readServePid();
+      console.log(JSON.stringify({
+        daemons: daemonRecs,
+        quantize: quantizeRecs,
+        uploads: uploadRecs,
+        serve: {
+          host: cfg.host,
+          port: port0,
+          pid: detachedPid0,
+          up: !!(detachedPid0 || portInUse0),
+          detached: !!detachedPid0,
+        },
+      }, null, 2));
+      break;
     }
     let total = 0;
     for (const g of groups) total += g.entries.length;
@@ -6464,6 +6586,22 @@ switch (cmd) {
     break;
   }
   case "profile": {
+    if (rest.includes("-h") || rest.includes("--help")) {
+      console.error(`Usage: hipfire profile [model] [--kernel <substr>] [--json]
+
+  Roofline + compiled-kernel report for the detected GPU. Pass a [model] to
+  load it first (forces its kernels to JIT-compile so they show up).
+
+Flags:
+  --kernel <substr>   Only report kernels whose name contains <substr>
+  --json              Emit the full machine-readable hardware + kernel report
+
+Examples:
+  hipfire profile
+  hipfire profile qwen3.5:9b
+  hipfire profile qwen3.5:9b --kernel gemm --json`);
+      process.exit(0);
+    }
     const jsonFlag = rest.includes("--json");
     const kernelIdx = rest.indexOf("--kernel");
     const kernelFilter = kernelIdx >= 0 && kernelIdx + 1 < rest.length ? rest[kernelIdx + 1] : undefined;
@@ -6712,14 +6850,97 @@ switch (cmd) {
     break;
   }
   case "diag": {
-    console.log("hipfire diagnostics\n");
-    // Where the model list came from this run: network / cache / stale-cache
-    // (dynamic registry/v1.json) or bundled (compiled-in registry.json).
-    console.log(`registry:      ${REGISTRY_SOURCE}`);
+    const diagJson = takeFlag(rest, "--json");
     const sh = (cmd: string) => {
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
     };
+    if (diagJson) {
+      // Machine-readable diagnostics. Mirrors the human probe order but emits a
+      // single JSON object: platform, gpus (PCI), rocm, daemon, models, kernels,
+      // live GPU probe, config overrides.
+      const platform = process.platform;
+      const isWsl = existsSync("/proc/version") && (sh("cat /proc/version") || "").toLowerCase().includes("microsoft");
+      const platformLabel = isWsl ? "wsl2" : platform === "win32" ? "windows" : platform === "linux" ? "linux" : platform;
+      const lspci = sh("lspci 2>/dev/null | grep -i 'vga\\|display\\|3d'");
+      const pciGpus = lspci ? lspci.split("\n").map(l => l.trim()).filter(Boolean) : [];
+      const driNodes = sh("ls /dev/dri/ 2>/dev/null");
+      const hasKfd = existsSync("/dev/kfd");
+      const amdgpuLoaded = !!sh("lsmod 2>/dev/null | grep amdgpu | head -1");
+      const hipccVer = sh("hipcc --version 2>&1 | head -1");
+      const exeJ = process.platform === "win32" ? ".exe" : "";
+      const envBinJ = process.env.HIPFIRE_DAEMON_BIN;
+      const daemonBinJ = [
+        ...(envBinJ ? [envBinJ] : []),
+        resolve(__dirname, `../target/release/examples/daemon${exeJ}`),
+        join(HIPFIRE_DIR, "bin", `daemon${exeJ}`),
+      ].find(p => existsSync(p)) ?? null;
+      const modelsJ = listLocal();
+      // Kernels
+      const kernelsJ: { arch: string; blobs: number; hashes: number }[] = [];
+      const kBaseJ = (() => {
+        const a = join(HIPFIRE_DIR, "bin", "kernels", "compiled");
+        const b = resolve(__dirname, "../kernels/compiled");
+        return existsSync(a) ? a : existsSync(b) ? b : null;
+      })();
+      if (kBaseJ) {
+        for (const arch of readdirSync(kBaseJ).filter(d => d.startsWith("gfx"))) {
+          const dir = join(kBaseJ, arch);
+          kernelsJ.push({
+            arch,
+            blobs: readdirSync(dir).filter(f => f.endsWith(".hsaco")).length,
+            hashes: readdirSync(dir).filter(f => f.endsWith(".hash")).length,
+          });
+        }
+      }
+      // Live GPU probe
+      let gpu: any = null;
+      if (daemonBinJ) {
+        try {
+          const de = new Engine();
+          de.oneShot = true;
+          await de.start();
+          await de.send({ type: "ping" }); await de.recv();
+          await de.send({ type: "diag" });
+          const d = await de.recv();
+          if (d.type === "diag") {
+            gpu = {
+              arch: d.arch ?? null,
+              hip_version: d.hip_version ?? null,
+              vram_free_mb: d.vram_free_mb ?? null,
+              vram_total_mb: d.vram_total_mb ?? null,
+            };
+          }
+          await de.stop();
+        } catch (err: any) {
+          gpu = { error: err?.message ?? String(err) };
+        }
+      }
+      const overrides: Record<string, unknown> = {};
+      for (const k of Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]) {
+        if (cfg[k] !== CONFIG_DEFAULTS[k]) overrides[k] = cfg[k];
+      }
+      console.log(JSON.stringify({
+        registry: REGISTRY_SOURCE,
+        platform: platformLabel,
+        gpus: pciGpus,
+        dri_nodes: driNodes ? driNodes.split("\n").filter(Boolean) : [],
+        kfd: hasKfd,
+        amdgpu_loaded: amdgpuLoaded,
+        rocm: { hipcc: hipccVer || null },
+        daemon: daemonBinJ ? "found" : null,
+        models: modelsJ.map(m => ({ name: m.name, tag: m.tag || null, size: m.size })),
+        kernels: kernelsJ,
+        gpu,
+        config_path: CONFIG_PATH,
+        config_overrides: overrides,
+      }, null, 2));
+      break;
+    }
+    console.log("hipfire diagnostics\n");
+    // Where the model list came from this run: network / cache / stale-cache
+    // (dynamic registry/v1.json) or bundled (compiled-in registry.json).
+    console.log(`registry:      ${REGISTRY_SOURCE}`);
 
     // ── 1. Platform detection ──────────────────────────────
     const platform = process.platform;
@@ -6921,6 +7142,7 @@ switch (cmd) {
     break;
   }
   case "bench": {
+    const benchJson = takeFlag(rest, "--json");
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -6932,39 +7154,80 @@ switch (cmd) {
     const positional = rest.filter((_, i) => !skipSet.has(i));
     const benchModel = positional[0];
     if (!benchModel) {
-      console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [prompt]
+      console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [--json] [prompt]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
   --runs   Number of runs per variant (default: 5)
+  --json   Emit machine-readable {model,prefill_tok_s,gen_tok_s,runs,...} (standard mode only)
 
 Examples:
   hipfire bench qwen3.5:4b
-  hipfire bench qwen3.5:9b --runs 3
+  hipfire bench qwen3.5:9b --runs 3 --json
   hipfire bench --exp qwen3.5:4b --runs 5`);
       process.exit(1);
     }
+    if (benchJson && exp) {
+      console.error("Error: --json is not supported with --exp (variant comparison is human-only). Drop one.");
+      process.exit(1);
+    }
     const benchPrompt = positional.slice(1).join(" ") || "Explain the theory of general relativity in simple terms.";
-    await bench(benchModel, runs, exp, benchPrompt);
+    await bench(benchModel, runs, exp, benchPrompt, benchJson);
     break;
   }
   case "rm": {
+    const skipConfirm = takeFlag(rest, "--yes", "-y");
     const tag = rest[0] || "";
-    if (!tag) {
-      console.error("Usage: hipfire rm <model>   (e.g. hipfire rm qwen3.5:9b)");
+    if (!tag || tag === "-h" || tag === "--help") {
+      console.error("Usage: hipfire rm <model> [--yes|-y]   (e.g. hipfire rm qwen3.5:9b)");
+      console.error("  Removes the model file AND its sidecars (.triattn*.bin, *.mtp) next to it.");
+      console.error("  --yes / -y   Skip the confirmation prompt");
       console.error("  See installed models: hipfire list");
-      process.exit(1);
+      process.exit(tag ? 0 : 1);
     }
     const resolved = resolveModelTag(tag);
     const entry = REGISTRY[resolved];
     const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
-    if (path && existsSync(path)) {
-      unlinkSync(path);
-      console.log(`Removed ${path}`);
-    } else {
+    if (!path || !existsSync(path)) {
       console.error(`Model not found: ${tag}`);
       console.error(`  See installed models: hipfire list`);
       process.exit(1);
+    }
+    // Discover associated sidecars next to the model: `<stem>.triattn*.bin`
+    // and any `<stem>*.mtp`. <stem> drops the model's own extension so e.g.
+    // `qwen35-27b.mq4` matches `qwen35-27b.triattn.bin` and `qwen35-27b.mtp`.
+    const modelDir = dirname(path);
+    const base = basename(path);
+    const stem = base.replace(/\.[^.]+$/, "");
+    const sidecars: string[] = [];
+    try {
+      for (const f of readdirSync(modelDir)) {
+        if (f === base) continue;
+        const full = join(modelDir, f);
+        if ((f.startsWith(stem + ".triattn") && f.endsWith(".bin")) ||
+            (f.startsWith(stem) && f.endsWith(".mtp"))) {
+          sidecars.push(full);
+        }
+      }
+    } catch {}
+    const targets = [path, ...sidecars];
+    console.error(`Will remove:`);
+    for (const t of targets) {
+      let sz = "";
+      try { sz = `  (${fmtBytes(statSync(t).size)})`; } catch {}
+      console.error(`  ${t}${sz}`);
+    }
+    if (!skipConfirm) {
+      const rl = require("readline").createInterface({ input: process.stdin, output: process.stderr });
+      const answer: string = await new Promise(res => rl.question(`Remove ${targets.length} file(s)? [y/N] `, (a: string) => { rl.close(); res(a); }));
+      if (!/^y(es)?$/i.test(answer.trim())) {
+        console.error("Aborted.");
+        process.exit(1);
+      }
+    }
+    for (const t of targets) {
+      try { unlinkSync(t); console.log(`Removed ${t}`); }
+      catch (e: any) { console.error(`Failed to remove ${t}: ${e?.message ?? e}`); }
     }
     break;
   }
@@ -6974,7 +7237,7 @@ Examples:
       console.error(`Usage: hipfire quantize <hf-model-id | local-dir | file.gguf> [flags]
 
 Flags:
-  --format <mq4|mq6|q8>      Quantization format (repeatable — default: mq4)
+  --format <fmt>             Quantization format (repeatable — default: mq4). See Formats below.
   --both                     Shorthand for --format mq4 --format mq6
   -o, --output <path>        Output file (single format only)
   --output-dir <dir>         Directory for outputs (multi-format: required)
@@ -6984,10 +7247,16 @@ Flags:
   --install                  Copy outputs into ~/.hipfire/models (so \`hipfire run\` finds them)
   --register <tag>           Add a local alias (e.g. my-finetune:4b) to ~/.hipfire/models.json
 
-Formats:
-  mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
-  mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size (safetensors only)
-  q8    Symmetric Q8 — reference/debugging (safetensors only)
+Formats (safetensors / HF input):
+  mq4                FWHT-rotated 4-bit, quality-gated — recommended for production (Qwen3.5+ DeltaNet hot path)
+  mq6                FWHT-rotated 6-bit — higher quality, ~1.47x file size
+  q8 / q8f16         Symmetric Q8 — reference/debugging
+  hf4 / hfq4 / hfq4g256   HFQ4 (no FWHT rotation) — dense models (Llama / Mistral / Gemma / older Qwen)
+  hf6 / hfq6 / hfq6g256   HFQ6 (no FWHT rotation) — dense, higher quality
+
+  NOTE: graded per-expert MoE formats (mq4p / mfp4 / E8 / mq*-mqlloyd-tiered)
+  are NOT produced by this CLI path — they need --imatrix + extra flags and
+  run hipfire-quantize directly. See docs/ / the quantizer for the MoE recipe.
 
 GGUF input (single .gguf file): supports --format hf4 (default) /
 hf6 / mq4 / mq6. Source weights are dequantized (Q4_K_M / Q8_0 /
@@ -7084,7 +7353,9 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
                           "hf4", "hf6", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
     for (const f of formats) {
       if (!validFormats.includes(f)) {
-        console.error(`Unsupported format: ${f}\nSupported: mq4, mq6, q8`);
+        console.error(`Unsupported format: ${f}\nSupported: ${validFormats.join(", ")}`);
+        console.error(`  (GGUF input narrows to: hf4, hf6, mq4, mq6)`);
+        console.error(`  Graded MoE formats (mq4p/mfp4/E8) require running hipfire-quantize directly with --imatrix.`);
         process.exit(1);
       }
     }
