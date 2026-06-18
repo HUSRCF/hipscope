@@ -107,6 +107,132 @@ fn qwen35_kv_mode(ctx: &LoadCtx) -> String {
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
 }
 
+/// Qwen3.5 pipeline-parallel (pp>1) load. Extracted from the carrier body so
+/// the pp>1 multi-GPU tail (`skeleton_pp`) lives in one place; qwen35 is the
+/// only carrier with a pp>1 path. KV policy (`QWEN35_PP_POLICY`), DeltaNet
+/// quant, and scratch sizing are byte-identical to the previous inline block.
+fn load_qwen35_pp(
+    mut hfq_file: hipfire_runtime::hfq::HfqFile,
+    meta: SourceMeta,
+    ctx: &mut LoadCtx,
+) -> Result<LoadedModel, String> {
+    let pp = ctx.pp;
+    let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
+        .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
+    let kv_mode = ctx
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(spec) => {
+            let counts: Result<Vec<usize>, _> =
+                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
+            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+            if counts.len() != pp {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+                    counts.len(),
+                    pp
+                ));
+            }
+            let sum: usize = counts.iter().sum();
+            if sum != config.n_layers {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
+                    sum, config.n_layers
+                ));
+            }
+            hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+        }
+        None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
+            .map_err(|e| format!("{e}"))?,
+    };
+    let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
+    let weights = hipfire_arch_qwen35::qwen35::load_weights(
+        &mut hfq_source,
+        &mut gpus.devices,
+        &layout,
+    )
+    .map_err(|e| format!("{e}"))?;
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+        .collect();
+    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+        hipfire_runtime::kv_mode::resolve(
+            &kv_mode,
+            &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
+            config.head_dim,
+        );
+    if let Some(w) = warning {
+        eprintln!(
+            "  KV cache: {w} (site {})",
+            hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
+        );
+    }
+    let dims = hipfire_runtime::llama::KvDims {
+        layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        max_seq: ctx.max_seq,
+        physical_cap: Some(ctx.max_seq),
+    };
+    let kv = hipfire_runtime::llama::KvCache::from_mode(
+        mode,
+        hipfire_runtime::llama::KvTarget::Multi(&mut gpus),
+        &dims,
+    )
+    .map_err(|e| format!("{e}"))?;
+    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
+    let (dn, la_to_device) = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
+        &mut gpus, &config, dn_quant,
+    )
+    .map_err(|e| format!("{e}"))?;
+    let scratch_set = hipfire_arch_qwen35::qwen35::Qwen35ScratchSet::new_with_kv_max_multi(
+        &mut gpus,
+        &config,
+        2048,
+        ctx.max_seq,
+    )
+    .map_err(|e| format!("{e}"))?;
+    let gpu0 = &mut gpus.devices[0];
+    let single_scratch = hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
+        gpu0,
+        &config,
+        2048,
+        ctx.max_seq,
+    )
+    .map_err(|e| format!("{e}"))?;
+    let bundle = hipfire_arch_qwen35::Qwen35Bundle {
+        config,
+        weights,
+        scratch: single_scratch,
+        kv_cache: kv,
+        dn_state: dn,
+    };
+    Ok(LoadedModel {
+        state: Some(ModelState::Qwen35(bundle)),
+        ..LoadedModel::skeleton_pp(
+            meta.arch_id,
+            meta.tokenizer,
+            ctx.max_seq,
+            ctx.max_seq,
+            ctx.path.to_string(),
+            meta.chat_template,
+            pp,
+            gpus,
+            scratch_set,
+            la_to_device,
+        )
+    })
+}
+
 pub struct Qwen35Carrier;
 impl Carrier for Qwen35Carrier {
     fn name(&self) -> &'static str {
@@ -117,148 +243,24 @@ impl Carrier for Qwen35Carrier {
         matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        // Per-source diagnostics stay at the call site, before resolve_source_meta.
+        if let ModelSource::Dir(s) = &src {
+            let qm = s
+                .quant_config()
+                .map(|q| q.method.as_str())
+                .unwrap_or("none");
+            eprintln!("  safetensors arch_id={}, quant_method={qm}", s.arch_id());
+        }
+        let meta = resolve_source_meta(&src, ctx.path)?;
+
         match src {
             ModelSource::Hfq(mut hfq_file) => {
-                // ── pp>1 path (pipeline-parallel) ──────────────
+                // ── pp>1 path (pipeline-parallel) — extracted helper ──
                 if ctx.pp > 1 {
-                    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(
-                        &hfq_file.metadata_json,
-                    )
-                    .map_err(|e| format!("tokenizer not found: {e}"))?;
-                    let chat_template = resolve_chat_template(&hfq_file, ctx.path);
-                    let arch_id = hfq_file.arch_id;
-                    let pp = ctx.pp;
-                    let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
-                        .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-                    let kv_mode = ctx
-                        .kv_mode_override
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-                    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                    {
-                        Some(spec) => {
-                            let counts: Result<Vec<usize>, _> =
-                                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
-                            let counts =
-                                counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
-                            if counts.len() != pp {
-                                return Err(format!(
-                                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
-                                    counts.len(),
-                                    pp
-                                ));
-                            }
-                            let sum: usize = counts.iter().sum();
-                            if sum != config.n_layers {
-                                return Err(format!(
-                                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
-                                    sum, config.n_layers
-                                ));
-                            }
-                            hipfire_runtime::multi_gpu::Gpus::init_layers(&counts)
-                                .map_err(|e| format!("{e}"))?
-                        }
-                        None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
-                            .map_err(|e| format!("{e}"))?,
-                    };
-                    let layout =
-                        hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
-                    let mut hfq_source =
-                        hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
-                    let weights = hipfire_arch_qwen35::qwen35::load_weights(
-                        &mut hfq_source,
-                        &mut gpus.devices,
-                        &layout,
-                    )
-                    .map_err(|e| format!("{e}"))?;
-                    let is_kv_layer: Vec<bool> = config
-                        .layer_types
-                        .iter()
-                        .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
-                        .collect();
-                    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-                        hipfire_runtime::kv_mode::resolve(
-                            &kv_mode,
-                            &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
-                            config.head_dim,
-                        );
-                    if let Some(w) = warning {
-                        eprintln!(
-                            "  KV cache: {w} (site {})",
-                            hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
-                        );
-                    }
-                    let dims = hipfire_runtime::llama::KvDims {
-                        layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
-                        n_kv_heads: config.n_kv_heads,
-                        head_dim: config.head_dim,
-                        max_seq: ctx.max_seq,
-                        physical_cap: Some(ctx.max_seq),
-                    };
-                    let kv = hipfire_runtime::llama::KvCache::from_mode(
-                        mode,
-                        hipfire_runtime::llama::KvTarget::Multi(&mut gpus),
-                        &dims,
-                    )
-                    .map_err(|e| format!("{e}"))?;
-                    let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
-                        .map_err(|e| format!("{e}"))?;
-                    let (dn, la_to_device) =
-                        hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
-                            &mut gpus, &config, dn_quant,
-                        )
-                        .map_err(|e| format!("{e}"))?;
-                    let scratch_set =
-                        hipfire_arch_qwen35::qwen35::Qwen35ScratchSet::new_with_kv_max_multi(
-                            &mut gpus,
-                            &config,
-                            2048,
-                            ctx.max_seq,
-                        )
-                        .map_err(|e| format!("{e}"))?;
-                    let gpu0 = &mut gpus.devices[0];
-                    let single_scratch =
-                        hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
-                            gpu0,
-                            &config,
-                            2048,
-                            ctx.max_seq,
-                        )
-                        .map_err(|e| format!("{e}"))?;
-                    let bundle = hipfire_arch_qwen35::Qwen35Bundle {
-                        config,
-                        weights,
-                        scratch: single_scratch,
-                        kv_cache: kv,
-                        dn_state: dn,
-                    };
-                    return Ok(LoadedModel {
-                        state: Some(ModelState::Qwen35(bundle)),
-                        ..LoadedModel::skeleton_pp(
-                            arch_id,
-                            tokenizer,
-                            ctx.max_seq,
-                            ctx.max_seq,
-                            ctx.path.to_string(),
-                            chat_template,
-                            pp,
-                            gpus,
-                            scratch_set,
-                            la_to_device,
-                        )
-                    });
+                    return load_qwen35_pp(hfq_file, meta, ctx);
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(
-                    &hfq_file.metadata_json,
-                )
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-                let chat_template = resolve_chat_template(&hfq_file, ctx.path);
-                let arch_id = hfq_file.arch_id;
                 let physical_cap = if ctx.cask.sidecar.is_some() {
                     let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
                         .ok()
@@ -298,10 +300,10 @@ impl Carrier for Qwen35Carrier {
                     hipfire_arch_qwen35::load_qwen35_bundle(ModelSource::Hfq(hfq_file), ctx)?;
                 finish_qwen35_load(
                     bundle,
-                    tokenizer,
+                    meta.tokenizer,
                     physical_cap,
-                    arch_id,
-                    chat_template,
+                    meta.arch_id,
+                    meta.chat_template,
                     ctx,
                     vision_config,
                     vision_weights,
@@ -311,28 +313,10 @@ impl Carrier for Qwen35Carrier {
                 if ctx.pp > 1 {
                     return Err("qwen35: safetensors + pp>1 unsupported".into());
                 }
-                let arch_id = source.arch_id();
-                let qm = source
-                    .quant_config()
-                    .map(|q| q.method.as_str())
-                    .unwrap_or("none");
-                eprintln!("  safetensors arch_id={arch_id}, quant_method={qm}");
-
-                let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
-                    hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-                        .map_err(|e| {
-                            format!("failed to parse tokenizer at {}: {e}", tok_path.display())
-                        })?
-                        .ok_or_else(|| {
-                            format!("failed to load tokenizer from {}", tok_path.display())
-                        })?
-                } else {
-                    return Err("no tokenizer.json found in model directory".into());
-                };
-                let chat_template = source.chat_template();
-
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
-                    .map_err(|e| format!("failed to parse Qwen3.5 config from config.json: {e}"))?;
+                    .map_err(|e| {
+                        format!("failed to parse Qwen3.5 config from config.json: {e}")
+                    })?;
                 let mut paro_source =
                     hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
                         .map_err(|e| format!("ParoSource::new: {e:?}"))?;
@@ -375,8 +359,9 @@ impl Carrier for Qwen35Carrier {
                 )
                 .map_err(|e| format!("KvCache: {e}"))?;
 
-                let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new(ctx.gpu, &config)
-                    .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
+                let dn_state =
+                    hipfire_arch_qwen35::qwen35::DeltaNetState::new(ctx.gpu, &config)
+                        .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
                 let scratch =
                     hipfire_arch_qwen35::qwen35::Qwen35Scratch::new(ctx.gpu, &config, 256)
                         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
@@ -391,12 +376,12 @@ impl Carrier for Qwen35Carrier {
                 Ok(LoadedModel {
                     state: Some(ModelState::Qwen35(bundle)),
                     ..LoadedModel::skeleton(
-                        arch_id,
-                        tokenizer,
+                        meta.arch_id,
+                        meta.tokenizer,
                         ctx.max_seq,
                         ctx.max_seq,
                         ctx.path.to_string(),
-                        chat_template,
+                        meta.chat_template,
                     )
                 })
             }
