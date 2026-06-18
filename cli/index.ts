@@ -1023,6 +1023,88 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
 const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
 const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
 
+// Small, scoped `--flag value` / `--flag=value` reader for the handful of
+// serve passthrough flags. NOT a general parser rewrite (W2) — it extracts a
+// single named flag's value from an argv slice and removes the consumed tokens
+// IN PLACE so the positional host/port loop never sees them. Returns the value
+// string, or null when the flag is absent. Errors out on a missing value.
+function takeFlagValue(args: string[], name: string): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === name) {
+      const v = args[i + 1];
+      if (v === undefined || v.startsWith("-")) {
+        console.error(`Error: ${name} requires a value`);
+        process.exit(1);
+      }
+      args.splice(i, 2);
+      return v;
+    }
+    if (a.startsWith(name + "=")) {
+      const v = a.slice(name.length + 1);
+      if (!v) { console.error(`Error: ${name} requires a value`); process.exit(1); }
+      args.splice(i, 1);
+      return v;
+    }
+  }
+  return null;
+}
+
+// Boolean `--flag` reader: removes the token in place and reports presence.
+function takeFlag(args: string[], ...names: string[]): boolean {
+  let found = false;
+  for (let i = args.length - 1; i >= 0; i--) {
+    if (names.includes(args[i])) { args.splice(i, 1); found = true; }
+  }
+  return found;
+}
+
+// Reap ORPHAN daemon / quantize processes and free a serve port. Mirrors
+// scripts/serve-restart.sh: `pkill -x daemon` (exact-name, NOT -f, so the bun
+// CLI itself is never matched) + `fuser -k <port>/tcp`. Used by
+// `hipfire stop --force` / `--all`. Returns a short human summary per action.
+function reapOrphans(port: number, all: boolean): string[] {
+  const out: string[] = [];
+  const sh = (cmd: string): { code: number; out: string } => {
+    try {
+      const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+      return { code: r.exitCode ?? 0, out: (r.stdout?.toString() ?? "").trim() };
+    } catch { return { code: 1, out: "" }; }
+  };
+  // Exact-name match on the inference daemon binary (examples/daemon). -x guards
+  // against killing the bun CLI / unrelated procs that merely mention "daemon".
+  const daemons = sh(`pgrep -x daemon`).out.split("\n").filter(Boolean);
+  if (daemons.length) {
+    sh(`pkill -x daemon`);
+    out.push(`reaped ${daemons.length} orphan daemon proc(s): ${daemons.join(" ")}`);
+  } else {
+    out.push("no orphan daemon procs");
+  }
+  if (all) {
+    // The quantize binary is `hipfire-quantize` (16 chars) → comm truncates to
+    // `hipfire-quantiz`, so `pgrep -x hipfire-quantize` never matches. Anchor on
+    // the release binary PATH via -f instead — this matches the real compute
+    // process while NOT matching the bun CLI's own `quantize` subcommand (which
+    // is `bun .../cli/index.ts quantize ...`, a different cmdline).
+    const quant = sh(`pgrep -f 'release/hipfire-quantize'`).out.split("\n").filter(Boolean);
+    if (quant.length) {
+      sh(`pkill -f 'release/hipfire-quantize'`);
+      out.push(`reaped ${quant.length} orphan quantize proc(s): ${quant.join(" ")}`);
+    } else {
+      out.push("no orphan quantize procs");
+    }
+  }
+  // Free the serve port (fuser -k SIGKILLs whatever holds <port>/tcp).
+  const before = sh(`fuser ${port}/tcp 2>/dev/null`).out;
+  if (before) {
+    sh(`fuser -k ${port}/tcp 2>/dev/null`);
+    out.push(`freed port ${port} (was held by:${before})`);
+  } else {
+    out.push(`port ${port} already free`);
+  }
+  return out;
+}
+
 function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
@@ -1717,7 +1799,18 @@ async function serve(port: number, host: string) {
   // next tick re-evaluates and evicts cleanly if the connection has
   // since gone idle.
   let lastRequestTime = Date.now();
-  const idleTimeoutMs = cfg.idle_timeout * 1000;
+  // Env override (set by `hipfire serve --idle-timeout <secs>`) wins over the
+  // persisted config, and — unlike a cfg mutation — propagates to the detached
+  // child (which re-loads cfg from disk but inherits the parent's env).
+  const idleTimeoutSec = (() => {
+    const ev = process.env.HIPFIRE_IDLE_TIMEOUT;
+    if (ev !== undefined) {
+      const n = parseInt(ev, 10);
+      if (Number.isInteger(n) && n >= 0) return n;
+    }
+    return cfg.idle_timeout;
+  })();
+  const idleTimeoutMs = idleTimeoutSec * 1000;
 
   // Serve lock: serializes all daemon stdin/stdout access so only one
   // caller is mid-send/recv on the single IPC pipe at a time. Declared
@@ -1752,7 +1845,7 @@ async function serve(port: number, host: string) {
       if (!current) return;
       if (e.generating) return;
       if (Date.now() - lastRequestTime < idleTimeoutMs) return;
-      console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
+      console.error(`[hipfire] idle for ${idleTimeoutSec}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
       // Reset capability state only on a successful unload.
@@ -1796,9 +1889,11 @@ async function serve(port: number, host: string) {
   // Keep process alive irrespective of the interval; clean up on exit.
   if (evictionInterval) process.on("exit", () => clearInterval(evictionInterval));
 
-  // Pre-warm: load default model and compile kernels before accepting requests
+  // Pre-warm: load default model and compile kernels before accepting requests.
+  // `hipfire serve --no-prewarm` sets HIPFIRE_NO_PREWARM=1 to skip this entirely
+  // (model loads lazily on the first request instead).
   const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
-  const rawWarmPath = findModel(defaultModel);
+  const rawWarmPath = process.env.HIPFIRE_NO_PREWARM === "1" ? null : findModel(defaultModel);
   const warmPath = rawWarmPath ? resolve(rawWarmPath) : null;
   if (warmPath) {
     try {
@@ -1842,7 +1937,7 @@ async function serve(port: number, host: string) {
         return Response.json({
           status: "ok",
           model: current,
-          idle_timeout_sec: cfg.idle_timeout,
+          idle_timeout_sec: idleTimeoutSec,
           pid: process.pid,
         });
       }
@@ -3640,6 +3735,202 @@ async function serve(port: number, host: string) {
       }
     }
   });
+}
+
+// Drive `hipfire serve` / `hipfire restart`: parse args, resolve bind +
+// optional positional model, apply passthrough flags as env (so they survive
+// the detach re-spawn), then either fork-detach (with /health readiness poll)
+// or run the in-process server. `args` is a MUTABLE copy of argv rest.
+async function runServe(args: string[]) {
+  let port: number | null = null;
+  let host: string | null = null;
+
+  // ── Passthrough flags (env, so they propagate to a detached child) ──
+  // Extracted BEFORE the positional loop so host/port parsing never sees them.
+  if (takeFlag(args, "--no-prewarm")) process.env.HIPFIRE_NO_PREWARM = "1";
+  const kvMode = takeFlagValue(args, "--kv-mode");
+  if (kvMode !== null) {
+    const validKv = ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"];
+    if (!validKv.includes(kvMode)) {
+      console.error(`Invalid --kv-mode: ${kvMode} (expected one of ${validKv.join(", ")})`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_KV_MODE = kvMode; // resolveKvMode() honors env over cfg
+  }
+  const idleTimeout = takeFlagValue(args, "--idle-timeout");
+  if (idleTimeout !== null) {
+    const n = parseInt(idleTimeout, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 86400) {
+      console.error(`Invalid --idle-timeout: ${idleTimeout} (expected 0..86400 seconds)`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_IDLE_TIMEOUT = String(n); // serve() honors env over cfg
+  }
+
+  let detach = false;
+  const setPort = (raw: string) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      console.error(`Invalid serve port: ${raw}`);
+      process.exit(1);
+    }
+    if (port !== null && port !== n) {
+      console.error(`Serve port specified more than once: ${port} and ${n}`);
+      process.exit(1);
+    }
+    port = n;
+  };
+  const setHost = (raw: string) => {
+    if (!raw) {
+      console.error("Serve host cannot be empty");
+      process.exit(1);
+    }
+    if (host !== null && host !== raw) {
+      console.error(`Serve host specified more than once: ${host} and ${raw}`);
+      process.exit(1);
+    }
+    host = raw;
+  };
+  // Expert-parallel degree for `--tp N` (or `--tp=N`). Sets HIPFIRE_TP, which
+  // buildLoadMessage forwards as params.tp so the daemon loads via
+  // load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
+  let tpPending = false;
+  const setTp = (raw: string) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 64) {
+      console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_TP = String(n);
+  };
+  // A positional model arg (`hipfire serve <model>`) pre-warms a SPECIFIC model
+  // for this run without a persistent `config set default_model`. Resolved via
+  // the same findModel() resolver used by run/pull; set as HIPFIRE_MODEL (which
+  // serve()'s pre-warm reads, and which propagates to a detached child).
+  let modelArg: string | null = null;
+  const setModel = (raw: string) => {
+    if (modelArg !== null && modelArg !== raw) {
+      console.error(`Serve model specified more than once: ${modelArg} and ${raw}`);
+      process.exit(1);
+    }
+    modelArg = raw;
+  };
+  for (const a of args) {
+    if (tpPending) { setTp(a); tpPending = false; continue; }
+    if (a === "--tp") { tpPending = true; continue; }
+    else if (a.startsWith("--tp=")) setTp(a.slice(5));
+    else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+    else if (/^\d+$/.test(a)) setPort(a);
+    else if (/^\[[^\]]+\]:\d+$/.test(a)) {
+      const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
+      setHost(m[1]);
+      setPort(m[2]);
+    }
+    else if (/^[^:]+:\d+$/.test(a)) {
+      const idx = a.lastIndexOf(":");
+      setHost(a.slice(0, idx));
+      setPort(a.slice(idx + 1));
+    }
+    else if (a === "-h" || a === "--help") {
+      console.error(`Usage: hipfire serve [model] [host] [port] [flags]\n\n`
+        + `  [model]    Pre-warm a SPECIFIC model this run (resolved like \`run\`/\`pull\`;\n`
+        + `             without it, serve pre-warms cfg.default_model = ${cfg.default_model})\n`
+        + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
+        + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
+        + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n\n`
+        + `Flags:\n`
+        + `  -d, --detach          Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
+        + `  --kv-mode <m>         KV cache mode this run (q8, asym4, asym3, asym2, fwht4/3/2, auto)\n`
+        + `  --idle-timeout <s>    Unload model after <s> idle seconds (0 = never; max 86400)\n`
+        + `  --no-prewarm          Skip pre-warm; load the model lazily on the first request\n`
+        + `  --tp N                Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N GPUs)\n\n`
+        + `Background daemon:\n`
+        + `  hipfire serve -d                       # start in background\n`
+        + `  hipfire serve qwen3.5:9b 0.0.0.0:11435 -d\n`
+        + `  hipfire serve --kv-mode q8 --idle-timeout 0 -d\n`
+        + `  hipfire restart -d                     # stop + force-reap + start\n`
+        + `  hipfire stop                           # kill the tracked daemon\n`
+        + `  hipfire stop --force                   # also reap orphans + free the port\n`
+        + `  hipfire ps                             # check if running\n`
+        + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
+      process.exit(0);
+    }
+    // A registry/alias-resolvable tag (or name:tag shape) is a MODEL to
+    // pre-warm, not a bind address. (Previously this was a hard error.)
+    else if (REGISTRY[resolveModelTag(a)] || findModel(a) || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
+      setModel(a);
+    }
+    else setHost(a);
+  }
+  if (modelArg !== null) {
+    // Resolve via the shared resolver so a tag, alias, filename, or path all work.
+    const resolved = findModel(modelArg);
+    if (!resolved) {
+      console.error(`Model not found: '${modelArg}'`);
+      console.error(`  List local models: hipfire list    |    pull one: hipfire pull ${modelArg}`);
+      process.exit(1);
+    }
+    // serve()'s pre-warm does findModel(HIPFIRE_MODEL) again; pass the tag so
+    // per-model config still resolves (findModel handles a path too).
+    process.env.HIPFIRE_MODEL = modelArg;
+  }
+  host = host ?? cfg.host;
+  port = port ?? cfg.port;
+
+  if (detach) {
+    // Refuse to start a second one.
+    const existing = readServePid();
+    if (existing) {
+      console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
+      console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
+      process.exit(1);
+    }
+    // Fork a detached child. `setsid` gives it its own session so Ctrl-C in the
+    // parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout + stderr go
+    // to the log file. HIPFIRE_DETACHED prevents infinite forking. The child
+    // re-runs `serve host port`; all passthrough flags ride along as env vars.
+    const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"];
+    const self = process.argv[0];
+    const script = process.argv[1];
+    const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
+    const childArgs = ["serve", host, String(port)];
+    const child = Bun.spawn([...runBg, self, script, ...childArgs], {
+      stdin: "ignore",
+      stdout: logFd,
+      stderr: logFd,
+      env: { ...process.env, HIPFIRE_DETACHED: "1" },
+    });
+    child.unref();
+    // Poll until /health is reachable. First-run kernel JIT on slower hardware
+    // (APUs, gfx1013) can take well over a minute for a 9B model, so give it a
+    // generous window. Subsequent starts hit the kernel cache (seconds).
+    const READINESS_TIMEOUT_MS = 300_000;   // 5 minutes
+    const startTime = Date.now();           // FIXED start for true elapsed
+    const deadline = startTime + READINESS_TIMEOUT_MS;
+    console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
+    let nextProgressAt = 30;                // seconds
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+      if (await isServeUp(port, host)) break;
+      // Progress every ~30s, computed off the FIXED start (not the deadline).
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      if (elapsed >= nextProgressAt) {
+        process.stderr.write(`  ...still starting (${elapsed}s elapsed — tail ${SERVE_LOG_FILE} to watch)\r`);
+        nextProgressAt += 30;
+      }
+    }
+    if (await isServeUp(port, host)) {
+      const bind = formatServeBind(host, port);
+      console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
+      console.log(`  log:  ${SERVE_LOG_FILE}`);
+      console.log(`  stop: hipfire stop`);
+    } else {
+      console.error(`Serve started (PID ${child.pid}) but /health did not respond within ${READINESS_TIMEOUT_MS / 1000}s.`);
+      console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
+    }
+    return;
+  }
+  await serve(port, host);
 }
 
 // ─── Quantize ───────────────────────────────────────────
@@ -5901,169 +6192,118 @@ refreshModelsCatalog();
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "serve": {
-    // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
-    // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
-    let port: number | null = null;
-    let host: string | null = null;
-    let detach = false;
-    const setPort = (raw: string) => {
-      const n = parseInt(raw, 10);
-      if (!Number.isInteger(n) || n < 1 || n > 65535) {
-        console.error(`Invalid serve port: ${raw}`);
-        process.exit(1);
-      }
-      if (port !== null && port !== n) {
-        console.error(`Serve port specified more than once: ${port} and ${n}`);
-        process.exit(1);
-      }
-      port = n;
-    };
-    const setHost = (raw: string) => {
-      if (!raw) {
-        console.error("Serve host cannot be empty");
-        process.exit(1);
-      }
-      if (host !== null && host !== raw) {
-        console.error(`Serve host specified more than once: ${host} and ${raw}`);
-        process.exit(1);
-      }
-      host = raw;
-    };
-    // Expert-parallel degree for `hipfire serve --tp N` (or `--tp=N`). Sets
-    // HIPFIRE_TP, which buildLoadMessage forwards as params.tp so the daemon
-    // loads via load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
-    let tpPending = false;
-    const setTp = (raw: string) => {
-      const n = parseInt(raw, 10);
-      if (!Number.isInteger(n) || n < 1 || n > 64) {
-        console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
-        process.exit(1);
-      }
-      process.env.HIPFIRE_TP = String(n);
-    };
-    for (const a of rest) {
-      if (tpPending) { setTp(a); tpPending = false; continue; }
-      if (a === "--tp") { tpPending = true; continue; }
-      else if (a.startsWith("--tp=")) setTp(a.slice(5));
-      else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
-      else if (/^\d+$/.test(a)) setPort(a);
-      else if (/^\[[^\]]+\]:\d+$/.test(a)) {
-        const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
-        setHost(m[1]);
-        setPort(m[2]);
-      }
-      else if (/^[^:]+:\d+$/.test(a)) {
-        const idx = a.lastIndexOf(":");
-        setHost(a.slice(0, idx));
-        setPort(a.slice(idx + 1));
-      }
-      else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [host] [port] [-d|--detach] [--tp N]\n\n`
-          + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
-          + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
-          + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
-          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
-          + `  --tp N         Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N visible GPUs)\n\n`
-          + `Background daemon:\n`
-          + `  hipfire serve -d           # start in background\n`
-          + `  hipfire serve 0.0.0.0:11435 -d\n`
-          + `  hipfire stop               # kill it\n`
-          + `  hipfire ps                 # check if running\n`
-          + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
-        process.exit(0);
-      }
-      // Model-tag-as-host guard: `hipfire serve qwen3.5:9b` used to silently
-      // bind to host "qwen3.5:9b" and fail later. A name:tag shape with a
-      // non-numeric port part (host:port matched above) — or anything that
-      // resolves in the registry — is a model tag, not a bind address.
-      else if (REGISTRY[resolveModelTag(a)] || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
-        console.error(`'${a}' looks like a model tag — \`hipfire serve\` takes [host] [port], not a model.`);
-        console.error(`The server loads models per-request (or pre-warms cfg.default_model). Instead:`);
-        console.error(`  hipfire run ${a} "hello"                # one-shot (uses running serve if any)`);
-        console.error(`  hipfire config set default_model ${a}   # make serve pre-warm this model`);
-        console.error(`  hipfire serve [host] [port]`);
-        process.exit(1);
-      }
-      else setHost(a);
+    await runServe(rest.slice());
+    break;
+  }
+  case "restart": {
+    // Stop the tracked serve (force-reap orphans + free port), then start it
+    // again with the SAME passthrough flags. Reuses the serve start path so the
+    // /health readiness poll behaves identically.
+    const args = rest.slice();
+    if (takeFlag(args, "-h", "--help")) {
+      console.error(`Usage: hipfire restart [host] [port] [-d|--detach] [serve flags...]\n\n`
+        + `Stops the running serve (force-reaps orphan daemon procs + frees the\n`
+        + `port, like \`hipfire stop --force\`) then starts a fresh one with the\n`
+        + `given flags. Accepts every \`hipfire serve\` flag:\n\n`
+        + `  --kv-mode <m>        KV cache mode for this run (q8, asym4, ...)\n`
+        + `  --idle-timeout <s>   Idle-unload timeout in seconds (0 = never)\n`
+        + `  --no-prewarm         Skip pre-warm; load model lazily on first request\n`
+        + `  --tp N               Expert-parallel across N GPUs\n`
+        + `  -d, --detach         Run in background\n\n`
+        + `Examples:\n`
+        + `  hipfire restart -d\n`
+        + `  hipfire restart 0.0.0.0:11435 --kv-mode q8 -d\n`);
+      process.exit(0);
     }
-    host = host ?? cfg.host;
-    port = port ?? cfg.port;
-
-    if (detach) {
-      // Refuse to start a second one.
-      const existing = readServePid();
-      if (existing) {
-        console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
-        console.error(`  Stop it: hipfire stop`);
-        process.exit(1);
-      }
-      // Fork a detached child. `setsid` gives it its own session so Ctrl-C
-      // in the parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout
-      // + stderr go to the log file. HIPFIRE_DETACHED prevents infinite forking.
-      const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"]
-      const self = process.argv[0];
-      const script = process.argv[1];
-      const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const childArgs = ["serve", host, String(port)];
-      const child = Bun.spawn([...runBg, self, script, ...childArgs], {
-        stdin: "ignore",
-        stdout: logFd,
-        stderr: logFd,
-        env: { ...process.env, HIPFIRE_DETACHED: "1" },
-      });
-      child.unref();
-      // Poll until /health is reachable. First-run kernel JIT on slower
-      // hardware (APUs, gfx1013) can take well over a minute for a 9B model,
-      // so give it a generous window. Subsequent starts hit the kernel cache
-      // and return in seconds.
-      const READINESS_TIMEOUT_MS = 300_000;   // 5 minutes
-      const deadline = Date.now() + READINESS_TIMEOUT_MS;
-      console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 500));
-        if (await isServeUp(port, host)) break;
-        // Show progress every 30s
-        const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
-        if (elapsed > 0 && elapsed % 30 === 0) {
-          process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
+    // Resolve the port the same way serve does so we free/poll the right one.
+    let restartPort = cfg.port;
+    for (const a of args) {
+      if (/^\d+$/.test(a)) { const n = parseInt(a, 10); if (n >= 1 && n <= 65535) restartPort = n; }
+      else if (/^\[[^\]]+\]:\d+$/.test(a)) restartPort = parseInt(a.match(/:(\d+)$/)![1], 10);
+      else if (/^[^:]+:\d+$/.test(a)) restartPort = parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
+    }
+    // Graceful stop of the tracked pid first (mirrors `hipfire stop`).
+    const tracked = readServePid();
+    if (tracked) {
+      try {
+        process.kill(tracked, "SIGTERM");
+        for (let i = 0; i < 50; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          if (!isPidAlive(tracked)) break;
         }
+        if (isPidAlive(tracked)) { try { process.kill(tracked, "SIGKILL"); } catch {} }
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+        console.error(`[restart] stopped serve (PID ${tracked})`);
+      } catch (err: any) {
+        console.error(`[restart] failed to stop tracked PID ${tracked}: ${err?.message ?? err}`);
       }
-      if (await isServeUp(port, host)) {
-        const bind = formatServeBind(host, port);
-        console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
-        console.log(`  log:  ${SERVE_LOG_FILE}`);
-        console.log(`  stop: hipfire stop`);
-      } else {
-        console.error(`Serve started (PID ${child.pid}) but /health did not respond within ${READINESS_TIMEOUT_MS / 1000}s.`);
-        console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
-      }
-      break;
     }
-    await serve(port, host);
+    // Force-reap any orphans + free the port so the new serve binds cleanly.
+    for (const line of reapOrphans(restartPort, false)) console.error(`[restart] ${line}`);
+    // Brief settle so the port leaves TIME_WAIT/closing before rebind.
+    await new Promise(r => setTimeout(r, 500));
+    console.error(`[restart] starting serve...`);
+    await runServe(args);
     break;
   }
   case "stop": {
+    const stopArgs = rest.slice();
+    if (takeFlag(stopArgs, "-h", "--help")) {
+      console.error(`Usage: hipfire stop [port] [--force] [--all]\n\n`
+        + `Stops the tracked background serve (the PID in ${SERVE_PID_FILE}).\n\n`
+        + `  [port]     Port to free when --force/--all is given (default: cfg.port = ${cfg.port})\n`
+        + `  --force    Beyond the tracked PID, reap ORPHAN daemon procs\n`
+        + `             (\`pkill -x daemon\`) and free the port (\`fuser -k <port>/tcp\`)\n`
+        + `  --all      Like --force, and also reap orphan quantize procs\n\n`
+        + `Plain \`hipfire stop\` only touches the tracked PID. Use --force when a\n`
+        + `stale daemon holds VRAM or the port after a crash (\"port in use\").\n`);
+      process.exit(0);
+    }
+    const force = takeFlag(stopArgs, "--force");
+    const all = takeFlag(stopArgs, "--all");
+    // Optional positional port (used only by the force/all reap).
+    let stopPort = cfg.port;
+    for (const a of stopArgs) {
+      if (/^\d+$/.test(a)) {
+        const n = parseInt(a, 10);
+        if (n >= 1 && n <= 65535) stopPort = n;
+        else { console.error(`Invalid stop port: ${a}`); process.exit(1); }
+      } else {
+        console.error(`Unknown stop argument: ${a} (expected [port] [--force] [--all])`);
+        process.exit(1);
+      }
+    }
+
     const pid = readServePid();
-    if (!pid) {
+    if (pid) {
+      try {
+        process.kill(pid, "SIGTERM");
+        // Wait up to 5s for graceful shutdown
+        for (let i = 0; i < 50; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          if (!isPidAlive(pid)) break;
+        }
+        if (isPidAlive(pid)) {
+          console.error(`PID ${pid} did not exit within 5s — sending SIGKILL`);
+          try { process.kill(pid, "SIGKILL"); } catch {}
+        }
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+        console.log(`hipfire serve stopped (PID ${pid})`);
+      } catch (err: any) {
+        console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
+        if (!(force || all)) process.exit(1);
+      }
+    } else if (!(force || all)) {
       console.log("hipfire serve is not running.");
       break;
+    } else {
+      console.log("No tracked serve PID; reaping orphans...");
     }
-    try {
-      process.kill(pid, "SIGTERM");
-      // Wait up to 5s for graceful shutdown
-      for (let i = 0; i < 50; i++) {
-        await new Promise(r => setTimeout(r, 100));
-        if (!isPidAlive(pid)) break;
-      }
-      if (isPidAlive(pid)) {
-        console.error(`PID ${pid} did not exit within 5s — sending SIGKILL`);
-        try { process.kill(pid, "SIGKILL"); } catch {}
-      }
-      try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
-      console.log(`hipfire serve stopped (PID ${pid})`);
-    } catch (err: any) {
-      console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
-      process.exit(1);
+
+    // --force / --all: reap orphan daemon (and, with --all, quantize) procs and
+    // free the port, per scripts/serve-restart.sh. Plain `stop` skips this.
+    if (force || all) {
+      for (const line of reapOrphans(stopPort, all)) console.log(`  ${line}`);
     }
     break;
   }
