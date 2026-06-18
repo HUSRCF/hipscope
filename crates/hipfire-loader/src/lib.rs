@@ -56,11 +56,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Qwen35Carrier,
     &LlamaCarrier,
     &DotsOcrCarrier,
-    &HfqCarrier {
-        arch_id: 9,
-        name: "deepseek4",
-        load: load_deepseek4,
-    },
+    &Deepseek4Carrier,
     &MinimaxCarrier,
     &HfqCarrier {
         arch_id: 11,
@@ -809,48 +805,6 @@ pub fn load_model(
         "pp>1 LoadedModel missing pp_gpus"
     );
     Ok(result)
-}
-
-fn load_deepseek4(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::arch::Architecture;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = deepseek4::DeepseekV4State::new(&config)?;
-    let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024);
-    let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
-    let eos_tok: u32 = {
-        let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
-        if ids.len() == 1 {
-            ids[0]
-        } else {
-            1
-        }
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        deepseek4_config: Some(config),
-        deepseek4_weights: Some(weights),
-        deepseek4_state: Some(state),
-        deepseek4_pbs: Some(pbs),
-        deepseek4_eos_tok: eos_tok,
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
 }
 
 fn load_lfm2moe(

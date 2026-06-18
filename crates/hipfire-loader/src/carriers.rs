@@ -573,6 +573,66 @@ impl Carrier for DotsOcrCarrier {
     }
 }
 
+// ─── Deepseek4Carrier ────────────────────────────────────────────────
+
+pub struct Deepseek4Carrier;
+impl Carrier for Deepseek4Carrier {
+    fn name(&self) -> &'static str {
+        "deepseek4"
+    }
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 9
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("deepseek4: pipeline-parallel (pp>1) unsupported".into());
+        }
+        let ModelSource::Hfq(_) = &src else {
+            return Err("deepseek4: directory source unsupported".into());
+        };
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let ModelSource::Hfq(mut hfq) = src else {
+            unreachable!()
+        };
+
+        use hipfire_arch_deepseek4 as deepseek4;
+        use hipfire_runtime::arch::Architecture;
+        let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+        let weights =
+            <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+        let state = deepseek4::DeepseekV4State::new(&config)?;
+        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let pbs =
+            deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
+        let eos_tok: u32 = {
+            let ids = meta.tokenizer.encode("<｜end▁of▁sentence｜>");
+            if ids.len() == 1 {
+                ids[0]
+            } else {
+                1
+            }
+        };
+        Ok(LoadedModel {
+            deepseek4_config: Some(config),
+            deepseek4_weights: Some(weights),
+            deepseek4_state: Some(state),
+            deepseek4_pbs: Some(pbs),
+            deepseek4_eos_tok: eos_tok,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 // ─── MinimaxCarrier ──────────────────────────────────────────────────
 
 pub struct MinimaxCarrier;
