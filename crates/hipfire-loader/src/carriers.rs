@@ -75,24 +75,20 @@ impl Carrier for Qwen2Carrier {
         if ctx.pp > 1 {
             return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
         }
-        let ModelSource::Hfq(hfq) = &src else {
+        let ModelSource::Hfq(_) = &src else {
             return Err("qwen2: directory source unsupported".into());
         };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-        let chat_template = resolve_chat_template(hfq, ctx.path);
-        let arch_id = hfq.arch_id;
+        let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
             ..LoadedModel::skeleton(
-                arch_id,
-                tokenizer,
+                meta.arch_id,
+                meta.tokenizer,
                 ctx.max_seq,
                 ctx.max_seq,
                 ctx.path.to_string(),
-                chat_template,
+                meta.chat_template,
             )
         })
     }
