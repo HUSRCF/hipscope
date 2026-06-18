@@ -7728,22 +7728,42 @@ pub fn sample_full_dist(
         return 0;
     }
     let top_p = top_p.clamp(0.0, 1.0);
+    // FIX #3: the request parser only filters `min_p > 0`, so a request can
+    // smuggle in min_p > 1.0 (which would `retain` an empty candidate set and
+    // panic on `cand[0]` below) or a negative min_p. Clamp at fn entry to the
+    // valid [0,1] probability-ratio range; min_p == 0 is the happy path (no cut).
+    let min_p = min_p.map(|mp| if mp.is_finite() { mp.clamp(0.0, 1.0) } else { 0.0 });
     let inv_temp = 1.0 / temperature;
 
     // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
+    // FIX #4: only finite logits feed the max; a NaN/Inf logit must not become
+    // `max_logit` (an Inf max would push every `(l - max)` to -Inf → all-zero
+    // probs → degenerate fallback even when finite tokens existed).
     let mut max_logit = f32::NEG_INFINITY;
     for &l in logits {
-        if l > max_logit {
+        if l.is_finite() && l > max_logit {
             max_logit = l;
         }
     }
 
-    // Materialize (idx, prob) with temperature-scaled softmax numerators. A
-    // NaN logit yields a NaN exp; `>`-based comparisons below drop it, so it
-    // can never be selected (parity with the greedy argmax NaN guard).
+    // Materialize (idx, prob) with temperature-scaled softmax numerators.
+    // FIX #4: a non-finite logit (NaN/Inf) yields a non-finite prob that would
+    // poison `total` (NaN total → degenerate argmax fallback, silently dropping
+    // the whole finite distribution). Zero out the prob of any non-finite logit
+    // (and of any non-finite computed prob) so finite tokens still get sampled.
+    // A zeroed prob can never be selected, matching the greedy argmax NaN guard.
     let mut cand: Vec<(u32, f32)> = Vec::with_capacity(n);
     for (i, &l) in logits.iter().enumerate() {
-        let p = ((l - max_logit) * inv_temp).exp();
+        let p = if l.is_finite() {
+            let pp = ((l - max_logit) * inv_temp).exp();
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         cand.push((i as u32, p));
     }
 
@@ -7754,6 +7774,12 @@ pub fn sample_full_dist(
     });
 
     // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
+    // FINDING #2 (intentional, do NOT "fix" by adding a default cap):
+    // `top_k == None` means NO top-k cap — the full sorted distribution is
+    // retained. This deliberately differs from the GPU sampler's gather-pool
+    // cap (which always pre-trims to a fixed candidate pool). For ds4 the card
+    // mandates temp=1.0 / top_p=1.0 / (no top_k), i.e. sampling from the full
+    // distribution; capping here would be LESS faithful to that card, not more.
     if let Some(k) = top_k {
         let k = k as usize;
         if k > 0 && k < cand.len() {
@@ -7761,21 +7787,39 @@ pub fn sample_full_dist(
         }
     }
 
-    // Total mass over the (possibly k-truncated) candidate set.
-    let total: f32 = cand.iter().map(|c| c.1).sum();
-    if total <= 0.0 || !total.is_finite() {
-        // Degenerate (all -inf / NaN) — fall back to argmax of raw logits.
+    // Degenerate guard over the (possibly k-truncated) set: if no finite mass
+    // survives (all -inf / all non-finite logits zeroed by FIX #4), fall back
+    // to argmax of the raw logits (which has its own NaN guard).
+    let pre_minp_total: f32 = cand.iter().map(|c| c.1).sum();
+    if pre_minp_total <= 0.0 || !pre_minp_total.is_finite() {
         return argmax(logits);
     }
 
     // min_p: drop candidates whose prob is below `min_p * p_max` (the highest
     // prob is cand[0] after the descending sort). Applied before nucleus.
+    // FIX #3: never let the retain empty the set — if the floor would drop
+    // everything (it can't here since cand[0] always passes `>= mp*cand[0]`
+    // for mp <= 1, but keep the invariant explicit and robust to fp edge
+    // cases), restore the single highest-prob candidate so `cand[0]` is safe.
     if let Some(mp) = min_p {
         if mp > 0.0 {
-            let p_max = cand[0].1;
-            let floor = mp * p_max;
+            let top = cand[0];
+            let floor = mp * top.1;
             cand.retain(|c| c.1 >= floor);
+            if cand.is_empty() {
+                cand.push(top);
+            }
         }
+    }
+
+    // FIX #1: recompute the nucleus mass AFTER the min_p filter, over the final
+    // retained set, so `p_thresh = top_p * (post-min_p mass)`. Summing the mass
+    // before min_p (the old behavior) made the cumulative threshold too large
+    // relative to the surviving probabilities, over-keeping the tail — and
+    // diverging from the GPU sampler's cap-before-sum semantics.
+    let total: f32 = cand.iter().map(|c| c.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return cand[0].0;
     }
 
     // top_p (nucleus): keep the smallest prefix whose cumulative mass reaches
@@ -8033,6 +8077,14 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The CPU sampler RNG (`SAMPLER_STATE`) is a process-global atomic shared by
+    // every test. Tests that reset+draw from it must not interleave with each
+    // other (a concurrent `simple_rand` from a sibling test would mutate the
+    // state between a reset and the draw, breaking determinism). Serialize all
+    // RNG-touching `sample_full_dist` tests behind this mutex.
+    static RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // hunt3 M-B (FinalFix): greedy argmax must drop NaN like the GPU kernel
     // (argmax.hip `data[i] > lmax`), never selecting a NaN-indexed token and
@@ -8055,6 +8107,108 @@ mod tests {
     fn argmax_finite_unaffected() {
         let logits = [0.1f32, 0.2, 0.9, 0.3];
         assert_eq!(argmax(&logits), 2);
+    }
+
+    // O1 fix-wave: edge-case guards for the host EP sampler `sample_full_dist`.
+    // All run CPU-only; they seed the shared RNG via `reset_cpu_sampler_rng`
+    // so the multinomial draw is deterministic.
+
+    #[test]
+    fn sample_full_dist_min_p_gt_one_no_panic() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3: min_p = 1.5 would empty the candidate set and panic on cand[0]
+        // before the clamp. After the clamp + keep-at-least-one guard it must
+        // return a valid in-range index without panicking.
+        reset_cpu_sampler_rng(12345);
+        let logits = [0.5f32, 2.0, 1.0, 0.1, 3.0];
+        let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(1.5));
+        assert!(
+            (idx as usize) < logits.len(),
+            "min_p>1 must still return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn sample_full_dist_min_p_filters_low_prob() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3 / general: min_p = 0.5 with a sharply peaked distribution must
+        // drop the low-prob tails. With temp=1.0 the dominant logit (idx 1 at
+        // 10.0) has prob ~1.0; min_p*p_max ~0.5 prunes everything else, so the
+        // draw can only return idx 1 regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [0.0f32, 10.0, 0.1, 0.2, 0.05];
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.5));
+            assert_eq!(idx, 1, "min_p=0.5 should leave only the peak (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn sample_full_dist_nan_logit_samples_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #4: a NaN logit must not poison `total` and force a silent greedy
+        // fallback / NaN-indexed token. The NaN index (3) must never be drawn,
+        // and the returned token must be a finite-logit index.
+        reset_cpu_sampler_rng(424242);
+        let logits = [1.0f32, 2.0, 0.5, f32::NAN, 1.5];
+        for _ in 0..64 {
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, None);
+            assert_ne!(idx, 3, "NaN-indexed token must never be selected");
+            assert!(
+                (idx as usize) < logits.len() && logits[idx as usize].is_finite(),
+                "must sample a finite-logit token, got idx {idx}"
+            );
+        }
+        // Also with +Inf present: must still pick a finite token, not the Inf.
+        reset_cpu_sampler_rng(424242);
+        let logits2 = [1.0f32, f32::INFINITY, 0.5, 2.0];
+        let idx2 = sample_full_dist(&logits2, 1.0, 1.0, None, None);
+        assert_ne!(idx2, 1, "Inf-indexed token must never be selected");
+        assert!(logits2[idx2 as usize].is_finite());
+    }
+
+    #[test]
+    fn sample_full_dist_happy_path_min_p_zero() {
+        // HAPPY PATH (the 3 cards): min_p = 0.0 with both top_k=None (full dist,
+        // ds4 card) and top_k=40, plus temp/top_p, must return a valid in-range
+        // index. The fixes are guarded on min_p>0 / non-finite / min_p>1, none
+        // of which trigger here, so behavior is unchanged.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        for &top_k in &[None, Some(40u32)] {
+            for seed in [1u32, 2, 3, 42] {
+                reset_cpu_sampler_rng(seed);
+                let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+                let idx = sample_full_dist(&logits, 1.0, 1.0, top_k, Some(0.0));
+                assert!(
+                    (idx as usize) < logits.len(),
+                    "happy path must return in-range idx (top_k={top_k:?}, seed {seed})"
+                );
+            }
+        }
+        // min_p = None (the other happy-path encoding) must also be in-range.
+        reset_cpu_sampler_rng(7);
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9];
+        let idx = sample_full_dist(&logits, 0.8, 0.95, Some(40), None);
+        assert!((idx as usize) < logits.len());
+    }
+
+    #[test]
+    fn sample_full_dist_fixed_seed_deterministic() {
+        // Determinism under a fixed seed (the daemon's `reset_cpu_sampler_rng`
+        // contract): two back-to-back resets to the same seed must produce the
+        // same token. The shared `SAMPLER_STATE` is a process-global atomic, so
+        // we serialize the two calls inside a single test (no other test runs
+        // between them in THIS function) — the standalone single-threaded proof
+        // of determinism is racy only across parallel tests, never within one.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+        for seed in [1u32, 2, 3, 42] {
+            reset_cpu_sampler_rng(seed);
+            let a = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            reset_cpu_sampler_rng(seed);
+            let b = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            assert_eq!(a, b, "fixed seed must be deterministic (seed {seed})");
+        }
     }
 
     #[test]
