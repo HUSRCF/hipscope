@@ -172,6 +172,25 @@ export interface HipfireConfig {
   // ── MTP speculative decode ──────────────────────────────
   mtp_mode: string;      // "off" | "on" | "auto"
   mtp_k: number;         // draft tokens per spec-decode window
+
+  // ── Chat-template overrides ───────────────────────────────────────────
+  // Lift the two env-only chat-template knobs (HIPFIRE_CHAT_TEMPLATE_FILE,
+  // HIPFIRE_DEFAULT_CHATML) onto the config surface so they can be set/edited
+  // via `hipfire config` + the TUI without exporting shell env.
+  //
+  // `chat_template`: path to a `.j2`/`.jinja` chat template. Empty = unset
+  // (engine resolves model/bundled/embedded as usual). When set, projects to
+  // HIPFIRE_CHAT_TEMPLATE_FILE. NOTE the froggeric pillar: for qwen3* models a
+  // set template overrides the arch-bundled froggeric pillar, which the daemon
+  // flags with an intentional "[chat_template] WARNING: ... overriding the
+  // qwen3 froggeric pillar" message — that warning is correct and is not
+  // suppressed here.
+  chat_template: string;
+  // `default_chatml`: whether the never-bare ChatML fallback applies when no
+  // template resolves. true (default) keeps the fallback; false projects to
+  // HIPFIRE_DEFAULT_CHATML=0 (Plain-only framing). The env var is only
+  // load-bearing at value "0", so we only set it when false.
+  default_chatml: boolean;
 }
 
 // Detect GPU at import time for smart defaults
@@ -250,6 +269,9 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_sparse_threshold: 32768,
   mtp_mode: "auto",
   mtp_k: 3,
+  // Chat-template overrides. Empty/true = engine defaults (no env projected).
+  chat_template: "",
+  default_chatml: true,
 };
 
 const KV_ADAPTIVE_OPTIONS = [
@@ -319,6 +341,15 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     case "mtp_mode": return ["off", "on", "auto"].includes(value);
     case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    // chat_template: empty (unset) OR a path that exists + is readable. Tilde
+    // is expanded for the existence check so `~/templates/x.j2` validates.
+    case "chat_template": {
+      if (typeof value !== "string") return false;
+      if (value.length === 0) return true;
+      const p = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+      try { return existsSync(p) && statSync(p).isFile(); } catch { return false; }
+    }
+    case "default_chatml": return typeof value === "boolean";
     default: return false;
   }
 }
@@ -1036,6 +1067,24 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   }
   process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
   process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
+  // Chat-template overrides. Shell env wins over config (don't clobber an
+  // explicitly-exported HIPFIRE_CHAT_TEMPLATE_FILE / HIPFIRE_DEFAULT_CHATML).
+  // chat_template: project the path only when set; empty config = leave the
+  // engine's model/bundled/embedded resolution untouched. For qwen3* targets
+  // a set template makes the daemon emit its intentional froggeric pillar-
+  // shadow WARNING — that is the correct, expected behavior (not suppressed).
+  if (!process.env.HIPFIRE_CHAT_TEMPLATE_FILE && cfg.chat_template && cfg.chat_template.length > 0) {
+    const p = cfg.chat_template.startsWith("~/")
+      ? join(homedir(), cfg.chat_template.slice(2))
+      : cfg.chat_template;
+    process.env.HIPFIRE_CHAT_TEMPLATE_FILE = p;
+  }
+  // default_chatml: the daemon's HIPFIRE_DEFAULT_CHATML is only load-bearing
+  // at value "0" (disables the never-bare ChatML fallback). Project "0" only
+  // when the config opts out AND the shell hasn't already set the var.
+  if (!process.env.HIPFIRE_DEFAULT_CHATML && cfg.default_chatml === false) {
+    process.env.HIPFIRE_DEFAULT_CHATML = "0";
+  }
 }
 
 // ─── Background serve lifecycle ─────────────────────────
@@ -5606,6 +5655,15 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "mtp_k",
       desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
       range: [1, 10], step: 1,
+    },
+    chat_template: {
+      label: "chat_template",
+      desc: "Path to a .j2/.jinja chat template → HIPFIRE_CHAT_TEMPLATE_FILE. Empty = engine default (model/bundled/embedded). For qwen3* a set path overrides the froggeric pillar (daemon warns, intentionally).",
+    },
+    default_chatml: {
+      label: "default_chatml",
+      desc: "Never-bare ChatML fallback when no template resolves. true = keep fallback; false = HIPFIRE_DEFAULT_CHATML=0 (Plain-only framing).",
+      options: ["true", "false"],
     },
   };
 
