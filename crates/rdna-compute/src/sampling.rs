@@ -140,7 +140,7 @@ impl Gpu {
         // to the pre-PF kernel, which had `if (repeat_penalty > 1.0f)`).
         self.sample_top_p_pf(
             logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
-            rng_state, repeat_window, repeat_penalty, 0.0, 0.0,
+            rng_state, repeat_window, repeat_penalty, 0.0, 0.0, None, None,
         )
     }
 
@@ -164,8 +164,14 @@ impl Gpu {
         repeat_penalty: f32,
         presence_penalty: f32,
         frequency_penalty: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
     ) -> HipResult<(u32, u32)> {
         self.bind_thread()?;
+        // Request-driven candidate caps. None preserves legacy behavior exactly:
+        // top_k → 20 (== kernel TOP_K, no cut), min_p → 0.0 (disabled).
+        let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
+        let min_p_val = min_p.unwrap_or(0.0);
         // Multi-workgroup parallel sampler (default ON): splits the 150K-vocab
         // top-K scan across N blocks instead of the single-block kernel that
         // idles 95 of 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-
@@ -174,6 +180,7 @@ impl Gpu {
             return self.sample_top_p_parallel_impl(
                 logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
                 rng_state, repeat_window, repeat_penalty, presence_penalty, frequency_penalty,
+                top_k_req, min_p_val,
             );
         }
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
@@ -190,6 +197,8 @@ impl Gpu {
         let mut rp = repeat_penalty;
         let mut pp = presence_penalty;
         let mut fp = frequency_penalty;
+        let mut tk = top_k_req;
+        let mut mp = min_p_val;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -203,6 +212,8 @@ impl Gpu {
             &mut rp as *mut _ as *mut std::ffi::c_void,
             &mut pp as *mut _ as *mut std::ffi::c_void,
             &mut fp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
+            &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
@@ -248,6 +259,8 @@ impl Gpu {
         repeat_penalty: f32,
         presence_penalty: f32,
         frequency_penalty: f32,
+        top_k_req: i32,
+        min_p_val: f32,
     ) -> HipResult<(u32, u32)> {
         const N_BLOCKS: u32 = 128;
         const TOP_K: usize = 20;
@@ -282,6 +295,8 @@ impl Gpu {
         let mut fp = frequency_penalty;
         let mut pval = partial_val_ptr;
         let mut pidx = partial_idx_ptr;
+        let mut tk = top_k_req;
+        let mut mp = min_p_val;
 
         let any_penalty =
             repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
@@ -328,6 +343,8 @@ impl Gpu {
                 &mut temp as *mut _ as *mut c_void,
                 &mut tp as *mut _ as *mut c_void,
                 &mut rng as *mut _ as *mut c_void,
+                &mut tk as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void,
             ];
             let func = &self.functions["sample_topk_finalize"];
             unsafe {
@@ -371,6 +388,9 @@ impl Gpu {
         // Graph-capture path does not expose presence/frequency penalties.
         let mut pp = 0.0f32;
         let mut fp = 0.0f32;
+        // Graph-capture path uses legacy candidate caps (no cut, min_p off).
+        let mut tk = 20i32;
+        let mut mp = 0.0f32;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -384,6 +404,8 @@ impl Gpu {
             &mut rp as *mut _ as *mut std::ffi::c_void,
             &mut pp as *mut _ as *mut std::ffi::c_void,
             &mut fp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
+            &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;

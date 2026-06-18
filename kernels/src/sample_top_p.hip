@@ -33,7 +33,9 @@ extern "C" __global__ void sample_top_p(
     int repeat_window,
     float repeat_penalty,
     float presence_penalty,                         // OpenAI: flat logit subtraction for any token seen in window
-    float frequency_penalty                         // OpenAI: logit subtraction scaled by occurrence count
+    float frequency_penalty,                        // OpenAI: logit subtraction scaled by occurrence count
+    int   top_k_req,                                // request top-K cutoff; <=0 or >=TOP_K means "no extra cut" (default 20 → byte-identical to legacy)
+    float min_p                                     // request min-p cutoff; 0.0 disables (byte-identical to legacy)
 ) {
     const int TOP_K = 20;
     extern __shared__ char smem[];
@@ -203,11 +205,33 @@ extern "C" __global__ void sample_top_p(
         unsigned int rng = rand_seed;
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 
+        // Request-driven candidate cap (applied to the sorted order BEFORE
+        // top-p). Two cuts, both no-ops at their defaults so the legacy path
+        // is byte-identical:
+        //   - top_k_req: keep at most this many candidates. <=0 or >=TOP_K
+        //     means "no cut" (legacy default 20 == TOP_K).
+        //   - min_p: drop candidates whose prob < min_p * max_prob. The sort
+        //     above is descending, so order[0] holds the max prob; we scan
+        //     until a candidate falls below the floor. 0.0 disables.
+        int cap = TOP_K;
+        if (top_k_req > 0 && top_k_req < TOP_K) cap = top_k_req;
+        if (min_p > 0.0f) {
+            float floor_p = min_p * probs[order[0]];
+            int mp_cap = cap;
+            for (int i = 1; i < cap; i++) {
+                if (probs[order[i]] < floor_p) { mp_cap = i; break; }
+            }
+            cap = mp_cap;
+        }
+        if (cap < 1) cap = 1;
+
         // Top-p filtering: find cutoff where cumulative mass reaches top_p * sum.
+        // The cumulative mass denominator is the FULL softmax sum (unchanged
+        // from legacy); the candidate cap only limits how far we may truncate.
         float p_thresh = top_p * sum;
         float trunc_sum = 0.0f;
-        int trunc_k = TOP_K;
-        for (int i = 0; i < TOP_K; i++) {
+        int trunc_k = cap;
+        for (int i = 0; i < cap; i++) {
             trunc_sum += probs[order[i]];
             if (trunc_sum >= p_thresh) { trunc_k = i + 1; break; }
         }

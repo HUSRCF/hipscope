@@ -1324,19 +1324,16 @@ struct LoadedModel {
     // are read via SafetensorsSource, not HfqFile, so no baked generation_config
     // accessor — the arch ladder remains the fallback there.
     //
-    // CARRIED-BUT-INERT until P2: the daemon sampler honors temperature/top_p
-    // (and presence_penalty, fed separately). top_k is a COMPILE-TIME constant
-    // in sample_top_p (sampler.rs K=20) and min_p is not implemented, so
-    // rec_top_k / rec_min_p are wired through but DO NOT affect sampling yet.
+    // The daemon sampler honors temperature/top_p (and presence_penalty, fed
+    // separately). As of W7 P2 it ALSO honors top_k / min_p: the generate
+    // handler reads these recommendation fields as the fallback under an
+    // explicit request `top_k` / `min_p` and feeds them into the sampler.
     rec_temperature: Option<f32>,
     rec_top_p: Option<f32>,
-    // CARRIED-BUT-INERT (P2 wires kernel support): the sampler's top-K is a
-    // compile-time constant and min_p is unimplemented, so these two are stored
-    // and resolved through the CLI/registry ladder but never read by the
-    // sampler today. #[allow(dead_code)] until P2 reads them.
-    #[allow(dead_code)]
+    // Read by the generate handler (W7 P2) as the fallback for request top_k /
+    // min_p, then plumbed into SamplerConfig.top_k / .min_p and the
+    // request-driven candidate cap in the sample_top_p kernel.
     rec_top_k: Option<f32>,
-    #[allow(dead_code)]
     rec_min_p: Option<f32>,
     rec_presence_penalty: Option<f32>,
 }
@@ -2347,8 +2344,12 @@ fn main() {
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
                 let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                // Accept HF-style `repetition_penalty` as a request ALIAS for our
+                // `repeat_penalty` field, used only when the canonical key is
+                // absent. (OpenAI/HF clients send `repetition_penalty`.)
                 let repeat_penalty = msg
                     .get("repeat_penalty")
+                    .or_else(|| msg.get("repetition_penalty"))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
@@ -2380,6 +2381,23 @@ fn main() {
                     as f32)
                     .max(0.0);
                 let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                // Request-driven top_k / min_p (W7 P2). Fallback ladder:
+                // explicit request field > .hfq/registry-baked rec_top_k /
+                // rec_min_p > None. None reproduces the legacy sampler exactly
+                // (top-K candidate gather of 20, no min-p cut). top_k <= 0 is
+                // treated as "unset" (None) so 0 never collapses to argmax.
+                let top_k: Option<u32> = msg
+                    .get("top_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|k| k as u32)
+                    .or_else(|| m.rec_top_k.map(|k| k as u32))
+                    .filter(|&k| k > 0);
+                let min_p: Option<f32> = msg
+                    .get("min_p")
+                    .and_then(|v| v.as_f64())
+                    .map(|p| p as f32)
+                    .or(m.rec_min_p)
+                    .filter(|&p| p > 0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -2640,7 +2658,7 @@ fn main() {
                     }
                     generate(
                         m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
                         presence_penalty, frequency_penalty,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         assistant_prefix,
@@ -7672,6 +7690,8 @@ fn generate_multi(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
     max_tokens: usize,
     repeat_penalty: f32,
     _repeat_window: usize,
@@ -8132,6 +8152,8 @@ fn generate_multi(
         presence_penalty,
         frequency_penalty,
         blocked_tokens: blocked0,
+        top_k,
+        min_p,
     };
     // hunt3 M-C: grammar-gated first sample (GPU fast path when matcher free;
     // CPU mask-then-sample when constraining). Matches generate()'s tok0 site.
@@ -8446,6 +8468,8 @@ fn generate_multi(
                     presence_penalty,
                     frequency_penalty,
                     blocked_tokens: blocked,
+                    top_k,
+                    min_p,
                 };
                 // hunt3 M-C: grammar-gated budget-alert resample.
                 next_token = {
@@ -8567,6 +8591,8 @@ fn generate_multi(
             presence_penalty,
             frequency_penalty,
             blocked_tokens: blocked,
+            top_k,
+            min_p,
         };
         // hunt3 M-C: grammar-gated steady-state sample.
         next_token = {
@@ -8664,7 +8690,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: Option<u32>, min_p: Option<f32>, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -8823,7 +8849,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     if m.pp > 1 {
         generate_multi(
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, max_tokens, repeat_penalty, repeat_window,
+            temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
             presence_penalty, frequency_penalty,
             budget_alert_at_tok, budget_alert_text, max_think_tokens,
             assistant_prefix,
@@ -10093,6 +10119,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             presence_penalty,
             frequency_penalty,
             blocked_tokens: blocked0,
+            top_k,
+            min_p,
         };
         // Grammar-gated sample: GPU fast path when the matcher is free
         // (the common case — no tool_call mid-flight); CPU slow path when
@@ -10549,6 +10577,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                         presence_penalty,
                         frequency_penalty,
                         blocked_tokens: blocked,
+                        top_k,
+                        min_p,
                     };
                     next_token = if grammar_active && !grammar_matcher.is_free() {
                         let mut logits = gpu
@@ -10684,6 +10714,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 presence_penalty,
                 frequency_penalty,
                 blocked_tokens: blocked,
+                top_k,
+                min_p,
             };
             // Grammar-gated sample (see setup block + tok0 site above).
             // GPU sample is the fast path; CPU mask-then-sample is the
@@ -13329,6 +13361,10 @@ fn generate_vl(
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
+        // VL path samples on the CPU (sample_cpu), which does not yet honor
+        // top_k / min_p; keep None so behavior is unchanged.
+        top_k: None,
+        min_p: None,
     };
     let vl_cfg = SamplerConfig {
         temperature: temp,
@@ -13338,6 +13374,8 @@ fn generate_vl(
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
+        top_k: None,
+        min_p: None,
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
     let t_prefill = Instant::now();

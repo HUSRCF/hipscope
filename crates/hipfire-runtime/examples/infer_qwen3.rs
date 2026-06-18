@@ -205,6 +205,8 @@ fn main() {
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
+        top_k: None,
+        min_p: None,
     };
     let mut rng_state_u32: u32 = rng_state;
 

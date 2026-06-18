@@ -162,7 +162,9 @@ extern "C" __global__ void sample_topk_finalize(
     unsigned int* __restrict__ result,       // [2]: token_id, rng_state
     float temperature,
     float top_p,
-    unsigned int rand_seed
+    unsigned int rand_seed,
+    int   top_k_req,                         // request top-K cutoff; <=0 or >=TOP_K = no extra cut (default 20 → byte-identical)
+    float min_p                              // request min-p cutoff; 0.0 disables (byte-identical)
 ) {
     extern __shared__ char smem[];
     const int tid = threadIdx.x;
@@ -215,10 +217,25 @@ extern "C" __global__ void sample_topk_finalize(
     unsigned int rng = rand_seed;
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 
+    // Request-driven candidate cap (see sample_top_p.hip for the rationale).
+    // Both cuts are no-ops at their defaults (top_k_req>=TOP_K, min_p==0.0),
+    // so the legacy parallel path stays byte-identical.
+    int cap = TOP_K;
+    if (top_k_req > 0 && top_k_req < TOP_K) cap = top_k_req;
+    if (min_p > 0.0f) {
+        float floor_p = min_p * probs[order[0]];
+        int mp_cap = cap;
+        for (int i = 1; i < cap; i++) {
+            if (probs[order[i]] < floor_p) { mp_cap = i; break; }
+        }
+        cap = mp_cap;
+    }
+    if (cap < 1) cap = 1;
+
     float p_thresh = top_p * sum;
     float trunc_sum = 0.0f;
-    int trunc_k = TOP_K;
-    for (int i = 0; i < TOP_K; i++) {
+    int trunc_k = cap;
+    for (int i = 0; i < cap; i++) {
         trunc_sum += probs[order[i]];
         if (trunc_sum >= p_thresh) { trunc_k = i + 1; break; }
     }
