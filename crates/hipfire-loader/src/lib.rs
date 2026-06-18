@@ -58,11 +58,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &DotsOcrCarrier,
     &Deepseek4Carrier,
     &MinimaxCarrier,
-    &HfqCarrier {
-        arch_id: 11,
-        name: "lfm2moe",
-        load: load_lfm2moe,
-    },
+    &Lfm2MoeCarrier,
     &HfqCarrier {
         arch_id: 12,
         name: "cohere2moe",
@@ -805,50 +801,6 @@ pub fn load_model(
         "pp>1 LoadedModel missing pp_gpus"
     );
     Ok(result)
-}
-
-fn load_lfm2moe(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
-    let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
-    let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
-        .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
-    let eos_tok: u32 = {
-        let try_one = |s: &str| -> Option<u32> {
-            let ids = tokenizer.encode(s);
-            if ids.len() == 1 {
-                Some(ids[0])
-            } else {
-                None
-            }
-        };
-        try_one("<|im_end|>")
-            .or_else(|| try_one("</s>"))
-            .or_else(|| try_one("<|endoftext|>"))
-            .unwrap_or(1)
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        state: Some(ModelState::Lfm2Moe(Lfm2MoeBundle {
-            config,
-            weights,
-            state,
-            eos_tok,
-        })),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
 }
 
 fn load_cohere2moe(

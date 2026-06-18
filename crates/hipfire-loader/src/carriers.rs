@@ -718,3 +718,63 @@ impl Carrier for MinimaxCarrier {
         })
     }
 }
+
+// ─── Lfm2MoeCarrier ──────────────────────────────────────────────────
+
+pub struct Lfm2MoeCarrier;
+impl Carrier for Lfm2MoeCarrier {
+    fn name(&self) -> &'static str {
+        "lfm2moe"
+    }
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 11
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("lfm2moe: pipeline-parallel (pp>1) unsupported".into());
+        }
+        let ModelSource::Hfq(_) = &src else {
+            return Err("lfm2moe: directory source unsupported".into());
+        };
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let ModelSource::Hfq(mut hfq) = src else {
+            unreachable!()
+        };
+
+        use hipfire_arch_lfm2moe as lfm2moe;
+        let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
+        let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
+        let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = meta.tokenizer.encode(s);
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            };
+            try_one("<|im_end|>")
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(1)
+        };
+        Ok(LoadedModel {
+            state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
