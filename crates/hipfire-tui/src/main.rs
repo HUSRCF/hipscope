@@ -179,8 +179,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Char('r') if !chat_capturing => app.reload(),
-        KeyCode::Char('e') if app.tab == app::Tab::Settings => app.settings_easy = true,
-        KeyCode::Char('a') if app.tab == app::Tab::Settings => app.settings_easy = false,
+        KeyCode::Char('e') if app.tab == app::Tab::Settings => app.set_settings_easy(true),
+        KeyCode::Char('a') if app.tab == app::Tab::Settings => app.set_settings_easy(false),
         _ => app.handle_tab_key(key),
     }
 

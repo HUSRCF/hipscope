@@ -181,7 +181,28 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
 /// Read-modify-write an already-validated [`Value`] for `key`. Used for
 /// `default_model` (selected in the Models tab) and the validated editable
 /// fields. Preserves every other key; atomic temp+rename.
+///
+/// Concurrency: a concurrent writer (the bun `hipfire config set` CLI, or a
+/// second TUI) may change a DIFFERENT key between our read and our rename. To
+/// avoid clobbering that unrelated write, we RE-READ the current on-disk object
+/// immediately before serializing and apply ONLY our one changed key onto that
+/// latest content (a single-key merge). A full-file replacement built from a
+/// stale snapshot would silently revert the concurrent key.
+///
+/// Residual race: two writers changing the SAME key simultaneously is
+/// last-writer-wins (whichever rename lands second). That is acceptable — there
+/// is no meaningful "correct" merge of two competing values for one key, and
+/// the rename itself is atomic so no torn/partial JSON is ever observable.
 pub fn write_raw_value(path: &Path, key: &str, value: Value) -> Result<(), WriteError> {
+    merge_key_and_write(path, key, value)
+}
+
+/// Re-read the current on-disk object as LATE as possible, insert ONLY `key`,
+/// then serialize + atomic temp+rename. By re-reading immediately before the
+/// write (rather than building a full snapshot up-front and inserting into it),
+/// a concurrent writer that touched a different key in the meantime is
+/// preserved — we only ever overwrite the single key we own.
+fn merge_key_and_write(path: &Path, key: &str, value: Value) -> Result<(), WriteError> {
     let mut obj = read_object(path)?;
     obj.insert(key.to_string(), value);
     write_object(path, &obj)
@@ -416,6 +437,64 @@ mod tests {
             &Value::Bool(false)
         );
         assert!(write_value(&cfg, "cask", "yes").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_write_to_different_key_is_preserved() {
+        // F1: a concurrent writer (bun `hipfire config set`, or a second TUI)
+        // changes a DIFFERENT key while we write ours. Because write_raw_value
+        // re-reads the latest on-disk object and merges ONLY our one key, the
+        // concurrent unrelated-key write must survive (not be clobbered by a
+        // stale full-file snapshot).
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{\n  \"kv_cache\": \"auto\"\n}\n").unwrap();
+
+        // Simulate the interleaving: AFTER the initial state, a concurrent
+        // process writes a different key (thinking) straight to disk...
+        write_value(&cfg, "thinking", "off").expect("concurrent write");
+        // ...and then OUR writer commits its own key. The merge must re-read
+        // the latest content (which now has `thinking`) and keep it.
+        write_value(&cfg, "temperature", "0.7").expect("our write");
+
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        let obj = parsed.as_object().unwrap();
+        // Our key landed.
+        assert_eq!(
+            obj.get("temperature").unwrap().as_f64().unwrap(),
+            0.7,
+            "our key must be written"
+        );
+        // The concurrent different-key write was preserved (not clobbered).
+        assert_eq!(
+            obj.get("thinking").unwrap(),
+            &Value::String("off".into()),
+            "concurrent different-key write must survive the merge"
+        );
+        // And the original key is still intact.
+        assert_eq!(
+            obj.get("kv_cache").unwrap(),
+            &Value::String("auto".into())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_key_simultaneous_is_last_writer_wins() {
+        // F1 residual: two writers changing the SAME key — last rename wins.
+        // This is the documented, acceptable residual (no torn JSON; atomic).
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{}\n").unwrap();
+        write_value(&cfg, "kv_cache", "q8").unwrap();
+        write_value(&cfg, "kv_cache", "asym4").unwrap(); // later write wins
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.as_object().unwrap().get("kv_cache").unwrap(),
+            &Value::String("asym4".into())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

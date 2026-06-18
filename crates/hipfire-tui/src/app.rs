@@ -384,6 +384,58 @@ impl App {
         }
     }
 
+    /// Number of selectable rows in the current Settings mode.
+    fn settings_row_count(&self) -> usize {
+        if self.settings_easy {
+            self.config.easy_rows().len()
+        } else {
+            self.config.values.len()
+        }
+    }
+
+    /// Switch the Settings tab between easy and advanced mode, clamping
+    /// `settings_selected` into the NEW mode's visible row range so we never
+    /// render an empty table with no editable row (the bug: from a high advanced
+    /// row index, pressing `e` left the selection past the end of the short easy
+    /// table). When the currently-selected key also exists in the target mode,
+    /// the selection follows that key so the cursor stays on the same setting.
+    pub fn set_settings_easy(&mut self, easy: bool) {
+        if self.settings_easy == easy {
+            return;
+        }
+        // Remember the key under the cursor BEFORE flipping mode.
+        let prev_key = self.selected_setting_key();
+        self.settings_easy = easy;
+        // Cancel any in-progress edit — its key may not exist in the new mode.
+        self.settings_edit = None;
+
+        // Try to keep the cursor on the same key in the new mode.
+        if let Some(key) = prev_key {
+            if let Some(idx) = self.settings_key_index(&key) {
+                self.settings_selected = idx;
+                return;
+            }
+        }
+        // Otherwise clamp into the new mode's row range (empty → 0).
+        let max_idx = self.settings_row_count().saturating_sub(1);
+        if self.settings_selected > max_idx {
+            self.settings_selected = max_idx;
+        }
+    }
+
+    /// Find the row index for `key` in the current Settings mode, if it maps to
+    /// a row there. Used to preserve the selection across an easy/advanced flip.
+    fn settings_key_index(&self, key: &str) -> Option<usize> {
+        if self.settings_easy {
+            self.config
+                .easy_keys()
+                .iter()
+                .position(|k| matches!(k, Some(s) if *s == key))
+        } else {
+            self.config.values.keys().position(|k| k == key)
+        }
+    }
+
     /// Resolve the currently-selected settings row to a config key, if any.
     /// In easy mode this maps through `ConfigState::easy_keys`; in advanced
     /// mode the row IS a `(key, value)` pair from the raw config map.
@@ -407,8 +459,10 @@ impl App {
     }
 
     /// Persist a validated value for `key` and reflect it in the in-memory
-    /// config so the UI updates immediately. Returns the status string.
-    fn persist_setting(&mut self, key: &str, raw: &str) -> String {
+    /// config so the UI updates immediately. Returns `(ok, status)` — `ok` is
+    /// false on a validation/write error so callers (the edit-mode Enter
+    /// handler) can KEEP the edit buffer for in-place correction.
+    fn persist_setting(&mut self, key: &str, raw: &str) -> (bool, String) {
         match writer::write_value(&self.paths.config, key, raw) {
             Ok(value) => {
                 let as_str = match &value {
@@ -421,13 +475,13 @@ impl App {
                 self.config.values.insert(key.to_string(), as_str.clone());
                 self.config.loaded_from_disk = true;
                 self.toast_info(format!("{key} saved"));
-                format!("{key} = {as_str} saved to ~/.hipfire/config.json")
+                (true, format!("{key} = {as_str} saved to ~/.hipfire/config.json"))
             }
             Err(err) => {
                 // Surface config-write failures as a loud transient toast in
                 // addition to the persistent footer line.
                 self.toast_error(format!("save failed: {err}"));
-                format!("{err}")
+                (false, format!("{err}"))
             }
         }
     }
@@ -471,7 +525,8 @@ impl App {
                                 _ => "true".into(),
                             }
                         };
-                        self.last_reload = self.persist_setting(&k, &next);
+                        let (_, status) = self.persist_setting(&k, &next);
+                        self.last_reload = status;
                     }
                     Some(_) => {
                         self.last_reload =
@@ -517,8 +572,19 @@ impl App {
                 self.last_reload = "edit cancelled".into();
             }
             KeyCode::Enter => {
-                if let Some(edit) = self.settings_edit.take() {
-                    self.last_reload = self.persist_setting(&edit.key, edit.buffer.trim());
+                // F4: peek the buffer (do NOT take() before validation). Only
+                // clear settings_edit on a successful save; on a validation /
+                // write error keep the buffer intact so the user can correct
+                // the value in place. The error is surfaced via the toast +
+                // status line by persist_setting.
+                if let Some(edit) = self.settings_edit.as_ref() {
+                    let key = edit.key.clone();
+                    let raw = edit.buffer.trim().to_string();
+                    let (ok, status) = self.persist_setting(&key, &raw);
+                    self.last_reload = status;
+                    if ok {
+                        self.settings_edit = None;
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -601,5 +667,130 @@ impl ChatState {
 
     pub fn is_input_focused(&self) -> bool {
         self.input_focused
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Build an App whose config writes target an isolated temp file, so the
+    /// settings tests never touch the user's real ~/.hipfire/config.json.
+    fn test_app() -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-tui-app-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, "{}\n").unwrap();
+
+        let mut app = App::load().expect("load app");
+        app.paths.config = cfg;
+        app.tab = Tab::Settings;
+        (app, dir)
+    }
+
+    #[test]
+    fn mode_switch_clamps_selection_into_visible_rows() {
+        // F3: from a high advanced-row index, pressing `e` (easy) must clamp the
+        // selection into the short easy table so a row is always selectable.
+        let (mut app, dir) = test_app();
+        app.settings_easy = false;
+        // Populate advanced rows so the index can sit far past the easy count.
+        app.config.values.clear();
+        for i in 0..20 {
+            app.config.values.insert(format!("k{i:02}"), "v".into());
+        }
+        app.settings_selected = 19; // last advanced row
+
+        app.set_settings_easy(true);
+
+        let easy_rows = app.config.easy_rows().len();
+        assert!(easy_rows > 0);
+        assert!(
+            app.settings_selected < easy_rows,
+            "selection {} must be clamped below easy row count {}",
+            app.settings_selected,
+            easy_rows
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_switch_preserves_selected_key_when_present() {
+        // F3 niceness: if the selected advanced key also appears in easy mode,
+        // the cursor follows it (kv_cache is row 3 in easy_keys).
+        let (mut app, dir) = test_app();
+        app.settings_easy = false;
+        app.config.values.clear();
+        // Order matters: BTreeMap sorts keys. Put kv_cache somewhere mid-list.
+        for k in ["aaa", "kv_cache", "zzz"] {
+            app.config.values.insert(k.into(), "auto".into());
+        }
+        // Advanced index of "kv_cache" (sorted: aaa, kv_cache, zzz → idx 1).
+        app.settings_selected = 1;
+
+        app.set_settings_easy(true);
+        // kv_cache is index 3 in easy_keys().
+        let easy_idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("kv_cache")))
+            .unwrap();
+        assert_eq!(app.settings_selected, easy_idx);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_keeps_edit_buffer() {
+        // F4: a rejected value (out of range) on Enter must KEEP settings_edit
+        // so the user can correct in place; a valid value commits + exits edit.
+        let (mut app, dir) = test_app();
+        // Edit `temperature` (Float 0.0..=2.0) with an out-of-range buffer.
+        app.settings_edit = Some(EditState {
+            key: "temperature".into(),
+            buffer: "5.0".into(),
+        });
+        app.handle_settings_edit_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_some(),
+            "rejected save must keep the edit buffer for correction"
+        );
+        assert_eq!(
+            app.settings_edit.as_ref().unwrap().buffer,
+            "5.0",
+            "buffer contents must be preserved verbatim on failure"
+        );
+        // An error toast was surfaced.
+        assert!(matches!(
+            app.toast.as_ref().map(|t| t.level),
+            Some(ToastLevel::Error)
+        ));
+
+        // Now correct it to a valid value: commits and exits edit mode.
+        app.settings_edit.as_mut().unwrap().buffer = "0.7".into();
+        app.handle_settings_edit_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_none(),
+            "valid save must commit and exit edit mode"
+        );
+        assert_eq!(
+            app.config.values.get("temperature").map(String::as_str),
+            Some("0.7")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

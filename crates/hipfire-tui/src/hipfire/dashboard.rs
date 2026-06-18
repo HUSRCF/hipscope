@@ -563,29 +563,56 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> RocmSmiRun {
         Err(e) => return RocmSmiRun::SpawnError(e.to_string()),
     };
 
+    // Drain stdout CONCURRENTLY on a reader thread. A verbose command (rocminfo)
+    // can emit more than one OS pipe buffer (~64 KiB) of output BEFORE it exits;
+    // if we only read after try_wait() reports exit, the child blocks on its
+    // write() — full pipe, no reader — never exits, and we kill it as a FALSE
+    // timeout. With a dedicated reader thread the pipe never backs up, so the
+    // child can run to completion while the watchdog below still bounds the
+    // wall-clock and kills a genuinely hung child.
+    let stdout = child.stdout.take();
+    let reader = stdout.map(|mut out| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    // Watchdog: poll for exit, enforce the hard deadline (kill + reap on timeout).
     let deadline = Instant::now() + timeout;
-    loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                // Exited within the deadline — drain stdout.
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut buf);
-                }
-                return RocmSmiRun::Output(buf);
-            }
+            Ok(Some(_status)) => break None, // exited cleanly within deadline
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Hung: kill and reap so we don't leak a zombie. Best-effort
-                    // — even if kill races the exit, we report TimedOut.
+                    // Hung: kill and reap so we don't leak a zombie. Killing the
+                    // child also closes the pipe, so the reader thread's
+                    // read_to_string returns and we can join it without hanging.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return RocmSmiRun::TimedOut;
+                    break Some(RocmSmiRun::TimedOut);
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return RocmSmiRun::SpawnError(e.to_string()),
+            Err(e) => {
+                // Reap best-effort so the reader thread unblocks, then report.
+                let _ = child.kill();
+                let _ = child.wait();
+                break Some(RocmSmiRun::SpawnError(e.to_string()));
+            }
         }
+    };
+
+    // Join the reader (it has finished once the pipe closed: clean exit OR kill).
+    let captured = match reader {
+        Some(h) => h.join().unwrap_or_default(),
+        None => String::new(),
+    };
+
+    match outcome {
+        Some(run) => run,        // TimedOut / SpawnError — discard partial output
+        None => RocmSmiRun::Output(captured),
     }
 }
 
@@ -956,6 +983,30 @@ mod tests {
         match run_bounded(cmd, Duration::from_secs(5)) {
             RocmSmiRun::Output(s) => assert_eq!(s, "hello"),
             other => panic!("expected Output, got {:?}", run_kind(&other)),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_run_stdout_fill_is_not_falsely_timed_out() {
+        // F2: a command that emits MORE than one OS pipe buffer (~64 KiB) of
+        // stdout BEFORE exiting must run to completion, not be killed as a false
+        // timeout. Before the concurrent-drain fix, the child would block on
+        // write() against a full pipe (no reader until after exit) and get
+        // killed. We emit ~1 MiB and assert we capture all of it.
+        let mut cmd = Command::new("sh");
+        // `yes` would never exit; use a bounded large emission via head.
+        cmd.args(["-c", "yes ABCDEFGHIJ | head -c 1048576"]);
+        let run = run_bounded(cmd, Duration::from_secs(10));
+        match run {
+            RocmSmiRun::Output(s) => {
+                assert_eq!(
+                    s.len(),
+                    1_048_576,
+                    "must capture the full 1 MiB without deadlocking the pipe"
+                );
+            }
+            other => panic!("expected Output (not a false timeout), got {:?}", run_kind(&other)),
         }
     }
 
