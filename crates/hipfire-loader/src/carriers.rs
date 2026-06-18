@@ -189,7 +189,7 @@ fn load_qwen35_pp(
         &dims,
     )
     .map_err(|e| format!("{e}"))?;
-    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| e.to_string())?;
+    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
     let (dn, la_to_device) = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
         &mut gpus, &config, dn_quant,
     )
@@ -243,6 +243,13 @@ impl Carrier for Qwen35Carrier {
         matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        // Dir + pp>1: early return before any diagnostics/meta resolution,
+        // preserving the original error string and preventing tokenizer work.
+        if ctx.pp > 1 {
+            if let ModelSource::Dir(..) = &src {
+                return Err("qwen35: safetensors + pp>1 unsupported".into());
+            }
+        }
         // Per-source diagnostics stay at the call site, before resolve_source_meta.
         if let ModelSource::Dir(s) = &src {
             let qm = s

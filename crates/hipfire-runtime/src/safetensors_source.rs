@@ -241,6 +241,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
+        "minimax_m2" => 10,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -402,6 +403,7 @@ mod tests {
             derive_arch_id(&json!({ "model_type": "qwen3.5", "num_experts": 8 })),
             6
         );
+        assert_eq!(derive_arch_id(&json!({ "model_type": "minimax_m2" })), 10);
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).
