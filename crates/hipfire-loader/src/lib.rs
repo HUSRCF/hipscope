@@ -975,52 +975,6 @@ fn load_cohere2moe(
     })
 }
 
-fn load_minimax(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::arch::Architecture;
-    let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
-        .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-    let eos_tok: u32 = {
-        let try_one = |s: &str| -> Option<u32> {
-            let ids = tokenizer.encode(s);
-            if ids.len() == 1 {
-                Some(ids[0])
-            } else {
-                None
-            }
-        };
-        try_one("[e~[")
-            .or_else(|| try_one("<|im_end|>"))
-            .or_else(|| try_one("</s>"))
-            .or_else(|| try_one("<|endoftext|>"))
-            .unwrap_or(1)
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        state: Some(ModelState::Minimax(MiniMaxBundle {
-            config,
-            weights,
-            state,
-            eos_tok,
-        })),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
-}
-
 // ─── MMQ screening ────────────────────────────────────────────────────
 
 // ─── DFlash state load ────────────────────────────────────────────────

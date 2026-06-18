@@ -189,7 +189,7 @@ fn load_qwen35_pp(
         &dims,
     )
     .map_err(|e| format!("{e}"))?;
-    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
+    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| e.to_string())?;
     let (dn, la_to_device) = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
         &mut gpus, &config, dn_quant,
     )
