@@ -9,13 +9,13 @@
 // The single-block kernel runs the entire 150K-vocab top-K scan on ONE
 // workgroup (one CU) while the other ~95 CUs idle — measured at ~305 us/token
 // on gfx1100 A3B decode (the largest isolated decode sink). This splits the
-// vocab scan across N_BLOCKS workgroups, each producing a block-local top-20,
-// then a single finalize block merges the N_BLOCKS×20 candidates and runs the
+// vocab scan across N_BLOCKS workgroups, each producing a block-local top-K,
+// then a single finalize block merges the N_BLOCKS×TOP_K candidates and runs the
 // IDENTICAL softmax / sort / top-p / RNG phase as the original.
 //
-// Correctness: the global top-20 is a subset of the union of the per-block
-// top-20s (a global top-20 element lives in some block's strip and is therefore
-// in that strip's top-20), so the merged result is the EXACT same top-20 as the
+// Correctness: the global top-K is a subset of the union of the per-block
+// top-Ks (a global top-K element lives in some block's strip and is therefore
+// in that strip's top-K), so the merged result is the EXACT same top-K as the
 // single-block kernel for distinct logit values — hence a byte-identical token.
 // Ties on exactly-equal f32 logits may pick a different representative index,
 // which is semantically equivalent (equal model preference).
@@ -23,8 +23,18 @@
 // Phase 0 (repeat penalty) modifies logits in place and must complete before
 // any block reads logits, so it is a separate prepass kernel launched only when
 // a penalty is active.
+//
+// TOP_K is the gather/stack-array budget (W7 P2b: widened 20 → 64 so request
+// top_k>20, e.g. minimax top_k=40, is honored). BYTE-PRESERVATION: the softmax
+// sum feeding p_thresh is computed over the CAPPED set [0,cap) where cap defaults
+// to top_k_req=20 — so the default path sums over the same top-20 set as before
+// the widen and stays byte-identical to 43c3129c. The wider gather only changes
+// behavior when the request asks for >20 candidates. The host caller MUST launch
+// these kernels with blockDim.x = 128 (not 256): LDS = BLOCK*TOP_K*8 bytes and
+// 128*64*8 = 64 KiB is the RDNA wave32 group-segment limit (256 would request
+// 128 KiB and fail to launch).
 
-#define TOP_K 20
+#define TOP_K 64
 
 // ── Phase 0: repeat / presence / frequency penalty, in place (1 block) ──
 // Byte-identical to sample_top_p.hip Phase 0.
@@ -192,16 +202,12 @@ extern "C" __global__ void sample_topk_finalize(
     }
 
     float inv_temp = 1.0f / temperature;
-    float sum = 0.0f;
     float probs[TOP_K];
     #pragma unroll
     for (int k = 0; k < TOP_K; k++) {
         if (vals[k] <= -1e29f) { probs[k] = 0.0f; continue; }
-        float p = expf((vals[k] - max_val) * inv_temp);
-        probs[k] = p;
-        sum += p;
+        probs[k] = expf((vals[k] - max_val) * inv_temp);
     }
-    if (sum <= 0.0f) { result[0] = (unsigned int)idx[0]; result[1] = rand_seed; return; }
 
     int order[TOP_K];
     #pragma unroll
@@ -218,8 +224,8 @@ extern "C" __global__ void sample_topk_finalize(
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 
     // Request-driven candidate cap (see sample_top_p.hip for the rationale).
-    // Both cuts are no-ops at their defaults (top_k_req>=TOP_K, min_p==0.0),
-    // so the legacy parallel path stays byte-identical.
+    // Both cuts are no-ops at their LEGACY defaults (top_k_req==20, min_p==0.0):
+    // cap collapses to 20, identical to the old top-20 gather.
     int cap = TOP_K;
     if (top_k_req > 0 && top_k_req < TOP_K) cap = top_k_req;
     if (min_p > 0.0f) {
@@ -231,6 +237,16 @@ extern "C" __global__ void sample_topk_finalize(
         cap = mp_cap;
     }
     if (cap < 1) cap = 1;
+
+    // BYTE-PRESERVATION: the softmax sum feeding p_thresh is taken over the
+    // CAPPED set [0,cap) of the descending-sorted candidates, NOT the full
+    // TOP_K=64 gather. With the legacy default cap=20 this sums exactly the
+    // same top-20 probabilities as the pre-widen 20-wide kernel, so p_thresh
+    // and every downstream decision are byte-identical to 43c3129c. A wider
+    // request (e.g. top_k=40) sums over a genuinely wider nucleus.
+    float sum = 0.0f;
+    for (int i = 0; i < cap; i++) sum += probs[order[i]];
+    if (sum <= 0.0f) { result[0] = (unsigned int)idx[order[0]]; result[1] = rand_seed; return; }
 
     float p_thresh = top_p * sum;
     float trunc_sum = 0.0f;

@@ -216,9 +216,11 @@ impl Gpu {
             &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
-        let block_size = 256u32;
-        // topk_val[nthreads*20] + topk_idx[nthreads*20] = 256*20*4 + 256*20*4 = 40960 bytes
-        let shared_mem = 256u32 * 20 * 4 * 2;
+        // W7 P2b: gather TOP_K widened 20→64. LDS = nthreads*TOP_K*8; with
+        // TOP_K=64 the block must be 128 threads (128*64*8 = 64 KiB, the RDNA
+        // wave32 group-segment limit; 256 would request 128 KiB and fail).
+        let block_size = 128u32;
+        let shared_mem = block_size * 64 * 4 * 2;
 
         unsafe {
             self.hip.launch_kernel(
@@ -263,8 +265,12 @@ impl Gpu {
         min_p_val: f32,
     ) -> HipResult<(u32, u32)> {
         const N_BLOCKS: u32 = 128;
-        const TOP_K: usize = 20;
-        const BLOCK: u32 = 256;
+        // W7 P2b: gather TOP_K widened 20→64 so request top_k>20 (minimax
+        // top_k=40) is honored. BLOCK dropped 256→128 to keep LDS within the
+        // 64 KiB RDNA wave32 group-segment limit: smem = BLOCK*TOP_K*8 =
+        // 128*64*8 = 64 KiB (256*64*8 = 128 KiB would fail to launch).
+        const TOP_K: usize = 64;
+        const BLOCK: u32 = 128;
         // smem: topk_val[BLOCK*TOP_K] + topk_idx[BLOCK*TOP_K], 4 bytes each.
         let shared_mem = BLOCK * TOP_K as u32 * 4 * 2;
 
@@ -408,9 +414,11 @@ impl Gpu {
             &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
-        let block_size = 256u32;
-        // topk_val[nthreads*20] + topk_idx[nthreads*20] = 256*20*4 + 256*20*4 = 40960 bytes
-        let shared_mem = 256u32 * 20 * 4 * 2;
+        // W7 P2b: gather TOP_K widened 20→64. LDS = nthreads*TOP_K*8; with
+        // TOP_K=64 the block must be 128 threads (128*64*8 = 64 KiB, the RDNA
+        // wave32 group-segment limit; 256 would request 128 KiB and fail).
+        let block_size = 128u32;
+        let shared_mem = block_size * 64 * 4 * 2;
 
         unsafe {
             self.hip.launch_kernel(
