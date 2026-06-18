@@ -28,6 +28,28 @@ import {
   type ServePidRecord,
   type PidEvidence,
 } from "./serve_admission";
+import {
+  EXIT,
+  formatErrorMessage,
+  formatProgressLine,
+} from "./cli_format";
+
+// ─── Top-level safety net (registered FIRST) ────────────
+// Last-resort handlers so a stray rejected promise / synchronous throw —
+// including one from the startup init below (mkdirSync / loadConfig /
+// initDynamicRegistry / refreshModelsCatalog) — NEVER surfaces a raw Bun/V8
+// stack to the user. Registered before ANY init runs so a startup failure is
+// caught here too. Intended `process.exit()` paths are unaffected (they
+// terminate the process directly, not via thrown errors).
+function dieClean(err: unknown): never {
+  process.stderr.write(`hipfire: ${formatErrorMessage(err)}\n`);
+  process.stderr.write(`Run \`hipfire diag\` for diagnostics.\n`);
+  process.exit(EXIT.ERROR);
+}
+process.on("unhandledRejection", (reason) => dieClean(reason));
+process.on("uncaughtException", (err) => dieClean(err));
+// Clean SIGINT exit code (130) instead of a partial/garbled teardown.
+process.on("SIGINT", () => { process.stderr.write("\n"); process.exit(EXIT.SIGINT); });
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -1270,6 +1292,19 @@ function takeFlag(args: string[], ...names: string[]): boolean {
   return found;
 }
 
+// After a command has consumed all of its known flags (via takeFlag /
+// takeFlagValue, which splice their tokens out of `rest`), call this to reject
+// any leftover dash-prefixed token. Without it, commands like list/ps/chat/diag
+// silently IGNORE typos like `--josn`, hiding user error. Positional args (no
+// leading "-") are left untouched. A bare "-" (stdin convention) is allowed.
+function rejectUnknownFlags(rest: string[], cmd: string): void {
+  const unknown = rest.find(a => a.startsWith("-") && a !== "-");
+  if (unknown !== undefined) {
+    console.error(`hipfire: unknown flag ${unknown} (see hipfire ${cmd} --help)`);
+    process.exit(EXIT.USAGE);
+  }
+}
+
 // Reap ORPHAN daemon / quantize processes and free a serve port. Mirrors
 // scripts/serve-restart.sh: `pkill -x daemon` (exact-name, NOT -f, so the bun
 // CLI itself is never matched) + `fuser -k <port>/tcp`. Used by
@@ -1930,21 +1965,36 @@ async function pull(tag: string): Promise<string> {
   const writer = Bun.file(tmpDest).writer();
   let downloaded = 0;
   let lastPrint = 0;
+  // Rolling-window rate: bytes downloaded since the last sample / elapsed.
+  const startMs = Date.now();
+  let windowBytes = 0;
+  let windowStartMs = startMs;
+  let lastRate = 0; // bytes/sec, smoothed across windows
+  let lastLineLen = 0;
 
   for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
     writer.write(chunk);
     downloaded += chunk.length;
+    windowBytes += chunk.length;
     const now = Date.now();
     if (now - lastPrint > 500 || downloaded === total) {
-      const pct = total > 0 ? ((downloaded / total) * 100).toFixed(1) : "?";
-      const mb = (downloaded / 1e6).toFixed(0);
-      const totalMb = total > 0 ? (total / 1e6).toFixed(0) : "?";
-      process.stderr.write(`\r  ${mb}/${totalMb} MB (${pct}%)`);
+      const windowMs = now - windowStartMs;
+      if (windowMs >= 250) {
+        const inst = (windowBytes / windowMs) * 1000; // bytes/sec this window
+        // EMA smoothing so the rate/ETA don't jitter wildly.
+        lastRate = lastRate > 0 ? lastRate * 0.6 + inst * 0.4 : inst;
+        windowBytes = 0;
+        windowStartMs = now;
+      }
+      const line = `  ${formatProgressLine({ downloaded, total, bytesPerSec: lastRate })}`;
+      // Pad to overwrite any longer previous line, then carriage-return.
+      process.stderr.write(`\r${line.padEnd(lastLineLen)}`);
+      lastLineLen = line.length;
       lastPrint = now;
     }
   }
   await writer.end();
-  console.error("");
+  process.stderr.write("\n");
 
   // Rename tmp → final (atomic-ish)
   const { renameSync } = await import("fs");
@@ -6885,11 +6935,30 @@ function syncCliRuntimePayload(repoDir: string): void {
 // read REGISTRY/ALIASES, so the swap must land before any of them run.
 // Cache-fresh path is one small file read; the network path is bounded by
 // REGISTRY_FETCH_TIMEOUT_MS so an offline box never hangs here.
-await initDynamicRegistry();
+//
+// This startup init is explicitly guarded: the process.on() safety net is
+// registered at the top of the file (after imports, before mkdirSync /
+// loadConfig), but we ALSO wrap the awaited init here so a thrown/rejected
+// startup error routes to dieClean → clean `hipfire: <msg>` + diag hint,
+// never a raw stack. dieClean exits, so control never falls through.
+try {
+  await initDynamicRegistry();
+  refreshModelsCatalog();
+} catch (err) {
+  dieClean(err);
+}
 
-refreshModelsCatalog();
+let [cmd, ...rest] = process.argv.slice(2);
 
-const [cmd, ...rest] = process.argv.slice(2);
+// `hipfire help <command>` == `hipfire <command> --help`. Rewrites the
+// dispatch so the per-command help body is the single source of truth.
+// Bare `hipfire help` falls through to the default-case full command list.
+if (cmd === "help" && rest.length > 0 && !rest[0].startsWith("-")) {
+  cmd = rest[0];
+  rest = ["--help"];
+}
+
+try {
 switch (cmd) {
   case "serve": {
     await runServe(rest.slice());
@@ -7035,19 +7104,22 @@ switch (cmd) {
     // value-flag (e.g. --temp) was placed before the model (rest[0] became the
     // flag name → "Model not found: --temp").
     const wantHelp = takeFlag(rest, "-h", "--help");
-    const runJson = takeFlag(rest, "--json");
+    const runJson = takeFlag(rest, "-j", "--json");
     const runNoStream = takeFlag(rest, "--no-stream");
     const kvModeVal = takeFlagValue(rest, "--kv-mode");
     const imageVal = takeFlagValue(rest, "--image");
     const systemVal = takeFlagValue(rest, "--system");
-    const tempVal = takeFlagValue(rest, "--temp");
+    // Short aliases: -t/--temp, -n/--max-tokens. takeFlagValue returns the
+    // first matching name found; we OR the short and long forms so either
+    // works in any position.
+    const tempVal = takeFlagValue(rest, "--temp") ?? takeFlagValue(rest, "-t");
     const topPVal = takeFlagValue(rest, "--top-p");
     const repeatPenaltyVal = takeFlagValue(rest, "--repeat-penalty");
-    const maxTokensVal = takeFlagValue(rest, "--max-tokens");
+    const maxTokensVal = takeFlagValue(rest, "--max-tokens") ?? takeFlagValue(rest, "-n");
     const model = rest[0];
     if (wantHelp || !model) {
-      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --json                   Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\"");
-      process.exit(wantHelp ? 0 : 1);
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\"");
+      process.exit(wantHelp ? 0 : EXIT.USAGE);
     }
     // Validate --kv-mode against the same allowlist config validation uses.
     if (kvModeVal !== null && !validateConfigValue("kv_cache", kvModeVal)) {
@@ -7090,15 +7162,30 @@ switch (cmd) {
     break;
   }
   case "chat": {
-    const chatArgs = rest.filter(a => !a.startsWith("--"));
-    const chatFlags = new Set(rest.filter(a => a.startsWith("--")));
-    const chatTag = chatArgs[0];
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire chat <model> [flags]
+
+  Interactive streaming chat TUI (multi-turn). Uses a running serve if one is
+  up on cfg.port, otherwise spawns a one-shot daemon for the session.
+
+Flags:
+  --no-color           Disable ANSI color in the TUI
+
+Examples:
+  hipfire chat qwen3.5:9b
+  hipfire chat qwen3.5:27b-mq6 --no-color`);
+      process.exit(0);
+    }
+    const noColor = takeFlag(rest, "--no-color");
+    rejectUnknownFlags(rest, "chat");
+    const chatTag = rest.filter(a => !a.startsWith("-"))[0];
     if (!chatTag) {
-      console.error("Usage: hipfire chat <tag> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
-      process.exit(1);
+      console.error("Usage: hipfire chat <model> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
+      console.error("Run `hipfire chat --help` for details.");
+      process.exit(EXIT.USAGE);
     }
     const { chatTui } = await import("./chat.ts");
-    await chatTui(chatTag, cfg, { noColor: chatFlags.has("--no-color") });
+    await chatTui(chatTag, cfg, { noColor });
     break;
   }
   case "pull": {
@@ -7108,8 +7195,25 @@ switch (cmd) {
     break;
   }
   case "list": {
-    const asJson = takeFlag(rest, "--json");
-    const showRemote = rest.includes("--remote") || rest.includes("-r");
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire list [flags]
+
+  Show local models (and, with -r, every model available to pull). Also lists
+  user aliases registered via \`hipfire quantize --register\`.
+
+Flags:
+  -r, --remote         Also show registry models available to pull
+  -j, --json           Emit a machine-readable {models, registry} object
+
+Examples:
+  hipfire list
+  hipfire list -r
+  hipfire list --json`);
+      process.exit(0);
+    }
+    const asJson = takeFlag(rest, "-j", "--json");
+    const showRemote = takeFlag(rest, "--remote", "-r");
+    rejectUnknownFlags(rest, "list");
     const local = listLocal();
     if (asJson) {
       // Machine-readable: every local model + every registry entry (with a
@@ -7174,9 +7278,32 @@ switch (cmd) {
     break;
   }
   case "ps": {
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire ps [flags]
+
+  List running hipfire processes: the inference daemon, quantize jobs, and HF
+  uploads, plus whether the configured serve port is in use.
+
+Flags:
+  -j, --json           Emit machine-readable {daemons, quantize, uploads, serve}
+
+Note: process discovery uses Linux tools (ps, ss). On non-Linux platforms the
+process groups are reported as unavailable.
+
+Examples:
+  hipfire ps
+  hipfire ps --json`);
+      process.exit(0);
+    }
     // List running hipfire-related processes: serve daemons, quantize jobs, uploads.
-    const psJson = takeFlag(rest, "--json");
+    const psJson = takeFlag(rest, "-j", "--json");
+    rejectUnknownFlags(rest, "ps");
+    // Cross-platform honesty: ps/ss are Linux-only. On other platforms we
+    // can't enumerate processes — say so instead of printing a misleading
+    // "No hipfire processes running."
+    const psLinux = process.platform === "linux";
     const sh = (cmd: string) => {
+      if (!psLinux) return "";
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
     };
@@ -7215,6 +7342,8 @@ switch (cmd) {
       const portInUse0 = sh(`ss -tlnp 2>/dev/null | grep :${port0}`);
       const detachedPid0 = readServePid();
       console.log(JSON.stringify({
+        platform: process.platform,
+        process_scan: psLinux ? "linux" : `unavailable (ps/ss are Linux-only; running on ${process.platform})`,
         daemons: daemonRecs,
         quantize: quantizeRecs,
         uploads: uploadRecs,
@@ -7226,6 +7355,12 @@ switch (cmd) {
           detached: !!detachedPid0,
         },
       }, null, 2));
+      break;
+    }
+    if (!psLinux) {
+      console.log(`(Linux-only; ps/ss unavailable on ${process.platform} — cannot enumerate hipfire processes)`);
+      const detachedPidNl = readServePid();
+      if (detachedPidNl) console.log(`tracked serve PID (from pidfile): ${detachedPidNl}`);
       break;
     }
     let total = 0;
@@ -7269,7 +7404,7 @@ switch (cmd) {
 
 Flags:
   --kernel <substr>   Only report kernels whose name contains <substr>
-  --json              Emit the full machine-readable hardware + kernel report
+  -j, --json          Emit the full machine-readable hardware + kernel report
 
 Examples:
   hipfire profile
@@ -7277,14 +7412,11 @@ Examples:
   hipfire profile qwen3.5:9b --kernel gemm --json`);
       process.exit(0);
     }
-    const jsonFlag = rest.includes("--json");
-    const kernelIdx = rest.indexOf("--kernel");
-    const kernelFilter = kernelIdx >= 0 && kernelIdx + 1 < rest.length ? rest[kernelIdx + 1] : undefined;
-    const skipSet = new Set<number>();
-    if (jsonFlag) skipSet.add(rest.indexOf("--json"));
-    if (kernelIdx >= 0) { skipSet.add(kernelIdx); skipSet.add(kernelIdx + 1); }
-    const positional = rest.filter((_, i) => !skipSet.has(i));
-    const profileModel = positional[0]; // optional: model to load (triggers kernel compile)
+    // takeFlag/takeFlagValue splice their tokens out of `rest`, so whatever
+    // survives is purely positional (the optional model). Supports -j alias.
+    const jsonFlag = takeFlag(rest, "-j", "--json");
+    const kernelFilter = takeFlagValue(rest, "--kernel") ?? undefined;
+    const profileModel = rest[0]; // optional: model to load (triggers kernel compile)
     await profile(profileModel, jsonFlag, kernelFilter);
     break;
   }
@@ -7525,8 +7657,30 @@ Examples:
     break;
   }
   case "diag": {
-    const diagJson = takeFlag(rest, "--json");
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire diag [flags]
+
+  Diagnostics: platform, PCI GPUs, DRM/KFD nodes, amdgpu module, ROCm/HIP
+  version, daemon binary, local models, compiled kernels, and a live GPU
+  probe (VRAM, arch) via the HIP runtime.
+
+Flags:
+  -j, --json           Emit the full machine-readable diagnostics object
+
+Note: hardware probes (lspci, lsmod, rocminfo, ss) are Linux-only; on other
+platforms those fields are reported as unavailable.
+
+Examples:
+  hipfire diag
+  hipfire diag --json`);
+      process.exit(0);
+    }
+    const diagJson = takeFlag(rest, "-j", "--json");
+    rejectUnknownFlags(rest, "diag");
+    // Cross-platform honesty: the shell probes below are Linux-only.
+    const diagLinux = process.platform === "linux";
     const sh = (cmd: string) => {
+      if (!diagLinux) return "";
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
     };
@@ -7598,6 +7752,7 @@ Examples:
       console.log(JSON.stringify({
         registry: REGISTRY_SOURCE,
         platform: platformLabel,
+        hardware_probe: diagLinux ? "linux" : `unavailable (lspci/lsmod/rocminfo are Linux-only; running on ${process.platform})`,
         gpus: pciGpus,
         dri_nodes: driNodes ? driNodes.split("\n").filter(Boolean) : [],
         kfd: hasKfd,
@@ -7641,7 +7796,7 @@ Examples:
       for (const line of lspci.split("\n")) console.log(`  ${line.trim()}`);
       gpuDetected = lspci.toLowerCase().includes("amd") || lspci.toLowerCase().includes("radeon");
     } else {
-      console.log("PCI GPUs:      (lspci not available)");
+      console.log(`PCI GPUs:      ${diagLinux ? "(lspci not available)" : `(Linux-only; lspci unavailable on ${process.platform})`}`);
     }
 
     // 2b. DRM render nodes + /dev/dxg
@@ -7680,7 +7835,7 @@ Examples:
 
     // 2g. amdgpu kernel module
     const amdgpuLoaded = sh("lsmod 2>/dev/null | grep amdgpu | head -1");
-    console.log(`amdgpu module: ${amdgpuLoaded ? "loaded" : "NOT LOADED"}`);
+    console.log(`amdgpu module: ${amdgpuLoaded ? "loaded" : diagLinux ? "NOT LOADED" : `(Linux-only; lsmod unavailable on ${process.platform})`}`);
 
     // ── 3. ROCm / HIP runtime ──────────────────────────────
     console.log("");
@@ -7817,7 +7972,7 @@ Examples:
     break;
   }
   case "bench": {
-    const benchJson = takeFlag(rest, "--json");
+    const benchJson = takeFlag(rest, "-j", "--json");
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -8232,6 +8387,35 @@ Examples:
     // Disambiguate: first arg is a model tag if it maps to a local catalog
     // model, a known REGISTRY entry, or matches the `name:tag` shape.
     // Otherwise treat as action.
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire config [<model:tag>] [action] [args] [--json]
+
+  No action          Open the interactive settings editor (TUI)
+  list               Print all keys, values, and which differ from defaults
+  get <key>          Print one key's value
+  set <key> <value>  Set a key (validated against its allowed range)
+  reset [key]        Reset one key (or all) to defaults
+  cask-profile [name] Show/apply a CASK eviction profile bundle
+
+  Prefix any action with a <model:tag> to scope it to that model's per-model
+  override (only PER_MODEL_KEYS are settable there).
+
+Flags:
+  -j, --json         For \`list\`/\`get\`: emit machine-readable JSON
+
+Examples:
+  hipfire config
+  hipfire config list
+  hipfire config list --json
+  hipfire config get kv_cache --json
+  hipfire config set temperature 0.7
+  hipfire config qwen3.5:9b set kv_cache q8
+  hipfire config reset`);
+      process.exit(0);
+    }
+    // Pull --json/-j out first (works for `config list --json` and
+    // `config get <key> --json`); harmless elsewhere.
+    const cfgJson = takeFlag(rest, "-j", "--json");
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
@@ -8297,6 +8481,16 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
+        if (cfgJson) {
+          // { scope, path, keys: { <key>: { value, default, overridden } } }
+          const out: Record<string, any> = {};
+          for (const k of validKeys) {
+            if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
+            out[k] = { value: (merged as any)[k], default: (CONFIG_DEFAULTS as any)[k], overridden: k in ov };
+          }
+          console.log(JSON.stringify({ scope: modelScope, path: MODELS_CATALOG_PATH, keys: out }, null, 2));
+          break;
+        }
         console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
@@ -8308,21 +8502,32 @@ Examples:
         console.log(`\nInteractive: hipfire config ${modelScope}`);
         console.log(`Set:         hipfire config ${modelScope} set <key> <value>`);
         console.log(`Unset:       hipfire config ${modelScope} reset <key>`);
+      } else if (cfgJson) {
+        // Global: { scope:"global", path, keys: { <key>: { value, default, is_default } } }
+        const out: Record<string, any> = {};
+        for (const k of validKeys) {
+          const v = cfg[k];
+          out[k] = { value: v, default: (CONFIG_DEFAULTS as any)[k], is_default: v === (CONFIG_DEFAULTS as any)[k] };
+        }
+        console.log(JSON.stringify({ scope: "global", path: CONFIG_PATH, keys: out }, null, 2));
       } else {
         listConfig(cfg);
       }
     } else if (action === "get") {
-      if (!key) { console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} get <key>`); process.exit(1); }
-      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
+      if (!key) { console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} get <key> [--json]`); process.exit(EXIT.USAGE); }
+      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(EXIT.USAGE); }
       if (modelScope) {
         if (!(PER_MODEL_KEYS as readonly string[]).includes(key)) {
           console.error(`${key} is not a per-model override (use global: hipfire config get ${key})`);
-          process.exit(1);
+          process.exit(EXIT.USAGE);
         }
         const v = (resolveModelConfig(modelScope) as any)[key];
-        console.log(v);
+        if (cfgJson) console.log(JSON.stringify({ scope: modelScope, key, value: v }));
+        else console.log(v);
       } else {
-        console.log(cfg[key as keyof HipfireConfig]);
+        const v = cfg[key as keyof HipfireConfig];
+        if (cfgJson) console.log(JSON.stringify({ scope: "global", key, value: v }));
+        else console.log(v);
       }
     } else if (action === "set") {
       if (!key || value === undefined) {
@@ -8477,7 +8682,7 @@ Examples:
     if (cmd && !["help", "-h", "--help"].includes(cmd)) {
       console.error(`Unknown command: ${cmd}`);
       console.error(`Run \`hipfire help\` for the full command list.`);
-      process.exit(1);
+      process.exit(EXIT.USAGE);
     }
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
@@ -8516,6 +8721,10 @@ Examples:
   sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
+Help:
+  hipfire <command> --help    Detailed help for one command
+  hipfire help <command>      Same as <command> --help
+
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
   hipfire pull qwen3.5:4b            # 2.6GB, best speed/quality balance
   hipfire pull qwen3.5:9b            # 5.3GB, best quality for 8GB cards
@@ -8539,4 +8748,13 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
     break;
   }
+}
+} catch (err) {
+  // Any uncaught throw from a command (existing per-command catches still
+  // run first; this only fires for what escapes them). Print a clean line,
+  // never a raw stack. Set HIPFIRE_DEBUG=1 to see the full stack.
+  if (process.env.HIPFIRE_DEBUG === "1" && err instanceof Error) {
+    process.stderr.write((err.stack ?? String(err)) + "\n");
+  }
+  dieClean(err);
 }
