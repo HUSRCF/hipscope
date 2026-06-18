@@ -6,8 +6,59 @@
 
 use crate::Carrier;
 use crate::{finish_qwen35_load, resolve_chat_template, LoadedModel, ModelState};
+use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
+
+// ─── Source-only metadata (tokenizer / chat_template / arch_id) ───────
+//
+// The single seam for the source-varying-but-arch-invariant axis. Adding a
+// future source kind (e.g. GGUF) is one new `match` arm here plus the
+// irreducible per-arch `(config, weights)` block in each carrier. Lives in
+// `hipfire-loader` (not `loader_api`) because it calls `resolve_chat_template`,
+// which reads the loader's built-in arch templates.
+//
+// NOTE: `arch_id` extraction is purely source-varying (`hfq.arch_id` vs
+// `source.arch_id()`), so it belongs here — but the *values* live in two
+// distinct namespaces (HFQ header ids vs `derive_arch_id` dir ids). A GGUF
+// plug-in author must pick the correct namespace, not assume a single one.
+struct SourceMeta {
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+    chat_template: Option<String>,
+    arch_id: u32,
+}
+
+fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
+    match src {
+        ModelSource::Hfq(hfq) => Ok(SourceMeta {
+            tokenizer: hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(
+                &hfq.metadata_json,
+            )
+            .map_err(|e| format!("tokenizer not found: {e}"))?,
+            chat_template: resolve_chat_template(hfq, path),
+            arch_id: hfq.arch_id,
+        }),
+        ModelSource::Dir(source) => Ok(SourceMeta {
+            tokenizer: tokenizer_from_dir(source)?,
+            chat_template: source.chat_template(),
+            arch_id: source.arch_id(),
+        }),
+    }
+}
+
+/// Folds the "no tokenizer.json / failed to parse" block duplicated verbatim
+/// in every Dir arm today.
+fn tokenizer_from_dir(
+    source: &hipfire_runtime::safetensors_source::SafetensorsSource,
+) -> Result<hipfire_runtime::tokenizer::Tokenizer, String> {
+    if let Some(tok_path) = source.tokenizer_json_path() {
+        hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+            .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
+            .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))
+    } else {
+        Err("no tokenizer.json found in model directory".into())
+    }
+}
 
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
 
@@ -511,5 +562,91 @@ impl Carrier for HfqCarrier {
             hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                 .map_err(|e| format!("tokenizer not found: {e}"))?;
         (self.load)(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+    }
+}
+
+// ─── MinimaxCarrier ──────────────────────────────────────────────────
+
+pub struct MinimaxCarrier;
+impl Carrier for MinimaxCarrier {
+    fn name(&self) -> &'static str {
+        "minimax"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 10
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            // Preserve the two per-source error strings byte-for-byte.
+            return Err(match &src {
+                ModelSource::Hfq(_) => "minimax: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "minimax: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        // Per-source diagnostic stays at the call site, before resolve_source_meta.
+        if let ModelSource::Dir(s) = &src {
+            eprintln!("  safetensors arch_id={}", s.arch_id());
+        }
+        let meta = resolve_source_meta(&src, ctx.path)?;
+
+        // ── source-varying seam: (config, weights) only ──
+        use hipfire_runtime::arch::Architecture;
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq_file) => {
+                let config =
+                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::config_from_hfq(
+                        &hfq_file,
+                    )?;
+                let weights =
+                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::load_weights(
+                        &mut hfq_file,
+                        &config,
+                        ctx.gpu,
+                    )?;
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = config_from_safetensors(&source)
+                    .ok_or_else(|| "failed to parse MiniMax config".to_string())?;
+                let weights = load_weights_from_safetensors(&source, &config, ctx.gpu)?;
+                (config, weights)
+            }
+        };
+
+        // ── single shared tail (byte-identical to the previous per-arm tails) ──
+        let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+            .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = meta.tokenizer.encode(s);
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            };
+            try_one("[e~[")
+                .or_else(|| try_one("<|im_end|>"))
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(1)
+        };
+        Ok(LoadedModel {
+            state: Some(ModelState::Minimax(crate::MiniMaxBundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
     }
 }

@@ -65,11 +65,7 @@ const REGISTRY: &[&dyn Carrier] = &[
         name: "deepseek4",
         load: load_deepseek4,
     },
-    &HfqCarrier {
-        arch_id: 10,
-        name: "minimax",
-        load: load_minimax,
-    },
+    &MinimaxCarrier,
     &HfqCarrier {
         arch_id: 11,
         name: "lfm2moe",
