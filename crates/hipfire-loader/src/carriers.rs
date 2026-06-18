@@ -528,6 +528,51 @@ impl Carrier for HfqCarrier {
     }
 }
 
+// ─── DotsOcrCarrier ──────────────────────────────────────────────────
+
+pub struct DotsOcrCarrier;
+impl Carrier for DotsOcrCarrier {
+    fn name(&self) -> &'static str {
+        "dots_ocr"
+    }
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 8
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("dots_ocr: pipeline-parallel (pp>1) unsupported".into());
+        }
+        let ModelSource::Hfq(_) = &src else {
+            return Err("dots_ocr: directory source unsupported".into());
+        };
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let ModelSource::Hfq(mut hfq) = src else {
+            unreachable!()
+        };
+
+        use hipfire_arch_dots_ocr::DotsOcr;
+        use hipfire_runtime::arch::Architecture;
+        let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+        let state =
+            hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(ctx.gpu, &config.text, ctx.max_seq)
+                .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        Ok(LoadedModel {
+            qwen2_state: Some(state),
+            dots_ocr_config: Some(config),
+            dots_ocr_weights: Some(weights),
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 // ─── MinimaxCarrier ──────────────────────────────────────────────────
 
 pub struct MinimaxCarrier;

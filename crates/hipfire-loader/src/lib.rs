@@ -55,11 +55,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
-    &HfqCarrier {
-        arch_id: 8,
-        name: "dots_ocr",
-        load: load_dots_ocr,
-    },
+    &DotsOcrCarrier,
     &HfqCarrier {
         arch_id: 9,
         name: "deepseek4",
@@ -813,35 +809,6 @@ pub fn load_model(
         "pp>1 LoadedModel missing pp_gpus"
     );
     Ok(result)
-}
-
-fn load_dots_ocr(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_arch_dots_ocr::DotsOcr;
-    use hipfire_runtime::arch::Architecture;
-    let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
-        .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        qwen2_state: Some(state),
-        dots_ocr_config: Some(config),
-        dots_ocr_weights: Some(weights),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
 }
 
 fn load_deepseek4(
