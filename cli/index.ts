@@ -61,7 +61,15 @@ const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
 const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
-const TEMP_CORRECTION = 0.82;
+// NOTE: the legacy global `TEMP_CORRECTION = 0.82` (an April-2026 ×0.82 fudge
+// "for HFQ4 logit noise") was REMOVED 2026-06-18. It silently scaled every
+// resolved temperature — including W7 card-recommended temps and explicit API
+// `temperature` — across all formats, not just 4-bit. The sampler now applies
+// standard softmax(logits/T) on both host and GPU paths (identical to
+// llama.cpp), modern quants sit at KLD ~0.02–0.06 vs f16, and a coherence A/B
+// (q08-mq4 + A3B mfp4-E8, temps 0.574→1.0) showed ZERO hard fails and no
+// degradation at the uncorrected temps — the 0.82 case was if anything MORE
+// repetitive. Temperatures are now honored verbatim. See UX_progress.md.
 
 mkdirSync(MODELS_DIR, { recursive: true });
 
@@ -2273,7 +2281,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // callers (no view) keep sending the concrete temp/topP/repeatPenalty args.
   const sv = extra.sampling;
   if (sv) {
-    if (typeof sv.temperature === "number") genMsg.temperature = sv.temperature * TEMP_CORRECTION;
+    if (typeof sv.temperature === "number") genMsg.temperature = sv.temperature;
     if (typeof sv.top_p === "number") genMsg.top_p = sv.top_p;
     if (typeof sv.repeat_penalty === "number") genMsg.repeat_penalty = sv.repeat_penalty;
     if (typeof sv.presence_penalty === "number") genMsg.presence_penalty = sv.presence_penalty;
@@ -2282,7 +2290,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     if (typeof sv.top_k === "number") genMsg.top_k = sv.top_k;
     if (typeof sv.min_p === "number") genMsg.min_p = sv.min_p;
   } else {
-    genMsg.temperature = temp * TEMP_CORRECTION;
+    genMsg.temperature = temp;
     genMsg.repeat_penalty = repeatPenalty;
     genMsg.top_p = topP;
   }
@@ -3395,10 +3403,11 @@ async function serve(port: number, host: string) {
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
           frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
         };
-        // temperature carries the TEMP_CORRECTION factor when sent.
+        // temperature is sent verbatim (the legacy ×0.82 TEMP_CORRECTION was
+        // removed 2026-06-18 — see the note at the top of the file).
         {
           const t = body.temperature ?? sendView.temperature;
-          if (typeof t === "number") genParams.temperature = t * TEMP_CORRECTION;
+          if (typeof t === "number") genParams.temperature = t;
           const tp = body.top_p ?? sendView.top_p;
           if (typeof tp === "number") genParams.top_p = tp;
           const rp = body.repeat_penalty ?? sendView.repeat_penalty;
