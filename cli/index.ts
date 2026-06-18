@@ -7569,18 +7569,46 @@ Examples:
     if (buildQ.exitCode !== 0) {
       console.error("  hipfire-quantize build failed (quantize subcommand won't work). Continuing.");
     }
-    // Recopy binaries
-    // Example binaries live under target/release/examples/
+    // Build the terminal UI binary so `hipfire tui` works out of the box.
+    const buildTui = Bun.spawnSync(
+      [CARGO_BIN, "build", "--release", "-p", "hipfire-tui"],
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
+    );
+    if (buildTui.exitCode !== 0) {
+      console.error("  hipfire-tui build failed (tui subcommand won't work). Continuing.");
+    }
+    // Recopy binaries. Resolve the ACTUAL target directory: cargo writes to
+    // $CARGO_TARGET_DIR when set (common when sharing a build cache across
+    // projects), otherwise the conventional <repo>/target. Hardcoding
+    // repoDir/target/release silently skips the copy on those setups, leaving
+    // the user with a freshly-built-but-never-installed binary.
+    const targetDir = process.env.CARGO_TARGET_DIR && process.env.CARGO_TARGET_DIR.length > 0
+      ? resolve(process.env.CARGO_TARGET_DIR)
+      : join(repoDir, "target");
+    const releaseDir = join(targetDir, "release");
+    // Example binaries live under <target>/release/examples/
     for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
-      const src = join(repoDir, `target/release/examples/${bin}${exe}`);
+      const src = join(releaseDir, "examples", `${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
-    // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize"]) {
-      const src = join(repoDir, `target/release/${bin}${exe}`);
+    // Workspace binaries (e.g. hipfire-quantize, hipfire-tui) live under <target>/release/.
+    // If the build step reported success but the binary isn't where we expect,
+    // warn loudly instead of silently skipping — that mismatch (wrong target
+    // dir, renamed artifact) would otherwise look like a clean update.
+    const buildOk: Record<string, boolean> = {
+      "hipfire-quantize": buildQ.exitCode === 0,
+      "hipfire-tui": buildTui.exitCode === 0,
+    };
+    for (const bin of ["hipfire-quantize", "hipfire-tui"]) {
+      const src = join(releaseDir, `${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
-      if (existsSync(src)) { copyFileSync(src, dst); }
+      if (existsSync(src)) {
+        copyFileSync(src, dst);
+      } else if (buildOk[bin]) {
+        console.error(`  WARNING: ${bin} build succeeded but binary not found at ${src} — not installed.`);
+        console.error(`           Check CARGO_TARGET_DIR / the build output, then re-run 'hipfire update'.`);
+      }
     }
     // Detect GPU arch from sysfs (cross-platform, no external commands)
     let archOut = "";
@@ -8675,6 +8703,63 @@ Examples:
     }
     break;
   }
+  case "tui": {
+    const args = rest.slice();
+    if (takeFlag(args, "-h", "--help")) {
+      console.error(`Usage: hipfire tui [flags...]\n\n`
+        + `Launch the hipfire terminal UI (ratatui) — Home, Chat, Models, Settings,\n`
+        + `and System tabs over your local config, registry, and serve status.\n`
+        + `Requires a TTY. Any flags are passed through to the hipfire-tui binary.\n\n`
+        + `Flags forwarded to hipfire-tui:\n`
+        + `  --check        Load config/registry/models without entering the render\n`
+        + `                 loop, then exit (headless smoke; no TTY needed)\n`
+        + `  -V, --version  Print the hipfire-tui version and exit\n\n`
+        + `The binary is ~/.hipfire/bin/hipfire-tui (installed by \`hipfire update\`).\n`
+        + `In a source checkout (with cargo) it falls back to \`cargo run --release -p hipfire-tui\`;\n`
+        + `otherwise run \`hipfire update\` to build and install it.\n`);
+      process.exit(0);
+    }
+    const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_TUI_BIN;
+    const candidates = [
+      ...(envBin ? [envBin] : []),
+      join(HIPFIRE_DIR, "bin", `hipfire-tui${exe}`),
+      resolve(__dirname, `../target/release/hipfire-tui${exe}`),
+    ];
+    const bin = candidates.find(p => existsSync(p));
+    let proc;
+    if (bin) {
+      proc = spawn([bin, ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env } });
+    } else {
+      // Dev fallback: build-and-run from the workspace, but ONLY when a real
+      // workspace Cargo.toml AND a cargo toolchain are both present. In an
+      // installed layout (~/.hipfire/cli) neither exists, so a bare
+      // `cargo run` would surface a confusing "could not find Cargo.toml"
+      // error. Print an actionable message instead.
+      const cargoToml = resolve(__dirname, "../Cargo.toml");
+      const cargoBin = findDep("cargo", [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"]);
+      if (!existsSync(cargoToml) || !cargoBin) {
+        // Platform-correct remedy: `hipfire update` is NOT Windows-aware (its
+        // GPU-arch + reset path is Linux/sysfs-only), so on Windows recommend
+        // the direct cargo build as the primary fix. On Linux `hipfire update`
+        // builds + installs the binary in one step.
+        const remedy = process.platform === "win32"
+          ? `  Build from source:       cargo build --release -p hipfire-tui\n`
+            + `  (then copy target\\release\\hipfire-tui.exe to ~/.hipfire/bin/, or re-run scripts\\install.ps1)`
+          : `  Build + install it with: hipfire update\n`
+            + `  Or build from source:    cargo build --release -p hipfire-tui`;
+        console.error(`hipfire-tui (terminal UI) is not installed.\n`
+          + `  Looked in: ${candidates.join(", ")}\n`
+          + remedy);
+        process.exit(EXIT.ERROR);
+      }
+      console.error(`hipfire-tui binary not found; falling back to \`cargo run --release -p hipfire-tui\` (first run compiles)...`);
+      proc = spawn([cargoBin, "run", "--release", "-p", "hipfire-tui", "--", ...args],
+        { stdin: "inherit", stdout: "inherit", stderr: "inherit", cwd: resolve(__dirname, ".."), env: { ...process.env } });
+    }
+    const code = await proc.exited;
+    process.exit(code);
+  }
   default: {
     // Unknown command: error to stderr + nonzero exit so scripts can detect
     // the typo instead of parsing help text off a 0-exit stdout.
@@ -8707,6 +8792,7 @@ Examples:
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
   chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
+  tui                   Launch the full terminal UI (Home/Chat/Models/Settings/System)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon

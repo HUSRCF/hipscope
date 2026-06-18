@@ -376,6 +376,21 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Push-Location $RepoDir
     try {
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        # OPTIONAL build (terminal UI). Must NOT abort the install if it fails:
+        # the mandatory daemon/CLI are installed regardless. Under PowerShell 7
+        # `$PSNativeCommandUseErrorActionPreference` a native non-zero exit from
+        # cargo throws a NativeCommandExitException, so guard BOTH the exception
+        # path (try/catch) AND the plain non-zero-exit path ($LASTEXITCODE);
+        # either way warn + continue down to the daemon copy.
+        Write-Host "  cargo build --release -p hipfire-tui (terminal UI)..."
+        try {
+            cargo build --release -p hipfire-tui
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it."
+            }
+        } catch {
+            Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it. ($_)"
+        }
     } finally {
         Pop-Location
     }
@@ -409,6 +424,28 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
+}
+
+# Terminal UI (workspace bin — lives under target\release\, not examples\).
+# Build on demand if the pre-built tree didn't include it. The TUI is
+# OPTIONAL — a failed build (or absent cargo) must NOT abort the install,
+# but it must NOT be swallowed silently either: warn clearly so the user
+# knows the terminal UI won't be available and how to get it.
+$TuiExe = "$TargetDir\release\hipfire-tui.exe"
+if (-not (Test-Path $TuiExe)) {
+    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+        Push-Location $RepoDir
+        try { cargo build --release -p hipfire-tui } catch {} finally { Pop-Location }
+    }
+}
+if (Test-Path $TuiExe) {
+    Copy-Item $TuiExe "$BinDir\hipfire-tui.exe" -Force
+    Write-Host "  hipfire-tui (terminal UI) installed ✓" -ForegroundColor Green
+} else {
+    # Windows remedy: `hipfire update` is NOT Windows-aware (its GPU-arch +
+    # git-reset path is Linux/sysfs-only), so recommend the direct cargo build
+    # as the PRIMARY fix on Windows, then re-running this installer to copy it.
+    Write-Warning "hipfire-tui (terminal UI) was not built — it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
 }
 
 # ─── CLI ─────────────────────────────────────────────────

@@ -17,11 +17,68 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() -> Result<()> {
+    // Non-interactive argument handling (headless-safe, no TTY required).
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("hipfire-tui {VERSION}");
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            "--check" => {
+                return run_check();
+            }
+            other => {
+                eprintln!("hipfire-tui: unknown argument '{other}'");
+                print_help();
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal);
     restore_terminal(&mut terminal)?;
     result
+}
+
+fn print_help() {
+    println!(
+        "hipfire-tui {VERSION} - terminal UI for hipfire\n\
+         \n\
+         USAGE:\n    \
+             hipfire-tui [FLAGS]\n\
+         \n\
+         FLAGS:\n    \
+             -h, --help       Print this help and exit\n    \
+             -V, --version    Print version and exit\n        \
+                 --check      Load config/registry/models without entering the\n                         \
+                              render loop, then exit 0 on success (headless smoke)\n\
+         \n\
+         With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
+         Tabs: Home, Chat, Models, Settings, System. Tab/BackTab to switch, q to quit."
+    );
+}
+
+/// Construct the App state (config + registry + local models) WITHOUT entering
+/// the ratatui render/event loop. Exits 0 on success, non-zero on init failure.
+/// This is the headless smoke path for CI and TTY-less environments.
+fn run_check() -> Result<()> {
+    let app = App::load()?;
+    println!("hipfire-tui --check OK");
+    println!("  config: default_model = {:?}", app.config.default_model);
+    println!("  registry: {} models, {} aliases", app.registry.models.len(), app.registry.aliases.len());
+    println!("  local models: {}", app.registry.local_files.len());
+    if let Some(warn) = &app.registry.warning {
+        println!("  registry warning: {warn}");
+    }
+    Ok(())
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
