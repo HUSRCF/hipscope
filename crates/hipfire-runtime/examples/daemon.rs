@@ -1310,6 +1310,35 @@ struct LoadedModel {
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
     chat_template: Option<String>,
+
+    // Author-recommended sampling defaults baked into the .hfq's
+    // `generation_config` metadata (HfqFile::recommended_sampling). Populated at
+    // load time from the source model's generation_config.json. These form the
+    // *baked* fallback layer of the sampling-inheritance ladder: the generate
+    // handler reads `m.rec_X.unwrap_or(<hardcoded arch-ladder default>)` so an
+    // author-recommended value beats the crude arch ladder, while an explicit
+    // per-request field still overrides it (and the curated registry
+    // `recommended_settings` is layered above this on the CLI send side).
+    //
+    // `None` on the raw-safetensors PP load path (load_model_pp): those models
+    // are read via SafetensorsSource, not HfqFile, so no baked generation_config
+    // accessor — the arch ladder remains the fallback there.
+    //
+    // CARRIED-BUT-INERT until P2: the daemon sampler honors temperature/top_p
+    // (and presence_penalty, fed separately). top_k is a COMPILE-TIME constant
+    // in sample_top_p (sampler.rs K=20) and min_p is not implemented, so
+    // rec_top_k / rec_min_p are wired through but DO NOT affect sampling yet.
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+    // CARRIED-BUT-INERT (P2 wires kernel support): the sampler's top-K is a
+    // compile-time constant and min_p is unimplemented, so these two are stored
+    // and resolved through the CLI/registry ladder but never read by the
+    // sampler today. #[allow(dead_code)] until P2 reads them.
+    #[allow(dead_code)]
+    rec_top_k: Option<f32>,
+    #[allow(dead_code)]
+    rec_min_p: Option<f32>,
+    rec_presence_penalty: Option<f32>,
 }
 
 fn ckpt_resume_enabled() -> bool {
@@ -2258,7 +2287,16 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 11 {
+                // Hardcoded arch ladder — the LAST-RESORT fallback for the
+                // sampling defaults. The author-recommended values baked into
+                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
+                // populated at load time via HfqFile::recommended_sampling) take
+                // precedence over this ladder; an explicit per-request field
+                // (set below via `msg.get(...)`) overrides both. The CLI's
+                // curated registry `recommended_settings` reach this handler as
+                // explicit request fields (CLI explicit-send guard), so they sit
+                // above the .hfq layer on that path.
+                let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
                     // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
                     // top_k=50, repetition_penalty=1.05. The daemon sampler is
                     // temp + top_p + repeat_penalty (no user-facing top_k — the
@@ -2275,6 +2313,14 @@ fn main() {
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
+                // Layer the .hfq-baked author recommendation OVER the arch
+                // ladder. Per-knob: a model that bakes only `temperature` still
+                // gets the arch-ladder `top_p`.
+                let default_temp = m
+                    .rec_temperature
+                    .map(|x| x as f64)
+                    .unwrap_or(arch_default_temp);
+                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
                 let temp = msg
                     .get("temperature")
                     .and_then(|v| v.as_f64())
@@ -2321,7 +2367,18 @@ fn main() {
                 // flat across the (now long) window, which is what breaks the
                 // block-level repetition loops on long reasoning generations.
                 // Clamp negatives to 0 (negative would REWARD repetition).
-                let presence_penalty = (msg.get("presence_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                // Fallback ladder: explicit request `presence_penalty` >
+                // .hfq-baked `m.rec_presence_penalty` > 0.0 (off). The .hfq's
+                // generation_config does not carry presence_penalty today, so
+                // m.rec_presence_penalty is always None on the load path; the
+                // field is wired so a curated registry card value still flows in
+                // as an explicit request field (CLI explicit-send guard). presence_penalty IS honored by the sampler.
+                let presence_penalty = (msg
+                    .get("presence_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64)
+                    as f32)
+                    .max(0.0);
                 let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -3120,6 +3177,25 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
     include_str!("../templates/eval/qwen35-froggeric-v20.jinja");
 const LFM2_TEMPLATE: &str = include_str!("../templates/eval/lfm2-liquidai.jinja");
 
+/// Pull the author-recommended sampling defaults baked into the .hfq's
+/// `generation_config` metadata into the `(rec_temperature, rec_top_p,
+/// rec_top_k)` triple that the `LoadedModel` constructors store. `top_k` is
+/// widened to `f32` to match the struct field (the daemon carries it through
+/// uniformly even though the kernel's top-K is a compile-time constant today).
+/// min_p and presence_penalty are NOT in generation_config — those reach the
+/// daemon only via the request (curated registry card → CLI explicit-send), so
+/// the matching `rec_min_p` / `rec_presence_penalty` struct fields stay `None`
+/// on the load path. Returns all-`None` when the .hfq carried no baked
+/// generation_config.
+fn rec_sampling_fields(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+) -> (Option<f32>, Option<f32>, Option<f32>) {
+    match hfq.recommended_sampling() {
+        Some(r) => (r.temperature, r.top_p, r.top_k.map(|k| k as f32)),
+        None => (None, None, None),
+    }
+}
+
 fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) -> Option<String> {
     // 1. Env-var override — the documented global escape hatch. KEPT, but if
     //    it overrides a qwen3* model (arch 5/6) it is fighting the froggeric
@@ -3589,6 +3665,7 @@ fn load_model(
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -3642,6 +3719,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -3674,6 +3756,7 @@ fn load_model(
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
             .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -3727,6 +3810,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -3780,6 +3868,7 @@ fn load_model(
             }
         };
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -3833,6 +3922,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -3879,6 +3973,7 @@ fn load_model(
                 .unwrap_or(1)
         };
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -3932,6 +4027,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -3993,6 +4093,7 @@ fn load_model(
                 .unwrap_or(1)
         };
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -4046,6 +4147,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -4453,6 +4559,7 @@ fn load_model(
         };
 
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -4506,6 +4613,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -4528,6 +4640,7 @@ fn load_model(
         .map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -4581,6 +4694,11 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature,
+            rec_top_p,
+            rec_top_k,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         })
     }
 }
@@ -4742,6 +4860,11 @@ fn load_model_safetensors(
             model_path: path.to_string(),
             dflash: None,
             chat_template,
+            rec_temperature: None,
+            rec_top_p: None,
+            rec_top_k: None,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         });
     }
 
@@ -4885,6 +5008,11 @@ fn load_model_safetensors(
         model_path: path.to_string(),
         dflash: None,
         chat_template,
+        rec_temperature: None,
+        rec_top_p: None,
+        rec_top_k: None,
+        rec_min_p: None,
+        rec_presence_penalty: None,
     })
 }
 
@@ -5127,6 +5255,11 @@ fn load_model_pp(
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
+        rec_temperature: rec_sampling_fields(&hfq).0,
+        rec_top_p: rec_sampling_fields(&hfq).1,
+        rec_top_k: rec_sampling_fields(&hfq).2,
+        rec_min_p: None,
+        rec_presence_penalty: None,
     })
 }
 
@@ -5260,6 +5393,7 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         if ids.len() == 1 { ids[0] } else { 1 }
     };
     let chat_template = resolve_chat_template(&hfq, path);
+    let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
 
     Ok(LoadedModel {
         arch_id,
@@ -5317,6 +5451,11 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         model_path: path.to_string(),
         dflash: None,
         chat_template,
+        rec_temperature,
+        rec_top_p,
+        rec_top_k,
+        rec_min_p: None,
+        rec_presence_penalty: None,
     })
 }
 
@@ -5382,6 +5521,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             .unwrap_or(1)
     };
     let chat_template = resolve_chat_template(&hfq, path);
+    let (rec_temperature, rec_top_p, rec_top_k) = rec_sampling_fields(&hfq);
 
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
@@ -5439,6 +5579,11 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         model_path: path.to_string(),
         dflash: None,
         chat_template,
+        rec_temperature,
+        rec_top_p,
+        rec_top_k,
+        rec_min_p: None,
+        rec_presence_penalty: None,
     })
 }
 

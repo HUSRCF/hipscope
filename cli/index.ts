@@ -471,12 +471,104 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
+  // Layer the registry card's recommended_settings UNDER per-model config and
+  // OVER the global base, so a curated card temp/top_p/etc. flows into the
+  // resolved HipfireConfig (and thus into `hipfire config <tag> show`,
+  // sizeAwareKvMode, etc.). Per-model models.json still wins. See
+  // resolveSamplingForSend for the explicit-SEND guard that decides which of
+  // these actually get transmitted to the daemon.
+  const card = tag ? REGISTRY[resolved]?.recommended_settings : undefined;
+  const cardLayer: Partial<HipfireConfig> = {};
+  if (card) {
+    if (typeof card.temperature === "number") cardLayer.temperature = card.temperature;
+    if (typeof card.top_p === "number") cardLayer.top_p = card.top_p;
+    if (typeof card.repeat_penalty === "number") cardLayer.repeat_penalty = card.repeat_penalty;
+  }
   return {
     ...base,
+    ...cardLayer,
     ...(catalogId ? (all[catalogId] ?? {}) : {}),
     ...(all[resolved] ?? {}),
     ...(tag !== resolved ? (all[tag] ?? {}) : {}),
   };
+}
+
+/// Sampling fields to actually TRANSMIT to the daemon, with the explicit-send
+/// guard. A field is `defined` ONLY when it came from one of:
+///   (1) an explicit `--flag` (passed in `flags`),
+///   (2) per-model models.json config, or
+///   (3) the registry card's `recommended_settings`.
+/// A field that is merely the bare global CONFIG_DEFAULTS value is left
+/// `undefined` so the CLI omits it from the request — letting the daemon's own
+/// resolution (`.hfq` generation_config → arch ladder) apply instead of the CLI
+/// silently overriding the card with temp=0.3/top_p=0.8. (Without this guard
+/// the daemon NEVER sees its own card/arch defaults: the CLI always sent the
+/// global default.)
+///
+/// NOTE: top_k and min_p are CARRIED through here (so a future P2 daemon that
+/// honors them inherits the card value) but the daemon sampler IGNORES them
+/// today — top-K is compile-time-fixed and min_p is unimplemented. presence_penalty,
+/// temperature, top_p, repeat_penalty DO take effect.
+interface SamplingForSend {
+  temperature?: number;
+  top_p?: number;
+  repeat_penalty?: number;
+  presence_penalty?: number;
+  top_k?: number; // carried-but-inert until P2
+  min_p?: number; // carried-but-inert until P2
+  system_prompt?: string;
+}
+export function resolveSamplingForSend(
+  tag: string | null | undefined,
+  flags?: {
+    temperature?: number;
+    top_p?: number;
+    repeat_penalty?: number;
+    presence_penalty?: number;
+  },
+): SamplingForSend {
+  const out: SamplingForSend = {};
+  const resolved = tag ? resolveModelTag(tag) : null;
+  const card = resolved ? REGISTRY[resolved]?.recommended_settings : undefined;
+
+  // Per-model explicit overrides: the union of the keys the user actually set
+  // under any of the layered config keys (catalog id / canonical tag / alias).
+  // Presence of a KEY (not its value) marks it explicit.
+  const perModel: Record<string, unknown> = {};
+  if (tag) {
+    const all = loadPerModelConfigs();
+    const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
+    if (catalogId && all[catalogId]) Object.assign(perModel, all[catalogId]);
+    if (resolved && all[resolved]) Object.assign(perModel, all[resolved]);
+    if (resolved && tag !== resolved && all[tag]) Object.assign(perModel, all[tag]);
+  }
+
+  // Layer order (lowest → highest): card < per-model < explicit --flag.
+  const pick = (
+    key: "temperature" | "top_p" | "repeat_penalty",
+  ): number | undefined => {
+    const flagVal = flags ? (flags as any)[key] : undefined;
+    if (typeof flagVal === "number") return flagVal;
+    if (typeof perModel[key] === "number") return perModel[key] as number;
+    if (card && typeof (card as any)[key] === "number") return (card as any)[key] as number;
+    return undefined;
+  };
+  out.temperature = pick("temperature");
+  out.top_p = pick("top_p");
+  out.repeat_penalty = pick("repeat_penalty");
+
+  // presence_penalty: flag > card (no per-model HipfireConfig field for it).
+  if (flags && typeof flags.presence_penalty === "number") {
+    out.presence_penalty = flags.presence_penalty;
+  } else if (card && typeof card.presence_penalty === "number") {
+    out.presence_penalty = card.presence_penalty;
+  }
+
+  // top_k / min_p: card-only today (no flag/per-model surface). Carried-but-inert.
+  if (card && typeof card.top_k === "number") out.top_k = card.top_k;
+  if (card && typeof card.min_p === "number") out.min_p = card.min_p;
+  if (card && typeof card.system_prompt === "string") out.system_prompt = card.system_prompt;
+  return out;
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -833,6 +925,19 @@ interface ModelEntry {
   /// resolveKvMode (but still loses to HIPFIRE_KV_MODE env and per-model
   /// config). Validated against REGISTRY_KV_MODE_VALUES at registry-load time.
   default_kv_mode?: string | null;
+  /// Optional curated author-recommended INFERENCE settings inherited from the
+  /// parent model card. Layered UNDER per-model models.json config and OVER the
+  /// CLI global default in resolveModelConfig. Bounds-validated at
+  /// registry-load time (registry_loader.ts validRecommendedSettings).
+  recommended_settings?: {
+    temperature?: number;
+    top_p?: number;
+    top_k?: number;
+    min_p?: number;
+    presence_penalty?: number;
+    repeat_penalty?: number;
+    system_prompt?: string;
+  } | null;
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -1216,20 +1321,35 @@ async function runViaHttp(
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
+  sampling?: SamplingForSend,
 ): Promise<boolean> {
   // VL requests proxy through the daemon's `image_base64` IPC field —
   // `hipfire run --image` can hit a running serve instead of cold-spawning
   // a fresh daemon per call.
 
   const messages: any[] = [];
-  if (system) messages.push({ role: "system", content: system });
+  // Explicit --system wins; else the card's recommended system_prompt.
+  const effectiveSystem = system ?? sampling?.system_prompt;
+  if (effectiveSystem) messages.push({ role: "system", content: effectiveSystem });
   messages.push({ role: "user", content: prompt });
-  const body: any = {
-    model, stream: true,
-    messages,
-    temperature: temp, max_tokens: maxTokens,
-    repeat_penalty: repeatPenalty, top_p: topP,
-  };
+  const body: any = { model, stream: true, messages, max_tokens: maxTokens };
+  // Explicit-send guard (same as the local genMsg path): transmit a sampling
+  // field only when it's in the explicit-send view; omitted fields fall through
+  // to the daemon's .hfq/arch-card resolution. Legacy callers (no view) send
+  // the concrete args as today.
+  if (sampling) {
+    if (typeof sampling.temperature === "number") body.temperature = sampling.temperature;
+    if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
+    if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
+    if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
+    // top_k / min_p: carried-but-inert (daemon ignores until P2).
+    if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
+    if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
+  } else {
+    body.temperature = temp;
+    body.repeat_penalty = repeatPenalty;
+    body.top_p = topP;
+  }
 
   if (image) {
     const imgBuf = Bun.file(resolve(image));
@@ -1679,6 +1799,13 @@ interface RunExtra {
   // --seed: awaits engine sampler-seed support (GenerateRequest has none; engine nondeterministic at temp0)
   jsonOut?: boolean;
   noStream?: boolean;
+  // Explicit-send sampling view (resolveSamplingForSend). When present, the
+  // run/genMsg path sends a sampling field ONLY if it appears here (came from
+  // --flag / per-model config / registry card); a field that's merely the bare
+  // global default is OMITTED so the daemon's .hfq/arch-card resolution applies.
+  // When undefined (legacy callers), the explicit temp/topP/repeatPenalty args
+  // are sent as today.
+  sampling?: SamplingForSend;
 }
 
 async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string, extra: RunExtra = {}) {
@@ -1712,7 +1839,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     || extra.jsonOut === true || extra.noStream === true;
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || wantsLocalControl;
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
-    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
+    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, extra.sampling);
     if (ok) return;
     // runViaHttp logged its own failure reason.
     // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
@@ -1752,9 +1879,27 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const modelCfg = resolveModelConfig(model);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
-    temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
-    repeat_penalty: repeatPenalty, top_p: topP,
+    max_tokens: maxTokens,
   };
+  // Explicit-send guard: when an explicit-send view is supplied, transmit a
+  // sampling field ONLY if it's in the view (flag / per-model / card). Anything
+  // omitted falls through to the daemon's .hfq/arch-card resolution. Legacy
+  // callers (no view) keep sending the concrete temp/topP/repeatPenalty args.
+  const sv = extra.sampling;
+  if (sv) {
+    if (typeof sv.temperature === "number") genMsg.temperature = sv.temperature * TEMP_CORRECTION;
+    if (typeof sv.top_p === "number") genMsg.top_p = sv.top_p;
+    if (typeof sv.repeat_penalty === "number") genMsg.repeat_penalty = sv.repeat_penalty;
+    if (typeof sv.presence_penalty === "number") genMsg.presence_penalty = sv.presence_penalty;
+    // top_k / min_p: carried-but-inert (daemon ignores until P2). Sent so a
+    // future daemon inherits the card value; harmless no-op today.
+    if (typeof sv.top_k === "number") genMsg.top_k = sv.top_k;
+    if (typeof sv.min_p === "number") genMsg.min_p = sv.min_p;
+  } else {
+    genMsg.temperature = temp * TEMP_CORRECTION;
+    genMsg.repeat_penalty = repeatPenalty;
+    genMsg.top_p = topP;
+  }
   // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
   // a closed `<think></think>` block via assistant_prefix=closed_think, so
   // the model never starts a thinking turn at all. This mirrors the
@@ -1776,7 +1921,10 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
-  if (system) genMsg.system = system;
+  // System prompt: explicit --system wins; else the card's recommended
+  // system_prompt (e.g. MiniMax-M2.7's identity prompt) if one is present.
+  const effectiveSystem = system ?? sv?.system_prompt;
+  if (effectiveSystem) genMsg.system = effectiveSystem;
 
   // --json / --no-stream: accumulate the (think-stripped) content instead of
   // streaming it to stdout token-by-token, then emit a single object/blob.
@@ -2292,7 +2440,15 @@ async function serve(port: number, host: string) {
         // if both happen to be present (last-wins would silently shadow
         // an upstream system block).
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
-        if (sysMsg) systemPrompt = extractText(sysMsg.content);
+        if (sysMsg) {
+          systemPrompt = extractText(sysMsg.content);
+        } else {
+          // No client system message — fall back to the registry card's
+          // recommended system_prompt when one is curated (e.g. MiniMax-M2.7's
+          // identity prompt). A client-supplied system message always wins.
+          const cardSys = resolveSamplingForSend(body.model).system_prompt;
+          if (cardSys) systemPrompt = cardSys;
+        }
 
         // The legacy Hermes `<tools>` block injection happens LATER, after
         // the model has actually been loaded/reloaded and `currentArch` is
@@ -2670,18 +2826,38 @@ async function serve(port: number, host: string) {
         const reasoningEffort: number | null =
           effortStr && effortStr in effortMap ? effortMap[effortStr] : null;
 
+        // Explicit-send guard at the serve layer. Precedence per field:
+        //   request body  >  per-model config / registry card (resolveSamplingForSend)
+        //   >  OMIT (let the daemon's .hfq generation_config → arch ladder resolve).
+        // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
+        // card/arch resolution is no longer masked by the CLI's temp=0.3.
+        const sendView = resolveSamplingForSend(body.model);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
-          repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
-          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
           frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
-          top_p: body.top_p ?? effective.top_p,
         };
+        // temperature carries the TEMP_CORRECTION factor when sent.
+        {
+          const t = body.temperature ?? sendView.temperature;
+          if (typeof t === "number") genParams.temperature = t * TEMP_CORRECTION;
+          const tp = body.top_p ?? sendView.top_p;
+          if (typeof tp === "number") genParams.top_p = tp;
+          const rp = body.repeat_penalty ?? sendView.repeat_penalty;
+          if (typeof rp === "number") genParams.repeat_penalty = rp;
+          // presence_penalty: explicit request (any non-null) > card > omit.
+          // Clamp negatives to 0 (boosts aren't meaningful for the kernel).
+          const pp = body.presence_penalty != null
+            ? Math.max(0, Number(body.presence_penalty) || 0)
+            : sendView.presence_penalty;
+          if (typeof pp === "number") genParams.presence_penalty = pp;
+          // top_k / min_p: carried-but-inert (daemon ignores until P2).
+          if (typeof sendView.top_k === "number") genParams.top_k = sendView.top_k;
+          if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
+        }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
@@ -6487,10 +6663,21 @@ switch (cmd) {
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
     const prompt = rest.slice(1).join(" ") || (image ? "Describe this image." : "Hello");
+    // Explicit-send view: only --flag / per-model / card values get transmitted;
+    // a bare global default is omitted so the daemon's .hfq/arch-card resolution
+    // applies. The concrete temp/topP/etc. above stay as the validation surface
+    // + legacy fallback (e.g. when no card/per-model value exists, the view's
+    // field is undefined and the daemon falls through to its own default).
+    const sampling = resolveSamplingForSend(model, {
+      temperature: tempVal !== null ? Number(tempVal) : undefined,
+      top_p: topPVal !== null ? Number(topPVal) : undefined,
+      repeat_penalty: repeatPenaltyVal !== null ? Number(repeatPenaltyVal) : undefined,
+    });
     await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, {
       kvMode: kvModeVal ?? undefined,
       jsonOut: runJson,
       noStream: runNoStream,
+      sampling,
     });
     break;
   }

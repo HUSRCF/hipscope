@@ -39,6 +39,19 @@ pub struct HfqTensorInfo {
     pub data_size: usize,
 }
 
+/// Author-recommended sampling defaults baked into a .hfq's
+/// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
+/// Each field is independently `Option` so the consumer can fall through to its
+/// own default per-knob. `repeat_penalty` is HF's `repetition_penalty` under
+/// the daemon's field name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecommendedSampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub repeat_penalty: Option<f32>,
+}
+
 pub struct HfqFile {
     _file: File,
     /// Path used to open the file. Exposed via [`Self::path`] so the
@@ -276,6 +289,42 @@ impl HfqFile {
             .get("chat_template")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// Author-recommended sampling defaults baked into this .hfq's
+    /// `generation_config` metadata. The quantizer copies the source model's
+    /// `generation_config.json` verbatim into `metadata.generation_config`
+    /// (hipfire-quantize/src/main.rs); HF stores the model author's preferred
+    /// inference defaults there (`temperature`, `top_p`, `top_k`,
+    /// `repetition_penalty`). This is the lowest-priority, *baked* layer of the
+    /// sampling-inheritance ladder — the daemon prefers an explicit per-request
+    /// value or the curated registry `recommended_settings` over it, and uses
+    /// it only as a fallback ahead of the hardcoded arch ladder. Every field is
+    /// independently `Option`: absent keys stay `None` so the daemon falls
+    /// through to its own default for just that one knob.
+    ///
+    /// Note the key remap: HF's `repetition_penalty` is surfaced here as
+    /// `repeat_penalty`, matching the daemon's sampler field name (the daemon
+    /// reads the `repeat_penalty` request key, not `repetition_penalty`).
+    /// Returns `None` only when the metadata is unparseable or carries no
+    /// `generation_config` block at all.
+    pub fn recommended_sampling(&self) -> Option<RecommendedSampling> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        // `generation_config` is `null` when the source model shipped no
+        // generation_config.json (the quantizer writes `Option` → JSON null).
+        let gc = meta.get("generation_config")?;
+        if gc.is_null() {
+            return None;
+        }
+        let f32_at = |k: &str| gc.get(k).and_then(|v| v.as_f64()).map(|x| x as f32);
+        let u32_at = |k: &str| gc.get(k).and_then(|v| v.as_u64()).map(|x| x as u32);
+        Some(RecommendedSampling {
+            temperature: f32_at("temperature"),
+            top_p: f32_at("top_p"),
+            top_k: u32_at("top_k"),
+            // HF spells it `repetition_penalty`; map to the daemon's name.
+            repeat_penalty: f32_at("repetition_penalty"),
+        })
     }
 
     /// Detect whether this .hfq's retained source provenance indicates a

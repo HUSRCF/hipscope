@@ -89,6 +89,52 @@ KNOWN_KV_MODES = {
     "turbo2",
 }
 
+# Bounds for the optional curated `recommended_settings` (author-recommended
+# inference settings inherited from the parent model card). MUST stay in sync
+# with cli/registry_loader.ts validRecommendedSettings. Each present numeric
+# knob is range-checked; an out-of-range value fails the run (fail-closed).
+#   (lo, hi, int_only)
+RECOMMENDED_BOUNDS = {
+    "temperature": (0.0, 2.0, False),
+    "top_p": (0.0, 1.0, False),
+    "top_k": (1.0, 100000.0, True),
+    "min_p": (0.0, 1.0, False),
+    "presence_penalty": (0.0, 2.0, False),
+    "repeat_penalty": (0.5, 2.0, False),
+}
+
+
+def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
+    """Carry-through validator for `recommended_settings` (verbatim in v1.json).
+
+    Mirrors cli/registry_loader.ts validRecommendedSettings bounds. Adds a
+    descriptive error per offending key; does not mutate rs (deepcopy already
+    carries it through)."""
+    if rs is None:
+        return
+    if not isinstance(rs, dict):
+        errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
+        return
+    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    for key, val in rs.items():
+        if key not in allowed:
+            errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
+            continue
+        if key == "system_prompt":
+            if not isinstance(val, str):
+                errors.append(f"{tag}: recommended_settings.system_prompt must be a string")
+            continue
+        lo, hi, int_only = RECOMMENDED_BOUNDS[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            errors.append(f"{tag}: recommended_settings.{key} must be a number, got {val!r}")
+            continue
+        if int_only and not float(val).is_integer():
+            errors.append(f"{tag}: recommended_settings.{key} must be an integer, got {val!r}")
+            continue
+        if not (lo <= val <= hi):
+            errors.append(f"{tag}: recommended_settings.{key}={val} out of range [{lo}, {hi}]")
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CURATED_PATH = REPO_ROOT / "cli" / "registry.json"
 OUTPUT_PATH = REPO_ROOT / "registry" / "v1.json"
@@ -119,6 +165,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 1
     if family == "deepseek-v4-flash":
         return 9
+    if family == "minimax" or family.startswith("minimax-"):
+        return 10
     if family == "lfm2.5":
         return 11
     return None
@@ -261,6 +309,10 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_kv_mode {kv_default!r} "
                 f"(allowed: {sorted(KNOWN_KV_MODES)})"
             )
+
+        # Optional curated recommended_settings (carried verbatim by deepcopy).
+        # Validate bounds — fail-closed, mirroring registry_loader.ts.
+        validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
 
         repo = entry.get("repo", "")
         if not repo:
