@@ -11,6 +11,23 @@ import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, readFileSync, writeFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import {
+  DEFAULT_MAX_REQUEST_BYTES,
+  checkContentLength,
+  BoundedBodyReader,
+  BoundedLock,
+  LockSaturatedError,
+  parseServePidFile,
+  serializeServePidRecord,
+  validatePidOwnership,
+  reapPlanForPlatform,
+  epKvModeWarning,
+  sanitizeDaemonName,
+  parseListenInodesForPort,
+  decideProcfsPortOwnership,
+  type ServePidRecord,
+  type PidEvidence,
+} from "./serve_admission";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -52,6 +69,18 @@ export interface HipfireConfig {
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
+  // serve: max /v1/chat/completions request body, bytes. Checked from
+  // Content-Length BEFORE acquiring the serve lock (→ HTTP 413) so a giant
+  // upload can't block the daemon lock; chunked bodies are read with a
+  // byte-counting cap. Default 64 MiB. (BUG req-body-no-cap)
+  max_request_bytes: number;
+  // serve: max waiters queued behind the in-flight request before new requests
+  // get HTTP 503 + Retry-After instead of enqueuing unboundedly. 0 disables the
+  // cap (legacy unbounded FIFO). (BUG lock-no-backpressure)
+  serve_max_queue: number;
+  // serve: max ms a request waits in the admission queue before 503. 0 = no
+  // wait timeout (depth cap still applies). (BUG lock-no-backpressure)
+  serve_queue_timeout_ms: number;
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
   // Gates the daemon's `budget_alert_at_tok` + `budget_alert_text` generate
   // params. When false (default), the daemon ignores those params entirely.
@@ -229,6 +258,9 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
+  max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+  serve_max_queue: 64,
+  serve_queue_timeout_ms: 30_000,
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
   dflash_mode: "off",
@@ -312,6 +344,9 @@ function validateConfigValue(key: string, value: any): boolean {
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
+    case "max_request_bytes": return typeof value === "number" && Number.isInteger(value) && value >= 4096 && value <= 4 * 1024 * 1024 * 1024;
+    case "serve_max_queue": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100000;
+    case "serve_queue_timeout_ms": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 3600000;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
     case "dflash_adaptive_b": return typeof value === "boolean";
@@ -1247,11 +1282,39 @@ function reapOrphans(port: number, all: boolean): string[] {
       return { code: r.exitCode ?? 0, out: (r.stdout?.toString() ?? "").trim() };
     } catch { return { code: 1, out: "" }; }
   };
+  // BUG reap-linux-only: the pgrep/pkill/fuser commands are Linux-specific. On
+  // non-Linux do NOT run them (they'd silently no-op and then we'd falsely
+  // claim the port was freed). Report the limitation explicitly + try an
+  // lsof/ss port-owner probe where available.
+  const plan = reapPlanForPlatform(process.platform);
+  if (!plan.supported) {
+    out.push(`orphan reap unsupported: ${plan.note}`);
+    // Best-effort port-owner identification (don't claim a kill we can't do).
+    const owner = sh(`lsof -ti tcp:${port} 2>/dev/null || true`).out
+      || sh(`ss -ltnp 2>/dev/null | grep -w ${port} || true`).out;
+    if (owner) out.push(`port ${port} held by: ${owner} (kill it manually; reap is Linux-only)`);
+    else out.push(`port ${port}: could not determine owner (no lsof/ss); not freed`);
+    return out;
+  }
+  // The configurable daemon cmdline (default `daemon`). Lets a non-standard
+  // daemon binary name still be reaped without code edits.
+  // BUG reap-escape: HIPFIRE_DAEMON_NAME is interpolated into the pgrep/pkill
+  // shell commands below, so it MUST be sanitized first — an unvalidated value
+  // like `daemon; rm -rf ~` would run arbitrary shell. sanitizeDaemonName
+  // allowlists [A-Za-z0-9._-] and falls back to "daemon" on anything else.
+  const rawDaemonName = process.env.HIPFIRE_DAEMON_NAME;
+  const daemonName = sanitizeDaemonName(rawDaemonName);
+  if (rawDaemonName !== undefined && rawDaemonName.trim() !== "" && daemonName !== rawDaemonName.trim()) {
+    out.push(`HIPFIRE_DAEMON_NAME ${JSON.stringify(rawDaemonName)} rejected (only [A-Za-z0-9._-] allowed); using ${JSON.stringify(daemonName)}`);
+  }
   // Exact-name match on the inference daemon binary (examples/daemon). -x guards
   // against killing the bun CLI / unrelated procs that merely mention "daemon".
-  const daemons = sh(`pgrep -x daemon`).out.split("\n").filter(Boolean);
+  // `-x --` : -x = exact comm match; `--` ends option parsing so even a name
+  // that started with a dash (already rejected by sanitizeDaemonName) can never
+  // be interpreted as an option flag.
+  const daemons = sh(`pgrep -x -- ${daemonName}`).out.split("\n").filter(Boolean);
   if (daemons.length) {
-    sh(`pkill -x daemon`);
+    sh(`pkill -x -- ${daemonName}`);
     out.push(`reaped ${daemons.length} orphan daemon proc(s): ${daemons.join(" ")}`);
   } else {
     out.push("no orphan daemon procs");
@@ -1285,13 +1348,176 @@ function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function readServePid(): number | null {
+// Module-level shell capture (the one in reapOrphans is function-local). Returns
+// trimmed stdout; empty string on any failure. Used by the pid-ownership probes.
+function shCapture(cmd: string): { code: number; out: string } {
   try {
-    const raw = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
-    const pid = parseInt(raw, 10);
-    if (!pid || !isPidAlive(pid)) return null;
-    return pid;
+    const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+    return { code: r.exitCode ?? 0, out: (r.stdout?.toString() ?? "").trim() };
+  } catch { return { code: 1, out: "" }; }
+}
+
+// BUG pid-reuse: read THIS process's /proc starttime (clock ticks, field 22) so
+// the serve pidfile stores a value comparable to gatherPidEvidence()'s
+// procStartTime — the definitive reused-pid discriminator on Linux. null off
+// Linux (the validator then leans on token / cmdline / port).
+function readOwnProcStartTime(): number | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = require("fs").readFileSync(`/proc/${process.pid}/stat`, "utf-8") as string;
+    const rparen = stat.lastIndexOf(")");
+    const rest = stat.slice(rparen + 2).split(" ");
+    const st = parseInt(rest[19], 10);
+    return Number.isInteger(st) ? st : null;
   } catch { return null; }
+}
+
+// BUG pid-reuse: read the serve pidfile as a RECORD ({pid,startTime,host,port,
+// token}), tolerating an OLD bare-numeric serve.pid (marked legacy). Returns the
+// parsed record (alive or not — callers decide) or null on garbage/missing.
+function readServePidRecord(): ServePidRecord | null {
+  try {
+    const raw = require("fs").readFileSync(SERVE_PID_FILE, "utf-8");
+    return parseServePidFile(raw);
+  } catch { return null; }
+}
+
+// Back-compat shim: many call sites just want "is a serve live?" → pid or null.
+function readServePid(): number | null {
+  const rec = readServePidRecord();
+  if (!rec) return null;
+  if (!isPidAlive(rec.pid)) return null;
+  return rec.pid;
+}
+
+// BUG pid-reuse: probe whether `pid` actually OWNS `port` (TCP listener). Tries
+// lsof, then ss, then a Linux procfs walk (/proc/<pid>/fd → socket inodes vs
+// /proc/net/tcp{,6}). Returns true/false when it could determine ownership, or
+// undefined when no tool/evidence was available (the validator treats undefined
+// as "unknown", not a refusal).
+function probePortOwner(pid: number, port: number): boolean | undefined {
+  // lsof: list pids holding the TCP port. -t = terse (pids only).
+  const lsof = shCapture(`lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null || true`).out.trim();
+  if (lsof) {
+    const pids = lsof.split(/\s+/).map(s => parseInt(s, 10)).filter(Number.isInteger);
+    if (pids.length) return pids.includes(pid);
+  }
+  // ss: parse `pid=<n>` out of the process column for the listening socket.
+  const ss = shCapture(`ss -ltnHp 2>/dev/null | grep -w ${port} || true`).out;
+  if (ss && /pid=\d+/.test(ss)) {
+    const owners = new Set<number>();
+    for (const m of ss.matchAll(/pid=(\d+)/g)) owners.add(parseInt(m[1], 10));
+    if (owners.size) return owners.has(pid);
+  }
+  // procfs (Linux): AUTHORITATIVE whenever /proc/net/tcp{,6} is readable. We parse
+  // the LISTEN entries for `port` (their socket inodes) and the candidate pid's
+  // own socket inodes, then decide:
+  //   - no LISTEN entry on the port      → port is free → false (our serve gone)
+  //   - LISTEN entry, candidate holds it → true
+  //   - LISTEN entry, candidate doesn't  → false (foreign/recycled pid)
+  // Only a genuinely UNREADABLE /proc/net/tcp{,6} (and lsof/ss both failed above)
+  // leaves the answer undefined. This removes the old "candidate holds no socket
+  // fds → inconclusive even though /proc shows the port owned elsewhere" gap.
+  if (process.platform === "linux") {
+    const fs = require("fs");
+    // Parse the port's LISTEN inodes from both tcp + tcp6. Track whether we could
+    // read ANY of the two files — if neither is readable, procfs is unusable.
+    const listenInodes: string[] = [];
+    let procNetReadable = false;
+    for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      let txt: string;
+      try { txt = fs.readFileSync(f, "utf-8"); } catch { continue; }
+      procNetReadable = true;
+      listenInodes.push(...parseListenInodesForPort(txt, port));
+    }
+    if (procNetReadable) {
+      // Collect the candidate pid's socket inodes (may be empty — that's fine and
+      // is exactly the case the old code mis-handled). An unreadable fd dir just
+      // yields an empty set → "candidate holds nothing".
+      const candidateInodes = new Set<string>();
+      try {
+        const fdDir = `/proc/${pid}/fd`;
+        for (const fd of fs.readdirSync(fdDir)) {
+          try {
+            const link = fs.readlinkSync(`${fdDir}/${fd}`) as string;
+            const m = link.match(/^socket:\[(\d+)\]$/);
+            if (m) candidateInodes.add(m[1]);
+          } catch {}
+        }
+      } catch {}
+      return decideProcfsPortOwnership(listenInodes, candidateInodes);
+    }
+  }
+  return undefined;
+}
+
+// BUG pid-reuse: hit http://<host>:<port>/health and return the echoed instance
+// token (the bun serve now includes `token` in its /health JSON). undefined when
+// /health is unreachable or carries no token. Pure-TS probe (no daemon).
+async function probeHealthToken(host: string | undefined, port: number | undefined): Promise<string | undefined> {
+  if (port === undefined) return undefined;
+  const h = serveProbeHost(host ?? "127.0.0.1");
+  try {
+    const ctl = AbortSignal.timeout(800);
+    const r = await fetch(`http://${h}:${port}/health`, { signal: ctl });
+    if (!r.ok) return undefined;
+    const j = await r.json() as any;
+    return typeof j?.token === "string" ? j.token : undefined;
+  } catch { return undefined; }
+}
+
+// BUG pid-reuse (fix3): gather evidence for a pid so validatePidOwnership() can
+// confirm we're not about to SIGTERM a REUSED pid. Collects /proc starttime +
+// cmdline (Linux), port-ownership of the RESOLVED TARGET PORT (threaded in by
+// the caller — the stop/restart/serve port we're operating on, NOT just
+// rec.port, so legacy bare-pid records get a real port probe too), AND the
+// /health-echoed token on that target port. Best-effort: any field we can't
+// read stays undefined (the validator handles partial evidence).
+async function gatherPidEvidence(rec: ServePidRecord, targetPort: number): Promise<PidEvidence> {
+  const ev: PidEvidence = {};
+  if (process.platform === "linux") {
+    try {
+      const stat = require("fs").readFileSync(`/proc/${rec.pid}/stat`, "utf-8") as string;
+      // Field 22 (1-indexed) = starttime. comm (field 2) may contain spaces in
+      // parens, so split after the last ')'.
+      const rparen = stat.lastIndexOf(")");
+      const rest = stat.slice(rparen + 2).split(" ");
+      // rest[0] = state (field 3) → starttime is rest[19] (field 22).
+      const st = parseInt(rest[19], 10);
+      if (Number.isInteger(st)) ev.procStartTime = st;
+    } catch {}
+    try {
+      const cl = require("fs").readFileSync(`/proc/${rec.pid}/cmdline`) as Buffer;
+      ev.cmdline = cl.toString("utf-8").replace(/\0/g, " ").trim();
+    } catch {}
+  }
+  // PORT FIRST: probe whether the recorded pid owns the RESOLVED TARGET port.
+  // This is authoritative in the validator and applies to legacy records too
+  // (which carry no rec.port) — we always probe the port the caller is acting on.
+  {
+    const owns = probePortOwner(rec.pid, targetPort);
+    if (owns !== undefined) ev.ownsPort = owns;
+  }
+  // /health token echo (definitive ownership when it matches rec.token), probed
+  // on the target port. Only meaningful for new records (legacy carries no token).
+  if (rec.token !== undefined) {
+    const tok = await probeHealthToken(rec.host, targetPort);
+    if (tok !== undefined) ev.healthToken = tok;
+  }
+  return ev;
+}
+
+// BUG pid-reuse (fix3): decide whether `rec.pid` is safe to kill, against the
+// RESOLVED TARGET PORT the caller is operating on (stop/restart/serve all know
+// their port — thread it in). Wraps the pure validator with the liveness check +
+// gathered evidence (proc + target-port ownership + /health token). NEVER kill on
+// a false verdict — the caller unlinks the stale pidfile instead. async because
+// it probes /health.
+async function validateServePid(rec: ServePidRecord, targetPort: number): Promise<{ owned: boolean; reason: string }> {
+  const alive = isPidAlive(rec.pid);
+  if (!alive) return validatePidOwnership(rec, {}, false);
+  const ev = await gatherPidEvidence(rec, targetPort);
+  return validatePidOwnership(rec, ev, alive);
 }
 
 export function serveProbeHost(host: string): string {
@@ -1982,6 +2208,9 @@ async function serve(port: number, host: string) {
   // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
   // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
   const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
+  // BUG pid-reuse: an opaque token written to the pidfile and (future) echoed by
+  // /health, so a kill path can positively confirm "this pid is OUR serve".
+  const serveToken = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   if (ownsPidFile) {
     // hunt3 B-3: a foreground `serve` run over a running `serve -d` would
     // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
@@ -1994,7 +2223,18 @@ async function serve(port: number, host: string) {
       process.exit(1);
     }
     try {
-      require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
+      // BUG pid-reuse: write a RECORD so stop/restart/serve-dedup can validate
+      // ownership before killing (vs trusting a bare pid that may have been
+      // reused). startTime stores the /proc starttime (Linux) for the strongest
+      // reused-pid discriminator; token lets a future /health check confirm us.
+      const rec: ServePidRecord = {
+        pid: process.pid,
+        startTime: readOwnProcStartTime() ?? Date.now(),
+        host,
+        port,
+        token: serveToken,
+      };
+      require("fs").writeFileSync(SERVE_PID_FILE, serializeServePidRecord(rec));
     } catch {}
   }
   const cleanupPid = () => {
@@ -2003,8 +2243,11 @@ async function serve(port: number, host: string) {
     // (or anything else) has since rewritten it, deleting it would orphan
     // that live daemon's pid record. Read-back-and-compare.
     try {
-      const cur = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
-      if (cur === String(process.pid)) require("fs").unlinkSync(SERVE_PID_FILE);
+      const cur = parseServePidFile(require("fs").readFileSync(SERVE_PID_FILE, "utf-8"));
+      // Unlink only if the file STILL names us — match on token (new format) or
+      // bare pid (legacy/own write). Either confirms we are the rightful owner.
+      const mine = cur && cur.pid === process.pid && (cur.legacy || cur.token === serveToken);
+      if (mine) require("fs").unlinkSync(SERVE_PID_FILE);
     } catch {}
   };
   process.on("exit", cleanupPid);
@@ -2071,30 +2314,52 @@ async function serve(port: number, host: string) {
   // Serve lock: serializes all daemon stdin/stdout access so only one
   // caller is mid-send/recv on the single IPC pipe at a time. Declared
   // BEFORE the eviction interval so the eviction tick can take it too
-  // (hunt3 B-1/B-5). `busy` covers the WHOLE lock-held window (incl. the
+  // (hunt3 B-1/B-5). The lock covers the WHOLE held window (incl. the
   // model-reload window where e.generating is still false).
-  let busy = false;
-  const queue: Array<{ resolve: () => void }> = [];
-  async function acquireLock() {
-    if (!busy) { busy = true; return; }
-    await new Promise<void>(resolve => queue.push({ resolve }));
-  }
-  function releaseLock() {
-    const next = queue.shift();
-    if (next) next.resolve();
-    else busy = false;
-  }
+  //
+  // BUG lock-no-backpressure: the queue is now BOUNDED. At capacity a new
+  // request is rejected (HTTP 503 + Retry-After) instead of enqueuing
+  // unboundedly; a disconnected client is removed from the queue (no dead
+  // {resolve} entry left behind). serve_max_queue=0 → effectively unbounded.
+  const serveMaxQueue = (() => {
+    const ev = process.env.HIPFIRE_SERVE_MAX_QUEUE;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n >= 0) return n; }
+    return cfg.serve_max_queue;
+  })();
+  const serveQueueTimeoutMs = (() => {
+    const ev = process.env.HIPFIRE_SERVE_QUEUE_TIMEOUT_MS;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n >= 0) return n; }
+    return cfg.serve_queue_timeout_ms;
+  })();
+  const serveLock = new BoundedLock({
+    // 0 → unbounded FIFO (a very large cap, never rejects on depth).
+    maxQueueDepth: serveMaxQueue > 0 ? serveMaxQueue : Number.MAX_SAFE_INTEGER,
+    maxWaitMs: serveMaxQueue > 0 ? serveQueueTimeoutMs : 0,
+  });
+  // Eviction-tick acquire is INTERNAL/privileged — it must never be rejected by
+  // the request admission cap. It only runs when the lock is uncontended (the
+  // tick pre-checks `serveLock.isBusy` and bails), so a plain acquire resolves
+  // immediately; on the off chance it would queue, we swallow a saturation
+  // reject and skip this tick rather than throwing inside the interval.
+  function releaseLock() { serveLock.release(); }
+  const maxRequestBytes = (() => {
+    const ev = process.env.HIPFIRE_MAX_REQUEST_BYTES;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n > 0) return n; }
+    return cfg.max_request_bytes;
+  })();
 
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
     // Cheap pre-checks before paying the lock-wait cost.
     if (!current) return;                              // nothing to unload
     if (e.generating) return;                          // active stream — don't yank
-    if (busy) return;                                  // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
+    if (serveLock.isBusy) return;                      // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
     // hunt3 B-1: take the serve lock before touching the daemon pipe.
     // Without it, this send(unload)+recv() races a concurrent request's
-    // recv() on the one stdout — two recv() callers cross-route acks.
-    await acquireLock();
+    // recv() on the one stdout — two recv() callers cross-route acks. The
+    // isBusy pre-check above means this acquire resolves immediately; guard
+    // the (unreachable) saturation reject so the interval never throws.
+    try { await serveLock.acquire().promise; } catch { return; }
     try {
       // hunt3 B-1: re-validate the idle precondition AFTER the lock wait —
       // a request may have arrived (and finished) while we were queued.
@@ -2190,11 +2455,16 @@ async function serve(port: number, host: string) {
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/health") {
+        // BUG pid-reuse: echo the instance token we wrote to the pidfile. A kill
+        // path can hit /health and treat a matching token as DEFINITIVE proof the
+        // pid is OUR serve (not a reused pid). This is the bun serve responding —
+        // pure TS, no Rust daemon involvement.
         return Response.json({
           status: "ok",
           model: current,
           idle_timeout_sec: idleTimeoutSec,
           pid: process.pid,
+          token: serveToken,
         });
       }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
@@ -2205,12 +2475,95 @@ async function serve(port: number, host: string) {
       // Update idle timer on every real request (eviction loop checks against this).
       lastRequestTime = Date.now();
 
-      await acquireLock();
+      // BUG req-body-no-cap: reject an oversized body from Content-Length BEFORE
+      // acquiring the serve lock, so a multi-GB upload can never block the
+      // daemon lock. Chunked / no-Content-Length bodies fall through to a
+      // byte-counting cap on the read below.
+      const clVerdict = checkContentLength(req.headers.get("content-length"), maxRequestBytes);
+      if (clVerdict.reject) {
+        return Response.json(
+          { error: { message: `request body too large (${clVerdict.reason}); max ${maxRequestBytes} bytes`, type: "invalid_request_error", code: "request_too_large" } },
+          { status: 413 },
+        );
+      }
+
+      // BUG req-body-no-cap: read the FULL body (size-capped) BEFORE touching the
+      // serve lock. For EVERY body shape — declared Content-Length, chunked,
+      // absent, or malformed Content-Length — the byte-counting cap + 413 happen
+      // entirely pre-lock, so no body byte is ever read inside the daemon-lock
+      // critical section. A slow / multi-GB upload can no longer pin the lock and
+      // starve every other client. We always stream through BoundedBodyReader
+      // (never req.json()) so the cap applies uniformly regardless of whether the
+      // declared Content-Length was trustworthy.
+      let body: any;
+      {
+        const reader = new BoundedBodyReader(maxRequestBytes);
+        const chunks: Uint8Array[] = [];
+        let overflowed = false;
+        const stream = req.body;
+        if (stream) {
+          const rd = stream.getReader();
+          try {
+            for (;;) {
+              const { done, value } = await rd.read();
+              if (done) break;
+              if (value) {
+                chunks.push(value);
+                if (!reader.push(value.byteLength)) { overflowed = true; try { await rd.cancel(); } catch {} break; }
+              }
+            }
+          } catch {
+            // Client disconnected / aborted mid-upload: treat as a malformed
+            // request rather than letting the throw escape (no lock held yet).
+            return Response.json(
+              { error: { message: "request body read aborted", type: "invalid_request_error", code: "bad_request" } },
+              { status: 400 },
+            );
+          }
+        }
+        if (overflowed) {
+          return Response.json(
+            { error: { message: `request body too large (streamed > ${maxRequestBytes} bytes)`, type: "invalid_request_error", code: "request_too_large" } },
+            { status: 413 },
+          );
+        }
+        const joined = new Uint8Array(reader.bytesRead);
+        let off = 0;
+        for (const c of chunks) { joined.set(c, off); off += c.byteLength; }
+        try {
+          body = JSON.parse(new TextDecoder().decode(joined));
+        } catch {
+          return Response.json(
+            { error: { message: "request body is not valid JSON", type: "invalid_request_error", code: "bad_request" } },
+            { status: 400 },
+          );
+        }
+      }
+
+      // BUG lock-no-backpressure: bounded admission. At capacity the client gets
+      // 503 + Retry-After instead of being enqueued forever; if the client
+      // disconnects while queued we abort() its waiter so the slot frees.
+      const adm = serveLock.acquire();
+      const onAbort = () => adm.abort();
+      try { req.signal?.addEventListener("abort", onAbort, { once: true }); } catch {}
+      try {
+        await adm.promise;
+      } catch (admErr: any) {
+        try { req.signal?.removeEventListener?.("abort", onAbort); } catch {}
+        if (admErr instanceof LockSaturatedError) {
+          return new Response(
+            JSON.stringify({ error: { message: "server busy: admission queue saturated; retry shortly", type: "server_error", code: "queue_saturated" } }),
+            { status: 503, headers: { "content-type": "application/json", "retry-after": String(admErr.retryAfterSec) } },
+          );
+        }
+        throw admErr;
+      }
+      try { req.signal?.removeEventListener?.("abort", onAbort); } catch {}
       // hunt3 B-5: re-bump after the lock wait so a request that sat QUEUED
       // behind a long generation (potentially longer than idle_timeout) does
       // not let the eviction tick fire the instant it finally begins. The
-      // `busy` lock flag already blocks eviction for the whole lock-held
-      // window (incl. the reload window where e.generating is still false).
+      // lock flag already blocks eviction for the whole lock-held window
+      // (incl. the reload window where e.generating is still false).
       lastRequestTime = Date.now();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
@@ -2245,7 +2598,9 @@ async function serve(port: number, host: string) {
       }
 
       try {
-        const body = (await req.json()) as any;
+        // BUG req-body-no-cap: `body` was already read + size-capped BEFORE the
+        // serve lock (see above). No body byte is read inside this critical
+        // section, so a slow/oversized upload can't pin the daemon lock.
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -4161,13 +4516,32 @@ async function runServe(args: string[]) {
   host = host ?? cfg.host;
   port = port ?? cfg.port;
 
+  // BUG ep-ignores-kvmode: the daemon EP/multi-GPU load currently drops
+  // kv_mode_override. When the operator asks for BOTH tp>1 and a non-default
+  // --kv-mode, warn loudly so they aren't misled into thinking it took effect.
+  {
+    const tpForWarn = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
+    const kvForWarn = process.env.HIPFIRE_KV_MODE ?? null;
+    const w = epKvModeWarning(tpForWarn, kvForWarn);
+    if (w) console.error(`[serve] WARNING: ${w}`);
+  }
+
   if (detach) {
-    // Refuse to start a second one.
-    const existing = readServePid();
-    if (existing) {
-      console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
-      console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
-      process.exit(1);
+    // Refuse to start a second one — but ONLY when the pidfile names a pid that
+    // VALIDATES as a live hipfire serve (BUG pid-reuse). A stale pidfile whose
+    // pid was reused by an unrelated process must NOT block a new serve; unlink
+    // it and proceed.
+    const existingRec = readServePidRecord();
+    if (existingRec) {
+      const v = await validateServePid(existingRec, port);
+      if (v.owned) {
+        console.error(`hipfire serve already running (PID ${existingRec.pid}) on port ${port}.`);
+        console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
+        process.exit(1);
+      } else {
+        console.error(`[serve] ignoring stale pidfile (PID ${existingRec.pid}): ${v.reason}`);
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      }
     }
     // Fork a detached child. `setsid` gives it its own session so Ctrl-C in the
     // parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout + stderr go
@@ -5694,6 +6068,21 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
       range: [0, 86400], step: 30,
     },
+    max_request_bytes: {
+      label: "max_request_bytes",
+      desc: "serve: max /v1/chat/completions request body in bytes (checked before the serve lock; over-limit → HTTP 413). Default 64 MiB.",
+      range: [4096, 4 * 1024 * 1024 * 1024], step: 1024 * 1024,
+    },
+    serve_max_queue: {
+      label: "serve_max_queue",
+      desc: "serve: max requests queued behind the in-flight one before new requests get HTTP 503 + Retry-After (0 = unbounded FIFO)",
+      range: [0, 100000], step: 1,
+    },
+    serve_queue_timeout_ms: {
+      label: "serve_queue_timeout_ms",
+      desc: "serve: max ms a request waits in the admission queue before 503 (0 = no wait timeout)",
+      range: [0, 3600000], step: 1000,
+    },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
       desc: "allow the budget_alert_at_tok / budget_alert_text generate params (research-only in-band nudge injected into the model's think stream — can leak into visible output). false = daemon ignores those params",
@@ -6534,19 +6923,29 @@ switch (cmd) {
       else if (/^[^:]+:\d+$/.test(a)) restartPort = parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
     }
     // Graceful stop of the tracked pid first (mirrors `hipfire stop`).
-    const tracked = readServePid();
-    if (tracked) {
-      try {
-        process.kill(tracked, "SIGTERM");
-        for (let i = 0; i < 50; i++) {
-          await new Promise(r => setTimeout(r, 100));
-          if (!isPidAlive(tracked)) break;
-        }
-        if (isPidAlive(tracked)) { try { process.kill(tracked, "SIGKILL"); } catch {} }
+    // BUG pid-reuse: validate ownership before SIGTERM/SIGKILL — NEVER kill a
+    // pid that fails validation (it was reused by an unrelated process); just
+    // unlink the stale pidfile.
+    const trackedRec = readServePidRecord();
+    if (trackedRec) {
+      const v = await validateServePid(trackedRec, restartPort);
+      if (!v.owned) {
+        console.error(`[restart] not killing PID ${trackedRec.pid}: ${v.reason} — removing stale pidfile`);
         try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
-        console.error(`[restart] stopped serve (PID ${tracked})`);
-      } catch (err: any) {
-        console.error(`[restart] failed to stop tracked PID ${tracked}: ${err?.message ?? err}`);
+      } else {
+        const tracked = trackedRec.pid;
+        try {
+          process.kill(tracked, "SIGTERM");
+          for (let i = 0; i < 50; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            if (!isPidAlive(tracked)) break;
+          }
+          if (isPidAlive(tracked)) { try { process.kill(tracked, "SIGKILL"); } catch {} }
+          try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+          console.error(`[restart] stopped serve (PID ${tracked})`);
+        } catch (err: any) {
+          console.error(`[restart] failed to stop tracked PID ${tracked}: ${err?.message ?? err}`);
+        }
       }
     }
     // Force-reap any orphans + free the port so the new serve binds cleanly.
@@ -6585,8 +6984,12 @@ switch (cmd) {
       }
     }
 
-    const pid = readServePid();
-    if (pid) {
+    // BUG pid-reuse: validate ownership before killing. A pidfile whose pid was
+    // reused by an unrelated process must NOT be killed — unlink it instead.
+    const stopRec = readServePidRecord();
+    const stopVerdict = stopRec ? await validateServePid(stopRec, stopPort) : null;
+    if (stopRec && stopVerdict && stopVerdict.owned) {
+      const pid = stopRec.pid;
       try {
         process.kill(pid, "SIGTERM");
         // Wait up to 5s for graceful shutdown
@@ -6604,6 +7007,11 @@ switch (cmd) {
         console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
         if (!(force || all)) process.exit(1);
       }
+    } else if (stopRec && stopVerdict && !stopVerdict.owned) {
+      // Pidfile present but the pid is not our serve (dead or reused).
+      console.error(`Not killing PID ${stopRec.pid}: ${stopVerdict.reason} — removing stale pidfile`);
+      try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      if (!(force || all)) { console.log("hipfire serve is not running."); break; }
     } else if (!(force || all)) {
       console.log("hipfire serve is not running.");
       break;
