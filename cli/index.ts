@@ -514,7 +514,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
-  const baseMode = resolveKvMode(resolved);
+  const baseMode = resolveKvMode(resolved, tag);
   const effectiveMode = sizeAwareKvMode(baseMode, resolved, tag);
   if (effectiveMode !== baseMode) {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
@@ -797,6 +797,11 @@ interface ModelEntry {
   /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
   /// is required once the file is in MODELS_DIR.
   mtp?: { file: string };
+  /// Optional per-model KV-cache default (the registry is the per-model card).
+  /// When present it takes precedence over the per-GPU archDefaults fallback in
+  /// resolveKvMode (but still loses to HIPFIRE_KV_MODE env and per-model
+  /// config). Validated against REGISTRY_KV_MODE_VALUES at registry-load time.
+  default_kv_mode?: string | null;
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -943,9 +948,26 @@ function archDefaults(arch: string): ArchDefaults {
 // Canonical modes: q8, asym4, asym3, asym2.
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
 // (plus "auto" → arch default).
-function resolveKvMode(cfg: HipfireConfig): string {
-  const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
-  if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+// Precedence (highest → lowest):
+//   HIPFIRE_KV_MODE env  >  per-model config (models.json per-tag kv_cache)
+//   >  the resolved model's registry `default_kv_mode`  >  archDefaults.
+// The first two arrive folded into `cfg.kv_cache` (env via `||`, per-model via
+// resolveModelConfig before this call). `cfg.kv_cache === "auto"` means "no
+// explicit user/per-model config" — only THEN does the registry's per-model
+// recommendation, and finally the per-GPU arch fallback, apply.
+function resolveKvMode(cfg: HipfireConfig, tag?: string | null): string {
+  let raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
+  if (raw === "auto") {
+    // No env / no explicit per-model config: prefer the registry's per-model
+    // default_kv_mode if the resolved model carries one, else arch fallback.
+    const regDefault = tag ? REGISTRY[resolveModelTag(tag)]?.default_kv_mode : undefined;
+    raw = (typeof regDefault === "string" && regDefault.length > 0)
+      ? regDefault
+      : ARCH_DEFAULTS.kv_cache; // per-model registry default takes precedence; this is the no-recommendation fallback
+    // A registry default_kv_mode of "auto" (or arch fallback "auto", which
+    // archDefaults never returns) collapses to the arch default.
+    if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+  }
   if (raw === "turbo" || raw === "turbo3") return "asym3";
   if (raw === "turbo2") return "asym2";
   if (raw === "turbo4") return "asym4";
@@ -971,7 +993,7 @@ function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | un
 // auto-resolution of model-size-dependent flags (currently only
 // dflash_ngram_block).
 function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
-  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg, modelTag);
   // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
   // shell (env overrides config). `auto` is the engine default — skip the
   // env var in that case so the engine's own default applies.

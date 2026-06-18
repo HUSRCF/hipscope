@@ -6,6 +6,7 @@
       "file": "qwen3.5-0.8b.mq4",
       "size_gb": 0.55,
       "min_vram_gb": 1,
+      "default_kv_mode": "q8",
       "desc": "386 / 5100 tok/s"
     },
     "qwen3.5:4b": {
@@ -13,6 +14,7 @@
       "file": "qwen3.5-4b.mq4",
       "size_gb": 2.6,
       "min_vram_gb": 4,
+      "default_kv_mode": "q8",
       "desc": "169 / 1900 tok/s"
     },
     "qwen3.5:9b": {
@@ -20,6 +22,7 @@
       "file": "qwen3.5-9b.mq4",
       "size_gb": 5.3,
       "min_vram_gb": 6,
+      "default_kv_mode": "q8",
       "desc": "125 / 1720 tok/s"
     },
     "qwen3.5:27b": {
@@ -27,6 +30,7 @@
       "file": "qwen3.5-27b.mq4",
       "size_gb": 15.0,
       "min_vram_gb": 16,
+      "default_kv_mode": "q8",
       "desc": "45 / 489 tok/s, 16GB+"
     },
     "qwen3.5:35b-a3b": {
@@ -34,6 +38,7 @@
       "file": "qwen3.5-35b-a3b.mq4",
       "size_gb": 19.7,
       "min_vram_gb": 22,
+      "default_kv_mode": "q8",
       "desc": "MoE 35B/3B-active, 115 tok/s"
     },
     "deepseek-v4-flash": {
@@ -51,6 +56,7 @@
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
+      "default_kv_mode": "q8",
       "desc": "MoE 35B/3B-active. mq4p graded-HQ default (robust on all arches; supersedes the dense-AWQ mq4 which is gfx12-only)."
     },
     "qwen3.6:35b-a3b-mq2": {
@@ -107,6 +113,7 @@
       "file": "qwen3.6-27b.mq4",
       "size_gb": 15.0,
       "min_vram_gb": 16,
+      "default_kv_mode": "q8",
       "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
       "triattn": {
         "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"

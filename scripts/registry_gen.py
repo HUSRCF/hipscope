@@ -70,6 +70,24 @@ KNOWN_QUANTS = {
     "q8",
     "hfq",
 }
+# Allowlist for the optional per-entry `default_kv_mode` field (the registry is
+# the per-model card). MUST stay in sync with cli/index.ts validateConfigValue
+# /resolveKvMode and cli/registry_loader.ts REGISTRY_KV_MODE_VALUES. A curated
+# entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
+KNOWN_KV_MODES = {
+    "auto",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+}
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CURATED_PATH = REPO_ROOT / "cli" / "registry.json"
@@ -234,6 +252,15 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
         quant = quant_for(entry.get("file", ""))
         if quant is None:
             errors.append(f"{tag}: unknown quant for file {entry.get('file')!r}")
+
+        # Optional per-model default_kv_mode (carried through verbatim by the
+        # deepcopy above). Validate against the KV allowlist — fail-closed.
+        kv_default = entry.get("default_kv_mode")
+        if kv_default is not None and kv_default not in KNOWN_KV_MODES:
+            errors.append(
+                f"{tag}: invalid default_kv_mode {kv_default!r} "
+                f"(allowed: {sorted(KNOWN_KV_MODES)})"
+            )
 
         repo = entry.get("repo", "")
         if not repo:
