@@ -418,58 +418,32 @@ impl Carrier for LlamaCarrier {
         matches!(arch_id, 0 | 1)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        match src {
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "llama: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "llama: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        if let ModelSource::Dir(s) = &src {
+            eprintln!("  safetensors arch_id={}", s.arch_id());
+        }
+        let meta = resolve_source_meta(&src, ctx.path)?;
+
+        // ── source-varying seam: yields a LlamaBundle ──
+        let bundle = match src {
             ModelSource::Hfq(hfq) => {
-                if ctx.pp > 1 {
-                    return Err("llama: pipeline-parallel (pp>1) unsupported".into());
-                }
-                let hfq_file = &hfq;
-                let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(
-                    &hfq_file.metadata_json,
-                )
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-                let chat_template = resolve_chat_template(hfq_file, ctx.path);
-                let arch_id = hfq_file.arch_id;
-                let bundle = hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?;
-                Ok(LoadedModel {
-                    state: Some(ModelState::Llama(bundle)),
-                    ..LoadedModel::skeleton(
-                        arch_id,
-                        tokenizer,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                        ctx.path.to_string(),
-                        chat_template,
-                    )
-                })
+                hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
             }
             ModelSource::Dir(source) => {
-                if ctx.pp > 1 {
-                    return Err("llama: safetensors + pp>1 unsupported".into());
-                }
-                let arch_id = source.arch_id();
-                eprintln!("  safetensors arch_id={arch_id}");
-
-                let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
-                    hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-                        .map_err(|e| {
-                            format!("failed to parse tokenizer at {}: {e}", tok_path.display())
-                        })?
-                        .ok_or_else(|| {
-                            format!("failed to load tokenizer from {}", tok_path.display())
-                        })?
-                } else {
-                    return Err("no tokenizer.json found in model directory".into());
-                };
-                let chat_template = source.chat_template();
-
-                let config =
-                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
+                let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
+                    .map_err(|e| {
                         format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
                     })?;
-                let weights =
-                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+                let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(
+                    &source, &config, ctx.gpu,
+                )
+                .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
                 let kv_mode = ctx
                     .kv_mode_override
                     .filter(|s| !s.is_empty())
@@ -502,26 +476,27 @@ impl Carrier for LlamaCarrier {
                 .map_err(|e| format!("KvCache: {e}"))?;
                 let scratch = hipfire_runtime::llama::ForwardScratch::new(ctx.gpu, &config)
                     .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
-
-                let bundle = hipfire_arch_llama::LlamaBundle {
+                hipfire_arch_llama::LlamaBundle {
                     config,
                     weights,
                     scratch,
                     kv,
-                };
-                Ok(LoadedModel {
-                    state: Some(ModelState::Llama(bundle)),
-                    ..LoadedModel::skeleton(
-                        arch_id,
-                        tokenizer,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                        ctx.path.to_string(),
-                        chat_template,
-                    )
-                })
+                }
             }
-        }
+        };
+
+        // ── single shared tail ──
+        Ok(LoadedModel {
+            state: Some(ModelState::Llama(bundle)),
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
     }
 }
 
