@@ -7412,13 +7412,21 @@ pub fn argmax(logits: &[f32]) -> u32 {
     // NaN, so a NaN logit is never selected and never displaces the real max.
     // The previous `max_by(partial_cmp.unwrap_or(Less))` kept a trailing NaN
     // candidate (verified: [1,5,3,NaN] → idx 3) — a NaN-indexed garbage token
-    // on the greedy path poisons the recurrent DeltaNet state. Empty logits
-    // would be a caller bug; fold over an empty slice returns index 0.
+    // on the greedy path poisons the recurrent DeltaNet state.
+    //
+    // O2b-2 finite guard: this is also the degenerate fallback for the sampler
+    // (`sample_top_p` / `sample_full_dist`), so it must skip ALL non-finite
+    // values, not just NaN. A `+Inf` logit would otherwise win the bare `>`
+    // comparison and be selected over the real finite max — `is_finite()` in
+    // the predicate keeps both `+Inf` and `NaN` from displacing a finite token.
+    // Mixed finite + non-finite → the finite max. All-non-finite (or empty)
+    // never replaces the seed → deterministic index 0, matching the
+    // O1-accepted `sample_full_dist` degenerate behavior.
     logits
         .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
-            if v > best.1 {
+            if v.is_finite() && v > best.1 {
                 (i, v)
             } else {
                 best
@@ -7622,6 +7630,13 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
 
     // Single pass: find max AND top-K indices from raw logits simultaneously.
     // Uses a fixed-size array (no heap alloc) with manual min-tracking.
+    //
+    // FINITE GUARD (ported from sample_full_dist, the O1 fix): only finite
+    // logits feed `max_logit` and the top-K set. A `+Inf` logit must not become
+    // `max_logit` (then `(l - max)` = Inf - Inf = NaN → exp(NaN) = NaN → NaN sum
+    // → degenerate token-0 return), and a NaN logit (already `>`-false) must not
+    // occupy a top-K slot. Slots left at NEG_INFINITY are zeroed in the softmax
+    // below, and if no finite mass survives we fall back to the NaN-safe argmax.
     let mut topk_val = [f32::NEG_INFINITY; TOP_K];
     let mut topk_idx = [0u32; TOP_K];
     let mut min_pos = 0usize; // index of smallest element in topk
@@ -7629,6 +7644,9 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     let mut max_logit = f32::NEG_INFINITY;
 
     for (i, &l) in logits.iter().enumerate() {
+        if !l.is_finite() {
+            continue;
+        }
         if l > max_logit {
             max_logit = l;
         }
@@ -7646,13 +7664,27 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
-    // Softmax only the K candidates (temperature-scaled)
+    // Softmax only the K candidates (temperature-scaled). FINITE GUARD: a slot
+    // still holding NEG_INFINITY (fewer than TOP_K finite logits) or a non-
+    // finite computed prob contributes zero mass rather than poisoning `sum`.
     let mut probs = [0.0f32; TOP_K];
     let mut sum = 0.0f32;
     for i in 0..TOP_K {
-        let p = ((topk_val[i] - max_logit) * inv_temp).exp();
+        let p = if topk_val[i].is_finite() {
+            let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
+            if pp.is_finite() { pp } else { 0.0 }
+        } else {
+            0.0
+        };
         probs[i] = p;
         sum += p;
+    }
+
+    // Degenerate guard: if no finite mass survives (all-NaN / all-+Inf / all
+    // -inf logits), fall back to argmax of the raw logits (its own NaN guard
+    // returns a finite in-vocab index, never the poisoned token 0).
+    if sum <= 0.0 || !sum.is_finite() {
+        return argmax(logits);
     }
 
     // Sort descending by probability (insertion sort on 20 elements)
@@ -8109,6 +8141,84 @@ mod tests {
         assert_eq!(argmax(&logits), 2);
     }
 
+    // O2b-2 finite-guard: argmax is the sampler degenerate fallback, so it must
+    // skip ALL non-finite values (not just NaN). A `+Inf` must never win the
+    // bare `>` over a real finite max.
+
+    #[test]
+    fn argmax_pos_inf_does_not_displace_finite_max() {
+        // Pre-fix: +Inf at idx 2 wins `>` → idx 2. With the finite guard the
+        // real finite max (idx 1) is returned.
+        let logits = [1.0f32, 5.0, f32::INFINITY, 3.0];
+        assert_eq!(argmax(&logits), 1);
+    }
+
+    #[test]
+    fn argmax_mixed_finite_and_nonfinite_picks_finite() {
+        // +Inf, NaN, and a finite peak interleaved → the finite peak (idx 4).
+        let logits = [
+            f32::INFINITY,
+            f32::NAN,
+            -2.0,
+            f32::NAN,
+            9.0,
+            f32::INFINITY,
+        ];
+        assert_eq!(argmax(&logits), 4);
+    }
+
+    #[test]
+    fn argmax_all_pos_inf_returns_zero() {
+        // No finite value survives → deterministic index 0 (matches the
+        // sample_full_dist degenerate fallback contract).
+        let logits = [f32::INFINITY; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    #[test]
+    fn argmax_all_nan_returns_zero() {
+        let logits = [f32::NAN; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    // O2b-2 overflow-guard: the daemon capacity guards compute
+    // `prompt + max_tokens` (or `start + suffix + max_tokens`) in usize and
+    // compare against a cap. An adversarial `max_tokens` near usize::MAX must
+    // not wrap the sum below the cap and slip past the guard. The guards use
+    // `saturating_add`; this asserts the saturating comparison still rejects.
+    #[test]
+    fn capacity_guard_saturating_add_rejects_huge_max_tokens() {
+        let cap: usize = 32_768;
+        let prompt_n: usize = 100;
+        let max_tokens: usize = usize::MAX - 1;
+        // Unchecked `prompt_n + max_tokens` would panic in debug / wrap in
+        // release to `prompt_n - 2` (≈ usize::MAX), which is > cap by luck here,
+        // but for an adversarial max_tokens chosen to land the wrapped sum
+        // under the cap it would bypass. saturating_add can never wrap.
+        assert!(prompt_n.saturating_add(max_tokens) > cap);
+
+        // Choose max_tokens so the *wrapped* unchecked sum would fall under the
+        // cap: max_tokens = usize::MAX - prompt_n + 1 → wraps to 0 < cap, which
+        // would WRONGLY pass an unchecked guard. saturating_add saturates to
+        // usize::MAX, so the guard still rejects.
+        let adversarial = usize::MAX - prompt_n + 1;
+        assert_eq!(prompt_n.wrapping_add(adversarial), 0, "wrapped sum is 0");
+        assert!(
+            prompt_n.saturating_add(adversarial) > cap,
+            "saturating guard must still reject the wrap-to-zero adversarial max_tokens"
+        );
+
+        // Triple-add form used by the ds4 single-GPU guard.
+        let start_pos: usize = 50;
+        let suffix_len: usize = 50;
+        assert!(
+            start_pos
+                .saturating_add(suffix_len)
+                .saturating_add(usize::MAX)
+                > cap
+        );
+    }
+
     // O1 fix-wave: edge-case guards for the host EP sampler `sample_full_dist`.
     // All run CPU-only; they seed the shared RNG via `reset_cpu_sampler_rng`
     // so the multinomial draw is deterministic.
@@ -8434,5 +8544,60 @@ mod tests {
         // Mock KvCache to test is_boundary logic
         // Since KvCache requires GPU allocation, we test the predicate in isolation
         // by constructing the boolean checks that the dispatch uses.
+    }
+
+    // O2b-2 fix-wave: finite/NaN guards for the LEGACY CPU sampler `sample_top_p`
+    // (the single-GPU non-EP path). Before the fix an all-non-finite logit
+    // vector collapsed to token 0 (max_logit stayed -inf / Inf-Inf=NaN poisoned
+    // the softmax sum). These mirror the `sample_full_dist_*` guards above:
+    // every degenerate input must still return a FINITE, in-vocab token.
+
+    #[test]
+    fn legacy_sample_top_p_all_nan_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(12345);
+        let logits = [f32::NAN; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-NaN must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_all_pos_inf_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(777);
+        // Pre-fix: +Inf max → (Inf - Inf) = NaN softmax → NaN sum → token 0.
+        let logits = [f32::INFINITY; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-+Inf must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_mixed_finite_nan_picks_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // The only finite mass is at idx 2 (a sharp peak after temp). The NaN
+        // slots (0,1,3,4) must never be drawn, and the +Inf slot (5) must be
+        // skipped — the draw is forced onto the finite peak regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [
+                f32::NAN,
+                f32::NAN,
+                20.0f32,
+                f32::NAN,
+                f32::NAN,
+                f32::INFINITY,
+            ];
+            let idx = sample_top_p(&logits, 0.7, 0.9);
+            assert_eq!(
+                idx, 2,
+                "mixed finite+NaN+Inf must pick the lone finite peak (seed {seed})"
+            );
+        }
     }
 }

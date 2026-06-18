@@ -2996,7 +2996,7 @@ fn main() {
                 // generate request against the loaded model still has room. We guard
                 // on the *physical* buffer (not the advertised max_seq) because this
                 // bench intentionally bypasses eviction to measure raw prefill.
-                if n + 32 > m.physical_cap {
+                if n.saturating_add(32) > m.physical_cap {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
@@ -6142,6 +6142,24 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 
     let prompt_n = prompt_ids.len();
 
+    // O2b-2 capacity guard (ds4 EP): this path replays the full prompt from
+    // position 0 every turn (no LCP reuse), so the absolute KV span is
+    // prompt_n + max_tokens. Without eviction the EP state KV was allocated
+    // for `m.physical_cap` (== max_seq at load). Overrunning it drives
+    // forward_ep past the KV buffer → corruption/panic (serve-wide crash).
+    // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
     let mut parser = match think_mode {
         ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
         ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
@@ -6427,6 +6445,24 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool, sampling: EpSampling) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
+
+    // O2b-2 capacity guard (minimax EP): even with LCP reuse the KV ends up
+    // holding [0, prompt_n) after prefill, then decode appends max_tokens, so
+    // the absolute span is prompt_n + max_tokens. The EP state KV was allocated
+    // for `m.physical_cap` (== max_seq at load); overrunning it writes past the
+    // per-rank KV buffer → corruption/panic (serve-wide crash). Emit a clean
+    // error and return BEFORE any state mutation — mirror the qwen35 guard.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // ── LCP partial reuse. The per-rank KV holds [0, prior_total) from last
     // turn; `conversation_tokens` mirrors it. Rewind n_tokens to the common
@@ -7378,7 +7414,7 @@ fn generate_dflash(
     } else {
         ctx_capacity
     };
-    if prompt_tokens.len() + df.block_size > eff_prompt_cap {
+    if prompt_tokens.len().saturating_add(df.block_size) > eff_prompt_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+block_size exceeds {} {} (eviction {})"}}"#,
@@ -7398,7 +7434,13 @@ fn generate_dflash(
         m.q35_scratch = Some(target.scratch);
         return;
     }
-    if m.eviction.is_none() && prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
+    if m.eviction.is_none()
+        && prompt_tokens
+            .len()
+            .saturating_add(max_tokens)
+            .saturating_add(df.block_size)
+            > ctx_capacity
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)"}}"#,
@@ -7825,7 +7867,7 @@ fn generate_dflash(
             let _ = stdout.flush();
             return;
         }
-        if position + df.block_size >= ctx_capacity {
+        if position.saturating_add(df.block_size) >= ctx_capacity {
             break;
         }
 
@@ -8281,7 +8323,7 @@ fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -8535,7 +8577,12 @@ fn generate_multi(
     }
 
     let trailer = nl.len();
-    if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+    if m.seq_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.physical_cap
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -9081,7 +9128,11 @@ fn generate_multi(
             let nudge_tokens = tokenizer.encode(budget_alert_text);
             let budget_left = max_tokens.saturating_sub(generated);
             let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv = m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+            let need_kv = m
+                .seq_pos
+                .saturating_add(nudge_len)
+                .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.conversation_tokens.push(tok);
@@ -9541,7 +9592,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             m.seq_pos
         );
     }
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+    {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -10323,11 +10376,17 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // the advertised context window (max_seq) — refuse requests that would
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
-    let absolute_pos = m.seq_pos
-        + m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
-        + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+    let absolute_pos = m
+        .seq_pos
+        .saturating_add(m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0))
+        .saturating_add(m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0));
     if m.eviction.is_none() {
-        if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+        if m.seq_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.physical_cap
+    {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -10341,7 +10400,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             let _ = stdout.flush();
             return;
         }
-    } else if absolute_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
+    } else if absolute_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.max_seq
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
@@ -11199,8 +11263,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv =
-                    m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                let need_kv = m.seq_pos
+                    .saturating_add(nudge_len)
+                    .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                    .saturating_add(nl.len());
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
@@ -12245,6 +12311,30 @@ fn generate_deepseek4(
     // that adds N new tokens this is just those N.
     let suffix_tokens: &[u32] = &prompt_ids[lcp..];
 
+    // O2b-2 capacity guard (ds4 single-GPU): after any cache reset above, the
+    // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
+    // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
+    // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
+    // down serve. Emit a clean error and return BEFORE prefill.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if (start_pos as usize)
+        .saturating_add(suffix_tokens.len())
+        .saturating_add(max_tokens)
+        > m.physical_cap
+    {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id,
+            start_pos as usize + suffix_tokens.len(),
+            max_tokens,
+            m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
     // Prefill: batched chunked through PBS. If spec_mode, also fill the
     // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
     // draft step sees a populated MTP history.
@@ -12995,7 +13085,11 @@ fn generate_lfm2moe(
     // cursors when the requested run would overflow the budget.
     let overflow = {
         let state = m.lfm2moe_state.as_ref().unwrap();
-        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+        state
+            .n_tokens
+            .saturating_add(prompt_ids.len())
+            .saturating_add(max_tokens)
+            > state.max_seq
     };
     if overflow {
         let (n, cap) = {
@@ -13008,6 +13102,25 @@ fn generate_lfm2moe(
         let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+
+        // O2b-2 capacity guard (lfm2moe single): the reset above (n_tokens=0)
+        // recovers a grown multi-turn conversation, but a SINGLE prompt larger
+        // than the whole context still overflows — the prefill decode_step loop
+        // writes past the KV (sized for state.max_seq) and panics, taking down
+        // serve. After the reset, if prompt + generation still overflows, emit a
+        // clean error and return BEFORE prefill — mirror the minimax/qwen2 guard.
+        // saturating_add: an adversarially huge max_tokens must not wrap usize
+        // and slip under the cap.
+        let cap = m.lfm2moe_state.as_ref().unwrap().max_seq;
+        if prompt_ids.len().saturating_add(max_tokens) > cap {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+                id, prompt_ids.len(), max_tokens, cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 
     let t0 = Instant::now();
@@ -13243,7 +13356,7 @@ fn generate_minimax(
     // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
     let overflow = {
         let state = m.minimax_state.as_ref().unwrap();
-        prompt_ids.len() + max_tokens > state.max_seq
+        prompt_ids.len().saturating_add(max_tokens) > state.max_seq
     };
     if overflow {
         let (n, cap) = {
@@ -13256,6 +13369,24 @@ fn generate_minimax(
         m.minimax_state.as_mut().unwrap().reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+
+        // O2b-2 capacity guard (minimax single): the reset above recovers a
+        // grown multi-turn conversation, but a SINGLE prompt larger than the
+        // whole context can never fit — prefilling it would write past the KV
+        // (sized for state.max_seq) and panic, taking down serve. After the
+        // reset, if prompt + generation still overflows, emit a clean error.
+        let cap = m.minimax_state.as_ref().unwrap().max_seq;
+        // saturating_add: an adversarially huge max_tokens must not wrap usize
+        // and slip under the cap.
+        if prompt_ids.len().saturating_add(max_tokens) > cap {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+                id, prompt_ids.len(), max_tokens, cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 
     // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
@@ -13536,7 +13667,12 @@ fn generate_qwen2(
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    if state.next_pos + prompt_ids.len() + max_tokens > state.max_seq {
+    if state
+        .next_pos
+        .saturating_add(prompt_ids.len())
+        .saturating_add(max_tokens)
+        > state.max_seq
+    {
         eprintln!(
             "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
             state.next_pos, state.max_seq,
@@ -13544,6 +13680,24 @@ fn generate_qwen2(
         state.reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+
+        // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
+        // recovers a grown multi-turn conversation, but a SINGLE prompt larger
+        // than the whole context still overflows — prefilling it writes past
+        // the KV (sized for state.max_seq) and panics, taking down serve. After
+        // the reset, if prompt + generation still overflows, emit a clean error.
+        // saturating_add: an adversarially huge max_tokens must not wrap usize
+        // and slip under the cap.
+        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
+            let cap = state.max_seq;
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+                id, prompt_ids.len(), max_tokens, cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 
     let t0 = Instant::now();
@@ -13758,7 +13912,9 @@ fn generate_vl(
         .unwrap_or(0);
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+    {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -13786,13 +13942,13 @@ fn generate_vl(
         }
     }
 
-    if m.eviction.is_none() && prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.max_seq {
         write_error(
             stdout,
             id,
             &format!(
                 "request size ({} tokens) exceeds loaded KV budget ({})",
-                prompt_est + max_tokens,
+                prompt_est.saturating_add(max_tokens),
                 m.max_seq,
             ),
         );
@@ -13836,11 +13992,19 @@ fn generate_vl(
     // Mirrors the textual generate() contract; reserves trailer slots so
     // natural im_end termination can still write the ChatML \n.
     let trailer = nl.len();
-    let absolute_pos_vl = m.seq_pos + kv.compact_offset;
+    let absolute_pos_vl = m.seq_pos.saturating_add(kv.compact_offset);
     let over_budget = if m.eviction.is_none() {
-        m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.physical_cap
+        m.seq_pos
+            .saturating_add(prompt_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.physical_cap
     } else {
-        absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
+        absolute_pos_vl
+            .saturating_add(prompt_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.max_seq
     };
     if over_budget {
         write_error(stdout, id, &format!(
@@ -14291,7 +14455,7 @@ fn generate_vl_dots_ocr(
 
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
-    if prompt_ids.len() + max_tokens > max_seq {
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
         write_error(stdout, id, &format!(
             "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
             prompt_ids.len(), max_tokens, max_seq));
