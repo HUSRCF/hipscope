@@ -148,6 +148,19 @@ fn arch_has_wmma_requires_rdna3_or_rdna4() {
 }
 
 #[test]
+fn arch_has_wave32_admits_all_rdna_excludes_cdna() {
+    // W4: HasWave32 = is_wave32() — every RDNA gen, NOT CDNA wave64. Strict
+    // superset of HasWmma on RDNA3/4 (so a HasWmma→HasWave32 flip is byte-
+    // identical there) and newly admits RDNA1/2.
+    assert!(ArchPredicate::HasWave32.eval_arch(&ctx_rdna1()));
+    assert!(ArchPredicate::HasWave32.eval_arch(&ctx_rdna2()));
+    assert!(ArchPredicate::HasWave32.eval_arch(&ctx_rdna3()));
+    assert!(ArchPredicate::HasWave32.eval_arch(&ctx_rdna4()));
+    assert!(!ArchPredicate::HasWave32.eval_arch(&ctx_gfx906()));
+    assert!(!ArchPredicate::HasWave32.eval_arch(&DispatchCtx::for_test("gfx942")));
+}
+
+#[test]
 fn arch_has_dp4a_requires_rdna1p1_or_newer() {
     assert!(!ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna1()));
     assert!(ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna2()));
@@ -527,10 +540,17 @@ fn gemv_family_resolves_hfq4_on_all_archs() {
 }
 
 #[test]
-fn gemv_family_resolves_mq3_prerotated_only_on_wmma_arch() {
+fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
+    // W4: MQ3G256's GEMV is a WMMA-free [32,1,1] wave32 scalar kernel. Its arch
+    // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
+    // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_err());
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna1(), None).is_ok());
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
     assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna4(), None).is_ok());
+    // CDNA wave64 (gfx906) still excluded by HasWave32.
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_gfx906(), None).is_err());
     assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.

@@ -420,6 +420,15 @@ pub struct ShapeInfo {
 #[derive(Clone, Copy, Debug)]
 pub enum ArchPredicate {
     Always,
+    /// `is_wave32()` — every RDNA generation (RDNA1 gfx10xx, RDNA2 gfx103x,
+    /// RDNA3 gfx11xx, RDNA4 gfx12xx), but NOT CDNA/GCN wave64 (gfx906/908/90a/942).
+    /// For [32,1,1] wave32 *scalar* kernels (MQ3G256 GEMV, MQ2/MQ3/MQ4-Lloyd) that
+    /// are WMMA-free and already run on RDNA1/2 via the qwen35 direct path — they
+    /// need wave32, NOT WMMA. A strict superset of HasWmma (RDNA3/4 ⊂ wave32), so
+    /// flipping a HasWmma gate to HasWave32 is byte-identical on RDNA3/4 and only
+    /// newly admits RDNA1/2; CDNA stays excluded (a wave64 lane layout would
+    /// mis-execute a [32,1,1] kernel).
+    HasWave32,
     HasWmma,
     /// `has_wmma_w32()` — gfx11-family wave32 WMMA (RDNA3 + RDNA3.5), EXCLUDING
     /// gfx12/RDNA4. For WMMA kernels with NO gfx12 source sibling (e.g.
@@ -677,10 +686,18 @@ impl KernelKey {
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
-            MQ3G256 => ArchPredicate::HasWmma,
+            // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
+            // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
+            // `_=>` arms) and ALREADY run on RDNA1/2 via the qwen35 direct path.
+            // The old HasWmma gate dead-gated RDNA1/2 in resolve() (→ MissingImpl)
+            // even though the kernel exists there. HasWave32 = is_wave32(), which
+            // is a strict superset of has_wmma() on RDNA3/4 (so routing on
+            // gfx1100/1201 is byte-identical) and newly admits RDNA1/2; CDNA
+            // wave64 stays excluded (a [32,1,1] kernel needs wave32 lanes).
+            MQ3G256 => ArchPredicate::HasWave32,
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
-            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
+            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

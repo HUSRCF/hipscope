@@ -3079,6 +3079,52 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     load_any_as_f32(hfq, gpu, name, n)
 }
 
+/// Loud model-load diagnostic for RDNA2 (gfx1030/1031/1032). Scans the model's
+/// per-tensor `quant_type` bytes and, if running on RDNA2 with any RDNA3+-only
+/// dtype present, prints a clear warning listing the offending formats. RDNA2 is
+/// wave32 (so the WMMA-free MQ3-Lloyd scalar kernels now resolve — W4 fix), but
+/// MQ5/MQ6/HFQ6 (HasMmq, RDNA3/4 only), the WMMA-only HFP4G32-fused prefill path,
+/// and the E8-lattice formats have NO validated RDNA2 kernel and are best-effort.
+///
+/// Additive and arch-gated to RDNA2 — no effect on RDNA3/4/CDNA loads.
+fn warn_rdna2_unvalidated_dtypes(hfq: &HfqFile, gpu: &Gpu) {
+    if !gpu.arch_caps.is_rdna2() {
+        return;
+    }
+    // (quant_type byte, human label) for dtypes with NO validated RDNA2 kernel.
+    //   8=HFQ6G256, 15=MQ6G256, 31=MQ5G256  → HasMmq (RDNA3/4 only)
+    //   24=MFP4G32, 33=MFP4G32P             → HFP4G32-fused (WMMA-only prefill)
+    //   34/35=MFP4G32E8/SOA, 36=MFP3G32E8, 37=MFP2G32E8 → E8 lattice (RDNA3/4)
+    const RDNA3PLUS_ONLY: &[(u8, &str)] = &[
+        (8, "HFQ6G256"),
+        (15, "MQ6G256"),
+        (31, "MQ5G256"),
+        (24, "MFP4G32 (HFP4G32-fused)"),
+        (33, "MFP4G32P (HFP4G32-fused)"),
+        (34, "MFP4G32E8"),
+        (35, "MFP4G32E8SOA"),
+        (36, "MFP3G32E8"),
+        (37, "MFP2G32E8"),
+    ];
+    let mut present: Vec<&str> = RDNA3PLUS_ONLY
+        .iter()
+        .filter(|(qt, _)| hfq.tensors().iter().any(|t| t.quant_type == *qt))
+        .map(|(_, label)| *label)
+        .collect();
+    present.dedup();
+    if present.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  ⚠️  RDNA2 ({}): this model contains RDNA3+-only quant formats: {}.",
+        gpu.arch, present.join(", ")
+    );
+    eprintln!(
+        "      RDNA2 (gfx1030): uniform .mq4 is the validated SKU; this model's \
+         MQ3-Lloyd/MQ6/E8 content is best-effort and UNVALIDATED on RDNA2."
+    );
+}
+
 // TODO(transformer-extraction): the overall `load_weights` orchestration
 // here (drop_mmap → embedding+tied-lm_head → norm → per-layer loop) is
 // the model the Qwen2 loader at
@@ -3093,6 +3139,10 @@ pub fn load_weights(
     config: &Qwen35Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen35Weights> {
+    // W4: loud RDNA2 diagnostic — flag RDNA3+-only quant formats (MQ5/MQ6/HFQ6/
+    // HFP4G32-fused/E8) that have no validated RDNA2 kernel. No-op off RDNA2.
+    warn_rdna2_unvalidated_dtypes(hfq, gpu);
+
     // Drop the mmap on unix to avoid double-buffering on UMA systems.
     // All tensor data reads go through pread + fadvise_dontneed, which
     // doesn't require the mmap. On discrete-GPU systems this is harmless

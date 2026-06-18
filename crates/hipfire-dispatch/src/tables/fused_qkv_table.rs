@@ -14,8 +14,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         // though the kernel runs there. `Always` matches the kernel's true
         // cross-arch availability (mirrors the FusedQkvQ4K row).
         (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
-        (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
+        // MQ3/MQ4-Lloyd fused QKV: the merged Lloyd kernels are WMMA-free [32,1,1]
+        // wave32 scalar (direct-LUT decode), so they run on every wave32 arch incl.
+        // RDNA1/2 — NOT just WMMA archs. The old HasWmma gate was a dead-gate (it
+        // was harmless on qwen35, which direct-dispatches these, but it lied to any
+        // resolve()-routed caller). HasWave32 matches true kernel availability and
+        // is byte-identical on RDNA3/4 (RDNA3/4 ⊂ wave32). CDNA stays excluded.
+        (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWave32),
+        (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWave32),
         // HFQ6G256 fused QKV: batched run-arm `gpu.gemm_qkv_hfq6g256` carries the
         // full cross-arch ladder (same as the qkvza sibling below). `Always`, not
         // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted qkv layers
@@ -68,8 +74,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         // matches the true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpHfq4G256 rows above).
         (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
-        (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
+        // MQ3/MQ4-Lloyd fused QKVZA: WMMA-free [32,1,1] wave32 scalar Lloyd kernels,
+        // run on every wave32 arch incl. RDNA1/2. HasWmma was a dead-gate (qwen35
+        // direct-dispatches); HasWave32 matches true availability, byte-identical
+        // on RDNA3/4, CDNA excluded. Mirrors the FusedQkv*Lloyd rows above.
+        (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWave32),
+        (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWave32),
         // HFQ6G256 fused QKVZA. The batched run-arm calls `gpu.gemm_qkvza_hfq6g256`,
         // which carries the full cross-arch ladder internally (wmma_gfx12 → wmma →
         // wave64_dp4a → dot2 → fp16 → scalar base), so the key is available on
@@ -125,8 +135,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         // the kernel's true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpQ4K rows).
         (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
-        (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
+        // MQ3/MQ4-Lloyd fused gate+up: WMMA-free [32,1,1] wave32 scalar Lloyd
+        // kernels, run on every wave32 arch incl. RDNA1/2. HasWmma was a dead-gate
+        // (qwen35 direct-dispatches); HasWave32 matches true availability,
+        // byte-identical on RDNA3/4, CDNA excluded. Mirrors the rows above.
+        (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWave32),
+        (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWave32),
         // HFQ6G256 fused gate+up: batched run-arm `gpu.gemm_gate_up_hfq6g256` is
         // cross-arch (same ladder as the qkv/qkvza siblings). `Always`, not
         // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted gate_up
