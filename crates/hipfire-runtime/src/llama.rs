@@ -7695,6 +7695,121 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     topk_idx[order[0]]
 }
 
+/// Host-side full-distribution sampler for the EP (multi-GPU) serve path.
+///
+/// The single-GPU handler resolves request>rec_*>arch-default sampling and runs
+/// the GPU `sample_top_p` kernel; the EP path (ds4/minimax) never reaches that
+/// handler and previously decoded with a hardcoded argmax, dropping the card's
+/// temp/top_p/top_k/min_p. ds4's card mandates temp=1.0/top_p=1.0 specifically
+/// because greedy argmax on the quantized instruct model falls into block-level
+/// attractor loops. This function restores those knobs host-side over the f32
+/// logits already downloaded by `download_f32`.
+///
+/// Pipeline mirrors the GPU sampler ordering: temperature scale → top_k cut →
+/// top_p (nucleus) cut → min_p cut → seeded multinomial draw. Uses the shared
+/// `simple_rand` RNG (SAMPLER_STATE), so a per-request `reset_cpu_sampler_rng`
+/// makes the draw deterministic and consistent with the rest of the daemon.
+///
+/// `temperature <= 1e-6` takes the argmax fast-path (greedy), matching the
+/// GPU kernel's `temperature <= 0` short-circuit but with a small epsilon so a
+/// near-zero temp never divides by ~0.
+pub fn sample_full_dist(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+) -> u32 {
+    if temperature <= 1e-6 {
+        return argmax(logits);
+    }
+    let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
+    let top_p = top_p.clamp(0.0, 1.0);
+    let inv_temp = 1.0 / temperature;
+
+    // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
+    let mut max_logit = f32::NEG_INFINITY;
+    for &l in logits {
+        if l > max_logit {
+            max_logit = l;
+        }
+    }
+
+    // Materialize (idx, prob) with temperature-scaled softmax numerators. A
+    // NaN logit yields a NaN exp; `>`-based comparisons below drop it, so it
+    // can never be selected (parity with the greedy argmax NaN guard).
+    let mut cand: Vec<(u32, f32)> = Vec::with_capacity(n);
+    for (i, &l) in logits.iter().enumerate() {
+        let p = ((l - max_logit) * inv_temp).exp();
+        cand.push((i as u32, p));
+    }
+
+    // Sort descending by probability (top_k / top_p / min_p all operate on the
+    // ranked distribution). Unstable sort with a NaN-last comparator.
+    cand.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
+    if let Some(k) = top_k {
+        let k = k as usize;
+        if k > 0 && k < cand.len() {
+            cand.truncate(k);
+        }
+    }
+
+    // Total mass over the (possibly k-truncated) candidate set.
+    let total: f32 = cand.iter().map(|c| c.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        // Degenerate (all -inf / NaN) — fall back to argmax of raw logits.
+        return argmax(logits);
+    }
+
+    // min_p: drop candidates whose prob is below `min_p * p_max` (the highest
+    // prob is cand[0] after the descending sort). Applied before nucleus.
+    if let Some(mp) = min_p {
+        if mp > 0.0 {
+            let p_max = cand[0].1;
+            let floor = mp * p_max;
+            cand.retain(|c| c.1 >= floor);
+        }
+    }
+
+    // top_p (nucleus): keep the smallest prefix whose cumulative mass reaches
+    // top_p * total. Always keep at least the top candidate.
+    if top_p < 1.0 {
+        let threshold = top_p * total;
+        let mut cum = 0.0f32;
+        let mut keep = 0usize;
+        for c in cand.iter() {
+            cum += c.1;
+            keep += 1;
+            if cum >= threshold {
+                break;
+            }
+        }
+        cand.truncate(keep.max(1));
+    }
+
+    // Seeded multinomial draw over the surviving candidates.
+    let kept_total: f32 = cand.iter().map(|c| c.1).sum();
+    if kept_total <= 0.0 || !kept_total.is_finite() {
+        return cand[0].0;
+    }
+    let r = simple_rand() * kept_total;
+    let mut acc = 0.0f32;
+    for c in &cand {
+        acc += c.1;
+        if acc >= r {
+            return c.0;
+        }
+    }
+    cand[cand.len() - 1].0
+}
+
 /// Apply the repeat penalty in-place to a specific subset of (token_id, value)
 /// candidates, rather than the full 151k-entry logits vector. Used by the
 /// GPU-assisted sampler path: the GPU produces a top-K=128 candidate set

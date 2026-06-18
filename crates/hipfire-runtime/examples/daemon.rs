@@ -5612,6 +5612,18 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
 /// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
 /// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
 #[allow(clippy::too_many_arguments)]
+/// Resolved sampling config for the EP (multi-GPU) decode loops. Carries the
+/// single-GPU handler's request>rec_*>arch-default resolution (computed at the
+/// `generate` call site) into `ep_serve_ds4` / `ep_serve_minimax`, which apply
+/// it host-side over the downloaded f32 logits via `llama::sample_full_dist`.
+#[derive(Clone, Copy)]
+struct EpSampling {
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+}
+
 fn generate_ep(
     m: &mut LoadedModel,
     stdout: &mut std::io::Stdout,
@@ -5624,6 +5636,7 @@ fn generate_ep(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    sampling: EpSampling,
 ) {
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
@@ -5722,8 +5735,8 @@ fn generate_ep(
     }
     let eos_tok = if m.arch_id == 10 { m.minimax_eos_tok } else { m.deepseek4_eos_tok };
     match m.arch_id {
-        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think),
-        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop),
+        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think, sampling),
+        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop, sampling),
     }
 }
 
@@ -5753,7 +5766,7 @@ fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt
 }
 
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String]) {
+fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String], sampling: EpSampling) {
     use std::time::Instant;
     use hipfire_arch_deepseek4::dsml::StreamEvent;
 
@@ -5879,9 +5892,16 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             matcher.token_mask(decoded_vocab, &mut grammar_mask);
             deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
         }
-        let mut next = 0u32;
-        let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
+        // Host-side sampler over the downloaded f32 logits (temp → top_k →
+        // top_p → min_p → seeded draw, temp<=1e-6 = argmax). RNG seeded once
+        // per request via reset_cpu_sampler_rng(0x13579BDF) in generate().
+        let next = hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
         if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         for ev in parser.feed(&piece) {
@@ -5973,7 +5993,7 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 /// reuse — see generate_minimax for the full rationale). `primed_think`
 /// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
 #[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool) {
+fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool, sampling: EpSampling) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
 
@@ -6044,9 +6064,17 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     let mut pos = prompt_n;
     let mut text_acc = String::new();
     while generated < max_tokens {
-        let mut next = 0u32;
-        let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
+        // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
+        // min_p → seeded draw, temp<=1e-6 = argmax). MiniMax's card carries
+        // top_k=40, threaded here via sampling.top_k. RNG seeded per request in
+        // generate() (reset_cpu_sampler_rng).
+        let next = hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
         if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
@@ -8701,7 +8729,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
     if m.ep.is_some() {
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop);
+        // EP serve (ds4/minimax): thread the SAME resolved sampling the
+        // single-GPU handler computed (request field > m.rec_* > arch-default
+        // ladder, all done at the call site above) into the EP decode loops.
+        // Previously the EP path dropped these to a hardcoded greedy argmax,
+        // which loops on ds4's quantized instruct model (card mandates
+        // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
+        // called above, so the host-side draw in ep_serve_* is deterministic.
+        let ep_sampling = EpSampling { temp, top_p, top_k, min_p };
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop, ep_sampling);
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
