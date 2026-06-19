@@ -464,7 +464,8 @@ pub enum EpArch {
 
 // ─── Helper functions ─────────────────────────────────────────────────
 
-fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
+/// Layer 1 (env var) + Layer 2 (per-model ~/.hipfire/templates) — source-agnostic.
+fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
     if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
         if !env_path.is_empty() {
             match std::fs::read_to_string(&env_path) {
@@ -504,6 +505,13 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
                 }
             }
         }
+    }
+    None
+}
+
+fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
+    if let Some(s) = resolve_chat_template_overrides(model_path) {
+        return Some(s);
     }
     match hfq.arch_id {
         5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
@@ -796,10 +804,9 @@ pub fn load_model(
         ));
     }
     let result = carrier.load(src, &mut ctx)?;
-    debug_assert!(
-        !(result.pp > 1) || result.pp_gpus.is_some(),
-        "pp>1 LoadedModel missing pp_gpus"
-    );
+    if result.pp > 1 && result.pp_gpus.is_none() {
+        return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
+    }
     Ok(result)
 }
 

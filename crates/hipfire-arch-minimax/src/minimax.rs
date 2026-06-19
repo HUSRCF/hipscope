@@ -186,14 +186,18 @@ pub fn apply_reap_plan(config: &mut MiniMaxConfig) -> Result<(), String> {
 /// Parse MiniMaxConfig from a ModelSource (safetensors or HFQ wrapper).
 /// The metadata JSON should contain the same `{"architecture":..., "config":{...}}`
 /// envelope as the HFQ format, as produced by SafetensorsSource::build_metadata_json.
-pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<MiniMaxConfig> {
-    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
-    let inner = meta.get("config")?;
-    let raw: RawMiniMaxConfig = serde_json::from_value(inner.clone()).ok()?;
+pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<MiniMaxConfig, String> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .map_err(|e| format!("minimax: metadata_json not valid JSON: {e}"))?;
+    let inner = meta
+        .get("config")
+        .ok_or_else(|| "minimax: metadata_json missing 'config' key".to_string())?;
+    let raw: RawMiniMaxConfig = serde_json::from_value(inner.clone())
+        .map_err(|e| format!("minimax: failed to parse MiniMaxConfig from metadata: {e}"))?;
     let head_dim = raw
         .head_dim
         .unwrap_or(raw.hidden_size / raw.num_attention_heads);
-    Some(MiniMaxConfig {
+    Ok(MiniMaxConfig {
         vocab_size: raw.vocab_size,
         hidden_size: raw.hidden_size,
         num_hidden_layers: raw.num_hidden_layers,

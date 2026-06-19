@@ -5,7 +5,7 @@
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
 use crate::Carrier;
-use crate::{finish_qwen35_load, resolve_chat_template, LoadedModel, ModelState};
+use crate::{finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel, ModelState};
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
@@ -40,7 +40,7 @@ fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, Stri
         }),
         ModelSource::Dir(source) => Ok(SourceMeta {
             tokenizer: tokenizer_from_dir(source)?,
-            chat_template: source.chat_template(),
+            chat_template: resolve_chat_template_overrides(path).or_else(|| source.chat_template()),
             arch_id: source.arch_id(),
         }),
     }
@@ -313,13 +313,16 @@ impl Carrier for Qwen35Carrier {
                 )
             }
             ModelSource::Dir(source) => {
-                if ctx.pp > 1 {
-                    return Err("qwen35: safetensors + pp>1 unsupported".into());
-                }
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
                     .map_err(|e| {
                         format!("failed to parse Qwen3.5 config from config.json: {e}")
                     })?;
+                if ctx.draft_path.is_some() {
+                    eprintln!("  warning: DFlash (speculative decoding) is not supported for safetensors Dir sources; draft_path ignored");
+                }
+                if ctx.cask.sidecar.is_some() {
+                    eprintln!("  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored");
+                }
                 let mut paro_source =
                     hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
                         .map_err(|e| format!("ParoSource::new: {e:?}"))?;
@@ -362,12 +365,33 @@ impl Carrier for Qwen35Carrier {
                 )
                 .map_err(|e| format!("KvCache: {e}"))?;
 
+                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
+                    .map_err(|e| format!("{e}"))?;
+                eprintln!(
+                    "  DeltaNet state quant: {}",
+                    if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
+                        "FP32"
+                    } else if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                        "Q4"
+                    } else {
+                        "Q8"
+                    }
+                );
+                if config.dim < 2048
+                    && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32
+                {
+                    eprintln!(
+                        "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
+                        config.dim,
+                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 { "Q4" } else { "Q8" }
+                    );
+                }
                 let dn_state =
-                    hipfire_arch_qwen35::qwen35::DeltaNetState::new(ctx.gpu, &config)
-                        .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
+                    hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant)
+                        .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
                 let scratch =
-                    hipfire_arch_qwen35::qwen35::Qwen35Scratch::new(ctx.gpu, &config, 256)
-                        .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
+                    hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq)
+                        .map_err(|e| format!("Qwen35Scratch::new_with_kv_max: {e:?}"))?;
 
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
                     config,
@@ -489,44 +513,6 @@ impl Carrier for LlamaCarrier {
 }
 
 // ─── Non-core carriers ───────────────────────────────────────────────
-
-/// Generic HFQ-only carrier: every non-core arch has the same load shape
-/// (pp>1 guard → `Hfq` destructure → tokenizer-from-metadata → delegate to
-/// a `crate::load_*` fn). Each concrete carrier differs only in its
-/// `arch_id`, `name`, and the load fn it calls — so they collapse into one
-/// struct parameterized by those three values.
-pub struct HfqCarrier {
-    pub arch_id: u32,
-    pub name: &'static str,
-    pub load: fn(
-        hipfire_runtime::hfq::HfqFile,
-        hipfire_runtime::tokenizer::Tokenizer,
-        &mut rdna_compute::Gpu,
-        usize,
-        &str,
-    ) -> Result<LoadedModel, String>,
-}
-
-impl Carrier for HfqCarrier {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == self.arch_id
-    }
-    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        if ctx.pp > 1 {
-            return Err(format!("{}: pp>1 unsupported via registry", self.name));
-        }
-        let ModelSource::Hfq(hfq) = src else {
-            return Err(format!("{}: directory source unsupported", self.name));
-        };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?;
-        (self.load)(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
-    }
-}
 
 // ─── DotsOcrCarrier ──────────────────────────────────────────────────
 
@@ -676,7 +662,7 @@ impl Carrier for MinimaxCarrier {
             }
             ModelSource::Dir(source) => {
                 let config = config_from_safetensors(&source)
-                    .ok_or_else(|| "failed to parse MiniMax config".to_string())?;
+                    .map_err(|e| format!("failed to parse MiniMax config from config.json: {e}"))?;
                 let weights = load_weights_from_safetensors(&source, &config, ctx.gpu)?;
                 (config, weights)
             }
