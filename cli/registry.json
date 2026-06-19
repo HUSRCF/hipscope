@@ -393,6 +393,35 @@
       "min_vram_gb": 3.8,
       "desc": "Qwen3.5 4b mq3 (v3-awq-f1)",
       "quant_recipe": "v3-awq-f1"
+    },
+    "qwopus3.6:27b-coder": {
+      "repo": "schuttdev/hipfire-qwopus3.6-27b-coder",
+      "file": "qwopus3.6-27b-coder.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95
+      },
+      "desc": "Qwen3.6-27B agentic coder finetune (Jackrong, SWE-bench Verified 67%). 33 tok/s AR single-GPU."
+    },
+    "nex-n2:mini": {
+      "repo": "schuttdev/hipfire-nex-n2-mini",
+      "file": "nex-n2-mini.mq4p",
+      "size_gb": 22.9,
+      "min_vram_gb": 25,
+      "default_kv_mode": "q8",
+      "quant_recipe": "a3b-graded",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
+      "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 85 tok/s. Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
     }
   },
   "aliases": {
