@@ -410,10 +410,10 @@
     "nex-n2:mini": {
       "repo": "schuttdev/hipfire-nex-n2-mini",
       "file": "nex-n2-mini.mq4p",
-      "size_gb": 22.9,
-      "min_vram_gb": 25,
+      "size_gb": 19.67,
+      "min_vram_gb": 22,
       "default_kv_mode": "q8",
-      "quant_recipe": "a3b-graded",
+      "quant_recipe": "a3b-tiermap-T3-2L",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -421,7 +421,7 @@
         "min_p": 0.0,
         "presence_penalty": 1.5
       },
-      "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 85 tok/s. Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
+      "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 88 tok/s. T3-2L graded experts (MQ6/MQ4/MQ2L). Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
     }
   },
   "aliases": {
