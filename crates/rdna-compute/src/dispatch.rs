@@ -195,9 +195,9 @@ pub enum DType {
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
-    HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
-    HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
+    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
@@ -516,7 +516,11 @@ impl BlockHessianAcc {
                 n += 1;
             }
         }
-        if n == 0 { 0.0 } else { s / n as f64 }
+        if n == 0 {
+            0.0
+        } else {
+            s / n as f64
+        }
     }
 }
 
@@ -611,10 +615,8 @@ impl HessianCapture {
         let ptrs: Vec<(SyncPtr, &[f32], usize)> = items
             .iter()
             .map(|(name, x, k)| {
-                let acc: &mut BlockHessianAcc = self
-                    .entries
-                    .get_mut(name)
-                    .expect("entry ensured above");
+                let acc: &mut BlockHessianAcc =
+                    self.entries.get_mut(name).expect("entry ensured above");
                 (SyncPtr(acc as *mut BlockHessianAcc), *x, *k)
             })
             .collect();
@@ -1058,7 +1060,6 @@ impl Gpu {
             )
         }
     }
-
 
     /// Dequantize an mfp4-E8 matrix [M x K] to FP16 [M x K] row-major.
     /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical footprint to mfp4+P).
@@ -2570,7 +2571,8 @@ mod tests {
                         pb[idx].to_bits(),
                         sb[idx].to_bits(),
                         "{name} block={b} idx={idx}: parallel {} != serial {} (NOT bit-identical)",
-                        pb[idx], sb[idx]
+                        pb[idx],
+                        sb[idx]
                     );
                 }
             }

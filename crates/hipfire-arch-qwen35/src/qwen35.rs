@@ -1354,7 +1354,10 @@ fn load_weight_tensor_raw(
         }
         32 => {
             // MFP4G32Lloyd lm_head: mfp4 rows + 32-B per-tensor fp16 codebook prefix.
-            assert!(k % 256 == 0, "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1369,7 +1372,10 @@ fn load_weight_tensor_raw(
         33 => {
             // MFP4G32P lm_head: mfp4+P — mfp4 rows with E4M3 per-block scale. NO prefix;
             // byte-identical layout to MFP4G32 (qt 24).
-            assert!(k % 256 == 0, "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1384,7 +1390,10 @@ fn load_weight_tensor_raw(
         34 => {
             // MFP4G32E8 lm_head: mfp4-E8 — mfp4+P container, NO prefix, same row_bytes;
             // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
-            assert!(k % 256 == 0, "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1399,7 +1408,10 @@ fn load_weight_tensor_raw(
         36 => {
             // MFP3G32E8: mfp4-E8 frame with 3-bit lattice, 13 B/blk, 3.25 bpw.
             // Drop-in cold tier for MQ3G256Lloyd (kernel tag 5).
-            assert!(k % 256 == 0, "MFP3G32E8 has K={k} but FWHT requires K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP3G32E8 has K={k} but FWHT requires K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1414,7 +1426,10 @@ fn load_weight_tensor_raw(
         37 => {
             // MFP2G32E8: mfp4-E8 frame with 2-bit lattice, 9 B/blk, 2.25 bpw.
             // Drop-in cold tier for MQ2G256Lloyd (kernel tag 6).
-            assert!(k % 256 == 0, "MFP2G32E8 has K={k} but FWHT requires K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP2G32E8 has K={k} but FWHT requires K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1504,7 +1519,10 @@ fn load_weight_tensor_raw(
         }
         35 => {
             // MFP4G32E8SOA lm_head: mfp4-E8 SoA layout for coalesced GEMV.
-            assert!(k % 256 == 0, "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0");
+            assert!(
+                k % 256 == 0,
+                "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -2602,10 +2620,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             // Recon: value = row_scale_a * 2^(block_e-127) * cb[nibble].
             // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
             let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 { (data.len().saturating_sub(32)) / row_bytes } else { 0 };
+            let m_rows = if row_bytes > 0 {
+                (data.len().saturating_sub(32)) / row_bytes
+            } else {
+                0
+            };
             let mut cb = [0.0f32; 16];
             for i in 0..16 {
-                let bits = u16::from_le_bytes([data[2*i], data[2*i+1]]);
+                let bits = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
                 cb[i] = hipfire_runtime::llama::f16_to_f32(bits);
             }
             let mut out = vec![0.0f32; n];
@@ -2614,16 +2636,19 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let n_blocks = k_row / 32;
             for r in 0..m_rows {
                 let base = 32 + r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base+1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 for b in 0..n_blocks {
                     let po = base + 16 + b * 17;
                     let block_e = data[po] as i32;
                     let scale = row_scale_a * ((block_e - 127) as f32).exp2();
                     for i in 0..16 {
                         let byte = data[po + 1 + i];
-                        out[r*k_row + b*32 + 2*i]     = scale * cb[(byte & 0x0F) as usize];
-                        out[r*k_row + b*32 + 2*i + 1] = scale * cb[((byte >> 4) & 0x0F) as usize];
+                        out[r * k_row + b * 32 + 2 * i] = scale * cb[(byte & 0x0F) as usize];
+                        out[r * k_row + b * 32 + 2 * i + 1] =
+                            scale * cb[((byte >> 4) & 0x0F) as usize];
                     }
                 }
             }
@@ -2637,7 +2662,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             #[inline]
             fn e2m1(n: u8) -> f32 {
                 let m = E2M1_MAG[(n & 0x7) as usize];
-                if (n & 0x8) != 0 { -m } else { m }
+                if (n & 0x8) != 0 {
+                    -m
+                } else {
+                    m
+                }
             }
             // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
             // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
@@ -2645,27 +2674,37 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             fn e4m3(b: u8) -> f32 {
                 let exp = ((b >> 3) & 0xf) as i32;
                 let mant = (b & 0x7) as u32;
-                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-                if exp == 0xf && mant == 7 { return 448.0; }
+                if exp == 0 {
+                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+                }
+                if exp == 0xf && mant == 7 {
+                    return 448.0;
+                }
                 (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
             }
             let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let m_rows = if row_bytes > 0 {
+                data.len() / row_bytes
+            } else {
+                0
+            };
             let mut out = vec![0.0f32; n];
             let k_row = if m_rows > 0 { n / m_rows } else { n };
             let k_row = k_row.max(1);
             let n_blocks = k_row / 32;
             for r in 0..m_rows {
                 let base = r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 for b in 0..n_blocks {
                     let po = base + 16 + b * 17;
                     let scale = row_scale_a * e4m3(data[po]);
                     for i in 0..16 {
                         let byte = data[po + 1 + i];
-                        out[r*k_row + b*32 + 2*i]     = scale * e2m1(byte & 0x0F);
-                        out[r*k_row + b*32 + 2*i + 1] = scale * e2m1((byte >> 4) & 0x0F);
+                        out[r * k_row + b * 32 + 2 * i] = scale * e2m1(byte & 0x0F);
+                        out[r * k_row + b * 32 + 2 * i + 1] = scale * e2m1((byte >> 4) & 0x0F);
                     }
                 }
             }
@@ -2680,8 +2719,12 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             fn e4m3_e8(b: u8) -> f32 {
                 let exp = ((b >> 3) & 0xf) as i32;
                 let mant = (b & 0x7) as u32;
-                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-                if exp == 0xf && mant == 7 { return 448.0; }
+                if exp == 0 {
+                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+                }
+                if exp == 0xf && mant == 7 {
+                    return 448.0;
+                }
                 (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
             }
             #[inline]
@@ -2695,26 +2738,38 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 } else {
                     // coord == 7: recover from parity
                     let mut sl: u32 = 0;
-                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    for i in 0..7 {
+                        sl += (idx >> (4 * i)) & 0xF;
+                    }
                     let e7h = (idx >> 28) & 0x7;
                     let p7 = e7h << 1;
                     let lsb = (sl + p7) & 1;
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 { c + 0.5 } else { c }
+                if coset == 1 {
+                    c + 0.5
+                } else {
+                    c
+                }
             }
             const QUANT_STEP: f32 = 0.88;
             let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let m_rows = if row_bytes > 0 {
+                data.len() / row_bytes
+            } else {
+                0
+            };
             let mut out = vec![0.0f32; n];
             let k_row = if m_rows > 0 { n / m_rows } else { n };
             let k_row = k_row.max(1);
             let n_blocks = k_row / 32;
             for r in 0..m_rows {
                 let base = r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 for b in 0..n_blocks {
                     let po = base + 16 + b * 17;
                     let scale = row_scale_a * e4m3_e8(data[po]) * QUANT_STEP;
@@ -2740,8 +2795,12 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             fn e4m3_e8_soa(b: u8) -> f32 {
                 let exp = ((b >> 3) & 0xf) as i32;
                 let mant = (b & 0x7) as u32;
-                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-                if exp == 0xf && mant == 7 { return 448.0; }
+                if exp == 0 {
+                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+                }
+                if exp == 0xf && mant == 7 {
+                    return 448.0;
+                }
                 (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
             }
             #[inline]
@@ -2752,14 +2811,20 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     e = (idx >> (4 * coord as u32)) & 0xF;
                 } else {
                     let mut sl: u32 = 0;
-                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    for i in 0..7 {
+                        sl += (idx >> (4 * i)) & 0xF;
+                    }
                     let e7h = (idx >> 28) & 0x7;
                     let p7 = e7h << 1;
                     let lsb = (sl + p7) & 1;
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 { c + 0.5 } else { c }
+                if coset == 1 {
+                    c + 0.5
+                } else {
+                    c
+                }
             }
             const QUANT_STEP_SOA: f32 = 0.88;
             // Decode assuming n = k_row; figure out m_rows from total bytes.
@@ -2767,7 +2832,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let n_blocks = n / 32;
             let scale_padded = ((n_blocks + 15) >> 4) << 4;
             let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
-            let m_rows = if soa_row_bytes > 0 { data.len() / soa_row_bytes } else { 0 };
+            let m_rows = if soa_row_bytes > 0 {
+                data.len() / soa_row_bytes
+            } else {
+                0
+            };
             let mut out = vec![0.0f32; n];
             let k_row = if m_rows > 0 { n / m_rows } else { n };
             let k_row = k_row.max(1);
@@ -2776,16 +2845,22 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let row_bytes2 = 16 + scale_padded2 + n_blocks2 * 16;
             for r in 0..m_rows {
                 let base = r * row_bytes2;
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 let scale_arr = &data[base + 16..base + 16 + n_blocks2];
-                let cw_arr    = &data[base + 16 + scale_padded2..base + 16 + scale_padded2 + n_blocks2 * 16];
+                let cw_arr =
+                    &data[base + 16 + scale_padded2..base + 16 + scale_padded2 + n_blocks2 * 16];
                 for b in 0..n_blocks2 {
                     let scale = row_scale_a * e4m3_e8_soa(scale_arr[b]) * QUANT_STEP_SOA;
                     for g in 0..4usize {
                         let co = b * 16 + g * 4;
                         let idx = u32::from_le_bytes([
-                            cw_arr[co], cw_arr[co + 1], cw_arr[co + 2], cw_arr[co + 3],
+                            cw_arr[co],
+                            cw_arr[co + 1],
+                            cw_arr[co + 2],
+                            cw_arr[co + 3],
                         ]);
                         for i in 0..8usize {
                             out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode_soa(idx, i);
@@ -2802,22 +2877,32 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             fn e4m3_mfp3(b: u8) -> f32 {
                 let exp = ((b >> 3) & 0xf) as i32;
                 let mant = (b & 0x7) as u32;
-                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-                if exp == 0xf && mant == 7 { return 448.0; }
+                if exp == 0 {
+                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+                }
+                if exp == 0xf && mant == 7 {
+                    return 448.0;
+                }
                 (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
             }
             const MFP3_BLOCK: usize = 13; // 1 + 4*3
             const MFP3_STEP: f32 = 1.8; // MSE-tuned; matches QUANT_STEP_MFP3 in e8.rs + kernels
             let row_bytes = 16 + MFP3_BLOCK * (n / 32);
-            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let m_rows = if row_bytes > 0 {
+                data.len() / row_bytes
+            } else {
+                0
+            };
             let mut out = vec![0.0f32; n];
             let k_row = if m_rows > 0 { n / m_rows } else { n };
             let k_row = k_row.max(1);
             let n_blocks = k_row / 32;
             for r in 0..m_rows {
                 let base = r * (16 + n_blocks * MFP3_BLOCK);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 for b in 0..n_blocks {
                     let po = base + 16 + b * MFP3_BLOCK;
                     let scale = row_scale_a * e4m3_mfp3(data[po]) * MFP3_STEP;
@@ -2831,7 +2916,10 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                         let coset = (idx >> 23) & 1;
                         let mut e = [0u32; 8];
                         let mut sl: u32 = 0;
-                        for i in 0..7 { e[i] = (idx >> (3 * i as u32)) & 0x7; sl += e[i]; }
+                        for i in 0..7 {
+                            e[i] = (idx >> (3 * i as u32)) & 0x7;
+                            sl += e[i];
+                        }
                         let e7_high = (idx >> 21) & 0x3;
                         let p7 = e7_high << 1;
                         e[7] = p7 | ((sl + p7) & 1);
@@ -2852,22 +2940,32 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             fn e4m3_mfp2(b: u8) -> f32 {
                 let exp = ((b >> 3) & 0xf) as i32;
                 let mant = (b & 0x7) as u32;
-                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-                if exp == 0xf && mant == 7 { return 448.0; }
+                if exp == 0 {
+                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+                }
+                if exp == 0xf && mant == 7 {
+                    return 448.0;
+                }
                 (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
             }
             const MFP2_BLOCK: usize = 9; // 1 + 4*2
             const MFP2_STEP: f32 = 3.8; // MSE-tuned; matches QUANT_STEP_MFP2 in e8.rs + kernels
             let row_bytes = 16 + MFP2_BLOCK * (n / 32);
-            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let m_rows = if row_bytes > 0 {
+                data.len() / row_bytes
+            } else {
+                0
+            };
             let mut out = vec![0.0f32; n];
             let k_row = if m_rows > 0 { n / m_rows } else { n };
             let k_row = k_row.max(1);
             let n_blocks = k_row / 32;
             for r in 0..m_rows {
                 let base = r * (16 + n_blocks * MFP2_BLOCK);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
-                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    data[base],
+                    data[base + 1],
+                ]));
                 for b in 0..n_blocks {
                     let po = base + 16 + b * MFP2_BLOCK;
                     let scale = row_scale_a * e4m3_mfp2(data[po]) * MFP2_STEP;
@@ -2879,7 +2977,10 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                         let coset = (idx >> 15) & 1;
                         let mut e = [0u32; 8];
                         let mut sl: u32 = 0;
-                        for i in 0..7 { e[i] = (idx >> (2 * i as u32)) & 0x3; sl += e[i]; }
+                        for i in 0..7 {
+                            e[i] = (idx >> (2 * i as u32)) & 0x3;
+                            sl += e[i];
+                        }
                         let e7_high = (idx >> 14) & 0x1;
                         let p7 = e7_high << 1;
                         e[7] = p7 | ((sl + p7) & 1);
@@ -3269,7 +3370,11 @@ fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
 fn e8_soa_experts() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_E8_SOA_EXPERTS").map(|v| v == "1").unwrap_or(false))
+    *F.get_or_init(|| {
+        std::env::var("HIPFIRE_E8_SOA_EXPERTS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// AoS mfp4-E8 -> SoA byte transform (exact port of `aos_to_soa_full` in
@@ -3373,7 +3478,11 @@ pub(crate) fn load_moe_ffn(
     // The closure caches the decision so the pointer-table build below agrees
     // with this load loop.
     let ep_shard = current_ep_expert_shard();
-    let owns = |x: usize| ep_shard.as_ref().map_or(true, |(sh, r)| sh.owns_expert(*r, x));
+    let owns = |x: usize| {
+        ep_shard
+            .as_ref()
+            .map_or(true, |(sh, r)| sh.owns_expert(*r, x))
+    };
 
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
@@ -3418,7 +3527,11 @@ pub(crate) fn load_moe_ffn(
                     gpu.hip.memcpy_htod(&ew.gate_up.buf.buf, &soa)?;
                     converted += 1;
                 } else if layer_idx == 0 {
-                    eprintln!("  [e8-soa] SKIP: SoA size {} != AoS {} (n_blocks%16!=0) — keeping AoS", soa.len(), nbytes);
+                    eprintln!(
+                        "  [e8-soa] SKIP: SoA size {} != AoS {} (n_blocks%16!=0) — keeping AoS",
+                        soa.len(),
+                        nbytes
+                    );
                 }
             }
         }
@@ -3440,7 +3553,10 @@ pub(crate) fn load_moe_ffn(
     let mut gu_ptrs = vec![0u64; n_exp];
     let mut dn_ptrs = vec![0u64; n_exp];
     if ep_shard.is_some() {
-        assert!(!experts.is_empty(), "EP shard: rank owns no experts in layer {layer_idx}");
+        assert!(
+            !experts.is_empty(),
+            "EP shard: rank owns no experts in layer {layer_idx}"
+        );
         // Shared zeroed gate_up dummy (same byte size as a real expert gate_up).
         // LEAKED so the ptr stays valid for the model's lifetime (matches
         // shard_moe_experts v1).
@@ -3486,7 +3602,10 @@ pub(crate) fn load_moe_ffn(
     // *confirms* the indexed AWQ kernel is the firing path. The real
     // AWQ-vs-plain A/B uses two separately quantized files.
     let moe_awq_enabled = std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref() != Some("0");
-    let awq_present = experts.iter().filter(|e| e.down.awq_scale.is_some()).count();
+    let awq_present = experts
+        .iter()
+        .filter(|e| e.down.awq_scale.is_some())
+        .count();
     let expert_down_awq_ptrs = if ep_shard.is_some() {
         // EP shard: AWQ-EP needs a sharded scale pointer table (dummies for
         // non-owned slots). Not yet supported — guard rather than silently
@@ -3541,10 +3660,17 @@ pub(crate) fn load_moe_ffn(
         // aren't visible. Uniform files (all owned experts same dtype, e.g. .mq6)
         // → None; graded EP is not yet supported.
         let mixed = !experts.is_empty()
-            && (experts.iter().any(|e| e.gate_up.gpu_dtype != experts[0].gate_up.gpu_dtype)
-                || experts.iter().any(|e| e.down.gpu_dtype != experts[0].down.gpu_dtype));
+            && (experts
+                .iter()
+                .any(|e| e.gate_up.gpu_dtype != experts[0].gate_up.gpu_dtype)
+                || experts
+                    .iter()
+                    .any(|e| e.down.gpu_dtype != experts[0].down.gpu_dtype));
         if mixed {
-            return Err(HipError::new(0, "graded (mixed-dtype) MoE EP not yet supported"));
+            return Err(HipError::new(
+                0,
+                "graded (mixed-dtype) MoE EP not yet supported",
+            ));
         }
         None
     } else if n_exp > 0 {
@@ -3568,12 +3694,12 @@ pub(crate) fn load_moe_ffn(
                         // legacy down-only-graded binary still dispatches the
                         // correct down branch.
                         match e.down.gpu_dtype {
-                            DType::MQ6G256 => 0u8,       // hot (gu4 dn6 mixed)
-                            DType::MQ2G256Lloyd => 1u8,  // cold MQ2L
-                            DType::MFP2G32E8 => 6u8,     // cold mfp2-E8
-                            DType::MQ3G256Lloyd => 3u8,  // cold MQ3L
-                            DType::MFP3G32E8 => 5u8,     // cold mfp3-E8
-                            _ => 2u8,                    // default MQ4
+                            DType::MQ6G256 => 0u8,      // hot (gu4 dn6 mixed)
+                            DType::MQ2G256Lloyd => 1u8, // cold MQ2L
+                            DType::MFP2G32E8 => 6u8,    // cold mfp2-E8
+                            DType::MQ3G256Lloyd => 3u8, // cold MQ3L
+                            DType::MFP3G32E8 => 5u8,    // cold mfp3-E8
+                            _ => 2u8,                   // default MQ4
                         }
                     }
                     DType::MQ3G256Lloyd => 3u8,
@@ -3589,7 +3715,7 @@ pub(crate) fn load_moe_ffn(
                     // Both gate_up AND down carry MFP2G32E8; the merged gemv kernels
                     // decode tag 6 via mfp2e8_row_partial (2-bit lattice, 9 B/blk).
                     DType::MFP2G32E8 => 6u8,
-                    _ => 2u8,  // default: treat unknown tiers as MQ4
+                    _ => 2u8, // default: treat unknown tiers as MQ4
                 })
                 .collect();
             let t = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
@@ -3897,9 +4023,8 @@ static EXPERT_STATS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 static EXPERT_STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn expert_stats_enabled() -> bool {
-    *EXPERT_STATS_ON.get_or_init(|| {
-        std::env::var("HIPFIRE_MOE_EXPERT_STATS").ok().as_deref() == Some("1")
-    })
+    *EXPERT_STATS_ON
+        .get_or_init(|| std::env::var("HIPFIRE_MOE_EXPERT_STATS").ok().as_deref() == Some("1"))
 }
 fn capture_expert_stats(
     gpu: &Gpu,
@@ -3910,22 +4035,41 @@ fn capture_expert_stats(
     topk_indices: &GpuTensor,
     topk_weights: &GpuTensor,
 ) {
-    let dn = match gpu.download_f32(down_expanded) { Ok(v) => v, Err(_) => return };
-    let ti = match gpu.download_f32(topk_indices) { Ok(v) => v, Err(_) => return };
-    let tw = match gpu.download_f32(topk_weights) { Ok(v) => v, Err(_) => return };
+    let dn = match gpu.download_f32(down_expanded) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let ti = match gpu.download_f32(topk_indices) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let tw = match gpu.download_f32(topk_weights) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
     let mut guard = EXPERT_STATS.lock().unwrap();
     let m = guard.get_or_insert_with(std::collections::HashMap::new);
     for krank in 0..k {
-        if krank >= ti.len() || krank >= tw.len() { break; }
+        if krank >= ti.len() || krank >= tw.len() {
+            break;
+        }
         let e = (ti[krank].to_bits() as i32) as u16; // i32-in-F32 alias
         let w = tw[krank] as f64;
         let base = krank * hidden;
-        if base + hidden > dn.len() { break; }
+        if base + hidden > dn.len() {
+            break;
+        }
         let mut sq = 0.0f64;
-        for j in 0..hidden { let x = dn[base + j] as f64; sq += x * x; }
+        for j in 0..hidden {
+            let x = dn[base + j] as f64;
+            sq += x * x;
+        }
         let norm = sq.sqrt();
         let ent = m.entry((layer_idx, e)).or_insert((0, 0.0, 0.0, 0.0));
-        ent.0 += 1; ent.1 += w; ent.2 += norm; ent.3 += w * norm;
+        ent.0 += 1;
+        ent.1 += w;
+        ent.2 += norm;
+        ent.3 += w * norm;
     }
 }
 /// Dump the accumulated per-(layer,expert) REAP stats to a TSV. Called from
@@ -3934,7 +4078,10 @@ pub fn dump_expert_stats(path: &str) {
     let guard = EXPERT_STATS.lock().unwrap();
     let m = match guard.as_ref() {
         Some(m) if !m.is_empty() => m,
-        _ => { eprintln!("expert_stats: empty (capture not enabled?)"); return; }
+        _ => {
+            eprintln!("expert_stats: empty (capture not enabled?)");
+            return;
+        }
     };
     let mut rows: Vec<_> = m.iter().collect();
     rows.sort_by_key(|((l, e), _)| (*l, *e));
@@ -4091,8 +4238,15 @@ fn moe_ffn_decode_impl(
         .run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
     if expert_stats_enabled() {
-        capture_expert_stats(gpu, ffn.layer_idx, k, hidden,
-            s.down_expanded, s.topk_indices, s.topk_weights);
+        capture_expert_stats(
+            gpu,
+            ffn.layer_idx,
+            k,
+            hidden,
+            s.down_expanded,
+            s.topk_indices,
+            s.topk_weights,
+        );
     }
     Ok(())
 }
@@ -4741,8 +4895,8 @@ pub fn forward_scratch(
     }
     // MoE models require allow_moe (HIPFIRE_GRAPH_MOE=1) in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let use_graph = ar_graph_test && graph_enabled && graph_eligible
-        && (config.num_experts == 0 || allow_moe);
+    let use_graph =
+        ar_graph_test && graph_enabled && graph_eligible && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -6208,9 +6362,14 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let e8_with_wmma = matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
         && matches!(
             arch,
-            "gfx1100" | "gfx1101" | "gfx1102"
-            | "gfx1150" | "gfx1151" | "gfx1152"
-            | "gfx1200" | "gfx1201"
+            "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+                | "gfx1200"
+                | "gfx1201"
         )
         && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
 
@@ -6392,8 +6551,8 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // prefill kernel, so the per-expert *uniform* requirement is waived for the
     // routed experts; the router + shared expert still go through their own
     // batched paths and are validated below.
-    let routed_ok = dtypes.routed_mixed_merged
-        || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
+    let routed_ok =
+        dtypes.routed_mixed_merged || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
     if !(router_ok && shared_gate_ok && routed_ok) {
         return false;
     }
@@ -6419,7 +6578,8 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
     // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
     // E8-family match helper: MFP4, MFP3, MFP2 lattice types.
-    let is_e8_family = |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
+    let is_e8_family =
+        |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
 
     if admit_e8
         && dtypes.shared_expert_gate == DType::Q8_0
@@ -6531,8 +6691,8 @@ pub fn prefill_batch_pbs_eligible(
     let verify_decouple = n <= 32
         && decouple_env.as_deref() != Some("0")
         && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
-    let force_fallback = !verify_decouple
-        && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback =
+        !verify_decouple && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
     let moe_topk_ok =
@@ -6541,12 +6701,12 @@ pub fn prefill_batch_pbs_eligible(
         std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
         arch,
     );
-    let has_dn = weights.layers.iter().any(|lw| matches!(
-        lw,
-        LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-    ));
+    let has_dn = weights
+        .layers
+        .iter()
+        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),));
     let all_dtypes_ok = weights.layers.iter().all(|lw| match lw {
-        LayerWeights::DeltaNet(l) =>
+        LayerWeights::DeltaNet(l) => {
             is_batchable_la(l.wqkv.gpu_dtype, arch)
                 && is_batchable_la(l.wz.gpu_dtype, arch)
                 && is_batchable_la(l.w_beta.gpu_dtype, arch)
@@ -6554,9 +6714,10 @@ pub fn prefill_batch_pbs_eligible(
                 && is_batchable_la(l.wo.gpu_dtype, arch)
                 && is_batchable_la(l.w_gate.gpu_dtype, arch)
                 && is_batchable_la(l.w_up.gpu_dtype, arch)
-                && is_batchable_la(l.w_down.gpu_dtype, arch),
+                && is_batchable_la(l.w_down.gpu_dtype, arch)
+        }
         LayerWeights::FullAttn(_) => true,
-        LayerWeights::DeltaNetMoe(l) =>
+        LayerWeights::DeltaNetMoe(l) => {
             moe_topk_ok
                 && moe_router_logits_present
                 && is_batchable_la(l.wqkv.gpu_dtype, arch)
@@ -6564,15 +6725,17 @@ pub fn prefill_batch_pbs_eligible(
                 && is_batchable_la(l.w_beta.gpu_dtype, arch)
                 && is_batchable_la(l.w_alpha.gpu_dtype, arch)
                 && is_batchable_la(l.wo.gpu_dtype, arch)
-                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
-        LayerWeights::FullAttnMoe(l) =>
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch)
+        }
+        LayerWeights::FullAttnMoe(l) => {
             moe_topk_ok
                 && moe_router_logits_present
                 && is_batchable_la(l.wq.gpu_dtype, arch)
                 && is_batchable_la(l.wk.gpu_dtype, arch)
                 && is_batchable_la(l.wv.gpu_dtype, arch)
                 && is_batchable_la(l.wo.gpu_dtype, arch)
-                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch)
+        }
     });
     let result = !force_fallback
         && n >= MIN_BATCH
@@ -6666,9 +6829,14 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
     // branch). Gate on HIPFIRE_E8_GFX12 to allow safe opt-in rollout.
     let admit_e8 = matches!(
         arch,
-        "gfx1100" | "gfx1101" | "gfx1102"
-        | "gfx1150" | "gfx1151" | "gfx1152"
-        | "gfx1200" | "gfx1201"
+        "gfx1100"
+            | "gfx1101"
+            | "gfx1102"
+            | "gfx1150"
+            | "gfx1151"
+            | "gfx1152"
+            | "gfx1200"
+            | "gfx1201"
     ) && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
@@ -7433,7 +7601,11 @@ fn prefill_moe_ffn_body_batched(
                 n,
             )?;
             gpu.sigmoid_scaled_residual_add_batched_f32(
-                &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
+                &pbs.x_batch,
+                &down_tmp,
+                shared_scalar,
+                n,
+                dim,
             )?;
         }
         // Uniform mfp4-E8 shared expert down (Option B): dequant the E8 down weight
@@ -7470,7 +7642,11 @@ fn prefill_moe_ffn_body_batched(
             )?;
             gpu.free_tensor(down_f16)?;
             gpu.sigmoid_scaled_residual_add_batched_f32(
-                &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
+                &pbs.x_batch,
+                &down_tmp,
+                shared_scalar,
+                n,
+                dim,
             )?;
         }
         other => panic!(
@@ -7504,22 +7680,24 @@ fn prefill_moe_ffn_body_batched(
         has_paro_shared: ffn.paro_shared.is_some(),
     };
 
-    let paro_gate_up = ffn.paro_shared.as_ref().map(|paro| {
-        hipfire_dispatch::families::gemv::GivensRef {
-            pairs: &paro.gate_up_pairs,
-            theta: &paro.gate_up_theta,
-            scales: &paro.gate_up_channel_scales,
-            krot: paro.krot as usize,
-        }
-    });
-    let paro_down = ffn.paro_shared.as_ref().map(|paro| {
-        hipfire_dispatch::families::gemv::GivensRef {
-            pairs: &paro.down_pairs,
-            theta: &paro.down_theta,
-            scales: &paro.down_channel_scales,
-            krot: paro.krot as usize,
-        }
-    });
+    let paro_gate_up =
+        ffn.paro_shared
+            .as_ref()
+            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
+                pairs: &paro.gate_up_pairs,
+                theta: &paro.gate_up_theta,
+                scales: &paro.gate_up_channel_scales,
+                krot: paro.krot as usize,
+            });
+    let paro_down =
+        ffn.paro_shared
+            .as_ref()
+            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
+                pairs: &paro.down_pairs,
+                theta: &paro.down_theta,
+                scales: &paro.down_channel_scales,
+                krot: paro.krot as usize,
+            });
     // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
     // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
     // stub applied experts[0]'s scale to every routed slot, which is wrong once
@@ -12726,8 +12904,12 @@ pub fn shard_moe_experts(
     // (compacted[0]'s scale) — they read zeroed gate_up ⇒ silu output 0 ⇒
     // 0/scale = 0 regardless, so the all-reduced sum is unaffected.
     if let Some(awq_tbl) = ffn.expert_down_awq_ptrs.as_ref() {
-        let dummy_aw = compacted[0].down.awq_scale.as_ref()
-            .map(|s| s.buf.as_ptr() as u64).unwrap_or(0);
+        let dummy_aw = compacted[0]
+            .down
+            .awq_scale
+            .as_ref()
+            .map(|s| s.buf.as_ptr() as u64)
+            .unwrap_or(0);
         let mut aw = vec![dummy_aw; n_exp];
         for (e, slot) in aw.iter_mut().enumerate() {
             if shard.owns_expert(rank, e) {
@@ -16135,21 +16317,33 @@ mod tests {
         // MQ3-Lloyd admits gfx1100/1101/1102/1150/1151 — the MQ3-Lloyd GEMM
         // source selectors DO ship a gfx1150 kernel.
         for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
-            assert!(is_batchable_la(DType::MQ3G256Lloyd, arch), "MQ3G256Lloyd should batch on {arch}");
+            assert!(
+                is_batchable_la(DType::MQ3G256Lloyd, arch),
+                "MQ3G256Lloyd should batch on {arch}"
+            );
         }
         // MQ4-Lloyd admits gfx1100/1101/1102/1151 ONLY (NOT gfx1150). ANTIBLEED
         // admit-vs-select fix: the MQ4-Lloyd GEMM source selectors panic on
         // gfx1150 (no kernel), so admitting it upstream would crash at lookup.
         for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1151"] {
-            assert!(is_batchable_la(DType::MQ4G256Lloyd, arch), "MQ4G256Lloyd should batch on {arch}");
+            assert!(
+                is_batchable_la(DType::MQ4G256Lloyd, arch),
+                "MQ4G256Lloyd should batch on {arch}"
+            );
         }
         assert!(
             !is_batchable_la(DType::MQ4G256Lloyd, "gfx1150"),
             "gfx1150 must NOT admit Lloyd MQ4 (no MQ4-Lloyd kernel source → panic)"
         );
         // gfx1152 not in either admit list
-        assert!(!is_batchable_la(DType::MQ3G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ3");
-        assert!(!is_batchable_la(DType::MQ4G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ4");
+        assert!(
+            !is_batchable_la(DType::MQ3G256Lloyd, "gfx1152"),
+            "gfx1152 should NOT admit Lloyd MQ3"
+        );
+        assert!(
+            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1152"),
+            "gfx1152 should NOT admit Lloyd MQ4"
+        );
         // gfx12 requires env gate
         assert!(
             !is_batchable_la(DType::MQ3G256Lloyd, "gfx1200"),
@@ -16216,7 +16410,9 @@ mod tests {
     #[test]
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false
+        ));
     }
 
     #[test]
@@ -16231,21 +16427,29 @@ mod tests {
         dtypes.expert_gate_up_uniform = false;
         dtypes.expert_down_uniform = false;
         dtypes.expert_down = DType::MQ3G256Lloyd; // representative cold-tier dtype
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
         // The same mixed file WITHOUT the merged-kernel tag table is NOT admissible.
         dtypes.routed_mixed_merged = false;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
     }
 
     #[test]
     fn moe_prefill_rejects_mq3_before_admission_work() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_down = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
     }
 
     #[test]
@@ -16260,25 +16464,33 @@ mod tests {
         assert!(!moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, false, false
         ));
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
     }
 
     #[test]
     fn moe_prefill_rejects_nonuniform_expert_projections() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up_uniform = false;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_down_uniform = false;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
     }
 
     #[test]
     fn moe_prefill_shared_gate_up_must_be_one_dtype() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
     }
 
     #[test]
@@ -16286,8 +16498,12 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::ParoQ4G128);
         dtypes.router = DType::F32;
         dtypes.shared_expert_scalar_gate = DType::F32;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, true, false
+        ));
     }
 
     #[test]
@@ -16297,9 +16513,13 @@ mod tests {
         dtypes.expert_gate_up = DType::MFP4G32E8;
         dtypes.expert_down = DType::MFP4G32E8;
         // Without the arch gate (non-gfx1151), E8 is rejected.
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false
+        ));
         // With the gfx1151 arch gate, the Q8-shared + E8-routed layer admits.
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, true));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, true
+        ));
     }
 
     #[test]

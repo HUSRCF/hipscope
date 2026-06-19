@@ -3066,8 +3066,9 @@ pub fn spec_step_dflash(
     // only; zero cost when unset.
     static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let logit_dump_active = !use_temp_sampling
-        && *LOGIT_DUMP_ENV
-            .get_or_init(|| std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1"));
+        && *LOGIT_DUMP_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
+        });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
@@ -3659,7 +3660,11 @@ pub fn spec_step_dflash(
                 }
             }
             let rejected = accept_len < b - 1;
-            let rej_tok: i64 = if rejected { block[accept_len + 1] as i64 } else { -1 };
+            let rej_tok: i64 = if rejected {
+                block[accept_len + 1] as i64
+            } else {
+                -1
+            };
             let (rej_logit, gap, rej_rank) = if rejected {
                 let rv = row[rej_tok as usize];
                 let rank = row.iter().filter(|&&v| v > rv).count() + 1;

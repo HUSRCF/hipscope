@@ -70,7 +70,10 @@ fn main() {
     // Bench-only: repeat the prompt N times to synthesize long contexts without
     // multi-KB CLI args. Lets us drive 16k/32k+ prefills to validate that the
     // chunked path's scratch is bounded by chunk_size, not the prompt length.
-    let prompt = match std::env::var("HIPFIRE_EP_PROMPT_REPEAT").ok().and_then(|v| v.parse::<usize>().ok()) {
+    let prompt = match std::env::var("HIPFIRE_EP_PROMPT_REPEAT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         Some(r) if r > 1 => prompt_base.repeat(r),
         _ => prompt_base,
     };
@@ -179,7 +182,9 @@ fn main() {
         qwen35::set_ep_expert_shard(None);
         weights_per_rank.push(w);
     }
-    eprintln!("  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");
+    eprintln!(
+        "  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)"
+    );
 
     // ── per-rank state + routed partials (+ prefill scratch when batched) ────
     use hipfire_arch_qwen35::qwen35::PrefillBatchScratch;
@@ -201,7 +206,11 @@ fn main() {
         kv_per_rank.push(
             match kv_mode.as_str() {
                 "asym3" => KvCache::new_gpu_asym3(
-                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                    g,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
                 ),
                 "fwht3" => {
                     let is_kv: Vec<bool> = config
@@ -210,11 +219,19 @@ fn main() {
                         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                         .collect();
                     KvCache::new_gpu_fwht3_filtered(
-                        g, &is_kv, config.n_kv_heads, config.head_dim, kv_seq,
+                        g,
+                        &is_kv,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_seq,
                     )
                 }
                 _ => KvCache::new_gpu_q8(
-                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                    g,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
                 ),
             }
             .expect("kv"),
@@ -229,7 +246,10 @@ fn main() {
                 PrefillBatchScratch::new_opt(g, &config, max_batch, /*cap_gdn_tape=*/ false)
                     .expect("pbs"),
             );
-            prefill_partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("prefill partial"));
+            prefill_partials.push(
+                g.zeros(&[max_batch * config.dim], DType::F32)
+                    .expect("prefill partial"),
+            );
         }
     }
     if n > 1 {
@@ -256,9 +276,16 @@ fn main() {
         while offset < prompt_tokens.len() {
             let chunk_n = (prompt_tokens.len() - offset).min(chunk_size);
             qwen35::forward_prefill_batch_ep(
-                &mut gpus, &weights_per_rank, &config,
-                &prompt_tokens[offset..offset + chunk_n], offset,
-                &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
+                &mut gpus,
+                &weights_per_rank,
+                &config,
+                &prompt_tokens[offset..offset + chunk_n],
+                offset,
+                &mut kv_per_rank,
+                &mut dn_per_rank,
+                &scratch_per_rank,
+                &pbs_per_rank,
+                &prefill_partials,
             )
             .expect("forward_prefill_batch_ep chunk");
             offset += chunk_n;

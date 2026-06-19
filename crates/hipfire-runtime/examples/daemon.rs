@@ -2769,7 +2769,6 @@ fn main() {
 /// the A1B export (which ships no embedded chat_template) still gets correct
 /// jinja framing instead of the hand-rolled ChatML fallback.
 
-
 /// Parse a HIPFIRE_KV_ADAPTIVE-style string (env value OR per-load
 /// `params.kv_adaptive`) into `(named-preset, k_floor, v_floor)`.
 ///
