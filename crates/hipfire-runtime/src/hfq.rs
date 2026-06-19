@@ -44,7 +44,7 @@ fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 #[derive(Clone)]
 pub struct HfqTensorInfo {
     pub name: String,
-    pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
+    pub quant_type: u8, // serialized QuantType byte (e.g. 13=MQ4G256, 15=MQ6G256, 31=MQ5G256); see hipfire-quantize QuantType enum
     pub shape: Vec<u32>,
     pub group_size: u32,
     pub data_offset: usize,
@@ -213,7 +213,7 @@ impl HfqFile {
             cumulative_offset += data_size;
         }
 
-        Ok(Self {
+        let me = Self {
             _file: file,
             path: path.to_path_buf(),
             mmap: Some(mmap),
@@ -222,7 +222,27 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
-        })
+        };
+
+        // Structural-pillar tripwire: a qwen3.5/3.6 checkpoint MUST carry
+        // arch_id 5 (dense) or 6 (MoE) so the daemon's chat-template resolver
+        // routes it through the froggeric pillar and its forward dispatches to
+        // the qwen35 crate. If the retained source provenance says qwen3* but
+        // the stamped arch_id is anything else, the pillar cannot fire — hard-
+        // fail at load rather than silently serving a mis-framed model.
+        if !matches!(me.arch_id, 5 | 6) {
+            if let Some(prov) = me.qwen3_provenance() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "qwen3* model ({prov}) stamped arch_id={}; cannot guarantee froggeric pillar — re-quantize with correct arch_id (5=dense, 6=MoE)",
+                        me.arch_id
+                    ),
+                ));
+            }
+        }
+
+        Ok(me)
     }
 
     /// Drop the mmap to free the virtual address mapping. After this call,
@@ -276,6 +296,59 @@ impl HfqFile {
             .get("chat_template")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// Detect whether this .hfq's retained source provenance indicates a
+    /// qwen3.5 / qwen3.6 model. The quantizer writes the original family
+    /// identity into the .hfq metadata blob: the safetensors path stores
+    /// `metadata.architecture` (= `config.model_type`) and the full
+    /// `metadata.config` (which carries `architectures[]` and `model_type`);
+    /// the GGUF path stores `metadata.architecture` (e.g. "qwen3moe") and
+    /// `metadata.config.model_type`. This scans all of those for the same
+    /// qwen3_5/qwen3.5/qwen3_6/qwen3.6 substrings used by
+    /// `safetensors_source::detect_arch_id` so the load-time pillar tripwire
+    /// can flag a qwen3* checkpoint whose `arch_id` header was mis-stamped
+    /// (i.e. not 5/6). Returns the matched provenance string for the error
+    /// message, or `None` when no qwen3* marker is present (or metadata is
+    /// unparseable / absent).
+    pub fn qwen3_provenance(&self) -> Option<String> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        let is_qwen35 = |s: &str| {
+            let l = s.to_lowercase();
+            l.contains("qwen3_5")
+                || l.contains("qwen3.5")
+                || l.contains("qwen3_6")
+                || l.contains("qwen3.6")
+        };
+        // metadata.architecture (model_type str for safetensors; GGUF arch str).
+        if let Some(a) = meta.get("architecture").and_then(|v| v.as_str()) {
+            if is_qwen35(a) {
+                return Some(format!("architecture={a}"));
+            }
+        }
+        // metadata.config.model_type and metadata.config.architectures[].
+        let cfg = meta.get("config");
+        if let Some(mt) = cfg
+            .and_then(|c| c.get("model_type"))
+            .and_then(|v| v.as_str())
+        {
+            if is_qwen35(mt) {
+                return Some(format!("model_type={mt}"));
+            }
+        }
+        if let Some(archs) = cfg
+            .and_then(|c| c.get("architectures"))
+            .and_then(|v| v.as_array())
+        {
+            for v in archs {
+                if let Some(a) = v.as_str() {
+                    if is_qwen35(a) {
+                        return Some(format!("architectures={a}"));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a tensor name, trying common prefix variants.

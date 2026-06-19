@@ -210,6 +210,8 @@ pub(crate) fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs: None,
+        expert_dtype_tags: None,
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
