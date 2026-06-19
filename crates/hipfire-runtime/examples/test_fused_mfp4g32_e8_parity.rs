@@ -12,7 +12,8 @@
 
 use std::path::Path;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_arch_qwen35::qwen35::{self, LayerWeights};
+use hipfire_runtime::model_load::Layout;
+use hipfire_arch_qwen35::qwen35::{self, HfqSource, LayerWeights};
 use rdna_compute::DType;
 
 #[cfg(not(feature = "deltanet"))]
@@ -31,7 +32,9 @@ fn main() {
     if !gpu.arch_caps.is_gfx1151() {
         eprintln!("WARNING: not gfx1151 — fused kernels are gfx1151-only; set HIP_VISIBLE_DEVICES=1");
     }
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+    let mut source = HfqSource::new(&mut hfq, &config);
+    let layout = Layout::single(config.n_layers);
+    let weights = qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout).expect("load weights");
 
     // First DeltaNet layer carries both the FFN (gate/up) and the LA preamble
     // (qkv/z/beta/alpha) — everything we need.
