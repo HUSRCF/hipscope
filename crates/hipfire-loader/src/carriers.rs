@@ -94,6 +94,18 @@ fn resolve_eos_tok(
     1
 }
 
+/// Dir-source diagnostic: arch_id + quant_method. One-line call at the top of
+/// every Dir-capable carrier's load(). Qwen35 prints a richer variant inline.
+fn dir_diag(src: &ModelSource) {
+    if let ModelSource::Dir(s) = src {
+        let qm = s
+            .quant_config()
+            .map(|q| q.method.as_str())
+            .unwrap_or("none");
+        eprintln!("  safetensors arch_id={}, quant_method={qm}", s.arch_id());
+    }
+}
+
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
 
 pub struct Qwen2Carrier;
@@ -287,13 +299,7 @@ impl Carrier for Qwen35Carrier {
             }
         }
         // Per-source diagnostics stay at the call site, before resolve_source_meta.
-        if let ModelSource::Dir(s) = &src {
-            let qm = s
-                .quant_config()
-                .map(|q| q.method.as_str())
-                .unwrap_or("none");
-            eprintln!("  safetensors arch_id={}, quant_method={qm}", s.arch_id());
-        }
+        dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         match src {
@@ -465,9 +471,7 @@ impl Carrier for LlamaCarrier {
             }
             .into());
         }
-        if let ModelSource::Dir(s) = &src {
-            eprintln!("  safetensors arch_id={}", s.arch_id());
-        }
+        dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         // ── source-varying seam: yields a LlamaBundle ──
@@ -538,7 +542,11 @@ impl Carrier for DotsOcrCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("dots_ocr: pipeline-parallel (pp>1) unsupported".into());
+            return Err(match &src {
+                ModelSource::Hfq(_) => "dots_ocr: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "dots_ocr: safetensors + pp>1 unsupported",
+            }
+            .into());
         }
         let (meta, mut hfq) = require_hfq(src, ctx.path, "dots_ocr")?;
 
@@ -577,7 +585,11 @@ impl Carrier for Deepseek4Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("deepseek4: pipeline-parallel (pp>1) unsupported".into());
+            return Err(match &src {
+                ModelSource::Hfq(_) => "deepseek4: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "deepseek4: safetensors + pp>1 unsupported",
+            }
+            .into());
         }
         let (meta, mut hfq) = require_hfq(src, ctx.path, "deepseek4")?;
 
@@ -632,9 +644,7 @@ impl Carrier for MinimaxCarrier {
             .into());
         }
         // Per-source diagnostic stays at the call site, before resolve_source_meta.
-        if let ModelSource::Dir(s) = &src {
-            eprintln!("  safetensors arch_id={}", s.arch_id());
-        }
+        dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         // ── source-varying seam: (config, weights) only ──
@@ -696,7 +706,11 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("lfm2moe: pipeline-parallel (pp>1) unsupported".into());
+            return Err(match &src {
+                ModelSource::Hfq(_) => "lfm2moe: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "lfm2moe: safetensors + pp>1 unsupported",
+            }
+            .into());
         }
         let (meta, mut hfq) = require_hfq(src, ctx.path, "lfm2moe")?;
 
