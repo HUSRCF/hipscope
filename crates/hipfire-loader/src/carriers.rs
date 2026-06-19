@@ -38,11 +38,16 @@ fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, Stri
             chat_template: resolve_chat_template(hfq, path),
             arch_id: hfq.arch_id,
         }),
-        ModelSource::Dir(source) => Ok(SourceMeta {
-            tokenizer: tokenizer_from_dir(source)?,
-            chat_template: resolve_chat_template_overrides(path).or_else(|| source.chat_template()),
-            arch_id: source.arch_id(),
-        }),
+        ModelSource::Dir(source) => {
+            let arch_id = source.arch_id();
+            Ok(SourceMeta {
+                tokenizer: tokenizer_from_dir(source)?,
+                chat_template: resolve_chat_template_overrides(path)
+                    .or_else(|| source.chat_template())
+                    .or_else(|| arch_default_template(arch_id)),
+                arch_id,
+            })
+        }
     }
 }
 
@@ -58,6 +63,35 @@ fn tokenizer_from_dir(
     } else {
         Err("no tokenizer.json found in model directory".into())
     }
+}
+
+/// Checks that `src` is HFQ-only, resolves metadata, and unwraps the file —
+/// collapses the three-step boilerplate in every HFQ-only carrier.
+fn require_hfq(
+    src: ModelSource,
+    path: &str,
+    carrier_name: &str,
+) -> Result<(SourceMeta, hipfire_runtime::hfq::HfqFile), String> {
+    let ModelSource::Hfq(_) = &src else {
+        return Err(format!("{carrier_name}: directory source unsupported"));
+    };
+    let meta = resolve_source_meta(&src, path)?;
+    let ModelSource::Hfq(hfq) = src else { unreachable!() };
+    Ok((meta, hfq))
+}
+
+/// Returns the first candidate string that tokenizes to exactly one token, or 1.
+fn resolve_eos_tok(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    candidates: &[&str],
+) -> u32 {
+    for s in candidates {
+        let ids = tokenizer.encode(s);
+        if ids.len() == 1 {
+            return ids[0];
+        }
+    }
+    1
 }
 
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
@@ -96,11 +130,33 @@ impl Carrier for Qwen2Carrier {
 
 // ─── Qwen35Carrier ───────────────────────────────────────────────────
 
-fn qwen35_kv_mode(ctx: &LoadCtx) -> String {
+fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
     ctx.kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
+}
+
+fn resolve_kv_mode(
+    ctx: &LoadCtx,
+    policy: &hipfire_runtime::kv_mode::KvModePolicy,
+    head_dim: usize,
+) -> hipfire_runtime::kv_mode::KvMode {
+    let kv_mode = kv_mode_from_ctx(ctx);
+    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+        hipfire_runtime::kv_mode::resolve(&kv_mode, policy, head_dim);
+    if let Some(w) = warning {
+        eprintln!("  KV cache: {w} (site {})", policy.site);
+    }
+    mode
+}
+
+fn arch_default_template(arch_id: u32) -> Option<String> {
+    match arch_id {
+        5 | 6 => Some(super::FROGGERIC_QWEN35_TEMPLATE.to_string()),
+        11 => Some(super::LFM2_TEMPLATE.to_string()),
+        _ => None,
+    }
 }
 
 /// Qwen3.5 pipeline-parallel (pp>1) load. Extracted from the carrier body so
@@ -115,11 +171,6 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let kv_mode = ctx
-        .kv_mode_override
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
         .ok()
         .filter(|s| !s.is_empty())
@@ -160,18 +211,7 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(
-            &kv_mode,
-            &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
-            config.head_dim,
-        );
-    if let Some(w) = warning {
-        eprintln!(
-            "  KV cache: {w} (site {})",
-            hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
-        );
-    }
+    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY, config.head_dim);
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -338,19 +378,7 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let kv_mode = qwen35_kv_mode(ctx);
-                let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-                    hipfire_runtime::kv_mode::resolve(
-                        &kv_mode,
-                        &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
-                        config.head_dim,
-                    );
-                if let Some(w) = warning {
-                    eprintln!(
-                        "  KV cache: {w} (site {})",
-                        hipfire_runtime::kv_mode::QWEN35_PARO_POLICY.site
-                    );
-                }
+                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY, config.head_dim);
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
                     n_kv_heads: config.n_kv_heads,
@@ -456,23 +484,7 @@ impl Carrier for LlamaCarrier {
                     &source, &config, ctx.gpu,
                 )
                 .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                let kv_mode = ctx
-                    .kv_mode_override
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-                let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-                    hipfire_runtime::kv_mode::resolve(
-                        &kv_mode,
-                        &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-                        config.head_dim,
-                    );
-                if let Some(w) = warning {
-                    eprintln!(
-                        "  KV cache: {w} (site {})",
-                        hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
-                    );
-                }
+                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY, config.head_dim);
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Flat(config.n_layers),
                     n_kv_heads: config.n_kv_heads,
@@ -528,13 +540,7 @@ impl Carrier for DotsOcrCarrier {
         if ctx.pp > 1 {
             return Err("dots_ocr: pipeline-parallel (pp>1) unsupported".into());
         }
-        let ModelSource::Hfq(_) = &src else {
-            return Err("dots_ocr: directory source unsupported".into());
-        };
-        let meta = resolve_source_meta(&src, ctx.path)?;
-        let ModelSource::Hfq(mut hfq) = src else {
-            unreachable!()
-        };
+        let (meta, mut hfq) = require_hfq(src, ctx.path, "dots_ocr")?;
 
         use hipfire_arch_dots_ocr::DotsOcr;
         use hipfire_runtime::arch::Architecture;
@@ -573,13 +579,7 @@ impl Carrier for Deepseek4Carrier {
         if ctx.pp > 1 {
             return Err("deepseek4: pipeline-parallel (pp>1) unsupported".into());
         }
-        let ModelSource::Hfq(_) = &src else {
-            return Err("deepseek4: directory source unsupported".into());
-        };
-        let meta = resolve_source_meta(&src, ctx.path)?;
-        let ModelSource::Hfq(mut hfq) = src else {
-            unreachable!()
-        };
+        let (meta, mut hfq) = require_hfq(src, ctx.path, "deepseek4")?;
 
         use hipfire_arch_deepseek4 as deepseek4;
         use hipfire_runtime::arch::Architecture;
@@ -593,14 +593,7 @@ impl Carrier for Deepseek4Carrier {
             .unwrap_or(1024);
         let pbs =
             deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
-        let eos_tok: u32 = {
-            let ids = meta.tokenizer.encode("<｜end▁of▁sentence｜>");
-            if ids.len() == 1 {
-                ids[0]
-            } else {
-                1
-            }
-        };
+        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         Ok(LoadedModel {
             deepseek4_config: Some(config),
             deepseek4_weights: Some(weights),
@@ -671,21 +664,7 @@ impl Carrier for MinimaxCarrier {
         // ── single shared tail (byte-identical to the previous per-arm tails) ──
         let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-        let eos_tok: u32 = {
-            let try_one = |s: &str| -> Option<u32> {
-                let ids = meta.tokenizer.encode(s);
-                if ids.len() == 1 {
-                    Some(ids[0])
-                } else {
-                    None
-                }
-            };
-            try_one("[e~[")
-                .or_else(|| try_one("<|im_end|>"))
-                .or_else(|| try_one("</s>"))
-                .or_else(|| try_one("<|endoftext|>"))
-                .unwrap_or(1)
-        };
+        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"]);
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -719,33 +698,14 @@ impl Carrier for Lfm2MoeCarrier {
         if ctx.pp > 1 {
             return Err("lfm2moe: pipeline-parallel (pp>1) unsupported".into());
         }
-        let ModelSource::Hfq(_) = &src else {
-            return Err("lfm2moe: directory source unsupported".into());
-        };
-        let meta = resolve_source_meta(&src, ctx.path)?;
-        let ModelSource::Hfq(mut hfq) = src else {
-            unreachable!()
-        };
+        let (meta, mut hfq) = require_hfq(src, ctx.path, "lfm2moe")?;
 
         use hipfire_arch_lfm2moe as lfm2moe;
         let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
         let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
-        let eos_tok: u32 = {
-            let try_one = |s: &str| -> Option<u32> {
-                let ids = meta.tokenizer.encode(s);
-                if ids.len() == 1 {
-                    Some(ids[0])
-                } else {
-                    None
-                }
-            };
-            try_one("<|im_end|>")
-                .or_else(|| try_one("</s>"))
-                .or_else(|| try_one("<|endoftext|>"))
-                .unwrap_or(1)
-        };
+        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);
         Ok(LoadedModel {
             state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
                 config,
