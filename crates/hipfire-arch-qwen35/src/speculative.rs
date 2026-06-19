@@ -83,7 +83,12 @@ fn run_spec_gemm_key(
         rotation: None,
         awq_scale: None,
     };
-    let params = GemmParams { w: &w, x, y, batch_size: n };
+    let params = GemmParams {
+        w: &w,
+        x,
+        y,
+        batch_size: n,
+    };
     SPEC_CTX.with(|cell| {
         let needs_rebuild = {
             let slot = cell.borrow();
@@ -554,13 +559,19 @@ impl ModelSlot {
         let mut hfq = HfqFile::open(path).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("open {} ({}): {}", path.display(), name, e))
         })?;
-        let config = qwen35::config_from_hfq(&hfq).ok_or_else(|| {
+        let config = qwen35::config_from_hfq(&hfq).map_err(|e| {
             hip_bridge::HipError::new(
                 0,
-                &format!("invalid Qwen3.5 config in {} ({})", path.display(), name),
+                &format!(
+                    "invalid Qwen3.5 config in {} ({}): {e}",
+                    path.display(),
+                    name
+                ),
             )
         })?;
-        let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
+        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+        let layout = qwen35::Layout::single(config.n_layers);
+        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
 
         // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
         // FullAttention out of 64 total), only the FullAttention layers need
@@ -1064,7 +1075,12 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
-            return gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps);
+            return gpu.graphs.replay_graph_launch(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
+            );
         }
 
         if can_graph && gpu.graphs.replay_needs_warmup(n_steps) {
@@ -1075,19 +1091,27 @@ impl GdnTape {
 
         if can_graph {
             gpu.graphs.begin_replay_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), n_steps,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
             )?;
             let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
             if r.is_ok() {
                 gpu.graphs.end_replay_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 // Same pattern as verify_graph: hipStreamBeginCapture records
                 // without executing, so launch once here to apply this cycle's
                 // state updates.
-                gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps)?;
+                gpu.graphs.replay_graph_launch(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    n_steps,
+                )?;
                 return Ok(());
             } else {
                 let _ = gpu
@@ -2488,8 +2512,10 @@ fn verify_dflash_block_inner(
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
             gpu.graphs.verify_graph_launch(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             Ok(())
         } else if gpu.graphs.verify_needs_warmup(b) {
@@ -2528,8 +2554,10 @@ fn verify_dflash_block_inner(
             // Capture path: first call at this B after warmup.
             let capture_lmhead_argmax = moe_lmhead_graph_ok;
             gpu.graphs.begin_verify_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
@@ -2564,7 +2592,8 @@ fn verify_dflash_block_inner(
             if r.is_ok() {
                 let blob_count = gpu.graphs.capture_blobs.len();
                 gpu.graphs.end_verify_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 if capture_lmhead_argmax {
@@ -2580,8 +2609,10 @@ fn verify_dflash_block_inner(
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
                 gpu.graphs.verify_graph_launch(
-                    &gpu.hip, gpu.device_id,
-                    gpu.active_stream.as_ref().unwrap(), b,
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    b,
                 )?;
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
@@ -3035,8 +3066,9 @@ pub fn spec_step_dflash(
     // only; zero cost when unset.
     static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let logit_dump_active = !use_temp_sampling
-        && *LOGIT_DUMP_ENV
-            .get_or_init(|| std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1"));
+        && *LOGIT_DUMP_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
+        });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
@@ -3628,7 +3660,11 @@ pub fn spec_step_dflash(
                 }
             }
             let rejected = accept_len < b - 1;
-            let rej_tok: i64 = if rejected { block[accept_len + 1] as i64 } else { -1 };
+            let rej_tok: i64 = if rejected {
+                block[accept_len + 1] as i64
+            } else {
+                -1
+            };
             let (rej_logit, gap, rej_rank) = if rejected {
                 let rv = row[rej_tok as usize];
                 let rank = row.iter().filter(|&&v| v > rv).count() + 1;
@@ -5883,7 +5919,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
         target_hidden_host.extend_from_slice(&block);
@@ -5947,7 +5985,9 @@ pub fn seed_target_hidden_suffix_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         pos += chunk.len();
         off = end;

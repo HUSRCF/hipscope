@@ -472,6 +472,137 @@ impl Lfm2MoeWeights {
     }
 }
 
+// ──────────────────────────── Teardown ────────────────────────────
+// Exhaustive-destructure frees so a future added GPU-bearing field is a
+// compile error ("missing field in pattern"), not a silent VRAM leak.
+// WeightTensors use `free_all` (covers buf + non-aliased ParoQuant rotation +
+// AWQ sidecar — lfm2moe attaches AWQ scales to expert-0, so a `.buf`-only free
+// would leak them).
+
+impl ConvWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let ConvWeights {
+            in_proj,
+            conv_weight,
+            out_proj,
+            conv_state_idx: _,
+        } = self;
+        in_proj.free_all(gpu);
+        let _ = gpu.free_tensor(conv_weight);
+        out_proj.free_all(gpu);
+    }
+}
+
+impl AttnWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let AttnWeights {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            kv_idx: _,
+        } = self;
+        wq.free_all(gpu);
+        wk.free_all(gpu);
+        wv.free_all(gpu);
+        wo.free_all(gpu);
+        let _ = gpu.free_tensor(q_norm);
+        let _ = gpu.free_tensor(k_norm);
+    }
+}
+
+impl Mixer {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Mixer::Conv(c) => c.free_gpu(gpu),
+            Mixer::Attention(a) => a.free_gpu(gpu),
+        }
+    }
+}
+
+impl DenseFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let DenseFfn { w1, w3, w2 } = self;
+        w1.free_all(gpu);
+        w3.free_all(gpu);
+        w2.free_all(gpu);
+    }
+}
+
+impl ExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let ExpertWeights { gate_up, down } = self;
+        gate_up.free_all(gpu);
+        down.free_all(gpu);
+    }
+}
+
+impl MoeFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MoeFfn {
+            router,
+            expert_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+        } = self;
+        router.free_all(gpu);
+        let _ = gpu.free_tensor(expert_bias);
+        for e in experts {
+            e.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(expert_down_ptrs);
+    }
+}
+
+impl Ffn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Ffn::Dense(d) => d.free_gpu(gpu),
+            Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+}
+
+impl Lfm2MoeLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Lfm2MoeLayerWeights {
+            operator_norm,
+            ffn_norm,
+            mixer,
+            ffn,
+        } = self;
+        let _ = gpu.free_tensor(operator_norm);
+        let _ = gpu.free_tensor(ffn_norm);
+        mixer.free_gpu(gpu);
+        ffn.free_gpu(gpu);
+    }
+}
+
+impl Lfm2MoeWeights {
+    /// Return all weight GPU buffers to the pool. Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Lfm2MoeWeights {
+            embed,
+            embedding_norm,
+            lm_head,
+            layers,
+        } = self;
+        // `embed` (raw upload) and `lm_head` (Q8 weight) are separate
+        // allocations even though both come from embed_tokens.weight — no
+        // aliasing, no double-free.
+        let _ = gpu.free_tensor(embed);
+        let _ = gpu.free_tensor(embedding_norm);
+        lm_head.free_all(gpu);
+        for layer in layers {
+            layer.free_gpu(gpu);
+        }
+    }
+}
+
 // ──────────────────────────── State ────────────────────────────
 
 /// Per-decode GPU scratch + KV cache (attention layers) + conv-state cache
@@ -522,6 +653,73 @@ pub struct Lfm2MoeState {
 }
 
 impl Lfm2MoeState {
+    /// Return all decode-scratch + cache GPU buffers to the pool. Consumes self.
+    /// Exhaustive destructure: a future added buffer field fails to compile here.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Lfm2MoeState {
+            kv,
+            conv_states,
+            pos_buf,
+            graph_warmed_up: _,
+            max_seq: _,
+            n_tokens: _,
+            h,
+            tmp,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            conv_bcx,
+            conv_y,
+            ffn_tmp,
+            ffn_x_rot,
+            dense_gate,
+            dense_up,
+            dense_act,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            logits,
+        } = self;
+        kv.free_gpu(gpu);
+        for t in conv_states {
+            let _ = gpu.free_tensor(t);
+        }
+        // pos_buf is a raw DeviceBuffer (no Drop impl) — free explicitly.
+        let _ = gpu.hip.free(pos_buf);
+        for t in [
+            h,
+            tmp,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            conv_bcx,
+            conv_y,
+            ffn_tmp,
+            ffn_x_rot,
+            dense_gate,
+            dense_up,
+            dense_act,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            logits,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Lfm2MoeConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(8192);
         Self::new_with_max_seq(gpu, cfg, max_seq)
