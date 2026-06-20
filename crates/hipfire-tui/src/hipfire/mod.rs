@@ -3,6 +3,7 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 pub mod chat;
+pub mod chat_history;
 pub mod config;
 pub mod dashboard;
 pub mod log_tail;
@@ -66,6 +67,7 @@ pub struct HipfirePaths {
     pub serve_pid: PathBuf,
     pub serve_log: PathBuf,
     pub ui_state: PathBuf,
+    pub chat_history: PathBuf,
     pub registry_candidates: Vec<PathBuf>,
 }
 
@@ -83,6 +85,7 @@ impl HipfirePaths {
             serve_pid: root.join("serve.pid"),
             serve_log: root.join("serve.log"),
             ui_state: root.join("ui_state.json"),
+            chat_history: root.join("chat_history.json"),
             registry_candidates: vec![
                 cwd.join("cli/registry.json"),
                 root.join("cli/registry.json"),

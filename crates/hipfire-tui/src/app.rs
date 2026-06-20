@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
+    chat_history::ChatHistory,
     config::ConfigState,
     dashboard::{Dashboard, DashboardWorker},
     log_tail::{LogSnapshot, LogTailer},
@@ -718,11 +719,78 @@ impl App {
                 self.chat.scroll = 0;
                 self.chat.status = "conversation cleared".into();
             }
+            "save" => self.chat_save(arg),
+            "load" => self.chat_load(arg),
+            "sessions" | "ls" => self.chat_sessions(),
+            "delete" | "del" => self.chat_delete(arg),
             "help" | "" => {
-                self.chat.status =
-                    "/model <tag> · /system <text> · /temp <0-2> · /top_p <0-1> · /clear".into();
+                self.chat.status = "/model · /system · /temp · /top_p · /clear · /save · /load · /sessions · /delete".into();
             }
             other => self.toast_error(format!("unknown command: /{other} (try /help)")),
+        }
+    }
+
+    /// `/save <name>` — persist the current conversation as a named session.
+    fn chat_save(&mut self, name: &str) {
+        if name.is_empty() {
+            self.toast_error("usage: /save <name>");
+            return;
+        }
+        if self.chat.messages.is_empty() {
+            self.toast_info("nothing to save (empty conversation)");
+            return;
+        }
+        let mut h = ChatHistory::load(&self.paths.chat_history);
+        h.upsert(name, self.chat.messages.clone());
+        match h.save(&self.paths.chat_history) {
+            Ok(()) => self.chat.status = format!("saved session '{name}'"),
+            Err(e) => self.toast_error(format!("save failed: {e}")),
+        }
+    }
+
+    /// `/load <name>` — replace the conversation with a saved session.
+    fn chat_load(&mut self, name: &str) {
+        if name.is_empty() {
+            self.toast_error("usage: /load <name> (see /sessions)");
+            return;
+        }
+        let h = ChatHistory::load(&self.paths.chat_history);
+        match h.get(name) {
+            Some(msgs) => {
+                self.chat.messages = msgs.to_vec();
+                self.chat.scroll = 0;
+                self.chat.status =
+                    format!("loaded '{name}' ({} messages)", self.chat.messages.len());
+            }
+            None => self.toast_error(format!("no session '{name}' (see /sessions)")),
+        }
+    }
+
+    /// `/sessions` — list saved session names.
+    fn chat_sessions(&mut self) {
+        let h = ChatHistory::load(&self.paths.chat_history);
+        let names = h.names();
+        self.chat.status = if names.is_empty() {
+            "no saved sessions (use /save <name>)".into()
+        } else {
+            format!("sessions: {}", names.join(", "))
+        };
+    }
+
+    /// `/delete <name>` — remove a saved session.
+    fn chat_delete(&mut self, name: &str) {
+        if name.is_empty() {
+            self.toast_error("usage: /delete <name>");
+            return;
+        }
+        let mut h = ChatHistory::load(&self.paths.chat_history);
+        if h.remove(name) {
+            match h.save(&self.paths.chat_history) {
+                Ok(()) => self.chat.status = format!("deleted session '{name}'"),
+                Err(e) => self.toast_error(format!("delete failed: {e}")),
+            }
+        } else {
+            self.toast_error(format!("no session '{name}'"));
         }
     }
 
@@ -1353,6 +1421,38 @@ mod tests {
         let (mut app, dir) = test_app();
         app.handle_chat_command("definitely-not-a-command");
         assert!(app.toast.is_some(), "unknown command surfaces an error toast");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_save_load_sessions_round_trip() {
+        let (mut app, dir) = test_app();
+        app.paths.chat_history = dir.join("chat_history.json");
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+        ];
+        app.handle_chat_command("save debug");
+        app.handle_chat_command("clear");
+        assert!(app.chat.messages.is_empty());
+        app.handle_chat_command("load debug");
+        assert_eq!(app.chat.messages.len(), 2);
+        assert_eq!(app.chat.messages[1].content, "hello");
+        app.handle_chat_command("sessions");
+        assert!(app.chat.status.contains("debug"));
+        app.handle_chat_command("delete debug");
+        app.handle_chat_command("load debug");
+        assert!(
+            app.toast.is_some(),
+            "loading a deleted session surfaces an error"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
