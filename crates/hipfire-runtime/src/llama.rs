@@ -5160,7 +5160,8 @@ impl KvCache {
             quant_hfq4: self.quant_hfq4,
             quant_q4,
             v_mode_bits: self.v_mode_bits(),
-            // ── per-call: zero-filled, caller overwrites via functional update ──
+            // ── per-call defaults (note batch_size = 1, not 0), overwritten
+            //    by the caller via functional update ──
             pos: 0,
             flash_mode: 0,
             capture_mode: false,
@@ -8889,6 +8890,46 @@ mod tests {
         assert_eq!(
             KvTierPlan::derive(got).unwrap().attend_key,
             KvTierPlan::derive(legacy).unwrap().attend_key,
+        );
+
+        // Prefill case: the batched sites override the non-zero `batch_size`
+        // default (and set `is_tree`). Pin that the functional-update override
+        // wins over the accessor default, matching the old prefill literal.
+        let got_prefill = KvTierInputs {
+            pos: 100,
+            flash_mode: 2,
+            capture_mode: true,
+            batch_size: 4,
+            is_tree: true,
+            ..kv.tier_inputs()
+        };
+        let legacy_prefill = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 2,
+            capture_mode: true,
+            batch_size: 4,
+            is_tree: true,
+            is_boundary: false,
+        };
+        assert_eq!(
+            got_prefill, legacy_prefill,
+            "tier_inputs() prefill override must be byte-identical to the legacy prefill literal"
+        );
+        assert_eq!(
+            KvTierPlan::derive(got_prefill).unwrap().write_key,
+            KvTierPlan::derive(legacy_prefill).unwrap().write_key,
+        );
+        assert_eq!(
+            KvTierPlan::derive(got_prefill).unwrap().attend_key,
+            KvTierPlan::derive(legacy_prefill).unwrap().attend_key,
         );
     }
 }
