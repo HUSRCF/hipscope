@@ -50,6 +50,25 @@ const KV_CACHE: &[&str] = &[
     "auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4",
     "turbo3", "turbo2",
 ];
+// kv_adaptive: mirrors the bun config-TUI's options list (KV_ADAPTIVE_OPTIONS in
+// cli/index.ts) 1:1 — the 4 presets PLUS the 9 explicit-tier `advanced:k=…,v=…`
+// combinations — so the ratatui cycles the same set the bun TUI does and can
+// restore an existing advanced value (not fall back into the simple list).
+const KV_ADAPTIVE: &[&str] = &[
+    "off",
+    "conservative",
+    "balanced",
+    "aggressive",
+    "advanced:k=fwht4,v=lloyd4",
+    "advanced:k=fwht4,v=lloyd3",
+    "advanced:k=fwht4,v=lloyd2",
+    "advanced:k=fwht3,v=lloyd4",
+    "advanced:k=fwht3,v=lloyd3",
+    "advanced:k=fwht3,v=lloyd2",
+    "advanced:k=fwht2,v=lloyd4",
+    "advanced:k=fwht2,v=lloyd3",
+    "advanced:k=fwht2,v=lloyd2",
+];
 const MTP_MODE: &[&str] = &["off", "on", "auto"];
 const DFLASH_MODE: &[&str] = &["on", "off", "auto"];
 const THINKING: &[&str] = &["on", "off"];
@@ -61,6 +80,7 @@ const PREFILL_COMPRESSION: &[&str] = &["off", "auto", "always"];
 /// in the editable-settings table.
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec { key: "kv_cache", kind: FieldKind::Enum(KV_CACHE) },
+    FieldSpec { key: "kv_adaptive", kind: FieldKind::Enum(KV_ADAPTIVE) },
     FieldSpec { key: "mtp_mode", kind: FieldKind::Enum(MTP_MODE) },
     FieldSpec { key: "dflash_mode", kind: FieldKind::Enum(DFLASH_MODE) },
     FieldSpec { key: "thinking", kind: FieldKind::Enum(THINKING) },
@@ -544,6 +564,29 @@ mod tests {
         fs::write(&cfg, "{ this is not json").unwrap();
         let err = write_value(&cfg, "kv_cache", "q8");
         assert!(matches!(err, Err(WriteError::Parse(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kv_adaptive_mirrors_bun_full_option_list() {
+        // Adaptive-KV is editable in the ratatui exactly as in the bun TUI: the 4
+        // presets AND the 9 explicit-tier advanced combos validate + cycle, so an
+        // existing advanced value can be restored (not lost to the simple list).
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{}\n").unwrap();
+        for m in ["off", "conservative", "balanced", "aggressive", "advanced:k=fwht3,v=lloyd3"] {
+            assert!(write_value(&cfg, "kv_adaptive", m).is_ok(), "{m} should validate");
+        }
+        // A garbage value is still rejected.
+        assert!(write_value(&cfg, "kv_adaptive", "advanced:k=zzz").is_err());
+        // Cycling from an advanced value advances within the full list, not back
+        // to a preset (the bug this fixes).
+        assert_eq!(
+            cycle_enum("kv_adaptive", "advanced:k=fwht4,v=lloyd4", true).unwrap(),
+            "advanced:k=fwht4,v=lloyd3"
+        );
+        assert_eq!(cycle_enum("kv_adaptive", "off", true).unwrap(), "conservative");
         let _ = fs::remove_dir_all(&dir);
     }
 

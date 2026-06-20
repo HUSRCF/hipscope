@@ -923,7 +923,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     // fixed slice; the table keeps the elastic middle so it never disappears.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(9)])
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Min(8)])
         .split(pad(area, 1, 0));
     if app.confirm_reset_all {
         // Destructive: clears the whole config.json (default_model / host / port
@@ -1063,22 +1063,54 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
         app.selected_setting_key()
     };
 
+    // Current committed value + any staged 5b preview for the selected key, so the
+    // options list can mark "where you are" and "what you're about to commit".
+    let cur = help_key
+        .as_deref()
+        .map(|k| app.config.values.get(k).cloned().unwrap_or_default())
+        .unwrap_or_default();
+    let pending = help_key.as_deref().and_then(|k| preview_for(app, Some(k)));
+
     let mut lines: Vec<Line> = Vec::new();
     match help_key.as_deref().and_then(knobs::knob_info) {
         Some(info) => {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    info.title,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
+            let mut head = vec![
+                Span::styled(info.title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({})", info.key), Style::default().fg(MUTED)),
-                Span::styled(format!("   default: {}", default_display(info.default)), Style::default().fg(MUTED)),
-            ]));
+                Span::styled(
+                    format!("   default: {}", default_display(info.default)),
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            if !cur.is_empty() {
+                head.push(Span::styled(format!("   now: {cur}"), Style::default().fg(TEXT)));
+            }
+            lines.push(Line::from(head));
             lines.push(Line::from(Span::styled(info.summary, Style::default().fg(TEXT))));
             lines.push(Line::from(vec![
                 Span::styled("Effect: ", Style::default().fg(YELLOW)),
                 Span::styled(info.effect, Style::default().fg(TEXT)),
             ]));
+            // Per-option help: what each selectable value does, with the current
+            // value marked "▸" (accent) and a staged preview marked "●" (yellow).
+            if !info.options.is_empty() {
+                lines.push(Line::from(Span::styled("Options:", Style::default().fg(YELLOW))));
+                for (val, desc) in info.options {
+                    let is_pending = pending.as_deref() == Some(*val);
+                    let is_current = !is_pending && cur == *val;
+                    let (marker, vstyle) = if is_pending {
+                        ("● ", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                    } else if is_current {
+                        ("▸ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("  ", Style::default().fg(TEXT))
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker}{val}"), vstyle),
+                        Span::styled(format!(" — {desc}"), Style::default().fg(MUTED)),
+                    ]));
+                }
+            }
             lines.push(Line::from(vec![
                 Span::styled("When: ", Style::default().fg(YELLOW)),
                 Span::styled(info.when, Style::default().fg(TEXT)),
@@ -1105,7 +1137,8 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
+            // trim:false so the per-option indent / markers keep their column.
+            .wrap(Wrap { trim: false })
             .block(block("About this setting"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         area,
@@ -1855,6 +1888,23 @@ mod render_tests {
     }
 
     #[test]
+    fn settings_explainer_lists_options_with_current_marked() {
+        // 5e+: selecting an enum shows each option's meaning in the in-tab pane,
+        // marking the current value with the ▸ pointer.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "kv_adaptive").unwrap();
+        });
+        assert!(text.contains("Options:"), "options section present");
+        assert!(text.contains("aggressive"), "an option value is listed");
+        // The corrected (honest) aggressive text — same floor as balanced today.
+        assert!(text.contains("identical to balanced"), "an option description is shown");
+        assert!(text.contains("▸"), "the current option is marked with a pointer");
+    }
+
+    #[test]
     fn settings_explainer_easy_composite_row_has_help() {
         // The composite Model row (no inline-editable key) still gets help via
         // easy_help_keys -> default_model.
@@ -1915,6 +1965,9 @@ mod render_tests {
         let text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
+            // Select the previewed row so it's on-screen (scroll follows selection).
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "dflash_mode").unwrap();
             app.settings_pending = Some(crate::app::PendingEnum {
                 key: "dflash_mode".into(),
                 value: "auto".into(),
