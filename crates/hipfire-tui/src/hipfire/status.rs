@@ -88,7 +88,7 @@ pub fn start_background_serve() -> Result<()> {
     let script = cwd.join("cli/index.ts");
     if !script.exists() {
         return Err(anyhow!(
-            "cli/index.ts not found; run this spike from the hipfire repo root"
+            "cli/index.ts not found; run hipfire from the repo root"
         ));
     }
 

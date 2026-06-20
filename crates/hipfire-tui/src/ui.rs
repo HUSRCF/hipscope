@@ -61,7 +61,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             "hipfire",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" / wick spike", Style::default().fg(ACCENT)),
+        Span::styled(" · control panel", Style::default().fg(ACCENT)),
         Span::styled(
             format!(
                 "    serve: {}    model: {}",
@@ -106,7 +106,7 @@ fn footer_hints(app: &App) -> String {
         Tab::Dashboard => format!("r refresh now (auto ~1.5s) · {global}"),
         Tab::Chat => {
             // Chat owns q/r as text input, so it has its own exit hints.
-            "Enter send / start serve · Ctrl+O newline · Up/Down scroll · Esc blur".to_string()
+            "Enter send · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
         }
         Tab::Models => format!("Up/Down select · Enter/Right expand · Enter select · Left fold · r refresh · {global}"),
         Tab::Settings => {
@@ -231,65 +231,59 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(card("Runtime", status), left[0]);
 
     let actions = vec![
-        ListItem::new("Chat: use the Chat tab; it streams through existing hipfire serve."),
-        ListItem::new("Models: browse registry and local downloads."),
-        ListItem::new("Settings: easy/advanced split, writable (persists to ~/.hipfire/config.json)."),
-        ListItem::new("System: hardware and path checks."),
+        ListItem::new("Dashboard — live serve status, queue depth, tok/s, VRAM."),
+        ListItem::new("Chat — stream a conversation through your local serve."),
+        ListItem::new("Models — browse the registry and your downloads."),
+        ListItem::new("Settings — edit config (easy/advanced); persists to ~/.hipfire."),
+        ListItem::new("System — GPU, HIP, kernel cache, and path checks."),
     ];
     frame.render_widget(
         List::new(actions)
-            .block(block("Prototype map"))
+            .block(block("Tabs  (Tab / BackTab to switch)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         left[1],
     );
 
-    let philosophy = Text::from(vec![
+    let quickstart = Text::from(vec![
         Line::from(Span::styled(
-            "Spike leash",
+            "Quick start",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("This is Wick-shaped, but still hipfire-owned."),
-        Line::from("No command replacement, no plugin runtime, no generated skills yet."),
-        Line::from("Every active surface reads real local state or talks to the existing daemon."),
-        Line::from("The disabled tool cards below mark the next vertical slice."),
+        Line::from("1. Pull a model   ·  hipfire pull qwen3.5:4b"),
+        Line::from("2. Start serving  ·  hipfire serve -d"),
+        Line::from("3. Chat           ·  open the Chat tab and type"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Everything here reads your live local state and the",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "running daemon — edits persist to ~/.hipfire.",
+            Style::default().fg(MUTED),
+        )),
     ]);
     frame.render_widget(
-        Paragraph::new(philosophy)
-            .block(block("Intent"))
+        Paragraph::new(quickstart)
+            .block(block("Getting started"))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(TEXT).bg(PANEL)),
         right[0],
     );
 
-    let tools = vec![
-        Row::new([
-            "Quantizer",
-            "planned",
-            "front-end existing hipfire quantize flow",
-        ]),
-        Row::new(["AWQ import", "planned", "model conversion/install workflow"]),
-        Row::new([
-            "TriAttention",
-            "planned",
-            "sidecar generation/validation wizard",
-        ]),
-        Row::new([
-            "Agent profiles",
-            "later",
-            "/default, /agent, /code profile system",
-        ]),
+    let keys = vec![
+        Row::new(["Tab / BackTab", "switch tabs"]),
+        Row::new(["\u{2191}  \u{2193}", "move within a tab"]),
+        Row::new(["Enter", "select / send"]),
+        Row::new(["r", "refresh live data"]),
+        Row::new(["q", "quit"]),
     ];
     frame.render_widget(
         Table::new(
-            tools,
-            [
-                Constraint::Length(16),
-                Constraint::Length(12),
-                Constraint::Min(20),
-            ],
+            keys,
+            [Constraint::Length(16), Constraint::Min(20)],
         )
-        .header(Row::new(["Tooling", "Status", "Reason"]).style(Style::default().fg(MUTED)))
-        .block(block("Tooling runway"))
+        .header(Row::new(["Key", "Action"]).style(Style::default().fg(MUTED)))
+        .block(block("Keys  (full list in each tab's footer)"))
         .style(Style::default().fg(TEXT).bg(PANEL))
         .row_highlight_style(Style::default().bg(PANEL_2)),
         right[1],
@@ -451,7 +445,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "Prototype 1 uses the existing hipfire serve OpenAI endpoint.",
+            "Chat streams from your local hipfire serve (OpenAI-compatible).",
         ));
     } else {
         for msg in &app.chat.messages {

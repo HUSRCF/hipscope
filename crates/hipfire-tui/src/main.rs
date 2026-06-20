@@ -138,8 +138,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if app.chat.sending {
-            app.chat.status =
-                "stream is still running; wait for this spike build to finish it".into();
+            app.chat.status = "generation in progress — press Esc to stop it".into();
             return false;
         }
         return true;
@@ -167,7 +166,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if app.tab == app::Tab::Settings && app.settings_edit.is_some() {
                 app.handle_tab_key(key);
             } else if app.chat.sending {
-                app.chat.status = "stream abort is not wired in prototype 1".into();
+                app.chat.request_abort();
             } else if chat_capturing {
                 // Only blur the chat input when the Chat tab is the one focused;
                 // on other tabs Esc quits as before.

@@ -7141,6 +7141,20 @@ try {
   dieClean(err);
 }
 
+// Locate an INSTALLED hipfire-tui binary (env override -> ~/.hipfire/bin ->
+// workspace target/release). Returns undefined if none is present, so callers
+// can fall back gracefully instead of erroring.
+function findTuiBin(): string | undefined {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const envBin = process.env.HIPFIRE_TUI_BIN;
+  const candidates = [
+    ...(envBin ? [envBin] : []),
+    join(HIPFIRE_DIR, "bin", `hipfire-tui${exe}`),
+    resolve(__dirname, `../target/release/hipfire-tui${exe}`),
+  ];
+  return candidates.find(p => existsSync(p));
+}
+
 let [cmd, ...rest] = process.argv.slice(2);
 
 // `hipfire help <command>` == `hipfire <command> --help`. Rewrites the
@@ -9000,6 +9014,17 @@ Examples:
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
     if (!cmd) {
+      // Bare `hipfire` launches the terminal UI — the default surface — when run
+      // interactively and the binary is installed. Non-interactive contexts
+      // (pipes, CI, `hipfire | …`) or a not-yet-installed TUI fall through to the
+      // welcome + command list below. `hipfire help`/`-h`/`--help` still print help
+      // (they set `cmd`, so they never reach this branch).
+      const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+      const tuiBin = findTuiBin();
+      if (interactive && tuiBin) {
+        const proc = spawn([tuiBin], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env } });
+        process.exit(await proc.exited);
+      }
       const hasModels = existsSync(MODELS_DIR) && readdirSync(MODELS_DIR).length > 0;
       const hasConfig = existsSync(CONFIG_PATH);
       const isFirstRun = !hasModels && !hasConfig;
@@ -9020,7 +9045,8 @@ Examples:
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
   chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
-  tui                   Launch the full terminal UI (Home/Chat/Models/Settings/System)
+  tui                   Launch the terminal UI — Home/Chat/Models/Settings/System
+                        (also opens when you run bare \`hipfire\` in a terminal)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon

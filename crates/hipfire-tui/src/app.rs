@@ -3,7 +3,11 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -322,6 +326,9 @@ impl App {
 
                 let (tx, rx) = mpsc::channel();
                 self.chat.rx = Some(rx);
+                // Fresh cancel flag per generation; Esc flips it (request_abort).
+                self.chat.abort = Arc::new(AtomicBool::new(false));
+                let abort = self.chat.abort.clone();
                 let host = self.config.probe_host();
                 let port = self.config.port;
                 let model = self.active_model.clone();
@@ -332,7 +339,7 @@ impl App {
                     }
                 }
                 thread::spawn(move || {
-                    let _ = stream_chat(&host, port, &model, &messages, tx);
+                    let _ = stream_chat(&host, port, &model, &messages, tx, abort);
                 });
             }
             KeyCode::Backspace => {
@@ -611,13 +618,20 @@ impl App {
                             last.content.push_str(&text);
                         }
                     }
-                    ChatEvent::Status(status) => self.chat.status = status,
                     ChatEvent::Done => {
                         self.chat.status = "ready".into();
                         self.chat.sending = false;
                         finished = true;
                     }
                     ChatEvent::Error(err) => {
+                        // Drop a trailing empty assistant bubble so a failed request
+                        // doesn't read as a blank reply; surface the cause as a toast.
+                        if let Some(last) = self.chat.messages.last() {
+                            if last.role == "assistant" && last.content.is_empty() {
+                                self.chat.messages.pop();
+                            }
+                        }
+                        self.toast_error(format!("chat error: {err}"));
                         self.chat.status = format!("error: {err}");
                         self.chat.sending = false;
                         finished = true;
@@ -640,6 +654,8 @@ pub struct ChatState {
     pub scroll: u16,
     rx: Option<Receiver<ChatEvent>>,
     input_focused: bool,
+    // Set true to ask the in-flight stream thread to stop (checked per line).
+    abort: Arc<AtomicBool>,
 }
 
 impl Default for ChatState {
@@ -652,11 +668,21 @@ impl Default for ChatState {
             scroll: 0,
             rx: None,
             input_focused: true,
+            abort: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl ChatState {
+    /// Ask an in-flight generation to stop. No-op when nothing is streaming.
+    /// The partial reply already streamed is kept.
+    pub fn request_abort(&mut self) {
+        if self.sending {
+            self.abort.store(true, Ordering::Relaxed);
+            self.status = "stopping…".into();
+        }
+    }
+
     pub fn focus_input(&mut self) {
         self.input_focused = true;
     }
