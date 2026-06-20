@@ -140,10 +140,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 /// no-op where unsupported — the escape is consumed without altering the screen.
 fn emit_clipboard(text: &str) {
     use std::io::Write;
-    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let seq = osc52_sequence(text);
     let mut out = io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+/// The OSC 52 set-clipboard escape frame for `text` (extracted for testing).
+fn osc52_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
 }
 
 /// Minimal standard-alphabet base64 (OSC 52 payload); avoids a new dependency.
@@ -337,6 +342,15 @@ mod tests {
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // High bytes (0x80-0xFF) — the `& 63` masking keeps table indexing valid.
+        assert_eq!(base64_encode(&[0xFF, 0x00, 0x80]), "/wCA");
+        // Multibyte UTF-8 round-trips through the byte encoder.
+        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn osc52_frame_shape() {
+        assert_eq!(osc52_sequence("foo"), "\x1b]52;c;Zm9v\x07");
     }
 
     #[test]

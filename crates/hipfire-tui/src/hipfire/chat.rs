@@ -60,6 +60,10 @@ fn stream_chat_inner(
     let url = format!("http://{host}:{port}/v1/chat/completions");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(600))
+        // Per-read bound: a stalled socket (half-open TCP, server hang) errors out
+        // within this window instead of parking the worker thread for the full
+        // total timeout — paired with the optimistic UI abort in request_abort.
+        .timeout_read(Duration::from_secs(120))
         .build();
     let mut body = json!({
         "model": model,
@@ -127,11 +131,17 @@ fn stream_chat_inner(
         else {
             continue;
         };
+        // Coalesce reasoning + content into ONE Delta per chunk so the UI's
+        // delta-count token proxy isn't double-counted for reasoning models.
+        let mut chunk = String::new();
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-            let _ = tx.send(ChatEvent::Delta(text.to_string()));
+            chunk.push_str(text);
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            let _ = tx.send(ChatEvent::Delta(text.to_string()));
+            chunk.push_str(text);
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(ChatEvent::Delta(chunk));
         }
     }
 

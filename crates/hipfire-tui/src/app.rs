@@ -615,10 +615,21 @@ impl App {
                     self.chat.focus_input();
                     return;
                 }
-                // Slash commands act locally (no serve needed) and never send.
-                if let Some(cmd) = input.strip_prefix('/') {
+                // A leading '/' is a command — except `//…`, which escapes to a
+                // literal message whose text starts with a single '/'.
+                if let Some(rest) = input.strip_prefix('/') {
+                    if let Some(literal) = rest.strip_prefix('/') {
+                        if !self.status.serve_http_ok {
+                            self.start_serve_for_chat();
+                            return;
+                        }
+                        self.send_chat(format!("/{literal}"));
+                        self.chat.focus_input();
+                        return;
+                    }
+                    // Commands act locally (no serve needed) and never send.
                     self.chat.input.clear();
-                    self.handle_chat_command(cmd);
+                    self.handle_chat_command(rest);
                     self.chat.focus_input();
                     return;
                 }
@@ -703,6 +714,19 @@ impl App {
         });
     }
 
+    /// Whether the conversation tail is `[.., user]` or `[.., user, assistant]`
+    /// — the only shapes /regen and /edit can act on. Checked BEFORE any mutation
+    /// so a malformed or freshly-loaded history is never corrupted.
+    fn tail_is_redoable(&self) -> bool {
+        let msgs = &self.chat.messages;
+        let n = msgs.len();
+        match msgs.last().map(|m| m.role.as_str()) {
+            Some("assistant") => n >= 2 && msgs[n - 2].role == "user",
+            Some("user") => true,
+            _ => false,
+        }
+    }
+
     /// `/regen` — drop the last assistant reply and re-stream from the last user
     /// turn (no new user message).
     fn regenerate(&mut self) {
@@ -710,16 +734,18 @@ impl App {
             self.toast_info("generation in progress");
             return;
         }
-        if self.chat.messages.last().map(|m| m.role.as_str()) == Some("assistant") {
-            self.chat.messages.pop();
-        }
-        if self.chat.messages.last().map(|m| m.role.as_str()) != Some("user") {
+        if !self.tail_is_redoable() {
             self.toast_error("nothing to regenerate");
             return;
         }
+        // Check serve readiness BEFORE the destructive pop, so an offline serve
+        // doesn't lose the existing reply.
         if !self.status.serve_http_ok {
             self.start_serve_for_chat();
             return;
+        }
+        if self.chat.messages.last().map(|m| m.role.as_str()) == Some("assistant") {
+            self.chat.messages.pop();
         }
         self.spawn_stream();
     }
@@ -731,17 +757,18 @@ impl App {
             self.toast_info("generation in progress");
             return;
         }
+        if !self.tail_is_redoable() {
+            self.toast_error("no message to edit");
+            return;
+        }
         if self.chat.messages.last().map(|m| m.role.as_str()) == Some("assistant") {
             self.chat.messages.pop();
         }
-        if self.chat.messages.last().map(|m| m.role.as_str()) == Some("user") {
-            let last = self.chat.messages.pop().expect("checked non-empty");
-            self.chat.input = last.content;
-            self.chat.focus_input();
-            self.chat.status = "editing last message — Enter to resend".into();
-        } else {
-            self.toast_error("no message to edit");
-        }
+        let last = self.chat.messages.pop().expect("tail validated as user turn");
+        self.chat.input = last.content;
+        self.chat.reset_stats();
+        self.chat.focus_input();
+        self.chat.status = "editing last message — Enter to resend".into();
     }
 
     /// `/copy` — stage the last non-empty assistant reply for the OSC52 clipboard
@@ -755,8 +782,18 @@ impl App {
             .find(|m| m.role == "assistant" && !m.content.is_empty())
         {
             Some(m) => {
-                self.pending_clipboard = Some(m.content.clone());
-                self.chat.status = "copied last reply to clipboard".into();
+                // Cap the OSC52 payload — a very large escape can stall or be
+                // rejected by the terminal.
+                const MAX_COPY: usize = 100 * 1024;
+                if m.content.len() > MAX_COPY {
+                    self.toast_error(format!(
+                        "reply too large to copy ({} KB > 100 KB)",
+                        m.content.len() / 1024
+                    ));
+                } else {
+                    self.pending_clipboard = Some(m.content.clone());
+                    self.chat.status = "copied last reply to clipboard".into();
+                }
             }
             None => self.toast_error("no reply to copy"),
         }
@@ -791,6 +828,7 @@ impl App {
             "clear" => {
                 self.chat.messages.clear();
                 self.chat.scroll = 0;
+                self.chat.reset_stats();
                 self.chat.status = "conversation cleared".into();
             }
             "save" => self.chat_save(arg),
@@ -836,6 +874,7 @@ impl App {
             Some(msgs) => {
                 self.chat.messages = msgs.to_vec();
                 self.chat.scroll = 0;
+                self.chat.reset_stats();
                 self.chat.status =
                     format!("loaded '{name}' ({} messages)", self.chat.messages.len());
             }
@@ -1162,36 +1201,19 @@ impl App {
                         self.chat.gen_tokens += 1;
                     }
                     ChatEvent::Done => {
-                        // Record throughput of the generation that just finished
-                        // (delta count ≈ tokens; tok/s over wall-clock).
-                        if let Some(start) = self.chat.gen_start.take() {
-                            let secs = start.elapsed().as_secs_f64();
-                            let tps = if secs > 0.0 {
-                                self.chat.gen_tokens as f64 / secs
-                            } else {
-                                0.0
-                            };
-                            self.chat.last_stats = Some(GenStats {
-                                tokens: self.chat.gen_tokens,
-                                tps,
-                            });
-                        }
+                        // Record throughput + drop a zero-delta empty assistant.
+                        self.chat.finalize_generation();
                         self.chat.status = "ready".into();
                         self.chat.sending = false;
                         finished = true;
                     }
                     ChatEvent::Error(err) => {
-                        // Drop a trailing empty assistant bubble so a failed request
-                        // doesn't read as a blank reply; surface the cause as a toast.
-                        if let Some(last) = self.chat.messages.last() {
-                            if last.role == "assistant" && last.content.is_empty() {
-                                self.chat.messages.pop();
-                            }
-                        }
+                        // finalize drops the trailing empty assistant so a failed
+                        // request doesn't read as a blank reply; surface the cause.
+                        self.chat.finalize_generation();
                         self.toast_error(format!("chat error: {err}"));
                         self.chat.status = format!("error: {err}");
                         self.chat.sending = false;
-                        self.chat.gen_start = None;
                         finished = true;
                     }
                 }
@@ -1257,13 +1279,53 @@ impl Default for ChatState {
 }
 
 impl ChatState {
-    /// Ask an in-flight generation to stop. No-op when nothing is streaming.
-    /// The partial reply already streamed is kept.
+    /// Ask an in-flight generation to stop, and optimistically free the tab. A
+    /// hung read may never deliver Done, so we don't wait on the worker: clear
+    /// `sending`, drop the receiver, and finalize. The detached thread exits when
+    /// its socket errors (bounded by the read timeout); its late events land on a
+    /// dropped receiver. The partial reply already streamed is kept.
     pub fn request_abort(&mut self) {
         if self.sending {
             self.abort.store(true, Ordering::Relaxed);
-            self.status = "stopping…".into();
+            self.sending = false;
+            self.rx = None;
+            self.finalize_generation();
+            self.status = "stopped".into();
         }
+    }
+
+    /// End-of-generation cleanup, shared by Done / Error / abort: record tok/s
+    /// (only if any tokens actually streamed) and drop a trailing empty assistant
+    /// bubble left by a zero-delta finish (immediate [DONE], empty deltas, or
+    /// abort-before-first-token) so it isn't rendered or sent in the next turn.
+    fn finalize_generation(&mut self) {
+        if let Some(start) = self.gen_start.take() {
+            if self.gen_tokens > 0 {
+                let secs = start.elapsed().as_secs_f64();
+                let tps = if secs > 0.0 {
+                    self.gen_tokens as f64 / secs
+                } else {
+                    0.0
+                };
+                self.last_stats = Some(GenStats {
+                    tokens: self.gen_tokens,
+                    tps,
+                });
+            }
+        }
+        if let Some(last) = self.messages.last() {
+            if last.role == "assistant" && last.content.is_empty() {
+                self.messages.pop();
+            }
+        }
+    }
+
+    /// Clear any displayed throughput + in-flight counters. Called when the
+    /// conversation the stats referred to is replaced (/clear, /load, /edit).
+    fn reset_stats(&mut self) {
+        self.last_stats = None;
+        self.gen_start = None;
+        self.gen_tokens = 0;
     }
 
     pub fn focus_input(&mut self) {
@@ -1614,6 +1676,68 @@ mod tests {
         app.tab = Tab::Chat;
         app.handle_chat_command("regen");
         assert!(app.toast.is_some(), "regenerate with no turn to redo toasts");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn regenerate_offline_preserves_the_reply() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.status.serve_http_ok = false; // serve down
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "q".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "a".into(),
+            },
+        ];
+        app.regenerate();
+        // Serve-readiness is checked BEFORE the destructive pop, so the reply
+        // survives an offline regen attempt.
+        assert_eq!(app.chat.messages.len(), 2, "reply preserved when serve offline");
+        assert_eq!(app.chat.messages[1].content, "a");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_delta_done_drops_empty_assistant_bubble() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(), // empty slot, no deltas streamed
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        assert_eq!(app.chat.messages.len(), 1, "empty assistant bubble dropped");
+        assert!(app.chat.last_stats.is_none(), "no stats when zero tokens streamed");
+        assert!(!app.chat.sending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clear_resets_stale_throughput_stats() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.last_stats = Some(GenStats {
+            tokens: 42,
+            tps: 99.0,
+        });
+        app.handle_chat_command("clear");
+        assert!(app.chat.last_stats.is_none(), "tok/s cleared with the conversation");
         let _ = std::fs::remove_dir_all(dir);
     }
 

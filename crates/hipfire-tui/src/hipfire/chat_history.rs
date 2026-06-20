@@ -45,7 +45,9 @@ impl ChatHistory {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("chat_history.json");
-        let tmp = path.with_file_name(format!("{name}.tmp"));
+        // pid-tag the temp so two instances sharing ~/.hipfire never collide on
+        // the temp write before the (atomic) rename.
+        let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
         fs::write(&tmp, body.as_bytes())?;
         fs::rename(&tmp, path)
     }
@@ -115,7 +117,8 @@ mod tests {
         assert!(!back.remove("debug"));
         assert_eq!(back.names(), vec!["other"]);
 
-        assert!(!p.with_file_name("chat_history.json.tmp").exists());
+        let tmp = p.with_file_name(format!("chat_history.json.{}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "temp file is renamed away, not left behind");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -126,6 +129,22 @@ mod tests {
         let p = dir.join("chat_history.json");
         fs::write(&p, b"{not json").unwrap();
         assert!(ChatHistory::load(&p).sessions.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_and_empty_object_degrade_to_empty() {
+        // The documented degrade-to-empty contract on both failure modes:
+        let dir = std::env::temp_dir().join(format!("hipfire-chathist-m-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        // (a) nonexistent path -> read error -> empty
+        let missing = dir.join("nope.json");
+        let _ = fs::remove_file(&missing);
+        assert!(ChatHistory::load(&missing).sessions.is_empty());
+        // (b) valid JSON missing the sessions key -> serde(default) -> empty
+        let empty = dir.join("empty.json");
+        fs::write(&empty, b"{}").unwrap();
+        assert!(ChatHistory::load(&empty).sessions.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

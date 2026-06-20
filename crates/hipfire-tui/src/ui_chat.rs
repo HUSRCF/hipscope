@@ -78,16 +78,31 @@ fn prose_line(raw: &str, theme: &CodeTheme) -> Line<'static> {
         return Line::from(Span::styled(raw.to_string(), text));
     }
     let code = Style::default().fg(theme.code_fg).bg(theme.code_bg);
+    // Only PAIRED backticks form an inline code span; an unmatched backtick is
+    // rendered literally so the transcript isn't misrepresented.
+    let chars: Vec<char> = raw.chars().collect();
     let mut spans = Vec::new();
-    let mut is_code = false;
-    for part in raw.split('`') {
-        if !part.is_empty() {
-            spans.push(Span::styled(
-                part.to_string(),
-                if is_code { code } else { text },
-            ));
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(off) = chars[i + 1..].iter().position(|&c| c == '`') {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), text));
+                }
+                let inner: String = chars[i + 1..i + 1 + off].iter().collect();
+                spans.push(Span::styled(inner, code));
+                i = i + 1 + off + 1; // skip past the closing backtick
+                continue;
+            }
+            buf.push('`'); // unmatched — literal
+        } else {
+            buf.push(chars[i]);
         }
-        is_code = !is_code;
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, text));
     }
     if spans.is_empty() {
         spans.push(Span::styled(String::new(), text));
@@ -96,32 +111,41 @@ fn prose_line(raw: &str, theme: &CodeTheme) -> Line<'static> {
 }
 
 /// Byte index of a line-trailing `//` or `#` comment, skipping matches inside
-/// single/double-quoted strings. None if the line has no comment.
+/// double-quoted strings. None if the line has no comment. Deliberately
+/// grammar-free: only `"` opens a string (so lifetimes / apostrophes in code
+/// aren't mistaken for char literals), with backslash-parity escape handling.
 fn find_comment(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
-    let mut in_str: Option<u8> = None;
+    let mut in_str = false;
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        match in_str {
-            Some(q) => {
-                if c == q && (i == 0 || bytes[i - 1] != b'\\') {
-                    in_str = None;
-                }
+        if in_str {
+            if c == b'"' && even_preceding_backslashes(bytes, i) {
+                in_str = false;
             }
-            None => {
-                if c == b'"' || c == b'\'' {
-                    in_str = Some(c);
-                } else if c == b'#' {
-                    return Some(i);
-                } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
-                    return Some(i);
-                }
-            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'#' {
+            return Some(i);
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return Some(i);
         }
         i += 1;
     }
     None
+}
+
+/// Whether the `"` at byte `i` is unescaped — i.e. preceded by an even number of
+/// backslashes (`\\"` closes the string; `\"` does not).
+fn even_preceding_backslashes(bytes: &[u8], i: usize) -> bool {
+    let mut count = 0;
+    let mut k = i;
+    while k > 0 && bytes[k - 1] == b'\\' {
+        count += 1;
+        k -= 1;
+    }
+    count % 2 == 0
 }
 
 #[cfg(test)]
@@ -178,5 +202,37 @@ mod tests {
         assert_eq!(find_comment("x = 1 # c"), Some(6));
         assert_eq!(find_comment("s = \"# not a comment\""), None);
         assert_eq!(find_comment("plain code"), None);
+        // Lifetimes / apostrophes are NOT strings (only `"` opens one).
+        assert_eq!(find_comment("let x: &'a str = y; // c"), Some(20));
+        // Escaped quote inside a string doesn't close it early (backslash parity).
+        assert_eq!(find_comment(r#"s = "a\"b"; // c"#), Some(12));
+    }
+
+    #[test]
+    fn code_line_with_multibyte_before_comment_does_not_panic() {
+        // The byte index from find_comment must land on a char boundary (# is
+        // ASCII) even when earlier chars are multibyte.
+        let lines = render_body("```\ncafé = 1 # x\n```", &theme());
+        let code = &lines[1];
+        assert_eq!(code.spans.len(), 2);
+        assert!(code.spans[0].content.contains("café = 1"));
+        assert!(code.spans[1].content.contains("# x"));
+    }
+
+    #[test]
+    fn unbalanced_fence_keeps_trailing_lines_as_code() {
+        // A code block that is never closed: every following line stays code.
+        let lines = render_body("intro\n```\ncode one\ncode two", &theme());
+        assert_ne!(lines[0].spans[0].style.bg, Some(Color::Black), "intro is prose");
+        assert_eq!(lines[2].spans[0].style.bg, Some(Color::Black), "code one");
+        assert_eq!(lines[3].spans[0].style.bg, Some(Color::Black), "code two");
+    }
+
+    #[test]
+    fn odd_inline_backtick_is_kept_literal() {
+        // An unmatched backtick is rendered, not swallowed.
+        let lines = render_body("a `b c", &theme());
+        let joined: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "a `b c");
     }
 }
