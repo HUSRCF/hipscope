@@ -320,14 +320,12 @@ impl HfqFile {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         };
-        pick(name)
-            .or_else(|| pick("default"))
-            .or_else(|| {
-                arr.first()
-                    .and_then(|t| t.get("template"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
+        pick(name).or_else(|| pick("default")).or_else(|| {
+            arr.first()
+                .and_then(|t| t.get("template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
     }
 
     /// Detect whether this .hfq's retained source provenance indicates a

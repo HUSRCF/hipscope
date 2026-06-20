@@ -21,7 +21,10 @@
 use rdna_compute::{DType, Gpu};
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -56,16 +59,16 @@ fn main() {
     let v_cache = gpu.upload_raw(&kv, &[cache_bytes]).expect("v upload");
 
     // Q: [n × n_heads × head_dim] f32.
-    let q_data: Vec<f32> = (0..n * nh * hd).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let q_data: Vec<f32> = (0..n * nh * hd)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
     let out = gpu.zeros(&[n * nh * hd], DType::F32).expect("out");
 
     // positions: i32 bits in f32 slot — positions[b] = ctx - n + b (the
     // queries sit at the tail of the context, as in real tail-chunk prefill).
     let pos_data: Vec<i32> = (0..n).map(|b| (ctx - n + b) as i32).collect();
-    let pos_bytes = unsafe {
-        std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4)
-    };
+    let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4) };
     let positions = gpu.upload_raw(pos_bytes, &[n]).expect("pos upload");
 
     // flash_partials: [sub_batch × n_heads × max_tiles × (2+head_dim)].
@@ -103,9 +106,10 @@ fn main() {
     let window = env_usize("WINDOW", 0) as i32;
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked_windowed(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0, window,
-        ).expect("windowed batched");
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0, window,
+        )
+        .expect("windowed batched");
     });
 
     println!(

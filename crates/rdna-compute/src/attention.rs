@@ -1583,7 +1583,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -1660,8 +1662,18 @@ impl Gpu {
         partials: &GpuTensor,
     ) -> HipResult<()> {
         self.attention_flash_q8_0_windowed(
-            q, k_cache, v_cache, out, pos_buf, seq_len_hint, n_heads, n_kv_heads, head_dim,
-            max_seq, partials, 0,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            0,
         )
     }
 
@@ -3181,7 +3193,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3215,9 +3229,26 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
             "attention_flash_asym4_wmma_tile_batched",
-            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
-            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ true,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3248,9 +3279,26 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched_gfx12",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
             "attention_flash_asym4_wmma_tile_batched_gfx12",
-            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
-            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ true,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3344,7 +3392,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3389,7 +3439,9 @@ impl Gpu {
             None,
             0,
             0,
-            V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3435,7 +3487,9 @@ impl Gpu {
             None,
             0,
             0,
-            v_mode_bits, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3626,7 +3680,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3717,7 +3773,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits, /*window=*/ 0, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -9674,8 +9732,16 @@ impl Gpu {
         max_n_total: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(n_heads % 16, 0, "direct_wmma: n_heads must be %16 (got {n_heads})");
-        debug_assert_eq!(head_dim % 16, 0, "direct_wmma: head_dim must be %16 (got {head_dim})");
+        debug_assert_eq!(
+            n_heads % 16,
+            0,
+            "direct_wmma: n_heads must be %16 (got {n_heads})"
+        );
+        debug_assert_eq!(
+            head_dim % 16,
+            0,
+            "direct_wmma: head_dim must be %16 (got {head_dim})"
+        );
         let n_pad = ((max_n_total + 15) / 16) * 16;
         let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4; // q f16 + s f32
         if lds_bytes > 64 * 1024 {
@@ -9769,8 +9835,16 @@ impl Gpu {
         max_n_total: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(n_heads % 16, 0, "batched_wmma: n_heads must be %16 (got {n_heads})");
-        debug_assert_eq!(head_dim % 16, 0, "batched_wmma: head_dim must be %16 (got {head_dim})");
+        debug_assert_eq!(
+            n_heads % 16,
+            0,
+            "batched_wmma: n_heads must be %16 (got {n_heads})"
+        );
+        debug_assert_eq!(
+            head_dim % 16,
+            0,
+            "batched_wmma: head_dim must be %16 (got {head_dim})"
+        );
         let n_pad = ((max_n_total + 15) / 16) * 16;
         let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4;
         if lds_bytes > 64 * 1024 {
