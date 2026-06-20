@@ -51,6 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Models => draw_models(frame, app, root[1]),
         Tab::Settings => draw_settings(frame, app, root[1]),
         Tab::System => draw_system(frame, app, root[1]),
+        Tab::Logs => draw_logs(frame, app, root[1]),
     }
     draw_footer(frame, app, root[2]);
 
@@ -214,6 +215,7 @@ fn footer_hints(app: &App) -> String {
             }
         }
         Tab::System => format!("live diagnostics (auto ~1.5s) · r refresh · {global}"),
+        Tab::Logs => format!("serve.log tail (auto ~1s) · r refresh · {global}"),
     }
 }
 
@@ -1005,6 +1007,62 @@ fn card(title: &str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
         .wrap(Wrap { trim: false })
 }
 
+fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::hipfire::log_tail::LogStatus;
+    let inner = pad(area, 1, 0);
+    let (title, body): (String, Text) = match &app.logs.status {
+        LogStatus::Pending => (
+            "serve.log".into(),
+            Text::from(Line::from(Span::styled(
+                "reading serve.log\u{2026}",
+                Style::default().fg(MUTED),
+            ))),
+        ),
+        LogStatus::Missing => (
+            "serve.log (not found)".into(),
+            Text::from(vec![
+                Line::from(Span::styled("No serve.log yet.", Style::default().fg(YELLOW))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Start serve (Dashboard tab: s) — its output lands in ~/.hipfire/serve.log.",
+                    Style::default().fg(MUTED),
+                )),
+            ]),
+        ),
+        LogStatus::Empty => (
+            "serve.log (empty)".into(),
+            Text::from(Line::from(Span::styled(
+                "serve.log is empty.",
+                Style::default().fg(MUTED),
+            ))),
+        ),
+        LogStatus::Error(e) => (
+            "serve.log (error)".into(),
+            Text::from(Line::from(Span::styled(
+                format!("read error: {e}"),
+                Style::default().fg(RED),
+            ))),
+        ),
+        LogStatus::Ok => {
+            let title = format!("serve.log (last {} lines)", app.logs.lines.len());
+            // Show the tail that fits, newest at the bottom.
+            let height = inner.height.saturating_sub(2) as usize; // borders
+            let start = app.logs.lines.len().saturating_sub(height.max(1));
+            let lines: Vec<Line> = app.logs.lines[start..]
+                .iter()
+                .map(|l| Line::from(l.as_str()))
+                .collect();
+            (title, Text::from(lines))
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(block(&title))
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        inner,
+    );
+}
+
 fn block(title: &str) -> Block<'static> {
     Block::default()
         .title(Span::styled(
@@ -1371,5 +1429,32 @@ mod render_tests {
         });
         assert!(text.contains("Pulling"), "gauge title shows the model");
         assert!(text.contains("37"), "percent in the gauge label");
+    }
+
+    #[test]
+    fn logs_tab_missing_state_is_honest() {
+        use crate::hipfire::log_tail::{LogSnapshot, LogStatus};
+        let text = render_with(|app| {
+            app.tab = Tab::Logs;
+            app.logs = LogSnapshot {
+                lines: vec![],
+                status: LogStatus::Missing,
+            };
+        });
+        assert!(text.contains("No serve.log yet"), "honest missing-state guidance");
+    }
+
+    #[test]
+    fn logs_tab_renders_tail_lines() {
+        use crate::hipfire::log_tail::{LogSnapshot, LogStatus};
+        let text = render_with(|app| {
+            app.tab = Tab::Logs;
+            app.logs = LogSnapshot {
+                lines: vec!["serve started on :11435".into(), "loaded qwen3.5:9b".into()],
+                status: LogStatus::Ok,
+            };
+        });
+        assert!(text.contains("loaded qwen3.5:9b"), "tail line is shown");
+        assert!(text.contains("last 2 lines"), "title reflects the line count");
     }
 }

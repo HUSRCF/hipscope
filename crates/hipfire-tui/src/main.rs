@@ -142,6 +142,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         // is focused — never any synchronous network / rocm-smi call, so a hung
         // probe cannot block render or input.
         app.sync_dashboard();
+        app.sync_logs();
         app.expire_toast();
 
         terminal.draw(|frame| ui::draw(frame, app))?;

@@ -5,6 +5,7 @@
 pub mod chat;
 pub mod config;
 pub mod dashboard;
+pub mod log_tail;
 pub mod model_actions;
 pub mod registry;
 pub mod serve_ctrl;

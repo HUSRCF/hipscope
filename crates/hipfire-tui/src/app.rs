@@ -19,6 +19,7 @@ use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     config::ConfigState,
     dashboard::{Dashboard, DashboardWorker},
+    log_tail::{LogSnapshot, LogTailer},
     model_actions::{self, PullEvent, RmOutcome},
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
@@ -67,16 +68,18 @@ pub enum Tab {
     Models,
     Settings,
     System,
+    Logs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Home,
         Tab::Dashboard,
         Tab::Chat,
         Tab::Models,
         Tab::Settings,
         Tab::System,
+        Tab::Logs,
     ];
 
     pub fn title(self) -> &'static str {
@@ -87,6 +90,7 @@ impl Tab {
             Tab::Models => "Models",
             Tab::Settings => "Settings",
             Tab::System => "System",
+            Tab::Logs => "Logs",
         }
     }
 
@@ -146,6 +150,11 @@ pub struct App {
     /// Model tag awaiting a y/n delete confirmation; the Models tab shows a
     /// prompt while this is `Some`.
     pub confirm_delete: Option<String>,
+    /// Latest serve.log tail (Logs tab), mirrored from the LogTailer worker.
+    pub logs: LogSnapshot,
+    /// Background serve.log tailer. Reads the file off the UI thread; dropped
+    /// (joined) when the App is dropped.
+    log_tailer: LogTailer,
     /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
     /// thread. Dropped (joined) when the App is dropped.
     dashboard_worker: DashboardWorker,
@@ -159,6 +168,7 @@ impl App {
         let status = StatusState::load_local(&paths);
         let active_model = config.default_model.clone();
         let dashboard_worker = DashboardWorker::spawn(config.clone());
+        let log_tailer = LogTailer::spawn(paths.serve_log.clone());
 
         // Restore session UI state (active tab + expanded Models groups) so the
         // TUI reopens where the user left off. Missing/corrupt -> defaults. The
@@ -190,8 +200,21 @@ impl App {
             pull: None,
             rm_cmd: None,
             confirm_delete: None,
+            logs: LogSnapshot::default(),
+            log_tailer,
             dashboard_worker,
         })
+    }
+
+    /// Mirror the latest serve.log tail from the background tailer, and tell it
+    /// whether the Logs tab is focused (so it only reads while visible). Called
+    /// each frame — a cheap lock+clone, never a synchronous file read on the UI
+    /// thread.
+    pub fn sync_logs(&mut self) {
+        self.log_tailer.set_active(self.tab == Tab::Logs);
+        if self.tab == Tab::Logs {
+            self.logs = self.log_tailer.snapshot();
+        }
     }
 
     /// Start downloading `tag` on a background worker (Models tab `p`). No-op
