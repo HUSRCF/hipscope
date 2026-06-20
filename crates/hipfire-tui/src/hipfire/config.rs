@@ -105,10 +105,36 @@ impl ConfigState {
             None,            // Model (set via Models tab)
             Some("max_seq"), // Context
             Some("dflash_mode"),
+            Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
             Some("thinking"),
             None, // Serve host:port (composite)
         ]
+    }
+
+    /// True when prefill compression is requested (auto/always) but no
+    /// `prefill_drafter` is set — pflash then silently no-ops. Mirrors the bun
+    /// CLI warning (`prefill_compression=… but prefill_drafter is unset`). Surfaced
+    /// honestly in the easy row + as a toast when the user enables compression.
+    ///
+    /// Scope: this reflects the GLOBAL config (`~/.hipfire/config.json`), which is
+    /// what the Settings tab edits — like every other row here. A per-model
+    /// override (`hipfire config <tag> set prefill_drafter …`, counted in
+    /// `per_model_count`) is resolved by the daemon at serve time and is NOT
+    /// layered in here; the daemon's own gate is the final word. Empty-string =
+    /// disabled matches bun exactly (`"" disables`).
+    pub fn pflash_needs_drafter(&self) -> bool {
+        let compression = self
+            .values
+            .get("prefill_compression")
+            .map(String::as_str)
+            .unwrap_or("off");
+        let drafter_empty = self
+            .values
+            .get("prefill_drafter")
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        compression != "off" && drafter_empty
     }
 
     /// Per-easy-row override status, parallel to [`easy_rows`]/[`easy_keys`].
@@ -122,6 +148,7 @@ impl ConfigState {
             self.is_override("default_model"),                       // Model
             self.is_override("max_seq"),                             // Context
             self.is_override("dflash_mode"),                         // Spec decode
+            self.is_override("prefill_compression"),                 // Prefill
             self.is_override("kv_cache"),                            // KV cache
             self.is_override("thinking"),                            // Thinking
             self.is_override("host") || self.is_override("port"),    // Serve
@@ -150,6 +177,23 @@ impl ConfigState {
                     .cloned()
                     .unwrap_or_else(|| "off".into()),
                 "DFlash mode. Keep off unless intentionally testing drafts.",
+            ),
+            (
+                "Prefill",
+                {
+                    let c = self
+                        .values
+                        .get("prefill_compression")
+                        .cloned()
+                        .unwrap_or_else(|| "off".into());
+                    // Honest: compression on without a drafter is a no-op.
+                    if self.pflash_needs_drafter() {
+                        format!("{c} (needs drafter)")
+                    } else {
+                        c
+                    }
+                },
+                "Prefill KV compression (pflash). Needs a prefill_drafter (.hfq) to engage.",
             ),
             (
                 "KV cache",
@@ -203,6 +247,9 @@ fn defaults() -> BTreeMap<String, String> {
         ("prompt_normalize", "true"),
         ("mmq_screen", "auto"),
         ("prefill_compression", "off"),
+        // pflash (prefill KV compression). Compression no-ops without a drafter.
+        ("prefill_drafter", ""),
+        ("prefill_threshold", "32768"),
         ("mtp_mode", "auto"),
         ("mtp_k", "3"),
     ]
@@ -218,5 +265,80 @@ fn value_to_string(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Null => String::new(),
         _ => v.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ConfigState seeded from an explicit value map (defaults overlaid).
+    fn state_with(pairs: &[(&str, &str)]) -> ConfigState {
+        let mut values = defaults();
+        let mut overrides = BTreeSet::new();
+        for (k, v) in pairs {
+            overrides.insert((*k).to_string());
+            values.insert((*k).to_string(), (*v).to_string());
+        }
+        ConfigState {
+            host: "0.0.0.0".into(),
+            port: 11435,
+            default_model: "qwen3.5:9b".into(),
+            values,
+            overrides,
+            per_model_count: 0,
+            loaded_from_disk: true,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn pflash_needs_drafter_logic() {
+        // 5d honest state: compression on + no drafter -> warns; with a drafter,
+        // or compression off, -> fine.
+        assert!(!state_with(&[]).pflash_needs_drafter(), "off by default = fine");
+        assert!(
+            state_with(&[("prefill_compression", "auto")]).pflash_needs_drafter(),
+            "auto without drafter needs one"
+        );
+        assert!(
+            state_with(&[("prefill_compression", "always")]).pflash_needs_drafter(),
+            "always without drafter needs one"
+        );
+        assert!(
+            !state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")])
+                .pflash_needs_drafter(),
+            "auto WITH a drafter is fine"
+        );
+    }
+
+    #[test]
+    fn easy_rows_surface_pflash_with_honest_hint() {
+        // The Prefill easy row exists and flags the missing drafter inline.
+        let st = state_with(&[("prefill_compression", "auto")]);
+        let prefill = st
+            .easy_rows()
+            .into_iter()
+            .find(|(label, _, _)| *label == "Prefill")
+            .expect("Prefill easy row present");
+        assert!(prefill.1.contains("needs drafter"), "no-op state shown: {}", prefill.1);
+
+        // With a drafter set, the hint goes away.
+        let st2 = state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")]);
+        let prefill2 = st2
+            .easy_rows()
+            .into_iter()
+            .find(|(label, _, _)| *label == "Prefill")
+            .unwrap();
+        assert!(!prefill2.1.contains("needs drafter"), "hint cleared: {}", prefill2.1);
+    }
+
+    #[test]
+    fn easy_view_vectors_stay_parallel() {
+        // 5d adds a row to all three easy vectors; they must stay equal length.
+        let st = state_with(&[]);
+        let n = st.easy_rows().len();
+        assert_eq!(st.easy_keys().len(), n);
+        assert_eq!(st.easy_override_state().len(), n);
     }
 }

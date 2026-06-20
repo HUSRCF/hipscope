@@ -83,6 +83,14 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "prefill_compression",
         kind: FieldKind::Enum(PREFILL_COMPRESSION),
     },
+    // pflash drafter path (.hfq). Mirrors bun `prefill_drafter` (typeof string —
+    // no existence check; "" disables). Required for compression to engage.
+    FieldSpec {
+        key: "prefill_drafter",
+        kind: FieldKind::FreeStr { require_existing_file: false },
+    },
+    // pflash auto-mode token cutoff. Mirrors bun int 0..=524288 (default 32768).
+    FieldSpec { key: "prefill_threshold", kind: FieldKind::Int { min: 0, max: 524288 } },
     FieldSpec { key: "mtp_k", kind: FieldKind::Int { min: 1, max: 10 } },
     // Bool fields (cycled true/false via Left/Right/Space).
     FieldSpec { key: "dflash_adaptive_b", kind: FieldKind::Bool },
@@ -536,6 +544,28 @@ mod tests {
         fs::write(&cfg, "{ this is not json").unwrap();
         let err = write_value(&cfg, "kv_cache", "q8");
         assert!(matches!(err, Err(WriteError::Parse(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pflash_knobs_are_editable_and_range_checked() {
+        // 5d: prefill_drafter (free string, no existence check) + prefill_threshold
+        // (int 0..=524288) are now writable from the TUI, mirroring the bun schema.
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{}\n").unwrap();
+
+        // Drafter accepts any string incl. a path that doesn't exist yet, and "".
+        assert!(write_value(&cfg, "prefill_drafter", "~/.hipfire/models/d.hfq").is_ok());
+        assert!(write_value(&cfg, "prefill_drafter", "").is_ok());
+        // Threshold range boundaries.
+        assert!(write_value(&cfg, "prefill_threshold", "0").is_ok());
+        assert!(write_value(&cfg, "prefill_threshold", "524288").is_ok());
+        assert!(write_value(&cfg, "prefill_threshold", "524289").is_err());
+        assert!(write_value(&cfg, "prefill_threshold", "-1").is_err());
+        // Compression enum unchanged.
+        assert_eq!(cycle_enum("prefill_compression", "off", true).unwrap(), "auto");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

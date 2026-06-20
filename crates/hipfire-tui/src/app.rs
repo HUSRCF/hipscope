@@ -1174,6 +1174,17 @@ impl App {
                 // reset wrongly reports "already at its default").
                 self.config.overrides.insert(key.to_string());
                 self.config.loaded_from_disk = true;
+                // Honest pflash state: turning compression on without a drafter is
+                // a no-op until a prefill_drafter (.hfq) is set.
+                if key == "prefill_compression" && self.config.pflash_needs_drafter() {
+                    self.toast_error("prefill_compression on, but prefill_drafter is unset — no-op until set");
+                    return (
+                        true,
+                        format!(
+                            "{key} = {as_str} saved; set prefill_drafter (a .hfq path) or it stays off"
+                        ),
+                    );
+                }
                 self.toast_info(format!("{key} saved"));
                 (true, format!("{key} = {as_str} saved to ~/.hipfire/config.json"))
             }
