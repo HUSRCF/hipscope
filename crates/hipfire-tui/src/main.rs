@@ -146,6 +146,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
 
         terminal.draw(|frame| ui::draw(frame, app))?;
         app.drain_chat_events();
+        app.drain_serve_command();
 
         if event::poll(std::time::Duration::from_millis(80))? {
             match event::read()? {

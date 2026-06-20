@@ -20,6 +20,7 @@ use crate::hipfire::{
     config::ConfigState,
     dashboard::{Dashboard, DashboardWorker},
     registry::{RegistryAction, RegistryState},
+    serve_ctrl::{self, ServeAction, ServeOutcome},
     status::{start_background_serve, StatusState},
     ui_state::UiState,
     writer::{self, FieldKind},
@@ -121,6 +122,13 @@ pub struct App {
     pub tab_hitboxes: Vec<(u16, u16, Tab)>,
     /// Terminal row the tab labels render on (for click hit-testing).
     pub tab_row_y: u16,
+    /// In-flight serve lifecycle command (start/stop/restart). Its single
+    /// outcome arrives on this receiver; `drain_serve_command` consumes it each
+    /// frame and turns it into a toast. `None` when no command is running.
+    serve_cmd: Option<Receiver<ServeOutcome>>,
+    /// Label ("start"/"stop"/"restart") of the in-flight serve command, for the
+    /// status line; empty when idle.
+    pub serve_cmd_label: String,
     /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
     /// thread. Dropped (joined) when the App is dropped.
     dashboard_worker: DashboardWorker,
@@ -160,8 +168,70 @@ impl App {
             show_help: false,
             tab_hitboxes: Vec::new(),
             tab_row_y: 0,
+            serve_cmd: None,
+            serve_cmd_label: String::new(),
             dashboard_worker,
         })
+    }
+
+    /// True while a serve lifecycle command (start/stop/restart) is running.
+    pub fn serve_cmd_running(&self) -> bool {
+        self.serve_cmd.is_some()
+    }
+
+    /// Kick off a serve lifecycle command on a background thread. No-op (with a
+    /// toast) if one is already in flight. The live serve up/down state updates
+    /// separately via the DashboardWorker once the daemon responds.
+    fn start_serve_command(&mut self, action: ServeAction) {
+        if self.serve_cmd.is_some() {
+            self.toast_info("a serve command is already running");
+            return;
+        }
+        self.serve_cmd = Some(serve_ctrl::run(action));
+        self.serve_cmd_label = action.label().to_string();
+        self.toast_info(format!("serve {}\u{2026}", action.label()));
+    }
+
+    /// Consume the serve command outcome if it has arrived (called each frame).
+    /// Surfaces a toast and kicks an immediate dashboard re-probe so the new
+    /// serve state shows up promptly.
+    pub fn drain_serve_command(&mut self) {
+        let outcome = match &self.serve_cmd {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => Some(o),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Some(ServeOutcome::Failed(
+                    "serve command thread exited unexpectedly".into(),
+                )),
+            },
+            None => return,
+        };
+        self.serve_cmd = None;
+        self.serve_cmd_label.clear();
+        match outcome {
+            Some(ServeOutcome::Ok(msg)) => self.toast_info(msg),
+            Some(ServeOutcome::Failed(msg)) => self.toast_error(msg),
+            None => {}
+        }
+        self.dashboard_worker.force_refresh();
+    }
+
+    /// Dashboard-tab keys: serve lifecycle controls.
+    fn handle_dashboard_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('s') => self.start_serve_command(ServeAction::Start),
+            KeyCode::Char('x') => self.start_serve_command(ServeAction::Stop),
+            KeyCode::Char('R') => self.start_serve_command(ServeAction::Restart),
+            _ => {}
+        }
+    }
+
+    /// Test seam: inject an in-flight serve-command receiver without spawning a
+    /// real `bun` process, so `drain_serve_command` can be exercised in unit tests.
+    #[cfg(test)]
+    pub fn inject_serve_cmd(&mut self, rx: Receiver<ServeOutcome>) {
+        self.serve_cmd = Some(rx);
+        self.serve_cmd_label = "test".into();
     }
 
     /// Persist the current session UI state (active tab + expanded Models
@@ -276,6 +346,7 @@ impl App {
 
     pub fn handle_tab_key(&mut self, key: KeyEvent) {
         match self.tab {
+            Tab::Dashboard => self.handle_dashboard_key(key),
             Tab::Chat => self.handle_chat_key(key),
             Tab::Models => self.handle_models_key(key),
             Tab::Settings => self.handle_settings_key(key),
@@ -903,6 +974,28 @@ mod tests {
         let restored = crate::hipfire::ui_state::UiState::load(&app.paths.ui_state);
         assert_eq!(restored.active_tab, "Models");
         assert!(restored.expanded_groups.contains(&"qwen".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_serve_command_idle_is_noop() {
+        let (mut app, dir) = test_app();
+        assert!(!app.serve_cmd_running());
+        app.drain_serve_command();
+        assert!(app.toast.is_none(), "no in-flight command -> no toast");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_serve_command_consumes_outcome_and_toasts() {
+        let (mut app, dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ServeOutcome::Ok("serve start: done".into())).unwrap();
+        app.inject_serve_cmd(rx);
+        assert!(app.serve_cmd_running());
+        app.drain_serve_command();
+        assert!(!app.serve_cmd_running(), "outcome clears the in-flight command");
+        assert!(app.toast.is_some(), "outcome raises a toast");
         let _ = std::fs::remove_dir_all(dir);
     }
 

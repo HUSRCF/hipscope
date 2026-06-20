@@ -188,7 +188,13 @@ fn footer_hints(app: &App) -> String {
     let global = "Tab/BackTab switch · q quit";
     match app.tab {
         Tab::Home => format!("r refresh · {global}"),
-        Tab::Dashboard => format!("r refresh now (auto ~1.5s) · {global}"),
+        Tab::Dashboard => {
+            if app.serve_cmd_running() {
+                format!("serve {}\u{2026} · {global}", app.serve_cmd_label)
+            } else {
+                format!("s start · x stop · R restart · r refresh · {global}")
+            }
+        }
         Tab::Chat => {
             // Chat owns q/r as text input, so it has its own exit hints.
             "Enter send · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
@@ -1274,5 +1280,13 @@ mod render_tests {
                 .draw(|frame| draw(frame, &mut app))
                 .expect("draw must not panic at tiny geometry");
         }
+    }
+
+    #[test]
+    fn dashboard_footer_shows_serve_controls() {
+        let text = render_with(|app| app.tab = Tab::Dashboard);
+        assert!(text.contains("s start"), "serve start control in footer");
+        assert!(text.contains("x stop"), "serve stop control in footer");
+        assert!(text.contains("R restart"), "serve restart control in footer");
     }
 }
