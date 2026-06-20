@@ -253,12 +253,27 @@ export interface HipfireConfig {
   default_chatml: boolean;
 }
 
-// Detect GPU at import time for smart defaults
+// Detect GPU at import time (for diagnostics / display only — no longer drives
+// the KV default).
 const DETECTED_ARCH = detectGpuArch();
-const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
+
+// Universal KV cache default. q8 (near-reference, ~2x vs fp16, DFlash-safe) is the
+// go-forward default for every card; a model can recommend a compressed mode via
+// its registry `default_kv_mode`, and the user can override per-config / per-model.
+// (We used to guess a per-arch fwht mode from a hardcoded `vram_gb` table — but
+// those numbers were wrong for the unified-memory APUs, fed no actual fit logic,
+// and silently handed unregistered models a lossy default. Removed. If genuine
+// fit-safety is wanted on a tight card, gate on the REAL vram_free_mb the daemon
+// already reports, not a static per-arch number — or set a per-model
+// default_kv_mode in the registry.)
+const DEFAULT_KV_MODE = "q8";
 
 const CONFIG_DEFAULTS: HipfireConfig = {
-  kv_cache: ARCH_DEFAULTS.kv_cache,
+  // "auto" = the inherit sentinel: resolve to the model's registry
+  // default_kv_mode, else DEFAULT_KV_MODE (q8). Keeping the literal default as
+  // "auto" (not a concrete mode) is what makes the registry path live for a clean
+  // config — a concrete literal here would bypass it.
+  kv_cache: "auto",
   kv_adaptive: "off",
   flash_mode: "auto",
   default_model: "qwen3.5:9b",
@@ -671,7 +686,7 @@ void _applyThinkingMode_deprecated;
 function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string | null): string {
   if (baseMode !== "asym3") return baseMode;
   if (process.env.HIPFIRE_KV_MODE) return baseMode; // explicit env wins
-  if (resolved.kv_cache !== ARCH_DEFAULTS.kv_cache) return baseMode; // explicit config/per-model
+  if (resolved.kv_cache !== "auto") return baseMode; // explicit config/per-model — respect it
   if (!tag) return baseMode;
   const t = resolveModelTag(tag).toLowerCase();
   const isLarge = t.includes(":27b") || t.includes(":35b") || t.includes("-27b") || t.includes("-35b");
@@ -987,9 +1002,10 @@ interface ModelEntry {
   /// is required once the file is in MODELS_DIR.
   mtp?: { file: string };
   /// Optional per-model KV-cache default (the registry is the per-model card).
-  /// When present it takes precedence over the per-GPU archDefaults fallback in
-  /// resolveKvMode (but still loses to HIPFIRE_KV_MODE env and per-model
-  /// config). Validated against REGISTRY_KV_MODE_VALUES at registry-load time.
+  /// When present it takes precedence over the q8 default in resolveKvMode (but
+  /// still loses to HIPFIRE_KV_MODE env and per-model config). This is the
+  /// supported way to ship a compressed KV default for a specific model.
+  /// Validated against REGISTRY_KV_MODE_VALUES at registry-load time.
   default_kv_mode?: string | null;
   /// Optional curated author-recommended INFERENCE settings inherited from the
   /// parent model card. Layered UNDER per-model models.json config and OVER the
@@ -1110,65 +1126,39 @@ function detectGpuArch(): string {
   return "unknown";
 }
 
-interface ArchDefaults {
-  kv_cache: string;        // best KV mode for this hardware
-  vram_gb: number;         // approximate VRAM
-}
-
-function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (FWHT-rotated, DFlash-safe):
-  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
-  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
-  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
-  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
-  //   calibrated against → degraded acceptance / attractors with DFlash (which
-  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
-  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
-  //   or the `asym*` modes for the legacy Givens behavior.
-  switch (arch) {
-    // RDNA3
-    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
-    // RDNA4
-    case "gfx1200": case "gfx1201":
-      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
-    // RDNA2
-    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
-    // RDNA1
-    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
-    default: return { kv_cache: "fwht3", vram_gb: 8 };
-  }
-}
+// KV cache mode notes (for picking a non-default mode, per-model or by hand):
+//   q8     — near-reference, ~2× vs fp16. The default. DFlash-safe.
+//   fwht3  — K 3-bit FWHT-rotated + V Q8, ~5.5× compression. The K-rotation basis
+//            matches the MQ4 weight/draft FWHT convention, so DFlash speculative
+//            acceptance stays high — prefer fwht* over asym* when DFlash is on.
+//   fwht2  — 2-bit FWHT tier, for genuinely memory-tight setups.
+//   asym3/asym4 — Givens basis the draft was NOT calibrated against → degraded
+//            DFlash acceptance / attractors. Legacy; avoid with DFlash.
+// Set a compressed mode per-model via the registry `default_kv_mode`, or globally
+// via `hipfire config set kv_cache <mode>` — not by guessing from the GPU arch.
 
 // ─── KV cache mode resolver ──────────────────────────────
 // Canonical modes: q8, asym4, asym3, asym2.
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
-// (plus "auto" → arch default).
+// (plus "auto" → registry default_kv_mode, else q8).
 // Precedence (highest → lowest):
 //   HIPFIRE_KV_MODE env  >  per-model config (models.json per-tag kv_cache)
-//   >  the resolved model's registry `default_kv_mode`  >  archDefaults.
+//   >  the resolved model's registry `default_kv_mode`  >  DEFAULT_KV_MODE (q8).
 // The first two arrive folded into `cfg.kv_cache` (env via `||`, per-model via
 // resolveModelConfig before this call). `cfg.kv_cache === "auto"` means "no
 // explicit user/per-model config" — only THEN does the registry's per-model
-// recommendation, and finally the per-GPU arch fallback, apply.
+// recommendation, and finally the q8 fallback, apply.
 function resolveKvMode(cfg: HipfireConfig, tag?: string | null): string {
   let raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
   if (raw === "auto") {
     // No env / no explicit per-model config: prefer the registry's per-model
-    // default_kv_mode if the resolved model carries one, else arch fallback.
+    // default_kv_mode if the resolved model carries one, else the q8 default.
     const regDefault = tag ? REGISTRY[resolveModelTag(tag)]?.default_kv_mode : undefined;
     raw = (typeof regDefault === "string" && regDefault.length > 0)
       ? regDefault
-      : ARCH_DEFAULTS.kv_cache; // per-model registry default takes precedence; this is the no-recommendation fallback
-    // A registry default_kv_mode of "auto" (or arch fallback "auto", which
-    // archDefaults never returns) collapses to the arch default.
-    if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+      : DEFAULT_KV_MODE;
+    // A registry default_kv_mode of "auto" collapses to the q8 default.
+    if (raw === "auto") return DEFAULT_KV_MODE;
   }
   if (raw === "turbo" || raw === "turbo3") return "asym3";
   if (raw === "turbo2") return "asym2";
@@ -6610,7 +6600,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
-      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${ARCH_DEFAULTS.kv_cache}${C.reset}\n`);
+      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${DEFAULT_KV_MODE} (unless a model recommends otherwise)${C.reset}\n`);
     }
     if (process.env.HIPFIRE_GRAPH === "1") {
       write(`${C.yellow}⚠ HIPFIRE_GRAPH=1 is set in your environment. AR forward hipGraph capture is${C.reset}\n`);
@@ -8158,8 +8148,7 @@ Examples:
           console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
           console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 
-          const ad = archDefaults(diag.arch || "unknown");
-          console.log(`  kv default:  ${ad.kv_cache} (${ad.vram_gb}GB VRAM)`);
+          console.log(`  kv default:  ${DEFAULT_KV_MODE} (auto → registry default_kv_mode, else q8)`);
           const hasWmma = (diag.arch || "").startsWith("gfx11") || (diag.arch || "").startsWith("gfx12");
           console.log(`  WMMA:        ${hasWmma ? "yes (4.1x prefill)" : "no (FP16 packed, +15% prefill)"}`);
 
@@ -9032,7 +9021,7 @@ Examples:
       const isFirstRun = !hasModels && !hasConfig;
       if (isFirstRun) {
         console.log(`\x1b[1mWelcome to hipfire — LLM inference for AMD GPUs\x1b[0m`);
-        console.log(`\nDetected GPU: \x1b[36m${DETECTED_ARCH || "unknown"}\x1b[0m · KV default: \x1b[36m${ARCH_DEFAULTS.kv_cache}\x1b[0m`);
+        console.log(`\nDetected GPU: \x1b[36m${DETECTED_ARCH || "unknown"}\x1b[0m · KV default: \x1b[36m${DEFAULT_KV_MODE}\x1b[0m`);
         console.log(`\nFirst-run setup:`);
         console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
         console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);

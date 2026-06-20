@@ -61,7 +61,7 @@ pub const KNOBS: &[KnobInfo] = &[
         effect: "Lower precision (q8 → asym3 → asym2) saves VRAM and can speed decode, at some quality risk. Higher keeps fidelity.",
         default: "auto",
         when: "Leave on auto unless you need to fit a larger context or are A/B-testing precision.",
-        note: Some("auto is the inherit sentinel — it resolves to the model's registry default_kv_mode if set, else this GPU's arch default (e.g. fwht3 on RDNA3). So the effective default is hardware-dependent, not a fixed value."),
+        note: Some("auto is the inherit sentinel — it resolves to the model's registry default_kv_mode if set, else q8 (the universal default; near-reference and DFlash-safe). A model can ship a compressed default via the registry; it's no longer guessed from the GPU arch."),
     },
     KnobInfo {
         key: "dflash_mode",
