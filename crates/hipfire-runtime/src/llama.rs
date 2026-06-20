@@ -8848,4 +8848,47 @@ mod tests {
         // Since KvCache requires GPU allocation, we test the predicate in isolation
         // by constructing the boolean checks that the dispatch uses.
     }
+
+    // ── KvCache::tier_inputs() accessor pin test ─────────────────
+
+    #[test]
+    fn tier_inputs_q8_is_byte_identical_to_legacy_literal() {
+        // Skip cleanly on a box with no GPU (CI); runs for real on gfx1151.
+        let mut gpu = match Gpu::init() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let kv = KvCache::new_gpu_q8(&mut gpu, 1, 8, 64, 16).unwrap();
+
+        // What the unified accessor produces for a decode call at pos=100.
+        let got = KvTierInputs { pos: 100, ..kv.tier_inputs() };
+
+        // The exact literal the qwen35 decode site used before this refactor.
+        let legacy = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+        };
+
+        assert_eq!(got, legacy, "tier_inputs() must be byte-identical to the legacy literal");
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().write_key,
+            KvTierPlan::derive(legacy).unwrap().write_key,
+        );
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().attend_key,
+            KvTierPlan::derive(legacy).unwrap().attend_key,
+        );
+    }
 }
