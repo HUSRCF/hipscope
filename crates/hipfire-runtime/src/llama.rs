@@ -5171,6 +5171,22 @@ impl KvCache {
         }
     }
 
+    /// The sealed decode of this cache's storage tier. The sanctioned way to
+    /// branch on KV quant mode — replaces hand-rolled `if kv.quant_q8 { … }` ladders.
+    pub fn k_tier(&self) -> hipfire_dispatch::families::kv_tier::KTier {
+        // `quant_q4` is the residual (see tier_inputs()); recompute it here so
+        // classify sees the same value derive() would.
+        let quant_q4 = self.quantized
+            && !self.quant_hfq4
+            && !self.quant_q8
+            && !self.quant_int8
+            && self.k_scales.is_empty();
+        hipfire_dispatch::families::kv_tier::classify(
+            self.quant_q8, self.quant_asym4, self.quant_asym3, self.quant_asym2,
+            self.quant_hfq4, quant_q4, self.quant_fwht,
+        )
+    }
+
     fn resize_real_tensors_zeroed(
         gpu: &mut Gpu,
         tensors: &mut [GpuTensor],
