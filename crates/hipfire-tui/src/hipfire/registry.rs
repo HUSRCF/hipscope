@@ -197,6 +197,12 @@ impl RegistryState {
         }
     }
 
+    /// Whether `tag` resolves to a known model (a registry/local entry or an
+    /// alias). Used by the Chat `/model <tag>` command.
+    pub fn has_model(&self, tag: &str) -> bool {
+        self.models.iter().any(|m| m.tag == tag) || self.aliases.contains_key(tag)
+    }
+
     pub fn visible_items(&self) -> Vec<ModelListItem> {
         let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (idx, row) in self.models.iter().enumerate() {

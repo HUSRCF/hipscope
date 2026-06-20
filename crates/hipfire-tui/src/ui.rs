@@ -198,7 +198,7 @@ fn footer_hints(app: &App) -> String {
         }
         Tab::Chat => {
             // Chat owns q/r as text input, so it has its own exit hints.
-            "Enter send · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
+            "Enter send (/help for commands) · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
         }
         Tab::Models => {
             if app.confirm_delete.is_some() {
@@ -569,9 +569,19 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let input_title = if app.chat.sending {
-        format!("Input - {}", app.chat.status)
-    } else {
         format!("Input - {} - model {}", app.chat.status, app.active_model)
+    } else {
+        let mut extras = vec![format!("model {}", app.active_model)];
+        if !app.chat.system_prompt.is_empty() {
+            extras.push("sys".into());
+        }
+        if let Some(t) = app.chat.temp {
+            extras.push(format!("temp {t}"));
+        }
+        if let Some(p) = app.chat.top_p {
+            extras.push(format!("top_p {p}"));
+        }
+        format!("Input - {} - {}", app.chat.status, extras.join(" · "))
     };
     let input = Paragraph::new(app.chat.input.as_str())
         .block(block(&input_title))

@@ -605,8 +605,15 @@ impl App {
 
         match key.code {
             KeyCode::Enter => {
-                let prompt = self.chat.input.trim().to_string();
-                if prompt.is_empty() {
+                let input = self.chat.input.trim().to_string();
+                if input.is_empty() {
+                    self.chat.focus_input();
+                    return;
+                }
+                // Slash commands act locally (no serve needed) and never send.
+                if let Some(cmd) = input.strip_prefix('/') {
+                    self.chat.input.clear();
+                    self.handle_chat_command(cmd);
                     self.chat.focus_input();
                     return;
                 }
@@ -614,35 +621,8 @@ impl App {
                     self.start_serve_for_chat();
                     return;
                 }
-                self.chat.input.clear();
-                self.chat.messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: prompt.clone(),
-                });
-                self.chat.messages.push(ChatMessage {
-                    role: "assistant".into(),
-                    content: String::new(),
-                });
-                self.chat.sending = true;
-                self.chat.status = "streaming from hipfire serve".into();
-
-                let (tx, rx) = mpsc::channel();
-                self.chat.rx = Some(rx);
-                // Fresh cancel flag per generation; Esc flips it (request_abort).
-                self.chat.abort = Arc::new(AtomicBool::new(false));
-                let abort = self.chat.abort.clone();
-                let host = self.config.probe_host();
-                let port = self.config.port;
-                let model = self.active_model.clone();
-                let mut messages = self.chat.messages.clone();
-                if let Some(last) = messages.last_mut() {
-                    if last.role == "assistant" && last.content.is_empty() {
-                        messages.pop();
-                    }
-                }
-                thread::spawn(move || {
-                    let _ = stream_chat(&host, port, &model, &messages, tx, abort);
-                });
+                self.send_chat(input);
+                self.chat.focus_input();
             }
             KeyCode::Backspace => {
                 self.chat.input.pop();
@@ -659,6 +639,121 @@ impl App {
                 self.chat.scroll = self.chat.scroll.saturating_sub(1);
             }
             _ => {}
+        }
+    }
+
+    /// Push the prompt + an empty assistant slot and spawn the stream worker,
+    /// applying the session system prompt + sampling overrides.
+    fn send_chat(&mut self, prompt: String) {
+        self.chat.input.clear();
+        self.chat.messages.push(ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        });
+        self.chat.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+        });
+        self.chat.sending = true;
+        self.chat.status = "streaming from hipfire serve".into();
+
+        let (tx, rx) = mpsc::channel();
+        self.chat.rx = Some(rx);
+        // Fresh cancel flag per generation; Esc flips it (request_abort).
+        self.chat.abort = Arc::new(AtomicBool::new(false));
+        let abort = self.chat.abort.clone();
+        let host = self.config.probe_host();
+        let port = self.config.port;
+        let model = self.active_model.clone();
+        let temp = self.chat.temp;
+        let top_p = self.chat.top_p;
+        let mut messages = self.chat.messages.clone();
+        if let Some(last) = messages.last_mut() {
+            if last.role == "assistant" && last.content.is_empty() {
+                messages.pop();
+            }
+        }
+        if !self.chat.system_prompt.is_empty() {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content: self.chat.system_prompt.clone(),
+                },
+            );
+        }
+        thread::spawn(move || {
+            let _ = stream_chat(&host, port, &model, &messages, temp, top_p, tx, abort);
+        });
+    }
+
+    /// Dispatch a Chat slash command (the input after the leading '/').
+    fn handle_chat_command(&mut self, cmd: &str) {
+        let mut parts = cmd.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        match name {
+            "model" | "m" => {
+                if arg.is_empty() {
+                    self.chat.status = format!("model: {} (use /model <tag>)", self.active_model);
+                } else if self.registry.has_model(arg) {
+                    self.active_model = arg.to_string();
+                    self.chat.status = format!("model -> {arg}");
+                } else {
+                    self.toast_error(format!("unknown model: {arg}"));
+                }
+            }
+            "system" | "sys" => {
+                self.chat.system_prompt = arg.to_string();
+                self.chat.status = if arg.is_empty() {
+                    "system prompt cleared".into()
+                } else {
+                    format!("system prompt set ({} chars)", arg.chars().count())
+                };
+            }
+            "temp" => self.set_sampling(true, arg),
+            "top_p" => self.set_sampling(false, arg),
+            "clear" => {
+                self.chat.messages.clear();
+                self.chat.scroll = 0;
+                self.chat.status = "conversation cleared".into();
+            }
+            "help" | "" => {
+                self.chat.status =
+                    "/model <tag> · /system <text> · /temp <0-2> · /top_p <0-1> · /clear".into();
+            }
+            other => self.toast_error(format!("unknown command: /{other} (try /help)")),
+        }
+    }
+
+    /// Set or clear a per-session sampling override. `is_temp` selects
+    /// temperature (range 0..=2) vs top_p (range 0..=1). An empty/"off" arg
+    /// clears the override (serve default).
+    fn set_sampling(&mut self, is_temp: bool, arg: &str) {
+        let (label, lo, hi) = if is_temp {
+            ("temperature", 0.0, 2.0)
+        } else {
+            ("top_p", 0.0, 1.0)
+        };
+        if arg.is_empty() || arg == "off" {
+            if is_temp {
+                self.chat.temp = None;
+            } else {
+                self.chat.top_p = None;
+            }
+            self.chat.status = format!("{label}: serve default");
+            return;
+        }
+        match arg.parse::<f64>() {
+            Ok(v) if (lo..=hi).contains(&v) => {
+                if is_temp {
+                    self.chat.temp = Some(v);
+                } else {
+                    self.chat.top_p = Some(v);
+                }
+                self.chat.status = format!("{label}: {v}");
+            }
+            _ => self.toast_error(format!("{label} must be a number in {lo}..={hi}")),
         }
     }
 
@@ -954,6 +1049,11 @@ pub struct ChatState {
     pub status: String,
     pub sending: bool,
     pub scroll: u16,
+    /// Session system prompt, prepended to the request when non-empty (/system).
+    pub system_prompt: String,
+    /// Per-session sampling overrides (/temp, /top_p); None = serve default.
+    pub temp: Option<f64>,
+    pub top_p: Option<f64>,
     rx: Option<Receiver<ChatEvent>>,
     input_focused: bool,
     // Set true to ask the in-flight stream thread to stop (checked per line).
@@ -968,6 +1068,9 @@ impl Default for ChatState {
             status: "ready".into(),
             sending: false,
             scroll: 0,
+            system_prompt: String::new(),
+            temp: None,
+            top_p: None,
             rx: None,
             input_focused: true,
             abort: Arc::new(AtomicBool::new(false)),
@@ -1208,6 +1311,48 @@ mod tests {
         let job = app.pull.as_ref().expect("pull stays active during progress");
         assert_eq!(job.percent, Some(42.0));
         assert_eq!(job.line, "[bar] 42.0% 8 MB/s");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_slash_commands_set_session_state() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+
+        // /system sets then clears the prompt.
+        app.handle_chat_command("system You are a helpful pirate.");
+        assert_eq!(app.chat.system_prompt, "You are a helpful pirate.");
+        app.handle_chat_command("system");
+        assert!(app.chat.system_prompt.is_empty());
+
+        // /temp + /top_p validate range and accept off.
+        app.handle_chat_command("temp 0.7");
+        assert_eq!(app.chat.temp, Some(0.7));
+        app.handle_chat_command("temp 9"); // out of 0..=2 -> rejected, unchanged
+        assert_eq!(app.chat.temp, Some(0.7));
+        app.handle_chat_command("temp off");
+        assert_eq!(app.chat.temp, None);
+        app.handle_chat_command("top_p 0.9");
+        assert_eq!(app.chat.top_p, Some(0.9));
+        app.handle_chat_command("top_p 5"); // out of 0..=1 -> rejected
+        assert_eq!(app.chat.top_p, Some(0.9));
+
+        // /clear empties the conversation.
+        app.chat.messages.push(ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        });
+        app.handle_chat_command("clear");
+        assert!(app.chat.messages.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_unknown_command_toasts_does_not_panic() {
+        let (mut app, dir) = test_app();
+        app.handle_chat_command("definitely-not-a-command");
+        assert!(app.toast.is_some(), "unknown command surfaces an error toast");
         let _ = std::fs::remove_dir_all(dir);
     }
 

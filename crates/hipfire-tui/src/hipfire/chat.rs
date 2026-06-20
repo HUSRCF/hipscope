@@ -34,21 +34,26 @@ pub fn stream_chat(
     port: u16,
     model: &str,
     messages: &[ChatMessage],
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     tx: Sender<ChatEvent>,
     abort: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = stream_chat_inner(host, port, model, messages, &tx, &abort);
+    let result = stream_chat_inner(host, port, model, messages, temperature, top_p, &tx, &abort);
     if let Err(err) = result {
         let _ = tx.send(ChatEvent::Error(err.to_string()));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_chat_inner(
     host: &str,
     port: u16,
     model: &str,
     messages: &[ChatMessage],
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     tx: &Sender<ChatEvent>,
     abort: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -56,11 +61,18 @@ fn stream_chat_inner(
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(600))
         .build();
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "stream": true,
         "messages": messages,
     });
+    // Per-session sampling overrides (set via /temp and /top_p).
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(p) = top_p {
+        body["top_p"] = json!(p);
+    }
     let resp = match agent
         .post(&url)
         .set("Content-Type", "application/json")
