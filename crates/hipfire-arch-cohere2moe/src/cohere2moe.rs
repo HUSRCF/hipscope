@@ -337,6 +337,87 @@ impl Cohere2MoeWeights {
     }
 }
 
+impl DenseFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let DenseFfn { gate, up, down } = self;
+        gate.free_all(gpu);
+        up.free_all(gpu);
+        down.free_all(gpu);
+    }
+}
+
+impl ExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let ExpertWeights { gate_up, down } = self;
+        gate_up.free_all(gpu);
+        down.free_all(gpu);
+    }
+}
+
+impl MoeFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MoeFfn {
+            router,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+        } = self;
+        router.free_all(gpu);
+        for e in experts {
+            e.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(expert_down_ptrs);
+    }
+}
+
+impl Ffn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Ffn::Dense(d) => d.free_gpu(gpu),
+            Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+}
+
+impl Cohere2MoeLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Cohere2MoeLayerWeights {
+            input_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            ffn,
+            attn_kind: _,
+        } = self;
+        let _ = gpu.free_tensor(input_norm);
+        wq.free_all(gpu);
+        wk.free_all(gpu);
+        wv.free_all(gpu);
+        wo.free_all(gpu);
+        ffn.free_gpu(gpu);
+    }
+}
+
+impl Cohere2MoeWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Cohere2MoeWeights {
+            embed,
+            embed_dtype: _,
+            final_norm,
+            lm_head,
+            layers,
+        } = self;
+        let _ = gpu.free_tensor(embed);
+        let _ = gpu.free_tensor(final_norm);
+        lm_head.free_all(gpu);
+        for layer in layers {
+            layer.free_gpu(gpu);
+        }
+    }
+}
+
 // ──────────────────────────── State ────────────────────────────
 
 /// Per-decode GPU scratch + KV cache (one slot per layer — every Cohere2 layer
@@ -405,6 +486,67 @@ const FLASH_PREFILL_SUBBATCH: usize = 64;
 const DEFAULT_MAX_SEQ: usize = 32_768;
 
 impl Cohere2MoeState {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Cohere2MoeState {
+            kv,
+            pos_buf,
+            max_seq: _,
+            n_tokens: _,
+            h,
+            normed,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            dense_gate,
+            dense_up,
+            dense_act,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            expert_gate_up,
+            expert_act,
+            expert_down,
+            final_norm_buf,
+            logits,
+            flash_partials,
+        } = self;
+        kv.free_gpu(gpu);
+        let _ = gpu.hip.free(pos_buf);
+        for t in [
+            h,
+            normed,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            dense_gate,
+            dense_up,
+            dense_act,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            expert_gate_up,
+            expert_act,
+            expert_down,
+            final_norm_buf,
+            logits,
+            flash_partials,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Cohere2MoeConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
         Self::new_with_max_seq(gpu, cfg, max_seq)

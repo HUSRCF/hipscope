@@ -32,9 +32,10 @@
 //!   - a discoverable contract for adding a new arch ("implement this trait
 //!     and register your `arch_id`").
 
-use crate::qwen35::{config_from_hfq as qwen35_config_from_hfq,
-                    load_weights as qwen35_load_weights,
-                    DeltaNetState, Qwen35Config, Qwen35Weights};
+use crate::qwen35::{
+    config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
+    HfqSource, Layout, Qwen35Config, Qwen35Weights,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -63,7 +64,6 @@ impl Architecture for Qwen35 {
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
         qwen35_config_from_hfq(hfq)
-            .ok_or_else(|| "qwen35: failed to parse config from HFQ metadata".to_string())
     }
 
     fn load_weights(
@@ -71,7 +71,9 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        qwen35_load_weights(hfq, cfg, gpu)
+        let mut source = HfqSource::new(hfq, cfg);
+        let layout = Layout::single(cfg.n_layers);
+        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }
 

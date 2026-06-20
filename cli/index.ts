@@ -828,10 +828,49 @@ interface ModelEntry {
 // binary by `bun build --compile`, so the JSON is inlined at build time via
 // `await import` with `assert: { type: "json" }`. Edit-then-rebuild flow
 // keeps the JSON as the source of truth without a runtime fs dep.
+//
+// Dynamic refresh (task #47): compiled binaries would otherwise inline this
+// JSON forever, so `initDynamicRegistry()` (called once at startup, before
+// the command dispatch) swaps in registry/v1.json fetched from GitHub with a
+// 24h cache at ~/.hipfire/registry.cache.json. The bundled data below is the
+// always-works fallback — offline, fetch failure, or a registry that fails
+// validation all leave it untouched. See cli/registry_loader.ts.
 import registryData from "./registry.json" with { type: "json" };
+import {
+  loadDynamicRegistry,
+  DEFAULT_REGISTRY_URL,
+  type RegistrySource,
+} from "./registry_loader";
 
-const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
-const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
+let REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
+let ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
+
+const REGISTRY_CACHE_PATH = join(HIPFIRE_DIR, "registry.cache.json");
+let REGISTRY_SOURCE: RegistrySource = "bundled";
+
+async function initDynamicRegistry(): Promise<void> {
+  // Opt-outs: HIPFIRE_NO_REGISTRY_FETCH=1 pins the bundled registry (also
+  // skips the cache — predictable for debugging); bun test sets NODE_ENV=test
+  // and must never touch the network or ~/.hipfire.
+  if (process.env.HIPFIRE_NO_REGISTRY_FETCH === "1" || process.env.NODE_ENV === "test") return;
+  try {
+    const result = await loadDynamicRegistry({
+      url: process.env.HIPFIRE_REGISTRY_URL || DEFAULT_REGISTRY_URL,
+      cachePath: REGISTRY_CACHE_PATH,
+    });
+    if (result.registry) {
+      // v1 is a strict superset of the bundled shape (validated upstream by
+      // scripts/registry_gen.py and again by validateRegistryV1), so a
+      // wholesale swap is safe — and required, so that models intentionally
+      // removed from the registry actually disappear.
+      REGISTRY = result.registry.models as unknown as Record<string, ModelEntry>;
+      ALIASES = result.registry.aliases;
+      REGISTRY_SOURCE = result.source;
+    }
+  } catch {
+    // Never let registry refresh break the CLI — bundled data always works.
+  }
+}
 
 export function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
@@ -5929,6 +5968,12 @@ function syncCliRuntimePayload(repoDir: string): void {
 
 // ─── Main ───────────────────────────────────────────────
 
+// Dynamic registry first: refreshModelsCatalog() and every command below
+// read REGISTRY/ALIASES, so the swap must land before any of them run.
+// Cache-fresh path is one small file read; the network path is bounded by
+// REGISTRY_FETCH_TIMEOUT_MS so an offline box never hangs here.
+await initDynamicRegistry();
+
 refreshModelsCatalog();
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -6506,6 +6551,9 @@ switch (cmd) {
   }
   case "diag": {
     console.log("hipfire diagnostics\n");
+    // Where the model list came from this run: network / cache / stale-cache
+    // (dynamic registry/v1.json) or bundled (compiled-in registry.json).
+    console.log(`registry:      ${REGISTRY_SOURCE}`);
     const sh = (cmd: string) => {
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }

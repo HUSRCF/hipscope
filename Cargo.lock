@@ -216,6 +216,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
@@ -289,6 +290,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-loader"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.2.1"
 dependencies = [
@@ -318,6 +338,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-loader",
  "libc",
  "memmap2",
  "minijinja",
@@ -525,6 +546,7 @@ name = "rdna-compute"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "rayon",
 ]
 
 [[package]]
