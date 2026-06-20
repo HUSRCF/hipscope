@@ -738,3 +738,32 @@ impl Carrier for Lfm2MoeCarrier {
         })
     }
 }
+
+// ─── Cohere2MoeCarrier ───────────────────────────────────────────────
+// cohere2moe (arch_id 12, HFQ-only) landed upstream via the generic
+// `HfqCarrier` fn-pointer registry entry. Our dedicated-carrier refactor
+// removed that generic struct, so this wraps the still-standalone
+// `crate::load_cohere2moe` with the same HFQ-extraction glue the old
+// `HfqCarrier::load` used — keeping cohere2moe's load path byte-identical
+// to upstream while fitting the dedicated-carrier registry.
+pub struct Cohere2MoeCarrier;
+impl Carrier for Cohere2MoeCarrier {
+    fn name(&self) -> &'static str {
+        "cohere2moe"
+    }
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 12
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("cohere2moe: pp>1 unsupported via registry".into());
+        }
+        let ModelSource::Hfq(hfq) = src else {
+            return Err("cohere2moe: directory source unsupported".into());
+        };
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
+        crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+    }
+}

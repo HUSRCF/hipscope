@@ -290,6 +290,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         sliding_window: raw.sliding_window,
         num_nextn_predict_layers: raw.num_nextn_predict_layers,
         num_hash_layers: raw.num_hash_layers,
+        reap_keep: None,
     })
 }
 

@@ -59,11 +59,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Deepseek4Carrier,
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
-    &HfqCarrier {
-        arch_id: 12,
-        name: "cohere2moe",
-        load: load_cohere2moe,
-    },
+    &Cohere2MoeCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
