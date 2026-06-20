@@ -22,6 +22,7 @@
 //!   ← {"type":"unloaded"}
 
 use base64::Engine;
+use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -1532,6 +1533,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            12 => "north_mini_code",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1543,6 +1545,11 @@ fn main() {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
                             }
                             Some(ModelState::Qwen2(b)) => (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
+                            ),
+                            Some(ModelState::Cohere2Moe(b)) => (
                                 b.config.hidden_size,
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
@@ -1607,7 +1614,8 @@ fn main() {
 
                         // `cache_capable`: the daemon implements LCP prompt-cache
                         // reuse for these arches' AR generate path (qwen3.5/3.6
-                        // = 5/6, deepseek4 = 9, minimax-m2 = 10). The serve layer keys its
+                        // = 5/6, deepseek4 = 9, minimax-m2 = 10, Cohere2-MoE
+                        // = 12). The serve layer keys its
                         // per-request `reset` decision off THIS flag rather than
                         // a hardcoded arch-string allowlist, so a new
                         // cache-capable arch (or an arch-string rename) can't
@@ -1615,7 +1623,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -1889,6 +1897,11 @@ fn main() {
                     // models that fall into block-level attractors at lower
                     // temperatures — use the card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
+                } else if m.arch_id == 12 {
+                    // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
+                    // markers are sampled best with the model-card nucleus
+                    // defaults.
+                    (1.0_f64, 0.95_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
@@ -2398,6 +2411,7 @@ fn main() {
                         9 => "deepseek4",
                         10 => "minimax_m2",
                         11 => "lfm2moe",
+                        12 => "north_mini_code",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -2531,6 +2545,9 @@ fn main() {
                 if let Some(ref mut s) = m.qwen2_state {
                     s.reset();
                 }
+                if let Some(b) = m.cohere2moe_mut() {
+                    let _ = b.state.reset(&mut gpu);
+                }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -2626,6 +2643,28 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if minimax::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 12 {
+                    // Cohere2-MoE warm-pass: per-token decode_step over the
+                    // synthetic prompt. This primes attention + MoE dispatch
+                    // without mutating qwen/minimax-specific state.
+                    let b = m
+                        .cohere2moe_mut()
+                        .expect("arch_id=12 requires cohere2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if cohere2moe::forward::decode_step(
                             config, weights, state, &mut gpu, tok, i as u32,
                         )
                         .is_err()
@@ -2852,6 +2891,7 @@ fn generate_ep(
                                     content: sys.to_string(),
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
+                                    tool_plan: String::new(),
                                 });
                             }
                             v.push(hipfire_runtime::prompt_frame::Message {
@@ -2859,6 +2899,7 @@ fn generate_ep(
                                 content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                             synthesized = v;
                             &synthesized
@@ -3668,6 +3709,7 @@ fn generate_dflash(
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -3675,6 +3717,7 @@ fn generate_dflash(
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -4988,6 +5031,7 @@ fn generate_multi(
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -4995,6 +5039,7 @@ fn generate_multi(
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -5966,6 +6011,36 @@ fn generate(
         );
         return;
     }
+    if m.arch_id == 12 {
+        // arch_id=12 (Cohere2-MoE / North-Mini-Code). Standalone bring-up
+        // with Cohere agentic marker parsing, batched prefill when supported,
+        // and prefix-cache reuse. PFlash / DFlash / VL / multi-GPU /
+        // sampler-budget scaffolding all bypass here.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_cohere2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
     if m.arch_id == 10 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
         // deepseek4 / lfm2moe short-circuits above. PFlash / DFlash / VL /
@@ -6424,6 +6499,7 @@ fn generate(
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
+                            tool_plan: String::new(),
                         });
                     }
                     v.push(hipfire_runtime::prompt_frame::Message {
@@ -6431,6 +6507,7 @@ fn generate(
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        tool_plan: String::new(),
                     });
                     synthesized = v;
                     &synthesized
@@ -9551,6 +9628,7 @@ fn generate_lfm2moe(
                                     content: sys.to_string(),
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
+                                    tool_plan: String::new(),
                                 });
                             }
                             v.push(hipfire_runtime::prompt_frame::Message {
@@ -9558,6 +9636,7 @@ fn generate_lfm2moe(
                                 content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                             synthesized = v;
                             &synthesized
@@ -9808,6 +9887,7 @@ fn generate_minimax(
                                     content: sys.to_string(),
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
+                                    tool_plan: String::new(),
                                 });
                             }
                             v.push(hipfire_runtime::prompt_frame::Message {
@@ -9815,6 +9895,7 @@ fn generate_minimax(
                                 content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
+                                tool_plan: String::new(),
                             });
                             synthesized = v;
                             &synthesized
@@ -10076,6 +10157,833 @@ fn generate_minimax(
     }
 
     m.seq_pos = m.minimax().unwrap().state.n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Parse a Cohere `<|START_ACTION|>` … `<|END_ACTION|>` body — a JSON array of
+/// `{tool_call_id, tool_name, parameters}` — into the daemon's tool_calls wire
+/// shape `[{name, arguments}]`. Tolerant of surrounding whitespace and trailing
+/// junk (slices from the first `[` to the last `]`); returns empty on any parse
+/// failure so a malformed/truncated action never crashes the stream.
+fn parse_cohere_action(buf: &str) -> Vec<serde_json::Value> {
+    let t = buf.trim();
+    let slice = match (t.find('['), t.rfind(']')) {
+        (Some(s), Some(e)) if e > s => &t[s..=e],
+        _ => return Vec::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(slice) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match parsed.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|tc| {
+            let name = tc.get("tool_name").and_then(|v| v.as_str())?;
+            let args = tc
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(serde_json::json!({"name": name, "arguments": args}))
+        })
+        .collect()
+}
+
+/// Snap a hallucinated/verbose tool name back to a real tool from the request.
+/// North (driven by a non-Cohere agentic harness) sometimes emits the tool name
+/// with descriptive words glued on, e.g. `bash immediate return command` instead
+/// of `bash`. Match by exact name, then leading whitespace token, then any
+/// whitespace token, preferring the longest known match; pass through unchanged
+/// if nothing matches (the client then reports an unknown tool, as before).
+fn snap_tool_name(name: &str, known: &[String]) -> String {
+    if known.is_empty() || known.iter().any(|k| k == name) {
+        return name.to_string();
+    }
+    let toks: Vec<&str> = name.split_whitespace().collect();
+    let mut best: Option<&str> = None;
+    for k in known {
+        let hit = toks.first() == Some(&k.as_str()) || toks.iter().any(|t| *t == k.as_str());
+        if hit && best.map_or(true, |b| k.len() > b.len()) {
+            best = Some(k.as_str());
+        }
+    }
+    best.map(String::from).unwrap_or_else(|| name.to_string())
+}
+
+/// Snap a glitched argument key (e.g. `path_`, `path_l`) to a real parameter of
+/// the tool. Match exact, then prefix either way, preferring the longest valid
+/// parameter; pass through unchanged if nothing matches.
+fn snap_param_name(key: &str, valid: &[String]) -> String {
+    if valid.is_empty() || valid.iter().any(|v| v == key) {
+        return key.to_string();
+    }
+    let mut best: Option<&str> = None;
+    for v in valid {
+        if key.starts_with(v.as_str()) || v.starts_with(key) {
+            if best.map_or(true, |b| v.len() > b.len()) {
+                best = Some(v.as_str());
+            }
+        }
+    }
+    best.map(String::from).unwrap_or_else(|| key.to_string())
+}
+
+/// Normalize each parsed tool_call against the request's tool schemas: snap the
+/// tool `name` to a known tool, then snap each argument key to a real parameter
+/// of that tool (`tool_params` maps tool name → its parameter names).
+fn snap_call_names(
+    calls: &mut [serde_json::Value],
+    known: &[String],
+    tool_params: &[(String, Vec<String>)],
+) {
+    for c in calls.iter_mut() {
+        let name = match c.get("name").and_then(|v| v.as_str()) {
+            Some(n) => snap_tool_name(n, known),
+            None => continue,
+        };
+        c["name"] = serde_json::Value::String(name.clone());
+        if let Some((_, valid)) = tool_params.iter().find(|(tn, _)| *tn == name) {
+            if !valid.is_empty() {
+                if let Some(args) = c.get_mut("arguments").and_then(|a| a.as_object_mut()) {
+                    for k in args.keys().cloned().collect::<Vec<_>>() {
+                        let sk = snap_param_name(&k, valid);
+                        if sk != k && !args.contains_key(&sk) {
+                            if let Some(v) = args.remove(&k) {
+                                args.insert(sk, v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod toolcall_robustness_tests {
+    use super::{parse_cohere_action, snap_call_names, snap_param_name, snap_tool_name};
+
+    #[test]
+    fn snaps_glitched_param_key() {
+        let valid = ["path".to_string()];
+        assert_eq!(snap_param_name("path_", &valid), "path"); // the retest glitch
+        assert_eq!(snap_param_name("path_l", &valid), "path");
+        assert_eq!(snap_param_name("path", &valid), "path"); // correct passes through
+        assert_eq!(snap_param_name("command", &valid), "command"); // no match → as-is
+    }
+
+    #[test]
+    fn snaps_verbose_hallucinated_name() {
+        let known = ["bash".to_string(), "read".to_string(), "write".to_string()];
+        // the exact failures observed driving North from the tb harness
+        assert_eq!(
+            snap_tool_name("bash immediate return command", &known),
+            "bash"
+        );
+        assert_eq!(snap_tool_name("bash immediate", &known), "bash");
+        // already-correct names pass through unchanged
+        assert_eq!(snap_tool_name("read", &known), "read");
+        // any-token match
+        assert_eq!(snap_tool_name("please write the file", &known), "write");
+        // no match → left as-is (client reports unknown, as before)
+        assert_eq!(snap_tool_name("frobnicate", &known), "frobnicate");
+        // prefer the longest known match
+        let k2 = ["bash".to_string(), "bash_script".to_string()];
+        assert_eq!(snap_tool_name("bash_script now", &k2), "bash_script");
+    }
+
+    #[test]
+    fn recovers_tool_call_written_as_text() {
+        // the exact JSON the model emitted as TEXT instead of <|START_ACTION|>
+        let text = r#"[
+    {"tool_call_id": "12", "tool_name": "read", "parameters": {"path": "/home/nick/CLionProjects/tb/.idea/.gitignore"}}
+]"#;
+        let mut calls = parse_cohere_action(text);
+        assert_eq!(calls.len(), 1);
+        snap_call_names(
+            &mut calls,
+            &["read".to_string()],
+            &[("read".to_string(), vec!["path".to_string()])],
+        );
+        assert_eq!(calls[0]["name"], "read");
+        assert_eq!(
+            calls[0]["arguments"]["path"],
+            "/home/nick/CLionProjects/tb/.idea/.gitignore"
+        );
+        // prose / incidental brackets are NOT mistaken for a tool call
+        assert!(parse_cohere_action("I'll read the file now.").is_empty());
+        assert!(parse_cohere_action("The result is [1, 2, 3].").is_empty());
+    }
+
+    #[test]
+    fn snaps_name_inside_recovered_call() {
+        let text =
+            r#"[{"tool_name": "bash immediate return command", "parameters": {"command": "ls"}}]"#;
+        let mut calls = parse_cohere_action(text);
+        snap_call_names(
+            &mut calls,
+            &["bash".to_string()],
+            &[("bash".to_string(), vec!["command".to_string()])],
+        );
+        assert_eq!(calls[0]["name"], "bash");
+    }
+}
+
+/// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
+/// `generate_minimax`, plus: BATCHED `forward_batch` prefill (≈9×, see the
+/// prefill block) and a Cohere agentic-marker state machine in the decode loop
+/// that suppresses the special markers, routes `<|START_THINKING|>` content to a
+/// reasoning channel, emits `<|START_TEXT|>` content as the visible answer, and
+/// parses `<|START_ACTION|>` blocks into `tool_calls` events. Decode is plain
+/// per-token `decode_step` (no hipGraph variant yet). Out of scope (NOT wired):
+/// spec-decode, MTP, grammar-constrained decoding, tool EXECUTION, repeat
+/// penalty, multi-GPU.
+#[allow(clippy::too_many_arguments)]
+fn generate_cohere2moe(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if m.cohere2moe().is_none() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"cohere2moe_config missing on arch_id=12 generate"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same two-path branch as the minimax / lfm2moe AR path) ──
+    // `primed_think` records whether the rendered prompt actually ended with a
+    // `<think>` generation-primer, so we only re-emit the opener (below) when
+    // the model truly begins inside the reasoning block. (A jinja render failure
+    // now returns an error rather than falling back, so we never reach decode
+    // with an off-distribution Plain frame.)
+    // Set on the sole surviving (successful-render) path; the failure paths in
+    // the block below return, so this needs no dead initializer.
+    let primed_think: bool;
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Cohere2-MoE / North-Mini-Code REQUIRES its embedded Jinja chat_template
+        // — its structural tokens are NOT ChatML (turns end with
+        // `<|END_OF_TURN_TOKEN|>`). The hand-rolled Plain ChatML frame emits
+        // `<|im_start|>`/`<|im_end|>` which this model never trained on,
+        // producing an off-distribution prompt that (a) decodes incoherently and
+        // (b) never matches across turns so the LCP prompt-cache is dead. Force
+        // jinja on (falls back to Plain only when the .hfq carries no template).
+        // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    if std::env::var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                        let ids = tokenizer.encode(&rendered);
+                        eprintln!(
+                            "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
+                            rendered.len(), ids.len(),
+                            &rendered[..rendered.len().min(400)],
+                            &rendered[rendered.len().saturating_sub(800)..],
+                        );
+                    }
+                    tokenizer.encode(&rendered)
+                }
+                Err(e) => {
+                    // North-Mini-Code's turns are NOT ChatML; a Plain frame emits
+                    // <|im_start|>/<|im_end|> the model never trained on → off-
+                    // distribution garbage that reads as a model-quality bug. Refuse
+                    // rather than silently serve it.
+                    eprintln!(
+                        "[daemon] cohere2moe jinja render failed ({e}) — refusing ChatML fallback"
+                    );
+                    emit_error_with_id(stdout, id, format!("cohere2moe jinja render failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            // cohere2moe REQUIRES its embedded jinja template (see above). When it
+            // is unavailable — HIPFIRE_JINJA_CHAT=0, or the .hfq carries no template
+            // — the only frame we could build is Plain ChatML, off-distribution for
+            // North. Refuse loudly instead of serving garbage.
+            let why = if !jinja_enabled {
+                "HIPFIRE_JINJA_CHAT=0 disables the required template"
+            } else {
+                "model .hfq carries no chat_template"
+            };
+            eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("cohere2moe requires its jinja chat template ({why})"),
+            );
+            return;
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.cohere2moe().unwrap().eos_tok;
+
+    // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
+    // FULL rendered conversation + generation would overflow. `prompt_ids` is
+    // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
+    // The KV cache holds `max_seq` positions. A prompt that itself exceeds that
+    // cannot be prefilled without writing PAST the cache — which previously
+    // produced silent GPU-memory corruption (degenerate/garbage output): the
+    // guard reset the cursor but then prefilled the oversized prompt anyway.
+    // Fix: prompt too long → clean error + free KV; prompt fits but generation
+    // would overflow → cap the token budget to the remaining slots so decode
+    // stops at capacity instead of writing OOB.
+    let max_seq = m.cohere2moe().unwrap().state.max_seq;
+    if prompt_ids.len() >= max_seq {
+        eprintln!(
+            "[daemon] arch_id=12 prompt {} >= max_seq {} — refusing (would OOB the KV cache)",
+            prompt_ids.len(),
+            max_seq,
+        );
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
+                prompt_ids.len(),
+                max_seq
+            ),
+        );
+        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        return;
+    }
+    // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
+    // cache. `max_tokens` is shadowed for the decode loop below.
+    let max_tokens = max_tokens.min(max_seq - prompt_ids.len());
+
+    // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
+    // Jinja-rendered conversation (the trained chat template). Cohere2-MoE is
+    // standard attention with no compound recurrent/compressed state, so KV
+    // positions ≥ lcp are simply overwritten by the new prefill and the stale
+    // tail is never attended. We rewind `n_tokens` to `lcp` and re-prefill the
+    // suffix; the reused prefix GROWS with the conversation.
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        // A usable common prefix that leaves at least one fresh token to prefill.
+        // `partial` is the divergence case (lcp < prior_len); lcp == prior_len is
+        // the degenerate pure-extension case (rewind is then a no-op).
+        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        let partial = lcp < prior_len;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
+                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                m.cohere2moe().unwrap().state.n_tokens,
+            );
+        }
+        if cache_hit {
+            // Rewind KV + token history to the common prefix. When lcp ==
+            // prior_len this is a no-op; when lcp < prior_len it discards the
+            // stale tail. The prefill loop below reads `state.n_tokens` as its
+            // base position, so n_tokens is the only KV state the rewind must
+            // touch (plus the mirror token history).
+            m.cohere2moe_mut().unwrap().state.n_tokens = lcp;
+            m.conversation_tokens.truncate(lcp);
+            m.seq_pos = lcp;
+            prompt_ids[lcp..].to_vec()
+        } else {
+            if prior_len > 0 {
+                let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+            }
+            prompt_ids.clone()
+        }
+    };
+
+    let t0 = Instant::now();
+
+    // ── Prefill: BATCHED `forward_batch` (~9× the per-token path) when the
+    // expert tier supports the indexed-MoE GEMV (MQ4/MQ6), chunked at 256 (the
+    // WMMA Q8-projection + grouped-MoE sweet spot). `forward_batch` writes KV at
+    // [start_pos..start_pos+b] and its attention covers the cached prefix
+    // [0..start_pos], so it composes with the prompt cache (start_pos = lcp).
+    // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
+    // The LAST forward's logits predict the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let b = m.cohere2moe_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
+            let mut i = 0;
+            while i < prefill_ids.len() {
+                let end = (i + 256).min(prefill_ids.len());
+                let start_pos = state.n_tokens;
+                match cohere2moe::forward::forward_batch(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    &prefill_ids[i..end],
+                    start_pos,
+                ) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("cohere2moe batched prefill failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
+                i = end;
+            }
+        } else {
+            let mut position = state.n_tokens as u32;
+            for &tok in &prefill_ids {
+                match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                position += 1;
+            }
+        }
+    }
+    for &tok in &prefill_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Re-emit a leading `<think>\n` opener into the token stream (display-only,
+    // not pushed to state) when the rendered prompt primed the assistant turn
+    // inside a reasoning block, so downstream `<think>` consumers see a
+    // well-formed block. No-op for templates that don't prime think.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": "<think>\n"}),
+        );
+        let _ = stdout.flush();
+    }
+
+    // ── Decode loop. Sample host-side from the running logits vector.
+    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
+    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
+    // don't lock-step (greedy is still deterministic). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
+    // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
+    // for its response (NOT the template's <|START_RESPONSE|>, which isn't a
+    // real special token here — verified empirically).
+    let (mk_think0, mk_think1, mk_text0, mk_text1, mk_act0, mk_act1) = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        // `encode` SPLITS these added tokens (they round-trip on DECODE only),
+        // so resolve content→id via special_token_id, with North-Mini-Code's
+        // fixed marker ids as the fallback.
+        let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
+        (
+            mark("<|START_THINKING|>", 255010),
+            mark("<|END_THINKING|>", 255011),
+            mark("<|START_TEXT|>", 255012),
+            mark("<|END_TEXT|>", 255013),
+            mark("<|START_ACTION|>", 255014),
+            mark("<|END_ACTION|>", 255015),
+        )
+    };
+    #[derive(PartialEq, Clone, Copy)]
+    enum Sec {
+        Pre,
+        Think,
+        Text,
+        Action,
+    }
+    let mut sec = Sec::Pre;
+    let mut action_buf = String::new();
+
+    // Degenerate-output guards. The long-context forward can collapse into a
+    // single-token attractor — observed in a Pi session where a ~30K-token
+    // prompt drove the model to emit `<PAD>` until the client aborted ~9.5 min
+    // later. These stop the decode promptly instead of hanging. They do NOT mask
+    // the underlying forward bug: a fired guard MEANS the forward produced
+    // garbage (long-context attention/KV) and is logged loudly so it's caught.
+    let pad_tok = m.tokenizer.as_ref().unwrap().special_token_id("<PAD>");
+    let mut last_tok: u32 = u32::MAX;
+    let mut repeat_run: usize = 0;
+    const REPEAT_GUARD: usize = 24; // consecutive-identical-token attractor
+
+    // Empty-turn guard: North sometimes emits <|END_THINKING|> then
+    // <|END_OF_TURN_TOKEN|> with no response or action, surfacing as a turn with
+    // reasoning only and empty visible content (the model ends after <think>
+    // without returning a result). Track whether anything visible (a text token
+    // or a tool_call) was produced; if EOS arrives before that, mask it and
+    // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
+    // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
+    let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let mut emitted_visible = false;
+    let mut eos_suppressions = 0usize;
+    const MAX_EOS_SUPPRESS: usize = 3;
+
+    // Think-budget force-close (mechanism #2): a heavy reasoner can out-think its
+    // token budget and return reasoning only (it hits max_tokens still inside
+    // <think>). Reserve room for an answer; honor an explicit max_think_tokens
+    // when the client sets one. When thinking reaches the budget with nothing
+    // visible yet, inject <|END_THINKING|> + <|START_TEXT|> so the model closes
+    // thinking and answers within the reserve instead of hitting the cap empty.
+    let think_reserve = (max_tokens / 4).clamp(64, 512).min(max_tokens / 2);
+    let think_budget = if max_think_tokens > 1 {
+        max_think_tokens.min(max_tokens.saturating_sub(think_reserve))
+    } else {
+        max_tokens.saturating_sub(think_reserve)
+    };
+    let mut think_count = 0usize;
+    let mut think_force_closed = false;
+    let mut forced_toks: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+
+    // Tool-calling robustness against non-Cohere harnesses: known tool names (to
+    // snap a verbose/hallucinated name back to the real tool) and a buffer of the
+    // visible output (to recover a tool call the model wrote as TEXT instead of
+    // via <|START_ACTION|>). Handles both {function:{name}} (OpenAI) and {name}.
+    let known_tools: Vec<String> = tools
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| t.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // name -> [parameter names], for snapping glitched argument keys.
+    let tool_params: Vec<(String, Vec<String>)> = tools
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    let f = t.get("function").unwrap_or(t);
+                    let name = f.get("name").and_then(|n| n.as_str())?.to_string();
+                    let params = f
+                        .get("parameters")
+                        .and_then(|p| p.get("properties"))
+                        .and_then(|p| p.as_object())
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    Some((name, params))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut tool_calls_emitted = false;
+    let mut vis_buf = String::new();
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        if empty_turn_guard
+            && forced_toks.is_empty()
+            && !think_force_closed
+            && !emitted_visible
+            && sec == Sec::Think
+            && think_count >= think_budget
+        {
+            eprintln!(
+                "[cohere2moe] think-budget guard: force-closing thinking at {think_count} think-tok \
+                 (budget {think_budget}, max_tokens {max_tokens}) — forcing an answer"
+            );
+            forced_toks.push_back(mk_think1);
+            forced_toks.push_back(mk_text0);
+            think_force_closed = true;
+        }
+        let mut next_tok = match forced_toks.pop_front() {
+            Some(t) => t,
+            None => deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng),
+        };
+        if next_tok == eos_tok {
+            if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
+                // Reasoning-only turn in progress — the model is ending after
+                // <think> with nothing visible. FORCE a <|START_TEXT|> continuation
+                // rather than re-sampling the EOS-masked distribution: re-sampling
+                // drew from the low-probability tail (where garbage / other-language
+                // tokens live), emitting a garbage first token that then derailed the
+                // turn (the "veen hier" / "ماعopilot" glitches). Injecting the marker
+                // puts the model in the response section so its NEXT token is sampled
+                // normally (same as the think-budget force-close, which is coherent).
+                // Close thinking first if we somehow took EOS while still inside it.
+                eos_suppressions += 1;
+                eprintln!(
+                    "[cohere2moe] empty-turn guard: forcing START_TEXT (EOS after thinking, no \
+                     visible output, #{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
+                );
+                if sec == Sec::Think {
+                    forced_toks.push_back(mk_think1);
+                }
+                forced_toks.push_back(mk_text0);
+                next_tok = forced_toks.pop_front().unwrap();
+            } else {
+                break;
+            }
+        }
+        // Degenerate-output guards (see above). `<PAD>` is never a valid
+        // generation token, and any token repeating REPEAT_GUARD× in a row is an
+        // attractor. Either means the forward collapsed — stop before emitting
+        // or decoding further, and log so the real bug isn't silently swallowed.
+        if Some(next_tok) == pad_tok {
+            eprintln!(
+                "[cohere2moe] DEGENERATE OUTPUT: <PAD> (id {next_tok}) emitted at gen {generated_count}, \
+                 ctx={} — forward collapse (long-context attention/KV bug); stopping",
+                m.cohere2moe().map(|b| b.state.n_tokens).unwrap_or(0)
+            );
+            break;
+        }
+        if next_tok == last_tok {
+            repeat_run += 1;
+            if repeat_run >= REPEAT_GUARD {
+                eprintln!(
+                    "[cohere2moe] DEGENERATE OUTPUT: token {next_tok} repeated {repeat_run}× at gen {generated_count} \
+                     (attractor) — forward collapse; stopping"
+                );
+                break;
+            }
+        } else {
+            last_tok = next_tok;
+            repeat_run = 1;
+        }
+        // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1). Was wired into
+        // the qwen35/deepseek4 generate loops but NOT here, so coherence_probe
+        // and token-id detectors silently saw nothing for north-mini-code.
+        emit_committed_event(
+            stdout,
+            id,
+            next_tok,
+            generated_count,
+            decode_t0.elapsed().as_millis() as u64,
+        );
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // Agentic-marker state machine — markers themselves are never emitted.
+        if next_tok == mk_think0 {
+            sec = Sec::Think;
+        } else if next_tok == mk_text0 {
+            sec = Sec::Text;
+        } else if next_tok == mk_act0 {
+            sec = Sec::Action;
+            action_buf.clear();
+        } else if next_tok == mk_think1 || next_tok == mk_text1 {
+            sec = Sec::Pre;
+        } else if next_tok == mk_act1 {
+            // End of an action block → parse the JSON array into tool_calls,
+            // snapping any verbose/hallucinated tool name to a real tool.
+            let mut calls = parse_cohere_action(&action_buf);
+            snap_call_names(&mut calls, &known_tools, &tool_params);
+            if !calls.is_empty() {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({"type": "tool_calls", "id": id, "calls": calls}),
+                );
+                let _ = stdout.flush();
+                emitted_visible = true;
+                tool_calls_emitted = true;
+            }
+            sec = Sec::Pre;
+        } else {
+            // Build the fragment through serde_json so arbitrary UTF-8 can't
+            // corrupt the JSONL line.
+            let frag = {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                tokenizer.decode(&[next_tok])
+            };
+            // Defense-in-depth: never emit a Cohere structural marker into
+            // visible output / the action buffer. The ID state machine above
+            // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
+            // special token the model might emit (START_OF_TURN_TOKEN,
+            // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
+            // `<|MARKER|>`. The token is still fed to decode_step below; only its
+            // emit is dropped, so a state-machine miss can never leak a marker.
+            let is_marker = frag.len() > 4
+                && frag.starts_with("<|")
+                && frag.ends_with("|>")
+                && frag[2..frag.len() - 2]
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_');
+            if is_marker {
+                // suppressed
+            } else {
+                match sec {
+                    Sec::Action => action_buf.push_str(&frag),
+                    Sec::Think => {
+                        // Reasoning channel: tagged so clients can fold it; the CLI
+                        // (ignoring unknown fields) shows it inline.
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true}),
+                        );
+                        let _ = stdout.flush();
+                        think_count += 1;
+                    }
+                    Sec::Text | Sec::Pre => {
+                        vis_buf.push_str(&frag);
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type": "token", "id": id, "text": frag}),
+                        );
+                        let _ = stdout.flush();
+                        emitted_visible = true;
+                    }
+                }
+            }
+        }
+
+        // Advance one step on the freshly sampled token (plain eager decode —
+        // no hipGraph variant on this arch yet).
+        let step = {
+            let b = m.cohere2moe_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            let position = state.n_tokens as u32;
+            cohere2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
+
+    // Tool-call-as-text recovery: if the model never emitted a <|START_ACTION|>
+    // block but wrote a tool-call JSON array (`[{tool_name, parameters}]`) as
+    // visible text — which happens when a non-Cohere harness primes it with a
+    // generic tool-call format — parse it out and emit it as a real tool_calls
+    // event so the harness can actually execute it.
+    if !tool_calls_emitted {
+        let mut recovered = parse_cohere_action(&vis_buf);
+        if !recovered.is_empty() {
+            snap_call_names(&mut recovered, &known_tools, &tool_params);
+            eprintln!(
+                "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
+                recovered.len()
+            );
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "tool_calls", "id": id, "calls": recovered}),
+            );
+            let _ = stdout.flush();
+        }
+    }
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);

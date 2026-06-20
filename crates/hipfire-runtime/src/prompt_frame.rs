@@ -518,6 +518,15 @@ pub struct Message {
     /// `is defined` against it don't see a misleading null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assistant-turn reasoning that preceded a tool call ("interleaved
+    /// thinking"). Rendered into the Cohere/North chat template's
+    /// `<|START_THINKING|>{{message.tool_plan}}<|END_THINKING|>` slot so a
+    /// multi-turn agentic flow preserves prior reasoning (per the
+    /// North-Mini-Code model card — "pass model-generated thinking to future
+    /// agentic steps/turns"). Empty for plain turns / non-thinking models;
+    /// always serialized (templates that don't reference it ignore the field).
+    #[serde(default)]
+    pub tool_plan: String,
 }
 
 /// One assistant-emitted tool call, attached to an assistant `Message`.
@@ -613,6 +622,7 @@ impl<'a> JinjaChatFrame<'a> {
                 content: sys.to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             });
         }
         messages.push(Message {
@@ -620,6 +630,7 @@ impl<'a> JinjaChatFrame<'a> {
             content: self.user.to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         });
         self.render_messages(&messages, None, None)
     }
@@ -648,11 +659,19 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja_contrib::pycompat::unknown_method_callback;
 
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Lenient undefined: undefined renders as "", is falsy in boolean
+        // context, and compares false — matching HuggingFace's jinja2 DEFAULT
+        // environment, which is what upstream chat templates are authored
+        // against. REQUIRED by Cohere2's tool_use template, which legitimately
+        // references optional fields the engine doesn't always populate
+        // (`message.tool_plan`, per-tool_call `id`, `{% if developer_preamble %}`,
+        // `{% if enable_citations %}`). Strict/SemiStrict raised on those and
+        // forced a fallback to the hand-rolled ChatML frame mid-conversation —
+        // the agentic multi-turn derail (the model then saw <|im_start|> markers
+        // and hallucinated). Complete templates (qwen, etc.) never hit undefined,
+        // so they render byte-identically; this only changes the
+        // previously-erroring paths, degrading them to HF-equivalent "".
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into
@@ -840,6 +859,7 @@ pub fn build_cached_history_jinja(
                     content: sentinel.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    tool_plan: String::new(),
                 });
                 continue;
             }
@@ -1304,6 +1324,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_plan: String::new(),
         };
         let r1 = t.encode(
             &frame
@@ -1327,12 +1348,14 @@ mod tests {
             content: "ok".to_string(),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_plan: String::new(),
         };
         let u2 = Message {
             role: Role::User,
             content: "again".to_string(),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_plan: String::new(),
         };
         let messages_t2 = vec![u1.clone(), a1, u2];
 
@@ -1398,6 +1421,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1460,12 +1484,14 @@ mod tests {
                 content: "be brief".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Assistant,
@@ -1475,12 +1501,14 @@ mod tests {
                     arguments: serde_json::json!({"city":"SF"}),
                 }],
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Tool,
                 content: "72F".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
+                tool_plan: String::new(),
             },
         ];
         let out = frame

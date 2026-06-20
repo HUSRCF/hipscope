@@ -306,7 +306,16 @@ Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
 or the forward pass MUST pass `./scripts/coherence-gate.sh` before
 committing. A pre-commit hook in `.githooks/pre-commit` runs it automatically
 when relevant files are staged. Spec-decode changes also trigger
-`./scripts/coherence-gate-dflash.sh` (see next section).
+`./scripts/coherence-gate-dflash.sh` (see next section). **Cohere2-MoE /
+North-Mini-Code (arch_id=12)** changes — the flash Q8 tile/reduce kernels, the
+`hipfire-arch-cohere2moe` forward, or the daemon's cohere2moe serve path — run
+the arch-specific `./scripts/coherence-gate-cohere2moe.sh`. It is a greedy
+matrix (capital / sheep-reasoning / one-line code / a >4096-token long-context
+row that exercises the sliding-window flash attention above the 4096 window AND
+the KV-capacity OOB guard) and hard-fails additionally on a Cohere `<|MARKER|>`
+leaking into visible output (decode marker-state-machine failure) or a daemon
+`{"type":"error"}` event. The Qwen `coherence-gate.sh` is ChatML/AWQ-specific
+and does NOT cover North.
 
 First-time setup (once per clone):
 ```

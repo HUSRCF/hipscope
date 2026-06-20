@@ -41,10 +41,19 @@
       "file": "deepseek-v4-flash.mq2lloyd",
       "size_gb": 82,
       "min_vram_gb": 96,
+      "sampling": { "temperature": 1.0, "top_p": 1.0 },
       "mtp": {
         "file": "deepseek-v4-flash-mtp.mq2lloyd"
       },
       "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code)."
+    },
+    "north-mini-code": {
+      "repo": "nwoolmer/hipfire-north-mini-code",
+      "file": "north-mini-code.mq4.hfq",
+      "size_gb": 16,
+      "min_vram_gb": 24,
+      "sampling": { "temperature": 1.0, "top_p": 0.95 },
+      "desc": "CohereLabs North-Mini-Code-1.0 (Cohere2-MoE, arch_id=12). MQ4 4-bit. Agentic code model: parallel block, sigmoid 128-expert MoE; <|START_THINKING|>/<|START_TEXT|>/<|START_ACTION|> tool-call format. ~880 tok/s prefill, ~37 tok/s decode on gfx1151."
     },
     "qwen3.6:35b-a3b": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
@@ -299,6 +308,7 @@
       "file": "lfm2.5-350m.mq4",
       "size_gb": 0.23,
       "min_vram_gb": 2,
+      "sampling": { "temperature": 0.1, "top_p": 0.8 },
       "desc": "LFM2.5 350M dense (MQ4, embedded chat template)"
     },
     "lfm2.5:8b-a1b": {
@@ -306,6 +316,7 @@
       "file": "lfm2.5-8b-a1b.mq4",
       "size_gb": 4.9,
       "min_vram_gb": 7,
+      "sampling": { "temperature": 0.1, "top_p": 0.8 },
       "desc": "LFM2.5 8B-A1B MoE (MQ4, jinja-validated)"
     },
     "lfm2.5:1.2b": {
@@ -313,6 +324,7 @@
       "file": "lfm2.5-1.2b-instruct.q8",
       "size_gb": 1.25,
       "min_vram_gb": 3,
+      "sampling": { "temperature": 0.1, "top_p": 0.8 },
       "desc": "LFM2.5 1.2B Instruct dense (Q8, embedded chat template)"
     },
     "lfm2.5:1.2b-thinking": {
@@ -320,6 +332,7 @@
       "file": "lfm2.5-1.2b-thinking.q8",
       "size_gb": 1.25,
       "min_vram_gb": 3,
+      "sampling": { "temperature": 0.1, "top_p": 0.8 },
       "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)"
     }
   },

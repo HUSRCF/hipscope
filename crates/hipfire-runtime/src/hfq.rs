@@ -292,10 +292,40 @@ impl HfqFile {
     /// failing renders fall back to the hand-rolled `prompt_frame` path.
     pub fn chat_template(&self) -> Option<String> {
         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
-        meta.get("tokenizer_config")?
-            .get("chat_template")?
-            .as_str()
-            .map(|s| s.to_string())
+        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
+        // Plain-string form: return it directly.
+        if let Some(s) = ct.as_str() {
+            return Some(s.to_string());
+        }
+        // List form (Cohere-style {name, template}): fall back to the "default"
+        // entry (else the first) so we don't return None on the list shape.
+        self.chat_template_named("default")
+    }
+
+    /// Select a named chat template. Cohere-style models ship `chat_template`
+    /// as a LIST of {name, template}; older models ship a plain string. Returns
+    /// the requested name, else the "default" entry, else the first; for a plain
+    /// string, returns it directly.
+    pub fn chat_template_named(&self, name: &str) -> Option<String> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
+        if let Some(s) = ct.as_str() {
+            return Some(s.to_string());
+        }
+        let arr = ct.as_array()?;
+        let pick = |want: &str| {
+            arr.iter()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(want))
+                .and_then(|t| t.get("template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        pick(name).or_else(|| pick("default")).or_else(|| {
+            arr.first()
+                .and_then(|t| t.get("template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
     }
 
     /// Detect whether this .hfq's retained source provenance indicates a

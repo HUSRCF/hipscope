@@ -7,6 +7,7 @@
 mod carriers;
 pub use carriers::*;
 
+use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -73,6 +74,11 @@ const REGISTRY: &[&dyn Carrier] = &[
         arch_id: 11,
         name: "lfm2moe",
         load: load_lfm2moe,
+    },
+    &HfqCarrier {
+        arch_id: 12,
+        name: "cohere2moe",
+        load: load_cohere2moe,
     },
 ];
 
@@ -243,6 +249,7 @@ pub enum ModelState {
     Llama(hipfire_arch_llama::LlamaBundle),
     Lfm2Moe(Lfm2MoeBundle),
     Minimax(MiniMaxBundle),
+    Cohere2Moe(Cohere2MoeBundle),
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. `eos_tok` is resolved at load time and
@@ -259,6 +266,14 @@ pub struct MiniMaxBundle {
     pub config: minimax::MiniMaxConfig,
     pub weights: minimax::MiniMaxWeights,
     pub state: minimax::MiniMaxState,
+    pub eos_tok: u32,
+}
+
+/// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle.
+pub struct Cohere2MoeBundle {
+    pub config: cohere2moe::Cohere2MoeConfig,
+    pub weights: cohere2moe::Cohere2MoeWeights,
+    pub state: cohere2moe::Cohere2MoeState,
     pub eos_tok: u32,
 }
 
@@ -395,6 +410,21 @@ impl LoadedModel {
         }
     }
 
+    /// Cohere2-MoE bundle if this model is arch_id=12, else None.
+    pub fn cohere2moe(&self) -> Option<&Cohere2MoeBundle> {
+        match &self.state {
+            Some(ModelState::Cohere2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
+        match &mut self.state {
+            Some(ModelState::Cohere2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
     /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
@@ -498,6 +528,20 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
                 return Some(t);
             }
             return Some(LFM2_TEMPLATE.to_string());
+        }
+        12 => {
+            if let Some(t) = hfq.chat_template_named("tool_use") {
+                return Some(
+                    t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
+                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
+                        .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
+                        .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
+                        .replace(
+                            "{{ tc['function']['arguments']|tojson }}",
+                            "{{ tc.arguments|tojson }}",
+                        ),
+                );
+            }
         }
         _ => {}
     }
@@ -890,6 +934,51 @@ fn load_lfm2moe(
     })
 }
 
+fn load_cohere2moe(
+    mut hfq: HfqFile,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    path: &str,
+) -> Result<LoadedModel, String> {
+    use hipfire_runtime::arch::Architecture;
+    let config = <cohere2moe::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
+    let weights = <cohere2moe::Cohere2Moe as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+    let state = cohere2moe::Cohere2MoeState::new_with_max_seq(gpu, &config, max_seq)
+        .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
+    let eos_tok: u32 = {
+        let try_one = |s: &str| -> Option<u32> {
+            let ids = tokenizer.encode(s);
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
+        };
+        try_one("<|END_OF_TURN_TOKEN|>")
+            .or_else(|| try_one("</s>"))
+            .or_else(|| try_one("<|endoftext|>"))
+            .unwrap_or(255001)
+    };
+    let chat_template = resolve_chat_template(&hfq, path);
+    Ok(LoadedModel {
+        state: Some(ModelState::Cohere2Moe(Cohere2MoeBundle {
+            config,
+            weights,
+            state,
+            eos_tok,
+        })),
+        ..LoadedModel::skeleton(
+            hfq.arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
+}
+
 fn load_minimax(
     mut hfq: HfqFile,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -1188,6 +1277,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             | Some(ModelState::Llama(_))
             | Some(ModelState::Lfm2Moe(_))
             | Some(ModelState::Minimax(_))
+            | Some(ModelState::Cohere2Moe(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1240,6 +1330,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
             }
             ModelState::Minimax(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Cohere2Moe(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
@@ -1320,6 +1414,7 @@ mod registry_tests {
             (9, false, "deepseek4"),
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
+            (12, false, "cohere2moe"),
         ];
         for &(id, is_dir, want) in cases {
             let got: Vec<&str> = REGISTRY
