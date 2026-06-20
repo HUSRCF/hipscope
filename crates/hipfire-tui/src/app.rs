@@ -1290,9 +1290,9 @@ impl App {
                     ChatEvent::Error(err) => {
                         // finalize drops the trailing empty assistant so a failed
                         // request doesn't read as a blank reply; surface the cause.
-                        if let Some((stats, secs)) = self.chat.finalize_generation() {
-                            self.log_request(stats, secs);
-                        }
+                        // An errored partial is NOT logged to the inspector
+                        // (incomplete + misleading tok/s, same rule as abort).
+                        let _ = self.chat.finalize_generation();
                         self.toast_error(format!("chat error: {err}"));
                         self.chat.status = format!("error: {err}");
                         self.chat.sending = false;
@@ -1870,6 +1870,35 @@ mod tests {
         assert_eq!(app.request_log.len(), 1, "completed request is logged");
         assert_eq!(app.request_log[0].model, "qwen3.5:9b");
         assert_eq!(app.request_log[0].tokens, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn errored_request_is_not_logged() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        app.chat.gen_model = "qwen3.5:9b".into();
+        tx.send(ChatEvent::Delta("partial".into())).unwrap();
+        tx.send(ChatEvent::Error("boom".into())).unwrap();
+        app.drain_chat_events();
+        assert!(
+            app.request_log.is_empty(),
+            "an errored partial is not logged as a request"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

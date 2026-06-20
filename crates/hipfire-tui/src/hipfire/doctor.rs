@@ -12,10 +12,17 @@
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::hipfire::cli_command;
+use crate::hipfire::dashboard::{run_bounded, RocmSmiRun};
+
+/// Hard wall-clock bound on `hipfire diag` — it spawns the daemon (GPU init), so
+/// it is much heavier than rocm-smi, but a hung daemon must not leak the worker
+/// thread or an orphan holding VRAM forever.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One diagnostic line: a name, whether it passed, and a short detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,30 +62,32 @@ fn run_inner() -> DoctorReport {
             }
         }
     };
-    match cmd.arg("diag").arg("--json").output() {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            // The JSON is the last non-empty line (diag may log warnings first).
-            match stdout.lines().rev().find(|l| l.trim_start().starts_with('{')) {
-                Some(json) => parse_diag_json(json),
-                None => DoctorReport {
-                    checks: Vec::new(),
-                    error: Some(format!(
-                        "diag produced no JSON: {}",
-                        String::from_utf8_lossy(&o.stderr)
-                            .lines()
-                            .next_back()
-                            .unwrap_or("")
-                            .trim()
-                    )),
-                },
-            }
-        }
-        Err(e) => DoctorReport {
-            checks: Vec::new(),
-            error: Some(format!("diag spawn failed: {e}")),
+    cmd.arg("diag").arg("--json");
+    let err = |msg: String| DoctorReport {
+        checks: Vec::new(),
+        error: Some(msg),
+    };
+    match run_bounded(cmd, DOCTOR_TIMEOUT) {
+        RocmSmiRun::Output(stdout) => match extract_json_object(&stdout) {
+            Some(json) => parse_diag_json(json),
+            None => err("diag produced no JSON object".into()),
         },
+        RocmSmiRun::NotFound => err("bun not found on PATH".into()),
+        RocmSmiRun::TimedOut => err(format!(
+            "diag timed out after {}s (killed)",
+            DOCTOR_TIMEOUT.as_secs()
+        )),
+        RocmSmiRun::SpawnError(e) => err(format!("diag spawn failed: {e}")),
     }
+}
+
+/// Extract the top-level JSON object — first `{` to last `}` — from diag's
+/// stdout, tolerating leading log lines AND pretty multi-line formatting (the
+/// CLI emits `JSON.stringify(..., null, 2)`, so a single-line scan would miss it).
+fn extract_json_object(stdout: &str) -> Option<&str> {
+    let start = stdout.find('{')?;
+    let end = stdout.rfind('}')?;
+    (end >= start).then(|| &stdout[start..=end])
 }
 
 fn check(name: &str, ok: bool, detail: impl Into<String>) -> DoctorCheck {
@@ -132,12 +141,10 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
         hipcc.unwrap_or("not found"),
     ));
 
-    let daemon = v["daemon"].as_str();
-    checks.push(check(
-        "daemon binary",
-        daemon == Some("found"),
-        daemon.unwrap_or("missing"),
-    ));
+    // Loose match: any non-empty string means a daemon was located (tolerates a
+    // future "present"/path value); null/empty is the only failure.
+    let daemon = v["daemon"].as_str().filter(|s| !s.is_empty());
+    checks.push(check("daemon binary", daemon.is_some(), daemon.unwrap_or("missing")));
 
     let n_gpus = v["gpus"].as_array().map(|a| a.len()).unwrap_or(0);
     checks.push(check(
@@ -155,12 +162,17 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
 
     // Live GPU probe (daemon one-shot): ok iff an arch came back with no error.
     let gpu = &v["gpu"];
-    let gpu_err = gpu.get("error").and_then(Value::as_str);
-    let gpu_arch = gpu.get("arch").and_then(Value::as_str);
-    let (gpu_ok, gpu_detail) = match (gpu_err, gpu_arch) {
-        (Some(e), _) => (false, e.to_string()),
-        (None, Some(arch)) => (true, arch.to_string()),
-        (None, None) => (false, "no live probe".to_string()),
+    let (gpu_ok, gpu_detail) = if let Some(s) = gpu.as_str() {
+        // Non-object scalar (e.g. "disabled") — surface it, not a generic message.
+        (false, s.to_string())
+    } else {
+        let gpu_err = gpu.get("error").and_then(Value::as_str);
+        let gpu_arch = gpu.get("arch").and_then(Value::as_str);
+        match (gpu_err, gpu_arch) {
+            (Some(e), _) => (false, e.to_string()),
+            (None, Some(arch)) => (true, arch.to_string()),
+            (None, None) => (false, "no live probe".to_string()),
+        }
     };
     checks.push(check("live GPU probe", gpu_ok, gpu_detail));
 
@@ -227,5 +239,29 @@ mod tests {
         let r = parse_diag_json("not json");
         assert!(r.error.is_some());
         assert!(r.checks.is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_handles_pretty_multiline_with_log_prefix() {
+        // The CLI emits JSON.stringify(.., null, 2) — pretty + possibly after logs.
+        let stdout = "warming up\n{\n  \"platform\": \"linux\",\n  \"kfd\": true\n}\n";
+        let json = extract_json_object(stdout).expect("object extracted");
+        let r = parse_diag_json(json);
+        assert!(r.error.is_none(), "pretty multi-line JSON parses");
+        assert!(r.checks.iter().any(|c| c.name == "/dev/kfd" && c.ok));
+        // No object at all -> None.
+        assert!(extract_json_object("no braces here").is_none());
+    }
+
+    #[test]
+    fn parse_diag_daemon_loose_and_gpu_scalar() {
+        // A non-"found" daemon string still counts as located; a scalar gpu is
+        // surfaced verbatim rather than a generic message.
+        let body = r#"{"daemon": "/home/u/.hipfire/bin/daemon", "gpu": "disabled"}"#;
+        let r = parse_diag_json(body);
+        let c = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap();
+        assert!(c("daemon binary").ok, "any non-empty daemon string is found");
+        assert!(!c("live GPU probe").ok);
+        assert_eq!(c("live GPU probe").detail, "disabled");
     }
 }

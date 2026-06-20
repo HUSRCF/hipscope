@@ -545,9 +545,9 @@ fn get_text(agent: &ureq::Agent, url: &str) -> Option<String> {
     }
 }
 
-/// Outcome of a bounded rocm-smi run. Separated from parsing so the timeout /
-/// kill path stays testable in isolation.
-enum RocmSmiRun {
+/// Outcome of a bounded subprocess run. Separated from parsing so the timeout /
+/// kill path stays testable in isolation. Shared with the doctor module.
+pub(crate) enum RocmSmiRun {
     /// Process exited within the deadline; carries captured stdout.
     Output(String),
     /// Binary not present on PATH.
@@ -618,23 +618,25 @@ pub fn parse_rocm_smi_load_json(body: &str) -> LoadState {
     cards.sort_by_key(|(idx, _)| *idx);
     let mut loads = Vec::new();
     for (idx, card) in cards {
-        let util = field_f64_containing(card, &["GPU use (%)", "GPU use"]);
+        // Specific needles only (no bare "Power"/"Temperature" fallback, which
+        // could latch onto a cap/sensor key); each reading is range-validated so
+        // an implausible value becomes an honest None.
+        let util = field_f64_containing(card, &["GPU use (%)", "GPU use"])
+            .filter(|u| (0.0..=100.0).contains(u));
         let temp = field_f64_containing(
             card,
-            &[
-                "Temperature (Sensor edge)",
-                "Temperature (Sensor junction)",
-                "Temperature",
-            ],
-        );
+            &["Temperature (Sensor edge)", "Temperature (Sensor junction)"],
+        )
+        .filter(|t| (0.0..=200.0).contains(t));
         let power = field_f64_containing(
             card,
             &[
                 "Average Graphics Package Power",
                 "Current Socket Graphics Package Power",
-                "Power",
+                "Current Graphics Package Power",
             ],
-        );
+        )
+        .filter(|p| (0.0..=2000.0).contains(p));
         if util.is_some() || temp.is_some() || power.is_some() {
             loads.push(GpuLoad {
                 index: idx,
@@ -652,18 +654,27 @@ pub fn parse_rocm_smi_load_json(body: &str) -> LoadState {
 }
 
 /// First card field whose key CONTAINS one of `needles` (tried in order),
-/// parsed as f64 (rocm-smi emits stringified numbers, occasionally raw numbers).
+/// parsed as a FINITE f64. rocm-smi emits numbers as strings, and
+/// `f64::from_str` accepts "NaN"/"inf" (which rocm-smi reports for unsupported
+/// sensors on some SKUs) — we reject those so a non-finite reading falls through
+/// to an honest `None` rather than rendering "NaN% util". Cap / Max / Min
+/// sentinel keys are skipped so a "Power Cap" can't be mistaken for live draw.
 fn field_f64_containing(card: &Value, needles: &[&str]) -> Option<f64> {
     let obj = card.as_object()?;
     for needle in needles {
         for (k, val) in obj {
+            if k.contains("Cap") || k.contains("Max") || k.contains("Min") {
+                continue;
+            }
             if k.contains(needle) {
                 let parsed = val
                     .as_str()
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .or_else(|| val.as_f64());
                 if let Some(n) = parsed {
-                    return Some(n);
+                    if n.is_finite() {
+                        return Some(n);
+                    }
                 }
             }
         }
@@ -675,7 +686,7 @@ fn field_f64_containing(card: &Value, needles: &[&str]) -> Option<f64> {
 /// `try_wait`; on deadline it `kill()`s and reaps the child so no zombie leaks.
 /// Generic over the command so the timeout/kill path is unit-testable with a
 /// stand-in (`sleep`) without depending on rocm-smi.
-fn run_bounded(mut cmd: Command, timeout: Duration) -> RocmSmiRun {
+pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> RocmSmiRun {
     let mut child = match cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1040,6 +1051,41 @@ mod tests {
             parse_rocm_smi_load_json("not json"),
             LoadState::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn parse_load_json_rejects_nonfinite_and_cap_keys() {
+        // rocm-smi reports "NaN"/"inf" for unsupported sensors on some SKUs;
+        // f64::from_str accepts them, so they must be rejected to honest None.
+        let body = r#"{"card0": {
+            "GPU use (%)": "NaN",
+            "Average Graphics Package Power (W)": "inf",
+            "Temperature (Sensor edge) (C)": "45.0"
+        }}"#;
+        match parse_rocm_smi_load_json(body) {
+            LoadState::Available(loads) => {
+                assert_eq!(loads[0].util_pct, None, "NaN util rejected");
+                assert_eq!(loads[0].power_w, None, "inf power rejected");
+                assert_eq!(loads[0].temp_c, Some(45.0), "finite temp kept");
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+        // A power CAP emitted before the draw key must not be read as live power.
+        let body2 = r#"{"card0": {
+            "Max Graphics Package Power (W)": "327",
+            "Average Graphics Package Power (W)": "120"
+        }}"#;
+        match parse_rocm_smi_load_json(body2) {
+            LoadState::Available(loads) => {
+                assert_eq!(loads[0].power_w, Some(120.0), "live draw, not the cap");
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+        // Out-of-range util (sensor sentinel) -> None.
+        match parse_rocm_smi_load_json(r#"{"card0": {"GPU use (%)": "65535"}}"#) {
+            LoadState::Unavailable(_) => {}
+            LoadState::Available(loads) => assert_eq!(loads[0].util_pct, None),
+        }
     }
 
     #[test]
