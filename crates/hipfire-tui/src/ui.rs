@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
     Frame,
 };
 
@@ -199,7 +199,13 @@ fn footer_hints(app: &App) -> String {
             // Chat owns q/r as text input, so it has its own exit hints.
             "Enter send · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
         }
-        Tab::Models => format!("Up/Down select · Enter/Right expand · Enter select · Left fold · r refresh · {global}"),
+        Tab::Models => {
+            if app.confirm_delete.is_some() {
+                "Delete this model?  y confirm · n / Esc cancel".to_string()
+            } else {
+                format!("Up/Down select · Enter open/expand · p pull · d delete · r refresh · {global}")
+            }
+        }
         Tab::Settings => {
             if app.settings_edit.is_some() {
                 "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
@@ -573,9 +579,21 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
+    // An in-flight pull or an armed delete-confirm gets a 3-row status strip at
+    // the bottom; otherwise the list takes the full height.
+    let show_status = app.pull.is_some() || app.confirm_delete.is_some();
+    let constraints: Vec<Constraint> = if show_status {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ]
+    } else {
+        vec![Constraint::Length(3), Constraint::Min(8)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .constraints(constraints)
         .split(pad(area, 1, 0));
     let summary = format!(
         "active: {}    {} downloaded / {} available    registry: {}    aliases: {}",
@@ -717,6 +735,47 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     .block(block("Registry browser"))
     .style(Style::default().bg(PANEL));
     frame.render_widget(table, chunks[1]);
+
+    if show_status {
+        draw_models_status(frame, app, chunks[2]);
+    }
+}
+
+/// The Models-tab bottom strip: a delete-confirm prompt (takes priority) or the
+/// in-flight pull's progress gauge (parsed percent + the raw CLI line label).
+fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(tag) = &app.confirm_delete {
+        frame.render_widget(
+            Paragraph::new(format!("Delete {tag}?  press y to confirm, n / Esc to cancel"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(RED))
+                        .title(" Confirm delete "),
+                )
+                .style(Style::default().fg(TEXT).bg(PANEL)),
+            area,
+        );
+    } else if let Some(job) = &app.pull {
+        let ratio = job.percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
+        let label = if job.line.is_empty() {
+            format!("pulling {}\u{2026}", job.tag)
+        } else {
+            job.line.clone()
+        };
+        frame.render_widget(
+            Gauge::default()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Pulling {} ", job.tag)),
+                )
+                .gauge_style(Style::default().fg(GREEN).bg(PANEL_2))
+                .ratio(ratio)
+                .label(label),
+            area,
+        );
+    }
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -1288,5 +1347,29 @@ mod render_tests {
         assert!(text.contains("s start"), "serve start control in footer");
         assert!(text.contains("x stop"), "serve stop control in footer");
         assert!(text.contains("R restart"), "serve restart control in footer");
+    }
+
+    #[test]
+    fn models_confirm_delete_prompt_renders() {
+        let text = render_with(|app| {
+            app.tab = Tab::Models;
+            app.confirm_delete = Some("qwen3.5:9b".into());
+        });
+        assert!(text.contains("Confirm delete"), "confirm prompt title");
+        assert!(text.contains("y to confirm"), "y/n guidance shown");
+    }
+
+    #[test]
+    fn models_pull_progress_gauge_renders() {
+        let text = render_with(|app| {
+            app.tab = Tab::Models;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.inject_pull("qwen3.5:9b".into(), rx);
+            let job = app.pull.as_mut().unwrap();
+            job.percent = Some(37.0);
+            job.line = "[bar] 37.0% 8 MB/s".into();
+        });
+        assert!(text.contains("Pulling"), "gauge title shows the model");
+        assert!(text.contains("37"), "percent in the gauge label");
     }
 }

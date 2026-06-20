@@ -147,6 +147,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         terminal.draw(|frame| ui::draw(frame, app))?;
         app.drain_chat_events();
         app.drain_serve_command();
+        app.drain_pull();
+        app.drain_rm();
 
         if event::poll(std::time::Duration::from_millis(80))? {
             match event::read()? {
@@ -200,6 +202,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             // While editing a settings value, Esc cancels the edit instead of
             // quitting / blurring chat.
             if app.tab == app::Tab::Settings && app.settings_edit.is_some() {
+                app.handle_tab_key(key);
+            } else if app.tab == app::Tab::Models && app.confirm_delete.is_some() {
+                // Esc cancels an armed delete confirmation instead of quitting.
                 app.handle_tab_key(key);
             } else if app.chat.sending {
                 app.chat.request_abort();

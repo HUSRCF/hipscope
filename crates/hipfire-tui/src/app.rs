@@ -19,6 +19,7 @@ use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     config::ConfigState,
     dashboard::{Dashboard, DashboardWorker},
+    model_actions::{self, PullEvent, RmOutcome},
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
     status::{start_background_serve, StatusState},
@@ -95,6 +96,15 @@ impl Tab {
     }
 }
 
+/// In-flight model download. `percent`/`line` are refreshed each frame from the
+/// background pull worker's progress events.
+pub struct PullJob {
+    pub tag: String,
+    rx: Receiver<PullEvent>,
+    pub percent: Option<f64>,
+    pub line: String,
+}
+
 pub struct App {
     pub paths: HipfirePaths,
     pub config: ConfigState,
@@ -129,6 +139,13 @@ pub struct App {
     /// Label ("start"/"stop"/"restart") of the in-flight serve command, for the
     /// status line; empty when idle.
     pub serve_cmd_label: String,
+    /// In-flight model pull (Models tab). `None` when idle.
+    pub pull: Option<PullJob>,
+    /// In-flight `rm` command receiver (Models tab).
+    rm_cmd: Option<Receiver<RmOutcome>>,
+    /// Model tag awaiting a y/n delete confirmation; the Models tab shows a
+    /// prompt while this is `Some`.
+    pub confirm_delete: Option<String>,
     /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
     /// thread. Dropped (joined) when the App is dropped.
     dashboard_worker: DashboardWorker,
@@ -170,8 +187,118 @@ impl App {
             tab_row_y: 0,
             serve_cmd: None,
             serve_cmd_label: String::new(),
+            pull: None,
+            rm_cmd: None,
+            confirm_delete: None,
             dashboard_worker,
         })
+    }
+
+    /// Start downloading `tag` on a background worker (Models tab `p`). No-op
+    /// (with a toast) if a pull is already running or the model is already local.
+    fn start_pull(&mut self, tag: String) {
+        if self.pull.is_some() {
+            self.toast_info("a pull is already running");
+            return;
+        }
+        let rx = model_actions::pull(tag.clone());
+        self.toast_info(format!("pulling {tag}\u{2026}"));
+        self.pull = Some(PullJob {
+            tag,
+            rx,
+            percent: None,
+            line: String::new(),
+        });
+    }
+
+    /// Consume pull progress/result events (called each frame). On completion it
+    /// reloads the registry so the new local model appears.
+    pub fn drain_pull(&mut self) {
+        let mut finished: Option<Result<String, String>> = None;
+        if let Some(job) = &mut self.pull {
+            loop {
+                match job.rx.try_recv() {
+                    Ok(PullEvent::Progress { percent, line }) => {
+                        job.percent = percent;
+                        job.line = line;
+                    }
+                    Ok(PullEvent::Done) => {
+                        finished = Some(Ok(job.tag.clone()));
+                        break;
+                    }
+                    Ok(PullEvent::Failed(err)) => {
+                        finished = Some(Err(format!("pull {}: {err}", job.tag)));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err(format!("pull {}: worker exited", job.tag)));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(result) = finished {
+            self.pull = None;
+            match result {
+                Ok(tag) => {
+                    self.toast_info(format!("pulled {tag}"));
+                    self.reload(); // surface the new local model
+                }
+                Err(msg) => self.toast_error(msg),
+            }
+        }
+    }
+
+    /// Request deletion of the selected local model — arms the y/n confirm.
+    fn request_delete(&mut self) {
+        match self.registry.selected_model() {
+            Some((tag, true)) => self.confirm_delete = Some(tag),
+            Some((_, false)) => self.toast_info("that model isn't downloaded"),
+            None => self.toast_info("select a model row to delete"),
+        }
+    }
+
+    /// Confirm the armed delete: spawn `rm <tag> --yes` and disarm.
+    fn confirm_delete_yes(&mut self) {
+        if let Some(tag) = self.confirm_delete.take() {
+            if self.rm_cmd.is_some() {
+                self.toast_info("a delete is already running");
+                return;
+            }
+            self.rm_cmd = Some(model_actions::remove(tag.clone()));
+            self.toast_info(format!("deleting {tag}\u{2026}"));
+        }
+    }
+
+    /// Cancel the armed delete.
+    fn cancel_delete(&mut self) {
+        if self.confirm_delete.take().is_some() {
+            self.toast_info("delete cancelled");
+        }
+    }
+
+    /// Consume the rm outcome if it has arrived (called each frame). Reloads the
+    /// registry on success so the removed model drops out of the list.
+    pub fn drain_rm(&mut self) {
+        let outcome = match &self.rm_cmd {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => o,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    RmOutcome::Failed("rm worker exited".into())
+                }
+            },
+            None => return,
+        };
+        self.rm_cmd = None;
+        match outcome {
+            RmOutcome::Ok(msg) => {
+                self.toast_info(msg);
+                self.reload();
+            }
+            RmOutcome::Failed(msg) => self.toast_error(msg),
+        }
     }
 
     /// True while a serve lifecycle command (start/stop/restart) is running.
@@ -232,6 +359,17 @@ impl App {
     pub fn inject_serve_cmd(&mut self, rx: Receiver<ServeOutcome>) {
         self.serve_cmd = Some(rx);
         self.serve_cmd_label = "test".into();
+    }
+
+    /// Test seam: inject an in-flight pull without spawning a real process.
+    #[cfg(test)]
+    pub fn inject_pull(&mut self, tag: String, rx: Receiver<PullEvent>) {
+        self.pull = Some(PullJob {
+            tag,
+            rx,
+            percent: None,
+            line: String::new(),
+        });
     }
 
     /// Persist the current session UI state (active tab + expanded Models
@@ -355,6 +493,15 @@ impl App {
     }
 
     fn handle_models_key(&mut self, key: KeyEvent) {
+        // A delete confirmation is modal: intercept y / n / Esc.
+        if self.confirm_delete.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_delete_yes(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_delete(),
+                _ => {}
+            }
+            return;
+        }
         let len = self.registry.visible_len().max(1);
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
@@ -411,6 +558,12 @@ impl App {
                     self.last_reload = format!("collapsed {name}");
                 }
             }
+            KeyCode::Char('p') => match self.registry.selected_model() {
+                Some((tag, false)) => self.start_pull(tag),
+                Some((_, true)) => self.toast_info("already downloaded"),
+                None => self.toast_info("select a model row to pull"),
+            },
+            KeyCode::Char('d') => self.request_delete(),
             _ => {}
         }
     }
@@ -996,6 +1149,42 @@ mod tests {
         app.drain_serve_command();
         assert!(!app.serve_cmd_running(), "outcome clears the in-flight command");
         assert!(app.toast.is_some(), "outcome raises a toast");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_confirm_can_be_cancelled() {
+        let (mut app, dir) = test_app();
+        app.confirm_delete = Some("qwen3.5:9b".into());
+        app.cancel_delete();
+        assert!(app.confirm_delete.is_none(), "Esc/n clears the armed delete");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_pull_and_rm_idle_are_noops() {
+        let (mut app, dir) = test_app();
+        app.drain_pull();
+        app.drain_rm();
+        assert!(app.toast.is_none(), "no in-flight pull/rm -> no toast");
+        assert!(app.pull.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_pull_updates_progress() {
+        let (mut app, dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(PullEvent::Progress {
+            percent: Some(42.0),
+            line: "[bar] 42.0% 8 MB/s".into(),
+        })
+        .unwrap();
+        app.inject_pull("qwen3.5:9b".into(), rx);
+        app.drain_pull();
+        let job = app.pull.as_ref().expect("pull stays active during progress");
+        assert_eq!(job.percent, Some(42.0));
+        assert_eq!(job.line, "[bar] 42.0% 8 MB/s");
         let _ = std::fs::remove_dir_all(dir);
     }
 
