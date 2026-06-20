@@ -5,6 +5,7 @@
 mod app;
 mod hipfire;
 mod ui;
+mod ui_chat;
 
 use std::{io, panic};
 

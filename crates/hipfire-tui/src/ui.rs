@@ -547,15 +547,22 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             "Chat streams from your local hipfire serve (OpenAI-compatible).",
         ));
     } else {
+        // Fenced ``` code blocks get a distinct background; comments + inline
+        // `code` are tinted. Rendering is isolated in `ui_chat`.
+        let code_theme = crate::ui_chat::CodeTheme {
+            text: TEXT,
+            code_fg: ACCENT,
+            code_bg: PANEL_2,
+            comment: MUTED,
+            fence: YELLOW,
+        };
         for msg in &app.chat.messages {
             let color = if msg.role == "user" { ACCENT } else { GREEN };
             lines.push(Line::from(Span::styled(
                 format!("{}:", msg.role),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
-            for line in msg.content.lines() {
-                lines.push(Line::from(line.to_string()));
-            }
+            lines.extend(crate::ui_chat::render_body(&msg.content, &code_theme));
             lines.push(Line::from(""));
         }
     }
@@ -1455,6 +1462,19 @@ mod render_tests {
             };
         });
         assert!(text.contains("No serve.log yet"), "honest missing-state guidance");
+    }
+
+    #[test]
+    fn chat_renders_fenced_code_block() {
+        let text = render_with(|app| {
+            app.tab = Tab::Chat;
+            app.chat.messages = vec![crate::hipfire::chat::ChatMessage {
+                role: "assistant".into(),
+                content: "here:\n```rust\nlet x = 1;\n```".into(),
+            }];
+        });
+        assert!(text.contains("let x = 1;"), "code line is rendered");
+        assert!(text.contains("rust"), "fence language label is shown");
     }
 
     #[test]
