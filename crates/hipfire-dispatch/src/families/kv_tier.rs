@@ -10,7 +10,7 @@ use crate::types::KernelKey;
 /// GPU-free scalar inputs for tier derivation. NO runtime types (avoids the
 /// dep cycle — `hipfire-dispatch` cannot depend on `hipfire-runtime`).
 /// The arch-side code constructs this from a `&KvCache` at each attention step.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KvTierInputs {
     pub quant_asym4: bool,
     pub quant_asym3: bool,
