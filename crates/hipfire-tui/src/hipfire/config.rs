@@ -111,6 +111,23 @@ impl ConfigState {
         ]
     }
 
+    /// Per-easy-row override status, parallel to [`easy_rows`]/[`easy_keys`].
+    /// Unlike `easy_keys` (which is `None` for the non-inline-editable Model /
+    /// Serve composite rows), this resolves override status for EVERY row from
+    /// its underlying config key(s), so the 5c override marker is consistent with
+    /// the advanced view — a user-set `default_model` / `host` / `port` shows as
+    /// changed in easy mode too, not just advanced.
+    pub fn easy_override_state(&self) -> Vec<bool> {
+        vec![
+            self.is_override("default_model"),                       // Model
+            self.is_override("max_seq"),                             // Context
+            self.is_override("dflash_mode"),                         // Spec decode
+            self.is_override("kv_cache"),                            // KV cache
+            self.is_override("thinking"),                            // Thinking
+            self.is_override("host") || self.is_override("port"),    // Serve
+        ]
+    }
+
     pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
         vec![
             (

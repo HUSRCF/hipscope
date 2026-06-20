@@ -879,6 +879,44 @@ fn preview_for(app: &App, key: Option<&str>) -> Option<String> {
     }
 }
 
+/// Value cell + row style for one settings row, encoding the 5b preview state and
+/// the 5c override-vs-default distinction at a glance:
+///   * staged preview   → "● {v} (preview)", YELLOW italic (a pending override)
+///   * committed override → "● {v}", bright + bold (this is yours)
+///   * inherited default → "  {v}", dimmed (untouched)
+///   * composite row     → "  {v}", neutral (set elsewhere, no override status)
+/// A staged preview takes precedence (it IS the active, uncommitted row) and uses
+/// the highlight background (PANEL_2) with a distinct YELLOW italic, so it reads
+/// as both selected and unsaved. For non-preview rows the cursor highlight
+/// (ACCENT on PANEL_2) wins so the selected row stays legible.
+/// `override_state`: Some(true)=override, Some(false)=default, None=composite.
+fn settings_row_display(
+    committed: &str,
+    preview: Option<&str>,
+    override_state: Option<bool>,
+    selected: bool,
+) -> (String, Style) {
+    if let Some(pv) = preview {
+        return (
+            format!("● {pv} (preview)"),
+            Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC),
+        );
+    }
+    let is_override = override_state == Some(true);
+    let marker = if is_override { "● " } else { "  " };
+    let shown = format!("{marker}{committed}");
+    let style = if selected {
+        Style::default().fg(ACCENT).bg(PANEL_2)
+    } else {
+        match override_state {
+            Some(true) => Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Some(false) => Style::default().fg(MUTED),
+            None => Style::default().fg(TEXT),
+        }
+    };
+    (shown, style)
+}
+
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -931,6 +969,9 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.settings_easy {
         let easy_keys = app.config.easy_keys();
+        // Override status for EVERY easy row (incl. the composite Model/Serve rows
+        // whose editable key is None) so the 5c marker matches the advanced view.
+        let override_states = app.config.easy_override_state();
         let rows_all = app
             .config
             .easy_rows()
@@ -943,22 +984,17 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (label, value, desc))| {
-                // 5b: if this row's key has a staged preview, show the previewed
-                // value distinctly (YELLOW "(preview)") instead of the committed
-                // one — it is NOT yet written to config.json.
                 let row_key = easy_keys.get(idx).and_then(|k| *k);
                 let preview = preview_for(app, row_key);
-                let shown = match &preview {
-                    Some(v) => format!("{v} (preview)"),
-                    None => value,
-                };
-                let style = if preview.is_some() {
-                    Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC)
-                } else if idx == app.settings_selected {
-                    Style::default().fg(ACCENT).bg(PANEL_2)
-                } else {
-                    Style::default().fg(TEXT).bg(PANEL)
-                };
+                // Every easy row has a definite override status (composite rows
+                // resolve theirs from default_model / host|port).
+                let override_state = override_states.get(idx).copied();
+                let (shown, style) = settings_row_display(
+                    &value,
+                    preview.as_deref(),
+                    override_state,
+                    idx == app.settings_selected,
+                );
                 Row::new([label.to_string(), shown, desc.to_string()]).style(style)
             })
             .collect::<Vec<_>>();
@@ -972,7 +1008,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                 ],
             )
             .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
-            .block(block("User-safe controls"))
+            .block(block("User-safe controls  (● = your override)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
@@ -984,26 +1020,22 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (k, v))| {
-                // 5b: staged preview shown distinctly (not yet on disk).
                 let preview = preview_for(app, Some(k.as_str()));
-                let shown = match &preview {
-                    Some(pv) => format!("{pv} (preview)"),
-                    None => v.clone(),
-                };
-                let style = if preview.is_some() {
-                    Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC)
-                } else if idx == app.settings_selected {
-                    Style::default().fg(ACCENT).bg(PANEL_2)
-                } else {
-                    Style::default().fg(TEXT).bg(PANEL)
-                };
+                // Every advanced row maps to a real config key.
+                let override_state = Some(app.config.is_override(k));
+                let (shown, style) = settings_row_display(
+                    v,
+                    preview.as_deref(),
+                    override_state,
+                    idx == app.settings_selected,
+                );
                 Row::new([k.clone(), shown]).style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
             Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
                 .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block("Advanced config.json view"))
+                .block(block("Advanced config.json view  (● = your override)"))
                 .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
@@ -1646,6 +1678,85 @@ mod render_tests {
         let text = render_with(|app| app.tab = Tab::Settings);
         assert!(text.contains("Del reset"), "single-key reset hint");
         assert!(text.contains("R reset-all"), "reset-all hint");
+    }
+
+    #[test]
+    fn settings_row_display_encodes_override_state() {
+        use ratatui::style::Modifier;
+        // 5c: override -> "● " marker + bold; default -> "  " (no marker) + dim
+        // MUTED; composite (None) -> neutral, no marker; preview wins (5b).
+        let (s, st) = settings_row_display("q8", None, Some(true), false);
+        assert_eq!(s, "● q8");
+        assert!(st.add_modifier.contains(Modifier::BOLD), "override is bold");
+        assert_eq!(st.fg, Some(TEXT));
+
+        let (s, st) = settings_row_display("auto", None, Some(false), false);
+        assert_eq!(s, "  auto", "default has no bullet");
+        assert_eq!(st.fg, Some(MUTED), "default is dimmed");
+
+        let (s, st) = settings_row_display("qwen3.5:9b", None, None, false);
+        assert_eq!(s, "  qwen3.5:9b", "composite row has no bullet");
+        assert_eq!(st.fg, Some(TEXT), "composite row is neutral, not dimmed");
+
+        // Selected override stays marked but uses the cursor highlight.
+        let (s, st) = settings_row_display("q8", None, Some(true), true);
+        assert_eq!(s, "● q8");
+        assert_eq!(st.fg, Some(ACCENT), "selected row uses the cursor color");
+
+        // Preview overrides everything.
+        let (s, st) = settings_row_display("auto", Some("on"), Some(false), false);
+        assert_eq!(s, "● on (preview)");
+        assert_eq!(st.fg, Some(YELLOW));
+        assert!(st.add_modifier.contains(Modifier::ITALIC));
+
+        // Preview on the SELECTED row still reads as highlighted: it keeps the
+        // PANEL_2 highlight background (not just yellow text floating on PANEL).
+        let (_s, st) = settings_row_display("auto", Some("on"), Some(false), true);
+        assert_eq!(st.fg, Some(YELLOW), "preview keeps its distinct yellow");
+        assert_eq!(st.bg, Some(PANEL_2), "preview row uses the highlight background");
+    }
+
+    #[test]
+    fn easy_override_state_is_row_parallel() {
+        // 5c review #1: easy_override_state must stay aligned with easy_rows /
+        // easy_keys so the marker lands on the right row.
+        let app = App::load().expect("App::load");
+        let rows = app.config.easy_rows().len();
+        assert_eq!(app.config.easy_override_state().len(), rows);
+        assert_eq!(app.config.easy_keys().len(), rows);
+    }
+
+    #[test]
+    fn settings_marks_overrides_with_legend() {
+        // 5c render: an override row carries the ● marker and the table titles
+        // explain what it means.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.config.overrides.clear();
+            app.config.overrides.insert("kv_cache".into());
+            // Put the override row under the cursor so it is on-screen.
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+        });
+        assert!(text.contains("● "), "override row marked with a bullet");
+        assert!(text.contains("your override"), "legend explains the marker");
+    }
+
+    #[test]
+    fn easy_model_row_marks_default_model_override() {
+        // 5c review #1: the composite Model row (editable key None) must still
+        // show the override marker when default_model is set — consistent with
+        // the advanced view, where the same key is marked.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.config.overrides.clear();
+            app.config.overrides.insert("default_model".into());
+            app.settings_selected = 0; // Model row
+        });
+        // Only default_model is overridden, so the single bullet is the Model row.
+        assert!(text.contains("● "), "Model composite row marked via default_model override");
     }
 
     #[test]
