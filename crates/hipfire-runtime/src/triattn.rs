@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use hip_bridge::HipResult;
+use hipfire_dispatch::families::kv_tier::KTier;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Q-side centers for one (layer, head, band) triple.
@@ -945,31 +946,32 @@ impl EvictionCtx {
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
 
-        enum Mode {
-            Q8,
-            Asym2,
-            Asym3,
-            Asym4,
-        }
-        let (mode, k_bytes_per_pos) = if kv.quant_asym3 {
-            (Mode::Asym3, self.n_kv_heads * (4 + (self.head_dim * 3) / 8))
-        } else if kv.quant_asym4 {
-            (Mode::Asym4, self.n_kv_heads * (4 + self.head_dim / 2))
-        } else if kv.quant_asym2 {
-            (Mode::Asym2, self.n_kv_heads * (4 + self.head_dim / 4))
-        } else if kv.quant_q8 {
-            (Mode::Q8, self.n_kv_heads * (self.head_dim / 32) * 34)
-        } else {
-            panic!("TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now");
-        };
+        let tier = kv.k_tier();
+        assert!(
+            tier.is_compactable(),
+            "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now (got {tier:?})"
+        );
+        let k_bytes_per_pos = tier.k_bytes_per_pos(self.n_kv_heads, self.head_dim);
         let v_bytes_per_pos = self.n_kv_heads * (self.head_dim / 32) * 34;
 
         let mut last_retain: Vec<u32> = Vec::new();
         for (fa_i, &layer_idx) in self.fa_layer_ids.iter().enumerate() {
             let offset = fa_i * self.centers_per_layer;
             let centers_layer = self.centers_dev.sub_offset(offset, self.centers_per_layer);
-            match mode {
-                Mode::Asym3 => gpu.triattn_score_asym3(
+            match tier {
+                KTier::Q8 => gpu.triattn_score_q8(
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    &self.scores_buf,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
+                )?,
+                KTier::Asym3 { .. } => gpu.triattn_score_asym3(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -987,7 +989,7 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                Mode::Asym4 => gpu.triattn_score_asym4(
+                KTier::Asym4 { .. } => gpu.triattn_score_asym4(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -1005,7 +1007,7 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                Mode::Asym2 => gpu.triattn_score_asym2(
+                KTier::Asym2 { .. } => gpu.triattn_score_asym2(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -1023,18 +1025,7 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                Mode::Q8 => gpu.triattn_score_q8(
-                    &kv.k_gpu[layer_idx],
-                    &centers_layer,
-                    &self.scores_buf,
-                    self.n_heads,
-                    self.n_kv_heads,
-                    self.head_dim,
-                    self.n_rot,
-                    self.rope_theta,
-                    p_q,
-                    current_physical,
-                )?,
+                _ => unreachable!("gated by is_compactable"),
             }
             gpu.hip.device_synchronize()?;
 
