@@ -154,6 +154,9 @@ pub struct App {
     /// Text staged by Chat `/copy` for the event loop to emit to the terminal
     /// clipboard (OSC52) after the next render; cleared once emitted.
     pub pending_clipboard: Option<String>,
+    /// Recent finished chat requests (newest first), for the System-tab request
+    /// inspector. Bounded to [`REQUEST_LOG_CAP`].
+    pub request_log: Vec<RequestRecord>,
     /// Latest serve.log tail (Logs tab), mirrored from the LogTailer worker.
     pub logs: LogSnapshot,
     /// Background serve.log tailer. Reads the file off the UI thread; dropped
@@ -205,6 +208,7 @@ impl App {
             rm_cmd: None,
             confirm_delete: None,
             pending_clipboard: None,
+            request_log: Vec::new(),
             logs: LogSnapshot::default(),
             log_tailer,
             dashboard_worker,
@@ -681,6 +685,7 @@ impl App {
         self.chat.sending = true;
         self.chat.status = "streaming from hipfire serve".into();
         self.chat.gen_start = Some(Instant::now());
+        self.chat.gen_model = self.active_model.clone();
         self.chat.gen_tokens = 0;
         self.chat.last_stats = None;
 
@@ -797,6 +802,20 @@ impl App {
             }
             None => self.toast_error("no reply to copy"),
         }
+    }
+
+    /// Record a finished request in the inspector ring (newest first, capped).
+    fn log_request(&mut self, stats: GenStats, secs: f64) {
+        self.request_log.insert(
+            0,
+            RequestRecord {
+                model: self.chat.gen_model.clone(),
+                tokens: stats.tokens,
+                tps: stats.tps,
+                secs,
+            },
+        );
+        self.request_log.truncate(REQUEST_LOG_CAP);
     }
 
     /// Dispatch a Chat slash command (the input after the leading '/').
@@ -1202,7 +1221,9 @@ impl App {
                     }
                     ChatEvent::Done => {
                         // Record throughput + drop a zero-delta empty assistant.
-                        self.chat.finalize_generation();
+                        if let Some((stats, secs)) = self.chat.finalize_generation() {
+                            self.log_request(stats, secs);
+                        }
                         self.chat.status = "ready".into();
                         self.chat.sending = false;
                         finished = true;
@@ -1210,7 +1231,9 @@ impl App {
                     ChatEvent::Error(err) => {
                         // finalize drops the trailing empty assistant so a failed
                         // request doesn't read as a blank reply; surface the cause.
-                        self.chat.finalize_generation();
+                        if let Some((stats, secs)) = self.chat.finalize_generation() {
+                            self.log_request(stats, secs);
+                        }
                         self.toast_error(format!("chat error: {err}"));
                         self.chat.status = format!("error: {err}");
                         self.chat.sending = false;
@@ -1234,6 +1257,19 @@ pub struct GenStats {
     pub tps: f64,
 }
 
+/// One finished chat request, for the System-tab request inspector. All fields
+/// are measured locally from the TUI's own generation — never fabricated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestRecord {
+    pub model: String,
+    pub tokens: usize,
+    pub tps: f64,
+    pub secs: f64,
+}
+
+/// Cap on retained request records (newest kept).
+const REQUEST_LOG_CAP: usize = 20;
+
 pub struct ChatState {
     pub input: String,
     pub messages: Vec<ChatMessage>,
@@ -1247,6 +1283,9 @@ pub struct ChatState {
     pub top_p: Option<f64>,
     /// Wall-clock start of the in-flight generation (for tok/s).
     gen_start: Option<Instant>,
+    /// Model the in-flight generation was sent to (captured at send, since
+    /// active_model can change mid-stream via /model).
+    gen_model: String,
     /// Streamed deltas counted so far this generation (≈ tokens).
     gen_tokens: usize,
     /// Stats of the most recent completed generation (shown under the reply).
@@ -1269,6 +1308,7 @@ impl Default for ChatState {
             temp: None,
             top_p: None,
             gen_start: None,
+            gen_model: String::new(),
             gen_tokens: 0,
             last_stats: None,
             rx: None,
@@ -1289,7 +1329,7 @@ impl ChatState {
             self.abort.store(true, Ordering::Relaxed);
             self.sending = false;
             self.rx = None;
-            self.finalize_generation();
+            let _ = self.finalize_generation(); // aborted = incomplete, not logged
             self.status = "stopped".into();
         }
     }
@@ -1298,7 +1338,8 @@ impl ChatState {
     /// (only if any tokens actually streamed) and drop a trailing empty assistant
     /// bubble left by a zero-delta finish (immediate [DONE], empty deltas, or
     /// abort-before-first-token) so it isn't rendered or sent in the next turn.
-    fn finalize_generation(&mut self) {
+    fn finalize_generation(&mut self) -> Option<(GenStats, f64)> {
+        let mut recorded = None;
         if let Some(start) = self.gen_start.take() {
             if self.gen_tokens > 0 {
                 let secs = start.elapsed().as_secs_f64();
@@ -1307,10 +1348,12 @@ impl ChatState {
                 } else {
                     0.0
                 };
-                self.last_stats = Some(GenStats {
+                let stats = GenStats {
                     tokens: self.gen_tokens,
                     tps,
-                });
+                };
+                self.last_stats = Some(stats);
+                recorded = Some((stats, secs));
             }
         }
         if let Some(last) = self.messages.last() {
@@ -1318,6 +1361,7 @@ impl ChatState {
                 self.messages.pop();
             }
         }
+        recorded
     }
 
     /// Clear any displayed throughput + in-flight counters. Called when the
@@ -1738,6 +1782,35 @@ mod tests {
         });
         app.handle_chat_command("clear");
         assert!(app.chat.last_stats.is_none(), "tok/s cleared with the conversation");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finished_request_is_logged_for_the_inspector() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        app.chat.gen_model = "qwen3.5:9b".into();
+        tx.send(ChatEvent::Delta("hello".into())).unwrap();
+        tx.send(ChatEvent::Delta(" world".into())).unwrap();
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        assert_eq!(app.request_log.len(), 1, "completed request is logged");
+        assert_eq!(app.request_log[0].model, "qwen3.5:9b");
+        assert_eq!(app.request_log[0].tokens, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

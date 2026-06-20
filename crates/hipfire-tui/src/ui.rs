@@ -1029,6 +1029,26 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|m| Line::from(format!("{}  {}", m.size, m.file))),
         );
     }
+    // Request inspector — the TUI's own recent chat generations (honest, local).
+    diagnostic_lines.push(Line::from(""));
+    diagnostic_lines.push(Line::from(Span::styled(
+        "Recent requests (this session):",
+        Style::default().fg(MUTED),
+    )));
+    if app.request_log.is_empty() {
+        diagnostic_lines.push(Line::from(Span::styled(
+            "none yet — send a Chat message",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for r in app.request_log.iter().take(8) {
+            diagnostic_lines.push(Line::from(format!(
+                "{}  {} tok · {:.0} tok/s · {:.1}s",
+                r.model, r.tokens, r.tps, r.secs
+            )));
+        }
+    }
+
     diagnostic_lines.extend([
         Line::from(""),
         Line::from(Span::styled(
@@ -1516,6 +1536,21 @@ mod render_tests {
             };
         });
         assert!(text.contains("No serve.log yet"), "honest missing-state guidance");
+    }
+
+    #[test]
+    fn system_tab_shows_request_inspector() {
+        let text = render_with(|app| {
+            app.tab = Tab::System;
+            app.request_log = vec![crate::app::RequestRecord {
+                model: "qwen3.5:9b".into(),
+                tokens: 128,
+                tps: 151.0,
+                secs: 0.85,
+            }];
+        });
+        assert!(text.contains("Recent requests"), "inspector section present");
+        assert!(text.contains("128 tok"), "token count shown");
     }
 
     #[test]
