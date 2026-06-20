@@ -5143,14 +5143,19 @@ impl KvCache {
     /// `batch_size`/`is_tree`/`is_boundary` after this returns (via functional
     /// update). Single source of truth for the cache-stable tier flags,
     /// replacing the four hand-copied literals.
-    pub fn tier_inputs(&self) -> KvTierInputs {
-        // `quant_q4` is not a stored flag — it is the "quantized but no known
-        // format and no separate scales" residual (llama legacy Q4 KV path).
-        let quant_q4 = self.quantized
+    /// The "quantized but no known format and no separate scales" residual —
+    /// the llama legacy Q4 KV path. Shared by `tier_inputs()` and `k_tier()`
+    /// so the two derivations can never silently diverge.
+    fn quant_q4_residual(&self) -> bool {
+        self.quantized
             && !self.quant_hfq4
             && !self.quant_q8
             && !self.quant_int8
-            && self.k_scales.is_empty();
+            && self.k_scales.is_empty()
+    }
+
+    pub fn tier_inputs(&self) -> KvTierInputs {
+        let quant_q4 = self.quant_q4_residual();
         KvTierInputs {
             quant_asym4: self.quant_asym4,
             quant_asym3: self.quant_asym3,
@@ -5174,13 +5179,9 @@ impl KvCache {
     /// The sealed decode of this cache's storage tier. The sanctioned way to
     /// branch on KV quant mode — replaces hand-rolled `if kv.quant_q8 { … }` ladders.
     pub fn k_tier(&self) -> hipfire_dispatch::families::kv_tier::KTier {
-        // `quant_q4` is the residual (see tier_inputs()); recompute it here so
-        // classify sees the same value derive() would.
-        let quant_q4 = self.quantized
-            && !self.quant_hfq4
-            && !self.quant_q8
-            && !self.quant_int8
-            && self.k_scales.is_empty();
+        // `quant_q4` is the residual (see quant_q4_residual()); same value
+        // derive() would see.
+        let quant_q4 = self.quant_q4_residual();
         hipfire_dispatch::families::kv_tier::classify(
             self.quant_q8, self.quant_asym4, self.quant_asym3, self.quant_asym2,
             self.quant_hfq4, quant_q4, self.quant_fwht,
