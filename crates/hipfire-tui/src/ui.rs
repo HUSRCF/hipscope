@@ -581,6 +581,9 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(p) = app.chat.top_p {
             extras.push(format!("top_p {p}"));
         }
+        if let Some(s) = app.chat.last_stats {
+            extras.push(format!("{} tok @ {:.0} tok/s", s.tokens, s.tps));
+        }
         format!("Input - {} - {}", app.chat.status, extras.join(" · "))
     };
     let input = Paragraph::new(app.chat.input.as_str())
