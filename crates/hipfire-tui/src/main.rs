@@ -261,9 +261,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') if !chat_capturing => return true,
         KeyCode::Esc => {
-            // While editing a settings value, Esc cancels the edit instead of
-            // quitting / blurring chat.
-            if app.tab == app::Tab::Settings && app.settings_edit.is_some() {
+            // While editing a settings value OR previewing an enum (5b), Esc
+            // cancels that instead of quitting / blurring chat.
+            if app.tab == app::Tab::Settings
+                && (app.settings_edit.is_some() || app.settings_pending.is_some())
+            {
                 app.handle_tab_key(key);
             } else if app.chat.sending {
                 app.chat.request_abort();
@@ -305,7 +307,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             // when the user returns) after the modal key-guard no longer applies.
             if let Some(tab) = app.tab_at(mouse.column, mouse.row) {
                 if tab != app::Tab::Settings {
+                    // Leaving Settings discards an armed reset-all confirm and an
+                    // uncommitted enum preview (neither should linger off-tab).
                     app.confirm_reset_all = false;
+                    app.settings_pending = None;
                 }
                 app.tab = tab;
             }

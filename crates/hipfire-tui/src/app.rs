@@ -32,10 +32,20 @@ use crate::hipfire::{
 };
 
 /// In-progress numeric/string edit of a settings field (Enter to commit,
-/// Esc to cancel). Enum fields are cycled in place and never enter this state.
+/// Esc to cancel). Enum fields use [`PendingEnum`] instead of this state.
 pub struct EditState {
     pub key: String,
     pub buffer: String,
+}
+
+/// A previewed-but-uncommitted enum value (5b). Cycling Left/Right/Space stages
+/// the next value here (dimmed in the UI) WITHOUT writing config.json, so merely
+/// browsing the options can't mutate config. Enter commits it; Esc or navigating
+/// away discards it. Booleans don't use this — a binary flip is a decision, not
+/// browsing, so they still toggle-on-key.
+pub struct PendingEnum {
+    pub key: String,
+    pub value: String,
 }
 
 /// Severity of a transient toast, drives its color in the footer overlay.
@@ -121,6 +131,9 @@ pub struct App {
     pub settings_easy: bool,
     pub settings_selected: usize,
     pub settings_edit: Option<EditState>,
+    /// A staged-but-uncommitted enum value preview (5b). `Some` only while the
+    /// user is cycling an enum and hasn't pressed Enter (commit) / Esc (cancel).
+    pub settings_pending: Option<PendingEnum>,
     pub chat: ChatState,
     pub last_reload: String,
     /// Transient over-footer status toast (action failures + confirmations).
@@ -204,6 +217,7 @@ impl App {
             settings_easy: true,
             settings_selected: 0,
             settings_edit: None,
+            settings_pending: None,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
             toast: None,
@@ -482,6 +496,9 @@ impl App {
         // and system diagnostics come from the background DashboardWorker, so we
         // never run /health or lspci/rocm-smi on the UI thread here.
         self.config = ConfigState::load(&self.paths);
+        // A reload re-reads config from disk, so drop any uncommitted enum preview
+        // (5b) rather than leave it pointing at a now-stale value.
+        self.settings_pending = None;
         // Preserve the user's expanded Models groups across an `r` refresh — a
         // fresh RegistryState::load() defaults them to empty, which would
         // collapse everything (and then a clean quit would persist that empty
@@ -504,11 +521,14 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
+        // Leaving Settings discards an uncommitted enum preview (5b).
+        self.settings_pending = None;
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
     }
 
     pub fn prev_tab(&mut self) {
+        self.settings_pending = None;
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
     }
@@ -1079,8 +1099,10 @@ impl App {
         // Remember the key under the cursor BEFORE flipping mode.
         let prev_key = self.selected_setting_key();
         self.settings_easy = easy;
-        // Cancel any in-progress edit — its key may not exist in the new mode.
+        // Cancel any in-progress edit / enum preview — their key may not exist in
+        // the new mode (5b: switching views discards an uncommitted preview).
         self.settings_edit = None;
+        self.settings_pending = None;
 
         // Try to keep the cursor on the same key in the new mode.
         if let Some(key) = prev_key {
@@ -1112,7 +1134,7 @@ impl App {
     /// Resolve the currently-selected settings row to a config key, if any.
     /// In easy mode this maps through `ConfigState::easy_keys`; in advanced
     /// mode the row IS a `(key, value)` pair from the raw config map.
-    fn selected_setting_key(&self) -> Option<String> {
+    pub(crate) fn selected_setting_key(&self) -> Option<String> {
         if self.settings_easy {
             self.config
                 .easy_keys()
@@ -1287,19 +1309,40 @@ impl App {
         .max(1);
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
+                // Moving off the row discards an uncommitted enum preview (5b).
+                self.discard_settings_preview();
                 self.settings_selected = (self.settings_selected + 1).min(len - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.discard_settings_preview();
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
+            // Esc cancels an in-progress enum preview (5b). With no preview this
+            // arm isn't reached (Esc is handled globally and only routed here when
+            // a preview/edit is active).
+            KeyCode::Esc => {
+                if self.settings_pending.is_some() {
+                    self.discard_settings_preview();
+                    self.last_reload = "preview cancelled".into();
+                }
+            }
             // Reset the selected key to its inherited/default value (5a). Delete
-            // and Backspace both read as "remove this override".
-            KeyCode::Delete | KeyCode::Backspace => self.reset_selected_setting(),
+            // and Backspace both read as "remove this override". Any staged enum
+            // preview is dropped first (reset is a different action).
+            KeyCode::Delete | KeyCode::Backspace => {
+                self.discard_settings_preview();
+                self.reset_selected_setting();
+            }
             // Arm the reset-ALL confirmation (5a). Shift+R, mirroring the
             // Dashboard's `R restart` convention; the lowercase `r` is the global
             // refresh.
-            KeyCode::Char('R') => self.arm_reset_all(),
-            // Cycle an enum field forward/back; persist immediately.
+            KeyCode::Char('R') => {
+                self.discard_settings_preview();
+                self.arm_reset_all();
+            }
+            // Cycle an enum field forward/back. Enums PREVIEW (staged, not written)
+            // so browsing options can't mutate config (5b); booleans toggle-commit
+            // (a binary flip is a decision, not browsing).
             KeyCode::Right | KeyCode::Char(' ') | KeyCode::Left => {
                 let forward = !matches!(key.code, KeyCode::Left);
                 let Some(k) = self.selected_setting_key() else {
@@ -1307,18 +1350,27 @@ impl App {
                     return;
                 };
                 match writer::field_spec(&k).map(|s| s.kind) {
-                    Some(FieldKind::Enum(_)) | Some(FieldKind::Bool) => {
-                        let cur = self.current_setting_value(&k);
-                        // Bool is modeled as a two-value cycle.
-                        let next = if let Some(n) = writer::cycle_enum(&k, &cur, forward) {
-                            n
-                        } else {
-                            match cur.as_str() {
-                                "true" => "false".into(),
-                                _ => "true".into(),
-                            }
+                    Some(FieldKind::Enum(_)) => {
+                        // Cycle from the current PREVIEW if we're mid-preview on
+                        // this key, else from the committed value. Stage only.
+                        let from = match &self.settings_pending {
+                            Some(p) if p.key == k => p.value.clone(),
+                            _ => self.current_setting_value(&k),
                         };
-                        let (_, status) = self.persist_setting(&k, &next);
+                        if let Some(next) = writer::cycle_enum(&k, &from, forward) {
+                            self.settings_pending = Some(PendingEnum {
+                                key: k.clone(),
+                                value: next.clone(),
+                            });
+                            self.last_reload =
+                                format!("{k} → {next} (preview) · Enter commit · Esc cancel");
+                        }
+                    }
+                    Some(FieldKind::Bool) => {
+                        // Binary toggle commits immediately (no browsing to guard).
+                        let cur = self.current_setting_value(&k);
+                        let next = if cur == "true" { "false" } else { "true" };
+                        let (_, status) = self.persist_setting(&k, next);
                         self.last_reload = status;
                     }
                     Some(_) => {
@@ -1330,8 +1382,22 @@ impl App {
                     }
                 }
             }
-            // Begin editing a numeric/free-string field.
+            // Enter commits a staged enum preview (5b), else begins editing a
+            // numeric/free-string field.
             KeyCode::Enter => {
+                // Commit a pending enum preview if one is staged for this row.
+                if let Some(pending) = self.settings_pending.take() {
+                    let cur_key = self.selected_setting_key();
+                    if cur_key.as_deref() == Some(pending.key.as_str()) {
+                        let (_, status) = self.persist_setting(&pending.key, &pending.value);
+                        self.last_reload = status;
+                    } else {
+                        // Selection moved under us — discard rather than write a
+                        // stale preview to the wrong key.
+                        self.last_reload = "preview discarded".into();
+                    }
+                    return;
+                }
                 let Some(k) = self.selected_setting_key() else {
                     self.last_reload = "this row is not inline-editable".into();
                     return;
@@ -1345,9 +1411,13 @@ impl App {
                         self.last_reload =
                             format!("editing {k}: type a value, Enter to save, Esc to cancel");
                     }
-                    Some(FieldKind::Enum(_)) | Some(FieldKind::Bool) => {
+                    Some(FieldKind::Enum(_)) => {
                         self.last_reload =
-                            format!("{k} is an enum; use Left/Right/Space to cycle");
+                            format!("{k}: Left/Right/Space to preview values, Enter to commit");
+                    }
+                    Some(FieldKind::Bool) => {
+                        self.last_reload =
+                            format!("{k} is on/off; Left/Right/Space toggles");
                     }
                     None => {
                         self.last_reload = format!("{k} is not editable from the TUI");
@@ -1356,6 +1426,13 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Drop any staged-but-uncommitted enum preview (5b). Called when the cursor
+    /// leaves the row, the tab changes, or another action supersedes it. Silent —
+    /// callers set their own status line.
+    fn discard_settings_preview(&mut self) {
+        self.settings_pending = None;
     }
 
     fn handle_settings_edit_key(&mut self, key: KeyEvent) {
@@ -1747,7 +1824,8 @@ mod tests {
         std::fs::write(&app.paths.config, "{}\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         app.settings_easy = false;
-        // Cycle kv_cache off its default (auto -> q8) — persists + marks override.
+        // Cycle kv_cache off its default (auto -> q8): previews, then Enter commits
+        // + marks override (5b: cycle no longer persists on its own).
         app.settings_selected = app
             .config
             .values
@@ -1755,7 +1833,8 @@ mod tests {
             .position(|k| k == "kv_cache")
             .unwrap();
         app.handle_settings_key(key(KeyCode::Right));
-        assert!(app.config.is_override("kv_cache"), "persist marks the override");
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(app.config.is_override("kv_cache"), "commit marks the override");
         assert_ne!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
 
         // Now Delete must actually reset it (not report "already default").
@@ -1833,6 +1912,140 @@ mod tests {
         assert!(app.confirm_reset_all, "unrelated key is swallowed, stays armed");
         app.handle_settings_key(key(KeyCode::Esc));
         assert!(!app.confirm_reset_all, "Esc cancels");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Select the advanced-mode row for `k` and return the on-disk config text.
+    fn select_advanced(app: &mut App, k: &str) {
+        app.settings_easy = false;
+        app.settings_selected = app.config.values.keys().position(|x| x == k).unwrap();
+    }
+
+    #[test]
+    fn enum_cycle_previews_without_writing() {
+        // 5b core: cycling an enum stages a preview and does NOT touch config.json
+        // — merely browsing options can no longer mutate config.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "dflash_mode");
+
+        app.handle_settings_key(key(KeyCode::Right));
+        // A preview is staged for dflash_mode...
+        let pending = app.settings_pending.as_ref().expect("preview staged");
+        assert_eq!(pending.key, "dflash_mode");
+        assert_ne!(pending.value, "off", "cycled off the default");
+        // ...but nothing was written and the committed value is unchanged.
+        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+        assert!(!app.config.is_override("dflash_mode"));
+        assert_eq!(app.config.values.get("dflash_mode").map(String::as_str), Some("off"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enum_preview_commits_on_enter() {
+        // Enter writes the staged preview to disk and marks the override.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "dflash_mode");
+
+        app.handle_settings_key(key(KeyCode::Right)); // off -> on (preview)
+        let staged = app.settings_pending.as_ref().unwrap().value.clone();
+        app.handle_settings_key(key(KeyCode::Enter)); // commit
+
+        assert!(app.settings_pending.is_none(), "preview cleared after commit");
+        assert!(app.config.is_override("dflash_mode"));
+        assert_eq!(app.config.values.get("dflash_mode").cloned(), Some(staged.clone()));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
+        assert_eq!(
+            parsed.as_object().unwrap().get("dflash_mode").unwrap(),
+            &serde_json::Value::String(staged)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enum_preview_cancels_on_esc_and_on_navigation() {
+        // Esc OR moving off the row discards the preview without writing.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "dflash_mode");
+
+        // Esc path.
+        app.handle_settings_key(key(KeyCode::Right));
+        assert!(app.settings_pending.is_some());
+        app.handle_settings_key(key(KeyCode::Esc));
+        assert!(app.settings_pending.is_none(), "Esc cancels preview");
+        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+
+        // Navigation path: Down discards.
+        app.handle_settings_key(key(KeyCode::Right));
+        assert!(app.settings_pending.is_some());
+        app.handle_settings_key(key(KeyCode::Down));
+        assert!(app.settings_pending.is_none(), "moving off the row discards preview");
+        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enum_preview_repeated_cycle_stages_from_preview() {
+        // Two Rights advance through the allowlist from the PREVIEW, not the
+        // committed value (so you can browse forward without committing).
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "dflash_mode"); // allowlist: on, off, auto; cur=off
+
+        app.handle_settings_key(key(KeyCode::Right)); // off -> auto
+        let first = app.settings_pending.as_ref().unwrap().value.clone();
+        app.handle_settings_key(key(KeyCode::Right)); // auto -> on
+        let second = app.settings_pending.as_ref().unwrap().value.clone();
+        assert_ne!(first, second, "second cycle advances from the preview");
+        // Still nothing written.
+        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bool_toggle_still_commits_immediately() {
+        // 5b: booleans are a binary decision, not browsing — they keep
+        // toggle-on-key (immediate write), no preview.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "cask"); // default false
+
+        app.handle_settings_key(key(KeyCode::Char(' ')));
+        assert!(app.settings_pending.is_none(), "bool does not preview");
+        assert!(app.config.is_override("cask"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
+        assert_eq!(
+            parsed.as_object().unwrap().get("cask").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tab_switch_discards_preview() {
+        // Leaving the Settings tab drops an uncommitted preview.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        select_advanced(&mut app, "dflash_mode");
+        app.handle_settings_key(key(KeyCode::Right));
+        assert!(app.settings_pending.is_some());
+        app.next_tab();
+        assert!(app.settings_pending.is_none(), "tab switch discards preview");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

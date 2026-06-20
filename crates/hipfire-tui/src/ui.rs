@@ -210,10 +210,12 @@ fn footer_hints(app: &App) -> String {
         Tab::Settings => {
             if app.confirm_reset_all {
                 "Reset ALL settings to defaults?  y confirm · n / Esc cancel".to_string()
+            } else if app.settings_pending.is_some() {
+                "Preview: Left/Right/Space change · Enter commit · Esc cancel".to_string()
             } else if app.settings_edit.is_some() {
                 "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
             } else {
-                format!("e easy · a advanced · Up/Down select · Left/Right/Space cycle · Enter edit · Del reset · R reset-all · r refresh · {global}")
+                format!("e easy · a advanced · Up/Down select · Left/Right/Space change · Enter commit/edit · Del reset · R reset-all · r refresh · {global}")
             }
         }
         Tab::System => {
@@ -852,6 +854,31 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Action hint for the SELECTED settings row, accurate to its field kind: enums
+/// preview-then-commit, booleans toggle immediately, numbers/strings open an
+/// editor (5b — the copy must not promise preview semantics for booleans).
+fn selected_action_hint(app: &App) -> &'static str {
+    use crate::hipfire::writer::{self, FieldKind};
+    match app.selected_setting_key().and_then(|k| writer::field_spec(&k).map(|s| s.kind)) {
+        Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.",
+        Some(FieldKind::Bool) => "Left/Right/Space toggles on/off (applies immediately).",
+        Some(FieldKind::Int { .. }) | Some(FieldKind::Float { .. }) | Some(FieldKind::FreeStr { .. }) => {
+            "Enter to edit the value."
+        }
+        None => "This row is set elsewhere (Models tab / serve).",
+    }
+}
+
+/// The staged enum-preview value for `key`, if a preview (5b) is active for it.
+/// `None` when there's no preview or it targets a different key.
+fn preview_for(app: &App, key: Option<&str>) -> Option<String> {
+    let key = key?;
+    match &app.settings_pending {
+        Some(p) if p.key == key => Some(p.value.clone()),
+        _ => None,
+    }
+}
+
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -880,13 +907,19 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "Advanced settings"
         };
-        let note = if let Some(edit) = &app.settings_edit {
+        let note = if let Some(p) = &app.settings_pending {
+            // 5b: a staged enum preview is not yet written.
+            format!("preview {} = {} (uncommitted) — Enter commit, Esc cancel", p.key, p.value)
+        } else if let Some(edit) = &app.settings_edit {
             // Show the live edit buffer.
             format!("editing {} = {}_  (Enter save, Esc cancel)", edit.key, edit.buffer)
-        } else if app.settings_easy {
-            "Writable. Left/Right cycle, Enter edits, Del resets. Press a for advanced.".to_string()
         } else {
-            "Writable raw config. Left/Right cycle, Enter edits, Del resets. Press e for easy.".to_string()
+            // Tailor the hint to the SELECTED row's kind so the copy never
+            // overstates preview semantics (booleans toggle immediately; only
+            // enums preview-then-commit).
+            let action = selected_action_hint(app);
+            let switch = if app.settings_easy { "a for advanced" } else { "e for easy" };
+            format!("{action}  Del resets. Press {switch}.")
         };
         frame.render_widget(
             Paragraph::new(format!("{mode}    {note}"))
@@ -897,6 +930,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.settings_easy {
+        let easy_keys = app.config.easy_keys();
         let rows_all = app
             .config
             .easy_rows()
@@ -909,13 +943,23 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (label, value, desc))| {
-                Row::new([label.to_string(), value, desc.to_string()]).style(
-                    if idx == app.settings_selected {
-                        Style::default().fg(ACCENT).bg(PANEL_2)
-                    } else {
-                        Style::default().fg(TEXT).bg(PANEL)
-                    },
-                )
+                // 5b: if this row's key has a staged preview, show the previewed
+                // value distinctly (YELLOW "(preview)") instead of the committed
+                // one — it is NOT yet written to config.json.
+                let row_key = easy_keys.get(idx).and_then(|k| *k);
+                let preview = preview_for(app, row_key);
+                let shown = match &preview {
+                    Some(v) => format!("{v} (preview)"),
+                    None => value,
+                };
+                let style = if preview.is_some() {
+                    Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC)
+                } else if idx == app.settings_selected {
+                    Style::default().fg(ACCENT).bg(PANEL_2)
+                } else {
+                    Style::default().fg(TEXT).bg(PANEL)
+                };
+                Row::new([label.to_string(), shown, desc.to_string()]).style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -940,11 +984,20 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (k, v))| {
-                Row::new([k.clone(), v.clone()]).style(if idx == app.settings_selected {
+                // 5b: staged preview shown distinctly (not yet on disk).
+                let preview = preview_for(app, Some(k.as_str()));
+                let shown = match &preview {
+                    Some(pv) => format!("{pv} (preview)"),
+                    None => v.clone(),
+                };
+                let style = if preview.is_some() {
+                    Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC)
+                } else if idx == app.settings_selected {
                     Style::default().fg(ACCENT).bg(PANEL_2)
                 } else {
                     Style::default().fg(TEXT).bg(PANEL)
-                })
+                };
+                Row::new([k.clone(), shown]).style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -1419,7 +1472,7 @@ mod render_tests {
     #[test]
     fn footer_hints_are_per_tab() {
         let settings = render_with(|app| app.tab = Tab::Settings);
-        assert!(settings.contains("cycle"), "settings footer mentions cycle");
+        assert!(settings.contains("change"), "settings footer mentions change");
         assert!(settings.contains("easy"), "settings footer mentions easy");
 
         let models = render_with(|app| app.tab = Tab::Models);
@@ -1593,6 +1646,49 @@ mod render_tests {
         let text = render_with(|app| app.tab = Tab::Settings);
         assert!(text.contains("Del reset"), "single-key reset hint");
         assert!(text.contains("R reset-all"), "reset-all hint");
+    }
+
+    #[test]
+    fn settings_hint_is_honest_per_row_kind() {
+        // 5b review: the action hint must NOT promise preview semantics on a
+        // boolean row (it toggles immediately), but must on an enum row.
+        let bool_text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "cask").unwrap();
+        });
+        assert!(
+            bool_text.contains("toggles on/off") && bool_text.contains("immediately"),
+            "boolean row advertises immediate toggle, not preview"
+        );
+
+        let enum_text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+        });
+        assert!(
+            enum_text.contains("preview values") && enum_text.contains("Enter commits"),
+            "enum row advertises preview-then-commit"
+        );
+    }
+
+    #[test]
+    fn settings_enum_preview_renders_distinctly() {
+        // 5b: a staged preview shows the value with "(preview)" + a commit/cancel
+        // footer, signalling it is NOT yet written.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_pending = Some(crate::app::PendingEnum {
+                key: "dflash_mode".into(),
+                value: "auto".into(),
+            });
+        });
+        assert!(text.contains("auto (preview)"), "previewed value is marked");
+        assert!(text.contains("Enter commit"), "commit/cancel guidance shown");
     }
 
     #[test]
