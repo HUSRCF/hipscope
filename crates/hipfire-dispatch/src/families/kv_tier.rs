@@ -171,47 +171,23 @@ impl KvTierPlan {
             is_boundary,
         } = inputs;
 
-        // At most one quant tier flag should be set.
-        debug_assert!(
-            [quant_asym4, quant_asym3, quant_asym2, quant_q8, quant_hfq4, quant_q4]
-                .iter()
-                .filter(|&&b| b)
-                .count() <= 1,
-            "at most one KV quant tier flag should be set"
-        );
-
         let (write_single, attend_single, uses_givens) = if is_boundary {
             // Boundary layers pin to Q8 regardless of global tier.
             let attend = q8_attend_key(pos, flash_mode, capture_mode);
             (KernelKey::KvWriteQ8_0, attend, false)
-        } else if quant_asym4 {
-            if quant_fwht {
-                (KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht, true)
-            } else {
-                (KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4, true)
-            }
-        } else if quant_asym3 {
-            if quant_fwht {
-                (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht, true)
-            } else {
-                (KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3, true)
-            }
-        } else if quant_asym2 {
-            if quant_fwht {
-                (KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht, true)
-            } else {
-                (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
-            }
-        } else if quant_q8 {
-            let attend = q8_attend_key(pos, flash_mode, capture_mode);
-            (KernelKey::KvWriteQ8_0, attend, false)
-        } else if quant_hfq4 {
-            (KernelKey::KvWriteHfq4, KernelKey::AttnHfq4Kv, false)
-        } else if quant_q4 {
-            (KernelKey::KvWriteQ4, KernelKey::AttnQ4Kv, false)
         } else {
-            // F32 fallback
-            (KernelKey::KvWriteF32, KernelKey::AttnF32, false)
+            match classify(quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_hfq4, quant_q4, quant_fwht) {
+                KTier::Asym4 { fwht: true }  => (KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht, true),
+                KTier::Asym4 { fwht: false } => (KernelKey::KvWriteAsym4,     KernelKey::AttnFlashAsym4,     true),
+                KTier::Asym3 { fwht: true }  => (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht, true),
+                KTier::Asym3 { fwht: false } => (KernelKey::KvWriteAsym3,     KernelKey::AttnFlashAsym3,     true),
+                KTier::Asym2 { fwht: true }  => (KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht, true),
+                KTier::Asym2 { fwht: false } => (KernelKey::KvWriteAsym2,     KernelKey::AttnFlashAsym2,     true),
+                KTier::Q8   => (KernelKey::KvWriteQ8_0, q8_attend_key(pos, flash_mode, capture_mode), false),
+                KTier::Hfq4 => (KernelKey::KvWriteHfq4, KernelKey::AttnHfq4Kv, false),
+                KTier::Q4   => (KernelKey::KvWriteQ4,   KernelKey::AttnQ4Kv,   false),
+                KTier::F32  => (KernelKey::KvWriteF32,  KernelKey::AttnF32,    false),
+            }
         };
 
         // Select batched keys when batch_size > 1.
