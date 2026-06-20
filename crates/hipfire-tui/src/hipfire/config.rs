@@ -88,6 +88,13 @@ impl ConfigState {
         self.overrides.contains(key)
     }
 
+    /// The hardcoded default map, for cross-checking the knob explainer defaults
+    /// (5e) against the real defaults so the two can't drift.
+    #[cfg(test)]
+    pub(crate) fn defaults_for_test() -> BTreeMap<String, String> {
+        defaults()
+    }
+
     pub fn probe_host(&self) -> String {
         match self.host.as_str() {
             "0.0.0.0" | "" => "127.0.0.1".into(),
@@ -152,6 +159,22 @@ impl ConfigState {
             self.is_override("kv_cache"),                            // KV cache
             self.is_override("thinking"),                            // Thinking
             self.is_override("host") || self.is_override("port"),    // Serve
+        ]
+    }
+
+    /// Help-lookup key for each easy row, parallel to [`easy_rows`]/[`easy_keys`].
+    /// Unlike `easy_keys`, this maps the composite Model/Serve rows to a
+    /// representative key (default_model / host) so the 5e explainer pane has
+    /// something to show for every row.
+    pub fn easy_help_keys(&self) -> Vec<&'static str> {
+        vec![
+            "default_model",       // Model
+            "max_seq",             // Context
+            "dflash_mode",         // Spec decode
+            "prefill_compression", // Prefill
+            "kv_cache",            // KV cache
+            "thinking",            // Thinking
+            "host",                // Serve
         ]
     }
 
@@ -252,6 +275,9 @@ fn defaults() -> BTreeMap<String, String> {
         ("prefill_threshold", "32768"),
         ("mtp_mode", "auto"),
         ("mtp_k", "3"),
+        // Mirror bun CONFIG_DEFAULTS for the remaining surfaced keys.
+        ("chat_template", ""),
+        ("default_chatml", "true"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -335,10 +361,23 @@ mod tests {
 
     #[test]
     fn easy_view_vectors_stay_parallel() {
-        // 5d adds a row to all three easy vectors; they must stay equal length.
+        // All four easy vectors must stay equal length (5d adds a row, 5e adds
+        // help keys) or the marker/help attaches to the wrong row.
         let st = state_with(&[]);
         let n = st.easy_rows().len();
         assert_eq!(st.easy_keys().len(), n);
         assert_eq!(st.easy_override_state().len(), n);
+        assert_eq!(st.easy_help_keys().len(), n);
+    }
+
+    #[test]
+    fn easy_help_keys_have_explainers() {
+        // 5e: every easy row's help key must resolve to a curated explainer.
+        for key in state_with(&[]).easy_help_keys() {
+            assert!(
+                crate::hipfire::knobs::knob_info(key).is_some(),
+                "easy help key {key} has no explainer"
+            );
+        }
     }
 }

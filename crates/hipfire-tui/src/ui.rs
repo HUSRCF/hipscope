@@ -13,6 +13,7 @@ use ratatui::{
 use crate::{
     app::{App, Tab},
     hipfire::dashboard::{LoadState, VramState},
+    hipfire::knobs,
     hipfire::registry::ModelListItem,
 };
 
@@ -918,9 +919,11 @@ fn settings_row_display(
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
+    // header · table · explainer-for-selected-key (5e). The explainer takes a
+    // fixed slice; the table keeps the elastic middle so it never disappears.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(9)])
         .split(pad(area, 1, 0));
     if app.confirm_reset_all {
         // Destructive: clears the whole config.json (default_model / host / port
@@ -1039,6 +1042,82 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
+    }
+
+    draw_settings_explainer(frame, app, chunks[2]);
+}
+
+/// The 5e explainer pane: for the selected settings row, show what the key is,
+/// what it does (with its tradeoff), the default, when to use it, and any
+/// load-bearing interaction. Falls back to an honest "no extended help" line for
+/// keys without a curated entry (e.g. low-level advanced keys).
+fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
+    // Resolve the key to explain. Easy mode maps every row (incl. the composite
+    // Model/Serve rows) via easy_help_keys; advanced uses the selected key.
+    let help_key: Option<String> = if app.settings_easy {
+        app.config
+            .easy_help_keys()
+            .get(app.settings_selected)
+            .map(|k| k.to_string())
+    } else {
+        app.selected_setting_key()
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    match help_key.as_deref().and_then(knobs::knob_info) {
+        Some(info) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    info.title,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  ({})", info.key), Style::default().fg(MUTED)),
+                Span::styled(format!("   default: {}", default_display(info.default)), Style::default().fg(MUTED)),
+            ]));
+            lines.push(Line::from(Span::styled(info.summary, Style::default().fg(TEXT))));
+            lines.push(Line::from(vec![
+                Span::styled("Effect: ", Style::default().fg(YELLOW)),
+                Span::styled(info.effect, Style::default().fg(TEXT)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("When: ", Style::default().fg(YELLOW)),
+                Span::styled(info.when, Style::default().fg(TEXT)),
+            ]));
+            if let Some(note) = info.note {
+                lines.push(Line::from(vec![
+                    Span::styled("Note: ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+                    Span::styled(note, Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+        None => {
+            let label = help_key.unwrap_or_else(|| "this row".into());
+            lines.push(Line::from(Span::styled(
+                format!("No extended help for {label}."),
+                Style::default().fg(MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "It is a low-level / advanced key — edit only if you know what it does.",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(block("About this setting"))
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        area,
+    );
+}
+
+/// Render a default value for display: an empty default reads as "(unset)".
+fn default_display(default: &str) -> String {
+    if default.is_empty() {
+        "(unset)".to_string()
+    } else {
+        default.to_string()
     }
 }
 
@@ -1757,6 +1836,49 @@ mod render_tests {
         });
         // Only default_model is overridden, so the single bullet is the Model row.
         assert!(text.contains("● "), "Model composite row marked via default_model override");
+    }
+
+    #[test]
+    fn settings_explainer_shows_selected_key_help() {
+        // 5e: selecting dflash_mode shows its explainer incl. the load-bearing
+        // thinking interaction and its default.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_selected =
+                app.config.values.keys().position(|k| k == "dflash_mode").unwrap();
+        });
+        assert!(text.contains("About this setting"), "explainer pane present");
+        assert!(text.contains("Spec decode"), "shows the knob title");
+        assert!(text.contains("thinking"), "surfaces the thinking↔dflash interaction");
+        assert!(text.contains("default:"), "shows the default");
+    }
+
+    #[test]
+    fn settings_explainer_easy_composite_row_has_help() {
+        // The composite Model row (no inline-editable key) still gets help via
+        // easy_help_keys -> default_model.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.settings_selected = 0; // Model row
+        });
+        assert!(text.contains("Default model"), "Model row resolves to default_model help");
+    }
+
+    #[test]
+    fn settings_explainer_falls_back_for_uncurated_key() {
+        // An advanced key without a curated entry shows an honest fallback, not a
+        // blank pane.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            // cask_budget has no curated knob entry.
+            app.config.values.clear();
+            app.config.values.insert("cask_budget".into(), "512".into());
+            app.settings_selected = 0;
+        });
+        assert!(text.contains("No extended help"), "honest fallback for uncurated key");
     }
 
     #[test]
