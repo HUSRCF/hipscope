@@ -152,6 +152,10 @@ pub struct App {
     /// Model tag awaiting a y/n delete confirmation; the Models tab shows a
     /// prompt while this is `Some`.
     pub confirm_delete: Option<String>,
+    /// Settings tab: a "reset ALL config to defaults" y/n confirmation is armed.
+    /// Single-key reset is reversible so it commits immediately; wiping the whole
+    /// file is gated behind this prompt (mirrors the Models delete-confirm modal).
+    pub confirm_reset_all: bool,
     /// Text staged by Chat `/copy` for the event loop to emit to the terminal
     /// clipboard (OSC52) after the next render; cleared once emitted.
     pub pending_clipboard: Option<String>,
@@ -212,6 +216,7 @@ impl App {
             pull: None,
             rm_cmd: None,
             confirm_delete: None,
+            confirm_reset_all: false,
             pending_clipboard: None,
             request_log: Vec::new(),
             doctor_cmd: None,
@@ -574,6 +579,8 @@ impl App {
                                     self.config
                                         .values
                                         .insert("default_model".into(), tag.clone());
+                                    // Now explicitly on disk -> resettable override.
+                                    self.config.overrides.insert("default_model".into());
                                     self.config.loaded_from_disk = true;
                                     self.last_reload =
                                         format!("default_model = {tag} saved to ~/.hipfire/config.json");
@@ -1139,6 +1146,11 @@ impl App {
                     self.config.default_model = as_str.clone();
                 }
                 self.config.values.insert(key.to_string(), as_str.clone());
+                // The key is now explicitly on disk -> an override, so a
+                // following Delete/Backspace can reset it this session (without
+                // it, is_override() stays false until the next full reload and
+                // reset wrongly reports "already at its default").
+                self.config.overrides.insert(key.to_string());
                 self.config.loaded_from_disk = true;
                 self.toast_info(format!("{key} saved"));
                 (true, format!("{key} = {as_str} saved to ~/.hipfire/config.json"))
@@ -1152,7 +1164,115 @@ impl App {
         }
     }
 
+    /// Reload only the config from disk after a reset. Keeps the cursor on the
+    /// same KEY (advanced-mode row indices shift when disk-only overrides vanish),
+    /// re-points the background dashboard worker (a reset can change host/port),
+    /// and clamps as a fallback. Registry/local-models are untouched — a config
+    /// reset can't change them.
+    fn reload_config_after_reset(&mut self) {
+        let prev_key = self.selected_setting_key();
+        self.config = ConfigState::load(&self.paths);
+        // Follow the previously-selected key to its new row, else clamp in range.
+        let restored = prev_key.and_then(|k| self.settings_key_index(&k));
+        if let Some(idx) = restored {
+            self.settings_selected = idx;
+        } else {
+            let max_idx = self.settings_row_count().saturating_sub(1);
+            if self.settings_selected > max_idx {
+                self.settings_selected = max_idx;
+            }
+        }
+        // host/port may have changed (reset-all clears them, advanced reset can
+        // delete a host/port override): keep the worker on the live endpoint.
+        self.dashboard_worker.update_config(self.config.clone());
+        self.dashboard_worker.force_refresh();
+    }
+
+    /// Reset the currently-selected setting to its inherited/default value by
+    /// deleting its key from config.json. A no-op (with an explanatory toast) for
+    /// rows that are already at their default or that have no resettable key
+    /// (the composite Model / Serve easy rows). Single-key reset is reversible —
+    /// just re-set the value — so it commits immediately without a confirm.
+    fn reset_selected_setting(&mut self) {
+        // A corrupt/non-object config.json loads as all-defaults with an empty
+        // override set, so per-key reset would wrongly say "already default" (and
+        // the writer refuses to clobber it anyway). Point the user at reset-all,
+        // which is the recovery hatch.
+        if let Some(warn) = self.config.warning.clone() {
+            self.last_reload = format!("config.json unreadable ({warn}); press R to reset all");
+            self.toast_error("config.json unreadable — use R (reset-all) to recover");
+            return;
+        }
+        let Some(k) = self.selected_setting_key() else {
+            self.last_reload = "this row has no resettable setting".into();
+            self.toast_info("nothing to reset on this row");
+            return;
+        };
+        if !self.config.is_override(&k) {
+            let cur = self.current_setting_value(&k);
+            self.last_reload = format!("{k} is already at its default ({cur})");
+            self.toast_info(format!("{k} already default"));
+            return;
+        }
+        let was = self.current_setting_value(&k);
+        match writer::delete_key(&self.paths.config, &k) {
+            Ok(_) => {
+                self.reload_config_after_reset();
+                let now = self.current_setting_value(&k);
+                self.last_reload = format!("{k} reset to default ({now}); was {was}");
+                self.toast_info(format!("{k} reset to default"));
+            }
+            Err(err) => {
+                self.last_reload = format!("{k} reset failed: {err}");
+                self.toast_error(format!("reset failed: {err}"));
+            }
+        }
+    }
+
+    /// Arm the "reset ALL config to defaults" confirmation. Wiping the whole file
+    /// is destructive (it also clears default_model / host / port), so it waits
+    /// for an explicit y before [`confirm_reset_all_yes`] runs.
+    fn arm_reset_all(&mut self) {
+        self.confirm_reset_all = true;
+        self.last_reload = "reset ALL settings to defaults? y to confirm, n / Esc to cancel".into();
+    }
+
+    fn cancel_reset_all(&mut self) {
+        if self.confirm_reset_all {
+            self.confirm_reset_all = false;
+            self.last_reload = "reset-all cancelled".into();
+            self.toast_info("reset-all cancelled");
+        }
+    }
+
+    /// Commit the confirmed reset-all: overwrite config.json with `{}` (every key
+    /// falls back to inherited/default), reload, and re-clamp the cursor.
+    fn confirm_reset_all_yes(&mut self) {
+        self.confirm_reset_all = false;
+        match writer::reset_all(&self.paths.config) {
+            Ok(()) => {
+                self.reload_config_after_reset();
+                self.last_reload = "all settings reset to defaults (config.json cleared)".into();
+                self.toast_info("all settings reset to defaults");
+            }
+            Err(err) => {
+                self.last_reload = format!("reset-all failed: {err}");
+                self.toast_error(format!("reset-all failed: {err}"));
+            }
+        }
+    }
+
     fn handle_settings_key(&mut self, key: KeyEvent) {
+        // A reset-all confirmation is modal: only y / n / Esc act while armed.
+        if self.confirm_reset_all {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_reset_all_yes(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_reset_all(),
+                _ => {}
+            }
+            return;
+        }
+
         // If a numeric/string edit is in progress, keystrokes feed the buffer.
         if self.settings_edit.is_some() {
             self.handle_settings_edit_key(key);
@@ -1172,6 +1292,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
+            // Reset the selected key to its inherited/default value (5a). Delete
+            // and Backspace both read as "remove this override".
+            KeyCode::Delete | KeyCode::Backspace => self.reset_selected_setting(),
+            // Arm the reset-ALL confirmation (5a). Shift+R, mirroring the
+            // Dashboard's `R restart` convention; the lowercase `r` is the global
+            // refresh.
+            KeyCode::Char('R') => self.arm_reset_all(),
             // Cycle an enum field forward/back; persist immediately.
             KeyCode::Right | KeyCode::Char(' ') | KeyCode::Left => {
                 let forward = !matches!(key.code, KeyCode::Left);
@@ -1524,6 +1651,188 @@ mod tests {
             .unwrap();
         assert_eq!(app.settings_selected, easy_idx);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_selected_deletes_override_and_reverts_to_default() {
+        // 5a: an explicit override is removed from disk and the in-memory value
+        // falls back to the hardcoded default after a config reload.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{\n  \"kv_cache\": \"q8\"\n}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        app.settings_easy = false;
+        assert!(app.config.is_override("kv_cache"));
+        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("q8"));
+
+        // Select kv_cache in the advanced list and reset it.
+        app.settings_selected = app
+            .config
+            .values
+            .keys()
+            .position(|k| k == "kv_cache")
+            .unwrap();
+        app.handle_settings_key(key(KeyCode::Delete));
+
+        // Gone from disk, no longer an override, reverted to the default literal.
+        let raw = std::fs::read_to_string(&app.paths.config).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(!parsed.as_object().unwrap().contains_key("kv_cache"));
+        assert!(!app.config.is_override("kv_cache"));
+        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_selected_is_noop_when_already_default() {
+        // Resetting a key that has no override must not write the file.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{\n  \"thinking\": \"off\"\n}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        app.settings_easy = false;
+        // kv_cache is NOT overridden here.
+        app.settings_selected = app
+            .config
+            .values
+            .keys()
+            .position(|k| k == "kv_cache")
+            .unwrap();
+        let before = std::fs::read_to_string(&app.paths.config).unwrap();
+        app.handle_settings_key(key(KeyCode::Delete));
+        let after = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert_eq!(before, after, "no-op reset must not rewrite the file");
+        assert!(app.last_reload.contains("already at its default"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_all_requires_confirmation_then_clears_file() {
+        // 5a reset-all: Shift+R arms a confirm; only `y` wipes the file.
+        let (mut app, dir) = test_app();
+        std::fs::write(
+            &app.paths.config,
+            "{\n  \"kv_cache\": \"q8\",\n  \"dflash_mode\": \"auto\"\n}\n",
+        )
+        .unwrap();
+        app.config = ConfigState::load(&app.paths);
+
+        // Arm, then CANCEL — the file is untouched.
+        app.handle_settings_key(key(KeyCode::Char('R')));
+        assert!(app.confirm_reset_all, "Shift+R arms the confirm");
+        app.handle_settings_key(key(KeyCode::Char('n')));
+        assert!(!app.confirm_reset_all, "n cancels");
+        let still: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
+        assert_eq!(still.as_object().unwrap().len(), 2, "cancel keeps overrides");
+
+        // Arm again and CONFIRM — config.json becomes {}.
+        app.handle_settings_key(key(KeyCode::Char('R')));
+        app.handle_settings_key(key(KeyCode::Char('y')));
+        assert!(!app.confirm_reset_all);
+        let cleared: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
+        assert_eq!(cleared, serde_json::json!({}), "confirm clears the file");
+        assert!(!app.config.is_override("kv_cache"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cycled_setting_is_resettable_same_session() {
+        // 5a review #1: a setting changed this session (via cycle/persist) is
+        // immediately an override, so Delete can reset it without a full reload.
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        app.settings_easy = false;
+        // Cycle kv_cache off its default (auto -> q8) — persists + marks override.
+        app.settings_selected = app
+            .config
+            .values
+            .keys()
+            .position(|k| k == "kv_cache")
+            .unwrap();
+        app.handle_settings_key(key(KeyCode::Right));
+        assert!(app.config.is_override("kv_cache"), "persist marks the override");
+        assert_ne!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+
+        // Now Delete must actually reset it (not report "already default").
+        app.handle_settings_key(key(KeyCode::Delete));
+        assert!(!app.config.is_override("kv_cache"));
+        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+        assert!(app.last_reload.contains("reset to default"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_all_keeps_cursor_on_surviving_key() {
+        // 5a review #4: reset-all removes disk-only keys ("aaa" here), shifting a
+        // surviving default key (kv_cache) up the BTreeMap. The cursor must follow
+        // kv_cache to its new index, not stay on the stale numeric position.
+        let (mut app, dir) = test_app();
+        std::fs::write(
+            &app.paths.config,
+            "{\n  \"aaa\": \"x\",\n  \"kv_cache\": \"q8\"\n}\n",
+        )
+        .unwrap();
+        app.config = ConfigState::load(&app.paths);
+        app.settings_easy = false;
+        app.settings_selected = app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+        let before_idx = app.settings_selected;
+
+        // Confirmed reset-all.
+        app.handle_settings_key(key(KeyCode::Char('R')));
+        app.handle_settings_key(key(KeyCode::Char('y')));
+
+        // "aaa" is gone; kv_cache survives (a default key) at a NEW, lower index.
+        assert!(!app.config.values.contains_key("aaa"));
+        let new_idx = app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+        assert!(new_idx < before_idx, "kv_cache shifted up after aaa removed");
+        assert_eq!(
+            app.config.values.keys().nth(app.settings_selected).map(String::as_str),
+            Some("kv_cache"),
+            "cursor follows kv_cache to its new row"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_on_corrupt_config_points_to_reset_all() {
+        // 5a review #5: a corrupt config.json is not "already default" — direct
+        // the user to reset-all (the recovery hatch).
+        let (mut app, dir) = test_app();
+        std::fs::write(&app.paths.config, "{ broken not json").unwrap();
+        app.config = ConfigState::load(&app.paths);
+        assert!(app.config.warning.is_some(), "corrupt file loads with a warning");
+        app.settings_easy = false;
+        app.settings_selected = 0;
+        app.handle_settings_key(key(KeyCode::Delete));
+        assert!(
+            app.last_reload.contains("reset all") || app.last_reload.contains("unreadable"),
+            "got: {}",
+            app.last_reload
+        );
+        // The corrupt file was NOT clobbered by the single-key path.
+        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{ broken not json");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_all_confirm_is_modal_against_quit_and_reload() {
+        // While the reset-all confirm is armed, a stray key (not y/n/Esc) must be
+        // swallowed — it neither cancels nor leaks to a global shortcut.
+        let (mut app, dir) = test_app();
+        app.handle_settings_key(key(KeyCode::Char('R')));
+        assert!(app.confirm_reset_all);
+        app.handle_settings_key(key(KeyCode::Char('j'))); // would normally move
+        assert!(app.confirm_reset_all, "unrelated key is swallowed, stays armed");
+        app.handle_settings_key(key(KeyCode::Esc));
+        assert!(!app.confirm_reset_all, "Esc cancels");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

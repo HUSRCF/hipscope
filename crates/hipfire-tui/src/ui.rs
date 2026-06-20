@@ -208,10 +208,12 @@ fn footer_hints(app: &App) -> String {
             }
         }
         Tab::Settings => {
-            if app.settings_edit.is_some() {
+            if app.confirm_reset_all {
+                "Reset ALL settings to defaults?  y confirm · n / Esc cancel".to_string()
+            } else if app.settings_edit.is_some() {
                 "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
             } else {
-                format!("e easy · a advanced · Up/Down select · Left/Right/Space cycle · Enter edit · r refresh · {global}")
+                format!("e easy · a advanced · Up/Down select · Left/Right/Space cycle · Enter edit · Del reset · R reset-all · r refresh · {global}")
             }
         }
         Tab::System => {
@@ -855,25 +857,44 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(8)])
         .split(pad(area, 1, 0));
-    let mode = if app.settings_easy {
-        "Easy settings"
-    } else {
-        "Advanced settings"
-    };
-    let note = if let Some(edit) = &app.settings_edit {
-        // Show the live edit buffer.
-        format!("editing {} = {}_  (Enter save, Esc cancel)", edit.key, edit.buffer)
-    } else if app.settings_easy {
-        "Writable. Left/Right cycle, Enter edits numbers. Press a for advanced.".to_string()
-    } else {
-        "Writable raw config. Left/Right cycle, Enter edits. Press e for easy.".to_string()
-    };
-    frame.render_widget(
-        Paragraph::new(format!("{mode}    {note}"))
-            .block(block("Settings"))
+    if app.confirm_reset_all {
+        // Destructive: clears the whole config.json (default_model / host / port
+        // included). RED-bordered, like the Models delete-confirm.
+        frame.render_widget(
+            Paragraph::new(
+                "Reset ALL settings to defaults? This clears ~/.hipfire/config.json.  \
+                 y = confirm · n / Esc = cancel",
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RED))
+                    .title(" Confirm reset-all "),
+            )
             .style(Style::default().fg(TEXT).bg(PANEL)),
-        chunks[0],
-    );
+            chunks[0],
+        );
+    } else {
+        let mode = if app.settings_easy {
+            "Easy settings"
+        } else {
+            "Advanced settings"
+        };
+        let note = if let Some(edit) = &app.settings_edit {
+            // Show the live edit buffer.
+            format!("editing {} = {}_  (Enter save, Esc cancel)", edit.key, edit.buffer)
+        } else if app.settings_easy {
+            "Writable. Left/Right cycle, Enter edits, Del resets. Press a for advanced.".to_string()
+        } else {
+            "Writable raw config. Left/Right cycle, Enter edits, Del resets. Press e for easy.".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{mode}    {note}"))
+                .block(block("Settings"))
+                .style(Style::default().fg(TEXT).bg(PANEL)),
+            chunks[0],
+        );
+    }
 
     if app.settings_easy {
         let rows_all = app
@@ -1551,6 +1572,27 @@ mod render_tests {
         });
         assert!(text.contains("Confirm delete"), "confirm prompt title");
         assert!(text.contains("y to confirm"), "y/n guidance shown");
+    }
+
+    #[test]
+    fn settings_reset_all_confirm_prompt_renders() {
+        // 5a: the armed reset-all confirm shows the destructive prompt + y/n
+        // guidance and names the file it clears.
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.confirm_reset_all = true;
+        });
+        assert!(text.contains("Confirm reset-all"), "confirm prompt title");
+        assert!(text.contains("config.json"), "names the file it clears");
+        assert!(text.contains("y = confirm"), "y/n guidance shown");
+    }
+
+    #[test]
+    fn settings_footer_shows_reset_controls() {
+        // 5a: reset + reset-all are discoverable in the Settings footer.
+        let text = render_with(|app| app.tab = Tab::Settings);
+        assert!(text.contains("Del reset"), "single-key reset hint");
+        assert!(text.contains("R reset-all"), "reset-all hint");
     }
 
     #[test]

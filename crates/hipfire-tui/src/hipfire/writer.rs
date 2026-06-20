@@ -286,6 +286,37 @@ impl std::fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+/// Remove a single key from the config JSON at `path`, falling its value back to
+/// the inherited/default resolution (registry → arch → hardcoded default). This
+/// mirrors the bun `hipfire config reset <key>` semantics: the CLI sets the key
+/// to its default and then `saveConfig` only writes non-default keys, so the net
+/// effect is the key disappearing from `config.json`. We do that directly —
+/// delete the key, preserve every other key, atomic temp+rename.
+///
+/// Returns `Ok(true)` if the key was present and removed, `Ok(false)` if it was
+/// already absent (no write performed). A corrupt config is an error rather than
+/// a clobber, identical to [`write_raw_value`].
+pub fn delete_key(path: &Path, key: &str) -> Result<bool, WriteError> {
+    let mut obj = read_object(path)?;
+    if obj.remove(key).is_none() {
+        return Ok(false);
+    }
+    write_object(path, &obj)?;
+    Ok(true)
+}
+
+/// Reset the ENTIRE config back to defaults by writing an empty object. Mirrors
+/// the bun `hipfire config reset` (no key): `saveConfig({...CONFIG_DEFAULTS})`
+/// keeps only non-default keys, i.e. writes `{}`. Every resolved value then
+/// falls through registry/arch inheritance again.
+///
+/// Unlike [`delete_key`], this does NOT read-then-merge: it is the recovery
+/// hatch for a stale OR corrupt config, so it unconditionally overwrites the
+/// file with `{}` (a corrupt config must not block its own reset).
+pub fn reset_all(path: &Path) -> Result<(), WriteError> {
+    write_object(path, &serde_json::Map::new())
+}
+
 /// Cycle an enum field's current value to the next (or previous) allowlist entry.
 /// Returns the new value string, or `None` if the key is not a cyclable enum.
 pub fn cycle_enum(key: &str, current: &str, forward: bool) -> Option<String> {
@@ -505,6 +536,80 @@ mod tests {
         fs::write(&cfg, "{ this is not json").unwrap();
         let err = write_value(&cfg, "kv_cache", "q8");
         assert!(matches!(err, Err(WriteError::Parse(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_key_removes_only_that_key() {
+        // 5a: reset one override -> the key disappears (falls back to default),
+        // every OTHER key is preserved verbatim.
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(
+            &cfg,
+            "{\n  \"kv_cache\": \"q8\",\n  \"thinking\": \"off\",\n  \"port\": 11435\n}\n",
+        )
+        .unwrap();
+
+        let removed = delete_key(&cfg, "kv_cache").expect("delete ok");
+        assert!(removed, "an existing key reports removed=true");
+
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert!(!obj.contains_key("kv_cache"), "reset key is gone from disk");
+        assert_eq!(obj.get("thinking").unwrap(), &Value::String("off".into()));
+        assert_eq!(obj.get("port").unwrap().as_i64().unwrap(), 11435);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_absent_key_is_noop() {
+        // Resetting a key that is already at its default (absent on disk) must not
+        // write or error — it simply reports removed=false.
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{\n  \"thinking\": \"off\"\n}\n").unwrap();
+        let removed = delete_key(&cfg, "kv_cache").expect("noop ok");
+        assert!(!removed, "absent key reports removed=false");
+        // File content is byte-for-byte unchanged.
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "{\n  \"thinking\": \"off\"\n}\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_key_refuses_corrupt_file() {
+        // A corrupt config must not be clobbered by a single-key reset (use
+        // reset_all for recovery instead).
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{ not json").unwrap();
+        assert!(matches!(delete_key(&cfg, "kv_cache"), Err(WriteError::Parse(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_all_empties_to_defaults() {
+        // 5a reset-all: everything reverts to defaults -> config.json = {}.
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{\n  \"kv_cache\": \"q8\",\n  \"dflash_mode\": \"auto\"\n}\n").unwrap();
+        reset_all(&cfg).expect("reset all ok");
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(parsed, serde_json::json!({}), "reset-all writes an empty object");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_all_recovers_a_corrupt_config() {
+        // The recovery hatch: a config so broken it can't be parsed must still be
+        // resettable. reset_all overwrites unconditionally (no read-merge).
+        let dir = temp_dir();
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, "{ totally broken ::: not json").unwrap();
+        reset_all(&cfg).expect("reset all recovers corrupt file");
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(parsed, serde_json::json!({}));
         let _ = fs::remove_dir_all(&dir);
     }
 }

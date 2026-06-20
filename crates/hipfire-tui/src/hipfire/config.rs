@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use serde_json::Value;
 
@@ -14,6 +17,12 @@ pub struct ConfigState {
     pub port: u16,
     pub default_model: String,
     pub values: BTreeMap<String, String>,
+    /// Keys explicitly present in `~/.hipfire/config.json` — i.e. user overrides,
+    /// as opposed to inherited/hardcoded defaults. `values` always carries every
+    /// default key merged with the disk overlay, so this set is the only way to
+    /// tell an override apart from a default (drives reset gating + the 5c
+    /// override marker).
+    pub overrides: BTreeSet<String>,
     pub per_model_count: usize,
     pub loaded_from_disk: bool,
     pub warning: Option<String>,
@@ -22,6 +31,7 @@ pub struct ConfigState {
 impl ConfigState {
     pub fn load(paths: &HipfirePaths) -> Self {
         let mut values = defaults();
+        let mut overrides = BTreeSet::new();
         let mut loaded_from_disk = false;
         let mut warning = None;
 
@@ -30,6 +40,7 @@ impl ConfigState {
                 Ok(Value::Object(map)) => {
                     loaded_from_disk = true;
                     for (k, v) in map {
+                        overrides.insert(k.clone());
                         values.insert(k, value_to_string(&v));
                     }
                 }
@@ -63,10 +74,18 @@ impl ConfigState {
             port,
             default_model,
             values,
+            overrides,
             per_model_count,
             loaded_from_disk,
             warning,
         }
+    }
+
+    /// True when `key` is an explicit user override in config.json (vs an
+    /// inherited/hardcoded default). Drives reset gating ("already default") and
+    /// the override marker in the Settings view.
+    pub fn is_override(&self, key: &str) -> bool {
+        self.overrides.contains(key)
     }
 
     pub fn probe_host(&self) -> String {

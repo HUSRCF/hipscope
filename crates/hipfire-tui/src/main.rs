@@ -236,6 +236,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The Settings reset-all confirmation is likewise modal: route every key to
+    // the tab handler (which acts only on y / n / Esc) so a global `q` or `r`
+    // can't quit or reload while the destructive prompt is armed.
+    if app.tab == app::Tab::Settings && app.confirm_reset_all {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // While a settings value is being edited, keystrokes (including q/e/a/r)
     // feed the edit buffer rather than triggering global shortcuts.
     let editing_setting = app.tab == app::Tab::Settings && app.settings_edit.is_some();
@@ -292,8 +300,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 return;
             }
             // Tab-bar click: map the clicked column to a tab via the hit regions
-            // the renderer recorded this frame.
+            // the renderer recorded this frame. Leaving the Settings tab discards
+            // an armed reset-all confirm so it can't linger (and re-arm itself
+            // when the user returns) after the modal key-guard no longer applies.
             if let Some(tab) = app.tab_at(mouse.column, mouse.row) {
+                if tab != app::Tab::Settings {
+                    app.confirm_reset_all = false;
+                }
                 app.tab = tab;
             }
         }
