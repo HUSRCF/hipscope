@@ -34,25 +34,49 @@ pub fn quantize_to_format(
         "hfq6" | "hfq6g256" => (QuantType::HFQ6G256, 256, quantize_hfq6g256(f32_data)),
         "mq4" | "mq4g256" => {
             let (s1, s2) = signs();
-            (QuantType::MQ4G256, 256, quantize_mq4g256(f32_data, &s1, &s2))
+            (
+                QuantType::MQ4G256,
+                256,
+                quantize_mq4g256(f32_data, &s1, &s2),
+            )
         }
         "mq6" | "mq6g256" => {
             let (s1, s2) = signs();
-            (QuantType::MQ6G256, 256, quantize_mq6g256(f32_data, &s1, &s2))
+            (
+                QuantType::MQ6G256,
+                256,
+                quantize_mq6g256(f32_data, &s1, &s2),
+            )
         }
         "mq2lloyd" | "mq2g256lloyd" => {
             let (s1, s2) = signs();
-            (QuantType::MQ2G256Lloyd, 256, quantize_mq2g256_lloyd(f32_data, &s1, &s2))
+            (
+                QuantType::MQ2G256Lloyd,
+                256,
+                quantize_mq2g256_lloyd(f32_data, &s1, &s2),
+            )
         }
         "mq3lloyd" | "mq3g256lloyd" => {
             let (s1, s2) = signs();
-            (QuantType::MQ3G256Lloyd, 256, quantize_mq3g256_lloyd(f32_data, &s1, &s2))
+            (
+                QuantType::MQ3G256Lloyd,
+                256,
+                quantize_mq3g256_lloyd(f32_data, &s1, &s2),
+            )
         }
         "mq4lloyd" | "mq4g256lloyd" => {
             let (s1, s2) = signs();
-            (QuantType::MQ4G256Lloyd, 256, quantize_mq4g256_lloyd(f32_data, &s1, &s2))
+            (
+                QuantType::MQ4G256Lloyd,
+                256,
+                quantize_mq4g256_lloyd(f32_data, &s1, &s2),
+            )
         }
-        other => return Err(format!("reap: unsupported overlay tier '{other}' for {name}")),
+        other => {
+            return Err(format!(
+                "reap: unsupported overlay tier '{other}' for {name}"
+            ))
+        }
     };
     Ok(HfqTensor {
         name: name.to_string(),
@@ -169,22 +193,18 @@ pub fn reap_override_for<'a>(name: &str, arch: ReapArch, plan: &'a ReapPlan) -> 
 /// `expert_index_of` (DRY).
 fn routed_expert_seg(arch: ReapArch) -> (&'static str, fn(&str) -> bool) {
     match arch {
-        ReapArch::Deepseek4 => (
-            ".ffn.experts.",
-            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-        ),
-        ReapArch::Qwen35 => (
-            ".mlp.experts.",
-            |n| n.ends_with(".gate_up_proj.weight") || n.ends_with(".down_proj.weight"),
-        ),
-        ReapArch::Lfm2Moe => (
-            ".feed_forward.experts.",
-            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-        ),
-        ReapArch::Minimax => (
-            ".block_sparse_moe.experts.",
-            |n| n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight"),
-        ),
+        ReapArch::Deepseek4 => (".ffn.experts.", |n| {
+            n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight")
+        }),
+        ReapArch::Qwen35 => (".mlp.experts.", |n| {
+            n.ends_with(".gate_up_proj.weight") || n.ends_with(".down_proj.weight")
+        }),
+        ReapArch::Lfm2Moe => (".feed_forward.experts.", |n| {
+            n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight")
+        }),
+        ReapArch::Minimax => (".block_sparse_moe.experts.", |n| {
+            n.ends_with(".w1.weight") || n.ends_with(".w2.weight") || n.ends_with(".w3.weight")
+        }),
     }
 }
 
@@ -214,7 +234,12 @@ pub fn expert_index_of(name: &str, arch: ReapArch) -> Option<u32> {
 /// compact slot index). `keep_l` is `keep[layer]` — original expert indices in
 /// compact-slot order. Non-routed-expert names (no parseable index) return `None`;
 /// callers gate this fn on routed-expert tensors only.
-pub fn bake_expert_rename(name: &str, arch: ReapArch, _layer: usize, keep_l: &[u32]) -> Option<String> {
+pub fn bake_expert_rename(
+    name: &str,
+    arch: ReapArch,
+    _layer: usize,
+    keep_l: &[u32],
+) -> Option<String> {
     let e = expert_index_of(name, arch)?;
     let slot = keep_l.iter().position(|&k| k == e)?;
     // Replace the expert-index token `.{seg}{E}.` with `.{seg}{slot}.`. The
@@ -291,7 +316,9 @@ fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
             name.contains(".self_attn.") || name.contains(".attn.") || name.contains(".attention.")
         }
         Role::Router => {
-            name.contains(".gate.weight") || name.contains(".router") || name.contains(".gate.tid2eid")
+            name.contains(".gate.weight")
+                || name.contains(".router")
+                || name.contains(".gate.tid2eid")
         }
         Role::SharedExpert => name.contains(".shared_expert") || name.contains(".shared_experts"),
         Role::LmHead => name.contains("lm_head") || name.contains("output.weight"),
@@ -335,7 +362,10 @@ mod tests {
     #[test]
     fn rejects_unknown_tier() {
         let err = quantize_to_format("x", "bogus", &[0.0; 256], &[1, 256]).unwrap_err();
-        assert!(err.contains("unsupported overlay tier 'bogus'"), "got: {err}");
+        assert!(
+            err.contains("unsupported overlay tier 'bogus'"),
+            "got: {err}"
+        );
     }
 }
 
@@ -377,27 +407,47 @@ mod resolve_tests {
             "quant_overrides":[{"layer":5,"role":"routed_experts","tier":"hfq6"}]}"#,
         );
         assert_eq!(
-            reap_override_for("model.layers.5.mlp.experts.99.gate_up_proj.weight", ReapArch::Qwen35, &p),
+            reap_override_for(
+                "model.layers.5.mlp.experts.99.gate_up_proj.weight",
+                ReapArch::Qwen35,
+                &p
+            ),
             Some("hfq6")
         );
         assert_eq!(
-            reap_override_for("model.layers.5.mlp.experts.99.down_proj.weight", ReapArch::Qwen35, &p),
+            reap_override_for(
+                "model.layers.5.mlp.experts.99.down_proj.weight",
+                ReapArch::Qwen35,
+                &p
+            ),
             Some("hfq6")
         );
         assert_eq!(
-            reap_override_for("model.layers.5.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
+            reap_override_for(
+                "model.layers.5.self_attn.q_proj.weight",
+                ReapArch::Qwen35,
+                &p
+            ),
             None
         );
     }
 
     #[test]
     fn layer_token_no_false_positive_2_vs_20() {
-        let p = plan_with(r#"{"original_experts":256,"num_layers":43,
-            "quant_overrides":[{"layer":2,"role":"routed_experts","experts":[0],"tier":"q8"}]}"#);
+        let p = plan_with(
+            r#"{"original_experts":256,"num_layers":43,
+            "quant_overrides":[{"layer":2,"role":"routed_experts","experts":[0],"tier":"q8"}]}"#,
+        );
         // layer-20 tensor must NOT match a layer-2 override
-        assert_eq!(reap_override_for("layers.20.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p), None);
+        assert_eq!(
+            reap_override_for("layers.20.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p),
+            None
+        );
         // layer-2 does match
-        assert_eq!(reap_override_for("layers.2.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p), Some("q8"));
+        assert_eq!(
+            reap_override_for("layers.2.ffn.experts.0.w1.weight", ReapArch::Deepseek4, &p),
+            Some("q8")
+        );
     }
 
     #[test]
@@ -407,11 +457,19 @@ mod resolve_tests {
             "quant_overrides":[{"layer":41,"role":"attention","tier":"q8"}]}"#,
         );
         assert_eq!(
-            reap_override_for("model.layers.41.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
+            reap_override_for(
+                "model.layers.41.self_attn.q_proj.weight",
+                ReapArch::Qwen35,
+                &p
+            ),
             Some("q8")
         );
         assert_eq!(
-            reap_override_for("model.layers.40.self_attn.q_proj.weight", ReapArch::Qwen35, &p),
+            reap_override_for(
+                "model.layers.40.self_attn.q_proj.weight",
+                ReapArch::Qwen35,
+                &p
+            ),
             None
         );
     }
@@ -430,9 +488,7 @@ mod bake_tests {
     #[test]
     fn no_override_bakes_all_at_base_fmt() {
         // Empty quant_overrides → every tensor falls back to base_fmt (q8).
-        let p = plan_with(
-            r#"{"original_experts":128,"num_layers":48,"quant_overrides":[]}"#,
-        );
+        let p = plan_with(r#"{"original_experts":128,"num_layers":48,"quant_overrides":[]}"#);
         let data = vec![0.3f32; 256];
         let tensors = vec![(
             "layers.0.self_attn.q_proj.weight".to_string(),
@@ -482,7 +538,10 @@ mod prune_tests {
     #[test]
     fn drops_pruned_expert() {
         let n = "layers.0.ffn.experts.5.w1.weight";
-        assert_eq!(bake_expert_rename(n, ReapArch::Deepseek4, 0, &[0, 2, 3]), None);
+        assert_eq!(
+            bake_expert_rename(n, ReapArch::Deepseek4, 0, &[0, 2, 3]),
+            None
+        );
     }
 
     #[test]
@@ -589,7 +648,10 @@ mod bake_finalize_tests {
     #[test]
     fn router_bias_classification_per_arch() {
         // Router weight names.
-        assert!(is_reap_router_weight("layers.5.ffn.gate.weight", ReapArch::Deepseek4));
+        assert!(is_reap_router_weight(
+            "layers.5.ffn.gate.weight",
+            ReapArch::Deepseek4
+        ));
         assert!(is_reap_router_weight(
             "model.layers.5.mlp.gate.weight",
             ReapArch::Qwen35
@@ -608,7 +670,10 @@ mod bake_finalize_tests {
             ReapArch::Qwen35
         ));
         // Per-expert bias names.
-        assert!(is_reap_expert_bias("layers.5.ffn.gate.bias", ReapArch::Deepseek4));
+        assert!(is_reap_expert_bias(
+            "layers.5.ffn.gate.bias",
+            ReapArch::Deepseek4
+        ));
         assert!(is_reap_expert_bias(
             "layers.5.feed_forward.expert_bias",
             ReapArch::Lfm2Moe
@@ -617,7 +682,10 @@ mod bake_finalize_tests {
             "model.layers.5.block_sparse_moe.e_score_correction_bias",
             ReapArch::Minimax
         ));
-        assert!(!is_reap_expert_bias("layers.5.ffn.gate.bias", ReapArch::Qwen35));
+        assert!(!is_reap_expert_bias(
+            "layers.5.ffn.gate.bias",
+            ReapArch::Qwen35
+        ));
     }
 
     fn meta(config: &str) -> String {
@@ -709,7 +777,9 @@ mod integ {
 
     /// A 4x256 tensor's worth of varied f32 (matches the plan's matched tensor).
     fn matched_f32() -> Vec<f32> {
-        (0..4 * 256).map(|i| ((i as f32) * 0.017).sin() * 3.0).collect()
+        (0..4 * 256)
+            .map(|i| ((i as f32) * 0.017).sin() * 3.0)
+            .collect()
     }
 
     #[test]
@@ -752,7 +822,10 @@ mod integ {
 
         // (b) bytes equal a direct quantize_hfq4g256 of the matched f32.
         let direct = quantize_hfq4g256(&matched);
-        assert_eq!(out[0].data, direct, "overlay bytes must equal direct encode");
+        assert_eq!(
+            out[0].data, direct,
+            "overlay bytes must equal direct encode"
+        );
 
         // (c) write_hfq → HfqFile round-trip: retrievable by name, right qt.
         let overlay_path = d.path().join("overlay.hfq");
@@ -768,14 +841,22 @@ mod integ {
         assert_eq!(info.quant_type, QuantType::HFQ4G256 as u8);
         assert_eq!(info.shape, vec![4u32, 256]);
         // The non-matched tensors must be absent from the overlay.
-        assert!(hf.find_tensor_info("layers.0.self_attn.q_proj.weight").is_none());
-        assert!(hf.find_tensor_info("layers.0.ffn.experts.1.w1.weight").is_none());
+        assert!(hf
+            .find_tensor_info("layers.0.self_attn.q_proj.weight")
+            .is_none());
+        assert!(hf
+            .find_tensor_info("layers.0.ffn.experts.1.w1.weight")
+            .is_none());
 
         // And the stored data bytes match what we wrote.
         let (_, data) = hf
             .tensor_data(&matched_name)
             .expect("tensor data readable back");
-        assert_eq!(data, &direct[..], "round-tripped data must equal direct encode");
+        assert_eq!(
+            data,
+            &direct[..],
+            "round-tripped data must equal direct encode"
+        );
     }
 
     /// SP3 Task 3: full SP4-overlay → SP3-load round trip on REAL HFQ
@@ -792,8 +873,12 @@ mod integ {
         let attn_name = "layers.0.self_attn.q_proj.weight";
         // [2, 256] = 512 f32 (multiple of the 256 group for the HFQ4G256 tier).
         let shape = [2usize, 256];
-        let exp_f32: Vec<f32> = (0..2 * 256).map(|i| ((i as f32) * 0.019).sin() * 5.0).collect();
-        let attn_f32: Vec<f32> = (0..2 * 256).map(|i| ((i as f32) * 0.011).cos() * 2.0).collect();
+        let exp_f32: Vec<f32> = (0..2 * 256)
+            .map(|i| ((i as f32) * 0.019).sin() * 5.0)
+            .collect();
+        let attn_f32: Vec<f32> = (0..2 * 256)
+            .map(|i| ((i as f32) * 0.011).cos() * 2.0)
+            .collect();
 
         // --- (1) base model: both tensors → Q8F16, arch 9, written to base.hfq.
         let base_dir = tempfile::tempdir().unwrap();
@@ -824,7 +909,10 @@ mod integ {
         std::env::remove_var("HIPFIRE_REAP_PLAN");
 
         // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
-        assert!(f.has_overlay(), "overlay.hfq should auto-attach from HIPFIRE_REAP_PLAN");
+        assert!(
+            f.has_overlay(),
+            "overlay.hfq should auto-attach from HIPFIRE_REAP_PLAN"
+        );
 
         // Expert tensor resolves to the OVERLAY (HFQ4G256), and its bytes equal
         // a direct hfq4g256 encode of the same f32.

@@ -4,14 +4,62 @@ LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
 in the hot path. Ollama-style UX.
 
 ```bash
-hipfire pull qwen3.5:9b
-hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
+hipfire pull lfm2.5:1.2b   # 1.25 GB — small dense model, fast first token
+hipfire serve -d           # background daemon, OpenAI-compatible API on 0.0.0.0:11435
+hipfire chat lfm2.5:1.2b   # interactive chat (auto-starts serve if it isn't running)
 ```
 
-Current release: **v0.2.0** — DeepSeek V4 Flash support. See [CHANGELOG.md](CHANGELOG.md).
+One-shot prompts and bigger models work the same way:
+
+```bash
+hipfire pull qwen3.5:9b
+hipfire run  qwen3.5:9b "What is the capital of France?"
+```
+
+Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4
+Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Curated weights live on Hugging Face at
+[huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
+(newer publishes) and the legacy per-model repos the registry still
+points at.
 
 Discord: <https://discord.gg/F3BaywB8Rs>
+
+## v0.2.1 highlights
+
+- **Dispatch unification (#397).** Every GEMV / GEMM / attention / MoE /
+  rotation / fused projection across all seven architecture crates now
+  resolves through typed kernel families with per-(arch × dtype) tables —
+  adding a dense quant is a table entry plus a kernel file, no model
+  code. Forward-as-pipeline lowered decode is default-on everywhere, and
+  GPU-free coverage gates assert dispatch plans for the whole fleet
+  including RDNA4.
+- **Multi-GPU expert-parallel serving.** `hipfire serve --tp N` shards
+  DeepSeek V4 Flash / MiniMax-M2 experts across N GPUs, with DSML
+  tool-call render/parse on the EP serve path.
+- **RDNA4 F16 fix.** A broken `gemm_f16_tiled` fallback was corrupting
+  ds4's DSA compressor on gfx12 — F16 GEMVs now route through WMMA on
+  RDNA4 (restoring ds4 EP tool-calling), and the rewritten fallback
+  kernel is correct and up to 13.8× faster.
+- **Jinja chat templates default-on** (HF-byte-exact tool rendering),
+  plus q8 error-feedback DeltaNet state by default.
+
+## Supported architectures
+
+| Family | Pull tags | Notes |
+|---|---|---|
+| Qwen 3.5 / 3.6 dense | `qwen3.5:0.8b` … `qwen3.5:27b`, `qwen3.6:27b` | Hybrid DeltaNet + FullAttn; DFlash spec-decode draft tags for 9B/27B |
+| Qwen 3.5 / 3.6 MoE | `qwen3.5:35b-a3b`, `qwen3.6:35b-a3b` | 35B total / 3B active |
+| LFM2.5 family | `lfm2.5:350m`, `lfm2.5:1.2b`, `lfm2.5:1.2b-thinking`, `lfm2.5:8b-a1b` | LiquidAI hybrid conv + GQA, dense and MoE; published under [hipfire-models](https://huggingface.co/hipfire-models) |
+| DeepSeek V4 Flash | `deepseek-v4-flash` | MQ2-Lloyd routed-expert MoE + MTP spec-decode; tool calls; multi-GPU `hipfire serve --tp 4` |
+| MiniMax-M2 | BYO (`hipfire quantize`) | Interleaved thinking, prefix caching, EP serve arm |
+| Qwen2 | BYO (`hipfire quantize`) | Plain Qwen2 decoder (e.g. 1.5B class) |
+| dots.ocr | BYO (`hipfire quantize`) | Qwen2-VL-family layout-extraction VLM — image → structured OCR |
+| LLaMA family | `qwen3:0.6b`, `qwen3:8b`, BYO GGUF | Standard-attention loader path |
+| Gemma 4 | — | In integration (`feat/gemma4-integrate`) — not on master yet |
+
+See [docs/MODELS.md](docs/MODELS.md) for the full curated registry
+(MQ6 variants, drafts, fine-tunes) and bring-your-own-model flows.
 
 ## Why
 
@@ -25,7 +73,8 @@ runtime.
 
 ## Headline numbers — 7900 XTX (gfx1100)
 
-Decode tok/s, default config (asym3 KV, FlashAttention auto):
+Decode tok/s, default config (measured at asym3 KV — perf-equivalent
+to today's `fwht3` per-arch default; FlashAttention auto):
 
 | Model | hipfire decode | hipfire prefill (peak) | vs ollama Q4_K_M |
 |---|---:|---:|---:|
@@ -39,6 +88,14 @@ on 27B HumanEval/53** (4.45× over AR), **372 tok/s peak on 9B**.
 DFlash speedup is genre-conditional — see
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
 and the cross-arch matrix (RDNA1 / RDNA2 / APU / MI300X).
+
+### RDNA4 (gfx1201, Radeon AI PRO R9700)
+
+| Model | Config | Decode tok/s |
+|---|---|---:|
+| Qwen2 1.5B HFQ4 | single GPU | **266** |
+| DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
+| Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
 
 CASK-based KV cache eviction lets you run long-context prompts without
 OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
@@ -159,10 +216,12 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Any change to kernels, quant
-formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path
-must pass `./scripts/coherence-gate-dflash.sh` before commit. The
-canonical correctness gate is per-arch channel-test; the speed-gate
-catches regressions on the baseline arch. Don't bypass either with
-`--no-verify` — see
+See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
+`./scripts/install-hooks.sh`. The no-GPU CI subset is
+`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
+change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
+or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
+before commit. The canonical correctness gate is per-arch channel-test;
+the speed-gate catches regressions on the baseline arch. Don't bypass
+either with `--no-verify` — see
 [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).

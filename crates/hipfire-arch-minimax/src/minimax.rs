@@ -274,10 +274,13 @@ fn load_wt_keep(
     k: usize,
     keep: &[u32],
 ) -> Result<WeightTensor, String> {
-    debug_assert_eq!(m, keep.len(), "minimax load_wt_keep: m must equal keep.len()");
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "minimax load_wt_keep: m must equal keep.len()"
+    );
     let (qt, sub) = hipfire_reap::load::gather_weight_rows("minimax", hfq, name, keep)?;
-    wt_from_raw(gpu, qt, &sub, m, k)
-        .map_err(|e| format!("minimax: load_wt_keep {name}: {e}"))
+    wt_from_raw(gpu, qt, &sub, m, k).map_err(|e| format!("minimax: load_wt_keep {name}: {e}"))
 }
 
 /// REAP keep variant of [`load_norm`] for a 1-D per-expert F16/F32 vector (the
@@ -293,7 +296,11 @@ fn load_norm_keep(
     m: usize,
     keep: &[u32],
 ) -> Result<GpuTensor, String> {
-    debug_assert_eq!(m, keep.len(), "minimax load_norm_keep: m must equal keep.len()");
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "minimax load_norm_keep: m must equal keep.len()"
+    );
     let f32_data = hipfire_reap::load::gather_f32_vec("minimax", hfq, name, keep)?;
     gpu.upload_f32(&f32_data, &[m])
         .map_err(|e| format!("minimax: upload routing_bias {name}: {e:?}"))
@@ -520,7 +527,11 @@ impl MiniMaxWeights {
             // EP shard: only upload rank-owned experts into the compact blob.
             // `local_of_global[e]` maps a global expert id to its slot in the
             // compact (owned-only) blob, or usize::MAX if not owned by this rank.
-            let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+            let owns = |e: usize| {
+                shard
+                    .map(|(s, rank)| s.owns_expert(rank, e))
+                    .unwrap_or(true)
+            };
             let mut local_of_global = vec![usize::MAX; n_exp];
             let mut n_owned = 0usize;
             // Iterate COMPACT slots `0..n_exp`. `e` = the ORIGINAL expert index
@@ -543,7 +554,9 @@ impl MiniMaxWeights {
                     dn_stride = w2.len();
                     qt_gu = qt1;
                     qt_dn = qt2;
-                    let cap = shard.map(|(s, _)| s.experts_per_rank(n_exp)).unwrap_or(n_exp);
+                    let cap = shard
+                        .map(|(s, _)| s.experts_per_rank(n_exp))
+                        .unwrap_or(n_exp);
                     gu_combined.reserve(gu_len * cap);
                     dn_combined.reserve(w2.len() * cap);
                 } else if gu_len != gu_stride || w2.len() != dn_stride {
@@ -681,6 +694,80 @@ impl MiniMaxWeights {
     }
 }
 
+// ──────────────────────────── Teardown ────────────────────────────
+// Exhaustive-destructure frees so a future added GPU-bearing field is a
+// compile error, not a silent VRAM leak. WeightTensors use `free_all`
+// (buf + non-aliased ParoQuant rotation + AWQ sidecar).
+//
+// SHARD=None (single-GPU) LAYOUT ONLY. The only caller that reaches this via
+// unload_model is `load_minimax` (shard=None, MiniMaxWeights::load → arch.rs
+// `..None`), where every expert is a distinct allocation. The EP packed-blob
+// path (shard=Some) aliases non-owned experts onto a shared zeroed buffer and
+// lives only in the standalone ep_minimax example, which manages its own
+// teardown and never builds a LoadedModel — so per-expert free is double-free
+// safe here.
+
+impl MiniMaxExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxExpertWeights { gate_up, down } = self;
+        gate_up.free_all(gpu);
+        down.free_all(gpu);
+    }
+}
+
+impl MiniMaxLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxLayerWeights {
+            attn_norm,
+            ffn_norm,
+            q_norm,
+            k_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            router,
+            routing_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+        } = self;
+        let _ = gpu.free_tensor(attn_norm);
+        let _ = gpu.free_tensor(ffn_norm);
+        let _ = gpu.free_tensor(q_norm);
+        let _ = gpu.free_tensor(k_norm);
+        wq.free_all(gpu);
+        wk.free_all(gpu);
+        wv.free_all(gpu);
+        wo.free_all(gpu);
+        router.free_all(gpu);
+        let _ = gpu.free_tensor(routing_bias);
+        for e in experts {
+            e.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(expert_down_ptrs);
+    }
+}
+
+impl MiniMaxWeights {
+    /// Return all weight GPU buffers to the pool. Consumes self.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxWeights {
+            embed,
+            final_norm,
+            lm_head,
+            layers,
+        } = self;
+        let _ = gpu.free_tensor(embed);
+        let _ = gpu.free_tensor(final_norm);
+        lm_head.free_all(gpu);
+        for layer in layers {
+            layer.free_gpu(gpu);
+        }
+    }
+}
+
 // ──────────────────────────── State ────────────────────────────
 
 /// Per-decode GPU scratch + KV cache. Buffers are eager-allocated (the model
@@ -732,6 +819,67 @@ pub struct MiniMaxState {
 }
 
 impl MiniMaxState {
+    /// Return all decode-scratch + KV-cache GPU buffers to the pool. Consumes
+    /// self. Exhaustive destructure: a future added buffer field fails to
+    /// compile here. `pos_host` is host memory (Box) — no GPU free.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let MiniMaxState {
+            kv,
+            pos_buf,
+            pos_host: _,
+            max_seq: _,
+            n_tokens: _,
+            ar_warmed_up: _,
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        } = self;
+        kv.free_gpu(gpu);
+        // pos_buf is a raw DeviceBuffer (no Drop impl) — free explicitly.
+        let _ = gpu.hip.free(pos_buf);
+        for t in [
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &MiniMaxConfig) -> Result<Self, String> {
         // Cap the KV cache so the real 204800-ctx config doesn't OOM; callers
         // that need a specific window use `new_with_max_seq`.
@@ -744,6 +892,28 @@ impl MiniMaxState {
         cfg: &MiniMaxConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        // `attention_q8_0_kv` (single-token decode) stages its per-head score
+        // buffer in LDS sized by `max_seq`: `(max_seq + block + head_dim) * 4`
+        // bytes must fit the 64 KB per-block shared-memory limit on every RDNA
+        // arch, so the single-token attention launch is hard-bounded near 16K
+        // context. A larger requested window blows the launch
+        // (`hipModuleLaunchKernel: invalid argument` — observed serving the
+        // 86 GB mq2-lloyd on gfx1151 with the daemon's default window: prefill
+        // via the batched kernel succeeds, then the first decode token dies).
+        // Clamp the served window here so the cache, the geometry hint, and the
+        // flash-partial sizing all stay launch-valid. Proper fix = tile the
+        // scores out of LDS (flash-style); tracked as a follow-up.
+        const MINIMAX_ATTN_LDS_MAX_SEQ: usize = 12288;
+        let max_seq = if max_seq > MINIMAX_ATTN_LDS_MAX_SEQ {
+            eprintln!(
+                "[minimax] requested max_seq {max_seq} exceeds the single-token \
+                 attention LDS bound; clamping to {MINIMAX_ATTN_LDS_MAX_SEQ} \
+                 (decode scores must fit the 64 KB per-block shared-mem limit)"
+            );
+            MINIMAX_ATTN_LDS_MAX_SEQ
+        } else {
+            max_seq
+        };
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();

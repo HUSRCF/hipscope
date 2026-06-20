@@ -54,13 +54,20 @@ fn main() {
             _ => panic!("unknown flag: {flag}"),
         }
     }
-    assert!(ctx_len > warmup + 4, "ctx must exceed warmup by enough to score");
+    assert!(
+        ctx_len > warmup + 4,
+        "ctx must exceed warmup by enough to score"
+    );
 
     let want_bytes = (offset + ctx_len) * 8;
     let raw = std::fs::read(&corpus_path).expect("read corpus");
     let take = want_bytes.min(raw.len());
     let corpus = String::from_utf8_lossy(&raw[..take]).to_string();
-    eprintln!("Corpus: {} bytes (of {}) from {corpus_path}", corpus.len(), raw.len());
+    eprintln!(
+        "Corpus: {} bytes (of {}) from {corpus_path}",
+        corpus.len(),
+        raw.len()
+    );
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let cfg = DeepseekV4::config_from_hfq(&hfq).expect("config");
@@ -71,7 +78,11 @@ fn main() {
         DeepseekV4::arch_id(),
         cfg.num_hidden_layers,
         cfg.n_routed_experts,
-        if cfg.reap_keep.is_some() { "ACTIVE" } else { "off" },
+        if cfg.reap_keep.is_some() {
+            "ACTIVE"
+        } else {
+            "off"
+        },
     );
 
     eprintln!("Tokenizing...");
@@ -172,7 +183,11 @@ fn main() {
         }
     }
 
-    let avg_nll = if scored > 0 { total_nll / scored as f64 } else { 0.0 };
+    let avg_nll = if scored > 0 {
+        total_nll / scored as f64
+    } else {
+        0.0
+    };
     let ppl = avg_nll.exp();
     let elapsed = t0.elapsed().as_secs_f64();
     println!();
@@ -186,7 +201,10 @@ fn main() {
             format!("full ({} experts/layer)", cfg.n_routed_experts)
         }
     );
-    println!("Tokens:   offset={offset} ctx={} warmup={warmup}", window.len());
+    println!(
+        "Tokens:   offset={offset} ctx={} warmup={warmup}",
+        window.len()
+    );
     println!("Scored:   {scored}");
     println!("NLL/tok:  {avg_nll:.10}");
     println!("PPL:      {ppl:.4}");

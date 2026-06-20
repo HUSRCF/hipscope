@@ -188,7 +188,11 @@ impl DeepseekV4 {
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
-        let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
@@ -431,13 +435,17 @@ impl DeepseekV4 {
         for &oe in keep {
             let oe = oe as usize;
             if oe >= orig_rows {
-                return Err(format!("deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"));
+                return Err(format!(
+                    "deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"
+                ));
             }
             let base = oe * per_row * 2;
             for j in 0..per_row {
                 let lo = bytes[base + j * 2];
                 let hi = bytes[base + j * 2 + 1];
-                f32_vals.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi])));
+                f32_vals.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    lo, hi,
+                ])));
             }
         }
         let mut shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
@@ -582,7 +590,9 @@ impl DeepseekV4 {
                 for proj in &["w1", "w2", "w3"] {
                     let name = format!("layers.{l}.ffn.experts.{e_src}.{proj}.weight");
                     if hfq.find_tensor_info(&name).is_none() {
-                        return Err(format!("deepseek4: layer {l} expert {e_src} missing '{proj}'"));
+                        return Err(format!(
+                            "deepseek4: layer {l} expert {e_src} missing '{proj}'"
+                        ));
                     }
                 }
             }
@@ -672,8 +682,10 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts =
-            std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS").ok().as_deref() != Some("0");
+        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+            .ok()
+            .as_deref()
+            != Some("0");
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -999,9 +1011,7 @@ impl DeepseekV4 {
                 // topk. Also cache host-side for the CPU-routing path.
                 let bias_name = format!("layers.{l}.ffn.gate.bias");
                 let bias_gpu = match ep.as_ref().and_then(|p| p.keep()) {
-                    Some(keep) => {
-                        Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, keep)?
-                    }
+                    Some(keep) => Self::upload_global_f16_as_f32_keep(hfq, gpu, &bias_name, keep)?,
                     None => Self::upload_global_f16_as_f32(hfq, gpu, &bias_name)?,
                 };
                 layer.gate_bias_host = gpu
@@ -1330,10 +1340,7 @@ impl DeepseekV4 {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
-                let keep = cfg
-                    .reap_keep
-                    .as_ref()
-                    .and_then(|r| r.expert_plan(l).keep());
+                let keep = cfg.reap_keep.as_ref().and_then(|r| r.expert_plan(l).keep());
                 Self::upload_layer_routed_experts(
                     hfq,
                     gpu,

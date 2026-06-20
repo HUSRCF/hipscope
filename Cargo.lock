@@ -188,15 +188,27 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hip-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libloading",
  "thiserror",
 ]
 
 [[package]]
+name = "hipfire-arch-cohere2moe"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -209,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -234,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -244,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -257,18 +269,19 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -281,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -293,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -302,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "regex",
  "serde",
@@ -311,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "md5",
  "regex",
@@ -321,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
@@ -329,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -337,8 +350,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-loader"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-quantize"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder",
  "hipfire-reap",
@@ -352,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-reap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hipfire-runtime",
  "serde_json",
@@ -361,11 +393,12 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "byteorder",
  "hip-bridge",
+ "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-lfm2moe",
@@ -377,6 +410,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-loader",
  "libc",
  "memmap2",
  "minijinja",
@@ -391,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -504,6 +538,7 @@ version = "2.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "805bfd7352166bae857ee569628b52bcd85a1cecf7810861ebceb1686b72b75d"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
  "serde_json",
@@ -629,14 +664,15 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "rayon",
 ]
 
 [[package]]
 name = "redline"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "libloading",

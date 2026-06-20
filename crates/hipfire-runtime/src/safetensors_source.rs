@@ -85,7 +85,11 @@ impl SafetensorsSource {
                     let dtype = meta["dtype"].as_str().unwrap_or("F16").to_string();
                     let shape: Vec<usize> = meta["shape"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let offsets = meta["data_offsets"]
                         .as_array()
@@ -127,6 +131,11 @@ impl SafetensorsSource {
             quant_config,
         })
     }
+
+    /// Public accessor so `loader_api` doesn't need the `ModelSource` trait in scope.
+    pub fn arch_id(&self) -> u32 {
+        self.arch_id
+    }
 }
 
 impl ModelSource for SafetensorsSource {
@@ -146,7 +155,10 @@ impl ModelSource for SafetensorsSource {
         let &(file_idx, tensor_idx) = self.tensor_map.get(name)?;
         let info = &self.tensors[tensor_idx];
         let mmap = &self.files[file_idx].mmap;
-        Some((info, &mmap[info.data_offset..info.data_offset + info.data_size]))
+        Some((
+            info,
+            &mmap[info.data_offset..info.data_offset + info.data_size],
+        ))
     }
 
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
@@ -164,7 +176,11 @@ impl ModelSource for SafetensorsSource {
 
     fn tokenizer_json_path(&self) -> Option<PathBuf> {
         let p = self.dir.join("tokenizer.json");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     fn chat_template(&self) -> Option<String> {
@@ -177,21 +193,26 @@ impl ModelSource for SafetensorsSource {
 }
 
 fn derive_arch_id(config: &serde_json::Value) -> u32 {
-    let archs = config.get("architectures")
+    let archs = config
+        .get("architectures")
         .and_then(|a| a.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
 
     // Check text_config for MoE indicators
     let text_config = config.get("text_config").unwrap_or(config);
-    let has_experts = text_config.get("num_experts")
+    let has_experts = text_config
+        .get("num_experts")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) > 0;
+        .unwrap_or(0)
+        > 0;
 
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
-        if arch_lower.contains("qwen3_5") || arch_lower.contains("qwen3.5")
-            || arch_lower.contains("qwen3_6") || arch_lower.contains("qwen3.6")
+        if arch_lower.contains("qwen3_5")
+            || arch_lower.contains("qwen3.5")
+            || arch_lower.contains("qwen3_6")
+            || arch_lower.contains("qwen3.6")
         {
             return if has_experts { 6 } else { 5 };
         }
@@ -204,23 +225,41 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
     }
 
     // Fallback: check model_type
-    let model_type = config.get("model_type")
+    let model_type = config
+        .get("model_type")
         .or_else(|| text_config.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
     match model_type {
         "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
-            if has_experts { 6 } else { 5 }
+            if has_experts {
+                6
+            } else {
+                5
+            }
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
         _ => {
-            eprintln!("warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)");
-            5
+            // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
+            // carrier matches, so `load_model` fails cleanly with "no carrier for
+            // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
+            // deep in weight loading with a confusing error.
+            eprintln!(
+                "warning: unrecognized model_type '{model_type}'; no carrier claims it \
+                 (add a carrier or extend derive_arch_id's model_type mapping)"
+            );
+            UNCLAIMED_ARCH_ID
         }
     }
 }
+
+/// Sentinel `arch_id` emitted by [`derive_arch_id`] for an unrecognized
+/// `model_type`. No carrier's `claims_arch_id` matches it, so routing fails
+/// loudly with a clean "no carrier" error rather than silently defaulting to
+/// Qwen35. Far outside the assigned range (0..=64) the registry tests sweep.
+const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let qc = config.get("quantization_config")?;
@@ -229,7 +268,8 @@ fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let group_size = qc.get("group_size").and_then(|v| v.as_u64()).unwrap_or(128) as u32;
     let krot = qc.get("krot").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
-    let dynamic_excludes = qc.get("dynamic")
+    let dynamic_excludes = qc
+        .get("dynamic")
         .and_then(|d| d.as_object())
         .map(|obj| {
             obj.keys()
@@ -255,10 +295,14 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
 
     // Determine architecture string
     let text_config = config.get("text_config").unwrap_or(config);
-    let model_type = text_config.get("model_type")
+    let model_type = text_config
+        .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    meta.insert("architecture".to_string(), serde_json::Value::String(model_type.to_string()));
+    meta.insert(
+        "architecture".to_string(),
+        serde_json::Value::String(model_type.to_string()),
+    );
 
     // Embed the full config.json as the "config" key
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw_config) {
@@ -266,4 +310,31 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
     }
 
     serde_json::to_string(&serde_json::Value::Object(meta)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn known_model_types_route_as_expected() {
+        assert_eq!(derive_arch_id(&json!({ "model_type": "llama" })), 0);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "mistral" })), 0);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen2" })), 1);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3.5" })), 5);
+        assert_eq!(
+            derive_arch_id(&json!({ "model_type": "qwen3.5", "num_experts": 8 })),
+            6
+        );
+    }
+
+    /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).
+    /// It returns the unclaimed sentinel so routing fails with a clean "no carrier".
+    #[test]
+    fn unrecognized_model_type_is_unclaimed_not_qwen35() {
+        let id = derive_arch_id(&json!({ "model_type": "totally_unknown_arch" }));
+        assert_eq!(id, UNCLAIMED_ARCH_ID);
+        assert_ne!(id, 5, "must not default to Qwen35");
+    }
 }

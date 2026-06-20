@@ -8,13 +8,17 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, readFileSync, writeFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
+const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
+const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
+const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
@@ -40,6 +44,11 @@ export interface HipfireConfig {
   temperature: number;    // default temperature for run
   top_p: number;
   repeat_penalty: number;
+  /// Computed (never persisted): set by resolveModelConfig when the model
+  /// carries a registry `sampling` recipe. Tells the run/serve paths to send
+  /// temperature RAW (skip the global TEMP_CORRECTION) — the recipe value IS
+  /// the intended sampler temperature.
+  sampling_authoritative?: boolean;
   max_tokens: number;     // per-turn generation cap
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
@@ -73,7 +82,7 @@ export interface HipfireConfig {
   // produce subtle output drift on certain prompt shapes that hide behind
   // higher peak tok/s — confounded debugging when DFlash was silently
   // on by default (auto). Opt in per-model with
-  // `hipfire config set-model <tag> dflash_mode on` once you've confirmed
+  // `hipfire config <tag> set dflash_mode on` once you've confirmed
   // the model + prompt shape on your hardware.
   //
   // A3B-specific rationale (kept for the `auto` path): A3B DFlash is a
@@ -230,8 +239,8 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mmq_screen_threshold: 0.10,
 
   // PFlash off by default. Operators opt in per target via:
-  //   hipfire config set-model <tag> prefill_compression auto
-  //   hipfire config set-model <tag> prefill_drafter ~/.hipfire/models/<drafter>.hfq
+  //   hipfire config <tag> set prefill_compression auto
+  //   hipfire config <tag> set prefill_drafter ~/.hipfire/models/<drafter>.hfq
   prefill_compression: "off",
   prefill_threshold: 32768,
   prefill_keep_ratio: 0.05,
@@ -350,7 +359,9 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
+// Sparse per-tag overrides. Stored in ~/.hipfire/models.json (schema v2).
+// Legacy ~/.hipfire/per_model_config.json is read once and folded into the
+// catalog on refresh.
 // Resolution order: --flag > per-model > global > engine fallback.
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
@@ -381,42 +392,43 @@ type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
 
 function loadPerModelConfigs(): PerModelConfigs {
-  try {
-    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
-    const out: PerModelConfigs = {};
-    let migrated = false;
-    for (const [tag, ov] of Object.entries(raw ?? {})) {
-      const clean: PerModelOverride = {};
-      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
-      // overlays from PR #104 stored true/false; without this they'd fail the
-      // new tri-state validator and the override would silently disappear.
-      if (typeof (ov as any)?.mmq_screen === "boolean") {
-        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
-        migrated = true;
-      }
-      for (const k of PER_MODEL_KEYS) {
-        const v = (ov as any)?.[k];
-        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
-      }
-      if (Object.keys(clean).length > 0) out[tag] = clean;
-    }
-    // Persist migration so the legacy boolean doesn't sit in the file forever
-    // tripping every read. Best-effort: if the write fails (read-only fs,
-    // permission), the in-memory result is still correct for this run.
-    if (migrated) {
-      try { savePerModelConfigs(out); } catch {}
-    }
-    return out;
-  } catch { return {}; }
+  const out: PerModelConfigs = {};
+  const merge = (tag: string, ov: any) => {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = { ...(out[tag] ?? {}), ...clean };
+  };
+
+  for (const [tag, ov] of Object.entries(loadLegacyPerModelConfigsRaw())) merge(tag, ov);
+
+  const catalog = loadModelsCatalog();
+  for (const [tag, ov] of Object.entries(catalog.configs ?? {})) merge(tag, ov);
+  for (const [id, model] of Object.entries(catalog.models ?? {})) {
+    if (!model.config || Object.keys(model.config).length === 0) continue;
+    merge(id, model.config);
+  }
+  return out;
 }
 
 function savePerModelConfigs(all: PerModelConfigs) {
-  // Drop empty entries so the file stays minimal
-  const clean: PerModelConfigs = {};
+  const catalog = refreshModelsCatalog({ write: false });
+  const configs: PerModelConfigs = {};
+
+  for (const model of Object.values(catalog.models)) delete model.config;
+
   for (const [tag, ov] of Object.entries(all)) {
-    if (Object.keys(ov).length > 0) clean[tag] = ov;
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length === 0) continue;
+    const modelId = catalogModelIdForConfigKey(catalog, tag);
+    if (modelId && catalog.models[modelId]) {
+      catalog.models[modelId].config = { ...(catalog.models[modelId].config ?? {}), ...clean };
+    } else {
+      configs[tag] = clean;
+    }
   }
-  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
+
+  catalog.configs = configs;
+  writeModelsCatalog(catalog);
+  clearLegacyPerModelConfigs();
 }
 
 // Return the effective config for a given model tag. Per-model overrides
@@ -428,11 +440,31 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   if (!tag) return base;
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
+  const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
   // Layer both keys: a model can carry overrides under the canonical
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
-  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
+  // Per-model sampling recipe from the registry: the model's recommended
+  // defaults, enforced ABOVE the global default but BELOW any user per-model
+  // override. `sampling_authoritative` tells the run/serve paths to send these
+  // RAW (the recipe IS the intended sampler value — skip TEMP_CORRECTION).
+  const recipe = REGISTRY[resolved]?.sampling;
+  const recipeCfg = recipe
+    ? {
+        ...(recipe.temperature !== undefined ? { temperature: recipe.temperature } : {}),
+        ...(recipe.top_p !== undefined ? { top_p: recipe.top_p } : {}),
+        ...(recipe.repeat_penalty !== undefined ? { repeat_penalty: recipe.repeat_penalty } : {}),
+        sampling_authoritative: true,
+      }
+    : {};
+  return {
+    ...base,
+    ...recipeCfg,
+    ...(catalogId ? (all[catalogId] ?? {}) : {}),
+    ...(all[resolved] ?? {}),
+    ...(tag !== resolved ? (all[tag] ?? {}) : {}),
+  };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -488,6 +520,16 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   }
   const params: any = { max_seq };
 
+  // Expert-parallel degree (EP, task #26). `hipfire serve --tp N` (which sets
+  // HIPFIRE_TP) shards the routed experts across N GPUs via the daemon's
+  // load_model_ep (MiniMax-M2 / DeepSeek-V4). Forwarded only when > 1 so
+  // single-GPU loads stay byte-identical; the daemon refuses tp>1 for
+  // non-EP arches and for DFlash drafters (mutually exclusive with pp).
+  {
+    const tp = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
+    if (Number.isInteger(tp) && tp > 1) params.tp = tp;
+  }
+
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
@@ -541,7 +583,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
   if (!dflashAllowed) {
     if (mode === "auto" && isA3B) {
-      const hint = tag ? `config set-model ${tag} dflash_mode on` : `config set dflash_mode on`;
+      const hint = tag ? `config ${tag} set dflash_mode on` : `config set dflash_mode on`;
       console.error(`[hipfire] DFlash disabled for A3B target (dflash_mode=auto, no sidecar). Override with 'hipfire ${hint}'.`);
     } else if (mode === "off") {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
@@ -584,9 +626,10 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
         const dirs = [
           dirname(path),
+          DRAFTS_DIR,
           `${process.cwd()}/models`,
           `${process.cwd()}/../../models`,
-          `${homedir()}/.hipfire/models`,
+          MODELS_DIR,
         ];
         const candidates: string[] = [];
         for (const d of dirs) {
@@ -636,18 +679,28 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
-      const candidate = join(modelDir, entry.triattn.file);
-      if (existsSync(candidate)) autoAttachedSidecar = candidate;
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        const candidate = join(dir, entry.triattn.file);
+        if (existsSync(candidate)) {
+          autoAttachedSidecar = candidate;
+          break;
+        }
+      }
     }
     if (!autoAttachedSidecar) {
       // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
       // hand-installed sidecars not in the registry.
-      try {
-        const baseName = basename(path);
-        const entries = readdirSync(modelDir);
-        const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
-        if (m) autoAttachedSidecar = join(modelDir, m);
-      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
+      const baseName = basename(path);
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        try {
+          const entries = readdirSync(dir);
+          const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+          if (m) {
+            autoAttachedSidecar = join(dir, m);
+            break;
+          }
+        } catch { /* dir read failures are fine — try the next dir */ }
+      }
     }
   }
   if (autoAttachedSidecar) {
@@ -749,6 +802,12 @@ interface ModelEntry {
   size_gb: number;
   min_vram_gb: number;
   desc: string;
+  /// Per-model sampling recipe — the model's recommended defaults (e.g. the
+  /// HF card's values). Enforced as the default in `resolveModelConfig`: ABOVE
+  /// the global default, BELOW any user per-model override. Sent RAW to the
+  /// sampler (bypasses the global TEMP_CORRECTION). Omit to inherit the global
+  /// default (0.3/0.8 — the qwen-family tune).
+  sampling?: { temperature?: number; top_p?: number; repeat_penalty?: number };
   /// Optional published TriAttention sidecar in the same HF repo. When set,
   /// `hipfire pull` also fetches it next to the weights, and `serve`/`run`
   /// auto-attaches the file at startup if `cask_sidecar` is unset and the
@@ -769,10 +828,49 @@ interface ModelEntry {
 // binary by `bun build --compile`, so the JSON is inlined at build time via
 // `await import` with `assert: { type: "json" }`. Edit-then-rebuild flow
 // keeps the JSON as the source of truth without a runtime fs dep.
+//
+// Dynamic refresh (task #47): compiled binaries would otherwise inline this
+// JSON forever, so `initDynamicRegistry()` (called once at startup, before
+// the command dispatch) swaps in registry/v1.json fetched from GitHub with a
+// 24h cache at ~/.hipfire/registry.cache.json. The bundled data below is the
+// always-works fallback — offline, fetch failure, or a registry that fails
+// validation all leave it untouched. See cli/registry_loader.ts.
 import registryData from "./registry.json" with { type: "json" };
+import {
+  loadDynamicRegistry,
+  DEFAULT_REGISTRY_URL,
+  type RegistrySource,
+} from "./registry_loader";
 
-const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
-const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
+let REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
+let ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
+
+const REGISTRY_CACHE_PATH = join(HIPFIRE_DIR, "registry.cache.json");
+let REGISTRY_SOURCE: RegistrySource = "bundled";
+
+async function initDynamicRegistry(): Promise<void> {
+  // Opt-outs: HIPFIRE_NO_REGISTRY_FETCH=1 pins the bundled registry (also
+  // skips the cache — predictable for debugging); bun test sets NODE_ENV=test
+  // and must never touch the network or ~/.hipfire.
+  if (process.env.HIPFIRE_NO_REGISTRY_FETCH === "1" || process.env.NODE_ENV === "test") return;
+  try {
+    const result = await loadDynamicRegistry({
+      url: process.env.HIPFIRE_REGISTRY_URL || DEFAULT_REGISTRY_URL,
+      cachePath: REGISTRY_CACHE_PATH,
+    });
+    if (result.registry) {
+      // v1 is a strict superset of the bundled shape (validated upstream by
+      // scripts/registry_gen.py and again by validateRegistryV1), so a
+      // wholesale swap is safe — and required, so that models intentionally
+      // removed from the registry actually disappear.
+      REGISTRY = result.registry.models as unknown as Record<string, ModelEntry>;
+      ALIASES = result.registry.aliases;
+      REGISTRY_SOURCE = result.source;
+    }
+  } catch {
+    // Never let registry refresh break the CLI — bundled data always works.
+  }
+}
 
 export function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
@@ -1507,7 +1605,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const modelCfg = resolveModelConfig(model);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
-    temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
+    temperature: temp * (modelCfg.sampling_authoritative ? 1 : TEMP_CORRECTION), max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
   // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
@@ -1980,7 +2078,20 @@ async function serve(port: number, host: string) {
             }
             const entry: any = { role, content: "" };
             if (role === "assistant") {
-              entry.content = stripThinkingInline(extractText(m.content));
+              const rawContent = extractText(m.content);
+              entry.content = stripThinkingInline(rawContent);
+              // Preserve prior-turn reasoning for Cohere/North "interleaved
+              // thinking": carry it in `tool_plan` (rendered into the template's
+              // <|START_THINKING|>{{message.tool_plan}}<|END_THINKING|> slot on
+              // agentic turns). Content stays stripped — Qwen needs that and
+              // ignores tool_plan; only the Cohere template reads it. Prefer an
+              // explicit reasoning field, else fall back to an inline <think>.
+              const inlineThink = (rawContent.match(/<think>([\s\S]*?)<\/think>/)?.[1] ?? "").trim();
+              const reasoning =
+                (typeof m.reasoning === "string" && m.reasoning) ||
+                (typeof m.reasoning_content === "string" && m.reasoning_content) ||
+                inlineThink || "";
+              if (reasoning) entry.tool_plan = reasoning;
               if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
                 const tcs: any[] = [];
                 for (const tc of m.tool_calls) {
@@ -2396,7 +2507,7 @@ async function serve(port: number, host: string) {
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
+          temperature: (body.temperature ?? effective.temperature) * (effective.sampling_authoritative ? 1 : TEMP_CORRECTION),
           max_tokens: requestMaxTokens,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
@@ -2930,6 +3041,10 @@ async function serve(port: number, host: string) {
                 // at 2725). Start in-think so the leading reasoning streams as
                 // reasoning_content and is split off content at the first </think>.
                 let inThink = genParams.assistant_prefix === "open_think";
+                // Latches once the daemon sends an explicit `reasoning:true` token
+                // (Cohere2/North marker-machine split). After that, unflagged
+                // tokens are visible content, not `<think>`-delimited reasoning.
+                let sawReasoningFlag = false;
                 let stripNextLeadingNl = false;
                 // Track whether we've emitted any visible content yet. Used
                 // to detect an orphan `</think>` opener — when the daemon
@@ -2958,6 +3073,31 @@ async function serve(port: number, host: string) {
                   if (msg.type === "token") {
                     completionTokens++;
                     let text = msg.text as string;
+                    // Cohere2-MoE / North-Mini-Code (and any arch whose daemon
+                    // marker state machine splits reasoning itself) tags thinking
+                    // tokens with an explicit `reasoning:true` flag and emits NO
+                    // `<think>`/`</think>` text. Honor the flag — it's
+                    // authoritative. The default thinking-on path sets
+                    // assistant_prefix="open_think" (inThink starts true) on the
+                    // assumption the model closes its reasoning with a `</think>`
+                    // token; North never emits one, so the `</think>` heuristic
+                    // below would trap the entire visible answer in
+                    // reasoning_content. Once we've seen the flag, a token WITHOUT
+                    // it is the visible answer → clear inThink so it streams as
+                    // `content`. Arches that stream literal `<think>` tags (Qwen)
+                    // never set the flag, so this is inert for them.
+                    if ((msg as any).reasoning === true) {
+                      sawReasoningFlag = true;
+                      if (text) {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                        })}\n\n`));
+                        visibleChunkSent = true;
+                      }
+                      continue;
+                    }
+                    if (sawReasoningFlag) inThink = false;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
                       if (text.includes("</think>")) {
@@ -3301,9 +3441,20 @@ async function serve(port: number, host: string) {
         // body that surfaces under `message.reasoning_content` below.
         let reasoningContent = "";
         let daemonFinishReason: string | null = null;
+        // Latches when the daemon sends an explicit `reasoning:true` token
+        // (Cohere2/North marker-machine split — see the streaming path). After
+        // that, reasoning accumulates separately and `content` holds only the
+        // visible answer, so the open_think `<think>`-strip below must be skipped
+        // (it would prepend a synthetic `<think>` and, finding no `</think>`,
+        // strip the whole answer).
+        let nsSawReasoningFlag = false;
         for await (const msg of e.generate(genParams)) {
           if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
-          if (msg.type === "token") { content += msg.text; completionTokens++; }
+          if (msg.type === "token") {
+            completionTokens++;
+            if ((msg as any).reasoning === true) { reasoningContent += msg.text; nsSawReasoningFlag = true; }
+            else content += msg.text;
+          }
           else if (msg.type === "reasoning") {
             // V4F's StreamParser splits `<think>…</think>` content out
             // as `reasoning` events. Accumulate so the non-stream chat
@@ -3388,7 +3539,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag);
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
@@ -3782,17 +3933,16 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
-    const aliasPath = join(HIPFIRE_DIR, "models.json");
-    let aliases: Record<string, any> = {};
-    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
-    aliases[opts.register] = {
+    const catalog = refreshModelsCatalog({ write: false });
+    catalog.aliases[opts.register] = {
       repo: opts.uploadRepo ?? "",
       file: basename(primary.path),
       local_path: primary.path,
       registered_at: new Date().toISOString(),
     };
-    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
+    writeModelsCatalog(catalog);
+    refreshModelsCatalog();
     console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
     console.error(`  Try: hipfire run ${opts.register} "hello"`);
   }
@@ -3807,19 +3957,319 @@ interface UserAlias {
   registered_at?: string;
 }
 
-function loadUserAliases(): Record<string, UserAlias> {
+interface LocalModelRecord {
+  id: string;
+  file: string;
+  path: string;
+  size_bytes: number;
+  size_gb: number;
+  registry_tag?: string | null;
+  aliases?: string[];
+  chat_templates?: string[];
+  dflash_drafts?: string[];
+  triattn?: string[];
+  config?: PerModelOverride;
+}
+
+interface ModelsCatalog {
+  schema_version: 2;
+  updated_at: string;
+  aliases: Record<string, UserAlias>;
+  configs?: PerModelConfigs;
+  models: Record<string, LocalModelRecord>;
+}
+
+const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i;
+
+function readJsonFile(path: string): any | null {
   try {
-    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
-  } catch { return {}; }
+    const raw = readFileSync(path, "utf-8").trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function sanitizePerModelOverride(ov: any): PerModelOverride {
+  const clean: PerModelOverride = {};
+  if (!ov || typeof ov !== "object") return clean;
+  const src = { ...ov };
+  // Migrate legacy boolean mmq_screen -> tri-state.
+  if (typeof src.mmq_screen === "boolean") src.mmq_screen = src.mmq_screen ? "on" : "off";
+  for (const k of PER_MODEL_KEYS) {
+    const v = src[k];
+    if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+  }
+  return clean;
+}
+
+function normalizeAliasMap(raw: any): Record<string, UserAlias> {
+  const aliases: Record<string, UserAlias> = {};
+  if (!raw || typeof raw !== "object") return aliases;
+  for (const [tag, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.file !== "string") continue;
+    aliases[tag] = {
+      repo: typeof v.repo === "string" ? v.repo : "",
+      file: v.file,
+      local_path: typeof v.local_path === "string" ? v.local_path : undefined,
+      registered_at: typeof v.registered_at === "string" ? v.registered_at : undefined,
+    };
+  }
+  return aliases;
+}
+
+function emptyModelsCatalog(aliases: Record<string, UserAlias> = {}): ModelsCatalog {
+  return {
+    schema_version: 2,
+    updated_at: new Date().toISOString(),
+    aliases,
+    configs: {},
+    models: {},
+  };
+}
+
+function sanitizePerModelConfigs(raw: any): PerModelConfigs {
+  const out: PerModelConfigs = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [tag, ov] of Object.entries(raw)) {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = clean;
+  }
+  return out;
+}
+
+function normalizeCatalogModels(raw: any): Record<string, LocalModelRecord> {
+  const models: Record<string, LocalModelRecord> = {};
+  if (!raw || typeof raw !== "object") return models;
+  for (const [id, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.path !== "string" || typeof v.file !== "string") continue;
+    models[id] = {
+      id,
+      file: v.file,
+      path: v.path,
+      size_bytes: Number(v.size_bytes) || 0,
+      size_gb: Number(v.size_gb) || 0,
+      registry_tag: typeof v.registry_tag === "string" ? v.registry_tag : null,
+      aliases: Array.isArray(v.aliases) ? v.aliases.filter((x: any) => typeof x === "string") : [],
+      chat_templates: Array.isArray(v.chat_templates) ? v.chat_templates.filter((x: any) => typeof x === "string") : [],
+      dflash_drafts: Array.isArray(v.dflash_drafts) ? v.dflash_drafts.filter((x: any) => typeof x === "string") : [],
+      triattn: Array.isArray(v.triattn) ? v.triattn.filter((x: any) => typeof x === "string") : [],
+      config: sanitizePerModelOverride(v.config),
+    };
+    if (Object.keys(models[id].config ?? {}).length === 0) delete models[id].config;
+  }
+  return models;
+}
+
+function loadModelsCatalog(): ModelsCatalog {
+  const raw = readJsonFile(MODELS_CATALOG_PATH);
+  if (raw?.schema_version === 2) {
+    return {
+      schema_version: 2,
+      updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date().toISOString(),
+      aliases: normalizeAliasMap(raw.aliases),
+      configs: sanitizePerModelConfigs(raw.configs),
+      models: normalizeCatalogModels(raw.models),
+    };
+  }
+  // Legacy models.json was a flat alias map written by quantize --register.
+  return emptyModelsCatalog(normalizeAliasMap(raw));
+}
+
+function loadLegacyPerModelConfigsRaw(): Record<string, any> {
+  const raw = readJsonFile(PER_MODEL_CONFIG_PATH);
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function clearLegacyPerModelConfigs() {
+  try {
+    if (existsSync(PER_MODEL_CONFIG_PATH)) writeFileSync(PER_MODEL_CONFIG_PATH, "{}\n");
+  } catch {}
+}
+
+function writeModelsCatalog(catalog: ModelsCatalog) {
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  catalog.schema_version = 2;
+  catalog.updated_at = new Date().toISOString();
+  const tmp = `${MODELS_CATALOG_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(catalog, null, 2) + "\n");
+  renameSync(tmp, MODELS_CATALOG_PATH);
+}
+
+function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
+  try {
+    return readdirSync(dir)
+      .filter(pred)
+      .map(f => join(dir, f))
+      .filter(p => {
+        try { return statSync(p).isFile(); } catch { return false; }
+      })
+      .sort();
+  } catch { return []; }
+}
+
+function registryTagForFile(file: string): string | null {
+  const fNorm = file
+    .replace(/\.q4\.hfq$/i, ".hf4")
+    .replace(/\.hfq6\.hfq$/i, ".hf6")
+    .replace(/-hfq4\.hfq$/i, ".hf4")
+    .replace(/\.hfq$/i, ".hf4");
+  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
+}
+
+function modelFamily(id: string): string | null {
+  const lower = id.toLowerCase();
+  const m = lower.match(/^(qwen3(?:\.[56])?|carnice|qwopus|gemma|mistral)/);
+  return m?.[1] ?? null;
+}
+
+function templateMatchesModel(templatePath: string, modelId: string): boolean {
+  const t = basename(templatePath).toLowerCase();
+  const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
+  const lowerId = modelId.toLowerCase();
+  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i, "");
+  if (tStem === lowerId || tStem === modelStem) return true;
+  const family = modelFamily(modelId);
+  if (!family) return false;
+  return tStem === `${family}-chat_template`
+    || tStem === `${family}_chat_template`
+    || tStem === `${family}.chat_template`;
+}
+
+function draftMatchesModel(draftPath: string, modelId: string): boolean {
+  const d = basename(draftPath).toLowerCase();
+  if (!d.endsWith(".hfq")) return false;
+  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq|mq2lloyd)/);
+  if (!m) return false;
+  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
+}
+
+function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
+  const s = basename(sidecarPath).toLowerCase();
+  return s.startsWith(`${modelId.toLowerCase()}.triattn`) && s.endsWith(".bin");
+}
+
+function catalogModelIdForConfigKey(catalog: ModelsCatalog, key: string): string | null {
+  if (catalog.models[key]) return key;
+  const resolved = resolveModelTag(key);
+  for (const model of Object.values(catalog.models)) {
+    if (model.registry_tag === key || model.registry_tag === resolved) return model.id;
+    if ((model.aliases ?? []).includes(key) || (model.aliases ?? []).includes(resolved)) return model.id;
+  }
+  return null;
+}
+
+function refreshModelsCatalog(opts: { write?: boolean } = {}): ModelsCatalog {
+  const shouldWrite = opts.write !== false;
+  const previous = loadModelsCatalog();
+  const legacyConfigs = sanitizePerModelConfigs(loadLegacyPerModelConfigsRaw());
+  const catalog = emptyModelsCatalog(previous.aliases);
+  const templates = scanFiles(TEMPLATES_DIR, f => /\.(j2|jinja|jinja2)$/i.test(f));
+  const drafts = [
+    ...scanFiles(DRAFTS_DIR, f => f.toLowerCase().endsWith(".hfq")),
+    ...scanFiles(MODELS_DIR, f => /dflash/i.test(f) && f.toLowerCase().endsWith(".hfq")),
+  ];
+  const triattn = [
+    ...scanFiles(TRIATTN_DIR, f => f.toLowerCase().endsWith(".triattn.bin")),
+    ...scanFiles(MODELS_DIR, f => /\.triattn.*\.bin$/i.test(f)),
+  ];
+
+  const existingConfigs: PerModelConfigs = { ...(previous.configs ?? {}), ...legacyConfigs };
+  for (const [id, model] of Object.entries(previous.models ?? {})) {
+    if (model.config && Object.keys(model.config).length > 0) existingConfigs[id] = model.config;
+  }
+
+  const modelPaths = [
+    ...scanFiles(MODELS_DIR, f => MODEL_EXT_RE.test(f)),
+    ...scanFiles(resolve(__dirname, "../models"), f => MODEL_EXT_RE.test(f)),
+  ];
+  const seen = new Set<string>();
+  for (const path of modelPaths) {
+    const file = basename(path);
+    if (seen.has(file)) continue;
+    seen.add(file);
+    let st;
+    try { st = statSync(path); } catch { continue; }
+    const registryTag = registryTagForFile(file);
+    const aliases = Object.entries(catalog.aliases)
+      .filter(([_, a]) => {
+        if (a.local_path && resolve(a.local_path) === resolve(path)) return true;
+        return a.file === file;
+      })
+      .map(([tag]) => tag)
+      .sort();
+
+    const configCandidates = [file, registryTag, ...aliases].filter(Boolean) as string[];
+    let mergedConfig: PerModelOverride = {};
+    for (const key of configCandidates) {
+      mergedConfig = { ...mergedConfig, ...sanitizePerModelOverride(existingConfigs[key]) };
+    }
+
+    const rec: LocalModelRecord = {
+      id: file,
+      file,
+      path: resolve(path),
+      size_bytes: st.size,
+      size_gb: Number((st.size / 1e9).toFixed(3)),
+      registry_tag: registryTag,
+      aliases,
+      chat_templates: templates.filter(t => templateMatchesModel(t, file)),
+      dflash_drafts: drafts.filter(d => draftMatchesModel(d, file)),
+      triattn: triattn.filter(s => triattnMatchesModel(s, file)),
+    };
+    if (Object.keys(mergedConfig).length > 0) rec.config = mergedConfig;
+    catalog.models[file] = rec;
+  }
+
+  const unresolved: PerModelConfigs = {};
+  for (const [key, ov] of Object.entries(existingConfigs)) {
+    if (!catalogModelIdForConfigKey(catalog, key)) {
+      const clean = sanitizePerModelOverride(ov);
+      if (Object.keys(clean).length > 0) unresolved[key] = clean;
+    }
+  }
+  catalog.configs = unresolved;
+
+  if (shouldWrite) {
+    try {
+      writeModelsCatalog(catalog);
+      if (Object.keys(legacyConfigs).length > 0) clearLegacyPerModelConfigs();
+    } catch {}
+  }
+  return catalog;
+}
+
+function catalogModelOptions(): string[] {
+  const catalog = loadModelsCatalog();
+  const values = new Set<string>();
+  for (const model of Object.values(catalog.models)) {
+    values.add(model.id);
+    if (model.registry_tag) values.add(model.registry_tag);
+    for (const alias of model.aliases ?? []) values.add(alias);
+  }
+  return [...values].sort();
+}
+
+function loadUserAliases(): Record<string, UserAlias> {
+  return loadModelsCatalog().aliases;
 }
 
 export function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
 
+  const catalog = loadModelsCatalog();
+  const catalogModel = catalog.models[name]
+    ?? catalog.models[resolveModelTag(name)]
+    ?? catalog.models[catalogModelIdForConfigKey(catalog, name) ?? ""];
+  if (catalogModel?.path && existsSync(catalogModel.path)) return resolve(catalogModel.path);
+
   // User aliases (from `hipfire quantize ... --register`) take precedence
   // over the built-in REGISTRY so custom tags always resolve.
-  const userAliases = loadUserAliases();
+  const userAliases = catalog.aliases;
   const alias = userAliases[name] || userAliases[resolveModelTag(name)];
   if (alias) {
     if (alias.local_path && existsSync(alias.local_path)) return resolve(alias.local_path);
@@ -3917,26 +4367,13 @@ export function findModel(name: string): string | null {
 
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
-  const seen = new Set<string>();
-  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6") || f.endsWith(".mq2lloyd")) && !seen.has(f)) {
-        seen.add(f);
-        // statSync may throw on dangling symlinks or files removed mid-scan;
-        // skip those individually instead of aborting the rest of the loop
-        // (a previous try/catch wrapping the entire iteration ate everything
-        // after the first stale symlink — see commit log for the bug story).
-        try {
-          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-          // Find matching registry tag (check new and old naming)
-          const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
-          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
-          models.push({ name: f, tag, size: `${sz}GB` });
-        } catch {}
-      }
-    }
+  const catalog = loadModelsCatalog();
+  for (const model of Object.values(catalog.models).sort((a, b) => a.id.localeCompare(b.id))) {
+    models.push({
+      name: model.id,
+      tag: model.registry_tag ?? "",
+      size: `${(model.size_bytes / 1e9).toFixed(1)}GB`,
+    });
   }
   return models;
 }
@@ -4661,9 +5098,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
-  // Build default_model options from REGISTRY so users can cycle through
-  // known tags without typing. "custom" lets them fall back to free text.
-  const modelOptions = Object.keys(REGISTRY).sort();
+  // Build default_model options from the local catalog so config does not
+  // offer registry-only models that are not actually installed. Fall back to
+  // the registry only on a completely fresh install with no local catalog yet.
+  const modelOptions = catalogModelOptions();
+  if (modelOptions.length === 0) modelOptions.push(...Object.keys(REGISTRY).sort());
 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
@@ -4742,7 +5181,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
-      desc: "show a one-line warning on startup when an experimental feature is enabled",
+      desc: "allow the budget_alert_at_tok / budget_alert_text generate params (research-only in-band nudge injected into the model's think stream — can leak into visible output). false = daemon ignores those params",
       options: ["true", "false"],
     },
     dflash_adaptive_b: {
@@ -4796,7 +5235,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prompt_normalize: {
       label: "prompt_normalize",
-      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      desc: "collapse \\n{3,} → \\n\\n before encode (+24% τ on PEP-8 code prompts; on by default — set false to keep raw whitespace)",
       options: ["true", "false"],
     },
     mmq_screen: {
@@ -5019,7 +5458,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
-      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${MODELS_CATALOG_PATH}${C.reset}\n`);
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
@@ -5346,16 +5785,17 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
 }
 
 // Sub-TUI launched from the global config TUI's "[per-model configs]" row.
-// Lists registered models (REGISTRY + any user-registered aliases), shows
-// which have overrides, and returns the selected tag or null if user escapes.
+// Lists local catalog models, shows which have overrides, and returns the
+// selected model id or null if user escapes.
 function modelPickerTui(): Promise<string | null> {
+  const catalog = loadModelsCatalog();
   const tags = [
-    ...Object.keys(REGISTRY),
-    ...Object.keys(loadUserAliases()),
+    ...Object.keys(catalog.models),
+    ...Object.keys(catalog.configs ?? {}),
   ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
 
   if (tags.length === 0) {
-    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
+    console.log("No local models. Pull one first: hipfire pull qwen3.5:9b");
     return Promise.resolve(null);
   }
 
@@ -5378,9 +5818,10 @@ function modelPickerTui(): Promise<string | null> {
       const ov = overlays[tag];
       const cnt = ov ? Object.keys(ov).length : 0;
       const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
-      const entry = REGISTRY[tag];
-      const desc = entry?.desc ?? "(user-registered)";
-      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
+      const model = catalog.models[tag];
+      const entry = model?.registry_tag ? REGISTRY[model.registry_tag] : undefined;
+      const desc = entry?.desc ?? (model ? model.path : "(config-only)");
+      const size = model ? `${model.size_gb.toFixed(1)}GB`.padStart(7) : "".padStart(7);
       const marker = cnt > 0
         ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
         : `${C.dim}(no overrides)${C.reset}`;
@@ -5527,6 +5968,14 @@ function syncCliRuntimePayload(repoDir: string): void {
 
 // ─── Main ───────────────────────────────────────────────
 
+// Dynamic registry first: refreshModelsCatalog() and every command below
+// read REGISTRY/ALIASES, so the swap must land before any of them run.
+// Cache-fresh path is one small file read; the network path is bounded by
+// REGISTRY_FETCH_TIMEOUT_MS so an offline box never hangs here.
+await initDynamicRegistry();
+
+refreshModelsCatalog();
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "serve": {
@@ -5558,8 +6007,23 @@ switch (cmd) {
       }
       host = raw;
     };
+    // Expert-parallel degree for `hipfire serve --tp N` (or `--tp=N`). Sets
+    // HIPFIRE_TP, which buildLoadMessage forwards as params.tp so the daemon
+    // loads via load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
+    let tpPending = false;
+    const setTp = (raw: string) => {
+      const n = parseInt(raw, 10);
+      if (!Number.isInteger(n) || n < 1 || n > 64) {
+        console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
+        process.exit(1);
+      }
+      process.env.HIPFIRE_TP = String(n);
+    };
     for (const a of rest) {
-      if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+      if (tpPending) { setTp(a); tpPending = false; continue; }
+      if (a === "--tp") { tpPending = true; continue; }
+      else if (a.startsWith("--tp=")) setTp(a.slice(5));
+      else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
       else if (/^\d+$/.test(a)) setPort(a);
       else if (/^\[[^\]]+\]:\d+$/.test(a)) {
         const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
@@ -5572,11 +6036,12 @@ switch (cmd) {
         setPort(a.slice(idx + 1));
       }
       else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
+        console.error(`Usage: hipfire serve [host] [port] [-d|--detach] [--tp N]\n\n`
           + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
           + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
-          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
+          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
+          + `  --tp N         Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N visible GPUs)\n\n`
           + `Background daemon:\n`
           + `  hipfire serve -d           # start in background\n`
           + `  hipfire serve 0.0.0.0:11435 -d\n`
@@ -5584,7 +6049,20 @@ switch (cmd) {
           + `  hipfire ps                 # check if running\n`
           + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
         process.exit(0);
-      } else setHost(a);
+      }
+      // Model-tag-as-host guard: `hipfire serve qwen3.5:9b` used to silently
+      // bind to host "qwen3.5:9b" and fail later. A name:tag shape with a
+      // non-numeric port part (host:port matched above) — or anything that
+      // resolves in the registry — is a model tag, not a bind address.
+      else if (REGISTRY[resolveModelTag(a)] || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
+        console.error(`'${a}' looks like a model tag — \`hipfire serve\` takes [host] [port], not a model.`);
+        console.error(`The server loads models per-request (or pre-warms cfg.default_model). Instead:`);
+        console.error(`  hipfire run ${a} "hello"                # one-shot (uses running serve if any)`);
+        console.error(`  hipfire config set default_model ${a}   # make serve pre-warm this model`);
+        console.error(`  hipfire serve [host] [port]`);
+        process.exit(1);
+      }
+      else setHost(a);
     }
     host = host ?? cfg.host;
     port = port ?? cfg.port;
@@ -5669,12 +6147,12 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 512 },
+      "--max-tokens": { default: 4096 },
       "--system": { default: undefined },
     };
     const stringFlags = new Set(["--image", "--system"]);
@@ -6073,6 +6551,9 @@ switch (cmd) {
   }
   case "diag": {
     console.log("hipfire diagnostics\n");
+    // Where the model list came from this run: network / cache / stale-cache
+    // (dynamic registry/v1.json) or bundled (compiled-in registry.json).
+    console.log(`registry:      ${REGISTRY_SOURCE}`);
     const sh = (cmd: string) => {
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
@@ -6307,6 +6788,11 @@ Examples:
   }
   case "rm": {
     const tag = rest[0] || "";
+    if (!tag) {
+      console.error("Usage: hipfire rm <model>   (e.g. hipfire rm qwen3.5:9b)");
+      console.error("  See installed models: hipfire list");
+      process.exit(1);
+    }
     const resolved = resolveModelTag(tag);
     const entry = REGISTRY[resolved];
     const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
@@ -6315,6 +6801,8 @@ Examples:
       console.log(`Removed ${path}`);
     } else {
       console.error(`Model not found: ${tag}`);
+      console.error(`  See installed models: hipfire list`);
+      process.exit(1);
     }
     break;
   }
@@ -6633,15 +7121,16 @@ Examples:
     // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
     // `hipfire config <model:tag> cask-profile <name>`   → per-model bundle setter
     //
-    // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
-    // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
+    // Disambiguate: first arg is a model tag if it maps to a local catalog
+    // model, a known REGISTRY entry, or matches the `name:tag` shape.
+    // Otherwise treat as action.
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
-      // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
-      if (REGISTRY[resolved] || firstArg.includes(":")) {
-        modelScope = resolved;
+      const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
+      if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = catalogId ?? resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
     }
@@ -6700,7 +7189,7 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
-        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
+        console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
           const v = (merged as any)[k];
@@ -6874,6 +7363,14 @@ Examples:
     break;
   }
   default: {
+    // Unknown command: error to stderr + nonzero exit so scripts can detect
+    // the typo instead of parsing help text off a 0-exit stdout.
+    // `help`/`-h`/`--help` are explicit help requests, not typos.
+    if (cmd && !["help", "-h", "--help"].includes(cmd)) {
+      console.error(`Unknown command: ${cmd}`);
+      console.error(`Run \`hipfire help\` for the full command list.`);
+      process.exit(1);
+    }
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
     if (!cmd) {
@@ -6887,7 +7384,8 @@ Examples:
         console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
         console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);
         console.log(`  3. Run your first prompt:   \x1b[1mhipfire run qwen3.5:4b "hello"\x1b[0m`);
-        console.log(`  4. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
+        console.log(`  4. Chat interactively:      \x1b[1mhipfire chat qwen3.5:4b\x1b[0m`);
+        console.log(`  5. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
         console.log(`\nFull command list:\n`);
       }
     }
@@ -6895,6 +7393,7 @@ Examples:
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
+  chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon

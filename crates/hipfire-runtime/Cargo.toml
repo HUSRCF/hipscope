@@ -40,13 +40,14 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
+arch-cohere2moe = []
 arch-dots-ocr = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
@@ -55,7 +56,12 @@ hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
+# default BTreeMap alphabetic sort. Required so request tool-definition key order
+# survives parse → render → `| tojson`, byte-matching the model's trained
+# chat_template (HF apply_chat_template preserves insertion order). Feature-
+# unifies across the workspace build.
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
@@ -75,7 +81,7 @@ regex = "1"
 # branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
 # inside the system block; without it, tool-using turns die at render time
 # (caught by jinja_smoke scenario C, 2026-05-09).
-minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
 # `pycompat` ships an unknown-method callback that makes Python
 # str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
 # work on plain Jinja values — required by the Qwen3 family
@@ -97,8 +103,10 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
@@ -115,7 +123,7 @@ tempfile = "3"
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
 
 [[example]]
 name = "hfq_split"
@@ -315,8 +323,31 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "build_kld_ref"
 required-features = []
 
+# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
+# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
+[[example]]
+name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
+# F32 oracle (dual forward, no ref top-K approx) for parity with
+# llama-perplexity --kl-divergence full-vocab KLD.
+[[example]]
+name = "eval_hipfire_fullvocab"
+required-features = ["arch-qwen35", "deltanet"]
+
+# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
+# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
+[[example]]
+name = "oracle_xcheck"
+required-features = ["arch-qwen35", "deltanet"]
+
 [[example]]
 name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "collect_e8_hessian_native"
 required-features = ["arch-qwen35", "deltanet"]
 
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /

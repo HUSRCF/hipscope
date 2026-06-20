@@ -74,7 +74,9 @@ impl ReapPlan {
                 "reap: original_experts {original_experts} != model n_routed_experts {orig_experts_expected}"
             ));
         }
-        let num_layers = v["num_layers"].as_u64().unwrap_or(num_layers_expected as u64) as usize;
+        let num_layers = v["num_layers"]
+            .as_u64()
+            .unwrap_or(num_layers_expected as u64) as usize;
         if num_layers != num_layers_expected {
             return Err(format!(
                 "reap: num_layers {num_layers} != model num_hidden_layers {num_layers_expected}"
@@ -108,8 +110,8 @@ impl ReapPlan {
     /// Read & json-parse `<dir>/reap_plan.json`.
     fn read_plan_value(dir: &str) -> Result<serde_json::Value, String> {
         let path = Path::new(dir).join("reap_plan.json");
-        let txt = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reap: read {path:?}: {e}"))?;
+        let txt =
+            std::fs::read_to_string(&path).map_err(|e| format!("reap: read {path:?}: {e}"))?;
         serde_json::from_str(&txt).map_err(|e| format!("reap: parse {path:?}: {e}"))
     }
 
@@ -130,7 +132,11 @@ impl ReapPlan {
                         arr.len()
                     ));
                 }
-                let kept = arr.first().and_then(|r| r.as_array()).map(|r| r.len()).unwrap_or(0);
+                let kept = arr
+                    .first()
+                    .and_then(|r| r.as_array())
+                    .map(|r| r.len())
+                    .unwrap_or(0);
                 // A keep map present but empty (0 kept experts) would override
                 // n_routed_experts to 0 downstream → a model with no routed
                 // experts (router selects from an empty set). Reject early.
@@ -166,9 +172,7 @@ impl ReapPlan {
                         // A duplicate kept index would gather the same expert into
                         // two compact slots → wrong router fan-out / double-count.
                         if !seen.insert(idx) {
-                            return Err(format!(
-                                "reap: keep layer {l} has duplicate index {idx}"
-                            ));
+                            return Err(format!("reap: keep layer {l} has duplicate index {idx}"));
                         }
                         v32.push(idx);
                     }
@@ -191,7 +195,9 @@ impl ReapPlan {
                     ));
                 }
                 let role = Role::parse(
-                    o["role"].as_str().ok_or_else(|| format!("reap: quant_override[{i}] missing role"))?,
+                    o["role"]
+                        .as_str()
+                        .ok_or_else(|| format!("reap: quant_override[{i}] missing role"))?,
                 )?;
                 let experts: Vec<u32> = if let Some(a) = o["experts"].as_array() {
                     a.iter().enumerate().map(|(j, x)| {
@@ -214,7 +220,12 @@ impl ReapPlan {
                     .as_str()
                     .ok_or_else(|| format!("reap: quant_override[{i}] missing tier"))?
                     .to_string();
-                quant_overrides.push(QuantOverride { layer, role, experts, tier });
+                quant_overrides.push(QuantOverride {
+                    layer,
+                    role,
+                    experts,
+                    tier,
+                });
             }
         }
 
@@ -387,9 +398,7 @@ mod tests {
 
     #[test]
     fn loads_legacy_keepmap() {
-        let d = write_legacy(
-            r#"{"kept_per_layer":2,"original_experts":4,"keep":[[0,3],[1,2]]}"#,
-        );
+        let d = write_legacy(r#"{"kept_per_layer":2,"original_experts":4,"keep":[[0,3],[1,2]]}"#);
         let p = ReapPlan::load_any(d.path().to_str().unwrap(), 2, 4).unwrap();
         assert_eq!(p.kept_per_layer(), 2);
         assert_eq!(p.keep.as_ref().unwrap()[0], vec![0, 3]);
@@ -419,9 +428,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_index() {
-        let d = write_plan(
-            r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[0,9]]}}"#,
-        );
+        let d = write_plan(r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[0,9]]}}"#);
         let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
         assert!(err.contains("index 9 >= original_experts 4"), "got: {err}");
     }
@@ -478,9 +485,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_keep_index() {
-        let d = write_plan(
-            r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[1,1]]}}"#,
-        );
+        let d = write_plan(r#"{"original_experts":4,"num_layers":1,"keep":{"per_layer":[[1,1]]}}"#);
         let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
         assert!(err.contains("duplicate index 1"), "got: {err}");
     }

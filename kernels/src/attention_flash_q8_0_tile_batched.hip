@@ -39,7 +39,11 @@ __global__ void attention_flash_q8_0_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int /*v_mode_bits*/,                       // consumed-but-unused: the shared
+                                               // launcher pushes V_MODE_* here for
+                                               // the asym tile kernels; Q8 ignores it.
+    int window                                 // sliding-window span; <= 0 = full causal
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -50,10 +54,32 @@ __global__ void attention_flash_q8_0_tile_batched(
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
     const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
+    // Sliding-window lower bound: a query at position seq_len-1 attends only to
+    // keys in [seq_len-window, seq_len); keys at t < win_lo are masked out.
+    // window <= 0 = full causal (legacy behavior, no lower bound).
+    const int win_lo = (window > 0) ? (seq_len - window) : 0;
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
     const int tile_len = tile_end - tile_start;
+
+    // Sliding-window fast path: a tile entirely below win_lo has no in-window
+    // keys, so it contributes nothing to the output. Write an empty partial
+    // (tile_sum=0 → the reduce skips it via its `p[1] > 0` guard) and return
+    // BEFORE the Q load and Phase A-D. This matters because Phase D below loads
+    // V for every position even when its weight is 0, so the masked-but-iterated
+    // tiles are the dominant per-query cost on sliding layers at long context.
+    // Only fires when window>0 (cohere2moe sliding layers); window<=0 (full
+    // causal, all other arches + the global NoPE layers) is byte-identical.
+    if (window > 0 && tile_end <= win_lo) {
+        if (tid == 0) {
+            float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                 + tile_id * (2 + head_dim);
+            pe[0] = -1e30f;
+            pe[1] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -71,17 +97,24 @@ __global__ void attention_flash_q8_0_tile_batched(
     // Load Q for this batch position: 8 consecutive dims per thread (matches
     // asym3 tile so the dim-indexed partials/reduce layout is identical).
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    const int d0 = tid * 8;
+    // Dims-per-thread = head_dim/32 (4 for hd=128, 8 for hd=256). The block is
+    // always 32 lanes, so the __shfl_xor reductions below still sum over all
+    // head_dim dims; only the per-thread span (d0) scales with head_dim. The
+    // mq[]/out_vec[] arrays stay sized 8 (the hd=256 max).
+    const int dpt = head_dim / 32;
+    const int d0 = tid * dpt;
     float mq[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) mq[i] = q_head[d0 + i];
+    for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
     // Phase A: Q·K (Q8_0 dequant — 8 dims, spanning bi = d0/32, bj = d0%32).
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        if (t < win_lo) {                  // outside sliding window → mask, skip dot
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;                      // t is wave-uniform, so all lanes skip together
+        }
         float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < dpt; i++) {
             const int d = d0 + i;
             const int bi = d / 32;
             const int bj = d % 32;
@@ -126,8 +159,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         float w = scores[t_local];
         int t = tile_start + t_local;
         const unsigned char* vb = v_cache + (size_t)t * row_stride;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < dpt; i++) {
             const int d = d0 + i;
             const int bi = d / 32;
             const int bj = d % 32;
@@ -143,7 +175,6 @@ __global__ void attention_flash_q8_0_tile_batched(
         p[0] = tile_max;
         p[1] = tile_sum;
     }
-    #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < dpt; i++)
         p[2 + d0 + i] = out_vec[i];
 }

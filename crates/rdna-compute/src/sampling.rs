@@ -11,10 +11,26 @@ use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
+/// Whether the multi-workgroup parallel sampler is enabled (default ON).
+/// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
+/// byte-exact A/B and as a fallback). Read once, cached.
+fn sample_parallel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("HIPFIRE_SAMPLE_PARALLEL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 impl Gpu {
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
-        &mut self, logits: &GpuTensor, result: &GpuTensor, vocab_size: usize,
+        &mut self,
+        logits: &GpuTensor,
+        result: &GpuTensor,
+        vocab_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("max_prob", kernels::MAX_PROB_SRC, "max_prob")?;
@@ -23,12 +39,22 @@ impl Gpu {
         let mut rp = result.buf.as_ptr();
         let mut vs = vocab_size as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void, &mut rp as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
             &mut vs as *mut _ as *mut c_void,
         ];
         let block = 256u32;
         let shared = (block * 4) as u32;
-        unsafe { self.hip.launch_kernel(func, [1, 1, 1], [block, 1, 1], shared, self.stream_ref(), &mut params) }
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block, 1, 1],
+                shared,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
     }
 
     /// GPU-side batched argmax: writes one i32 index per row into `result`
@@ -68,7 +94,9 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dp); b.push_ptr(rp); b.push_i32(nn);
+                b.push_ptr(dp);
+                b.push_ptr(rp);
+                b.push_i32(nn);
                 b
             },
         )
@@ -96,18 +124,23 @@ impl Gpu {
         let block_size = 256u32;
         let shared = block_size * 8; // float + int per thread
         unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [block_size, 1, 1], shared, None, &mut params)?;
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block_size, 1, 1],
+                shared,
+                None,
+                &mut params,
+            )?;
         }
 
         let mut result = [0i32];
-        let result_bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 4)
-        };
+        let result_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 4) };
         self.hip.memcpy_dtoh(result_bytes, &result_buf)?;
         self.hip.free(result_buf)?;
         Ok(result[0] as u32)
     }
-
 
     /// GPU-side top-K + top-P sampling. Returns (token_id, new_rng_state).
     /// Eliminates 600KB logits download per token.
@@ -126,8 +159,17 @@ impl Gpu {
         // Back-compat shim: no presence/frequency penalties (byte-identical
         // to the pre-PF kernel, which had `if (repeat_penalty > 1.0f)`).
         self.sample_top_p_pf(
-            logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
-            rng_state, repeat_window, repeat_penalty, 0.0, 0.0,
+            logits,
+            result_buf,
+            repeat_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+            0.0,
+            0.0,
         )
     }
 
@@ -153,6 +195,25 @@ impl Gpu {
         frequency_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         self.bind_thread()?;
+        // Multi-workgroup parallel sampler (default ON): splits the 150K-vocab
+        // top-K scan across N blocks instead of the single-block kernel that
+        // idles 95 of 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-
+        // identical token for distinct logits. Opt out: HIPFIRE_SAMPLE_PARALLEL=0.
+        if sample_parallel_enabled() {
+            return self.sample_top_p_parallel_impl(
+                logits,
+                result_buf,
+                repeat_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                repeat_window,
+                repeat_penalty,
+                presence_penalty,
+                frequency_penalty,
+            );
+        }
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
 
@@ -195,6 +256,152 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )?;
+        }
+
+        let mut out = [0u8; 8];
+        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
+        Ok((token_id, new_rng))
+    }
+
+    /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Three
+    /// stream-ordered launches: an in-place penalty prepass (only when a
+    /// penalty is active), `sample_topk_partial` (vocab top-K split across
+    /// `N_BLOCKS` workgroups → partials scratch), and `sample_topk_finalize`
+    /// (merge partials → global top-K + the verbatim softmax/sort/top-p/RNG
+    /// tail). Byte-identical token to the single-block kernel for distinct
+    /// logits.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_top_p_parallel_impl(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        const N_BLOCKS: u32 = 128;
+        const TOP_K: usize = 20;
+        const BLOCK: u32 = 256;
+        // smem: topk_val[BLOCK*TOP_K] + topk_idx[BLOCK*TOP_K], 4 bytes each.
+        let shared_mem = BLOCK * TOP_K as u32 * 4 * 2;
+
+        let m = "sample_top_p_parallel";
+        self.ensure_kernel(
+            m,
+            kernels::SAMPLE_TOP_P_PARALLEL_SRC,
+            "sample_apply_repeat_penalty",
+        )?;
+        self.ensure_kernel(m, kernels::SAMPLE_TOP_P_PARALLEL_SRC, "sample_topk_partial")?;
+        self.ensure_kernel(
+            m,
+            kernels::SAMPLE_TOP_P_PARALLEL_SRC,
+            "sample_topk_finalize",
+        )?;
+
+        // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
+        let n_cand = N_BLOCKS as usize * TOP_K;
+        let val_bytes = n_cand * 4;
+        let partial_base = self
+            .scratch
+            .ensure_sample_partials(&self.hip, val_bytes * 2)?;
+        let partial_val_ptr = partial_base;
+        let partial_idx_ptr =
+            unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut nb = N_BLOCKS as i32;
+        let mut ncand = n_cand as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut pval = partial_val_ptr;
+        let mut pidx = partial_idx_ptr;
+
+        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+
+        // 1) Penalty prepass (in-place on logits), only when active.
+        if any_penalty && repeat_window > 0 {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut repeat_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut rw as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut fp as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_apply_repeat_penalty"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [1, 1, 1],
+                    [BLOCK, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // 2) Per-block partial top-K over vocab strips.
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut nb as *mut _ as *mut c_void,
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_topk_partial"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [N_BLOCKS, 1, 1],
+                    [BLOCK, 1, 1],
+                    shared_mem,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // 3) Merge partials → global top-K, then softmax/top-p/RNG sample.
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+                &mut ncand as *mut _ as *mut c_void,
+                &mut result_ptr as *mut _ as *mut c_void,
+                &mut temp as *mut _ as *mut c_void,
+                &mut tp as *mut _ as *mut c_void,
+                &mut rng as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_topk_finalize"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [1, 1, 1],
+                    [BLOCK, 1, 1],
+                    shared_mem,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
         }
 
         let mut out = [0u8; 8];
@@ -264,7 +471,6 @@ impl Gpu {
         }
     }
 
-
     /// Top-K=1024 extraction over a logits vector. Populates an 8 KB
     /// buffer with [1024 × u32 indices | 1024 × f32 values]. One
     /// device→host copy pulls the whole thing. The host then runs its
@@ -277,7 +483,7 @@ impl Gpu {
     pub fn topk_logits_f32(
         &mut self,
         logits: &GpuTensor,
-        topk_buf: &GpuTensor,   // DType::F32 shape [2048] = 8192 bytes
+        topk_buf: &GpuTensor, // DType::F32 shape [2048] = 8192 bytes
         vocab_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -294,9 +500,18 @@ impl Gpu {
         let bytes = vocab_size * 4 + 8192;
         let timer = crate::profile::begin_timer(&self.hip, "sampling", "topk_logits_f32", bytes);
         let result = unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         };
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -317,7 +532,11 @@ impl Gpu {
         b: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k >= 1 && k <= 8, "topk_logsumexp_batched: K={} must be in [1,8]", k);
+        assert!(
+            k >= 1 && k <= 8,
+            "topk_logsumexp_batched: K={} must be in [1,8]",
+            k
+        );
         self.ensure_kernel(
             "topk_logsumexp_batched",
             kernels::TOPK_LOGSUMEXP_BATCHED_SRC,

@@ -1,7 +1,11 @@
 /// Gather kept rows from a row-major tensor's raw bytes. `shape[0]` is the
 /// row count (e.g. experts); every row must be `bytes.len()/shape[0]` bytes.
 /// Returns `(new_shape, gathered_bytes)`. Exact for row-independent quant.
-pub fn gather_rows(shape: &[usize], bytes: &[u8], keep: &[u32]) -> Result<(Vec<usize>, Vec<u8>), String> {
+pub fn gather_rows(
+    shape: &[usize],
+    bytes: &[u8],
+    keep: &[u32],
+) -> Result<(Vec<usize>, Vec<u8>), String> {
     let orig_rows = *shape.first().unwrap_or(&0);
     if orig_rows == 0 || bytes.len() % orig_rows != 0 {
         return Err(format!(
@@ -14,7 +18,9 @@ pub fn gather_rows(shape: &[usize], bytes: &[u8], keep: &[u32]) -> Result<(Vec<u
     for &oe in keep {
         let oe = oe as usize;
         if oe >= orig_rows {
-            return Err(format!("reap: row-gather keep idx {oe} >= rows {orig_rows}"));
+            return Err(format!(
+                "reap: row-gather keep idx {oe} >= rows {orig_rows}"
+            ));
         }
         out.extend_from_slice(&bytes[oe * rowstride..(oe + 1) * rowstride]);
     }
@@ -30,10 +36,10 @@ mod tests {
     #[test]
     fn gathers_subset_in_order() {
         // 4 rows × 3 bytes
-        let bytes: Vec<u8> = vec![0,0,0, 1,1,1, 2,2,2, 3,3,3];
+        let bytes: Vec<u8> = vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3];
         let (shape, out) = gather_rows(&[4, 3], &bytes, &[2, 0, 3]).unwrap();
         assert_eq!(shape, vec![3, 3]);
-        assert_eq!(out, vec![2,2,2, 0,0,0, 3,3,3]);
+        assert_eq!(out, vec![2, 2, 2, 0, 0, 0, 3, 3, 3]);
     }
 
     #[test]
