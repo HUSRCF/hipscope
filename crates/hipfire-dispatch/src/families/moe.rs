@@ -29,6 +29,13 @@ use crate::types::*;
 
 // ── MoE eligibility lattice ────────────────────────────
 
+/// Routed-expert tiers the mixed-tier bucketed decode path can execute: the
+/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (see
+/// `run_moe_decode_mixed`). A per-expert tier table containing any other DType
+/// cannot be served by the mixed path and is rejected up front with a clear
+/// error rather than failing deep in the per-bucket dispatch.
+pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
+
 /// Per-layer dtype snapshot the MoE eligibility lattice reads. Built by the
 /// model from its weight structs; kept dtype-only so this stays GPU-free and
 /// the dispatch crate needs no dependency on any arch crate.
@@ -40,13 +47,13 @@ use crate::types::*;
 /// routed_* checks relied on).
 pub struct MoeDtypes {
     pub router: DType,
-    pub shared_gate: DType,          // ffn.shared_expert_gate
-    pub shared_expert_gate: DType,   // ffn.shared_expert.gate
-    pub shared_expert_up: DType,     // ffn.shared_expert.up
-    pub shared_expert_down: DType,   // ffn.shared_expert.down
+    pub shared_gate: DType,        // ffn.shared_expert_gate
+    pub shared_expert_gate: DType, // ffn.shared_expert.gate
+    pub shared_expert_up: DType,   // ffn.shared_expert.up
+    pub shared_expert_down: DType, // ffn.shared_expert.down
     pub experts_all_gate_up_mq4: bool,
-    pub routed_gate_up: DType,       // ffn.experts[0].gate_up
-    pub routed_down: DType,          // ffn.experts[0].down
+    pub routed_gate_up: DType, // ffn.experts[0].gate_up
+    pub routed_down: DType,    // ffn.experts[0].down
     /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
     /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
     /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
@@ -62,7 +69,14 @@ pub struct MoeDtypes {
     ///   6 = MFP2G32E8     (16 B hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
     /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
     pub routed_has_mixed_experts: bool,
-    pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
+    pub has_paro_shared: bool, // ffn.paro_shared.is_some()
+    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch. `None`
+    /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
+    /// resolution). `Some(table)` with >1 distinct DType marks the layer
+    /// `mixed`; a `Some` table that is all-equal collapses to the uniform path.
+    pub per_expert_gate_up: Option<Vec<DType>>,
+    /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
+    pub per_expert_down: Option<Vec<DType>>,
 }
 
 impl MoeDtypes {
@@ -117,6 +131,11 @@ pub struct MoeResolution {
     pub routed_indexable_mixed_per_expert: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
+    /// True when a per-expert tier table is `Some` AND contains >1 distinct
+    /// DType — the layer's routed experts span multiple quant tiers and need
+    /// the bucketed dispatch path (Task 3). `None` tables or all-equal `Some`
+    /// tables leave this `false` ⇒ unchanged uniform fast path.
+    pub mixed: bool,
 }
 
 impl MoeResolution {
@@ -167,7 +186,8 @@ impl MoeResolution {
         // shared silu+mul+rotate plumbing applies. Graded mixed-E8 uses the tag-table
         // path (routed_indexable_mixed_per_expert) rather than this uniform arm.
         let routed_gate_up_e8 = matches!(d.routed_gate_up, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
-        let routed_indexable_e8 = arch_has_e8_wmma && routed_gate_up_e8
+        let routed_indexable_e8 = arch_has_e8_wmma
+            && routed_gate_up_e8
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
         let routed_dtype_indexable = routed_indexable_mq4
@@ -191,6 +211,18 @@ impl MoeResolution {
             || routed_gate_up_paro
             || routed_indexable_e8;
 
+        // A per-expert tier table is "mixed" only when it is Some AND spans more
+        // than one distinct DType. A Some table that is all-equal collapses to
+        // the uniform fast path (mixed = false), so existing arches — which pass
+        // None for both tables — are always uniform and byte-identical to today.
+        let table_varies = |t: &Option<Vec<DType>>| {
+            t.as_ref()
+                .and_then(|v| v.split_first())
+                .map(|(first, rest)| rest.iter().any(|dt| dt != first))
+                .unwrap_or(false)
+        };
+        let mixed = table_varies(&d.per_expert_gate_up) || table_varies(&d.per_expert_down);
+
         Self {
             gate_side_mq4,
             gate_fusable,
@@ -204,6 +236,7 @@ impl MoeResolution {
             routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
+            mixed,
         }
     }
 
@@ -350,7 +383,7 @@ pub struct MoeBiasAwareParams<'a> {
     /// model's shared-expert step must have run first to seed this buffer.
     pub ffn_out: &'a GpuTensor,
     // router
-    pub scores: &'a GpuTensor,    // post-sqrt_softplus gate·x (weights use these)
+    pub scores: &'a GpuTensor, // post-sqrt_softplus gate·x (weights use these)
     pub gate_bias: &'a GpuTensor, // per-expert routing bias (selection only)
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
@@ -376,7 +409,10 @@ pub enum MoePrefillRouting<'a> {
     BiasAware { gate_bias: &'a GpuTensor },
     /// Static `tid2eid` hash routing (layers `0..num_hash_layers`). `tokens` is
     /// the device-side `[B]` i32 token-id buffer.
-    Hash { tid2eid: &'a GpuTensor, tokens: &'a GpuTensor },
+    Hash {
+        tid2eid: &'a GpuTensor,
+        tokens: &'a GpuTensor,
+    },
 }
 
 /// Parameters for the deepseek4 batched/prefill MoE (k=6, MQ2-Lloyd). The
@@ -398,15 +434,15 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
     // routing
     pub routing: MoePrefillRouting<'a>,
-    pub scores: &'a GpuTensor,       // post-sqrt_softplus moe_scores_batch [B, n_exp]
+    pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]
     pub topk_indices: &'a GpuTensor, // [B, k_top] (routing out, expert in)
     pub topk_weights: &'a GpuTensor, // [B, k_top]
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     // activation / residual
-    pub x_rot: &'a GpuTensor,        // ffn_x_rot_batch [B, hidden]
-    pub ffn_out: &'a GpuTensor,      // ffn_out_batch [B, hidden] (accumulate target)
+    pub x_rot: &'a GpuTensor,   // ffn_x_rot_batch [B, hidden]
+    pub ffn_out: &'a GpuTensor, // ffn_out_batch [B, hidden] (accumulate target)
     // grouped-path scratch
     pub expert_token_counts: &'a GpuTensor,
     pub expert_offsets: &'a GpuTensor,
@@ -561,15 +597,15 @@ impl MoePrefillResolution {
         // MQ5 grouped-WMMA (`gemm_hfq5g256_moe_grouped_wmma`) is gfx12-only
         // (same as MQ6) — fall back to Path 1 (indexed batched GEMV) on
         // gfx11/gfx9 to avoid the gfx12-only kernel panic.
-        let mq5_on_non_gfx12 = d.routed_gate_up == DType::MQ5G256
-            && !(arch.is_gfx1200() || arch.is_gfx1201());
+        let mq5_on_non_gfx12 =
+            d.routed_gate_up == DType::MQ5G256 && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq5_on_non_gfx12;
         // Mixed per-expert: the merged grouped kernel covers all four dtype
         // tags on any WMMA arch (gfx11 _k2 or gfx12 .gfx12). The routed
         // representative dtype may be MQ6/MQ5 and trip the suppression above,
         // so re-admit Path 2 when the file is graded-mixed (tag table present).
-        let use_path2 = use_path2
-            || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
+        let use_path2 =
+            use_path2 || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
         // mfp4-E8 routed experts: use Path 2 (grouped-WMMA) on gfx1151 and gfx12
         // (RDNA4). Both have a native E8 grouped-WMMA GEMM kernel:
         //   gfx1151 → gemm_mfp4g32_e8_moe_grouped_wmma (gfx1151.hip)
@@ -583,22 +619,19 @@ impl MoePrefillResolution {
         // tok/s). Real prefill throughput is what bench_sweep measures, so route
         // gfx1100 through Path 2 and re-measure. Only ever active under the
         // HIPFIRE_E8_GFX12 batched-prefill gate.
-        let e8_no_grouped =
-            matches!(d.routed_gate_up, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
-            && !(arch.is_rdna3() || arch.is_rdna4());
+        let e8_no_grouped = matches!(
+            d.routed_gate_up,
+            DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8
+        ) && !(arch.is_rdna3() || arch.is_rdna4());
         let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
         let is_gfx1151 = arch.is_gfx1151();
-        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151
-            && flags.moe_paro_i8.unwrap_or(true);
-        let use_paro_i8_k8 = use_paro_i8
-            && flags.moe_paro_i8_k8.unwrap_or(true);
-        let force_mq4_grouped_fp16 = use_path2
-            && is_gfx1151
-            && d.has_mq6_projection()
-            && flags.moe_grouped_i8.is_none();
+        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
+        let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);
+        let force_mq4_grouped_fp16 =
+            use_path2 && is_gfx1151 && d.has_mq6_projection() && flags.moe_grouped_i8.is_none();
         Self {
             use_path2,
             down_path0,
@@ -620,7 +653,9 @@ impl MoeFamily {
     pub fn new() -> Self {
         let mut registry = KernelRegistry::new();
         moe_table::populate(&mut registry);
-        registry.validate().expect("moe kernel table has empty entries");
+        registry
+            .validate()
+            .expect("moe kernel table has empty entries");
         Self { registry }
     }
 
@@ -719,5 +754,66 @@ impl MoeFamily {
 impl KernelFamily for MoeFamily {
     fn name(&self) -> &'static str {
         "moe"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uniform_mq4() -> MoeDtypes {
+        MoeDtypes {
+            router: DType::MQ4G256,
+            shared_gate: DType::MQ4G256,
+            shared_expert_gate: DType::MQ4G256,
+            shared_expert_up: DType::MQ4G256,
+            shared_expert_down: DType::MQ4G256,
+            experts_all_gate_up_mq4: true,
+            routed_gate_up: DType::MQ4G256,
+            routed_down: DType::MQ4G256,
+            routed_has_mixed_experts: false,
+            has_paro_shared: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    #[test]
+    fn resolve_none_per_expert_is_not_mixed() {
+        let d = uniform_mq4();
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.mixed);
+    }
+
+    #[test]
+    fn resolve_some_per_expert_with_varied_tiers_is_mixed() {
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ6G256]); // varies
+        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ6G256]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(r.mixed);
+    }
+
+    #[test]
+    fn resolve_empty_per_expert_table_is_not_mixed_and_does_not_panic() {
+        // A degenerate empty table must not index v[0]; it collapses to uniform.
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![]);
+        d.per_expert_down = Some(vec![]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.mixed);
+    }
+
+    #[test]
+    fn resolve_some_per_expert_all_same_is_not_mixed() {
+        // a per-expert table that is uniform should NOT trigger the mixed path
+        let mut d = uniform_mq4();
+        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ4G256]);
+        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ4G256]);
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(
+            !r.mixed,
+            "a uniform per-expert table must take the fast uniform path"
+        );
     }
 }

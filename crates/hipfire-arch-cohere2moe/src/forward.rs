@@ -817,6 +817,8 @@ pub fn forward_batch(
                         routed_gate_up: edt,
                         routed_down: m.experts[0].down.gpu_dtype,
                         routed_has_mixed_experts: false,
+                        per_expert_gate_up: None,
+                        per_expert_down: None,
                         has_paro_shared: false,
                     },
                     batch_size: b,

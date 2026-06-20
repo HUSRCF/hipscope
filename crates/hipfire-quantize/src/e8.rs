@@ -30,7 +30,7 @@ pub const QUANT_STEP_MFP3: f32 = 1.8;
 /// QUANT_STEP for mfp2-E8 (2-bit nibbles, box [-2,1] via bias=2). MSE-optimal q.
 pub const QUANT_STEP_MFP2: f32 = 3.8;
 
-const COORD_BIAS: i32 = 7;   // biased range [0,15] → integer range [-7,8]
+const COORD_BIAS: i32 = 7; // biased range [0,15] → integer range [-7,8]
 const COORD_BITS: u32 = 4;
 
 // --------------------------------------------------------------------------
@@ -81,14 +81,32 @@ fn closest_e8(u: &[f32; 8]) -> [f32; 8] {
     let a = closest_d8(u);
     // Shift for the D8+1/2 coset.
     let mut ush = [0.0f32; 8];
-    for i in 0..8 { ush[i] = u[i] - 0.5; }
+    for i in 0..8 {
+        ush[i] = u[i] - 0.5;
+    }
     let bsh = closest_d8(&ush);
     let mut b = [0.0f32; 8];
-    for i in 0..8 { b[i] = bsh[i] + 0.5; }
+    for i in 0..8 {
+        b[i] = bsh[i] + 0.5;
+    }
 
-    let da: f32 = (0..8).map(|i| { let e = u[i] - a[i]; e * e }).sum();
-    let db: f32 = (0..8).map(|i| { let e = u[i] - b[i]; e * e }).sum();
-    if da <= db { a } else { b }
+    let da: f32 = (0..8)
+        .map(|i| {
+            let e = u[i] - a[i];
+            e * e
+        })
+        .sum();
+    let db: f32 = (0..8)
+        .map(|i| {
+            let e = u[i] - b[i];
+            e * e
+        })
+        .sum();
+    if da <= db {
+        a
+    } else {
+        b
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -96,12 +114,20 @@ fn closest_e8(u: &[f32; 8]) -> [f32; 8] {
 // --------------------------------------------------------------------------
 pub fn encode_index(p: &[f32; 8]) -> u32 {
     // Determine coset: half-integer coords → coset=1.
-    let coset = if (p[0].fract().abs() - 0.5).abs() < 0.1 { 1u32 } else { 0u32 };
+    let coset = if (p[0].fract().abs() - 0.5).abs() < 0.1 {
+        1u32
+    } else {
+        0u32
+    };
 
     // Integer coords of the underlying D8 point.
     let mut w = [0i32; 8];
     for i in 0..8 {
-        w[i] = if coset == 1 { (p[i] - 0.5).round() as i32 } else { p[i].round() as i32 };
+        w[i] = if coset == 1 {
+            (p[i] - 0.5).round() as i32
+        } else {
+            p[i].round() as i32
+        };
     }
 
     // Bias and clamp to [0,15].
@@ -114,7 +140,11 @@ pub fn encode_index(p: &[f32; 8]) -> u32 {
     let sl: u32 = e.iter().sum();
     if (sl & 1) != 0 {
         // Nudge e[7] by ±1 within [0,15].
-        if e[7] < 15 { e[7] += 1; } else { e[7] -= 1; }
+        if e[7] < 15 {
+            e[7] += 1;
+        } else {
+            e[7] -= 1;
+        }
     }
 
     // Pack: bits[4i..4i+4) = e[i] for i=0..6, bits[28..31) = e[7]>>1, bit[31]=coset.
@@ -160,7 +190,9 @@ pub fn decode_index(idx: u32) -> [f32; 8] {
 /// `q` = QUANT_STEP (0.88); pass `QUANT_STEP` constant.
 pub fn quantize8(v: &[f32; 8], q: f32) -> u32 {
     let mut u = [0.0f32; 8];
-    for i in 0..8 { u[i] = v[i] / q; }
+    for i in 0..8 {
+        u[i] = v[i] / q;
+    }
     let p = closest_e8(&u);
     encode_index(&p)
 }
@@ -170,7 +202,9 @@ pub fn quantize8(v: &[f32; 8], q: f32) -> u32 {
 pub fn dequantize8(idx: u32, q: f32) -> [f32; 8] {
     let p = decode_index(idx);
     let mut v = [0.0f32; 8];
-    for i in 0..8 { v[i] = p[i] * q; }
+    for i in 0..8 {
+        v[i] = p[i] * q;
+    }
     v
 }
 
@@ -213,7 +247,9 @@ fn coord_bias_n(n: u32) -> i32 {
 }
 
 #[inline(always)]
-fn coord_max_n(n: u32) -> i32 { (1i32 << n) - 1 }          // n=4→15, n=3→7, n=2→3
+fn coord_max_n(n: u32) -> i32 {
+    (1i32 << n) - 1
+} // n=4→15, n=3→7, n=2→3
 
 /// Encode an E8 lattice point to an `8n`-bit codeword (returned in low `8n` bits of u32).
 /// `p` must be an actual E8 point (integer or half-integer coords, even D8 sum).
@@ -225,12 +261,20 @@ pub fn encode_index_n(p: &[f32; 8], n: u32) -> u32 {
     let mask: u32 = (1u32 << n) - 1;
 
     // Detect coset from fractional part of the first coordinate.
-    let coset = if (p[0].fract().abs() - 0.5).abs() < 0.1 { 1u32 } else { 0u32 };
+    let coset = if (p[0].fract().abs() - 0.5).abs() < 0.1 {
+        1u32
+    } else {
+        0u32
+    };
 
     // Integer coords of underlying D8 point.
     let mut w = [0i32; 8];
     for i in 0..8 {
-        w[i] = if coset == 1 { (p[i] - 0.5).round() as i32 } else { p[i].round() as i32 };
+        w[i] = if coset == 1 {
+            (p[i] - 0.5).round() as i32
+        } else {
+            p[i].round() as i32
+        };
     }
 
     // Bias, clamp to [0, 2^n - 1].
@@ -243,7 +287,11 @@ pub fn encode_index_n(p: &[f32; 8], n: u32) -> u32 {
     let sl: u32 = e.iter().sum();
     if (sl & 1) != 0 {
         // Nudge e[7] by ±1 within [0, cmax]; same semantics as the n=4 path.
-        if (e[7] as i32) < cmax { e[7] += 1; } else { e[7] -= 1; }
+        if (e[7] as i32) < cmax {
+            e[7] += 1;
+        } else {
+            e[7] -= 1;
+        }
     }
 
     // Pack: bits[n·i .. n·i+n) = e[i] for i=0..6;
@@ -293,7 +341,9 @@ pub fn decode_index_n(idx: u32, n: u32) -> [f32; 8] {
 /// `q` = QUANT_STEP_MFP3 (n=3) or QUANT_STEP_MFP2 (n=2).
 pub fn quantize8_n(v: &[f32; 8], q: f32, n: u32) -> u32 {
     let mut u = [0.0f32; 8];
-    for i in 0..8 { u[i] = v[i] / q; }
+    for i in 0..8 {
+        u[i] = v[i] / q;
+    }
     let p = closest_e8(&u);
     encode_index_n(&p, n)
 }
@@ -302,7 +352,9 @@ pub fn quantize8_n(v: &[f32; 8], q: f32, n: u32) -> u32 {
 pub fn dequantize8_n(idx: u32, q: f32, n: u32) -> [f32; 8] {
     let p = decode_index_n(idx, n);
     let mut v = [0.0f32; 8];
-    for i in 0..8 { v[i] = p[i] * q; }
+    for i in 0..8 {
+        v[i] = p[i] * q;
+    }
     v
 }
 
@@ -315,7 +367,9 @@ mod tests {
 
     /// Simple deterministic LCG for test randomness (no external dep).
     fn lcg_next(state: &mut u64) -> f32 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let hi = (*state >> 32) as u32;
         (hi as f32 / (u32::MAX as f32)) * 2.0 - 1.0
     }
@@ -324,7 +378,9 @@ mod tests {
         loop {
             let u1 = (lcg_next(state) + 1.0) * 0.5; // uniform (0,1]
             let u2 = (lcg_next(state) + 1.0) * 0.5;
-            if u1 <= 0.0 { continue; }
+            if u1 <= 0.0 {
+                continue;
+            }
             let r = (-2.0 * u1.ln()).sqrt() * sigma;
             let theta = 2.0 * std::f32::consts::PI * u2;
             return (r * theta.cos(), r * theta.sin());
@@ -346,7 +402,9 @@ mod tests {
         let mut state = 0x12345678u64;
         for _ in 0..2000 {
             let mut v = [0.0f32; 8];
-            for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+            for i in 0..8 {
+                v[i] = lcg_next(&mut state) * 6.0;
+            }
             let p = closest_d8(&v);
             let s: i32 = p.iter().map(|&x| x as i32).sum();
             assert_eq!(s & 1, 0, "D8 sum not even: {:?}", p);
@@ -359,7 +417,9 @@ mod tests {
         let mut failures = 0usize;
         for _ in 0..500_000 {
             let mut v = [0.0f32; 8];
-            for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+            for i in 0..8 {
+                v[i] = lcg_next(&mut state) * 6.0;
+            }
             let idx = quantize8(&v, QUANT_STEP);
             // Re-encode the decoded point — must give the same index.
             let p = decode_index(idx);
@@ -371,8 +431,12 @@ mod tests {
             let dq = dequantize8(idx, QUANT_STEP);
             for i in 0..8 {
                 let expected = p[i] * QUANT_STEP;
-                assert!((dq[i] - expected).abs() < 1e-6,
-                    "dequantize8 mismatch at i={i}: {:.6} vs {:.6}", dq[i], expected);
+                assert!(
+                    (dq[i] - expected).abs() < 1e-6,
+                    "dequantize8 mismatch at i={i}: {:.6} vs {:.6}",
+                    dq[i],
+                    expected
+                );
             }
         }
         assert_eq!(failures, 0, "bijection failures: {failures}");
@@ -390,7 +454,10 @@ mod tests {
                 for &s in &[1.0f32, -1.0f32] {
                     let v = m * s;
                     let d = (x - v).abs();
-                    if d < best_d { best_d = d; best = v; }
+                    if d < best_d {
+                        best_d = d;
+                        best = v;
+                    }
                 }
             }
             best
@@ -409,15 +476,19 @@ mod tests {
                 let mut block = [0.0f32; 8];
                 for i in 0..4 {
                     let (a, b) = box_muller(&mut state, sigma);
-                    block[2*i] = a;
-                    block[2*i+1] = b;
+                    block[2 * i] = a;
+                    block[2 * i + 1] = b;
                 }
                 // Per-block normalization: max/6 (same as mfp4+P).
                 let bmax = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-                if bmax == 0.0 { continue; }
+                if bmax == 0.0 {
+                    continue;
+                }
                 let sc = bmax / 6.0;
                 let mut vn = [0.0f32; 8];
-                for i in 0..8 { vn[i] = block[i] / sc; }
+                for i in 0..8 {
+                    vn[i] = block[i] / sc;
+                }
 
                 // E8 MSE in original domain.
                 let dq = dequantize8(quantize8(&vn, QUANT_STEP), QUANT_STEP);
@@ -463,23 +534,34 @@ mod tests {
         let mut failures = 0usize;
         for _ in 0..500_000 {
             let mut v = [0.0f32; 8];
-            for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+            for i in 0..8 {
+                v[i] = lcg_next(&mut state) * 6.0;
+            }
             let idx = quantize8_n(&v, q, n);
 
             // High bits must be zero (required for narrow kernel reads).
-            assert_eq!(idx >> (8 * n), 0,
-                "n=3: high bits non-zero: idx=0x{idx:08x}");
+            assert_eq!(
+                idx >> (8 * n),
+                0,
+                "n=3: high bits non-zero: idx=0x{idx:08x}"
+            );
 
             let p = decode_index_n(idx, n);
             let idx2 = encode_index_n(&p, n);
-            if idx != idx2 { failures += 1; }
+            if idx != idx2 {
+                failures += 1;
+            }
 
             // dequantize8_n must equal decode_index_n * q.
             let dq = dequantize8_n(idx, q, n);
             for i in 0..8 {
                 let expected = p[i] * q;
-                assert!((dq[i] - expected).abs() < 1e-6,
-                    "n=3 dequantize8_n mismatch i={i}: {:.6} vs {:.6}", dq[i], expected);
+                assert!(
+                    (dq[i] - expected).abs() < 1e-6,
+                    "n=3 dequantize8_n mismatch i={i}: {:.6} vs {:.6}",
+                    dq[i],
+                    expected
+                );
             }
         }
         assert_eq!(failures, 0, "n=3 bijection failures: {failures}");
@@ -493,22 +575,33 @@ mod tests {
         let mut failures = 0usize;
         for _ in 0..500_000 {
             let mut v = [0.0f32; 8];
-            for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+            for i in 0..8 {
+                v[i] = lcg_next(&mut state) * 6.0;
+            }
             let idx = quantize8_n(&v, q, n);
 
             // High bits must be zero.
-            assert_eq!(idx >> (8 * n), 0,
-                "n=2: high bits non-zero: idx=0x{idx:08x}");
+            assert_eq!(
+                idx >> (8 * n),
+                0,
+                "n=2: high bits non-zero: idx=0x{idx:08x}"
+            );
 
             let p = decode_index_n(idx, n);
             let idx2 = encode_index_n(&p, n);
-            if idx != idx2 { failures += 1; }
+            if idx != idx2 {
+                failures += 1;
+            }
 
             let dq = dequantize8_n(idx, q, n);
             for i in 0..8 {
                 let expected = p[i] * q;
-                assert!((dq[i] - expected).abs() < 1e-6,
-                    "n=2 dequantize8_n mismatch i={i}: {:.6} vs {:.6}", dq[i], expected);
+                assert!(
+                    (dq[i] - expected).abs() < 1e-6,
+                    "n=2 dequantize8_n mismatch i={i}: {:.6} vs {:.6}",
+                    dq[i],
+                    expected
+                );
             }
         }
         assert_eq!(failures, 0, "n=2 bijection failures: {failures}");
@@ -521,15 +614,21 @@ mod tests {
         let n = 4u32;
         for _ in 0..100_000 {
             let mut v = [0.0f32; 8];
-            for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+            for i in 0..8 {
+                v[i] = lcg_next(&mut state) * 6.0;
+            }
             let idx_ref = quantize8(&v, QUANT_STEP);
-            let idx_n   = quantize8_n(&v, QUANT_STEP, n);
+            let idx_n = quantize8_n(&v, QUANT_STEP, n);
             assert_eq!(idx_ref, idx_n, "n=4 mismatch for v={v:?}");
             let p_ref = decode_index(idx_ref);
-            let p_n   = decode_index_n(idx_ref, n);
+            let p_n = decode_index_n(idx_ref, n);
             for i in 0..8 {
-                assert!((p_ref[i] - p_n[i]).abs() < 1e-7,
-                    "n=4 decode mismatch i={i}: {:.7} vs {:.7}", p_ref[i], p_n[i]);
+                assert!(
+                    (p_ref[i] - p_n[i]).abs() < 1e-7,
+                    "n=4 decode mismatch i={i}: {:.7} vs {:.7}",
+                    p_ref[i],
+                    p_n[i]
+                );
             }
         }
     }
@@ -543,10 +642,16 @@ mod tests {
     fn decoded_points_are_valid_e8() {
         let mut state = 0xc0de_cafe_1234_5678u64;
         for &n in &[2u32, 3u32] {
-            let q = if n == 3 { QUANT_STEP_MFP3 } else { QUANT_STEP_MFP2 };
+            let q = if n == 3 {
+                QUANT_STEP_MFP3
+            } else {
+                QUANT_STEP_MFP2
+            };
             for _ in 0..200_000 {
                 let mut v = [0.0f32; 8];
-                for i in 0..8 { v[i] = lcg_next(&mut state) * 6.0; }
+                for i in 0..8 {
+                    v[i] = lcg_next(&mut state) * 6.0;
+                }
                 let idx = quantize8_n(&v, q, n);
                 let p = decode_index_n(idx, n);
 
@@ -554,8 +659,11 @@ mod tests {
                 if coset == 0 {
                     // D8: all coords integer.
                     for i in 0..8 {
-                        assert!(p[i].fract().abs() < 1e-6,
-                            "n={n} D8 non-integer coord[{i}]={:.4}", p[i]);
+                        assert!(
+                            p[i].fract().abs() < 1e-6,
+                            "n={n} D8 non-integer coord[{i}]={:.4}",
+                            p[i]
+                        );
                     }
                     // Even sum.
                     let s: i32 = p.iter().map(|&x| x as i32).sum();
@@ -563,13 +671,20 @@ mod tests {
                 } else {
                     // D8+1/2: all coords half-integer (x - 0.5 is integer).
                     for i in 0..8 {
-                        assert!((p[i].fract().abs() - 0.5).abs() < 1e-5,
-                            "n={n} coset non-half-integer coord[{i}]={:.4}", p[i]);
+                        assert!(
+                            (p[i].fract().abs() - 0.5).abs() < 1e-5,
+                            "n={n} coset non-half-integer coord[{i}]={:.4}",
+                            p[i]
+                        );
                     }
                     // Even sum when shifted: sum(p[i]-0.5) = sum(p[i]) - 4 must be even.
                     let s_shifted: f32 = p.iter().map(|&x| x - 0.5).sum::<f32>();
                     let s_int = s_shifted.round() as i32;
-                    assert_eq!(s_int & 1, 0, "n={n} coset shifted-sum odd: {s_int}, p={p:?}");
+                    assert_eq!(
+                        s_int & 1,
+                        0,
+                        "n={n} coset shifted-sum odd: {s_int}, p={p:?}"
+                    );
                 }
             }
         }
@@ -632,12 +747,15 @@ mod tests {
     fn host_kernel_mirror_n2_exhaustive() {
         // n=2: 2^16 = 65536 codewords, exhaustive.
         for idx in 0u32..(1 << 16) {
-            let rust  = decode_index_n(idx, 2);
-            let kern  = kernel_mirror_decode(idx, 2);
+            let rust = decode_index_n(idx, 2);
+            let kern = kernel_mirror_decode(idx, 2);
             for i in 0..8 {
-                assert!((rust[i] - kern[i]).abs() < 1e-7,
+                assert!(
+                    (rust[i] - kern[i]).abs() < 1e-7,
                     "n=2 idx=0x{idx:04x} coord[{i}]: Rust={:.4} kernel={:.4}",
-                    rust[i], kern[i]);
+                    rust[i],
+                    kern[i]
+                );
             }
         }
     }
@@ -649,14 +767,19 @@ mod tests {
         let total = 1_000_000u32;
         for _ in 0..total {
             // Use LCG to generate random 24-bit codewords.
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let idx = (state >> 40) as u32 & 0xFF_FFFF; // 24 bits
             let rust = decode_index_n(idx, 3);
             let kern = kernel_mirror_decode(idx, 3);
             for i in 0..8 {
-                assert!((rust[i] - kern[i]).abs() < 1e-7,
+                assert!(
+                    (rust[i] - kern[i]).abs() < 1e-7,
                     "n=3 idx=0x{idx:06x} coord[{i}]: Rust={:.4} kernel={:.4}",
-                    rust[i], kern[i]);
+                    rust[i],
+                    kern[i]
+                );
             }
         }
         // Edge cases: all-zeros, all-ones (max valid bits), coset-only.
@@ -664,9 +787,12 @@ mod tests {
             let rust = decode_index_n(idx, 3);
             let kern = kernel_mirror_decode(idx, 3);
             for i in 0..8 {
-                assert!((rust[i] - kern[i]).abs() < 1e-7,
+                assert!(
+                    (rust[i] - kern[i]).abs() < 1e-7,
                     "n=3 edge idx=0x{idx:06x} coord[{i}]: Rust={:.4} kernel={:.4}",
-                    rust[i], kern[i]);
+                    rust[i],
+                    kern[i]
+                );
             }
         }
     }
@@ -693,12 +819,15 @@ mod tests {
             let mut blk = [0.0f32; 8];
             for i in 0..4 {
                 let (a, b) = box_muller(&mut state, E8_SIGMA);
-                blk[2*i] = a; blk[2*i+1] = b;
+                blk[2 * i] = a;
+                blk[2 * i + 1] = b;
             }
             // Block-normalize (same as quantizer: max/6).
             let bmax = blk.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
             if bmax > 0.0 {
-                for x in blk.iter_mut() { *x /= bmax / 6.0; }
+                for x in blk.iter_mut() {
+                    *x /= bmax / 6.0;
+                }
             }
             blocks.push(blk);
         }
@@ -726,21 +855,35 @@ mod tests {
                         p[i].round() as i32
                     };
                     let biased = raw + bias;
-                    if biased <= 0 || biased >= cmax { sat += 1; }
+                    if biased <= 0 || biased >= cmax {
+                        sat += 1;
+                    }
                 }
             }
             let avg_mse = mse / (n_blocks * 8) as f64;
             let sat_rate = sat as f64 / (n_blocks * 8) as f64;
-            eprintln!("mfp3 q={q:.3}: mse={avg_mse:.6} sat={:.2}%", sat_rate * 100.0);
-            if avg_mse < best_mse { best_mse = avg_mse; best_q = q; }
+            eprintln!(
+                "mfp3 q={q:.3}: mse={avg_mse:.6} sat={:.2}%",
+                sat_rate * 100.0
+            );
+            if avg_mse < best_mse {
+                best_mse = avg_mse;
+                best_q = q;
+            }
         }
         eprintln!("mfp3 best q={best_q:.3} mse={best_mse:.6}");
 
         // The locked constant must be within 5% of the optimal candidate.
-        let ratio = if QUANT_STEP_MFP3 > best_q { QUANT_STEP_MFP3 / best_q } else { best_q / QUANT_STEP_MFP3 };
-        assert!(ratio <= 1.05,
+        let ratio = if QUANT_STEP_MFP3 > best_q {
+            QUANT_STEP_MFP3 / best_q
+        } else {
+            best_q / QUANT_STEP_MFP3
+        };
+        assert!(
+            ratio <= 1.05,
             "QUANT_STEP_MFP3={QUANT_STEP_MFP3} deviates >5% from optimal q={best_q} \
-             (ratio={ratio:.3}). Retune the constant and the kernel #define.");
+             (ratio={ratio:.3}). Retune the constant and the kernel #define."
+        );
     }
 
     #[test]
@@ -756,11 +899,14 @@ mod tests {
             let mut blk = [0.0f32; 8];
             for i in 0..4 {
                 let (a, b) = box_muller(&mut state, E8_SIGMA);
-                blk[2*i] = a; blk[2*i+1] = b;
+                blk[2 * i] = a;
+                blk[2 * i + 1] = b;
             }
             let bmax = blk.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
             if bmax > 0.0 {
-                for x in blk.iter_mut() { *x /= bmax / 6.0; }
+                for x in blk.iter_mut() {
+                    *x /= bmax / 6.0;
+                }
             }
             blocks.push(blk);
         }
@@ -779,14 +925,23 @@ mod tests {
             }
             let avg_mse = mse / (n_blocks * 8) as f64;
             eprintln!("mfp2 q={q:.3}: mse={avg_mse:.6}");
-            if avg_mse < best_mse { best_mse = avg_mse; best_q = q; }
+            if avg_mse < best_mse {
+                best_mse = avg_mse;
+                best_q = q;
+            }
         }
         eprintln!("mfp2 best q={best_q:.3} mse={best_mse:.6}");
 
-        let ratio = if QUANT_STEP_MFP2 > best_q { QUANT_STEP_MFP2 / best_q } else { best_q / QUANT_STEP_MFP2 };
-        assert!(ratio <= 1.05,
+        let ratio = if QUANT_STEP_MFP2 > best_q {
+            QUANT_STEP_MFP2 / best_q
+        } else {
+            best_q / QUANT_STEP_MFP2
+        };
+        assert!(
+            ratio <= 1.05,
             "QUANT_STEP_MFP2={QUANT_STEP_MFP2} deviates >5% from optimal q={best_q} \
-             (ratio={ratio:.3}). Retune the constant and the kernel #define.");
+             (ratio={ratio:.3}). Retune the constant and the kernel #define."
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -820,14 +975,20 @@ mod tests {
         let mut e = [0i32; 8];
         let mut s = 0i32;
         for i in 0..8 {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let r = ((*state >> 33) as u32) % span;
             e[i] = lo + r as i32;
             s += e[i];
         }
         // Force even sum (E8/D8 constraint) by nudging e[7] inside the interior box.
         if (s & 1) != 0 {
-            if e[7] < hi { e[7] += 1; } else { e[7] -= 1; }
+            if e[7] < hi {
+                e[7] += 1;
+            } else {
+                e[7] -= 1;
+            }
         }
         let mut p = [0.0f32; 8];
         for i in 0..8 {
@@ -854,7 +1015,9 @@ mod tests {
             }
             // occasionally push values hard to the rails to exercise saturation
             if (state & 0x7) == 0 {
-                for x in v.iter_mut() { *x *= 4.0; }
+                for x in v.iter_mut() {
+                    *x *= 4.0;
+                }
             }
 
             let idx1 = quantize8_n(&v, q, n);
@@ -862,20 +1025,32 @@ mod tests {
 
             // (a) no NaN/Inf anywhere
             for i in 0..8 {
-                assert!(dq1[i].is_finite(),
-                    "n={n}: non-finite decode dq[{i}]={} for v={v:?} idx=0x{idx1:08x}", dq1[i]);
+                assert!(
+                    dq1[i].is_finite(),
+                    "n={n}: non-finite decode dq[{i}]={} for v={v:?} idx=0x{idx1:08x}",
+                    dq1[i]
+                );
             }
             // codeword occupies only the low 8n bits (narrow-read safety)
-            assert_eq!(idx1 >> (8 * n), 0,
-                "n={n}: codeword 0x{idx1:08x} has bits above 8n={}", 8 * n);
+            assert_eq!(
+                idx1 >> (8 * n),
+                0,
+                "n={n}: codeword 0x{idx1:08x} has bits above 8n={}",
+                8 * n
+            );
 
             // (c) determinism: same input -> identical codeword AND identical bytes
             let idx2 = quantize8_n(&v, q, n);
             assert_eq!(idx1, idx2, "n={n}: non-deterministic encode for v={v:?}");
             let dq2 = dequantize8_n(idx2, q, n);
             for i in 0..8 {
-                assert_eq!(dq1[i].to_bits(), dq2[i].to_bits(),
-                    "n={n}: non-deterministic decode dq[{i}] {} vs {}", dq1[i], dq2[i]);
+                assert_eq!(
+                    dq1[i].to_bits(),
+                    dq2[i].to_bits(),
+                    "n={n}: non-deterministic decode dq[{i}] {} vs {}",
+                    dq1[i],
+                    dq2[i]
+                );
             }
         }
 
@@ -889,12 +1064,14 @@ mod tests {
         let mut max_err = 0.0f32;
         for _ in 0..n_box {
             let point = random_inbox_e8_point(&mut bstate, n); // an actual E8 point
-            // Build v = q * point + jitter, jitter small enough to stay in the
-            // Voronoi cell of `point` (E8 packing radius = sqrt(2)/2 in lattice
-            // units; use a conservative 0.30 to stay well inside).
+                                                               // Build v = q * point + jitter, jitter small enough to stay in the
+                                                               // Voronoi cell of `point` (E8 packing radius = sqrt(2)/2 in lattice
+                                                               // units; use a conservative 0.30 to stay well inside).
             let mut v = [0.0f32; 8];
             for i in 0..8 {
-                bstate = bstate.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                bstate = bstate
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let j = (((bstate >> 40) as f32) / (u32::MAX as f32)) * 2.0 - 1.0; // [-1,1]
                 v[i] = q * point[i] + 0.30 * q * j;
             }
@@ -907,11 +1084,15 @@ mod tests {
                 sq += e * e;
             }
             let l2 = sq.sqrt();
-            if l2 > max_err { max_err = l2; }
+            if l2 > max_err {
+                max_err = l2;
+            }
             // Allow a small epsilon for fp32 rounding in the closest-point search.
-            assert!(l2 <= bound + 1e-3,
+            assert!(
+                l2 <= bound + 1e-3,
                 "n={n}: in-box L2 recon error {l2:.5} exceeds lattice cell bound \
-                 q*R_cov={bound:.5} (q={q})");
+                 q*R_cov={bound:.5} (q={q})"
+            );
         }
 
         // ---- empirical RMS on the FWHT-Gaussian (informational) ----
@@ -922,12 +1103,20 @@ mod tests {
             let mut blk = [0.0f32; 8];
             for i in 0..4 {
                 let (a, b) = box_muller(&mut gstate, E8_SIGMA);
-                blk[2 * i] = a; blk[2 * i + 1] = b;
+                blk[2 * i] = a;
+                blk[2 * i + 1] = b;
             }
             let bmax = blk.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-            if bmax > 0.0 { for x in blk.iter_mut() { *x /= bmax / 6.0; } }
+            if bmax > 0.0 {
+                for x in blk.iter_mut() {
+                    *x /= bmax / 6.0;
+                }
+            }
             let dq = dequantize8_n(quantize8_n(&blk, q, n), q, n);
-            for i in 0..8 { let e = (blk[i] - dq[i]) as f64; mse += e * e; }
+            for i in 0..8 {
+                let e = (blk[i] - dq[i]) as f64;
+                mse += e * e;
+            }
         }
         let rms = (mse / (n_g * 8) as f64).sqrt();
         eprintln!(

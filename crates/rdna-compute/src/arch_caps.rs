@@ -411,7 +411,6 @@ impl ArchCaps {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,7 +635,9 @@ mod tests {
                 "mq4-lloyd mb4 must admit {arch}"
             );
         }
-        for arch in &["gfx1150", "gfx1152", "gfx1103", "gfx1200", "gfx1201", "gfx906"] {
+        for arch in &[
+            "gfx1150", "gfx1152", "gfx1103", "gfx1200", "gfx1201", "gfx906",
+        ] {
             assert!(
                 !make_caps(arch).supports_mq4_lloyd_mb4(),
                 "mq4-lloyd mb4 must NOT admit {arch} (no kernel source → panic)"

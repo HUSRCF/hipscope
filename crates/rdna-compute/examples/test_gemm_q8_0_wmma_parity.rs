@@ -67,13 +67,19 @@ fn main() {
             gpu.gemm_q8_0_wmma(&d_a, &x_n, &d_y_wmma, m, k, n).unwrap();
 
             let d_y_ref = gpu.zeros(&[n * m], DType::F32).unwrap();
-            gpu.gemm_q8_0_batched_chunked(&d_a, &x_n, &d_y_ref, m, k, n).unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_a, &x_n, &d_y_ref, m, k, n)
+                .unwrap();
 
             let y_wmma = gpu.download_f32(&d_y_wmma).unwrap();
-            let y_ref  = gpu.download_f32(&d_y_ref).unwrap();
-            let stats  = compare(&y_wmma, &y_ref);
-            let pass   = stats.mean_rel < 2e-3 && stats.max_rel < 3.5e-2;
-            let mark   = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+            let y_ref = gpu.download_f32(&d_y_ref).unwrap();
+            let stats = compare(&y_wmma, &y_ref);
+            let pass = stats.mean_rel < 2e-3 && stats.max_rel < 3.5e-2;
+            let mark = if pass {
+                "PASS"
+            } else {
+                total_fail += 1;
+                "FAIL"
+            };
             eprintln!(
                 "  N={n:4}  {mark}   mean_rel={:.3e}  max_rel={:.3e}",
                 stats.mean_rel, stats.max_rel,
@@ -96,23 +102,34 @@ fn main() {
         gpu.gemm_q8_0_wmma(&d_a, &d_x, &d_y_wmma, m, k, n).unwrap();
 
         let d_y_ref = gpu.zeros(&[n * m], DType::F32).unwrap();
-        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x, &d_y_ref, m, k, n).unwrap();
+        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x, &d_y_ref, m, k, n)
+            .unwrap();
 
         let y_wmma = gpu.download_f32(&d_y_wmma).unwrap();
-        let y_ref  = gpu.download_f32(&d_y_ref).unwrap();
-        let stats  = compare(&y_wmma, &y_ref);
-        let pass   = stats.mean_rel < 2e-3 && stats.max_rel < 3.5e-2;
-        let mark   = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+        let y_ref = gpu.download_f32(&d_y_ref).unwrap();
+        let stats = compare(&y_wmma, &y_ref);
+        let pass = stats.mean_rel < 2e-3 && stats.max_rel < 3.5e-2;
+        let mark = if pass {
+            "PASS"
+        } else {
+            total_fail += 1;
+            "FAIL"
+        };
         eprintln!(
             "  N={n:4}  {mark}   mean_rel={:.3e}  max_rel={:.3e}",
             stats.mean_rel, stats.max_rel,
         );
 
-        let max_abs_diff = y_wmma.iter().zip(y_ref.iter())
+        let max_abs_diff = y_wmma
+            .iter()
+            .zip(y_ref.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let max_abs_ref = y_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        eprintln!("         max_abs_diff={:.4e}  max_abs_ref={:.4e}", max_abs_diff, max_abs_ref);
+        eprintln!(
+            "         max_abs_diff={:.4e}  max_abs_ref={:.4e}",
+            max_abs_diff, max_abs_ref
+        );
     }
 
     // ── Suite 2: Stale-cache suite (same X buffer, different content each call) ──
@@ -143,31 +160,37 @@ fn main() {
 
         // Pre-compute the reference outputs (scalar path, always correct).
         let d_ref0 = gpu.zeros(&[n * m], DType::F32).unwrap();
-        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x_reuse, &d_ref0, m, k, n).unwrap();
+        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x_reuse, &d_ref0, m, k, n)
+            .unwrap();
         let ref0 = gpu.download_f32(&d_ref0).unwrap();
 
         // Overwrite d_x_reuse with step-1 content BEFORE computing ref1
         // (so both refs use the correct content for each step).
-        let x_step1_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(x_step1.as_ptr() as *const u8, x_step1.len() * 4)
-        };
+        let x_step1_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x_step1.as_ptr() as *const u8, x_step1.len() * 4) };
         gpu.hip.memcpy_htod(&d_x_reuse.buf, x_step1_bytes).unwrap();
         let d_ref1 = gpu.zeros(&[n * m], DType::F32).unwrap();
-        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x_reuse, &d_ref1, m, k, n).unwrap();
+        gpu.gemm_q8_0_batched_chunked(&d_a, &d_x_reuse, &d_ref1, m, k, n)
+            .unwrap();
         let ref1 = gpu.download_f32(&d_ref1).unwrap();
 
         // --- Call 1: Load step-0 content, run gemm_q8_0_wmma (warms the FP16 cache) ---
-        let x_step0_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(x_step0.as_ptr() as *const u8, x_step0.len() * 4)
-        };
+        let x_step0_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x_step0.as_ptr() as *const u8, x_step0.len() * 4) };
         gpu.hip.memcpy_htod(&d_x_reuse.buf, x_step0_bytes).unwrap();
         let d_y0 = gpu.zeros(&[n * m], DType::F32).unwrap();
-        gpu.gemm_q8_0_wmma(&d_a, &d_x_reuse, &d_y0, m, k, n).unwrap();
+        gpu.gemm_q8_0_wmma(&d_a, &d_x_reuse, &d_y0, m, k, n)
+            .unwrap();
         let y0 = gpu.download_f32(&d_y0).unwrap();
 
         let stats0 = compare(&y0, &ref0);
         let pass0 = stats0.mean_rel < 2e-3 && stats0.max_rel < 3.5e-2;
-        let mark0 = if pass0 { "PASS" } else { total_fail += 1; "FAIL" };
+        let mark0 = if pass0 {
+            "PASS"
+        } else {
+            total_fail += 1;
+            "FAIL"
+        };
         eprintln!(
             "  step-0 (cache warm)  {mark0}   mean_rel={:.3e}  max_rel={:.3e}",
             stats0.mean_rel, stats0.max_rel,
@@ -178,12 +201,18 @@ fn main() {
         // With the fix (convert_fp16_x_uncached): always reconverts → correct → PASS.
         gpu.hip.memcpy_htod(&d_x_reuse.buf, x_step1_bytes).unwrap();
         let d_y1 = gpu.zeros(&[n * m], DType::F32).unwrap();
-        gpu.gemm_q8_0_wmma(&d_a, &d_x_reuse, &d_y1, m, k, n).unwrap();
+        gpu.gemm_q8_0_wmma(&d_a, &d_x_reuse, &d_y1, m, k, n)
+            .unwrap();
         let y1 = gpu.download_f32(&d_y1).unwrap();
 
         let stats1 = compare(&y1, &ref1);
         let pass1 = stats1.mean_rel < 2e-3 && stats1.max_rel < 3.5e-2;
-        let mark1 = if pass1 { "PASS" } else { total_fail += 1; "FAIL" };
+        let mark1 = if pass1 {
+            "PASS"
+        } else {
+            total_fail += 1;
+            "FAIL"
+        };
         eprintln!(
             "  step-1 (stale-cache) {mark1}   mean_rel={:.3e}  max_rel={:.3e}",
             stats1.mean_rel, stats1.max_rel,
@@ -202,7 +231,10 @@ fn main() {
     std::process::exit(if total_fail == 0 { 0 } else { 1 });
 }
 
-struct Stats { mean_rel: f64, max_rel: f64 }
+struct Stats {
+    mean_rel: f64,
+    max_rel: f64,
+}
 fn compare(wmma: &[f32], reference: &[f32]) -> Stats {
     let max_ref = reference.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let thr = max_ref * 0.01;
@@ -211,13 +243,15 @@ fn compare(wmma: &[f32], reference: &[f32]) -> Stats {
         if r.abs() > thr {
             let rel = ((w - r).abs() / r.abs()) as f64;
             sum += rel;
-            if rel > max_r { max_r = rel; }
+            if rel > max_r {
+                max_r = rel;
+            }
             cnt += 1;
         }
     }
     Stats {
         mean_rel: if cnt == 0 { 0.0 } else { sum / cnt as f64 },
-        max_rel:  max_r,
+        max_rel: max_r,
     }
 }
 

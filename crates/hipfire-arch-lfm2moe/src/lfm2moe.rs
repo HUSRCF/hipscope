@@ -87,6 +87,25 @@ fn load_f32(
         .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
 }
 
+/// REAP keep variant of [`load_f32`] for a 1-D per-expert vector (the MoE
+/// `expert_bias`, shape `[orig_experts]`): gather the kept elements BEFORE
+/// dequant, then upload as `[keep.len()]`. Each element is one expert's bias,
+/// fully self-contained (F16/F32 are trivially row-independent; Q8_0's 32-elem
+/// blocks would NOT be element-gatherable, but expert_bias ships as F16/F32 —
+/// guarded below). `m` MUST equal `keep.len()`.
+fn load_f32_keep(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    keep: &[u32],
+) -> Result<GpuTensor, String> {
+    debug_assert_eq!(m, keep.len(), "load_f32_keep: m must equal keep.len()");
+    let f32_data = hipfire_reap::load::gather_f32_vec("lfm2moe", hfq, name, keep)?;
+    gpu.upload_f32(&f32_data, &[m])
+        .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
+}
+
 /// Minimal Q8_0 dequant (32-elem blocks: little-endian f16 scale + 32 int8).
 fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(data.len() / 34 * 32);
@@ -108,6 +127,32 @@ fn load_wt(
 ) -> Result<WeightTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("lfm2moe: load_wt {name}: {e}"))
+}
+
+/// REAP keep variant of [`load_wt`]: gather the tensor's first-axis rows (one
+/// row per ORIGINAL expert) down to `keep` BEFORE quant decode, then build the
+/// `WeightTensor` from the gathered bytes with `m = keep.len()`.
+///
+/// Only used for the MoE router (`feed_forward.gate.weight`, shape
+/// `[orig_experts, hidden]`) under an active keep-map. `gather_rows` is exact
+/// for any row-independent quant (every per-expert row is self-contained — its
+/// own scale/zero/codebook live in the row), which holds for every quant_type
+/// `wt_from_raw` accepts. `keep` MUST be in compact slot order and `m` MUST
+/// equal `keep.len()`. Reads owned bytes via `hfq.tensor_data_vec` directly
+/// (bypassing the `read_tensor` wrapper) to retain `info.shape` for deriving
+/// the original row count — the non-keep path uses `read_tensor`, which
+/// discards `info`.
+fn load_wt_keep(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    keep: &[u32],
+) -> Result<WeightTensor, String> {
+    debug_assert_eq!(m, keep.len(), "load_wt_keep: m must equal keep.len()");
+    let (qt, sub) = hipfire_reap::load::gather_weight_rows("lfm2moe", hfq, name, keep)?;
+    wt_from_raw(gpu, qt, &sub, m, k).map_err(|e| format!("lfm2moe: load_wt_keep {name}: {e}"))
 }
 
 /// quant_type → DType mapping (mirrors minimax::wt_from_raw); uploads raw
@@ -370,18 +415,54 @@ impl Lfm2MoeWeights {
                 )?;
                 Ffn::Dense(DenseFfn { w1, w3, w2 })
             } else {
-                let router = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.feed_forward.gate.weight"),
-                    n_exp,
-                    hidden,
-                )?;
-                let expert_bias =
-                    load_f32(hfq, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
+                // REAP keep-map for this layer (None ⇒ no pruning / identity).
+                // When a keep is present, `n_exp == cfg.num_experts` is already
+                // the KEPT count (overridden in apply_reap_plan); the router and
+                // expert loops below load only the kept original experts, in
+                // compact slot order.
+                let reap_ep = cfg.reap_keep.as_ref().map(|r| r.expert_plan(l));
+                let keep_l = reap_ep.as_ref().and_then(|e| e.keep());
+
+                // Router: hidden → n_exp. Under a keep, gather the router's
+                // expert rows (`[orig_experts, hidden]`) down to the kept set so
+                // it emits logits only for kept experts, in compact slot order.
+                // No keep ⇒ the literal original full load.
+                let router = match keep_l {
+                    Some(keep) => load_wt_keep(
+                        hfq,
+                        gpu,
+                        &format!("{p}.feed_forward.gate.weight"),
+                        n_exp,
+                        hidden,
+                        keep,
+                    )?,
+                    None => load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.feed_forward.gate.weight"),
+                        n_exp,
+                        hidden,
+                    )?,
+                };
+                // expert_bias is a 1-D [orig_experts] F32 vector indexed by
+                // expert; under a keep it must also be gathered to the kept set
+                // (parallel to the router rows). No keep ⇒ literal original load.
+                let expert_bias = match keep_l {
+                    Some(keep) => load_f32_keep(
+                        hfq,
+                        gpu,
+                        &format!("{p}.feed_forward.expert_bias"),
+                        n_exp,
+                        keep,
+                    )?,
+                    None => load_f32(hfq, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?,
+                };
                 // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
+                // Iterate compact slots `0..n_exp`; `e` = the ORIGINAL expert
+                // index loaded into slot (slot==e on the no-keep identity path).
                 let mut experts = Vec::with_capacity(n_exp);
-                for e in 0..n_exp {
+                for slot in 0..n_exp {
+                    let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
                     let ep = format!("{p}.feed_forward.experts.{e}");
                     let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                     let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
@@ -392,16 +473,26 @@ impl Lfm2MoeWeights {
                     let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
                     let mut down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
                         .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
-                    // AWQ scales: shared per layer, emitted once on expert 0 by the
+                    // AWQ scales: LAYER-SHARED, emitted once on expert 0 by the
                     // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
-                    // Attach the gate_up scale (len hidden) to expert 0's gate_up and
-                    // the down scale (len moe_inter) to expert 0's down; the forward
+                    // The scale tensors are NOT expert-indexed — their names are
+                    // `{p}.feed_forward.awq_scale_{gate_up,down}.weight` and their
+                    // lengths are `hidden` / `moe_inter` (per-projection dims, NOT
+                    // per-expert), so they are INVARIANT under a REAP keep and load
+                    // UNCHANGED. We attach them to the representative FIRST COMPACT
+                    // SLOT (`slot == 0`, i.e. `experts[0]`) — the same slot the
+                    // forward reads from — regardless of which original expert it
+                    // maps to. Gate on `slot == 0` (not `e == 0`): under a keep the
+                    // original expert 0 may be pruned, so `e == 0` could never fire
+                    // (dropping the scale) or fire on a non-representative slot.
+                    // Attach the gate_up scale (len hidden) to slot 0's gate_up and
+                    // the down scale (len moe_inter) to slot 0's down; the forward
                     // reads both from experts[0] and divides x/s in the unrotated
                     // basis via the AWQ-aware rotate_x_mq_for (gate_up input) and
                     // fused_silu_mul_rotate_mq_batched_for (post-SwiGLU intermediate
                     // for down). down (w2) is the most quant-sensitive proj, so its
                     // AWQ is the whole point. No-op on non-AWQ files.
-                    if e == 0 {
+                    if slot == 0 {
                         gate_up.awq_scale = load_lfm2_awq_scale(
                             hfq,
                             gpu,

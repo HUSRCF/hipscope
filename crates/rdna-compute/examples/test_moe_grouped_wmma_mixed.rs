@@ -19,7 +19,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_mixed
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ── Utilities (verbatim from test_moe_grouped_wmma_mq3lloyd.rs) ───────────
 
@@ -99,34 +99,39 @@ fn fp32_to_fp16_bits(f: f32) -> u16 {
 }
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc_tensor u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc_tensor u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("memcpy_htod u8");
     t
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc_tensor f32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc_tensor f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod f32");
     t
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-    let t = gpu.alloc_tensor(&[data.len() * 4], DType::Raw).expect("alloc_tensor i32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 4], DType::Raw)
+        .expect("alloc_tensor i32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod i32");
     t
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
-    let t = gpu.alloc_tensor(&[data.len() * 8], DType::Raw).expect("alloc_tensor u64");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 8], DType::Raw)
+        .expect("alloc_tensor u64");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod u64");
     t
 }
@@ -139,10 +144,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -225,7 +231,11 @@ fn dequant_mq6_row(weight: &[u8], k: usize) -> Vec<f32> {
             let byte_idx = bit_pos / 8;
             let bit_off = bit_pos % 8;
             let raw = weight[payload_off + byte_idx] as u32;
-            let raw2 = if byte_idx + 1 < 192 { weight[payload_off + byte_idx + 1] as u32 } else { 0 };
+            let raw2 = if byte_idx + 1 < 192 {
+                weight[payload_off + byte_idx + 1] as u32
+            } else {
+                0
+            };
             let q = ((raw >> bit_off) | (raw2 << (8 - bit_off))) & 63;
             bit_pos += 6;
             let val = sc_h * (q as f32) + zp_h;
@@ -647,7 +657,9 @@ fn run_case(
             x_src_rows,
         )
         .expect("mixed grouped kernel launch (gate_up)");
-        gpu.hip.device_synchronize().expect("sync after mixed kernel (gate_up)");
+        gpu.hip
+            .device_synchronize()
+            .expect("sync after mixed kernel (gate_up)");
         let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
         let y_ref = cpu_reference_mixed(
             &expert_weights,
@@ -680,7 +692,9 @@ fn run_case(
             x_src_rows,
         )
         .expect("mixed grouped kernel launch (down)");
-        gpu.hip.device_synchronize().expect("sync after mixed kernel (down)");
+        gpu.hip
+            .device_synchronize()
+            .expect("sync after mixed kernel (down)");
         let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
         let y_ref = cpu_reference_mixed(
             &expert_weights,

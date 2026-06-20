@@ -5783,6 +5783,14 @@ impl Gpu {
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
     #[allow(clippy::too_many_arguments)]
+    /// `n_ranks` is the number of top-k ranks (grid.y workgroups) this launch
+    /// drives. In the uniform decode path it is the full `k` (=8); in the
+    /// mixed-tier path it is a per-tier bucket size (`n < 8`, possibly with a
+    /// non-zero base offset baked into the sub-viewed tensors). The kernel reads
+    /// `topk_indices[blockIdx.y]` and writes `y_gate/y_up[blockIdx.y*mi+…]`, so
+    /// launching `n_ranks` workgroups runs exactly ranks `0..n_ranks` — never
+    /// past the (sub-viewed) buffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
@@ -5792,6 +5800,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
@@ -5841,8 +5850,13 @@ impl Gpu {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             bytes,
         );
-        let result =
-            self.launch_maybe_blob(func_name, [grid_x, 8, 1], block, 0, &mut params, || {
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid_x, n_ranks as u32, 1],
+            block,
+            0,
+            &mut params,
+            || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp);
                 b.push_ptr(ip);
@@ -5852,7 +5866,8 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b
-            });
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5862,6 +5877,9 @@ impl Gpu {
     /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV.
     /// wave32-only (gfx10/11/12) — no wave64 path yet because ParoQuant
     /// A3B is not currently validated on gfx94x.
+    /// `n_ranks` sets grid.y (the number of top-k ranks driven); see
+    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` for the uniform-vs-mixed contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_paro_q4g128_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
@@ -5871,6 +5889,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -5903,7 +5922,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_paro_q4g128_moe_gate_up_k8_indexed",
-            [m as u32, 8, 1],
+            [m as u32, n_ranks as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -6537,6 +6556,9 @@ impl Gpu {
     /// MQ4→MQ6 promotion) on the device-side top-K path under hipGraph
     /// capture.
     #[allow(clippy::too_many_arguments)]
+    /// `n_ranks` sets grid.y (the number of top-k ranks driven); see
+    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` for the uniform-vs-mixed contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq6g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -6546,6 +6568,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -6582,7 +6605,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_hfq6g256_moe_gate_up_k8_indexed",
-            [m as u32, 8, 1],
+            [m as u32, n_ranks as u32, 1],
             [32u32, 1, 1],
             0,
             &mut params,

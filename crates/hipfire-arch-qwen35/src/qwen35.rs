@@ -206,6 +206,14 @@ pub struct Qwen35Config {
     /// to `u64::MAX` (no eviction — tested when VRAM is unlimited or we just
     /// want to verify the routing path works without eviction pressure).
     pub vram_budget_bytes: u64,
+
+    /// Optional REAP keep-map: emulate a pruned routed-expert pool by
+    /// partial-loading this full quant (load only the kept experts under
+    /// remapped names, gather the router's expert rows to the kept set).
+    /// Populated at config time from `HIPFIRE_REAP_PLAN=<dir>`; `None` ⇒
+    /// no pruning (today's behavior, byte-identical to baseline). Not
+    /// (de)serialized — `Qwen35Config` does not derive serde.
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 /// Nested `rope_parameters` block. All fields optional — Qwen3.5 carries
@@ -360,7 +368,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 
     let has_shared_expert = raw.shared_expert_intermediate_size > 0;
 
-    Ok(Qwen35Config {
+    let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
         vocab_size: raw.vocab_size,
@@ -391,7 +399,47 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         // a follow-up commit). When false, no behavior change vs main.
         paged_experts: false,
         vram_budget_bytes: u64::MAX,
-    })
+        reap_keep: None,
+    };
+
+    // Apply the optional REAP keep-map HERE, inside the single public config
+    // entry point, so it is IMPOSSIBLE to bypass. `config_from_hfq` has ~50
+    // direct callers (daemon, perplexity example, every bench/profile example)
+    // that never go through the `Architecture` trait shim; wiring REAP only in
+    // the trait impl would silently ignore HIPFIRE_REAP_PLAN on all of them
+    // (including the deferred identity NLL gate, which the perplexity example
+    // drives via this public fn). The trait impl therefore does NOT re-apply.
+    //
+    // Error policy: config parsing now returns `Result<_, String>`, so an
+    // explicitly malformed REAP plan propagates as a hard load error instead
+    // of getting collapsed into a generic "bad metadata" fallback.
+    apply_reap_plan(&mut config)?;
+
+    Ok(config)
+}
+
+/// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
+///
+/// Reads `HIPFIRE_REAP_PLAN=<dir>` (qwen35 has no legacy env alias). When
+/// set, loads `<dir>/reap_plan.json` (or the legacy `keep_by_layer.json`)
+/// via `ReapPlan::load_any`, validating against the ORIGINAL routed-expert
+/// count (`config.num_experts`) BEFORE overriding it to the kept count.
+/// This emulates a pruned expert pool by partial-loading the full quant:
+/// only kept experts are loaded (under remapped names) and the router's
+/// expert rows are gathered to the kept set in `load_moe_ffn`.
+///
+/// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
+/// takes the literal original full-load path — byte-identical to baseline.
+/// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map; the
+/// ParoQuant path does not (see `paro_load_moe_ffn`).
+pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
+    if let Some(plan) =
+        hipfire_reap::plan::ReapPlan::from_env("qwen35", None, config.n_layers, config.num_experts)?
+    {
+        config.num_experts = plan.kept_per_layer();
+        config.reap_keep = Some(std::sync::Arc::new(plan));
+    }
+    Ok(())
 }
 
 /// Inner parser, decoupled from `HfqFile` / `ModelSource` for unit testability.
@@ -479,6 +527,34 @@ pub struct FullAttnLayerWeights {
 pub struct ExpertWeights {
     pub gate_up: WeightTensor, // [2 * moe_intermediate, hidden] — fused (gate || up)
     pub down: WeightTensor,    // [hidden, moe_intermediate]
+}
+
+/// SP2: build the per-expert (gate_up, down) quant-tier tables that
+/// [`hipfire_dispatch::families::moe::MoeDtypes`] uses to detect an
+/// intra-layer mixed-tier layer.
+///
+/// A table is `Some(vec)` only when the layer genuinely spans >1 distinct
+/// tier; a uniform layer — or paged mode where `experts` is empty — yields
+/// `None`, which `MoeResolution::resolve` collapses to the unchanged uniform
+/// fast path. We pre-filter to `None` for the uniform/empty cases here so the
+/// common path allocates nothing and is byte-identical to before SP2.
+fn per_expert_tier_tables(experts: &[ExpertWeights]) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
+    let gu: Vec<DType> = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
+    let dn: Vec<DType> = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    (mixed_tier_table(gu), mixed_tier_table(dn))
+}
+
+/// Collapse a per-expert dtype column to `None` when it is empty or uniform,
+/// `Some` only when it spans >1 distinct tier. Pure (no GPU weights) so it is
+/// unit-testable in isolation; `per_expert_tier_tables` is the GPU-weight
+/// adapter over it.
+fn mixed_tier_table(tiers: Vec<DType>) -> Option<Vec<DType>> {
+    match tiers.first() {
+        // Empty (paged mode) or uniform → uniform fast path.
+        None => None,
+        Some(&first) if tiers.iter().all(|&d| d == first) => None,
+        Some(_) => Some(tiers),
+    }
 }
 
 /// Shared expert storage — unlike routed experts, gate_proj and up_proj are
@@ -1617,6 +1693,64 @@ pub(crate) fn load_weight_tensor(
         }
         Ok(wt)
     }
+}
+
+/// REAP keep variant of [`load_weight_tensor`]: gather the tensor's first-axis
+/// rows (one row per original expert) down to `keep` BEFORE quant decode, then
+/// build the `WeightTensor` from the gathered bytes with `m = keep.len()`.
+///
+/// Only used for the MoE router (`mlp.gate.weight`, shape `[orig_experts, k]`)
+/// under an active keep-map. `gather_rows` is exact for any row-independent
+/// quant (every per-expert row is self-contained — its own scale/zero/codebook
+/// live in the row), which is true for every quant_type this loader accepts.
+/// `keep` MUST equal the compact slot order, and `m` MUST equal `keep.len()`.
+///
+/// The AWQ sidecar (when present) is indexed by `k` (the input/hidden
+/// dimension), shared across all expert rows, so it is loaded UNCHANGED —
+/// row selection does not touch it.
+fn load_weight_tensor_keep(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    keep: &[u32],
+) -> HipResult<WeightTensor> {
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "load_weight_tensor_keep: m ({m}) must equal keep.len() ({})",
+        keep.len()
+    );
+    // Resolve via the shared `qwen35_tensor_data_vec` helper (same candidate
+    // logic as the non-keep path; it preads + fadvise_dontneeds internally and
+    // returns OWNED bytes, so the gather + AWQ-sidecar reads don't fight a
+    // borrow). `orig_rows` is the on-disk first-axis length = original expert
+    // count. The matched (prefixed) candidate name is resolved separately for
+    // the AWQ sidecar lookup via a metadata-only existence check, since the
+    // helper doesn't surface which candidate it hit.
+    let (info, bytes) =
+        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let quant_type = info.quant_type;
+    let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
+    // Row-gather to the kept set. The on-disk row count is the ORIGINAL expert
+    // count (= bytes.len() / rowstride); gather_rows derives it from shape[0].
+    let (_new_shape, sub) = hipfire_reap::gather::gather_rows(&[orig_rows], &bytes, keep)
+        .map_err(|e| HipError::new(0, &format!("qwen35: router row-gather '{name}': {e}")))?;
+    let mut wt = load_weight_tensor_raw(gpu, quant_type, &sub, m, k)?;
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        // Resolve the matched candidate name (metadata only) so the AWQ sidecar
+        // is looked up under the same prefix the weight resolved to; fall back
+        // to the bare `name`. Mirrors the non-keep `load_weight_tensor`.
+        let matched = qwen35_tensor_name_candidates(name)
+            .into_iter()
+            .find(|c| hfq.find_tensor_info(c).is_some());
+        wt.awq_scale = matched
+            .as_deref()
+            .and_then(|mn| load_awq_scale_for(hfq, gpu, mn, k))
+            .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+    }
+    Ok(wt)
 }
 
 // ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
@@ -3420,15 +3554,36 @@ pub(crate) fn load_moe_ffn(
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
 
+    // REAP keep-map for this layer (None ⇒ no pruning / identity). When a
+    // keep is present, `n_exp == config.num_experts` is already the KEPT
+    // count; the router and expert loops below load only the kept rows.
+    let ep = config
+        .reap_keep
+        .as_ref()
+        .map(|r| r.expert_plan(layer_idx as usize));
+
     // Router: hidden_size → num_experts. Precision-sensitive but small.
-    let router = load_weight_tensor(
-        hfq,
-        gpu,
-        &format!("{p}.mlp.gate.weight"),
-        n_exp,
-        config.dim,
-        qwen35_tensor_name_candidates,
-    )?;
+    // Under a keep, gather the router's expert rows (`[orig_experts, dim]`)
+    // down to the kept set so it emits logits only for kept experts, in
+    // compact slot order. No keep ⇒ the literal original full load.
+    let router = match ep.as_ref().and_then(|e| e.keep()) {
+        Some(keep) => load_weight_tensor_keep(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.gate.weight"),
+            n_exp,
+            config.dim,
+            keep,
+        )?,
+        None => load_weight_tensor(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.gate.weight"),
+            n_exp,
+            config.dim,
+            qwen35_tensor_name_candidates,
+        )?,
+    };
 
     // Shared expert (always-on, contributes to every token). Unlike routed
     // experts, gate_proj + up_proj are stored separately in the safetensors
@@ -3473,20 +3628,33 @@ pub(crate) fn load_moe_ffn(
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
-    // EP streaming-shard: load ONLY this rank's owned experts (see fn doc). When
-    // not sharding (`None`), `owns(x)` is always true → full replicated load.
-    // The closure caches the decision so the pointer-table build below agrees
-    // with this load loop.
+    //
+    // REAP keep-map: `n_exp` is already the KEPT count (config.num_experts was
+    // overridden in apply_reap_plan), and under a keep `ExpertPlan::n_slots`
+    // also equals the kept count — so `n_exp` is the slot count on both the
+    // keep and no-keep paths. Iterate compact slots `0..n_exp` (matching ds4's
+    // `0..n_routed_experts`) and load only the kept original experts under
+    // their remapped names via `ep.src(slot)`. EP streaming-shard composes by
+    // applying ownership to that ORIGINAL expert id, while pointer tables keep
+    // compact slot indexing. No keep ⇒ identity (slot == original index) — the
+    // literal original loop.
     let ep_shard = current_ep_expert_shard();
-    let owns = |x: usize| {
+    if ep.is_some() && ep_shard.is_some() {
+        return Err(HipError::new(
+            0,
+            "qwen35: REAP keep-map + EP sharding are mutually exclusive",
+        ));
+    }
+    let owns_orig = |x: usize| {
         ep_shard
             .as_ref()
             .map_or(true, |(sh, r)| sh.owns_expert(*r, x))
     };
 
     let mut experts = Vec::with_capacity(n_exp);
-    for x in 0..n_exp {
-        if !owns(x) {
+    for slot in 0..n_exp {
+        let x = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
+        if !owns_orig(x) {
             continue; // non-owned on this rank: dummy pointer assigned below
         }
         let gate_up = load_weight_tensor(
@@ -3566,14 +3734,15 @@ pub(crate) fn load_moe_ffn(
         std::mem::forget(zero_gu);
         let dummy_dn = experts[0].down.buf.buf.as_ptr() as u64;
         let mut li = 0usize;
-        for e in 0..n_exp {
-            if owns(e) {
-                gu_ptrs[e] = experts[li].gate_up.buf.buf.as_ptr() as u64;
-                dn_ptrs[e] = experts[li].down.buf.buf.as_ptr() as u64;
+        for slot in 0..n_exp {
+            let orig = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
+            if owns_orig(orig) {
+                gu_ptrs[slot] = experts[li].gate_up.buf.buf.as_ptr() as u64;
+                dn_ptrs[slot] = experts[li].down.buf.buf.as_ptr() as u64;
                 li += 1;
             } else {
-                gu_ptrs[e] = dummy_gu;
-                dn_ptrs[e] = dummy_dn;
+                gu_ptrs[slot] = dummy_gu;
+                dn_ptrs[slot] = dummy_dn;
             }
         }
     } else {
@@ -4116,6 +4285,11 @@ fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // SP2: if a layer's experts span >1 quant tier (e.g. a re-quant overlay
+    // bumped some experts), expose the per-expert tier tables so dispatch
+    // buckets by tier. The common case (a uniform layer — or paged mode where
+    // `experts` is empty) yields None → unchanged uniform fast path.
+    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(&ffn.experts);
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
@@ -4140,6 +4314,8 @@ fn moe_ffn_decode_impl(
         // mixed down dtypes, so its presence == the mixed-per-expert flag.
         routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
+        per_expert_gate_up,
+        per_expert_down,
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
@@ -7662,6 +7838,10 @@ fn prefill_moe_ffn_body_batched(
     let total_slots = n * k_top;
     let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
+    // SP2: per-expert tier tables for intra-layer mixed-tier dispatch (same
+    // semantics as the decode builder). Uniform layer ⇒ None ⇒ uniform fast
+    // path. This prefill site always has ≥1 expert (indexed [0] above).
+    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(&ffn.experts);
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
@@ -7678,6 +7858,8 @@ fn prefill_moe_ffn_body_batched(
         // shared MoeDtypes struct still requires the flag; carry it honestly.
         routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
+        per_expert_gate_up,
+        per_expert_down,
     };
 
     let paro_gate_up =
@@ -12933,13 +13115,27 @@ pub fn shard_moe_experts(
 /// load path so callers (the `forward_ep` driver / examples) never reach into
 /// `LayerWeights` internals. `n_exp` is the model's routed expert count
 /// (`config.num_experts`).
+///
+/// `reap_active` MUST be `config.reap_keep.is_some()`. REAP expert-pruning and
+/// EP sharding are mutually exclusive (ds4/minimax enforce the same at expert-
+/// load time): under REAP `config.num_experts` is already overridden to the
+/// KEPT count, so `shard_moe_experts`' `experts.len() == n_exp` precondition
+/// would pass on a pruned model and the per-rank ownership math would re-remap
+/// already-compacted expert ids → silent weight corruption. Refuse up front.
 pub fn shard_all_moe_layers(
     gpu: &mut Gpu,
     weights: &mut Qwen35Weights,
     shard: &ShardConfig,
     rank: usize,
     n_exp: usize,
+    reap_active: bool,
 ) -> HipResult<()> {
+    if reap_active {
+        return Err(HipError::new(
+            0,
+            "qwen35: REAP keep-map + EP sharding are mutually exclusive",
+        ));
+    }
     for layer in weights.layers.iter_mut() {
         match layer {
             LayerWeights::DeltaNetMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
@@ -15848,6 +16044,47 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
+    // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:
+    // empty/uniform columns collapse to None (uniform fast path), only a
+    // genuinely multi-tier column yields Some(table).
+    #[test]
+    fn mixed_tier_table_empty_is_none() {
+        // Paged mode: no resident experts → uniform fast path.
+        assert_eq!(mixed_tier_table(Vec::new()), None);
+    }
+
+    #[test]
+    fn mixed_tier_table_uniform_is_none() {
+        // The common case: every expert one tier → None → byte-identical
+        // uniform path, no allocation surfaced to MoeDtypes.
+        let tiers = vec![DType::MQ4G256; 4];
+        assert_eq!(mixed_tier_table(tiers), None);
+        // Single-expert uniform column is also None.
+        assert_eq!(mixed_tier_table(vec![DType::MQ6G256]), None);
+    }
+
+    #[test]
+    fn mixed_tier_table_mixed_is_some_preserving_order() {
+        // A re-quant overlay bumped experts 1 and 3 to MQ6 → Some, and the
+        // table preserves per-expert order/dtype so dispatch buckets correctly.
+        let tiers = vec![
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ4G256,
+            DType::MQ6G256,
+        ];
+        assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
+
+    #[test]
+    fn mixed_tier_table_mixed_first_differs() {
+        // Guard against an off-by-one where only expert[0] is compared:
+        // here every later expert differs from expert[0].
+        let tiers = vec![DType::MQ4G256, DType::MQ6G256, DType::MQ6G256];
+        assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
 
     // ── N4 config-parser collapse: serde RawQwen35Config + finalize ──────
     // Oracle for the ×2 collapse (config_from_hfq vs config_from_safetensors)

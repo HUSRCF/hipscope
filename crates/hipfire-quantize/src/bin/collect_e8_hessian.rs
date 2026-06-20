@@ -104,7 +104,9 @@ fn read_u32(b: &[u8], off: usize) -> u32 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| -> Option<String> {
-        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1).cloned())
     };
     let acts = match arg("--acts") {
         Some(a) => a,
@@ -146,20 +148,17 @@ fn main() {
     let mut off = 8usize;
     for _ in 0..n_rows {
         for c in 0..k {
-            row[c] = f32::from_le_bytes([
-                bytes[off],
-                bytes[off + 1],
-                bytes[off + 2],
-                bytes[off + 3],
-            ]);
+            row[c] =
+                f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
             off += 4;
         }
         h.accumulate_row(&row);
     }
-    h.write_hblk(Path::new(&out_dir), &name).unwrap_or_else(|e| {
-        eprintln!("error: write_hblk failed: {e}");
-        std::process::exit(1);
-    });
+    h.write_hblk(Path::new(&out_dir), &name)
+        .unwrap_or_else(|e| {
+            eprintln!("error: write_hblk failed: {e}");
+            std::process::exit(1);
+        });
 }
 
 #[cfg(test)]
@@ -173,8 +172,12 @@ mod tests {
         let k = 512usize;
         let mut h = BlockHessian::new(k);
         let rows = [
-            (0..k).map(|c| (c as f32 * 0.001).sin()).collect::<Vec<f32>>(),
-            (0..k).map(|c| (c as f32 * 0.002).cos()).collect::<Vec<f32>>(),
+            (0..k)
+                .map(|c| (c as f32 * 0.001).sin())
+                .collect::<Vec<f32>>(),
+            (0..k)
+                .map(|c| (c as f32 * 0.002).cos())
+                .collect::<Vec<f32>>(),
             (0..k).map(|c| ((c % 7) as f32) - 3.0).collect::<Vec<f32>>(),
         ];
         for r in &rows {
@@ -186,7 +189,10 @@ mod tests {
             ref35 += r[3] as f64 * r[5] as f64;
         }
         let got = h.blocks[0][3 * 256 + 5];
-        assert!((got - ref35).abs() < 1e-9, "XX^T(3,5) mismatch: {got} vs {ref35}");
+        assert!(
+            (got - ref35).abs() < 1e-9,
+            "XX^T(3,5) mismatch: {got} vs {ref35}"
+        );
 
         // symmetry
         assert!((h.blocks[0][5 * 256 + 3] - h.blocks[0][3 * 256 + 5]).abs() < 1e-9);

@@ -84,49 +84,73 @@ fn dp4a_variant(key: KernelKey) -> KernelVariant {
 
 #[test]
 fn shape_batch_gt_passes_when_strictly_greater() {
-    let s = ShapeInfo { batch_size: 2, ..Default::default() };
+    let s = ShapeInfo {
+        batch_size: 2,
+        ..Default::default()
+    };
     assert!(ShapePredicate::BatchGt(1).eval(&s));
 }
 
 #[test]
 fn shape_batch_gt_fails_when_equal() {
-    let s = ShapeInfo { batch_size: 1, ..Default::default() };
+    let s = ShapeInfo {
+        batch_size: 1,
+        ..Default::default()
+    };
     assert!(!ShapePredicate::BatchGt(1).eval(&s));
 }
 
 #[test]
 fn shape_batch_gt_fails_when_less() {
-    let s = ShapeInfo { batch_size: 0, ..Default::default() };
+    let s = ShapeInfo {
+        batch_size: 0,
+        ..Default::default()
+    };
     assert!(!ShapePredicate::BatchGt(1).eval(&s));
 }
 
 #[test]
 fn shape_head_dim_eq_passes_on_match() {
-    let s = ShapeInfo { head_dim: 128, ..Default::default() };
+    let s = ShapeInfo {
+        head_dim: 128,
+        ..Default::default()
+    };
     assert!(ShapePredicate::HeadDimEq(128).eval(&s));
 }
 
 #[test]
 fn shape_head_dim_eq_fails_on_mismatch() {
-    let s = ShapeInfo { head_dim: 64, ..Default::default() };
+    let s = ShapeInfo {
+        head_dim: 64,
+        ..Default::default()
+    };
     assert!(!ShapePredicate::HeadDimEq(128).eval(&s));
 }
 
 #[test]
 fn shape_m_lt_passes_when_strictly_less() {
-    let s = ShapeInfo { m: 7, ..Default::default() };
+    let s = ShapeInfo {
+        m: 7,
+        ..Default::default()
+    };
     assert!(ShapePredicate::MLt(8).eval(&s));
 }
 
 #[test]
 fn shape_m_lt_fails_when_equal() {
-    let s = ShapeInfo { m: 8, ..Default::default() };
+    let s = ShapeInfo {
+        m: 8,
+        ..Default::default()
+    };
     assert!(!ShapePredicate::MLt(8).eval(&s));
 }
 
 #[test]
 fn shape_m_lt_fails_when_greater() {
-    let s = ShapeInfo { m: 9, ..Default::default() };
+    let s = ShapeInfo {
+        m: 9,
+        ..Default::default()
+    };
     assert!(!ShapePredicate::MLt(8).eval(&s));
 }
 
@@ -181,9 +205,13 @@ fn fused_qkv_hfq6_resolves_cross_arch() {
     // hfq6g256, which carry the full cross-arch ladder, so they are now `Always`.
     let fam = FusedQkvFamily::new();
     for ctx in [&ctx_gfx906(), &ctx_rdna3()] {
-        assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None).is_ok());
+        assert!(fam
+            .resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None)
+            .is_ok());
         assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, ctx, None).is_ok());
-        assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, ctx, None).is_ok());
+        assert!(fam
+            .resolve(KernelKey::FusedGateUpHfq6G256, ctx, None)
+            .is_ok());
     }
 }
 
@@ -192,24 +220,48 @@ fn fused_qkv_variant_for_key_classifies_by_family() {
     use KernelKey::*;
     // 3-way QKV family (incl. Q4K + Paro QKV synthesis).
     for k in [
-        FusedQkvHfq4G256, FusedQkvMq3G256Lloyd, FusedQkvMq4G256Lloyd,
-        FusedQkvHfq6G256, FusedQkvQ4K, FusedQkvParo4G128T,
+        FusedQkvHfq4G256,
+        FusedQkvMq3G256Lloyd,
+        FusedQkvMq4G256Lloyd,
+        FusedQkvHfq6G256,
+        FusedQkvQ4K,
+        FusedQkvParo4G128T,
     ] {
-        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::Qkv), "{k:?}");
+        assert_eq!(
+            fused_qkv_variant_for_key(k),
+            Some(FusedQkvVariant::Qkv),
+            "{k:?}"
+        );
     }
     // 4-way QKVZA family (incl. Paro).
     for k in [
-        FusedQkvzaHfq4G256, FusedQkvzaMq3G256Lloyd, FusedQkvzaMq4G256Lloyd,
-        FusedQkvzaHfq6G256, FusedQkvzaParo4G128T,
+        FusedQkvzaHfq4G256,
+        FusedQkvzaMq3G256Lloyd,
+        FusedQkvzaMq4G256Lloyd,
+        FusedQkvzaHfq6G256,
+        FusedQkvzaParo4G128T,
     ] {
-        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::Qkvza), "{k:?}");
+        assert_eq!(
+            fused_qkv_variant_for_key(k),
+            Some(FusedQkvVariant::Qkvza),
+            "{k:?}"
+        );
     }
     // 2-way Gate+Up family (incl. Q8_0 + Q4K + Paro).
     for k in [
-        FusedGateUpHfq4G256, FusedGateUpMq3G256Lloyd, FusedGateUpMq4G256Lloyd,
-        FusedGateUpHfq6G256, FusedGateUpQ4K, FusedGateUpQ8_0, FusedGateUpParo4G128T,
+        FusedGateUpHfq4G256,
+        FusedGateUpMq3G256Lloyd,
+        FusedGateUpMq4G256Lloyd,
+        FusedGateUpHfq6G256,
+        FusedGateUpQ4K,
+        FusedGateUpQ8_0,
+        FusedGateUpParo4G128T,
     ] {
-        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::GateUp), "{k:?}");
+        assert_eq!(
+            fused_qkv_variant_for_key(k),
+            Some(FusedQkvVariant::GateUp),
+            "{k:?}"
+        );
     }
     // Non-fused keys → None.
     assert_eq!(fused_qkv_variant_for_key(KernelKey::GemvF32), None);
@@ -223,7 +275,10 @@ fn registry_resolve_happy_path() {
     let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
     let ctx = ctx_rdna1();
-    assert_eq!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().key, KernelKey::GemvF32);
+    assert_eq!(
+        reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().key,
+        KernelKey::GemvF32
+    );
 }
 
 #[test]
@@ -239,7 +294,9 @@ fn registry_resolve_arch_gate_fails_returns_missing_impl() {
     let mut reg = KernelRegistry::new();
     reg.register(has_wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1(); // no WMMA
-    let err = reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap_err();
+    let err = reg
+        .resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None)
+        .unwrap_err();
     assert!(matches!(err, DispatchError::MissingImpl { .. }));
 }
 
@@ -249,7 +306,9 @@ fn registry_resolve_arch_gate_passes_on_capable_arch() {
     reg.register(has_wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna3(); // has WMMA w32
     assert_eq!(
-        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap().key,
+        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None)
+            .unwrap()
+            .key,
         KernelKey::GemmHfq4G256Wmma,
     );
 }
@@ -263,7 +322,9 @@ fn registry_resolve_falls_through_to_second_variant() {
     reg.register(always_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1();
     assert_eq!(
-        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap().key,
+        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None)
+            .unwrap()
+            .key,
         KernelKey::GemmHfq4G256Wmma,
     );
 }
@@ -280,8 +341,16 @@ fn registry_resolve_shape_gate_passes_when_shape_matches() {
         tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
-    let shape = ShapeInfo { head_dim: 128, ..Default::default() };
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap().key, KernelKey::AttnF32);
+    let shape = ShapeInfo {
+        head_dim: 128,
+        ..Default::default()
+    };
+    assert_eq!(
+        reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape))
+            .unwrap()
+            .key,
+        KernelKey::AttnF32
+    );
 }
 
 #[test]
@@ -296,8 +365,13 @@ fn registry_resolve_shape_gate_skips_when_shape_mismatches() {
         tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
-    let shape = ShapeInfo { head_dim: 64, ..Default::default() };
-    let err = reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap_err();
+    let shape = ShapeInfo {
+        head_dim: 64,
+        ..Default::default()
+    };
+    let err = reg
+        .resolve(KernelKey::AttnF32, &ctx, Some(&shape))
+        .unwrap_err();
     assert!(matches!(err, DispatchError::MissingImpl { .. }));
 }
 
@@ -314,7 +388,10 @@ fn registry_resolve_shape_none_bypasses_shape_gate() {
         tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, None).unwrap().key, KernelKey::AttnF32);
+    assert_eq!(
+        reg.resolve(KernelKey::AttnF32, &ctx, None).unwrap().key,
+        KernelKey::AttnF32
+    );
 }
 
 #[test]
@@ -331,27 +408,60 @@ fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
     });
     reg.register(always_variant(KernelKey::AttnF32)); // ungated fallback
     let ctx = ctx_rdna1();
-    let shape = ShapeInfo { head_dim: 64, ..Default::default() }; // doesn't match gated
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap().key, KernelKey::AttnF32);
+    let shape = ShapeInfo {
+        head_dim: 64,
+        ..Default::default()
+    }; // doesn't match gated
+    assert_eq!(
+        reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape))
+            .unwrap()
+            .key,
+        KernelKey::AttnF32
+    );
 }
 
 #[test]
 fn resolve_honors_shape_gate() {
     let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
-        key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
-        shape_gate: Some(ShapePredicate::BatchGt(1)), steps: &[PipelineOp::Gemv], has_awq: true, tile: TileImpl::None,
+        key: KernelKey::GemvF32,
+        arch_required: ArchPredicate::Always,
+        shape_gate: Some(ShapePredicate::BatchGt(1)),
+        steps: &[PipelineOp::Gemv],
+        has_awq: true,
+        tile: TileImpl::None,
     });
     reg.register(KernelVariant {
-        key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
-        shape_gate: None, steps: &[PipelineOp::Gemv], has_awq: false,
+        key: KernelKey::GemvF32,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
         tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
-    let batched = ShapeInfo { batch_size: 8, head_dim: 0, m: 4096, is_tree: false };
-    let scalar  = ShapeInfo { batch_size: 1, head_dim: 0, m: 4096, is_tree: false };
-    assert!(reg.resolve(KernelKey::GemvF32, &ctx, Some(&batched)).unwrap().has_awq);
-    assert!(!reg.resolve(KernelKey::GemvF32, &ctx, Some(&scalar)).unwrap().has_awq);
+    let batched = ShapeInfo {
+        batch_size: 8,
+        head_dim: 0,
+        m: 4096,
+        is_tree: false,
+    };
+    let scalar = ShapeInfo {
+        batch_size: 1,
+        head_dim: 0,
+        m: 4096,
+        is_tree: false,
+    };
+    assert!(
+        reg.resolve(KernelKey::GemvF32, &ctx, Some(&batched))
+            .unwrap()
+            .has_awq
+    );
+    assert!(
+        !reg.resolve(KernelKey::GemvF32, &ctx, Some(&scalar))
+            .unwrap()
+            .has_awq
+    );
     assert!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().has_awq);
 }
 
@@ -378,13 +488,13 @@ fn registry_all_keys_returns_registered_keys() {
 #[test]
 fn for_gemv_plain_maps_all_scalar_dtypes() {
     let cases = [
-        (DType::F32,       KernelKey::GemvF32),
-        (DType::F16,       KernelKey::GemvF16),
-        (DType::Q8_0,      KernelKey::GemvQ8_0),
-        (DType::HFQ4G256,  KernelKey::GemvHfq4G256),
-        (DType::MQ4G256,   KernelKey::GemvMq4G256),
-        (DType::MQ3G256,   KernelKey::GemvMq3G256),
-        (DType::MFP4G32,   KernelKey::GemvMfp4G32),
+        (DType::F32, KernelKey::GemvF32),
+        (DType::F16, KernelKey::GemvF16),
+        (DType::Q8_0, KernelKey::GemvQ8_0),
+        (DType::HFQ4G256, KernelKey::GemvHfq4G256),
+        (DType::MQ4G256, KernelKey::GemvMq4G256),
+        (DType::MQ3G256, KernelKey::GemvMq3G256),
+        (DType::MFP4G32, KernelKey::GemvMfp4G32),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -423,20 +533,32 @@ fn for_gemv_prerotated_falls_back_to_plain_for_non_rotated() {
     // Prerotated input path (Ship 2.1) — previously these returned Err, which
     // caused a MissingImpl panic at runtime when the interpreter tried to dispatch
     // a non-rotated dtype through the Prerotated variant.
-    assert_eq!(KernelKey::for_gemv_prerotated(DType::F32).unwrap(), KernelKey::GemvF32);
-    assert_eq!(KernelKey::for_gemv_prerotated(DType::Q8_0).unwrap(), KernelKey::GemvQ8_0);
-    assert_eq!(KernelKey::for_gemv_prerotated(DType::HFQ4G256).unwrap(), KernelKey::GemvHfq4G256);
+    assert_eq!(
+        KernelKey::for_gemv_prerotated(DType::F32).unwrap(),
+        KernelKey::GemvF32
+    );
+    assert_eq!(
+        KernelKey::for_gemv_prerotated(DType::Q8_0).unwrap(),
+        KernelKey::GemvQ8_0
+    );
+    assert_eq!(
+        KernelKey::for_gemv_prerotated(DType::HFQ4G256).unwrap(),
+        KernelKey::GemvHfq4G256
+    );
     // Rotation-needing dtypes still resolve to dedicated prerotated keys.
-    assert_eq!(KernelKey::for_gemv_prerotated(DType::MQ4G256).unwrap(), KernelKey::GemvMq4G256Prerotated);
+    assert_eq!(
+        KernelKey::for_gemv_prerotated(DType::MQ4G256).unwrap(),
+        KernelKey::GemvMq4G256Prerotated
+    );
 }
 
 #[test]
 fn for_gemv_residual_maps_hfq_and_mq() {
     let cases = [
-        (DType::HFQ4G256,     KernelKey::GemvHfq4G256Residual),
-        (DType::HFQ3G256,     KernelKey::GemvHfq3G256Residual),
-        (DType::HFQ6G256,     KernelKey::GemvHfq6G256Residual),
-        (DType::MQ4G256,      KernelKey::GemvMq4G256Residual),
+        (DType::HFQ4G256, KernelKey::GemvHfq4G256Residual),
+        (DType::HFQ3G256, KernelKey::GemvHfq3G256Residual),
+        (DType::HFQ6G256, KernelKey::GemvHfq6G256Residual),
+        (DType::MQ4G256, KernelKey::GemvMq4G256Residual),
         (DType::MQ3G256Lloyd, KernelKey::GemvMq3G256LloydResidual),
     ];
     for (dtype, expected) in cases {
@@ -474,8 +596,14 @@ fn for_gemv_rejects_unsupported_variant_combo() {
 #[test]
 fn dtype_needs_rotation_true_for_mq_family() {
     for dtype in [
-        DType::MQ4G256, DType::MQ3G256, DType::MQ2G256, DType::MQ5G256, DType::MQ6G256,
-        DType::MQ8G256, DType::MQ4G256Lloyd, DType::MFP4G32,
+        DType::MQ4G256,
+        DType::MQ3G256,
+        DType::MQ2G256,
+        DType::MQ5G256,
+        DType::MQ6G256,
+        DType::MQ8G256,
+        DType::MQ4G256Lloyd,
+        DType::MFP4G32,
     ] {
         assert!(dtype_needs_rotation(dtype), "{dtype:?} should need FWHT");
     }
@@ -483,22 +611,48 @@ fn dtype_needs_rotation_true_for_mq_family() {
 
 #[test]
 fn dtype_needs_rotation_false_for_hfq_and_scalar() {
-    for dtype in [DType::F32, DType::F16, DType::HFQ4G256, DType::Q8_0, DType::HFP4G32] {
-        assert!(!dtype_needs_rotation(dtype), "{dtype:?} should NOT need FWHT");
+    for dtype in [
+        DType::F32,
+        DType::F16,
+        DType::HFQ4G256,
+        DType::Q8_0,
+        DType::HFP4G32,
+    ] {
+        assert!(
+            !dtype_needs_rotation(dtype),
+            "{dtype:?} should NOT need FWHT"
+        );
     }
 }
 
 #[test]
 fn gemv_steps_rotation_matches_plan() {
-    for dtype in [DType::MQ4G256, DType::MFP4G32, DType::ParoQ4G128, DType::HFQ4G256] {
+    for dtype in [
+        DType::MQ4G256,
+        DType::MFP4G32,
+        DType::ParoQ4G128,
+        DType::HFQ4G256,
+    ] {
         let steps = KernelKey::gemv_steps(dtype, GemvVariant::Plain);
         let plan = dtype_rotation_plan(dtype);
         let has_fwht = steps.contains(&PipelineOp::RotateFwht);
         let has_givens = steps.contains(&PipelineOp::GivensRotate);
         match plan {
-            RotationPlan::Givens => { assert!(has_givens && !has_fwht, "{dtype:?}: Givens plan must emit GivensRotate, not FWHT"); }
-            RotationPlan::FwhtG256 | RotationPlan::FwhtG128 => { assert!(has_fwht && !has_givens, "{dtype:?}: FWHT plan must emit RotateFwht"); }
-            RotationPlan::None => { assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation"); }
+            RotationPlan::Givens => {
+                assert!(
+                    has_givens && !has_fwht,
+                    "{dtype:?}: Givens plan must emit GivensRotate, not FWHT"
+                );
+            }
+            RotationPlan::FwhtG256 | RotationPlan::FwhtG128 => {
+                assert!(
+                    has_fwht && !has_givens,
+                    "{dtype:?}: FWHT plan must emit RotateFwht"
+                );
+            }
+            RotationPlan::None => {
+                assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation");
+            }
             RotationPlan::Mq8Internal => {}
         }
     }
@@ -509,8 +663,12 @@ fn gemv_steps_rotation_matches_plan() {
 #[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None).is_ok());
+    assert!(fam
+        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None)
+        .is_ok());
+    assert!(fam
+        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None)
+        .is_ok());
 }
 
 #[test]
@@ -519,22 +677,94 @@ fn gemv_family_resolves_hfq4_on_all_archs() {
     // HFQ4G256 uses generic wave32/wave64 kernels with a fallback for every arch
     // (gfx906 via dp4a/sdot4, gfx1010 via generic). Previously gated on HasDp4a
     // (has_dot2_f32_f16 = RDNA1.1+) which excluded gfx906/gfx1010.
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna3(), None).is_ok());
-    assert!(fam.resolve(DType::MQ4G256,  GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::MQ4G256,  GemvVariant::Plain, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::HFQ4G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna1(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::HFQ4G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::HFQ4G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna1(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
 }
 
 #[test]
 fn gemv_family_resolves_mq3_prerotated_only_on_wmma_arch() {
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_err());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
-    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
-    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::F32,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────
@@ -592,6 +822,8 @@ fn dtypes_all_mq4() -> MoeDtypes {
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        per_expert_gate_up: None,
+        per_expert_down: None,
     }
 }
 
@@ -654,9 +886,14 @@ fn moe_res_mq6_routed_indexable() {
 fn moe_decode_oplist_prefix_matches_gate_side() {
     // The 4-way fused gate-side projection is capturable as a length-1 prefix.
     let oplist = [
-        PipelineOp::MoeGateSideProj, PipelineOp::Softmax, PipelineOp::TopKRenorm,
-        PipelineOp::SharedExpertDown, PipelineOp::IndexedGateUp,
-        PipelineOp::SiluMulRotate, PipelineOp::IndexedDownExpanded, PipelineOp::MoeCombine,
+        PipelineOp::MoeGateSideProj,
+        PipelineOp::Softmax,
+        PipelineOp::TopKRenorm,
+        PipelineOp::SharedExpertDown,
+        PipelineOp::IndexedGateUp,
+        PipelineOp::SiluMulRotate,
+        PipelineOp::IndexedDownExpanded,
+        PipelineOp::MoeCombine,
     ];
     let fused = Pipeline::new(&[PipelineOp::MoeGateSideProj]);
     assert!(fused.can_satisfy(&oplist));
@@ -684,19 +921,34 @@ use crate::pipeline::steps::{match_prefix, GemvInput};
 use crate::pipeline::{FusedPattern, Step};
 
 fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
-    WeightRef { buf: t, dtype: rdna_compute::DType::F32, m: 1, k: 1,
-                row_stride: 0, rotation: None, awq_scale: None }
+    WeightRef {
+        buf: t,
+        dtype: rdna_compute::DType::F32,
+        m: 1,
+        k: 1,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    }
 }
 
 fn gemv_step<'a>(t: &'a rdna_compute::GpuTensor, wr: &'a WeightRef<'a>) -> Step<'a> {
-    Step::Gemv { w: wr, input: GemvInput::Raw(t), out: t }
+    Step::Gemv {
+        w: wr,
+        input: GemvInput::Raw(t),
+        out: t,
+    }
 }
 
 #[test]
 fn match_prefix_empty_table_never_fires() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
-    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
+    let steps = [
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+    ];
     assert_eq!(match_prefix(&[], &steps, &ctx_rdna3()), None);
 }
 
@@ -704,12 +956,27 @@ fn match_prefix_empty_table_never_fires() {
 fn match_prefix_picks_longest() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
-    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
-    let table = [
-        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true },
-        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF16, guard: |_, _| true },
+    let steps = [
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
     ];
-    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF16, 3)));
+    let table = [
+        FusedPattern {
+            ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
+            key: KernelKey::GemvF32,
+            guard: |_, _| true,
+        },
+        FusedPattern {
+            ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv],
+            key: KernelKey::GemvF16,
+            guard: |_, _| true,
+        },
+    ];
+    assert_eq!(
+        match_prefix(&table, &steps, &ctx_rdna3()),
+        Some((KernelKey::GemvF16, 3))
+    );
 }
 
 #[test]
@@ -718,7 +985,9 @@ fn match_prefix_no_pattern_longer_than_steps() {
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
-        ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true,
+        ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
+        key: KernelKey::GemvF32,
+        guard: |_, _| true,
     }];
     assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), None);
 }
@@ -727,12 +996,21 @@ fn match_prefix_no_pattern_longer_than_steps() {
 fn match_prefix_single_op_consumes_one() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
-    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
+    let steps = [
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+    ];
     let table = [FusedPattern {
-        ops: &[PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true,
+        ops: &[PipelineOp::Gemv],
+        key: KernelKey::GemvF32,
+        guard: |_, _| true,
     }];
     // a len-1 pattern matches the first step, consuming exactly 1
-    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF32, 1)));
+    assert_eq!(
+        match_prefix(&table, &steps, &ctx_rdna3()),
+        Some((KernelKey::GemvF32, 1))
+    );
 }
 
 #[test]
@@ -743,7 +1021,7 @@ fn match_prefix_guard_false_blocks_match() {
     let table = [FusedPattern {
         ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
         key: KernelKey::GemvF32,
-        guard: |_, _| false,  // always reject
+        guard: |_, _| false, // always reject
     }];
     assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), None);
 }
@@ -753,22 +1031,28 @@ fn match_prefix_guard_receives_correct_window() {
     // Guard inspects window length — verifies it gets exactly ops.len() steps.
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
-    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
+    let steps = [
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+        gemv_step(&dummy, &wr),
+    ];
     let table = [FusedPattern {
         ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
         key: KernelKey::GemvF32,
-        guard: |window, _| window.len() == 2,  // must see exactly 2 steps
+        guard: |window, _| window.len() == 2, // must see exactly 2 steps
     }];
-    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF32, 2)));
+    assert_eq!(
+        match_prefix(&table, &steps, &ctx_rdna3()),
+        Some((KernelKey::GemvF32, 2))
+    );
 }
 
 // ── FUSED_TABLE guard tests ──────────────────────────────────────────────────
 
 use crate::pipeline::steps::{
-    guard_qkv_mq4g256lloyd, guard_qkv_mq3g256lloyd,
-    guard_qkv_hfq4g256, guard_qkv_hfq6g256,
-    guard_gate_up_mq4g256lloyd, guard_gate_up_mq3g256lloyd,
-    guard_gate_up_hfq4g256, guard_gate_up_hfq6g256,
+    guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
+    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd,
+    guard_qkv_mq4g256lloyd,
 };
 
 fn make_qkv3_steps<'a>(
@@ -778,12 +1062,30 @@ fn make_qkv3_steps<'a>(
 ) -> Vec<Step<'a>> {
     vec![
         Step::RmsnormAutomatic {
-            x: dummy, norm_weight: dummy, x_plain: dummy, out: dummy,
-            awq_scale: None, k: 4096, eps: 1e-6, rotation,
+            x: dummy,
+            norm_weight: dummy,
+            x_plain: dummy,
+            out: dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation,
         },
-        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
-        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
-        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
     ]
 }
 
@@ -794,19 +1096,40 @@ fn make_gate_up2_steps<'a>(
 ) -> Vec<Step<'a>> {
     vec![
         Step::RmsnormAutomatic {
-            x: dummy, norm_weight: dummy, x_plain: dummy, out: dummy,
-            awq_scale: None, k: 4096, eps: 1e-6, rotation,
+            x: dummy,
+            norm_weight: dummy,
+            x_plain: dummy,
+            out: dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation,
         },
-        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
-        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
     ]
 }
 
 #[test]
 fn guard_qkv_mq4g256lloyd_fires() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256Lloyd,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
@@ -814,8 +1137,15 @@ fn guard_qkv_mq4g256lloyd_fires() {
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::HFQ4G256,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::HFQ4G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
@@ -823,9 +1153,15 @@ fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None,
-                         awq_scale: Some(&dummy) }; // AWQ present → reject
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256Lloyd,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: Some(&dummy),
+    }; // AWQ present → reject
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
@@ -833,8 +1169,15 @@ fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256Lloyd,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     let mut ctx = ctx_rdna3();
     std::sync::Arc::make_mut(&mut ctx.flags).force_unfused = true;
@@ -844,8 +1187,15 @@ fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
 #[test]
 fn guard_qkv_hfq4g256_covers_mq4g256() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
 }
@@ -853,8 +1203,15 @@ fn guard_qkv_hfq4g256_covers_mq4g256() {
 #[test]
 fn guard_qkv_hfq4g256_covers_hfq4g256() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::HFQ4G256,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::HFQ4G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
 }
@@ -868,19 +1225,33 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
     // blocked. Only `force_unfused` or a non-uniform / wrong-length step window
     // suppresses it now.
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr_hfq6 = WeightRef { buf: &dummy, dtype: DType::HFQ6G256,
-                               m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
-    let wr_mq6  = WeightRef { buf: &dummy, dtype: DType::MQ6G256,
-                               m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr_hfq6 = WeightRef {
+        buf: &dummy,
+        dtype: DType::HFQ6G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let wr_mq6 = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ6G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps_hfq6 = make_qkv3_steps(&dummy, &wr_hfq6, RotationPlan::FwhtG256);
-    let steps_mq6  = make_qkv3_steps(&dummy, &wr_mq6,  RotationPlan::FwhtG256);
+    let steps_mq6 = make_qkv3_steps(&dummy, &wr_mq6, RotationPlan::FwhtG256);
 
     // gfx906 (dp4a) still fires.
     assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_gfx906()));
-    assert!(guard_qkv_hfq6g256(&steps_mq6,  &ctx_gfx906()));
+    assert!(guard_qkv_hfq6g256(&steps_mq6, &ctx_gfx906()));
     // RDNA3 (gfx1100) now ALSO fires (dp4a decoupled).
     assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna3()));
-    assert!(guard_qkv_hfq6g256(&steps_mq6,  &ctx_rdna3()));
+    assert!(guard_qkv_hfq6g256(&steps_mq6, &ctx_rdna3()));
     // RDNA1 (gfx1010) fires too — the guard no longer gates on dp4a; the
     // fused_qkv None arm safely lowers to gemm n=1 on any arch.
     assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna1()));
@@ -889,16 +1260,41 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
 #[test]
 fn guard_qkv_rejects_mixed_gemv_input() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256Lloyd,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = vec![
         Step::RmsnormAutomatic {
-            x: &dummy, norm_weight: &dummy, x_plain: &dummy, out: &dummy,
-            awq_scale: None, k: 4096, eps: 1e-6, rotation: RotationPlan::FwhtG256,
+            x: &dummy,
+            norm_weight: &dummy,
+            x_plain: &dummy,
+            out: &dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation: RotationPlan::FwhtG256,
         },
-        Step::Gemv { w: &wr, input: GemvInput::Prerotated(&dummy), out: &dummy },
-        Step::Gemv { w: &wr, input: GemvInput::Raw(&dummy), out: &dummy }, // mixed!
-        Step::Gemv { w: &wr, input: GemvInput::Prerotated(&dummy), out: &dummy },
+        Step::Gemv {
+            w: &wr,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+        Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&dummy),
+            out: &dummy,
+        }, // mixed!
+        Step::Gemv {
+            w: &wr,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
     ];
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
@@ -906,8 +1302,15 @@ fn guard_qkv_rejects_mixed_gemv_input() {
 #[test]
 fn guard_gate_up_mq4g256lloyd_fires() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
-                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256Lloyd,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
@@ -929,6 +1332,8 @@ fn moe_dtypes_mq4() -> MoeDtypes {
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        per_expert_gate_up: None,
+        per_expert_down: None,
     }
 }
 
@@ -1072,7 +1477,10 @@ fn moe_prefill_resolution_mq6_gfx11_uses_path2() {
     // included), superseding master's earlier gfx12-only fallback assertion.
     let arch = crate::context::DispatchCtx::for_test("gfx1100");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(r.use_path2, "MQ6 on gfx11 should use Path 2 (gfx11 `_k2` grouped WMMA exists)");
+    assert!(
+        r.use_path2,
+        "MQ6 on gfx11 should use Path 2 (gfx11 `_k2` grouped WMMA exists)"
+    );
     assert!(!r.down_path0, "gfx11 is not Path 0");
 }
 
@@ -1080,7 +1488,10 @@ fn moe_prefill_resolution_mq6_gfx11_uses_path2() {
 fn moe_prefill_resolution_mq6_gfx1151_uses_path2() {
     let arch = crate::context::DispatchCtx::for_test("gfx1151");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(r.use_path2, "MQ6 on gfx1151 should use Path 2 (grouped WMMA available)");
+    assert!(
+        r.use_path2,
+        "MQ6 on gfx1151 should use Path 2 (grouped WMMA available)"
+    );
     assert!(!r.down_path0);
 }
 
@@ -1088,7 +1499,10 @@ fn moe_prefill_resolution_mq6_gfx1151_uses_path2() {
 fn moe_prefill_resolution_mq6_gfx12_uses_path2() {
     let arch = crate::context::DispatchCtx::for_test("gfx1200");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
-    assert!(r.use_path2, "MQ6 on gfx12 should use Path 2 (grouped WMMA available)");
+    assert!(
+        r.use_path2,
+        "MQ6 on gfx12 should use Path 2 (grouped WMMA available)"
+    );
     assert!(!r.down_path0);
 }
 

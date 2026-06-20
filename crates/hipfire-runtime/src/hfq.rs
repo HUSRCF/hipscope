@@ -74,11 +74,93 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    /// Optional overlay HFQ whose tensors shadow this file's by name (the
+    /// REAP load-time splice, SP3). When `Some`, every tensor read method
+    /// consults the overlay first and falls back to the base. When `None`
+    /// (the common case), every read path is byte-identical to pre-overlay
+    /// behavior — each overlay check is gated on `self.overlay.is_some()`.
+    overlay: Option<Box<HfqFile>>,
 }
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        Self::open_at_offset(path, 0)
+        let mut f = Self::open_at_offset(path, 0)?;
+        // REAP load-time overlay splice (SP3): when HIPFIRE_REAP_PLAN points
+        // at a dir containing `overlay.hfq`, attach it so its re-quantized
+        // tensors shadow the base by name. Opened via `open_at_offset` (NOT
+        // `open`) so the overlay does NOT recursively env-attach. A mismatched
+        // arch_id is logged and we proceed base-only — the safe default for
+        // unrelated model opens that happen to share the env var.
+        if let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") {
+            let ov_path = std::path::Path::new(&dir).join("overlay.hfq");
+            if ov_path.exists() {
+                // NOTE: a failure to attach (unreadable overlay, arch mismatch,
+                // missing tensor, or shape mismatch) is logged and we proceed
+                // base-only — the safe default for an unrelated model open that
+                // merely shares the env var. The tradeoff (tracked on PR #445):
+                // if the overlay WAS meant for this model but is broken, the
+                // model silently loads UNPRUNED — watch stderr for this WARNING.
+                match Self::open_at_offset(&ov_path, 0)
+                    .map_err(|e| e.to_string())
+                    .and_then(|ov| {
+                        let n = ov.tensors.len();
+                        f.attach_overlay(ov).map(|_| n)
+                    }) {
+                    Ok(n) => eprintln!(
+                        "reap: overlay ACTIVE — {n} tensor(s) from {ov_path:?} shadow the base"
+                    ),
+                    Err(e) => eprintln!(
+                        "reap: WARNING overlay at {ov_path:?} not attached, \
+                         loading UNPRUNED base: {e}"
+                    ),
+                }
+            }
+        }
+        Ok(f)
+    }
+
+    /// Attach an overlay whose tensors shadow this file's by name. Used by the
+    /// REAP load-time splice (SP3). Errors if arch_id differs (wrong model).
+    pub fn attach_overlay(&mut self, overlay: HfqFile) -> Result<(), String> {
+        if overlay.arch_id != self.arch_id {
+            return Err(format!(
+                "reap overlay: arch_id {} != base arch_id {}",
+                overlay.arch_id, self.arch_id
+            ));
+        }
+        // A pure-shadow overlay only RE-quantizes existing tensors; it must not
+        // introduce names absent from the base, and each shadow must have the
+        // SAME logical shape as the base tensor it replaces (only the quant tier
+        // — quant_type/group_size/data_size — may differ). The name check catches
+        // an overlay built for a DIFFERENT model; the shape check catches two
+        // same-arch checkpoints (e.g. a 0.8B vs 9B at the same arch_id) whose
+        // tensors collide by name but differ in dimensions — splicing those would
+        // silently corrupt the weights. Called BEFORE self.overlay is set, so
+        // find_tensor_info searches only the base — correct.
+        for ti in &overlay.tensors {
+            match self.find_tensor_info(&ti.name) {
+                None => {
+                    return Err(format!(
+                        "reap overlay: tensor '{}' not present in base — overlay likely built for a different model",
+                        ti.name
+                    ));
+                }
+                Some(base_ti) if base_ti.shape != ti.shape => {
+                    return Err(format!(
+                        "reap overlay: tensor '{}' shape {:?} != base shape {:?} — overlay built for a different model",
+                        ti.name, ti.shape, base_ti.shape
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        self.overlay = Some(Box::new(overlay));
+        Ok(())
+    }
+
+    /// True when an overlay is attached (its tensors shadow the base).
+    pub fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
     }
 
     /// Open an HFQM container that lives inside a larger file, starting at
@@ -170,6 +252,22 @@ impl HfqFile {
                 }
             }
         }
+        // A truncated/corrupt container whose metadata JSON never closes its
+        // top-level brace leaves `json_end == 0`. Without this guard we'd slice
+        // an empty metadata string and read the tensor-index count from the
+        // metadata start (the wrong offset) → a bogus `idx_n` that panics the
+        // `assert_eq!` below or silently mis-parses the index. Now that overlays
+        // (`overlay.hfq`) are user-built artifacts fed through this same parser,
+        // surface it as a clean error instead. (`{}` ⇒ json_end == 2, fine.)
+        if json_end == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: metadata JSON at offset {metadata_offset} is not brace-terminated \
+                     (truncated or corrupt HFQ container)"
+                ),
+            ));
+        }
         let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
 
         // Parse tensor index (follows metadata JSON)
@@ -222,6 +320,7 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            overlay: None,
         };
 
         // Structural-pillar tripwire: a qwen3.5/3.6 checkpoint MUST carry
@@ -427,11 +526,29 @@ impl HfqFile {
     /// without copying its data. The weight pager calls this at load time to
     /// register byte ranges without forcing eager VRAM allocation.
     pub fn find_tensor_info(&self, name: &str) -> Option<&HfqTensorInfo> {
+        // Overlay-first resolution (SP3): an attached overlay shadows the base
+        // by name. Gated on `is_some()` so the no-overlay path is unchanged.
+        if self.overlay.is_some() {
+            if let Some(ov) = &self.overlay {
+                if let Some(info) = ov.find_tensor_info(name) {
+                    return Some(info);
+                }
+            }
+        }
         let idx = self.resolve_idx(name)?;
         Some(&self.tensors[idx])
     }
 
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
+        // Overlay-first resolution (SP3): if the overlay has this tensor,
+        // return its data; otherwise fall through to the base.
+        if self.overlay.is_some() {
+            if let Some(ov) = &self.overlay {
+                if ov.find_tensor_info(name).is_some() {
+                    return ov.tensor_data(name);
+                }
+            }
+        }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
         debug_assert!(
@@ -458,6 +575,15 @@ impl HfqFile {
         name: &str,
     ) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
         use std::os::unix::io::AsRawFd;
+        // Overlay-first resolution (SP3): the overlay reads from its own fd /
+        // pread_buf, so the returned guard borrows the overlay, not the base.
+        if self.overlay.is_some() {
+            if let Some(ov) = &self.overlay {
+                if ov.find_tensor_info(name).is_some() {
+                    return ov.tensor_data_pread(name);
+                }
+            }
+        }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
         let fd = self._file.as_raw_fd();
@@ -488,6 +614,16 @@ impl HfqFile {
     /// Non-unix fallback: just delegates to mmap-based tensor_data.
     #[cfg(not(unix))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
+        // Overlay-first resolution (SP3). `tensor_data` already consults the
+        // overlay, so delegating preserves it; the explicit guard keeps this
+        // symmetric with the unix path.
+        if self.overlay.is_some() {
+            if let Some(ov) = &self.overlay {
+                if ov.find_tensor_info(name).is_some() {
+                    return ov.tensor_data_pread(name);
+                }
+            }
+        }
         self.tensor_data(name)
     }
 
@@ -497,6 +633,15 @@ impl HfqFile {
     ///
     /// Returns owned Vec<u8> to avoid lifetime issues with the pread RefCell.
     pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
+        // Overlay-first resolution (SP3): the returned info reference borrows
+        // the overlay (which lives as long as `&self`), and the Vec is owned.
+        if self.overlay.is_some() {
+            if let Some(ov) = &self.overlay {
+                if ov.find_tensor_info(name).is_some() {
+                    return ov.tensor_data_vec(name);
+                }
+            }
+        }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
 
@@ -621,6 +766,23 @@ impl crate::model_source::ModelSource for HfqFile {
     }
 
     fn tensor_names(&self) -> Vec<&str> {
+        // Overlay-first resolution (SP3): the union of base ∪ overlay names,
+        // deduped. Deterministic order = base index order, then any
+        // overlay-only names sorted, so callers that sort get a stable result.
+        if let Some(ov) = &self.overlay {
+            let mut names: Vec<&str> = self.tensors.iter().map(|t| t.name.as_str()).collect();
+            let base: std::collections::HashSet<&str> = names.iter().copied().collect();
+            let mut extra: Vec<&str> = ov
+                .tensors
+                .iter()
+                .map(|t| t.name.as_str())
+                .filter(|n| !base.contains(n))
+                .collect();
+            extra.sort();
+            extra.dedup();
+            names.extend(extra);
+            return names;
+        }
         self.tensors.iter().map(|t| t.name.as_str()).collect()
     }
 
@@ -1456,5 +1618,165 @@ mod llama_config_tests {
         let config = envelope.get("config").unwrap();
         let c = llama_config_from_value(config, true).unwrap();
         assert!(c.has_qk_norm);
+    }
+}
+
+// ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::model_source::ModelSource; // for `tensor_names`
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    /// Minimal HFQ writer mirroring `hipfire-quantize`'s `write_hfq`
+    /// (`crates/hipfire-quantize/src/main.rs:3398`) byte-for-byte for the
+    /// layout `HfqFile::open` parses:
+    ///   - 32B header: magic "HFQM", u32 version, u32 arch_id, u32 n_tensors,
+    ///     u64 metadata_offset, u64 data_offset.
+    ///   - metadata JSON (we emit `{}`; the parser scans matching braces to
+    ///     find its end, so it must be valid balanced JSON).
+    ///   - index: u32 n; per tensor: u16 name_len, name bytes, u8 quant_type,
+    ///     u8 n_dims, n_dims×u32 shape, u32 group_size, u64 data_size.
+    ///   - zero padding so the data region starts 4096-aligned.
+    ///   - tensor data, concatenated in index order (offsets are derived at
+    ///     read time cumulatively from `data_offset`).
+    fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
+        let metadata = b"{}"; // balanced JSON; brace-scan parser stops at the close brace
+        let header_size: u64 = 32;
+        let metadata_offset = header_size;
+        let index_offset = metadata_offset + metadata.len() as u64;
+
+        let mut index = Vec::new();
+        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for (name, qt, shape, data) in tensors {
+            let nb = name.as_bytes();
+            index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            index.extend_from_slice(nb);
+            index.push(*qt);
+            index.push(shape.len() as u8);
+            for &d in *shape {
+                index.extend_from_slice(&d.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            index.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        }
+
+        let data_start_unaligned = index_offset + index.len() as u64;
+        let data_offset = (data_start_unaligned + 4095) & !4095;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(metadata).unwrap();
+        f.write_all(&index).unwrap();
+        let pad = (data_offset - data_start_unaligned) as usize;
+        f.write_all(&vec![0u8; pad]).unwrap();
+        for (_, _, _, data) in tensors {
+            f.write_all(data).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    // Env vars are process-global. `HfqFile::open` READS `HIPFIRE_REAP_PLAN`
+    // on every call, so EVERY test here that calls `open` must serialize on
+    // this mutex — otherwise the env-attach test's `set_var` leaks into a
+    // concurrent `open` in another test and attaches the wrong overlay.
+    // Hold the lock for the whole test body so env stays consistent across
+    // every `open` within it.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn overlay_tensor_shadows_base() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.hfq");
+        let ov = dir.path().join("overlay.hfq");
+        // base has tensorA (qt=3) + tensorB (qt=3); overlay re-quantizes A to qt=8.
+        write_min_hfq(
+            &base,
+            9,
+            &[
+                ("A", 3, &[2, 4], &vec![1u8; 2 * 4]),
+                ("B", 3, &[2, 4], &vec![2u8; 2 * 4]),
+            ],
+        );
+        write_min_hfq(&ov, 9, &[("A", 8, &[2, 4], &vec![9u8; 2 * 4])]);
+        let mut f = HfqFile::open(&base).unwrap();
+        f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap();
+        // A resolves to overlay (qt 8, bytes 9); B falls through to base (qt 3, bytes 2).
+        let (ia, da) = f.tensor_data_vec("A").unwrap();
+        assert_eq!(ia.quant_type, 8);
+        assert!(da.iter().all(|&b| b == 9));
+        let (ib, db) = f.tensor_data_vec("B").unwrap();
+        assert_eq!(ib.quant_type, 3);
+        assert!(db.iter().all(|&b| b == 2));
+        assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8);
+        // tensor_names is the union (base ∪ overlay), no dup.
+        let mut names = f.tensor_names();
+        names.sort();
+        assert_eq!(names, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn overlay_arch_mismatch_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("b.hfq");
+        let ov = dir.path().join("o.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![0u8; 4])]);
+        write_min_hfq(&ov, 6, &[("A", 3, &[1, 4], &vec![0u8; 4])]);
+        let mut f = HfqFile::open(&base).unwrap();
+        let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
+        assert!(err.contains("arch_id 6 != base arch_id 9"), "got: {err}");
+    }
+
+    #[test]
+    fn open_auto_attaches_overlay_from_env() {
+        // Env mutation is process-global; lock so this serializes with any
+        // other env-mutating test in this module.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![1u8; 4])]);
+        // overlay.hfq lives in the plan dir.
+        let plan = tempfile::tempdir().unwrap();
+        write_min_hfq(
+            &plan.path().join("overlay.hfq"),
+            9,
+            &[("A", 8, &[1, 4], &vec![7u8; 4])],
+        );
+        std::env::set_var("HIPFIRE_REAP_PLAN", plan.path());
+        let f = HfqFile::open(&base).unwrap();
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        assert!(f.has_overlay());
+        assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8); // overlay won
+    }
+
+    #[test]
+    fn overlay_with_foreign_tensor_rejected() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("b.hfq");
+        let ov = dir.path().join("o.hfq");
+        write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![0u8; 4])]);
+        // same arch_id 9, but overlay has a tensor "Z" the base lacks
+        write_min_hfq(
+            &ov,
+            9,
+            &[
+                ("A", 8, &[1, 4], &vec![1u8; 4]),
+                ("Z", 8, &[1, 4], &vec![1u8; 4]),
+            ],
+        );
+        let mut f = HfqFile::open(&base).unwrap();
+        let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
+        assert!(err.contains("'Z' not present in base"), "got: {err}");
     }
 }

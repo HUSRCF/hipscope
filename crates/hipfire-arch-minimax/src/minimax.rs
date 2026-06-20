@@ -43,6 +43,11 @@ pub struct MiniMaxConfig {
     pub scoring_func: String,
     /// MTP draft modules (spec-decode; 0 for the base forward / this ckpt).
     pub num_mtp_modules: usize,
+    /// Optional REAP keep-map: emulate a pruned expert pool by partial-loading
+    /// this full quant. Populated at config time from `HIPFIRE_REAP_PLAN=<dir>`;
+    /// `None` ⇒ no pruning (literal original full load, byte-identical to
+    /// baseline). Not (de)serialized — set in `apply_reap_plan`.
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 #[derive(Deserialize)]
@@ -103,7 +108,7 @@ impl MiniMaxConfig {
         let head_dim = raw
             .head_dim
             .unwrap_or(raw.hidden_size / raw.num_attention_heads);
-        Ok(MiniMaxConfig {
+        let mut config = MiniMaxConfig {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
             num_hidden_layers: raw.num_hidden_layers,
@@ -121,7 +126,23 @@ impl MiniMaxConfig {
             use_routing_bias: raw.use_routing_bias,
             scoring_func: raw.scoring_func,
             num_mtp_modules: raw.num_mtp_modules,
-        })
+            reap_keep: None,
+        };
+        // Apply the optional REAP keep-map HERE, inside the single public config
+        // entry point, so it is IMPOSSIBLE to bypass. Every caller funnels
+        // through `MiniMaxConfig::from_hfq` — the daemon (via the `Architecture`
+        // trait's `config_from_hfq`, which just delegates here) AND every
+        // example (`infer_minimax`, `ep_minimax`, `dump_minimax_hidden_states`,
+        // `debug_minimax_batch`) which call `MiniMaxConfig::from_hfq` directly,
+        // never through the trait. Wiring REAP only in the trait shim would
+        // silently ignore HIPFIRE_REAP_PLAN on all the direct callers. The trait
+        // impl therefore does NOT re-apply (double-apply ⇒ kept-of-kept ⇒
+        // load_any validation error). `from_hfq` returns `Result`, so a
+        // malformed plan propagates cleanly via `?` (REAP is opt-in ⇒ a user who
+        // explicitly set HIPFIRE_REAP_PLAN MUST hard-fail). With no env var,
+        // `apply_reap_plan` is a no-op (Ok), so baseline behavior is unchanged.
+        apply_reap_plan(&mut config)?;
+        Ok(config)
     }
 
     /// q projection output width (n_heads * head_dim).
@@ -132,6 +153,33 @@ impl MiniMaxConfig {
     pub fn kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
     }
+}
+
+/// Apply an optional REAP keep-map to a freshly parsed `MiniMaxConfig`.
+///
+/// Reads `HIPFIRE_REAP_PLAN=<dir>` (minimax has no legacy env alias). When set,
+/// loads `<dir>/reap_plan.json` (or the legacy `keep_by_layer.json`) via
+/// `ReapPlan::load_any`, validating against the ORIGINAL local-expert count
+/// (`config.num_local_experts`) BEFORE overriding it to the kept count. This
+/// emulates a pruned expert pool by partial-loading the full quant: only kept
+/// experts are packed into the per-layer blob (under remapped names) and the
+/// router's expert rows + routing bias are gathered to the kept set in
+/// `MiniMaxWeights::load`.
+///
+/// No env ⇒ no-op (`config.reap_keep` stays `None`); the loader then takes the
+/// literal original full-load path — byte-identical to baseline. REAP and EP
+/// sharding are MUTUALLY EXCLUSIVE; that guard lives in `MiniMaxWeights::load`.
+pub fn apply_reap_plan(config: &mut MiniMaxConfig) -> Result<(), String> {
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        "minimax",
+        None,
+        config.num_hidden_layers,
+        config.num_local_experts,
+    )? {
+        config.num_local_experts = plan.kept_per_layer();
+        config.reap_keep = Some(std::sync::Arc::new(plan));
+    }
+    Ok(())
 }
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -206,6 +254,56 @@ fn load_wt(
 ) -> Result<WeightTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("minimax: load_wt {name}: {e}"))
+}
+
+/// REAP keep variant of [`load_wt`]: gather the tensor's first-axis rows (one
+/// row per ORIGINAL expert) down to `keep` BEFORE quant decode, then build the
+/// `WeightTensor` with `m = keep.len()`. Only used for the MoE router
+/// (`block_sparse_moe.gate.weight`, shape `[orig_experts, hidden]`) under an
+/// active keep-map: it then emits logits only for kept experts, in compact slot
+/// order. `gather_rows` is exact for any row-independent quant (each per-expert
+/// row carries its own scale/zero/codebook), which holds for every quant_type
+/// `wt_from_raw` accepts. Reads owned bytes via `tensor_data_vec` to retain
+/// `info.shape` for the original row count. `keep` MUST be compact-slot-ordered
+/// and `m` MUST equal `keep.len()`.
+fn load_wt_keep(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    keep: &[u32],
+) -> Result<WeightTensor, String> {
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "minimax load_wt_keep: m must equal keep.len()"
+    );
+    let (qt, sub) = hipfire_reap::load::gather_weight_rows("minimax", hfq, name, keep)?;
+    wt_from_raw(gpu, qt, &sub, m, k).map_err(|e| format!("minimax: load_wt_keep {name}: {e}"))
+}
+
+/// REAP keep variant of [`load_norm`] for a 1-D per-expert F16/F32 vector (the
+/// router's `e_score_correction_bias` `[orig_experts]`). Gathers the kept rows
+/// (parallel to the router weight rows) so the per-expert routing bias aligns
+/// with the gathered router logits. `gather_rows` over a 1-D shape is an exact
+/// element select. Refuses block-packed quant (a single bias element is not a
+/// whole quant block) — only F16/F32 1-D vectors can be element-gathered.
+fn load_norm_keep(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    keep: &[u32],
+) -> Result<GpuTensor, String> {
+    debug_assert_eq!(
+        m,
+        keep.len(),
+        "minimax load_norm_keep: m must equal keep.len()"
+    );
+    let f32_data = hipfire_reap::load::gather_f32_vec("minimax", hfq, name, keep)?;
+    gpu.upload_f32(&f32_data, &[m])
+        .map_err(|e| format!("minimax: upload routing_bias {name}: {e:?}"))
 }
 
 /// quant_type → DType mapping (subset used by MiniMax HFQ files; mirrors
@@ -299,6 +397,16 @@ impl MiniMaxWeights {
         let inter = cfg.intermediate_size;
         let n_exp = cfg.num_local_experts;
 
+        // REAP keep-map and EP sharding are MUTUALLY EXCLUSIVE: REAP emulates a
+        // pruned pool by partial-loading kept experts into the compact blob (so
+        // `n_exp` is already the kept count and the pointer table spans only
+        // kept slots), while EP-shard packs only rank-owned experts and routes
+        // non-owned ones to a shared zeroed dummy. Combining them would
+        // double-remap the slot space. Mirror deepseek4's guard and refuse.
+        if cfg.reap_keep.is_some() && shard.is_some() {
+            return Err("minimax: REAP keep-map + EP sharding are mutually exclusive".into());
+        }
+
         // Globals.
         let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
         let embed = gpu
@@ -348,20 +456,56 @@ impl MiniMaxWeights {
                 q_dim,
             )?;
 
-            let router = load_wt(
-                hfq,
-                gpu,
-                &format!("{p}.block_sparse_moe.gate.weight"),
-                n_exp,
-                hidden,
-            )?;
-            // e_score_correction_bias: [n_exp] F16 → F32 (kept F16 in HFQ).
-            let routing_bias = load_norm(
-                hfq,
-                gpu,
-                &format!("{p}.block_sparse_moe.e_score_correction_bias"),
-                &[n_exp],
-            )?;
+            // REAP keep-map for this layer (None ⇒ no pruning / identity load).
+            // When a keep is present, `n_exp == cfg.num_local_experts` is already
+            // the KEPT count (overridden in apply_reap_plan); the router, routing
+            // bias, and expert-pack loop below load only the kept original
+            // experts, in compact slot order. (EP-shard is excluded above, so the
+            // keep path never coexists with the non-owned-zero path.)
+            let reap_ep = cfg.reap_keep.as_ref().map(|r| r.expert_plan(l));
+            let keep_l = reap_ep.as_ref().and_then(|e| e.keep());
+
+            // Router: hidden → n_exp. Under a keep, gather the router's expert
+            // rows (`[orig_experts, hidden]`) down to the kept set so it emits
+            // logits only for kept experts, in compact slot order. No keep ⇒ the
+            // literal original full load (byte-identical to baseline).
+            let router = match keep_l {
+                Some(keep) => load_wt_keep(
+                    hfq,
+                    gpu,
+                    &format!("{p}.block_sparse_moe.gate.weight"),
+                    n_exp,
+                    hidden,
+                    keep,
+                )?,
+                None => load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.block_sparse_moe.gate.weight"),
+                    n_exp,
+                    hidden,
+                )?,
+            };
+            // e_score_correction_bias: [n_exp] F16 → F32 (kept F16 in HFQ). This
+            // is a PER-EXPERT routing bias added to the router logits for top-k
+            // selection; under a keep it MUST be row-gathered to the kept set in
+            // the same compact slot order as the router weight, else the bias
+            // mis-aligns with the gathered logits. No keep ⇒ literal original.
+            let routing_bias = match keep_l {
+                Some(keep) => load_norm_keep(
+                    hfq,
+                    gpu,
+                    &format!("{p}.block_sparse_moe.e_score_correction_bias"),
+                    n_exp,
+                    keep,
+                )?,
+                None => load_norm(
+                    hfq,
+                    gpu,
+                    &format!("{p}.block_sparse_moe.e_score_correction_bias"),
+                    &[n_exp],
+                )?,
+            };
 
             // Routed experts: pack ALL experts of this layer into ONE gate_up
             // blob + ONE down blob (deepseek4 `upload_layer_routed_experts`
@@ -390,13 +534,22 @@ impl MiniMaxWeights {
             };
             let mut local_of_global = vec![usize::MAX; n_exp];
             let mut n_owned = 0usize;
-            for e in 0..n_exp {
+            // Iterate COMPACT slots `0..n_exp`. `e` = the ORIGINAL expert index
+            // loaded into this slot: under a REAP keep it is `src(slot)` (read the
+            // kept experts in compact order); with no keep it is `slot` itself, so
+            // the loop is byte-identical to the original literal pack (and the
+            // EP-shard path is unchanged — REAP excludes sharding, so when a keep
+            // is active `shard` is None and `owns(e)` is always true). `owns` /
+            // `local_of_global` stay indexed by the original id `e` (== slot on
+            // the no-keep path), preserving shard semantics exactly.
+            for slot in 0..n_exp {
+                let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
                 let ep = format!("{p}.block_sparse_moe.experts.{e}");
                 let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                 let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
                 let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
                 let gu_len = w1.len() + w3.len();
-                if e == 0 {
+                if slot == 0 {
                     gu_stride = gu_len;
                     dn_stride = w2.len();
                     qt_gu = qt1;
@@ -413,7 +566,15 @@ impl MiniMaxWeights {
                     ));
                 }
                 if owns(e) {
-                    local_of_global[e] = n_owned;
+                    // `local_of_global` is indexed by the KERNEL ROUTING INDEX —
+                    // the slot the router/topk emits, which the device pointer
+                    // table is built over below. With EP-shard that index is the
+                    // GLOBAL expert id `e`; with REAP (shard excluded) the router
+                    // is gathered to compact slots, so the routing index is the
+                    // COMPACT SLOT. On the plain path `e == slot`, so both agree
+                    // and the table is identity (byte-identical to baseline).
+                    let route = if shard.is_some() { e } else { slot };
+                    local_of_global[route] = n_owned;
                     n_owned += 1;
                     gu_combined.extend_from_slice(&w1);
                     gu_combined.extend_from_slice(&w3);

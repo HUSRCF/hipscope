@@ -9740,12 +9740,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            kname,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
@@ -9861,12 +9856,7 @@ impl Gpu {
 
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            kname,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
@@ -10367,8 +10357,7 @@ impl Gpu {
         let row_tile_stride = if use_m2 { 32 } else { 16 };
         let row_tiles = ((m + row_tile_stride - 1) / row_tile_stride) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
-        let bytes =
-            m_total * k * 2 + (m_total * m) * 4 + crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
@@ -11895,8 +11884,7 @@ impl Gpu {
         // BW estimate: mixed row footprint — use MQ4 as a conservative middle estimate.
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
@@ -12808,13 +12796,8 @@ impl Gpu {
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_mmq", bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            grid,
-            block,
-            shared_mem,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(xq_ptr);
@@ -12824,8 +12807,7 @@ impl Gpu {
                 b.push_i32(n_val);
                 b.push_i32(add_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -13537,13 +13519,8 @@ impl Gpu {
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            grid,
-            block,
-            shared_mem,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(xq_ptr);
@@ -13553,8 +13530,7 @@ impl Gpu {
                 b.push_i32(n_val);
                 b.push_i32(add_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -13649,13 +13625,8 @@ impl Gpu {
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            grid,
-            block,
-            shared_mem,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(xq_ptr);
@@ -13665,8 +13636,7 @@ impl Gpu {
                 b.push_i32(n_val);
                 b.push_i32(add_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

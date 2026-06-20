@@ -21,7 +21,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_hfq6_k2
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -92,7 +92,10 @@ fn f32_from_h16(h: u16) -> f32 {
         // Subnormal: normalize.
         let mut m = mant;
         let mut e: i32 = -14;
-        while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         m &= 0x3ff;
         ((sign as u32) << 31) | (((e + 127) as u32) << 23) | (m << 13)
     } else if exp == 0x1f {
@@ -115,9 +118,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -126,9 +128,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -137,9 +138,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -155,10 +155,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -208,7 +209,7 @@ fn build_expert_weight_hfq6(m: usize, k: usize, seed: u32) -> Vec<u8> {
                 let q2 = (lcg(&mut s) % 64) as u32;
                 let q3 = (lcg(&mut s) % 64) as u32;
                 let packed: u32 = q0 | (q1 << 6) | (q2 << 12) | (q3 << 18);
-                buf[off + byte_off]     = (packed & 0xFF) as u8;
+                buf[off + byte_off] = (packed & 0xFF) as u8;
                 buf[off + byte_off + 1] = ((packed >> 8) & 0xFF) as u8;
                 buf[off + byte_off + 2] = ((packed >> 16) & 0xFF) as u8;
             }
@@ -229,13 +230,23 @@ fn dequant_hfq6_row_fp16(weight: &[u8], k: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(k);
     for g in 0..groups {
         let off = g * 200;
-        let scale = f32::from_le_bytes([weight[off], weight[off+1], weight[off+2], weight[off+3]]);
-        let zero  = f32::from_le_bytes([weight[off+4], weight[off+5], weight[off+6], weight[off+7]]);
+        let scale = f32::from_le_bytes([
+            weight[off],
+            weight[off + 1],
+            weight[off + 2],
+            weight[off + 3],
+        ]);
+        let zero = f32::from_le_bytes([
+            weight[off + 4],
+            weight[off + 5],
+            weight[off + 6],
+            weight[off + 7],
+        ]);
         let sc_h = fp32_to_fp16_to_fp32(scale);
         let zp_h = fp32_to_fp16_to_fp32(zero);
         for i in (0..256).step_by(4) {
             let byte_off = 8 + (i / 4) * 3;
-            let b0 = weight[off + byte_off]     as u32;
+            let b0 = weight[off + byte_off] as u32;
             let b1 = weight[off + byte_off + 1] as u32;
             let b2 = weight[off + byte_off + 2] as u32;
             let q0 = (b0 & 0x3F) as f32;
@@ -254,7 +265,10 @@ fn dequant_hfq6_row_fp16(weight: &[u8], k: usize) -> Vec<f32> {
             let a1 = fp32_to_fp16_to_fp32(fp32_to_fp16_to_fp32(sc_h * q1_h) + zp_h);
             let a2 = fp32_to_fp16_to_fp32(fp32_to_fp16_to_fp32(sc_h * q2_h) + zp_h);
             let a3 = fp32_to_fp16_to_fp32(fp32_to_fp16_to_fp32(sc_h * q3_h) + zp_h);
-            out.push(a0); out.push(a1); out.push(a2); out.push(a3);
+            out.push(a0);
+            out.push(a1);
+            out.push(a2);
+            out.push(a3);
         }
     }
     out
@@ -291,7 +305,8 @@ fn cpu_reference(
     // Cache the per-expert dequant rows lazily. We compute the FP32
     // dequant of each expert once. For tight memory we could dequant
     // per-slot, but cases are small enough to materialize fully.
-    let dequant: Vec<Vec<f32>> = expert_weights.iter()
+    let dequant: Vec<Vec<f32>> = expert_weights
+        .iter()
         .map(|w| {
             // Full M × K dequant in FP16 precision (matches kernel a_reg).
             let groups_per_row = k / 256;
@@ -311,15 +326,25 @@ fn cpu_reference(
 
     for tile_y in 0..tiles {
         let expert = tile_ids[tile_y];
-        if expert < 0 { continue; }
+        if expert < 0 {
+            continue;
+        }
         let dq = &dequant[expert as usize];
         let slot_start = tile_y * 16;
         for lane in 0..16 {
             let slot_idx = slot_start + lane;
-            if slot_idx >= m_total { continue; }
+            if slot_idx >= m_total {
+                continue;
+            }
             let flat = sorted[slot_idx];
-            if flat < 0 { continue; }
-            let x_row = if x_row_div > 1 { (flat as usize) / x_row_div } else { flat as usize };
+            if flat < 0 {
+                continue;
+            }
+            let x_row = if x_row_div > 1 {
+                (flat as usize) / x_row_div
+            } else {
+                flat as usize
+            };
             // Compute one column of Y: y[slot_idx, :] = dq * x[x_row, :].
             for mi in 0..m {
                 let mut acc = 0f64;
@@ -337,15 +362,29 @@ fn cpu_reference(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     if !arch.starts_with("gfx11") {
-        println!("  SKIP — arch {} is not gfx11; HFQ6 k2 kernel only registered for gfx11", arch);
+        println!(
+            "  SKIP — arch {} is not gfx11; HFQ6 k2 kernel only registered for gfx11",
+            arch
+        );
         return;
     }
 
@@ -387,11 +426,23 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("hfq6 k2 grouped kernel launch");
-    gpu.hip.device_synchronize().expect("sync after hfq6 k2 kernel");
+    )
+    .expect("hfq6 k2 grouped kernel launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after hfq6 k2 kernel");
 
     let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
-    let y_ref = cpu_reference(&expert_weights, &x_f32, 1, &sorted, &tile_ids, m, k, m_total);
+    let y_ref = cpu_reference(
+        &expert_weights,
+        &x_f32,
+        1,
+        &sorted,
+        &tile_ids,
+        m,
+        k,
+        m_total,
+    );
 
     let mut max_abs = 0f32;
     let mut max_rel = 0f32;
@@ -400,8 +451,14 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     for (i, (a, b)) in y_ref.iter().zip(y_gpu_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if a.abs() > 1e-6 { d / a.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; argmax_rel = i; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+            argmax_rel = i;
+        }
     }
     let ref_sample = &y_ref[argmax_abs];
     let gpu_sample = &y_gpu_v[argmax_abs];

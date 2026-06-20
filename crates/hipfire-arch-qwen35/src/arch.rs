@@ -63,6 +63,11 @@ impl Architecture for Qwen35 {
     }
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
+        // REAP is applied INSIDE `qwen35_config_from_hfq` (the public free fn)
+        // so every caller — trait or direct — gets it; do NOT re-apply here,
+        // or the keep-map would be applied twice (double-overriding num_experts
+        // to kept-of-kept, which would then fail load_any's kept-count
+        // validation against the original count).
         qwen35_config_from_hfq(hfq)
     }
 
