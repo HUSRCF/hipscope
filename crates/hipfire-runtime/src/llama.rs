@@ -651,6 +651,27 @@ pub enum EmbeddingFormat {
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
 }
 
+/// Single-token embedding lookup, dispatched on the table's storage format.
+/// Centralizes the format→kernel mapping shared by every per-token decode path
+/// (and the dots-ocr VLM text path in the daemon), so a newly-added format only
+/// has to be wired in one place.
+pub fn embedding_lookup_dispatch(
+    gpu: &mut Gpu,
+    format: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token: u32,
+    dim: usize,
+) -> HipResult<()> {
+    match format {
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(table, output, token, dim),
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
+    }
+}
+
 /// GPU-resident LLaMA model weights.
 pub struct LlamaWeights {
     pub token_embd: GpuTensor,
@@ -1482,23 +1503,14 @@ pub fn prefill_forward(
     // Embedding: lookup each token individually into the batch buffer
     let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
     for (i, &token) in tokens.iter().enumerate() {
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::Q4K => {
-                gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?
-            }
-        }
+        embedding_lookup_dispatch(
+            gpu,
+            weights.embd_format,
+            &weights.token_embd,
+            &x_single,
+            token,
+            dim,
+        )?;
         gpu.hip
             .memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
     }
@@ -3124,23 +3136,14 @@ pub fn forward_scratch_embed(
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
     // Embedding lookup
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
-        }
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        dim,
+    )?;
     Ok(())
 }
 
@@ -4353,17 +4356,14 @@ pub fn forward(
 
     // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
 
@@ -4559,17 +4559,14 @@ fn forward_logits_gpu(
     let head_dim = config.head_dim;
 
     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
     let q = gpu.alloc_tensor(&[n_heads * head_dim], DType::F32)?;
@@ -4857,7 +4854,11 @@ impl KvCache {
     /// target)` cells return `Err` rather than panic, so a future policy mis-wire
     /// surfaces as a clean load failure.
     pub fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self> {
-        debug_assert_ne!(mode, KvMode::Asym3Auto, "from_mode received unresolved sentinel");
+        debug_assert_ne!(
+            mode,
+            KvMode::Asym3Auto,
+            "from_mode received unresolved sentinel"
+        );
         match target {
             KvTarget::Single(gpu) => Self::from_mode_single(mode, gpu, dims),
             KvTarget::Multi(gpus) => Self::from_mode_multi(mode, gpus, dims),
