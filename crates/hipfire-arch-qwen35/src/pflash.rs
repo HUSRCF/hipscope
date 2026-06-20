@@ -17,6 +17,7 @@
 //! selection land in subsequent phases.
 
 use hip_bridge::HipResult;
+use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -792,16 +793,10 @@ fn drafter_prefill(
     // quant_fwht flag). asym* WITHOUT quant_fwht (Givens-rotated) is
     // intentionally rejected here — banned from drafter scoring per
     // project policy.
-    let fwht_storage_ok = (kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2) && kv.quant_fwht;
+    let tier = kv.k_tier();
     assert!(
-        kv.quant_q8 || fwht_storage_ok,
-        "drafter_prefill: drafter KV must be Q8 or fwht{{4,3,2}} \
-         (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, quant_fwht={})",
-        kv.quant_q8,
-        kv.quant_asym4,
-        kv.quant_asym3,
-        kv.quant_asym2,
-        kv.quant_fwht,
+        tier.storage_ok_for_pflash(),
+        "drafter_prefill: drafter KV must be Q8 or fwht{{4,3,2}} (got {tier:?})"
     );
     assert!(
         n <= kv.physical_cap,
@@ -1062,8 +1057,8 @@ pub fn compute_scores_batched_gpu(
     // `quant_fwht == true`; asym* without fwht (Givens-rotated) is
     // disallowed here (drafter scoring policy bans asym3 — see
     // assert in drafter_prefill).
-    if kv.quant_q8 {
-        gpu.pflash_score_q8_kv(
+    match kv.k_tier() {
+        KTier::Q8 => gpu.pflash_score_q8_kv(
             &kv.k_gpu[layer_idx],
             &scores_buf,
             n,
@@ -1072,9 +1067,8 @@ pub fn compute_scores_batched_gpu(
             block_size,
             n_blocks,
             n - 1, // last_pos
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym4 {
-        gpu.pflash_score_fwht4_kv(
+        )?,
+        KTier::Asym4 { fwht: true } => gpu.pflash_score_fwht4_kv(
             &kv.k_gpu[layer_idx],
             &scores_buf,
             n,
@@ -1083,9 +1077,8 @@ pub fn compute_scores_batched_gpu(
             block_size,
             n_blocks,
             n - 1,
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym3 {
-        gpu.pflash_score_fwht3_kv(
+        )?,
+        KTier::Asym3 { fwht: true } => gpu.pflash_score_fwht3_kv(
             &kv.k_gpu[layer_idx],
             &scores_buf,
             n,
@@ -1094,9 +1087,8 @@ pub fn compute_scores_batched_gpu(
             block_size,
             n_blocks,
             n - 1,
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym2 {
-        gpu.pflash_score_fwht2_kv(
+        )?,
+        KTier::Asym2 { fwht: true } => gpu.pflash_score_fwht2_kv(
             &kv.k_gpu[layer_idx],
             &scores_buf,
             n,
@@ -1105,14 +1097,10 @@ pub fn compute_scores_batched_gpu(
             block_size,
             n_blocks,
             n - 1,
-        )?;
-    } else {
-        panic!(
-            "compute_scores_batched_gpu: unsupported drafter KV mode \
-             (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, \
-              quant_fwht={})",
-            kv.quant_q8, kv.quant_asym4, kv.quant_asym3, kv.quant_asym2, kv.quant_fwht,
-        );
+        )?,
+        other => panic!(
+            "compute_scores_batched_gpu: unsupported drafter KV mode (got {other:?})"
+        ),
     }
     let scores = gpu.download_f32(&scores_buf)?;
     let _ = gpu.free_tensor(scores_buf);
