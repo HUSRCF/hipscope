@@ -91,8 +91,8 @@ pub const KNOBS: &[KnobInfo] = &[
         options: &[
             ("off", "No adaptive downshift — fixed KV precision."),
             ("conservative", "Gentle floor: K=fwht4, V=lloyd4 — downshifts least."),
-            ("balanced", "Deeper floor: K=fwht2, V=lloyd2."),
-            ("aggressive", "Currently identical to balanced (same fwht2/lloyd2 floor)."),
+            ("balanced", "Middle floor: K=fwht3, V=lloyd3."),
+            ("aggressive", "Deep floor: K=fwht2, V=lloyd2 — saves the most VRAM."),
             ("advanced:k=…,v=…", "Pick the K (fwht4/3/2) and V (lloyd4/3/2) floor tiers explicitly — 9 combos."),
         ],
     },

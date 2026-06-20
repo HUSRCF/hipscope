@@ -3499,8 +3499,11 @@ fn parse_kv_adaptive(
     use llama::VMode;
     match s {
         "" | "off" => None,
+        // For named presets the floors come from KvAdaptive::from_preset (the
+        // tuple's k/v are only consumed on the `advanced` branch); keep them in
+        // sync anyway so this isn't a misleading second source of truth.
         "conservative" => Some((Some(Preset::Conservative), KMode::Fwht4, VMode::Lloyd4)),
-        "balanced" => Some((Some(Preset::Balanced), KMode::Fwht2, VMode::Lloyd2)),
+        "balanced" => Some((Some(Preset::Balanced), KMode::Fwht3, VMode::Lloyd3)),
         "aggressive" => Some((Some(Preset::Aggressive), KMode::Fwht2, VMode::Lloyd2)),
         other if other.starts_with("advanced:") => {
             // advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>

@@ -1899,8 +1899,8 @@ mod render_tests {
         });
         assert!(text.contains("Options:"), "options section present");
         assert!(text.contains("aggressive"), "an option value is listed");
-        // The corrected (honest) aggressive text — same floor as balanced today.
-        assert!(text.contains("identical to balanced"), "an option description is shown");
+        // The three presets are now distinct tiers — balanced is the middle floor.
+        assert!(text.contains("Middle floor"), "an option description is shown");
         assert!(text.contains("▸"), "the current option is marked with a pointer");
     }
 

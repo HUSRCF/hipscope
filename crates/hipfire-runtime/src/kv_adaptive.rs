@@ -100,8 +100,12 @@ impl KvAdaptive {
 
     pub fn from_preset(p: Preset, max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Self {
         let (k_floor, v_floor) = match p {
+            // A real three-rung ladder by floor: gentle → middle → deep. Balanced
+            // is the genuine middle tier (fwht3/lloyd3, 100 B/head) — previously it
+            // was set to the aggressive floor (fwht2/lloyd2), making the two presets
+            // identical. K/V bit-gap stays ≤ 1 tier at every rung.
             Preset::Conservative => (KMode::Fwht4, VMode::Lloyd4),
-            Preset::Balanced     => (KMode::Fwht2, VMode::Lloyd2),
+            Preset::Balanced     => (KMode::Fwht3, VMode::Lloyd3),
             Preset::Aggressive   => (KMode::Fwht2, VMode::Lloyd2),
         };
         Self::new(max_seq, n_kv_heads, head_dim, k_floor, v_floor)
@@ -214,7 +218,7 @@ mod tests {
     }
     #[test]
     fn cap_is_min_of_two_buffers_and_v_bound_at_start() {
-        // Balanced floors (K=fwht2=68, V=lloyd2=68). Start state K4(132)/q8(272):
+        // Deep floors (K=fwht2=68, V=lloyd2=68) — the aggressive tier. Start state K4(132)/q8(272):
         // K buffer holds 1000*68/132 = 515 positions, V buffer holds
         // 1000*68/272 = 250 → min = 250 (V is the binding constraint at start).
         let c_start = cap_min(1000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht4, VMode::Q8);
@@ -224,20 +228,32 @@ mod tests {
     }
     #[test]
     fn balanced_pattern_shape_and_thresholds() {
+        // Balanced is now the middle tier: K floor fwht3, V floor lloyd3. The step
+        // chain descends V to lloyd3, then K to fwht3 (no final lloyd2 step — that
+        // belongs to aggressive).
         let a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
         assert_eq!(a.steps, vec![
-            Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3),
-            Step::K(KMode::Fwht2), Step::V(VMode::Lloyd2),
+            Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3), Step::K(KMode::Fwht3),
         ]);
-        // thresholds non-decreasing (coincident allowed when steps share a
-        // binding point — here V→l3 and K→f2 both at ~0.515*max_seq).
+        // thresholds non-decreasing.
         for w in a.thresholds.windows(2) { assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds); }
-        // first threshold = start-tier cap (V-bound, 0.25*max_seq=2500) - margin.
-        // Asserted relative to a.margin so it tracks the chunk-safety value.
-        let start_cap = cap_min(10_000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht4, VMode::Q8);
-        assert_eq!(start_cap, 2500);
+        // first threshold = start-tier cap - margin (computed at the new floors so
+        // it can't drift to a stale magic number).
+        let start_cap = cap_min(10_000, 256, KMode::Fwht3, VMode::Lloyd3, KMode::Fwht4, VMode::Q8);
         assert_eq!(a.current_cap(), start_cap, "current_cap at construction == start-tier cap");
         assert_eq!(a.thresholds[0], start_cap - a.margin, "first threshold = start_cap - margin");
+    }
+
+    #[test]
+    fn presets_form_a_distinct_three_rung_ladder() {
+        // Conservative < balanced < aggressive by floor — none identical.
+        let c = KvAdaptive::from_preset(Preset::Conservative, 10_000, 4, 256);
+        let b = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
+        let g = KvAdaptive::from_preset(Preset::Aggressive, 10_000, 4, 256);
+        assert_eq!((c.k_floor, c.v_floor), (KMode::Fwht4, VMode::Lloyd4));
+        assert_eq!((b.k_floor, b.v_floor), (KMode::Fwht3, VMode::Lloyd3));
+        assert_eq!((g.k_floor, g.v_floor), (KMode::Fwht2, VMode::Lloyd2));
+        assert_ne!(b.steps, g.steps, "balanced and aggressive must differ");
     }
     #[test]
     fn margin_at_least_one_prefill_chunk() {
