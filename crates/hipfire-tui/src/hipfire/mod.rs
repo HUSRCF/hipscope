@@ -6,6 +6,7 @@ pub mod chat;
 pub mod chat_history;
 pub mod config;
 pub mod dashboard;
+pub mod doctor;
 pub mod log_tail;
 pub mod model_actions;
 pub mod registry;

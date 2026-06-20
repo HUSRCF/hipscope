@@ -191,6 +191,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         app.drain_serve_command();
         app.drain_pull();
         app.drain_rm();
+        app.drain_doctor();
         if let Some(text) = app.pending_clipboard.take() {
             emit_clipboard(&text);
         }

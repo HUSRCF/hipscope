@@ -214,7 +214,13 @@ fn footer_hints(app: &App) -> String {
                 format!("e easy · a advanced · Up/Down select · Left/Right/Space cycle · Enter edit · r refresh · {global}")
             }
         }
-        Tab::System => format!("live diagnostics (auto ~1.5s) · r refresh · {global}"),
+        Tab::System => {
+            if app.doctor_running() {
+                format!("doctor running… · live diagnostics · r refresh · {global}")
+            } else {
+                format!("d doctor · live diagnostics (auto ~1.5s) · r refresh · {global}")
+            }
+        }
         Tab::Logs => format!("serve.log tail (auto ~1s) · r refresh · {global}"),
     }
 }
@@ -1049,6 +1055,42 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // In-TUI doctor — `hipfire diag` pass/fail (on-demand via `d`).
+    diagnostic_lines.push(Line::from(""));
+    if app.doctor_running() {
+        diagnostic_lines.push(Line::from(Span::styled(
+            "Doctor: running hipfire diag…",
+            Style::default().fg(YELLOW),
+        )));
+    } else {
+        match app.doctor.as_ref() {
+            None => diagnostic_lines.push(Line::from(Span::styled(
+                "Doctor: press d to run hipfire diag",
+                Style::default().fg(MUTED),
+            ))),
+            Some(report) if report.error.is_some() => {
+                diagnostic_lines.push(Line::from(Span::styled(
+                    format!("Doctor error: {}", report.error.as_deref().unwrap_or("")),
+                    Style::default().fg(RED),
+                )));
+            }
+            Some(report) => {
+                diagnostic_lines.push(Line::from(Span::styled(
+                    "Doctor (hipfire diag):",
+                    Style::default().fg(MUTED),
+                )));
+                for c in &report.checks {
+                    let (mark, color) = if c.ok { ("ok ", GREEN) } else { ("XX ", RED) };
+                    diagnostic_lines.push(Line::from(vec![
+                        Span::styled(format!("  {mark}"), Style::default().fg(color)),
+                        Span::styled(format!("{}: ", c.name), Style::default().fg(TEXT)),
+                        Span::styled(c.detail.clone(), Style::default().fg(MUTED)),
+                    ]));
+                }
+            }
+        }
+    }
+
     diagnostic_lines.extend([
         Line::from(""),
         Line::from(Span::styled(
@@ -1551,6 +1593,32 @@ mod render_tests {
         });
         assert!(text.contains("Recent requests"), "inspector section present");
         assert!(text.contains("128 tok"), "token count shown");
+    }
+
+    #[test]
+    fn system_tab_renders_doctor_report() {
+        use crate::hipfire::doctor::{DoctorCheck, DoctorReport};
+        let text = render_with(|app| {
+            app.tab = Tab::System;
+            app.doctor = Some(DoctorReport {
+                checks: vec![
+                    DoctorCheck {
+                        name: "amdgpu module".into(),
+                        ok: true,
+                        detail: "loaded".into(),
+                    },
+                    DoctorCheck {
+                        name: "/dev/kfd".into(),
+                        ok: false,
+                        detail: "missing".into(),
+                    },
+                ],
+                error: None,
+            });
+        });
+        assert!(text.contains("Doctor (hipfire diag)"), "doctor section");
+        assert!(text.contains("amdgpu module"), "check name shown");
+        assert!(text.contains("missing"), "failed-check detail shown");
     }
 
     #[test]

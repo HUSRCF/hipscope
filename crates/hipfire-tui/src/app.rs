@@ -20,6 +20,7 @@ use crate::hipfire::{
     chat_history::ChatHistory,
     config::ConfigState,
     dashboard::{Dashboard, DashboardWorker},
+    doctor::{self, DoctorReport},
     log_tail::{LogSnapshot, LogTailer},
     model_actions::{self, PullEvent, RmOutcome},
     registry::{RegistryAction, RegistryState},
@@ -157,6 +158,10 @@ pub struct App {
     /// Recent finished chat requests (newest first), for the System-tab request
     /// inspector. Bounded to [`REQUEST_LOG_CAP`].
     pub request_log: Vec<RequestRecord>,
+    /// In-flight `hipfire diag --json` doctor run (System tab `d`).
+    doctor_cmd: Option<Receiver<DoctorReport>>,
+    /// Latest doctor report (System tab); `None` until first run.
+    pub doctor: Option<DoctorReport>,
     /// Latest serve.log tail (Logs tab), mirrored from the LogTailer worker.
     pub logs: LogSnapshot,
     /// Background serve.log tailer. Reads the file off the UI thread; dropped
@@ -209,6 +214,8 @@ impl App {
             confirm_delete: None,
             pending_clipboard: None,
             request_log: Vec::new(),
+            doctor_cmd: None,
+            doctor: None,
             logs: LogSnapshot::default(),
             log_tailer,
             dashboard_worker,
@@ -520,6 +527,7 @@ impl App {
             Tab::Chat => self.handle_chat_key(key),
             Tab::Models => self.handle_models_key(key),
             Tab::Settings => self.handle_settings_key(key),
+            Tab::System => self.handle_system_key(key),
             _ => {}
         }
     }
@@ -816,6 +824,57 @@ impl App {
             },
         );
         self.request_log.truncate(REQUEST_LOG_CAP);
+    }
+
+    /// Whether a doctor run is in flight (for the footer + re-trigger guard).
+    pub fn doctor_running(&self) -> bool {
+        self.doctor_cmd.is_some()
+    }
+
+    /// Start a `hipfire diag --json` doctor run on a background thread (System
+    /// tab `d`). No-op if one is already running.
+    fn run_doctor(&mut self) {
+        if self.doctor_cmd.is_some() {
+            self.toast_info("doctor already running");
+            return;
+        }
+        self.doctor_cmd = Some(doctor::run());
+        self.toast_info("running hipfire diag\u{2026}");
+    }
+
+    /// Consume the doctor report when it arrives (called each frame).
+    pub fn drain_doctor(&mut self) {
+        let report = match &self.doctor_cmd {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => DoctorReport {
+                    checks: Vec::new(),
+                    error: Some("doctor worker exited".into()),
+                },
+            },
+            None => return,
+        };
+        self.doctor_cmd = None;
+        match &report.error {
+            Some(err) => self.toast_error(format!("doctor: {err}")),
+            None => {
+                let fails = report.checks.iter().filter(|c| !c.ok).count();
+                if fails == 0 {
+                    self.toast_info("doctor: all checks passed");
+                } else {
+                    self.toast_error(format!("doctor: {fails} check(s) failed"));
+                }
+            }
+        }
+        self.doctor = Some(report);
+    }
+
+    /// System-tab keys: `d` runs the doctor.
+    fn handle_system_key(&mut self, key: KeyEvent) {
+        if let KeyCode::Char('d') = key.code {
+            self.run_doctor();
+        }
     }
 
     /// Dispatch a Chat slash command (the input after the leading '/').
