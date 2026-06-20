@@ -11,7 +11,10 @@ use std::{io, panic};
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -84,29 +87,54 @@ fn run_check() -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         hook(info);
     }));
 
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    match Terminal::new(backend) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            // We enabled raw mode + alt screen + mouse capture above; undo them
+            // (best-effort) before surfacing the failure so the terminal is left
+            // usable.
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = disable_raw_mode();
+            Err(e.into())
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // Attempt every step independently so an early failure can't leave mouse
+    // capture, the alternate screen, or raw mode enabled. Return the first
+    // error after all steps have been tried.
+    let leave = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let cursor = terminal.show_cursor();
+    let raw = disable_raw_mode();
+    leave?;
+    cursor?;
+    raw?;
     Ok(())
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
+    let result = event_loop(terminal, &mut app);
+    // Persist session UI state (active tab + expanded Models groups) on ANY exit
+    // — clean quit OR a propagated error — so the next launch reopens where the
+    // user left off. Best-effort (the save swallows its own errors); a panic
+    // still skips this, which is acceptable for non-load-bearing UI state.
+    app.save_ui_state();
+    result
+}
 
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         // Live-serve Dashboard: the fetch (HTTP + rocm-smi) runs on a dedicated
         // background thread. Here on the UI thread we ONLY mirror its latest
@@ -116,22 +144,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         app.sync_dashboard();
         app.expire_toast();
 
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
         app.drain_chat_events();
 
         if event::poll(std::time::Duration::from_millis(80))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if handle_key(&mut app, key) {
+                    if handle_key(app, key) {
                         break;
                     }
                 }
+                Event::Mouse(mouse) => handle_mouse(app, mouse),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
     }
-
     Ok(())
 }
 
@@ -142,6 +170,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return false;
         }
         return true;
+    }
+
+    // The `?` help overlay is modal: while it is open, any key (other than the
+    // Ctrl+C quit handled above) simply closes it.
+    if app.show_help {
+        app.show_help = false;
+        return false;
     }
 
     // While a settings value is being edited, keystrokes (including q/e/a/r)
@@ -180,8 +215,129 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('r') if !chat_capturing => app.reload(),
         KeyCode::Char('e') if app.tab == app::Tab::Settings => app.set_settings_easy(true),
         KeyCode::Char('a') if app.tab == app::Tab::Settings => app.set_settings_easy(false),
+        // `?` opens the keybinding help overlay (unless the chat input is
+        // capturing text, where `?` is a literal character).
+        KeyCode::Char('?') if !chat_capturing => app.show_help = true,
         _ => app.handle_tab_key(key),
     }
 
     false
+}
+
+/// Mouse handling: click a tab in the header to switch to it; scroll the wheel
+/// to move within the active tab's list. All other mouse events are ignored.
+/// A click or scroll also dismisses an open help overlay.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if app.show_help {
+                app.show_help = false;
+                return;
+            }
+            // Tab-bar click: map the clicked column to a tab via the hit regions
+            // the renderer recorded this frame.
+            if let Some(tab) = app.tab_at(mouse.column, mouse.row) {
+                app.tab = tab;
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.show_help {
+                app.show_help = false;
+                return;
+            }
+            app.handle_tab_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        MouseEventKind::ScrollUp => {
+            if app.show_help {
+                app.show_help = false;
+                return;
+            }
+            app.handle_tab_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::Tab;
+
+    fn test_app() -> App {
+        App::load().expect("App::load")
+    }
+    fn k(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn question_mark_opens_help_then_any_key_closes_it() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        assert!(!app.show_help);
+        let quit = handle_key(&mut app, k(KeyCode::Char('?')));
+        assert!(app.show_help, "? opens the help overlay");
+        assert!(!quit);
+        // Any subsequent key closes it, and must not quit or do anything else.
+        let quit = handle_key(&mut app, k(KeyCode::Char('j')));
+        assert!(!app.show_help, "any key closes the help overlay");
+        assert!(!quit, "dismissing help must not quit");
+    }
+
+    #[test]
+    fn left_click_on_tab_region_switches_tab() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.tab_row_y = 3;
+        app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, 3),
+        );
+        assert_eq!(app.tab, Tab::Dashboard);
+    }
+
+    #[test]
+    fn click_off_the_tab_bar_does_not_switch() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.tab_row_y = 3;
+        app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, 10),
+        );
+        assert_eq!(app.tab, Tab::Home, "a click off the tab row changes nothing");
+    }
+
+    #[test]
+    fn scroll_dismisses_help_overlay() {
+        let mut app = test_app();
+        app.show_help = true;
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn scroll_moves_list_selection() {
+        // The wheel must actually move the active list (its real purpose), not
+        // just dismiss the overlay. Settings easy-mode has a fixed row set, so
+        // the selection movement is deterministic.
+        let mut app = test_app();
+        app.tab = Tab::Settings;
+        app.settings_easy = true;
+        app.settings_selected = 0;
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.settings_selected, 1, "scroll down advances the selection");
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.settings_selected, 0, "scroll up retreats it");
+    }
 }

@@ -7,6 +7,7 @@ pub mod config;
 pub mod dashboard;
 pub mod registry;
 pub mod status;
+pub mod ui_state;
 pub mod writer;
 
 use std::{
@@ -22,6 +23,7 @@ pub struct HipfirePaths {
     pub per_model_config: PathBuf,
     pub serve_pid: PathBuf,
     pub serve_log: PathBuf,
+    pub ui_state: PathBuf,
     pub registry_candidates: Vec<PathBuf>,
 }
 
@@ -38,6 +40,7 @@ impl HipfirePaths {
             per_model_config: root.join("per_model_config.json"),
             serve_pid: root.join("serve.pid"),
             serve_log: root.join("serve.log"),
+            ui_state: root.join("ui_state.json"),
             registry_candidates: vec![
                 cwd.join("cli/registry.json"),
                 root.join("cli/registry.json"),

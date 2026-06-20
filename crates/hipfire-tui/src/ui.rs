@@ -26,6 +26,11 @@ const GREEN: Color = Color::Rgb(102, 217, 139);
 const YELLOW: Color = Color::Rgb(238, 190, 95);
 const RED: Color = Color::Rgb(255, 95, 104);
 
+/// Tab-bar divider, shared between the renderer (`Tabs::divider`) and the mouse
+/// hit-test math in `draw_header` so the two cannot drift (the hit-test advances
+/// `x` by exactly this width between tab cells).
+const TAB_DIVIDER: &str = " | ";
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -48,9 +53,71 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::System => draw_system(frame, app, root[1]),
     }
     draw_footer(frame, app, root[2]);
+
+    // The `?` help overlay draws last, centered on top of everything.
+    if app.show_help {
+        draw_help_overlay(frame, app, area);
+    }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+/// Centered modal listing the global + active-tab keybindings. Dismissed by any
+/// key (handled in main::handle_key). Reuses `footer_hints` for the per-tab line
+/// so there is a single source of truth for tab keys.
+fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Global",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  Tab / BackTab    switch tabs"),
+        Line::from("  ?                toggle this help"),
+        Line::from("  r                refresh live data"),
+        Line::from("  q                quit"),
+        Line::from("  mouse            click a tab · scroll to move in a list"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("This tab — {}", app.tab.title()),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    // The active-tab keys, one per line — keeps each short so nothing wraps and
+    // clips inside the modal, and makes the line count (hence height) exact. The
+    // globally-listed keys (Tab/BackTab, q) are skipped to avoid duplication.
+    for part in footer_hints(app).split('·') {
+        let part = part.trim();
+        if part.is_empty() || part.starts_with("Tab/BackTab") || part == "q quit" {
+            continue;
+        }
+        lines.push(Line::from(format!("  {part}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "press any key to close",
+        Style::default().fg(MUTED),
+    )));
+
+    let w = 60u16.min(area.width.saturating_sub(2));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" Keybindings "),
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        rect,
+    );
+}
+
+fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Length(3)])
@@ -92,8 +159,26 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         )
         .style(Style::default().fg(MUTED).bg(BG))
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-        .divider(Span::styled(" | ", Style::default().fg(PANEL_2)));
+        .divider(Span::styled(TAB_DIVIDER, Style::default().fg(PANEL_2)));
     frame.render_widget(tabs, chunks[1]);
+
+    // Record per-tab hit regions for mouse clicks. ratatui 0.29's Tabs layout:
+    // from the inner left, each tab cell is 1 (left pad) + title + 1 (right pad),
+    // with a 3-col " | " divider between cells. The block has only a BOTTOM
+    // border, so inner.x == area.x and titles sit on the area's top row.
+    app.tab_row_y = chunks[1].y;
+    app.tab_hitboxes.clear();
+    let right = chunks[1].x.saturating_add(chunks[1].width);
+    let mut x = chunks[1].x;
+    for tab in Tab::ALL {
+        if x >= right {
+            break;
+        }
+        let cell_w = 2 + tab.title().len() as u16; // left pad + title + right pad
+        let end = x.saturating_add(cell_w).min(right);
+        app.tab_hitboxes.push((x, end, tab));
+        x = end.saturating_add(TAB_DIVIDER.len() as u16); // divider between cells
+    }
 }
 
 /// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
@@ -1096,5 +1181,98 @@ mod render_tests {
         });
         assert!(text.contains("No models found"), "expected empty-state header");
         assert!(text.contains("hipfire pull"), "expected pull guidance");
+    }
+
+    #[test]
+    fn help_overlay_renders_keybindings() {
+        let text = render_with(|app| app.show_help = true);
+        assert!(text.contains("Keybindings"), "help overlay title");
+        assert!(text.contains("switch tabs"), "global keys listed");
+        assert!(text.contains("toggle this help"), "the ? key is documented");
+    }
+
+    #[test]
+    fn header_records_ordered_tab_hitboxes() {
+        let mut app = App::load().expect("App::load");
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        assert_eq!(app.tab_hitboxes.len(), Tab::ALL.len());
+        for (i, (start, end, tab)) in app.tab_hitboxes.iter().enumerate() {
+            assert!(end > start, "tab {tab:?} has an empty hit region");
+            assert_eq!(*tab, Tab::ALL[i], "hit regions ordered like Tab::ALL");
+        }
+        // A click inside the first tab's region resolves to Home.
+        let (start, _, _) = app.tab_hitboxes[0];
+        assert_eq!(app.tab_at(start, app.tab_row_y), Some(Tab::Home));
+    }
+
+    #[test]
+    fn tab_hitboxes_align_with_rendered_columns() {
+        // Cross-check each recorded hit region against where ratatui ACTUALLY
+        // drew the tab title in the buffer — the only check that catches a real
+        // off-by-one in draw_header's cell-width / divider math (the fabricated-
+        // hitbox click tests cannot).
+        let mut app = App::load().expect("App::load");
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        let width = buf.area().width as usize;
+        let row = app.tab_row_y as usize;
+        let content = buf.content();
+        let row_text: String = (0..width).map(|c| content[row * width + c].symbol()).collect();
+        for (start, _end, tab) in &app.tab_hitboxes {
+            let title = tab.title();
+            let title_col = (*start as usize) + 1; // title is drawn after the 1-col left pad
+            let drawn: String = row_text
+                .chars()
+                .skip(title_col)
+                .take(title.chars().count())
+                .collect();
+            assert_eq!(
+                drawn, title,
+                "tab {tab:?}: title must render at hitbox.start+1 (col {title_col})"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_terminal_drops_overflowing_tabs() {
+        // At a width where not all tabs fit, the hit regions must not register a
+        // tab ratatui didn't draw, every region is clamped to the area, and a
+        // click well past the visible tabs resolves to nothing.
+        let mut app = App::load().expect("App::load");
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        assert!(
+            app.tab_hitboxes.len() < Tab::ALL.len(),
+            "not all tabs fit at width 20"
+        );
+        for (_, end, _) in &app.tab_hitboxes {
+            assert!(*end <= 20, "hit region clamped to the area width");
+        }
+        assert_eq!(app.tab_at(100, app.tab_row_y), None, "click far past the tabs");
+    }
+
+    #[test]
+    fn help_overlay_does_not_panic_at_tiny_geometry() {
+        // Locks in the saturating-sub underflow guards in draw_help_overlay.
+        for (w, h) in [(4u16, 3u16), (2, 2), (1, 1)] {
+            let mut app = App::load().expect("App::load");
+            app.show_help = true;
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("draw must not panic at tiny geometry");
+        }
     }
 }

@@ -21,6 +21,7 @@ use crate::hipfire::{
     dashboard::{Dashboard, DashboardWorker},
     registry::{RegistryAction, RegistryState},
     status::{start_background_serve, StatusState},
+    ui_state::UiState,
     writer::{self, FieldKind},
     HipfirePaths,
 };
@@ -86,6 +87,11 @@ impl Tab {
             Tab::System => "System",
         }
     }
+
+    /// Resolve a tab from its title (for restoring the persisted active tab).
+    pub fn from_title(s: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|t| t.title() == s)
+    }
 }
 
 pub struct App {
@@ -108,6 +114,13 @@ pub struct App {
     /// UI thread ONLY reads this — it never calls fetch_dashboard / rocm-smi /
     /// HTTP synchronously, so a hung probe cannot block render or input.
     pub dashboard: Option<Dashboard>,
+    /// Whether the `?` keybinding help overlay is currently open.
+    pub show_help: bool,
+    /// Per-frame tab-bar hit regions `[x_start, x_end)` -> tab, recomputed by
+    /// the renderer each frame so a mouse-click column maps to a tab.
+    pub tab_hitboxes: Vec<(u16, u16, Tab)>,
+    /// Terminal row the tab labels render on (for click hit-testing).
+    pub tab_row_y: u16,
     /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
     /// thread. Dropped (joined) when the App is dropped.
     dashboard_worker: DashboardWorker,
@@ -117,17 +130,26 @@ impl App {
     pub fn load() -> Result<Self> {
         let paths = HipfirePaths::discover();
         let config = ConfigState::load(&paths);
-        let registry = RegistryState::load(&paths);
+        let mut registry = RegistryState::load(&paths);
         let status = StatusState::load_local(&paths);
         let active_model = config.default_model.clone();
         let dashboard_worker = DashboardWorker::spawn(config.clone());
+
+        // Restore session UI state (active tab + expanded Models groups) so the
+        // TUI reopens where the user left off. Missing/corrupt -> defaults. The
+        // active *model* is restored separately via config.default_model, which
+        // the Models tab already persists.
+        let ui = UiState::load(&paths.ui_state);
+        let tab = Tab::from_title(&ui.active_tab).unwrap_or(Tab::Home);
+        registry.expanded_groups = ui.expanded_groups.into_iter().collect();
+
         Ok(Self {
             paths,
             config,
             registry,
             status,
             active_model,
-            tab: Tab::Home,
+            tab,
             settings_easy: true,
             settings_selected: 0,
             settings_edit: None,
@@ -135,8 +157,22 @@ impl App {
             last_reload: "loaded hipfire state".into(),
             toast: None,
             dashboard: None,
+            show_help: false,
+            tab_hitboxes: Vec::new(),
+            tab_row_y: 0,
             dashboard_worker,
         })
+    }
+
+    /// Persist the current session UI state (active tab + expanded Models
+    /// groups) for the next launch. Best-effort — a failed write is ignored
+    /// (UI state is a convenience, not load-bearing).
+    pub fn save_ui_state(&self) {
+        let ui = UiState {
+            active_tab: self.tab.title().to_string(),
+            expanded_groups: self.registry.expanded_groups.iter().cloned().collect(),
+        };
+        let _ = ui.save(&self.paths.ui_state);
     }
 
     /// Raise a transient error toast (3.5s) over the footer.
@@ -194,7 +230,13 @@ impl App {
         // and system diagnostics come from the background DashboardWorker, so we
         // never run /health or lspci/rocm-smi on the UI thread here.
         self.config = ConfigState::load(&self.paths);
+        // Preserve the user's expanded Models groups across an `r` refresh — a
+        // fresh RegistryState::load() defaults them to empty, which would
+        // collapse everything (and then a clean quit would persist that empty
+        // set back to ui_state.json).
+        let expanded = self.registry.expanded_groups.clone();
         self.registry = RegistryState::load(&self.paths);
+        self.registry.expanded_groups = expanded;
         // Preserve the live overlay (serve_http_ok / health_text / gpu_lines)
         // already mirrored from the worker; only the local fields are refreshed.
         let mut status = StatusState::load_local(&self.paths);
@@ -217,6 +259,19 @@ impl App {
     pub fn prev_tab(&mut self) {
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
+    }
+
+    /// Resolve the tab whose recorded header hit region contains `(col, row)`,
+    /// or None when the position is not on the tab bar. The hit regions are
+    /// refreshed every frame by the renderer (`ui::draw_header`).
+    pub fn tab_at(&self, col: u16, row: u16) -> Option<Tab> {
+        if row != self.tab_row_y {
+            return None;
+        }
+        self.tab_hitboxes
+            .iter()
+            .find(|(start, end, _)| col >= *start && col < *end)
+            .map(|(_, _, tab)| *tab)
     }
 
     pub fn handle_tab_key(&mut self, key: KeyEvent) {
@@ -818,5 +873,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tab_at_maps_column_to_tab() {
+        let (mut app, dir) = test_app();
+        app.tab_row_y = 3;
+        app.tab_hitboxes = vec![
+            (0, 6, Tab::Home),
+            (9, 20, Tab::Dashboard),
+            (23, 29, Tab::Chat),
+        ];
+        assert_eq!(app.tab_at(3, 3), Some(Tab::Home));
+        assert_eq!(app.tab_at(5, 3), Some(Tab::Home)); // end-exclusive: 5 < 6
+        assert_eq!(app.tab_at(6, 3), None); // divider gap between cells
+        assert_eq!(app.tab_at(12, 3), Some(Tab::Dashboard));
+        assert_eq!(app.tab_at(3, 4), None); // wrong row
+        assert_eq!(app.tab_at(200, 3), None); // past the last tab
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_state_persists_tab_and_expanded_groups() {
+        let (mut app, dir) = test_app();
+        app.paths.ui_state = dir.join("ui_state.json");
+        app.tab = Tab::Models;
+        app.registry.expanded_groups.insert("qwen".into());
+        app.save_ui_state();
+        let restored = crate::hipfire::ui_state::UiState::load(&app.paths.ui_state);
+        assert_eq!(restored.active_tab, "Models");
+        assert!(restored.expanded_groups.contains(&"qwen".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_preserves_expanded_groups() {
+        // An `r` refresh reloads the registry; it must NOT collapse the user's
+        // expanded Models groups (a fresh RegistryState defaults them empty).
+        let (mut app, dir) = test_app();
+        app.registry.expanded_groups.insert("qwen".into());
+        app.reload();
+        assert!(
+            app.registry.expanded_groups.contains("qwen"),
+            "reload must carry expanded groups across the registry reload"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
