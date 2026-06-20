@@ -527,20 +527,102 @@ and supersedes the §7 plan.
 
 ### 10.4 Revised plan (supersedes §7)
 
-PR #455 (transparent loading) **merged 2026-06-20**, so this is now a clean
-follow-up off updated master — no longer stacked on an unlanded refactor.
+PR #455 (transparent loading) **merged into upstream/master at `68b7f839`
+(2026-06-19)**, so this is now a clean follow-up off updated master — no
+longer stacked on an unlanded refactor.
 
-1. **`validate_coverage` pass (the keeper).** After each arch's *existing*
-   loader, a GPU-free assertion: every config-derived tensor was claimed,
-   every shape matches config algebra, and the silent `unwrap_or` defaults +
-   `unwrap_or_else(|| panic!(...))` sites (`qwen2.rs:453,477,558,571`, and
-   per-arch equivalents) become **enumerated hard errors**. No schema, no
+#### 10.4.0 Status update — what the follow-up branch already landed (2026-06-20)
+
+The branch `feature/transparent-loading-all-models` (rebased onto merged
+master) already advanced two of the items this section names, so the "now"
+worklist below is smaller than first written:
+
+- **KV `from_mode` unification (roadmap followup #3) — DONE.** `KvCache::from_mode`
+  dispatcher + 6 per-site policies with disagreeing-defaults preserved
+  (`kv_mode.rs`, truth-table tests green). Behavior-preserving, not
+  behavior-changing — verified arm-for-arm against the old `match` ladders.
+- **dtype-plumbing fold (item 2 below) — ~60% done.** The shared helpers
+  (`source_bytes_to_f32_vec`, `bf16_bytes_to_f16`, `bf16_to_f32` in
+  `safetensors_source.rs`) landed (`c5fdb3ff`); **deepseek4 and minimax
+  already route through them**. Only **qwen2 + dots-ocr** still carry private
+  `source_bytes_to_f16_stream` copies — the item-2 list below is stale.
+- **lfm2moe BF16 decode — FIXED as a prerequisite to wiring its Dir arm.**
+  `effective_quant_type` collapsed `BF16→F16`, so the qt-keyed decode widened
+  BF16 with `f16_to_f32` → silently-wrong values. Now threads the source
+  dtype and routes fp conversions through the shared helpers.
+- **Additional-arch safetensors reach (followup #1) — wired AND validated with
+  real downloaded checkpoints** (`derive_arch_id` now maps `dots_ocr→8`,
+  `deepseek_v4→9`, `lfm2_moe|lfm2→11`):
+  - **dots-ocr Dir — WORKS, byte-identical to the q8-HFQ reference** on
+    `rednote-hilab/dots.ocr`. Fixing it surfaced two real bugs the dead
+    from_source path hid: (1) the vision tower loaded norms/biases as exact
+    `bf16→f32` instead of the validated `f16`-narrowed recipe — in a tower so
+    sensitive a ~5e-4 per-weight delta compounds ~1.36×/block over 42 blocks
+    to garbage; (2) `daemon.rs` hardcoded `embedding_lookup_q8`, misreading the
+    F32 Dir embedding as Q8 blocks. Both fixed; dense raw-HF safetensors now
+    loads correctly.
+  - **lfm2moe / deepseek4 Dir (MoE) — REFUSE raw-HF cleanly.** The indexed-MoE
+    GEMV forward has no float-expert path (it needs FWHT-rotated MQ4G256/HFQ4
+    experts); raw bf16 experts would be misread as 4-bit blocks → silent
+    garbage. lfm2moe now hard-errors on raw-float experts pointing at
+    quantize-first. deepseek4's Dir arm stays flagged unvalidated (no
+    checkpoint).
+  - **General finding:** raw-HF safetensors loading works for *dense* arches
+    but not *MoE* arches whose forward requires pre-quantized+rotated experts;
+    supporting raw-HF MoE means load-time quantization (out of scope, separate
+    feature). This is the real boundary the validation exposed.
+
+#### Remaining now-worklist
+
+1. **`validate_coverage` pass (the keeper — NOT yet built).** After each arch's
+   *existing* loader, a GPU-free assertion: every config-derived tensor was
+   claimed, every shape matches config algebra, and the silent `unwrap_or`
+   defaults + `unwrap_or_else(|| panic!(...))` sites (`qwen2.rs:453,558,571`,
+   and per-arch equivalents — **~110 such sites total**, deepseek4 ≈95,
+   qwen35 ≈55, qwen2 13) become **enumerated hard errors**. No schema, no
    thunks, no DAG, no new type zoo. ~1/5 the cost, captures the one real win.
-2. **Fold the dtype-conversion plumbing** (`source_bytes_to_f16_stream` et
-   al., duplicated across qwen2/deepseek4/dots-ocr/qwen35/minimax) into the
-   existing shared safetensors decode helpers (`c5fdb3ff`). This kills the
-   duplication that *actually caused bugs* (the BF16-arm class).
+   **This is the active next module.**
+2. **Finish the dtype-conversion fold** — only **qwen2 + dots-ocr** remain
+   (fold their private `source_bytes_to_f16_stream` copies, with the extra
+   `n_elements` assert, onto the shared helper). deepseek4/minimax/lfm2moe
+   already routed. This kills the duplication that *actually caused bugs*
+   (the BF16-arm class).
 3. **Schema (Layer A) becomes a future gate**, not a now-build. Revisit only
    if a future event proves the name-walk is a real sink — e.g. porting 3+
    near-identical dense arches in a row where the mechanical walk dominates
    (the §9.4 trigger). Layers B (thunk-DAG) stays cut.
+
+#### 10.4.1 Post-review cleanup decisions (2026-06-20)
+
+Three cleanup conclusions came out of the PR review. Resolved:
+
+1. **Embedding-format dispatch dedup — DONE.** The per-token `match embd_format`
+   ladder had grown to 5 copies (4 in `llama.rs`, 1 the new dots-ocr text path
+   in `daemon.rs`). Extracted `llama::embedding_lookup_dispatch(gpu, format,
+   table, output, token, dim)` (free fn beside `EmbeddingFormat`); all 5 sites
+   call it. Behavior-identical (same arms, same kernels) — a newly-added
+   embedding format is now wired in exactly one place.
+
+2. **MoE float-expert guard — kept per-arch, NOT unified.** Tempting to collapse
+   lfm2moe's + deepseek4's "refuse raw-float experts" guards into one shared
+   `is_raw_float_dtype(&str)` predicate. Rejected: they are *not* duplicated
+   logic. lfm2moe checks `effective_quant_type` (which already absorbs the dtype
+   string AND a byte-heuristic fallback for unknown dtypes); deepseek4 checks the
+   raw safetensors dtype string. A shared `matches!` predicate would NARROW the
+   validated lfm2moe guard — dropping its unknown-dtype fallback — to save one
+   line: a false unification (Ousterhout: special/general mixture). Each arch
+   reads its source through that arch's own validated lens; that seam is correct.
+   Follow-up only if deepseek4 Dir is ever validated: hoist `effective_quant_type`
+   into `safetensors_source` as the *richer* shared classifier and have both
+   consume it (widen coverage, never narrow it).
+
+3. **qwen2 text-norm BF16 widening — kept exact, NOT narrowed through F16.**
+   qwen2's `source_bytes_to_f32_vec` widens BF16 norms directly to F32; dots-ocr
+   narrows BF16→F16→F32 for its vision tower. The divergence is intentional and
+   correct: the dots F16 narrowing exists to byte-match the HFQ reference for a
+   hyper-sensitive tower (a fidelity-to-reference constraint), not because F16 is
+   more correct. For a raw Dir load there is no HFQ container forcing F16 storage,
+   so exact BF16→F32 is *strictly more faithful* to the checkpoint and the text
+   decoder tolerates the difference. Narrowing qwen2 to match dots would REDUCE
+   precision on an unvalidated path with no parity test to justify it. Revisit
+   only if exact Dir↔HFQ byte-parity becomes a hard requirement.
