@@ -175,10 +175,25 @@ pub fn read_tail(path: &Path, max_lines: usize) -> LogSnapshot {
             status: LogStatus::Error(e.to_string()),
         };
     }
-    let text = String::from_utf8_lossy(&bytes);
+    if bytes.is_empty() {
+        // The file shrank (truncated/rotated) between the stat and the read, so
+        // the seek landed past EOF. Report Empty rather than a dishonest "Ok with
+        // no lines"; the next poll (<=1s) recovers the real content.
+        return LogSnapshot {
+            lines: Vec::new(),
+            status: LogStatus::Empty,
+        };
+    }
+    // Normalize line endings so a bare '\r' (some progress/spinner writers) does
+    // not collapse many updates into one long line. (str::lines handles \r\n.)
+    let text = String::from_utf8_lossy(&bytes)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let mut lines: Vec<&str> = text.lines().collect();
-    // If we started mid-file, the first line is a partial fragment — drop it.
-    if from > 0 && !lines.is_empty() {
+    // Started mid-file: the first line is a partial fragment — drop it, UNLESS it
+    // is the only line (a single line longer than the window), where keeping it
+    // beats showing an empty log exactly when the user wants it most.
+    if from > 0 && lines.len() > 1 {
         lines.remove(0);
     }
     let start = lines.len().saturating_sub(max_lines);
@@ -228,6 +243,47 @@ mod tests {
         assert_eq!(s.lines.len(), 5);
         assert_eq!(s.lines.last().unwrap(), "line 49");
         assert_eq!(s.lines.first().unwrap(), "line 45");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn mid_file_drops_partial_first_line_keeps_whole_lines() {
+        // Write > TAIL_WINDOW so read_tail starts mid-file (from > 0).
+        let p = tmp("midfile.log");
+        let mut f = File::create(&p).unwrap();
+        for i in 0..6000 {
+            writeln!(f, "log line number {i} with padding text to lengthen the line").unwrap();
+        }
+        let s = read_tail(&p, 10);
+        assert_eq!(s.status, LogStatus::Ok);
+        assert_eq!(s.lines.len(), 10);
+        assert!(s.lines.last().unwrap().contains("number 5999"));
+        // The first returned line is a complete line, not a truncated fragment.
+        assert!(s.lines.first().unwrap().starts_with("log line number"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn single_line_longer_than_window_is_kept_not_dropped() {
+        let p = tmp("longline.log");
+        let mut f = File::create(&p).unwrap();
+        let big = "X".repeat(TAIL_WINDOW as usize + 1000); // > window, no '\n' in window
+        write!(f, "{big}").unwrap();
+        let s = read_tail(&p, 10);
+        assert_eq!(s.status, LogStatus::Ok);
+        assert_eq!(s.lines.len(), 1, "the sole long line is kept, not dropped to empty");
+        assert!(!s.lines[0].is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn last_line_without_trailing_newline_is_retained() {
+        let p = tmp("noeol.log");
+        let mut f = File::create(&p).unwrap();
+        writeln!(f, "first").unwrap();
+        write!(f, "second-no-newline").unwrap();
+        let s = read_tail(&p, 10);
+        assert_eq!(s.lines.last().unwrap(), "second-no-newline");
         let _ = std::fs::remove_file(&p);
     }
 }

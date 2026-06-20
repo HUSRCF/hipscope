@@ -2,10 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::{
-    env, fs,
-    process::{Command, Stdio},
-};
+use std::{fs, process::Stdio};
 
 use anyhow::{anyhow, Result};
 
@@ -84,23 +81,16 @@ impl StatusState {
 }
 
 pub fn start_background_serve() -> Result<()> {
-    let cwd = env::current_dir()?;
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return Err(anyhow!(
-            "cli/index.ts not found; run hipfire from the repo root"
-        ));
-    }
-
-    Command::new("bun")
-        .arg(script)
-        .arg("serve")
+    let mut cmd = super::cli_command().ok_or_else(|| {
+        anyhow!("cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run hipfire from the repo root)")
+    })?;
+    cmd.arg("serve")
         .arg("-d")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| anyhow!("failed to launch `bun cli/index.ts serve -d`: {err}"))?;
+        .map_err(|err| anyhow!("failed to launch `hipfire serve -d`: {err}"))?;
     Ok(())
 }
 

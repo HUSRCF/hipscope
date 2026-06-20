@@ -761,7 +761,12 @@ impl DashboardWorker {
     /// Read the latest snapshot (cheap clone). `None` until the first fetch
     /// completes. This is the ONLY path the UI thread uses for dashboard data.
     pub fn snapshot(&self) -> Option<Dashboard> {
-        self.snapshot.lock().unwrap().clone()
+        // Poison-tolerant: this runs on the UI thread every frame, so a worker
+        // panic while holding the lock must NOT crash render — recover the guard.
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Mark the Dashboard tab focused / unfocused. Flipping to active wakes the
@@ -784,7 +789,7 @@ impl DashboardWorker {
     /// Update the config the worker fetches against (e.g. after a port change
     /// on reload).
     pub fn update_config(&self, config: ConfigState) {
-        *self.config.lock().unwrap() = config;
+        *self.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
     }
 }
 
@@ -832,12 +837,12 @@ fn worker_loop(
         if due {
             // Clone the config out of the lock so the (potentially slow) fetch
             // never holds it.
-            let cfg = config.lock().unwrap().clone();
+            let cfg = config.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let mut dash = fetch_dashboard(&cfg);
             // Probe static system info on first need; reuse thereafter.
             let base = system_base.get_or_insert_with(SystemInfo::probe).clone();
             dash.system = Some(base.with_loaded_model(dash.model.as_deref()));
-            *snapshot.lock().unwrap() = Some(dash);
+            *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(dash);
             last_fetch = Some(Instant::now());
         }
 

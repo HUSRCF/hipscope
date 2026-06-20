@@ -183,6 +183,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // A Models delete-confirmation is modal: route every key to the tab handler
+    // (which acts only on y / n / Esc) so a global `q` or `r` cannot quit or
+    // reload while the confirm is armed.
+    if app.tab == app::Tab::Models && app.confirm_delete.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // While a settings value is being edited, keystrokes (including q/e/a/r)
     // feed the edit buffer rather than triggering global shortcuts.
     let editing_setting = app.tab == app::Tab::Settings && app.settings_edit.is_some();
@@ -203,9 +211,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             // While editing a settings value, Esc cancels the edit instead of
             // quitting / blurring chat.
             if app.tab == app::Tab::Settings && app.settings_edit.is_some() {
-                app.handle_tab_key(key);
-            } else if app.tab == app::Tab::Models && app.confirm_delete.is_some() {
-                // Esc cancels an armed delete confirmation instead of quitting.
                 app.handle_tab_key(key);
             } else if app.chat.sending {
                 app.chat.request_abort();

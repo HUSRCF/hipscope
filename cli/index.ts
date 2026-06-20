@@ -8971,7 +8971,7 @@ Examples:
     const bin = candidates.find(p => existsSync(p));
     let proc;
     if (bin) {
-      proc = spawn([bin, ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env } });
+      proc = spawn([bin, ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
     } else {
       // Dev fallback: build-and-run from the workspace, but ONLY when a real
       // workspace Cargo.toml AND a cargo toolchain are both present. In an
@@ -8997,7 +8997,7 @@ Examples:
       }
       console.error(`hipfire-tui binary not found; falling back to \`cargo run --release -p hipfire-tui\` (first run compiles)...`);
       proc = spawn([cargoBin, "run", "--release", "-p", "hipfire-tui", "--", ...args],
-        { stdin: "inherit", stdout: "inherit", stderr: "inherit", cwd: resolve(__dirname, ".."), env: { ...process.env } });
+        { stdin: "inherit", stdout: "inherit", stderr: "inherit", cwd: resolve(__dirname, ".."), env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
     }
     const code = await proc.exited;
     process.exit(code);
@@ -9022,7 +9022,9 @@ Examples:
       const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
       const tuiBin = findTuiBin();
       if (interactive && tuiBin) {
-        const proc = spawn([tuiBin], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env } });
+        // Pass the CLI entrypoint so the TUI can shell back to it (serve control,
+        // pull, rm) from any cwd — including an installed ~/.hipfire layout.
+        const proc = spawn([tuiBin], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
         process.exit(await proc.exited);
       }
       const hasModels = existsSync(MODELS_DIR) && readdirSync(MODELS_DIR).length > 0;

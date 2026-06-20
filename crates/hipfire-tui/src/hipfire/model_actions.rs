@@ -12,12 +12,13 @@
 //! drains each frame.
 
 use std::{
-    env,
     io::Read,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::mpsc::{self, Receiver, Sender},
     thread,
 };
+
+use crate::hipfire::cli_command;
 
 /// Streamed events from a `pull` run.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,28 +71,19 @@ pub fn parse_percent(line: &str) -> Option<f64> {
     num.parse::<f64>().ok()
 }
 
-fn cli_script() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    let cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return Err("cli/index.ts not found; run hipfire from the repo root".into());
-    }
-    Ok((cwd, script))
-}
-
 fn pull_inner(tag: String, tx: Sender<PullEvent>) {
-    let (cwd, script) = match cli_script() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = tx.send(PullEvent::Failed(e));
+    let mut cmd = match cli_command() {
+        Some(c) => c,
+        None => {
+            let _ = tx.send(PullEvent::Failed(
+                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+            ));
             return;
         }
     };
-    let mut child = match Command::new("bun")
-        .arg(&script)
+    let mut child = match cmd
         .arg("pull")
         .arg(&tag)
-        .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -113,7 +105,10 @@ fn pull_inner(tag: String, tx: Sender<PullEvent>) {
     });
 
     // Read stderr byte-by-byte, flushing a "line" on each '\r' or '\n' (the CLI
-    // overwrites one line with '\r' and only emits '\n' at completion).
+    // overwrites one line with '\r' and only emits '\n' at completion). Retain
+    // the most-recent non-empty line so a failure reports the real cause — the
+    // CLI writes its errors to stderr (the same stream as the progress).
+    let mut last_line = String::new();
     if let Some(mut stderr) = child.stderr.take() {
         let mut buf: Vec<u8> = Vec::new();
         let mut byte = [0u8; 1];
@@ -122,7 +117,9 @@ fn pull_inner(tag: String, tx: Sender<PullEvent>) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     if byte[0] == b'\r' || byte[0] == b'\n' {
-                        flush_progress(&mut buf, &tx);
+                        if let Some(line) = flush_progress(&mut buf, &tx) {
+                            last_line = line;
+                        }
                     } else {
                         buf.push(byte[0]);
                     }
@@ -130,7 +127,9 @@ fn pull_inner(tag: String, tx: Sender<PullEvent>) {
                 Err(_) => break,
             }
         }
-        flush_progress(&mut buf, &tx);
+        if let Some(line) = flush_progress(&mut buf, &tx) {
+            last_line = line;
+        }
     }
 
     let status = child.wait();
@@ -142,13 +141,19 @@ fn pull_inner(tag: String, tx: Sender<PullEvent>) {
             let _ = tx.send(PullEvent::Done);
         }
         Ok(_) => {
-            let msg = stdout
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("pull failed")
-                .trim()
-                .to_string();
+            // Prefer the last stderr line (where the CLI writes errors); fall
+            // back to stdout, then a generic message.
+            let msg = if !last_line.is_empty() {
+                last_line
+            } else {
+                stdout
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("pull failed")
+                    .trim()
+                    .to_string()
+            };
             let _ = tx.send(PullEvent::Failed(msg));
         }
         Err(e) => {
@@ -157,30 +162,35 @@ fn pull_inner(tag: String, tx: Sender<PullEvent>) {
     }
 }
 
-fn flush_progress(buf: &mut Vec<u8>, tx: &Sender<PullEvent>) {
+/// Flush the accumulated stderr line: send it as a Progress event and return it
+/// (so the caller can keep the latest line for error reporting). None if empty.
+fn flush_progress(buf: &mut Vec<u8>, tx: &Sender<PullEvent>) -> Option<String> {
     if buf.is_empty() {
-        return;
+        return None;
     }
     let line = String::from_utf8_lossy(buf).trim().to_string();
     buf.clear();
-    if !line.is_empty() {
-        let percent = parse_percent(&line);
-        let _ = tx.send(PullEvent::Progress { percent, line });
+    if line.is_empty() {
+        return None;
     }
+    let percent = parse_percent(&line);
+    let _ = tx.send(PullEvent::Progress {
+        percent,
+        line: line.clone(),
+    });
+    Some(line)
 }
 
 fn remove_inner(tag: &str) -> RmOutcome {
-    let (cwd, script) = match cli_script() {
-        Ok(v) => v,
-        Err(e) => return RmOutcome::Failed(e),
+    let mut cmd = match cli_command() {
+        Some(c) => c,
+        None => {
+            return RmOutcome::Failed(
+                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+            )
+        }
     };
-    let output = Command::new("bun")
-        .arg(&script)
-        .arg("rm")
-        .arg(tag)
-        .arg("--yes")
-        .current_dir(&cwd)
-        .output();
+    let output = cmd.arg("rm").arg(tag).arg("--yes").output();
     match output {
         Ok(o) if o.status.success() => RmOutcome::Ok(format!("removed {tag}")),
         Ok(o) => {
@@ -209,6 +219,29 @@ mod tests {
         );
         assert_eq!(parse_percent("[          ]   0.0%   —   123/272 MB"), Some(0.0));
         assert_eq!(parse_percent("[██████████] 100.0% done"), Some(100.0));
+        // Unknown-total downloads render "?%" — must yield None (drives the
+        // PullEvent::Progress { percent: None } path).
+        assert_eq!(parse_percent("[          ]   ?%   —   ?/? MB"), None);
         assert_eq!(parse_percent("no percent here"), None);
+    }
+
+    #[test]
+    fn flush_progress_parses_sends_and_returns_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut buf = b"[bar] 42.0% 8 MB/s".to_vec();
+        let line = flush_progress(&mut buf, &tx);
+        assert_eq!(line.as_deref(), Some("[bar] 42.0% 8 MB/s"));
+        assert!(buf.is_empty(), "buffer is consumed");
+        match rx.try_recv() {
+            Ok(PullEvent::Progress { percent, line }) => {
+                assert_eq!(percent, Some(42.0));
+                assert!(line.contains("42.0%"));
+            }
+            other => panic!("expected a Progress event, got {other:?}"),
+        }
+        // An empty buffer flushes nothing and emits no event.
+        let mut empty = Vec::new();
+        assert_eq!(flush_progress(&mut empty, &tx), None);
+        assert!(rx.try_recv().is_err());
     }
 }

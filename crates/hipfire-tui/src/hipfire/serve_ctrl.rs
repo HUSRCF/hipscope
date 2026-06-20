@@ -12,11 +12,11 @@
 //! only reports the command's own success/failure.
 
 use std::{
-    env,
-    process::Command,
     sync::mpsc::{self, Receiver},
     thread,
 };
+
+use crate::hipfire::cli_command;
 
 /// Result of a serve lifecycle command, surfaced to the user as a toast.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,21 +66,15 @@ pub fn run(action: ServeAction) -> Receiver<ServeOutcome> {
 }
 
 fn run_inner(action: ServeAction) -> ServeOutcome {
-    let cwd = match env::current_dir() {
-        Ok(d) => d,
-        Err(e) => return ServeOutcome::Failed(format!("serve {}: cwd: {e}", action.label())),
+    let mut cmd = match cli_command() {
+        Some(c) => c,
+        None => {
+            return ServeOutcome::Failed(
+                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+            )
+        }
     };
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return ServeOutcome::Failed(
-            "cli/index.ts not found; run hipfire from the repo root".into(),
-        );
-    }
-    let output = Command::new("bun")
-        .arg(&script)
-        .args(action.args())
-        .current_dir(&cwd)
-        .output();
+    let output = cmd.args(action.args()).output();
     match output {
         Ok(o) if o.status.success() => ServeOutcome::Ok(format!("serve {}: done", action.label())),
         Ok(o) => {
