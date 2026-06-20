@@ -5138,6 +5138,38 @@ impl KvCache {
         self.v_mode.bits()
     }
 
+    /// Mode-derived `KvTierInputs` with per-call fields zero-filled. Each
+    /// attention dispatch site sets `pos`/`flash_mode`/`capture_mode`/
+    /// `batch_size`/`is_tree`/`is_boundary` after this returns (via functional
+    /// update). Single source of truth for the cache-stable tier flags,
+    /// replacing the four hand-copied literals.
+    pub fn tier_inputs(&self) -> KvTierInputs {
+        // `quant_q4` is not a stored flag — it is the "quantized but no known
+        // format and no separate scales" residual (llama legacy Q4 KV path).
+        let quant_q4 = self.quantized
+            && !self.quant_hfq4
+            && !self.quant_q8
+            && !self.quant_int8
+            && self.k_scales.is_empty();
+        KvTierInputs {
+            quant_asym4: self.quant_asym4,
+            quant_asym3: self.quant_asym3,
+            quant_asym2: self.quant_asym2,
+            quant_q8: self.quant_q8,
+            quant_fwht: self.quant_fwht,
+            quant_hfq4: self.quant_hfq4,
+            quant_q4,
+            v_mode_bits: self.v_mode_bits(),
+            // ── per-call: zero-filled, caller overwrites via functional update ──
+            pos: 0,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+        }
+    }
+
     fn resize_real_tensors_zeroed(
         gpu: &mut Gpu,
         tensors: &mut [GpuTensor],
