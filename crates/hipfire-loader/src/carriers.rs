@@ -5,7 +5,10 @@
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
 use crate::Carrier;
-use crate::{finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel, ModelState};
+use crate::{
+    finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
+    ModelState,
+};
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
@@ -31,10 +34,8 @@ struct SourceMeta {
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
-            tokenizer: hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(
-                &hfq.metadata_json,
-            )
-            .map_err(|e| format!("tokenizer not found: {e}"))?,
+            tokenizer: hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|e| format!("tokenizer not found: {e}"))?,
             chat_template: resolve_chat_template(hfq, path),
             arch_id: hfq.arch_id,
         }),
@@ -65,26 +66,8 @@ fn tokenizer_from_dir(
     }
 }
 
-/// Checks that `src` is HFQ-only, resolves metadata, and unwraps the file —
-/// collapses the three-step boilerplate in every HFQ-only carrier.
-fn require_hfq(
-    src: ModelSource,
-    path: &str,
-    carrier_name: &str,
-) -> Result<(SourceMeta, hipfire_runtime::hfq::HfqFile), String> {
-    let ModelSource::Hfq(_) = &src else {
-        return Err(format!("{carrier_name}: directory source unsupported"));
-    };
-    let meta = resolve_source_meta(&src, path)?;
-    let ModelSource::Hfq(hfq) = src else { unreachable!() };
-    Ok((meta, hfq))
-}
-
 /// Returns the first candidate string that tokenizes to exactly one token, or 1.
-fn resolve_eos_tok(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-    candidates: &[&str],
-) -> u32 {
+fn resolve_eos_tok(tokenizer: &hipfire_runtime::tokenizer::Tokenizer, candidates: &[&str]) -> u32 {
     for s in candidates {
         let ids = tokenizer.encode(s);
         if ids.len() == 1 {
@@ -212,18 +195,19 @@ fn load_qwen35_pp(
     };
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
-    let weights = hipfire_arch_qwen35::qwen35::load_weights(
-        &mut hfq_source,
-        &mut gpus.devices,
-        &layout,
-    )
-    .map_err(|e| format!("{e}"))?;
+    let weights =
+        hipfire_arch_qwen35::qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout)
+            .map_err(|e| format!("{e}"))?;
     let is_kv_layer: Vec<bool> = config
         .layer_types
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY, config.head_dim);
+    let mode = resolve_kv_mode(
+        ctx,
+        &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
+        config.head_dim,
+    );
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -237,7 +221,8 @@ fn load_qwen35_pp(
         &dims,
     )
     .map_err(|e| format!("{e}"))?;
-    let dn_quant = crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
+    let dn_quant =
+        crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
     let (dn, la_to_device) = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
         &mut gpus, &config, dn_quant,
     )
@@ -360,9 +345,7 @@ impl Carrier for Qwen35Carrier {
             }
             ModelSource::Dir(source) => {
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
-                    .map_err(|e| {
-                        format!("failed to parse Qwen3.5 config from config.json: {e}")
-                    })?;
+                    .map_err(|e| format!("failed to parse Qwen3.5 config from config.json: {e}"))?;
                 if ctx.draft_path.is_some() {
                     eprintln!("  warning: DFlash (speculative decoding) is not supported for safetensors Dir sources; draft_path ignored");
                 }
@@ -384,7 +367,11 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY, config.head_dim);
+                let mode = resolve_kv_mode(
+                    ctx,
+                    &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
+                    config.head_dim,
+                );
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
                     n_kv_heads: config.n_kv_heads,
@@ -411,21 +398,24 @@ impl Carrier for Qwen35Carrier {
                         "Q8"
                     }
                 );
-                if config.dim < 2048
-                    && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32
-                {
+                if config.dim < 2048 && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
                     eprintln!(
                         "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
                         config.dim,
                         if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 { "Q4" } else { "Q8" }
                     );
                 }
-                let dn_state =
-                    hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant)
-                        .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
-                let scratch =
-                    hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq)
-                        .map_err(|e| format!("Qwen35Scratch::new_with_kv_max: {e:?}"))?;
+                let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
+                    ctx.gpu, &config, dn_quant,
+                )
+                .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
+                let scratch = hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
+                    ctx.gpu,
+                    &config,
+                    2048,
+                    ctx.max_seq,
+                )
+                .map_err(|e| format!("Qwen35Scratch::new_with_kv_max: {e:?}"))?;
 
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
                     config,
@@ -480,15 +470,18 @@ impl Carrier for LlamaCarrier {
                 hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
             }
             ModelSource::Dir(source) => {
-                let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-                    .map_err(|e| {
+                let config =
+                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
                         format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
                     })?;
-                let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(
-                    &source, &config, ctx.gpu,
-                )
-                .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY, config.head_dim);
+                let weights =
+                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
+                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+                let mode = resolve_kv_mode(
+                    ctx,
+                    &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
+                    config.head_dim,
+                );
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Flat(config.n_layers),
                     n_kv_heads: config.n_kv_heads,
@@ -537,8 +530,8 @@ impl Carrier for DotsOcrCarrier {
     fn name(&self) -> &'static str {
         "dots_ocr"
     }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 8
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 8
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -548,15 +541,31 @@ impl Carrier for DotsOcrCarrier {
             }
             .into());
         }
-        let (meta, mut hfq) = require_hfq(src, ctx.path, "dots_ocr")?;
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
 
+        use hipfire_arch_dots_ocr::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
         use hipfire_arch_dots_ocr::DotsOcr;
         use hipfire_runtime::arch::Architecture;
-        let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
-        let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-        let state =
-            hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(ctx.gpu, &config.text, ctx.max_seq)
-                .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        // ── source-varying seam: (config, weights) only ──
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq) => {
+                let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
+                let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = DotsOcrConfig::from_source(&source)?;
+                let weights = DotsOcrWeights::load_weights_from_source(&source, &config, ctx.gpu)?;
+                (config, weights)
+            }
+        };
+        let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
+            ctx.gpu,
+            &config.text,
+            ctx.max_seq,
+        )
+        .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         Ok(LoadedModel {
             qwen2_state: Some(state),
             dots_ocr_config: Some(config),
@@ -580,8 +589,8 @@ impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
         "deepseek4"
     }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 9
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 9
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -591,20 +600,38 @@ impl Carrier for Deepseek4Carrier {
             }
             .into());
         }
-        let (meta, mut hfq) = require_hfq(src, ctx.path, "deepseek4")?;
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
 
         use hipfire_arch_deepseek4 as deepseek4;
         use hipfire_runtime::arch::Architecture;
-        let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-        let weights =
-            <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+        // ── source-varying seam: (config, weights) only ──
+        // NOTE: the Dir/safetensors arm is UNVALIDATED — no deepseek_v4
+        // checkpoint was available locally to verify load fidelity. Reviewer-ask.
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq) => {
+                let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
+                    &mut hfq, &config, ctx.gpu,
+                )?;
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
+                    "deepseek4: failed to parse config from safetensors".to_string()
+                })?;
+                let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
+                    &source, &config, ctx.gpu,
+                )?;
+                (config, weights)
+            }
+        };
         let state = deepseek4::DeepseekV4State::new(&config)?;
         let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024);
-        let pbs =
-            deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
+        let pbs = deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         Ok(LoadedModel {
             deepseek4_config: Some(config),
@@ -674,7 +701,10 @@ impl Carrier for MinimaxCarrier {
         // ── single shared tail (byte-identical to the previous per-arm tails) ──
         let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"]);
+        let eos_tok = resolve_eos_tok(
+            &meta.tokenizer,
+            &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -701,8 +731,8 @@ impl Carrier for Lfm2MoeCarrier {
     fn name(&self) -> &'static str {
         "lfm2moe"
     }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 11
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 11
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -712,11 +742,26 @@ impl Carrier for Lfm2MoeCarrier {
             }
             .into());
         }
-        let (meta, mut hfq) = require_hfq(src, ctx.path, "lfm2moe")?;
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
 
         use hipfire_arch_lfm2moe as lfm2moe;
-        let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
-        let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
+        // ── source-varying seam: (config, weights) only ──
+        let (config, weights) = match src {
+            ModelSource::Hfq(mut hfq) => {
+                let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
+                let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
+                (config, weights)
+            }
+            ModelSource::Dir(source) => {
+                let config = lfm2moe::config_from_source(&source).ok_or_else(|| {
+                    "lfm2moe: failed to parse config from safetensors".to_string()
+                })?;
+                let weights = lfm2moe::load_weights_from_source(&source, &config, ctx.gpu)?;
+                (config, weights)
+            }
+        };
+
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);

@@ -18,6 +18,7 @@ use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -689,15 +690,17 @@ fn effective_quant_type(info: &hipfire_runtime::model_source::TensorInfo, data: 
 }
 
 /// Read raw bytes from a ModelSource with dtype classification.
-/// Returns `(effective_quant_type, &[u8])`.
+/// Returns `(effective_quant_type, source_dtype_string, &[u8])`. The dtype
+/// string is needed to distinguish F16 from BF16 (both qt==1, same byte size,
+/// different bit layout) — decoding BF16 as F16 silently corrupts values.
 fn read_tensor_from_source<'a>(
     source: &'a dyn ModelSource,
     name: &str,
-) -> Result<(u8, &'a [u8]), String> {
+) -> Result<(u8, &'a str, &'a [u8]), String> {
     let (info, data) = source
         .tensor_data(name)
         .ok_or_else(|| format!("lfm2moe: tensor not found in source: {name}"))?;
-    Ok((effective_quant_type(info, data), data))
+    Ok((effective_quant_type(info, data), info.dtype.as_str(), data))
 }
 
 /// Load a norm/1D tensor as F32 on GPU from a ModelSource.
@@ -708,16 +711,12 @@ fn load_f32_from_source(
     name: &str,
     shape: &[usize],
 ) -> Result<GpuTensor, String> {
-    let (qt, data) = read_tensor_from_source(source, name)?;
+    let (qt, dtype, data) = read_tensor_from_source(source, name)?;
     let f32_data: Vec<f32> = match qt {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        // F16/BF16 (qt==1) and F32 (qt==2) widen via the shared dtype-aware
+        // helper — it decodes BF16 with the correct bit layout (the old
+        // f16_to_f32 path silently mis-decoded BF16 as F16).
+        1 | 2 => source_bytes_to_f32_vec(dtype, data),
         3 => {
             // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
             dequant_q8_0(data)
@@ -741,16 +740,19 @@ fn load_wt_from_source(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
-    let (qt, data) = read_tensor_from_source(source, name)?;
-    wt_from_source_raw(gpu, qt, data, m, k)
+    let (qt, src_dtype, data) = read_tensor_from_source(source, name)?;
+    wt_from_source_raw(gpu, qt, src_dtype, data, m, k)
         .map_err(|e| format!("lfm2moe: load_wt_from_source {name}: {e}"))
 }
 
 /// Upload raw bytes as a WeightTensor, determining gpu_dtype from the
-/// (possibly inferred) quant_type.
+/// (possibly inferred) quant_type. `src_dtype` is the source dtype string,
+/// used to narrow BF16 → F16 before upload (the GPU F16 path can't consume
+/// raw BF16 bytes — uploading them as-is yields silently-wrong values).
 fn wt_from_source_raw(
     gpu: &mut Gpu,
     qt: u8,
+    src_dtype: &str,
     data: &[u8],
     m: usize,
     k: usize,
@@ -768,6 +770,16 @@ fn wt_from_source_raw(
         30 => DType::MQ4G256Lloyd,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
+    };
+    // BF16 sources arrive as raw 2-byte bf16 (qt==1, same size as F16);
+    // narrow to F16 bytes before the raw upload so the F16-tagged buffer holds
+    // correctly-decoded values.
+    let converted: Vec<u8>;
+    let data: &[u8] = if qt == 1 && src_dtype == "BF16" {
+        converted = bf16_bytes_to_f16(data);
+        &converted
+    } else {
+        data
     };
     let buf = gpu
         .upload_raw(data, &[data.len()])
@@ -795,7 +807,7 @@ fn load_lfm2_awq_scale_from_source(
     let qt = effective_quant_type(info, data);
     if qt != 1 {
         return None;
-    } // 1 = F16
+    } // 1 = F16/BF16 (both 2-byte)
     if data.len() != k * 2 {
         eprintln!(
             "lfm2moe AWQ sidecar {name}: {} bytes != {} (k*2); skipping",
@@ -804,10 +816,8 @@ fn load_lfm2_awq_scale_from_source(
         );
         return None;
     }
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
+    // dtype-aware widen so a BF16 sidecar isn't mis-decoded as F16.
+    let f32_data: Vec<f32> = source_bytes_to_f32_vec(info.dtype.as_str(), data);
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
 }
@@ -832,14 +842,29 @@ pub fn load_weights_from_source(
     let k_conv = cfg.conv_kernel_size;
 
     // Globals. embed_tokens is the shared (tied) lm_head.
-    let (_eqt, embed_bytes) = read_tensor_from_source(source, "model.embed_tokens.weight")?;
+    let (eqt, edt, embed_bytes) = read_tensor_from_source(source, "model.embed_tokens.weight")?;
+    // Match the lm_head / weight F16 convention: narrow BF16 embeddings to F16
+    // before the raw upload (uploading raw bf16 bytes would be misread).
+    let embed_converted: Vec<u8>;
+    let embed_bytes: &[u8] = if eqt == 1 && edt == "BF16" {
+        embed_converted = bf16_bytes_to_f16(embed_bytes);
+        &embed_converted
+    } else {
+        embed_bytes
+    };
     let embed = gpu
         .upload_raw(embed_bytes, &[embed_bytes.len()])
         .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
     let embedding_norm =
         load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
     // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
-    let lm_head = load_wt_from_source(source, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+    let lm_head = load_wt_from_source(
+        source,
+        gpu,
+        "model.embed_tokens.weight",
+        cfg.vocab_size,
+        hidden,
+    )?;
 
     let mut conv_state_count = 0usize;
     let mut kv_count = 0usize;
@@ -971,21 +996,44 @@ pub fn load_weights_from_source(
                 n_exp,
                 hidden,
             )?;
-            let expert_bias =
-                load_f32_from_source(source, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
+            let expert_bias = load_f32_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.expert_bias"),
+                &[n_exp],
+            )?;
+            // Guard: the indexed-MoE GEMV forward (gemv_hfq4g256/hfq6g256_moe,
+            // with FWHT-pre-rotated experts) has NO float-weight path. A raw HF
+            // safetensors checkpoint ships bf16/f16 experts (eqt 1) which would
+            // be misread as 4-bit blocks → silent garbage. Refuse cleanly: this
+            // path supports hipfire-quantized experts only.
+            {
+                let (eqt, _dt, _d) = read_tensor_from_source(
+                    source,
+                    &format!("{p}.feed_forward.experts.0.w1.weight"),
+                )?;
+                if eqt == 1 || eqt == 2 {
+                    return Err(format!(
+                        "lfm2moe: MoE experts at L{l} are raw float (eqt={eqt}); the indexed-MoE \
+                         forward requires quantized experts (HFQ4G256/MQ4G256/MQ6G256/HFQ6G256). \
+                         Quantize the checkpoint first (e.g. `hipfire-quantize … --format mq4`) \
+                         or load the prebuilt HFQ."
+                    ));
+                }
+            }
             // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
             let mut experts = Vec::with_capacity(n_exp);
             for e in 0..n_exp {
                 let ep = format!("{p}.feed_forward.experts.{e}");
-                let (qt1, w1) = read_tensor_from_source(source, &format!("{ep}.w1.weight"))?;
-                let (_qt3, w3) = read_tensor_from_source(source, &format!("{ep}.w3.weight"))?;
+                let (qt1, dt1, w1) = read_tensor_from_source(source, &format!("{ep}.w1.weight"))?;
+                let (_qt3, _dt3, w3) = read_tensor_from_source(source, &format!("{ep}.w3.weight"))?;
                 let mut gate_up_bytes: Vec<u8> = w1.to_vec();
                 gate_up_bytes.extend_from_slice(w3);
                 let mut gate_up =
-                    wt_from_source_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
+                    wt_from_source_raw(gpu, qt1, dt1, &gate_up_bytes, 2 * moe_inter, hidden)
                         .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
-                let (qt2, w2) = read_tensor_from_source(source, &format!("{ep}.w2.weight"))?;
-                let mut down = wt_from_source_raw(gpu, qt2, w2, hidden, moe_inter)
+                let (qt2, dt2, w2) = read_tensor_from_source(source, &format!("{ep}.w2.weight"))?;
+                let mut down = wt_from_source_raw(gpu, qt2, dt2, w2, hidden, moe_inter)
                     .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
                 // AWQ scales: shared per layer, emitted once on expert 0.
                 if e == 0 {
@@ -1141,7 +1189,12 @@ impl Lfm2MoeState {
             physical_cap: None,
         };
         let kv = hipfire_runtime::llama::KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, cfg.head_dim).mode,
+            hipfire_runtime::kv_mode::resolve(
+                "",
+                &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
+                cfg.head_dim,
+            )
+            .mode,
             hipfire_runtime::llama::KvTarget::Single(gpu),
             &dims,
         )
@@ -1242,5 +1295,28 @@ impl Lfm2MoeState {
         let _ = gpu.free_tensor(self.down_expanded);
         let _ = gpu.free_tensor(self.final_norm_buf);
         let _ = gpu.free_tensor(self.logits);
+    }
+}
+
+#[cfg(test)]
+mod bf16_decode_tests {
+    use hipfire_runtime::safetensors_source::source_bytes_to_f32_vec;
+
+    // Regression: lfm2moe's safetensors decode previously collapsed BF16 onto
+    // the F16 path (`effective_quant_type` mapped BF16 → qt 1 → `f16_to_f32`),
+    // silently corrupting every BF16 weight/norm. The loader now widens via the
+    // dtype-aware shared helper; this locks BF16 ≠ F16 for the same bytes so the
+    // collapse can't regress unnoticed (no GPU needed — pure byte decode).
+    #[test]
+    fn bf16_bytes_decode_distinct_from_f16() {
+        // 1.0 in bf16 = 0x3F80 (upper 16 bits of f32 1.0 = 0x3F800000).
+        let one_bf16 = 0x3F80u16.to_le_bytes();
+        let as_bf16 = source_bytes_to_f32_vec("BF16", &one_bf16);
+        let as_f16 = source_bytes_to_f32_vec("F16", &one_bf16);
+        assert_eq!(as_bf16, vec![1.0f32], "BF16 0x3F80 must widen to 1.0");
+        assert_ne!(
+            as_bf16, as_f16,
+            "decoding BF16 bytes as F16 must differ — the original bug"
+        );
     }
 }

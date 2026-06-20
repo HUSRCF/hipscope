@@ -1564,6 +1564,20 @@ impl DeepseekV4 {
             let (info0, _b0) = source
                 .tensor_data(&name0)
                 .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
+            // Guard: the indexed-MoE forward has no float-expert path — it
+            // reinterprets the packed expert blob as quant blocks. A raw-HF
+            // safetensors checkpoint ships bf16/f16/f32 experts, which would be
+            // misread → silent garbage. Refuse cleanly (quantized experts only),
+            // mirroring the lfm2moe Dir guard. (This Dir arm is otherwise
+            // unvalidated — no deepseek_v4 checkpoint was available locally.)
+            if matches!(info0.dtype.as_str(), "BF16" | "F16" | "F32") {
+                return Err(format!(
+                    "deepseek4: routed experts at {prefix} are raw float ({}); the \
+                     indexed-MoE forward requires quantized experts. Quantize the \
+                     checkpoint first or load the prebuilt HFQ.",
+                    info0.dtype
+                ));
+            }
             let stride = info0.data_size;
             let shape0: Vec<usize> = info0.shape.clone();
 

@@ -11912,10 +11912,21 @@ fn generate_vl_dots_ocr(
                 .copy_from_slice(&merged[visual_idx * dim..(visual_idx + 1) * dim]);
             visual_idx += 1;
         } else {
-            // dots.ocr text weights are Q8_0 (q8.hfq).
-            if let Err(e) =
-                gpu.embedding_lookup_q8(&weights.text.token_embd, &emb_scratch, token, dim)
-            {
+            // Dispatch the token-embedding lookup on the actual embedding
+            // format. HFQ dots.ocr ships Q8_0 embeddings, but the
+            // safetensors/Dir loader uploads F32 — hardcoding the Q8 kernel
+            // here misreads F32 bytes as Q8 blocks, corrupting every text
+            // token's embedding (the model then ignores the prompt). Mirrors
+            // the per-format dispatch in `llama::forward`.
+            let lookup = hipfire_runtime::llama::embedding_lookup_dispatch(
+                gpu,
+                weights.text.embd_format,
+                &weights.text.token_embd,
+                &emb_scratch,
+                token,
+                dim,
+            );
+            if let Err(e) = lookup {
                 embed_err = Some(format!("embedding lookup: {e:?}"));
                 break;
             }

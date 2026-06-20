@@ -241,7 +241,13 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
+        // Per-expert / VLM arches whose safetensors Dir paths route to their
+        // dedicated carriers. model_type strings mirror the quantizer ingest
+        // map (hipfire-quantize/src/main.rs auto_arch_id).
+        "dots_ocr" => 8,
+        "deepseek_v4" => 9,
         "minimax_m2" => 10,
+        "lfm2_moe" | "lfm2" => 11,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -404,6 +410,13 @@ mod tests {
             6
         );
         assert_eq!(derive_arch_id(&json!({ "model_type": "minimax_m2" })), 10);
+        // Per-expert / VLM Dir arches routed to dedicated carriers (mirrors the
+        // quantizer ingest map). Lock the strings so a rename can't silently
+        // unclaim a real checkpoint.
+        assert_eq!(derive_arch_id(&json!({ "model_type": "dots_ocr" })), 8);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "deepseek_v4" })), 9);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).
