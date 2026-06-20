@@ -7,6 +7,81 @@
 
 use crate::types::KernelKey;
 
+/// Sealed decode of the KV-cache storage tier. Produced ONLY by `classify`.
+/// Carries every distinction any consumer branches on, including the
+/// Givens-vs-FWHT rotation distinction (the `fwht` field on asym variants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KTier {
+    F32,
+    Q8,
+    Hfq4, // llama legacy
+    Q4,   // llama legacy
+    Asym4 { fwht: bool },
+    Asym3 { fwht: bool },
+    Asym2 { fwht: bool },
+}
+
+/// The single bool→tier decode. The only sanctioned producer of `KTier`.
+pub fn classify(
+    quant_q8: bool,
+    quant_asym4: bool,
+    quant_asym3: bool,
+    quant_asym2: bool,
+    quant_hfq4: bool,
+    quant_q4: bool,
+    quant_fwht: bool,
+) -> KTier {
+    debug_assert!(
+        [quant_asym4, quant_asym3, quant_asym2, quant_q8, quant_hfq4, quant_q4]
+            .iter().filter(|&&b| b).count() <= 1,
+        "at most one KV quant tier flag should be set"
+    );
+    if quant_asym4 { KTier::Asym4 { fwht: quant_fwht } }
+    else if quant_asym3 { KTier::Asym3 { fwht: quant_fwht } }
+    else if quant_asym2 { KTier::Asym2 { fwht: quant_fwht } }
+    else if quant_q8 { KTier::Q8 }
+    else if quant_hfq4 { KTier::Hfq4 }
+    else if quant_q4 { KTier::Q4 }
+    else { KTier::F32 }
+}
+
+impl KTier {
+    /// K bytes per position for the compaction gather kernels (cask/triattn).
+    /// Callers MUST gate with `is_compactable()` first.
+    pub fn k_bytes_per_pos(self, n_kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            KTier::Q8 => n_kv_heads * (head_dim / 32) * 34,
+            KTier::Asym4 { .. } => n_kv_heads * (4 + head_dim / 2),
+            KTier::Asym3 { .. } => n_kv_heads * (4 + (head_dim * 3) / 8),
+            KTier::Asym2 { .. } => n_kv_heads * (4 + head_dim / 4),
+            KTier::F32 | KTier::Hfq4 | KTier::Q4 => {
+                panic!("k_bytes_per_pos undefined for {self:?}")
+            }
+        }
+    }
+
+    /// Tiers the TriAttn/CASK compaction kernels support. Collapses `fwht`.
+    pub fn is_compactable(self) -> bool {
+        matches!(
+            self,
+            KTier::Q8 | KTier::Asym4 { .. } | KTier::Asym3 { .. } | KTier::Asym2 { .. }
+        )
+    }
+
+    /// Drafter-scoring storage must be Q8 or FWHT-asym (Givens-asym banned).
+    pub fn storage_ok_for_pflash(self) -> bool {
+        matches!(
+            self,
+            KTier::Q8
+                | KTier::Asym4 { fwht: true }
+                | KTier::Asym3 { fwht: true }
+                | KTier::Asym2 { fwht: true }
+        )
+    }
+
+    pub fn is_q8(self) -> bool { matches!(self, KTier::Q8) }
+}
+
 /// GPU-free scalar inputs for tier derivation. NO runtime types (avoids the
 /// dep cycle — `hipfire-dispatch` cannot depend on `hipfire-runtime`).
 /// The arch-side code constructs this from a `&KvCache` at each attention step.
@@ -694,5 +769,23 @@ mod tests {
         assert!(!tiers_match(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym4));
         assert!(!tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnF32));
         assert!(!tiers_match(KernelKey::KvWriteF32, KernelKey::AttnFlashAsym3Fwht));
+    }
+
+    // ── KTier enum and classify tests ──
+
+    #[test]
+    fn classify_carries_fwht_bit() {
+        assert_eq!(classify(false, false, true, false, false, false, true),  KTier::Asym3 { fwht: true });
+        assert_eq!(classify(false, false, true, false, false, false, false), KTier::Asym3 { fwht: false });
+        assert_eq!(classify(true,  false, false, false, false, false, false), KTier::Q8);
+        assert_eq!(classify(false, false, false, false, false, false, false), KTier::F32);
+    }
+
+    #[test]
+    fn ktier_queries() {
+        assert!(KTier::Q8.is_compactable() && KTier::Q8.is_q8() && KTier::Q8.storage_ok_for_pflash());
+        assert!(KTier::Asym3 { fwht: true }.storage_ok_for_pflash());
+        assert!(!KTier::Asym3 { fwht: false }.storage_ok_for_pflash());
+        assert!(!KTier::F32.is_compactable());
     }
 }
