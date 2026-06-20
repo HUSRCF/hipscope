@@ -12,7 +12,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Tab},
-    hipfire::dashboard::VramState,
+    hipfire::dashboard::{LoadState, VramState},
     hipfire::registry::ModelListItem,
 };
 
@@ -514,7 +514,51 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
-    frame.render_widget(card("VRAM (rocm-smi)", vram_lines), cols[1]);
+
+    // ── Live load (util / temp / power) ─────────────────────────────────
+    match dash.map(|d| &d.gpu_load) {
+        Some(LoadState::Available(loads)) => {
+            vram_lines.push(Line::from(""));
+            for l in loads {
+                let mut parts = Vec::new();
+                if let Some(u) = l.util_pct {
+                    parts.push(format!("{u:.0}% util"));
+                }
+                if let Some(t) = l.temp_c {
+                    parts.push(format!("{t:.0}°C"));
+                }
+                if let Some(p) = l.power_w {
+                    parts.push(format!("{p:.0} W"));
+                }
+                let color = match l.util_pct {
+                    Some(u) if u > 90.0 => RED,
+                    Some(u) if u > 50.0 => YELLOW,
+                    _ => GREEN,
+                };
+                let body = if parts.is_empty() {
+                    "no load fields".to_string()
+                } else {
+                    parts.join("  ·  ")
+                };
+                vram_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("GPU {}  ", l.index),
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(body, Style::default().fg(color)),
+                ]));
+            }
+        }
+        Some(LoadState::Unavailable(reason)) => {
+            vram_lines.push(Line::from(""));
+            vram_lines.push(Line::from(Span::styled(
+                reason.clone(),
+                Style::default().fg(MUTED),
+            )));
+        }
+        None => {}
+    }
+    frame.render_widget(card("GPU (rocm-smi)", vram_lines), cols[1]);
 }
 
 fn fmt_uptime(secs: u64) -> String {
@@ -1116,7 +1160,7 @@ fn scroll_start(selected: usize, height: u16, chrome: u16) -> usize {
 mod render_tests {
     use super::*;
     use crate::app::App;
-    use crate::hipfire::dashboard::{Dashboard, GpuMem, ServeStats, VramState};
+    use crate::hipfire::dashboard::{Dashboard, GpuLoad, GpuMem, LoadState, ServeStats, VramState};
     use ratatui::{backend::TestBackend, Terminal};
 
     /// Render the whole UI for the Dashboard tab with the given snapshot and
@@ -1156,6 +1200,12 @@ mod render_tests {
                 used_bytes: 8_000_000_000,
                 total_bytes: 24_000_000_000,
             }]),
+            gpu_load: LoadState::Available(vec![GpuLoad {
+                index: 0,
+                util_pct: Some(37.0),
+                temp_c: Some(45.0),
+                power_w: Some(120.0),
+            }]),
             offline_hint: None,
             system: None,
         };
@@ -1167,6 +1217,8 @@ mod render_tests {
         assert!(text.contains("served"), "expected requests served");
         assert!(text.contains("tok/s"), "expected recent tok/s");
         assert!(text.contains("GPU 0"), "expected per-GPU VRAM");
+        assert!(text.contains("37% util"), "expected live GPU utilization");
+        assert!(text.contains("120 W"), "expected live GPU power");
     }
 
     #[test]
@@ -1174,6 +1226,7 @@ mod render_tests {
         let dash = Dashboard::offline(
             "127.0.0.1:11435".into(),
             VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
+            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
         );
         let text = render_dashboard(Some(dash));
         assert!(text.contains("offline"), "expected offline marker");
@@ -1215,6 +1268,7 @@ mod render_tests {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),
             VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
+            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
         );
         d.system = Some(system);
         d

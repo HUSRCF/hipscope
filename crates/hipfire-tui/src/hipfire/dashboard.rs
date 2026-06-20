@@ -69,6 +69,24 @@ pub enum VramState {
     Unavailable(String),
 }
 
+/// Per-GPU live load parsed from `rocm-smi --showuse --showtemp --showpower`.
+/// Each field is optional — rocm-smi key names vary by ROCm version, so a
+/// missing reading is honestly `None`, never fabricated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuLoad {
+    pub index: u32,
+    pub util_pct: Option<f64>,
+    pub temp_c: Option<f64>,
+    pub power_w: Option<f64>,
+}
+
+/// GPU-load availability — real per-GPU readings, or an honest reason.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadState {
+    Available(Vec<GpuLoad>),
+    Unavailable(String),
+}
+
 /// Stats parsed from the serve's GET /stats endpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServeStats {
@@ -95,6 +113,8 @@ pub struct Dashboard {
     /// Models advertised by GET /v1/models (ids).
     pub model_ids: Vec<String>,
     pub vram: VramState,
+    /// Live per-GPU util / temp / power from rocm-smi (independent of serve).
+    pub gpu_load: LoadState,
     /// When serve is down: an honest hint, e.g. how to start it.
     pub offline_hint: Option<String>,
     /// Live system diagnostics (GPU/HIP/kernel-cache/loaded-model). Probed off
@@ -105,7 +125,7 @@ pub struct Dashboard {
 impl Dashboard {
     /// Offline dashboard: serve unreachable. Carries a start hint and whatever
     /// VRAM we could still read (rocm-smi works without serve).
-    pub fn offline(endpoint: String, vram: VramState) -> Self {
+    pub fn offline(endpoint: String, vram: VramState, gpu_load: LoadState) -> Self {
         Self {
             serve_up: false,
             endpoint,
@@ -114,6 +134,7 @@ impl Dashboard {
             stats: None,
             model_ids: Vec::new(),
             vram,
+            gpu_load,
             offline_hint: Some("serve offline — start it with `hipfire serve -d`".into()),
             system: None,
         }
@@ -547,6 +568,109 @@ fn run_rocm_smi_bounded() -> RocmSmiRun {
     run_bounded(cmd, ROCM_SMI_TIMEOUT)
 }
 
+fn run_rocm_smi_load_bounded() -> RocmSmiRun {
+    let mut cmd = Command::new("rocm-smi");
+    cmd.args(["--showuse", "--showtemp", "--showpower", "--json"]);
+    run_bounded(cmd, ROCM_SMI_TIMEOUT)
+}
+
+/// Probe rocm-smi for per-GPU util / temperature / power. Honest
+/// [`LoadState::Unavailable`] on non-Linux, missing binary, timeout, or
+/// unparseable output. Never blocks indefinitely (bounded + killed).
+pub fn fetch_gpu_load() -> LoadState {
+    if !cfg!(target_os = "linux") {
+        return LoadState::Unavailable("GPU load unavailable: rocm-smi is Linux-only".into());
+    }
+    match run_rocm_smi_load_bounded() {
+        RocmSmiRun::Output(text) => parse_rocm_smi_load_json(&text),
+        RocmSmiRun::NotFound => {
+            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into())
+        }
+        RocmSmiRun::TimedOut => LoadState::Unavailable(format!(
+            "GPU load unavailable: rocm-smi timed out after {}ms (killed)",
+            ROCM_SMI_TIMEOUT.as_millis()
+        )),
+        RocmSmiRun::SpawnError(e) => {
+            LoadState::Unavailable(format!("GPU load unavailable: rocm-smi error: {e}"))
+        }
+    }
+}
+
+/// Parse `rocm-smi --showuse --showtemp --showpower --json`. Field key names
+/// vary by ROCm version, so each metric is matched by substring (in preference
+/// order) and a missing field is honestly `None`.
+pub fn parse_rocm_smi_load_json(body: &str) -> LoadState {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return LoadState::Unavailable(format!("rocm-smi load JSON parse failed: {e}")),
+    };
+    let Some(obj) = v.as_object() else {
+        return LoadState::Unavailable("rocm-smi load JSON not an object".into());
+    };
+    let mut cards: Vec<(u32, &Value)> = obj
+        .iter()
+        .filter_map(|(k, val)| {
+            k.strip_prefix("card")
+                .and_then(|n| n.parse::<u32>().ok())
+                .map(|idx| (idx, val))
+        })
+        .collect();
+    cards.sort_by_key(|(idx, _)| *idx);
+    let mut loads = Vec::new();
+    for (idx, card) in cards {
+        let util = field_f64_containing(card, &["GPU use (%)", "GPU use"]);
+        let temp = field_f64_containing(
+            card,
+            &[
+                "Temperature (Sensor edge)",
+                "Temperature (Sensor junction)",
+                "Temperature",
+            ],
+        );
+        let power = field_f64_containing(
+            card,
+            &[
+                "Average Graphics Package Power",
+                "Current Socket Graphics Package Power",
+                "Power",
+            ],
+        );
+        if util.is_some() || temp.is_some() || power.is_some() {
+            loads.push(GpuLoad {
+                index: idx,
+                util_pct: util,
+                temp_c: temp,
+                power_w: power,
+            });
+        }
+    }
+    if loads.is_empty() {
+        LoadState::Unavailable("rocm-smi returned no load fields".into())
+    } else {
+        LoadState::Available(loads)
+    }
+}
+
+/// First card field whose key CONTAINS one of `needles` (tried in order),
+/// parsed as f64 (rocm-smi emits stringified numbers, occasionally raw numbers).
+fn field_f64_containing(card: &Value, needles: &[&str]) -> Option<f64> {
+    let obj = card.as_object()?;
+    for needle in needles {
+        for (k, val) in obj {
+            if k.contains(needle) {
+                let parsed = val
+                    .as_str()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .or_else(|| val.as_f64());
+                if let Some(n) = parsed {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Spawn `cmd`, capturing stdout, and enforce a hard `timeout`. Polls
 /// `try_wait`; on deadline it `kill()`s and reaps the child so no zombie leaks.
 /// Generic over the command so the timeout/kill path is unit-testable with a
@@ -656,6 +780,7 @@ pub fn fetch_vram() -> VramState {
 pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
     let endpoint = format!("{}:{}", config.probe_host(), config.port);
     let vram = fetch_vram();
+    let gpu_load = fetch_gpu_load();
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(450))
@@ -664,8 +789,8 @@ pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
 
     let health = get_text(&agent, &format!("{base}/health"));
     if health.is_none() {
-        // Serve unreachable — honest offline state (VRAM may still be present).
-        return Dashboard::offline(endpoint, vram);
+        // Serve unreachable — honest offline state (VRAM/load may still read).
+        return Dashboard::offline(endpoint, vram, gpu_load);
     }
     let health = health.unwrap();
     let health_model = parse_health_model(&health);
@@ -689,6 +814,7 @@ pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
         stats,
         model_ids,
         vram,
+        gpu_load,
         offline_hint: None,
         system: None,
     }
@@ -864,6 +990,57 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_load_json_extracts_util_temp_power() {
+        let body = r#"{
+            "card0": {
+                "GPU use (%)": "37",
+                "Temperature (Sensor edge) (C)": "45.0",
+                "Average Graphics Package Power (W)": "120.0"
+            },
+            "card1": {
+                "GPU use (%)": "0",
+                "Temperature (Sensor junction) (C)": "33.0",
+                "Current Socket Graphics Package Power (W)": "18.0"
+            }
+        }"#;
+        match parse_rocm_smi_load_json(body) {
+            LoadState::Available(loads) => {
+                assert_eq!(loads.len(), 2);
+                assert_eq!(loads[0].util_pct, Some(37.0));
+                assert_eq!(loads[0].temp_c, Some(45.0));
+                assert_eq!(loads[0].power_w, Some(120.0));
+                // Version-variant key names still resolve via substring match.
+                assert_eq!(loads[1].temp_c, Some(33.0));
+                assert_eq!(loads[1].power_w, Some(18.0));
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_load_json_tolerates_missing_fields_and_bad_input() {
+        // Only util present -> Available with temp/power honestly None.
+        match parse_rocm_smi_load_json(r#"{"card0": {"GPU use (%)": "12"}}"#) {
+            LoadState::Available(loads) => {
+                assert_eq!(loads[0].util_pct, Some(12.0));
+                assert_eq!(loads[0].temp_c, None);
+                assert_eq!(loads[0].power_w, None);
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+        // No load fields -> Unavailable, not a fabricated zero.
+        assert!(matches!(
+            parse_rocm_smi_load_json(r#"{"card0": {}}"#),
+            LoadState::Unavailable(_)
+        ));
+        // Bad JSON -> Unavailable.
+        assert!(matches!(
+            parse_rocm_smi_load_json("not json"),
+            LoadState::Unavailable(_)
+        ));
+    }
 
     #[test]
     fn health_model_present() {
