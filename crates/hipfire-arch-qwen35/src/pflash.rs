@@ -1098,9 +1098,7 @@ pub fn compute_scores_batched_gpu(
             n_blocks,
             n - 1,
         )?,
-        other => panic!(
-            "compute_scores_batched_gpu: unsupported drafter KV mode (got {other:?})"
-        ),
+        other => panic!("compute_scores_batched_gpu: unsupported drafter KV mode (got {other:?})"),
     }
     let scores = gpu.download_f32(&scores_buf)?;
     let _ = gpu.free_tensor(scores_buf);

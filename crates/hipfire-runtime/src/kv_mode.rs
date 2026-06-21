@@ -96,10 +96,10 @@ pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
 fn normalize_dir(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
-        "asym3" => Some(Asym3),                       // UNCONDITIONAL
+        "asym3" => Some(Asym3), // UNCONDITIONAL
         "asym4" | "turbo4" => Some(Asym4),
         "" | "auto" | "turbo" | "turbo3" => Some(Asym3Auto), // CONDITIONAL sentinel
-        _ => None,                                    // asym2/fwht*/garbage → default
+        _ => None,                                           // asym2/fwht*/garbage → default
     }
 }
 pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
@@ -276,7 +276,10 @@ mod tests {
         // The sentinel must always collapse before return, on every policy.
         for raw in ["", "auto", "turbo", "turbo3", "asym3", "q8", "garbage"] {
             for hd in [128usize, 256] {
-                assert_ne!(resolve(raw, &DIR_SAFETENSORS_POLICY, hd).mode, KvMode::Asym3Auto);
+                assert_ne!(
+                    resolve(raw, &DIR_SAFETENSORS_POLICY, hd).mode,
+                    KvMode::Asym3Auto
+                );
             }
         }
     }

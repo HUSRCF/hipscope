@@ -416,8 +416,12 @@ fn decode_step_layers_and_head(
 
 /// Conv mixer block (operator-norm folded in). Mirrors the hand-loop Conv arm.
 fn conv_mixer_block(
-    gpu: &mut Gpu, cfg: &Lfm2MoeConfig, op_norm: &rdna_compute::GpuTensor,
-    c: &ConvWeights, state: &Lfm2MoeState, l: usize,
+    gpu: &mut Gpu,
+    cfg: &Lfm2MoeConfig,
+    op_norm: &rdna_compute::GpuTensor,
+    c: &ConvWeights,
+    state: &Lfm2MoeState,
+    l: usize,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
     gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, cfg.rms_norm_eps)
@@ -425,8 +429,13 @@ fn conv_mixer_block(
     weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
         .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
     gpu.conv1d_gated_decode_f32(
-        &state.conv_bcx, &state.conv_states[c.conv_state_idx], &c.conv_weight,
-        &state.conv_y, 1, hidden, cfg.conv_kernel_size,
+        &state.conv_bcx,
+        &state.conv_states[c.conv_state_idx],
+        &c.conv_weight,
+        &state.conv_y,
+        1,
+        hidden,
+        cfg.conv_kernel_size,
     )
     .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
     weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
@@ -435,8 +444,13 @@ fn conv_mixer_block(
 
 /// Attention mixer block (operator-norm folded in). Mirrors the hand-loop Attn arm.
 fn attn_mixer_block(
-    gpu: &mut Gpu, cfg: &Lfm2MoeConfig, op_norm: &rdna_compute::GpuTensor,
-    a: &AttnWeights, state: &Lfm2MoeState, l: usize, seq_len: usize,
+    gpu: &mut Gpu,
+    cfg: &Lfm2MoeConfig,
+    op_norm: &rdna_compute::GpuTensor,
+    a: &AttnWeights,
+    state: &Lfm2MoeState,
+    l: usize,
+    seq_len: usize,
 ) -> Result<(), String> {
     let head_dim = cfg.head_dim;
     let n_heads = cfg.num_attention_heads;
@@ -444,15 +458,26 @@ fn attn_mixer_block(
     let eps = cfg.rms_norm_eps;
     gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, eps)
         .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q).map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k).map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v).map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
+    weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
+        .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
+    weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
+        .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
+    weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
+        .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
     gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
         .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
     gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
         .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
-    gpu.rope_f32(&state.fa_q, &state.fa_k, &state.pos_buf, n_heads, n_kv, head_dim, cfg.rope_theta)
-        .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+    gpu.rope_f32(
+        &state.fa_q,
+        &state.fa_k,
+        &state.pos_buf,
+        n_heads,
+        n_kv,
+        head_dim,
+        cfg.rope_theta,
+    )
+    .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
     let kv_idx = a.kv_idx;
     // KV write (Q8) + attention via the shared KV-usage abstraction. lfm2moe is
     // Q8 non-flash unconditional → derive's q8_attend_key returns AttnQ8_0Kv at
@@ -505,17 +530,28 @@ fn attn_mixer_block(
 
 /// Dense FFN gate/up half (ffn-norm folded in). Mirrors the hand-loop Dense head.
 fn dense_gate_up_block(
-    gpu: &mut Gpu, cfg: &Lfm2MoeConfig, ffn_norm: &rdna_compute::GpuTensor,
-    d: &DenseFfn, state: &Lfm2MoeState, l: usize,
+    gpu: &mut Gpu,
+    cfg: &Lfm2MoeConfig,
+    ffn_norm: &rdna_compute::GpuTensor,
+    d: &DenseFfn,
+    state: &Lfm2MoeState,
+    l: usize,
 ) -> Result<(), String> {
     gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
         .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate).map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
-    weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up).map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))
+    weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate)
+        .map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
+    weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up)
+        .map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))
 }
 
 /// Dense FFN down half (silu·mul + w2 residual). Mirrors the hand-loop Dense tail.
-fn dense_down_block(gpu: &mut Gpu, d: &DenseFfn, state: &Lfm2MoeState, l: usize) -> Result<(), String> {
+fn dense_down_block(
+    gpu: &mut Gpu,
+    d: &DenseFfn,
+    state: &Lfm2MoeState,
+    l: usize,
+) -> Result<(), String> {
     gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
         .map_err(|e| format!("lfm2moe L{l}: dense silu_mul: {e:?}"))?;
     weight_gemv_residual(gpu, &d.w2, &state.dense_act, &state.h)
@@ -524,8 +560,12 @@ fn dense_down_block(gpu: &mut Gpu, d: &DenseFfn, state: &Lfm2MoeState, l: usize)
 
 /// MoE FFN block (ffn-norm folded in). Mirrors the hand-loop Moe arm.
 fn moe_ffn_block(
-    gpu: &mut Gpu, cfg: &Lfm2MoeConfig, ffn_norm: &rdna_compute::GpuTensor,
-    m: &MoeFfn, state: &Lfm2MoeState, l: usize,
+    gpu: &mut Gpu,
+    cfg: &Lfm2MoeConfig,
+    ffn_norm: &rdna_compute::GpuTensor,
+    m: &MoeFfn,
+    state: &Lfm2MoeState,
+    l: usize,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
@@ -533,49 +573,100 @@ fn moe_ffn_block(
     let k_top = cfg.num_experts_per_tok;
     gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
         .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-    rotate_x_mq_for(gpu, &m.experts[0].gate_up, &state.ffn_tmp, &state.ffn_x_rot, hidden)
-        .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
+    rotate_x_mq_for(
+        gpu,
+        &m.experts[0].gate_up,
+        &state.ffn_tmp,
+        &state.ffn_x_rot,
+        hidden,
+    )
+    .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
     weight_gemv(gpu, &m.router, &state.ffn_tmp, &state.router_logits)
         .map_err(|e| format!("lfm2moe L{l}: router: {e}"))?;
-    gpu.sigmoid_f32(&state.router_logits).map_err(|e| format!("lfm2moe L{l}: sigmoid: {e:?}"))?;
+    gpu.sigmoid_f32(&state.router_logits)
+        .map_err(|e| format!("lfm2moe L{l}: sigmoid: {e:?}"))?;
     gpu.deepseek4_moe_topk_bias_aware_f32(
-        &state.router_logits, &m.expert_bias, &state.topk_indices, &state.topk_weights,
-        n_exp as i32, k_top as i32, cfg.routed_scaling_factor,
+        &state.router_logits,
+        &m.expert_bias,
+        &state.topk_indices,
+        &state.topk_weights,
+        n_exp as i32,
+        k_top as i32,
+        cfg.routed_scaling_factor,
     )
     .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
     let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
     if experts_mq6 {
         gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-            &m.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-            &state.gate_batch, &state.up_batch, 2 * moe_inter, hidden, k_top, 1,
+            &m.expert_gate_up_ptrs,
+            &state.topk_indices,
+            &state.ffn_x_rot,
+            &state.gate_batch,
+            &state.up_batch,
+            2 * moe_inter,
+            hidden,
+            k_top,
+            1,
         )
         .map_err(|e| format!("lfm2moe L{l}: gate_up(mq6): {e:?}"))?;
     } else {
         gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-            &m.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-            &state.gate_batch, &state.up_batch, 2 * moe_inter, hidden, k_top, 1,
+            &m.expert_gate_up_ptrs,
+            &state.topk_indices,
+            &state.ffn_x_rot,
+            &state.gate_batch,
+            &state.up_batch,
+            2 * moe_inter,
+            hidden,
+            k_top,
+            1,
         )
         .map_err(|e| format!("lfm2moe L{l}: gate_up: {e:?}"))?;
     }
     fused_silu_mul_rotate_mq_batched_for(
-        gpu, &m.experts[0].down, &state.gate_batch, &state.up_batch, &state.rot_batch, moe_inter, k_top,
+        gpu,
+        &m.experts[0].down,
+        &state.gate_batch,
+        &state.up_batch,
+        &state.rot_batch,
+        moe_inter,
+        k_top,
     )
     .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
     if experts_mq6 {
         gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-            &m.expert_down_ptrs, &state.topk_indices, &state.rot_batch, &state.down_expanded,
-            hidden, moe_inter, k_top, 1,
+            &m.expert_down_ptrs,
+            &state.topk_indices,
+            &state.rot_batch,
+            &state.down_expanded,
+            hidden,
+            moe_inter,
+            k_top,
+            1,
         )
         .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
     } else {
         gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            &m.expert_down_ptrs, &state.topk_indices, &state.rot_batch, &state.down_expanded,
-            hidden, moe_inter, k_top, 1,
+            &m.expert_down_ptrs,
+            &state.topk_indices,
+            &state.rot_batch,
+            &state.down_expanded,
+            hidden,
+            moe_inter,
+            k_top,
+            1,
         )
         .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
     }
-    gpu.moe_down_combine_k8_batched(&state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1)
-        .map_err(|e| format!("lfm2moe L{l}: combine: {e:?}"))
+    gpu.moe_down_combine_k8_batched(
+        &state.down_expanded,
+        &state.topk_weights,
+        &state.h,
+        hidden,
+        k_top,
+        1,
+    )
+    .map_err(|e| format!("lfm2moe L{l}: combine: {e:?}"))
 }
 
 /// lfm2-local super-op opcodes (encoded in OpBinding.weights[0]).
@@ -646,23 +737,53 @@ struct Lfm2MoeBindings<'a> {
 }
 
 impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
-    fn run_conv(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_conv(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match &self.layer.mixer {
-            Mixer::Conv(c) => conv_mixer_block(gpu, self.cfg, &self.layer.operator_norm, c, self.state, self.l),
+            Mixer::Conv(c) => conv_mixer_block(
+                gpu,
+                self.cfg,
+                &self.layer.operator_norm,
+                c,
+                self.state,
+                self.l,
+            ),
             _ => Err("run_conv on non-Conv layer".to_string()),
         }
         .map_err(DispatchError::Hip)
     }
 
-    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match &self.layer.mixer {
-            Mixer::Attention(a) => attn_mixer_block(gpu, self.cfg, &self.layer.operator_norm, a, self.state, self.l, self.seq_len),
+            Mixer::Attention(a) => attn_mixer_block(
+                gpu,
+                self.cfg,
+                &self.layer.operator_norm,
+                a,
+                self.state,
+                self.l,
+                self.seq_len,
+            ),
             _ => Err("run_attend on non-Attention layer".to_string()),
         }
         .map_err(DispatchError::Hip)
     }
 
-    fn run_proj(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_proj(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         let code = op.weights.first().map(|w| w.0).unwrap_or(u32::MAX);
         match (code, &self.layer.ffn) {
             (lfm2_op::DENSE_GATE_UP, Ffn::Dense(d)) => {
@@ -673,31 +794,65 @@ impl<'a> ForwardBindings for Lfm2MoeBindings<'a> {
         .map_err(DispatchError::Hip)
     }
 
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_residual_gemv(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         let code = op.weights.first().map(|w| w.0).unwrap_or(u32::MAX);
         match (code, &self.layer.ffn) {
             (lfm2_op::DENSE_DOWN, Ffn::Dense(d)) => dense_down_block(gpu, d, self.state, self.l),
-            _ => Err(format!("run_residual_gemv bad opcode {code} / non-Dense ffn")),
+            _ => Err(format!(
+                "run_residual_gemv bad opcode {code} / non-Dense ffn"
+            )),
         }
         .map_err(DispatchError::Hip)
     }
 
-    fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match &self.layer.ffn {
-            Ffn::Moe(m) => moe_ffn_block(gpu, self.cfg, &self.layer.ffn_norm, m, self.state, self.l),
+            Ffn::Moe(m) => {
+                moe_ffn_block(gpu, self.cfg, &self.layer.ffn_norm, m, self.state, self.l)
+            }
             _ => Err("run_moe on non-Moe ffn".to_string()),
         }
         .map_err(DispatchError::Hip)
     }
 
-    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("lfm2 has no standalone Norm super-op".into()))
+    fn run_norm(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(
+            "lfm2 has no standalone Norm super-op".into(),
+        ))
     }
-    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_recurrent(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("lfm2 has no Recurrent super-op".into()))
     }
-    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, kind: superop::EscapeKind) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip(format!("lfm2 has no Escape super-op ({kind:?})")))
+    fn run_escape(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        kind: superop::EscapeKind,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(format!(
+            "lfm2 has no Escape super-op ({kind:?})"
+        )))
     }
 }
 
@@ -728,14 +883,25 @@ fn decode_step_layers_and_head_lowered(
     for (l, layer) in weights.layers.iter().enumerate() {
         let program = lfm2_lower_variant(lfm2_variant_of(layer));
         {
-            let mut bind = Lfm2MoeBindings { cfg, layer, state, l, seq_len };
+            let mut bind = Lfm2MoeBindings {
+                cfg,
+                layer,
+                state,
+                l,
+                seq_len,
+            };
             superop::run_layer_program(gpu, &ctx, &program, &mut bind)
                 .map_err(|e| format!("lfm2moe L{l}: lowered run_layer_program: {e}"))?;
         }
     }
     state.n_tokens = seq_len;
-    gpu.rmsnorm_f32(&state.h, &weights.embedding_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
+    gpu.rmsnorm_f32(
+        &state.h,
+        &weights.embedding_norm,
+        &state.final_norm_buf,
+        eps,
+    )
+    .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
     Ok(())
@@ -852,9 +1018,20 @@ mod ship6_lower_tests {
     // order (mixer block, then FFN). CPU-pure (no GPU).
     #[test]
     fn lfm2_variant_shapes() {
-        let kinds = |v| lfm2_lower_variant(v).iter().map(|o| o.kind).collect::<Vec<_>>();
-        assert_eq!(kinds(Lfm2Variant::ConvDense), vec![Conv, Proj, ResidualGemv]);
-        assert_eq!(kinds(Lfm2Variant::AttnDense), vec![Attend, Proj, ResidualGemv]);
+        let kinds = |v| {
+            lfm2_lower_variant(v)
+                .iter()
+                .map(|o| o.kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(Lfm2Variant::ConvDense),
+            vec![Conv, Proj, ResidualGemv]
+        );
+        assert_eq!(
+            kinds(Lfm2Variant::AttnDense),
+            vec![Attend, Proj, ResidualGemv]
+        );
         assert_eq!(kinds(Lfm2Variant::ConvMoe), vec![Conv, Moe]);
         assert_eq!(kinds(Lfm2Variant::AttnMoe), vec![Attend, Moe]);
         let p = lfm2_lower_variant(Lfm2Variant::ConvDense);

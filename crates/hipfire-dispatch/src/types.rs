@@ -366,7 +366,7 @@ pub enum KernelKey {
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
     AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
-    AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
+    AttnQ8_0Kv,            // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.
     AttnGqaWarp,  // GQA, head_dim==128, long-ctx warp-reduce
@@ -384,9 +384,9 @@ pub enum KernelKey {
     AttnFlashAsym4FwhtBatchedMasked,
     AttnFlashAsym3BatchedMasked,
     AttnFlashAsym3FwhtBatchedMasked,
-    AttnFlashAsym2Batched,     // no _masked — 2-bit tree-verify gap
-    AttnFlashAsym2FwhtBatched, // no _masked — 2-bit tree-verify gap
-    AttnQ8_0KvBatchedMasked,   // P-1 no-LDS-cap tiled kernel
+    AttnFlashAsym2Batched,           // no _masked — 2-bit tree-verify gap
+    AttnFlashAsym2FwhtBatched,       // no _masked — 2-bit tree-verify gap
+    AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)

@@ -70,9 +70,9 @@ pub fn load_from_source(
     let moe_inter = cfg.moe_intermediate_size;
     let n_exp = cfg.num_experts;
 
-    let qc = source
-        .quant_config()
-        .ok_or_else(|| "cohere2moe Dir: ParoQuant model requires quantization_config".to_string())?;
+    let qc = source.quant_config().ok_or_else(|| {
+        "cohere2moe Dir: ParoQuant model requires quantization_config".to_string()
+    })?;
     let gs = qc.group_size;
     let kr = qc.krot;
 
@@ -104,25 +104,80 @@ pub fn load_from_source(
         // `p` is the prefix-RELATIVE layer path. paro_load_{wt,f32} prepend `mp`
         // (→ `model.layers.N...`); the `{mp}.{p}` call sites form the same.
         let p = format!("layers.{l}");
-        let input_norm =
-            paro_load_f32(source, gpu, &format!("{p}.input_layernorm.weight"), hidden)
-                .map_err(e("input norm"))?;
-        let wq = paro_load_wt(source, gpu, &format!("{p}.self_attn.q_proj"), q_dim, hidden, gs, kr)
-            .map_err(e("wq"))?;
-        let wk = paro_load_wt(source, gpu, &format!("{p}.self_attn.k_proj"), kv_dim, hidden, gs, kr)
-            .map_err(e("wk"))?;
-        let wv = paro_load_wt(source, gpu, &format!("{p}.self_attn.v_proj"), kv_dim, hidden, gs, kr)
-            .map_err(e("wv"))?;
-        let wo = paro_load_wt(source, gpu, &format!("{p}.self_attn.o_proj"), hidden, q_dim, gs, kr)
-            .map_err(e("wo"))?;
+        let input_norm = paro_load_f32(source, gpu, &format!("{p}.input_layernorm.weight"), hidden)
+            .map_err(e("input norm"))?;
+        let wq = paro_load_wt(
+            source,
+            gpu,
+            &format!("{p}.self_attn.q_proj"),
+            q_dim,
+            hidden,
+            gs,
+            kr,
+        )
+        .map_err(e("wq"))?;
+        let wk = paro_load_wt(
+            source,
+            gpu,
+            &format!("{p}.self_attn.k_proj"),
+            kv_dim,
+            hidden,
+            gs,
+            kr,
+        )
+        .map_err(e("wk"))?;
+        let wv = paro_load_wt(
+            source,
+            gpu,
+            &format!("{p}.self_attn.v_proj"),
+            kv_dim,
+            hidden,
+            gs,
+            kr,
+        )
+        .map_err(e("wv"))?;
+        let wo = paro_load_wt(
+            source,
+            gpu,
+            &format!("{p}.self_attn.o_proj"),
+            hidden,
+            q_dim,
+            gs,
+            kr,
+        )
+        .map_err(e("wo"))?;
 
         let ffn = if cfg.is_dense_ffn(l) {
-            let gate = paro_load_wt(source, gpu, &format!("{p}.mlp.gate_proj"), dense_inter, hidden, gs, kr)
-                .map_err(e("dense gate"))?;
-            let up = paro_load_wt(source, gpu, &format!("{p}.mlp.up_proj"), dense_inter, hidden, gs, kr)
-                .map_err(e("dense up"))?;
-            let down = paro_load_wt(source, gpu, &format!("{p}.mlp.down_proj"), hidden, dense_inter, gs, kr)
-                .map_err(e("dense down"))?;
+            let gate = paro_load_wt(
+                source,
+                gpu,
+                &format!("{p}.mlp.gate_proj"),
+                dense_inter,
+                hidden,
+                gs,
+                kr,
+            )
+            .map_err(e("dense gate"))?;
+            let up = paro_load_wt(
+                source,
+                gpu,
+                &format!("{p}.mlp.up_proj"),
+                dense_inter,
+                hidden,
+                gs,
+                kr,
+            )
+            .map_err(e("dense up"))?;
+            let down = paro_load_wt(
+                source,
+                gpu,
+                &format!("{p}.mlp.down_proj"),
+                hidden,
+                dense_inter,
+                gs,
+                kr,
+            )
+            .map_err(e("dense down"))?;
             Ffn::Dense(DenseFfn { gate, up, down })
         } else {
             // Router is F16 dense.
@@ -145,18 +200,35 @@ pub fn load_from_source(
                 let up_prefix = format!("{mp}.{p}.mlp.experts.{x}.up_proj");
                 let down_prefix = format!("{mp}.{p}.mlp.experts.{x}.down_proj");
 
-                let gate_bytes = paro_repack_moe_projection(source, &gate_prefix, moe_inter, hidden, gs as usize)
-                    .map_err(e("repack gate"))?;
-                let up_bytes = paro_repack_moe_projection(source, &up_prefix, moe_inter, hidden, gs as usize)
-                    .map_err(e("repack up"))?;
+                let gate_bytes = paro_repack_moe_projection(
+                    source,
+                    &gate_prefix,
+                    moe_inter,
+                    hidden,
+                    gs as usize,
+                )
+                .map_err(e("repack gate"))?;
+                let up_bytes =
+                    paro_repack_moe_projection(source, &up_prefix, moe_inter, hidden, gs as usize)
+                        .map_err(e("repack up"))?;
                 let mut gate_up_bytes = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
                 gate_up_bytes.extend_from_slice(&gate_bytes);
                 gate_up_bytes.extend_from_slice(&up_bytes);
-                let gate_up_buf = gpu.upload_raw(&gate_up_bytes, &[gate_up_bytes.len()]).map_err(e("upload gate_up"))?;
+                let gate_up_buf = gpu
+                    .upload_raw(&gate_up_bytes, &[gate_up_bytes.len()])
+                    .map_err(e("upload gate_up"))?;
 
-                let down_bytes = paro_repack_moe_projection(source, &down_prefix, hidden, moe_inter, gs as usize)
-                    .map_err(e("repack down"))?;
-                let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()]).map_err(e("upload down"))?;
+                let down_bytes = paro_repack_moe_projection(
+                    source,
+                    &down_prefix,
+                    hidden,
+                    moe_inter,
+                    gs as usize,
+                )
+                .map_err(e("repack down"))?;
+                let down_buf = gpu
+                    .upload_raw(&down_bytes, &[down_bytes.len()])
+                    .map_err(e("upload down"))?;
 
                 let gate_up = WeightTensor {
                     buf: gate_up_buf,
@@ -200,10 +272,18 @@ pub fn load_from_source(
                 .iter()
                 .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
                 .collect();
-            let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32).map_err(e("alloc gu_ptrs"))?;
-            let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32).map_err(e("alloc dn_ptrs"))?;
-            gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes).map_err(e("htod gu_ptrs"))?;
-            gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes).map_err(e("htod dn_ptrs"))?;
+            let expert_gate_up_ptrs = gpu
+                .alloc_tensor(&[2 * n_exp], DType::F32)
+                .map_err(e("alloc gu_ptrs"))?;
+            let expert_down_ptrs = gpu
+                .alloc_tensor(&[2 * n_exp], DType::F32)
+                .map_err(e("alloc dn_ptrs"))?;
+            gpu.hip
+                .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
+                .map_err(e("htod gu_ptrs"))?;
+            gpu.hip
+                .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
+                .map_err(e("htod dn_ptrs"))?;
 
             Ffn::Moe(MoeFfn {
                 router,

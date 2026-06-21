@@ -819,7 +819,9 @@ impl Carrier for Cohere2MoeCarrier {
             ModelSource::Dir(source) => {
                 // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
                 let config = hipfire_arch_cohere2moe::Cohere2MoeConfig::from_safetensors(&source)
-                    .map_err(|e| format!("failed to parse Cohere2-MoE config from config.json: {e}"))?;
+                    .map_err(|e| {
+                    format!("failed to parse Cohere2-MoE config from config.json: {e}")
+                })?;
                 let weights =
                     hipfire_arch_cohere2moe::paro_dir::load_from_source(&source, &config, ctx.gpu)?;
                 let state = hipfire_arch_cohere2moe::Cohere2MoeState::new_with_max_seq(

@@ -3568,10 +3568,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             c.n_kv_heads * c.head_dim,
         )
     }
-    fn attend_plan(
-        &self,
-        l: usize,
-    ) -> HipResult<Option<(KvTierPlan, AttnParams<'_>)>> {
+    fn attend_plan(&self, l: usize) -> HipResult<Option<(KvTierPlan, AttnParams<'_>)>> {
         let kv = self.kv_cache;
         let s = self.scratch;
         let c = self.config;

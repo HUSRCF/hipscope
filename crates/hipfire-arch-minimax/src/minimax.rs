@@ -970,7 +970,12 @@ impl MiniMaxState {
             physical_cap: None,
         };
         let kv = hipfire_runtime::llama::KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, cfg.head_dim).mode,
+            hipfire_runtime::kv_mode::resolve(
+                "",
+                &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
+                cfg.head_dim,
+            )
+            .mode,
             hipfire_runtime::llama::KvTarget::Single(gpu),
             &dims,
         )

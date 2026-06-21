@@ -692,7 +692,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(batched.write_key, KernelKey::KvWriteQ8_0Batched);
-        assert_eq!(batched.attend_key, KernelKey::AttnQ8_0KvBatchedMaskedWindowed);
+        assert_eq!(
+            batched.attend_key,
+            KernelKey::AttnQ8_0KvBatchedMaskedWindowed
+        );
         assert_eq!(batched.window, 4096);
     }
 
