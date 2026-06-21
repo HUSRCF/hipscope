@@ -699,37 +699,56 @@ pub fn forward_batch(
             )
             .map_err(|e| format!("cohere2moe L{l} batch rope: {e:?}"))?;
         }
-        gpu.kv_cache_write_q8_0_batched(&state.kv.k_gpu[l], &fk, &pos_array, n_kv, head_dim, b)
-            .map_err(|e| format!("cohere2moe L{l} batch kv k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0_batched(&state.kv.v_gpu[l], &fv, &pos_array, n_kv, head_dim, b)
-            .map_err(|e| format!("cohere2moe L{l} batch kv v: {e:?}"))?;
-        // Flash (tiled, O(1)-LDS) batched Q8 attention — the ">15k" prefill path
-        // (causal: tree_bias=None). Replaces the LDS-bound attention_q8_0_kv_batched.
-        // `sliding_attention` layers clip to the last `sliding_window` keys so
-        // context beyond the window attends correctly (not degraded full-causal);
-        // `full_attention` (global, NoPE) layers use window=0 = full causal.
+        // Batched KV write (Q8) + sliding-window flash attention via the shared
+        // KV-usage abstraction (causal: tree_bias=None). q8_windowed selects
+        // AttnQ8_0KvBatchedMaskedWindowed unconditionally (window>0 clips
+        // `sliding_attention` layers to the last `sliding_window` keys; window=0
+        // is full causal for `full_attention`/NoPE layers) — NOT the LDS-bound
+        // non-windowed batched key, which would drop the window.
         let window = if layer.attn_kind == AttnKind::Sliding {
             cfg.sliding_window as i32
         } else {
             0
         };
-        gpu.attention_flash_q8_0_batched_masked_windowed(
-            &fq,
-            &state.kv.k_gpu[l],
-            &state.kv.v_gpu[l],
-            &attn_out,
-            &pos_array,
+        let ctx = DispatchCtx::new(gpu);
+        let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
+            hipfire_dispatch::families::kv_tier::KvTierInputs {
+                q8_windowed: true,
+                window,
+                batch_size: b,
+                ..state.kv.tier_inputs()
+            },
+        )
+        .map_err(|e| format!("cohere2moe L{l} batch kv tier: {e}"))?;
+        let io = hipfire_dispatch::families::attention::AttnParams {
+            q: &fq,
+            k: &fk,
+            v: &fv,
+            k_cache: &state.kv.k_gpu[l],
+            v_cache: &state.kv.v_gpu[l],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &state.pos_buf,
+            pos: 0,
+            positions: Some(&pos_array),
             n_heads,
-            n_kv,
+            n_kv_heads: n_kv,
             head_dim,
-            max_seq,
-            max_ctx,
-            b,
-            &state.flash_partials,
-            None,
-            0,
-            0,
-            window,
+            physical_cap: max_seq,
+            batch_size: b,
+            max_ctx_len: max_ctx,
+            flash_partials: Some(&state.flash_partials),
+            givens_cos: None,
+            givens_sin: None,
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &attn_out,
+        };
+        hipfire_dispatch::pipeline::execute_steps(
+            gpu,
+            &ctx,
+            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
         )
         .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
         q8_proj_raw(gpu, &layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)

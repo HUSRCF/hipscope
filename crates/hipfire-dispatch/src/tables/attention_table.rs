@@ -138,6 +138,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // regression investigation should compare against master's two-path Q8,
         // not against this single-path kernel.
         (KernelKey::AttnQ8_0KvBatchedMasked,   ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
+        (KernelKey::AttnQ8_0KvBatchedMaskedWindowed, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
     ];
     for (key, arch, shape) in attn_batched {
         registry.register(KernelVariant {

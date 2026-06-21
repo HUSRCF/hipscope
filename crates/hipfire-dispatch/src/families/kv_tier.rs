@@ -414,6 +414,10 @@ fn batched_keys(
         (KvWriteQ8_0, AttnFlashQ8_0) | (KvWriteQ8_0, AttnQ8_0Kv) => {
             Ok((KvWriteQ8_0Batched, AttnQ8_0KvBatchedMasked))
         }
+        // cohere2moe windowed batched (sliding-window prefill).
+        (KvWriteQ8_0, AttnFlashQ8_0Windowed) => {
+            Ok((KvWriteQ8_0Batched, AttnQ8_0KvBatchedMaskedWindowed))
+        }
         // F32 → no batched keys exist. Returning single-token keys with
         // batch_size > 1 will cause MissingImpl at resolve (BatchEq(1) gate).
         // Intentionally fall through to the default arm rather than silently
@@ -467,6 +471,7 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         | (KvWriteAsym2FwhtBatched, AttnFlashAsym2FwhtBatched)
         // q8 batched
         | (KvWriteQ8_0Batched, AttnQ8_0KvBatchedMasked)
+        | (KvWriteQ8_0Batched, AttnQ8_0KvBatchedMaskedWindowed)
     )
 }
 
@@ -676,6 +681,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plain.attend_key, KernelKey::AttnQ8_0Kv);
+
+        // Batched (prefill): q8_windowed → batched windowed key, window carried.
+        let batched = KvTierPlan::derive(KvTierInputs {
+            quant_q8: true,
+            q8_windowed: true,
+            window: 4096,
+            batch_size: 128,
+            ..default_inputs()
+        })
+        .unwrap();
+        assert_eq!(batched.write_key, KernelKey::KvWriteQ8_0Batched);
+        assert_eq!(batched.attend_key, KernelKey::AttnQ8_0KvBatchedMaskedWindowed);
+        assert_eq!(batched.window, 4096);
     }
 
     #[test]

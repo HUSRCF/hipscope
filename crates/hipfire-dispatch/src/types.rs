@@ -387,6 +387,7 @@ pub enum KernelKey {
     AttnFlashAsym2Batched,     // no _masked — 2-bit tree-verify gap
     AttnFlashAsym2FwhtBatched, // no _masked — 2-bit tree-verify gap
     AttnQ8_0KvBatchedMasked,   // P-1 no-LDS-cap tiled kernel
+    AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal

@@ -1239,6 +1239,29 @@ fn dispatch_attend(
                     ))
                 }
             }
+            KernelKey::AttnQ8_0KvBatchedMaskedWindowed => {
+                // cohere2moe sliding-window prefill — always the tiled kernel
+                // (no LDS crossover), window from the plan (0 == full causal).
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_q8_0_batched_masked_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                    plan.window,
+                ))
+            }
 
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "attention/attend",
@@ -1313,6 +1336,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2Batched,
     KernelKey::AttnFlashAsym2FwhtBatched,
     KernelKey::AttnQ8_0KvBatchedMasked,
+    KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
     // Llama legacy
     KernelKey::AttnHfq4Kv,
     KernelKey::AttnQ4Kv,
@@ -1495,6 +1519,7 @@ mod tests {
                 | AttnFlashAsym2Batched
                 | AttnFlashAsym2FwhtBatched
                 | AttnQ8_0KvBatchedMasked
+                | AttnQ8_0KvBatchedMaskedWindowed
         )
     }
 
