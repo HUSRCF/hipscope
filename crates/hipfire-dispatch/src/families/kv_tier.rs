@@ -159,6 +159,14 @@ pub struct KvTierInputs {
     /// True for boundary layers (pinned to Q8 regardless of global tier).
     /// Inert until the boundary-layer producer populates `layer_is_boundary`.
     pub is_boundary: bool,
+    /// cohere2moe: use the sliding-window Q8 flash kernel unconditionally
+    /// (NOT the q8_attend_key flash/non-flash heuristic — the non-windowed,
+    /// non-flash AttnQ8_0Kv drops the window → wrong attention at ctx>window).
+    pub q8_windowed: bool,
+    /// Sliding-window size kernarg for the windowed Q8 kernel. `0` = full
+    /// (windowed kernel with window=0 == plain flash). Only read when
+    /// `q8_windowed` (or any future windowed tier) is set.
+    pub window: i32,
 }
 
 /// Paired KV write + attend plan. Derived from `KvTierInputs` by
@@ -174,6 +182,8 @@ pub struct KvTierPlan {
     pub uses_givens: bool,
     /// Token batch size (for ShapeInfo threading).
     pub batch_size: usize,
+    /// Sliding-window kernarg (cohere2moe windowed Q8). `0` = full attention.
+    pub window: i32,
 }
 
 /// Error returned by `KvTierPlan::derive` when the combination of inputs
@@ -224,6 +234,8 @@ impl KvTierPlan {
             batch_size,
             is_tree,
             is_boundary,
+            q8_windowed,
+            window,
         } = inputs;
 
         let (write_single, attend_single, uses_givens) = if is_boundary {
@@ -265,6 +277,17 @@ impl KvTierPlan {
                 ),
                 KTier::Asym2 { fwht: false } => {
                     (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
+                }
+                KTier::Q8 if q8_windowed => {
+                    // cohere2moe: windowed flash unconditionally (window=0 on
+                    // full layers == plain flash; >0 applies the sliding mask).
+                    // NOT q8_attend_key — the non-windowed AttnQ8_0Kv drops the
+                    // window and would attend the full context at ctx>window.
+                    (
+                        KernelKey::KvWriteQ8_0,
+                        KernelKey::AttnFlashQ8_0Windowed,
+                        false,
+                    )
                 }
                 KTier::Q8 => (
                     KernelKey::KvWriteQ8_0,
@@ -326,6 +349,7 @@ impl KvTierPlan {
             v_mode_bits,
             uses_givens,
             batch_size,
+            window,
         })
     }
 }
@@ -418,6 +442,7 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         // q8 single-token
         | (KvWriteQ8_0, AttnFlashQ8_0)
         | (KvWriteQ8_0, AttnQ8_0Kv)
+        | (KvWriteQ8_0, AttnFlashQ8_0Windowed)
         // hfq4 single-token (llama legacy)
         | (KvWriteHfq4, AttnHfq4Kv)
         // q4 single-token (llama legacy)
@@ -469,6 +494,8 @@ mod tests {
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
+            q8_windowed: false,
+            window: 0,
         }
     }
 
@@ -622,6 +649,33 @@ mod tests {
         assert_eq!(plan.write_key, KernelKey::KvWriteHfq8);
         assert_eq!(plan.attend_key, KernelKey::AttnHfq8Kv);
         assert!(!plan.uses_givens);
+    }
+
+    #[test]
+    fn q8_windowed_bypasses_flash_heuristic() {
+        // cohere2moe: q8_windowed picks the windowed key UNCONDITIONALLY (not
+        // AttnQ8_0Kv/AttnFlashQ8_0 from q8_attend_key), carrying the window.
+        for (pos, window) in [(10usize, 0i32), (10, 4096), (20000, 4096)] {
+            let inputs = KvTierInputs {
+                quant_q8: true,
+                q8_windowed: true,
+                window,
+                pos,
+                ..default_inputs()
+            };
+            let plan = KvTierPlan::derive(inputs).unwrap();
+            assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
+            assert_eq!(plan.attend_key, KernelKey::AttnFlashQ8_0Windowed);
+            assert_eq!(plan.window, window);
+        }
+        // Without the flag, q8 still uses the flash/non-flash heuristic.
+        let plain = KvTierPlan::derive(KvTierInputs {
+            quant_q8: true,
+            pos: 10,
+            ..default_inputs()
+        })
+        .unwrap();
+        assert_eq!(plain.attend_key, KernelKey::AttnQ8_0Kv);
     }
 
     #[test]

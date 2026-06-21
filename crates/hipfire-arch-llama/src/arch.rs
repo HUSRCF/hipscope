@@ -257,6 +257,8 @@ impl Llama {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
+                    q8_windowed: false,
+                    window: 0,
                 })
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {

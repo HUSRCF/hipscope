@@ -5407,6 +5407,8 @@ impl KvCache {
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
+            q8_windowed: false,
+            window: 0,
         }
     }
 
@@ -9144,6 +9146,8 @@ mod tests {
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
+            q8_windowed: false,
+            window: 0,
         };
 
         assert_eq!(
@@ -9262,6 +9266,8 @@ mod tests {
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
+            q8_windowed: false,
+            window: 0,
         };
         assert_eq!(
             got, legacy,

@@ -730,6 +730,27 @@ fn dispatch_attend(
                     fp,
                 ))
             }
+            KernelKey::AttnFlashQ8_0Windowed => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                // window comes from the plan (cohere2moe: sliding_window on
+                // Sliding layers, 0 on full layers; 0 == plain flash).
+                hip!(gpu.attention_flash_q8_0_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    fp,
+                    plan.window,
+                ))
+            }
             KernelKey::AttnQ8_0Kv => {
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
@@ -1272,6 +1293,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     // Single-token
     KernelKey::AttnF32,
     KernelKey::AttnFlashQ8_0,
+    KernelKey::AttnFlashQ8_0Windowed,
     KernelKey::AttnQ8_0Kv,
     KernelKey::AttnFlashAsym4,
     KernelKey::AttnFlashAsym4Fwht,

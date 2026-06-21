@@ -365,6 +365,7 @@ pub enum KernelKey {
     AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
+    AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
     AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.

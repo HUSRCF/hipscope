@@ -62,6 +62,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::AttnFlashAsym2,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnFlashAsym2Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnFlashQ8_0,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (KernelKey::AttnFlashQ8_0Windowed, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnQ8_0Kv,         ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnGqaFused,       ArchPredicate::HasWmma, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnF32,            ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),

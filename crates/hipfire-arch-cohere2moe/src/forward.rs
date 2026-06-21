@@ -216,46 +216,58 @@ fn decode_step_body(
             .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;
         }
 
-        // KV write (Q8) + GQA attention. `sliding_attention` layers clip to the
-        // last `sliding_window` keys (window>0); `full_attention` layers are
-        // full causal (window=0). One KV slot per layer.
-        gpu.kv_cache_write_q8_0(
-            &state.kv.k_gpu[l],
-            &state.fa_k,
-            &state.pos_buf,
-            n_kv,
-            head_dim,
-        )
-        .map_err(|e| format!("cohere2moe L{l}: kv write k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0(
-            &state.kv.v_gpu[l],
-            &state.fa_v,
-            &state.pos_buf,
-            n_kv,
-            head_dim,
-        )
-        .map_err(|e| format!("cohere2moe L{l}: kv write v: {e:?}"))?;
-        // Flash (tiled, O(1)-LDS, online-softmax) Q8 attention — no seq-bound
-        // shared-memory ceiling, so long context (large file reads) doesn't
-        // crash the legacy LDS-bound `attention_q8_0_kv`.
+        // KV write (Q8) + sliding-window flash attention via the shared KV-usage
+        // abstraction. `sliding_attention` layers clip to the last
+        // `sliding_window` keys (window>0); `full_attention` layers are full
+        // causal (window=0). cohere routes through AttnFlashQ8_0Windowed
+        // UNCONDITIONALLY (q8_windowed) — NOT the q8_attend_key flash/non-flash
+        // heuristic, whose non-windowed AttnQ8_0Kv would drop the window and
+        // attend the full context at ctx>window. (Tiled, O(1)-LDS, online-softmax
+        // — no seq-bound shared-memory ceiling.)
         let window = if layer.attn_kind == AttnKind::Sliding {
             cfg.sliding_window as i32
         } else {
             0
         };
-        gpu.attention_flash_q8_0_windowed(
-            &state.fa_q,
-            &state.kv.k_gpu[l],
-            &state.kv.v_gpu[l],
-            &state.fa_attn_out,
-            &state.pos_buf,
-            seq_len,
+        let ctx = DispatchCtx::new(gpu);
+        let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
+            hipfire_dispatch::families::kv_tier::KvTierInputs {
+                pos: seq_len - 1,
+                q8_windowed: true,
+                window,
+                ..state.kv.tier_inputs()
+            },
+        )
+        .map_err(|e| format!("cohere2moe L{l}: kv tier: {e}"))?;
+        let io = hipfire_dispatch::families::attention::AttnParams {
+            q: &state.fa_q,
+            k: &state.fa_k,
+            v: &state.fa_v,
+            k_cache: &state.kv.k_gpu[l],
+            v_cache: &state.kv.v_gpu[l],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &state.pos_buf,
+            pos: seq_len - 1,
+            positions: None,
             n_heads,
-            n_kv,
+            n_kv_heads: n_kv,
             head_dim,
-            state.kv.physical_cap,
-            &state.flash_partials,
-            window,
+            physical_cap: state.kv.physical_cap,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&state.flash_partials),
+            givens_cos: None,
+            givens_sin: None,
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &state.fa_attn_out,
+        };
+        hipfire_dispatch::pipeline::execute_steps(
+            gpu,
+            &ctx,
+            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
         )
         .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
 
