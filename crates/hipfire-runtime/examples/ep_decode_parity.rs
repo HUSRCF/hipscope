@@ -70,7 +70,10 @@ fn main() {
     // Bench-only: repeat the prompt N times to synthesize long contexts without
     // multi-KB CLI args. Lets us drive 16k/32k+ prefills to validate that the
     // chunked path's scratch is bounded by chunk_size, not the prompt length.
-    let prompt = match std::env::var("HIPFIRE_EP_PROMPT_REPEAT").ok().and_then(|v| v.parse::<usize>().ok()) {
+    let prompt = match std::env::var("HIPFIRE_EP_PROMPT_REPEAT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         Some(r) if r > 1 => prompt_base.repeat(r),
         _ => prompt_base,
     };
@@ -87,14 +90,21 @@ fn main() {
     // ── config + tokenizer (one open; per-rank loads reopen below) ──────────
     let hfq0 = HfqFile::open(model_path).expect("open model");
     let config = qwen35::config_from_hfq(&hfq0).expect("read config");
-    assert!(config.num_experts > 0, "ep_decode_parity expects a MoE (A3B) model");
+    assert!(
+        config.num_experts > 0,
+        "ep_decode_parity expects a MoE (A3B) model"
+    );
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq0.metadata_json)
         .expect("tokenizer");
     drop(hfq0);
     eprintln!(
         "config: layers={} dim={} experts={} top_k={} n_kv_heads={} head_dim={}",
-        config.n_layers, config.dim, config.num_experts, config.num_experts_per_tok,
-        config.n_kv_heads, config.head_dim,
+        config.n_layers,
+        config.dim,
+        config.num_experts,
+        config.num_experts_per_tok,
+        config.n_kv_heads,
+        config.head_dim,
     );
     // Prefill mode: HIPFIRE_EP_PREFILL=batched → WMMA batched prefill EP (E6b)
     // via forward_prefill_batch_ep; default (sequential) → token-by-token via
@@ -102,7 +112,11 @@ fn main() {
     let batched_prefill = std::env::var("HIPFIRE_EP_PREFILL").as_deref() == Ok("batched");
     eprintln!(
         "EP: tp_size={tp} steps={steps} kv_seq={kv_seq} prefill={} prompt={prompt:?}",
-        if batched_prefill { "batched-WMMA" } else { "sequential" },
+        if batched_prefill {
+            "batched-WMMA"
+        } else {
+            "sequential"
+        },
     );
 
     // ── tokenize (early — sizes the prefill batch + routed partials) ─────────
@@ -129,14 +143,22 @@ fn main() {
     // ── bring up N ranks ────────────────────────────────────────────────────
     let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
     let n = gpus.devices.len();
-    assert_eq!(n, tp, "init_tp gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)");
+    assert_eq!(
+        n, tp,
+        "init_tp gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)"
+    );
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
     }
 
     // ── replicated load + per-rank expert shard ─────────────────────────────
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, config.num_experts, ExpertAssign::Stride)
-        .expect("ShardConfig");
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        config.num_experts,
+        ExpertAssign::Stride,
+    )
+    .expect("ShardConfig");
     let mut weights_per_rank = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
@@ -147,11 +169,22 @@ fn main() {
         // peak to ~(sharded total + one layer) instead of the full model (which
         // OOMs a >VRAM model like .mq6 even with EP). Cleared after the load.
         qwen35::set_ep_expert_shard(Some((shard.clone(), r)));
-        let w = qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
+        let mut w = {
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(
+                &mut src,
+                std::slice::from_mut(&mut gpus.devices[r]),
+                &layout,
+            )
+        }
+        .expect("load_weights");
         qwen35::set_ep_expert_shard(None);
         weights_per_rank.push(w);
     }
-    eprintln!("  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)");
+    eprintln!(
+        "  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)"
+    );
 
     // ── per-rank state + routed partials (+ prefill scratch when batched) ────
     use hipfire_arch_qwen35::qwen35::PrefillBatchScratch;
@@ -173,7 +206,11 @@ fn main() {
         kv_per_rank.push(
             match kv_mode.as_str() {
                 "asym3" => KvCache::new_gpu_asym3(
-                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                    g,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
                 ),
                 "fwht3" => {
                     let is_kv: Vec<bool> = config
@@ -182,11 +219,19 @@ fn main() {
                         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                         .collect();
                     KvCache::new_gpu_fwht3_filtered(
-                        g, &is_kv, config.n_kv_heads, config.head_dim, kv_seq,
+                        g,
+                        &is_kv,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_seq,
                     )
                 }
                 _ => KvCache::new_gpu_q8(
-                    g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+                    g,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
                 ),
             }
             .expect("kv"),
@@ -201,7 +246,10 @@ fn main() {
                 PrefillBatchScratch::new_opt(g, &config, max_batch, /*cap_gdn_tape=*/ false)
                     .expect("pbs"),
             );
-            prefill_partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("prefill partial"));
+            prefill_partials.push(
+                g.zeros(&[max_batch * config.dim], DType::F32)
+                    .expect("prefill partial"),
+            );
         }
     }
     if n > 1 {
@@ -212,7 +260,10 @@ fn main() {
 
     // ── EP prefill (batched-WMMA or sequential) — timed (TTFT ≈ prefill wall) ─
     use std::time::Instant;
-    eprintln!("\n=== EP forward (prefill {} toks → decode {steps}) ===", prompt_tokens.len());
+    eprintln!(
+        "\n=== EP forward (prefill {} toks → decode {steps}) ===",
+        prompt_tokens.len()
+    );
     let t_prefill = Instant::now();
     if batched_prefill {
         // Chunked EP prefill: each window of <= chunk_size tokens runs the full
@@ -225,9 +276,16 @@ fn main() {
         while offset < prompt_tokens.len() {
             let chunk_n = (prompt_tokens.len() - offset).min(chunk_size);
             qwen35::forward_prefill_batch_ep(
-                &mut gpus, &weights_per_rank, &config,
-                &prompt_tokens[offset..offset + chunk_n], offset,
-                &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
+                &mut gpus,
+                &weights_per_rank,
+                &config,
+                &prompt_tokens[offset..offset + chunk_n],
+                offset,
+                &mut kv_per_rank,
+                &mut dn_per_rank,
+                &scratch_per_rank,
+                &pbs_per_rank,
+                &prefill_partials,
             )
             .expect("forward_prefill_batch_ep chunk");
             offset += chunk_n;
@@ -238,16 +296,28 @@ fn main() {
     } else {
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             qwen35::forward_ep(
-                &mut gpus, &weights_per_rank, &config, tok, pos,
-                &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+                &mut gpus,
+                &weights_per_rank,
+                &config,
+                tok,
+                pos,
+                &mut kv_per_rank,
+                &dn_per_rank,
+                &scratch_per_rank,
+                &partials,
             )
             .expect("forward_ep prefill");
         }
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     gpus.devices[0].bind_thread().expect("bind 0");
-    let mut logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
-    assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf in EP prefill logits");
+    let mut logits = gpus.devices[0]
+        .download_f32(&scratch_per_rank[0].logits)
+        .expect("dl");
+    assert!(
+        !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+        "NaN/Inf in EP prefill logits"
+    );
     let mut gen_ep: Vec<u32> = Vec::with_capacity(steps);
     let mut step_ms: Vec<f64> = Vec::with_capacity(steps);
     let mut next = llama::argmax(&logits);
@@ -256,14 +326,26 @@ fn main() {
     for step in 1..steps {
         let t = Instant::now();
         qwen35::forward_ep(
-            &mut gpus, &weights_per_rank, &config, next, base + step - 1,
-            &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+            &mut gpus,
+            &weights_per_rank,
+            &config,
+            next,
+            base + step - 1,
+            &mut kv_per_rank,
+            &dn_per_rank,
+            &scratch_per_rank,
+            &partials,
         )
         .expect("forward_ep decode");
         gpus.devices[0].bind_thread().expect("bind 0");
-        logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
+        logits = gpus.devices[0]
+            .download_f32(&scratch_per_rank[0].logits)
+            .expect("dl");
         step_ms.push(t.elapsed().as_secs_f64() * 1000.0);
-        assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf at EP step {step}");
+        assert!(
+            !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+            "NaN/Inf at EP step {step}"
+        );
         next = llama::argmax(&logits);
         gen_ep.push(next);
     }
@@ -297,30 +379,51 @@ fn main() {
     if n == 1 && !batched_prefill {
         eprintln!("\n=== tp=1 anchor: production forward_scratch (unsharded rank 0) ===");
         let mut kv_ref = KvCache::new_gpu_q8(
-            &mut gpus.devices[0], config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpus.devices[0],
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .expect("kv ref");
         let mut dn_ref = DeltaNetState::new(&mut gpus.devices[0], &config).expect("dn ref");
-        let scratch_ref = Qwen35Scratch::new(&mut gpus.devices[0], &config, 64).expect("scratch ref");
+        let scratch_ref =
+            Qwen35Scratch::new(&mut gpus.devices[0], &config, 64).expect("scratch ref");
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             qwen35::forward_scratch(
-                &mut gpus.devices[0], &weights_per_rank[0], &config, tok, pos,
-                &mut kv_ref, &mut dn_ref, &scratch_ref,
+                &mut gpus.devices[0],
+                &weights_per_rank[0],
+                &config,
+                tok,
+                pos,
+                &mut kv_ref,
+                &mut dn_ref,
+                &scratch_ref,
             )
             .expect("forward_scratch prefill");
         }
-        let ref_logits = gpus.devices[0].download_f32(&scratch_ref.logits).expect("dl ref");
+        let ref_logits = gpus.devices[0]
+            .download_f32(&scratch_ref.logits)
+            .expect("dl ref");
         let ref_max_logit = ref_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut gen_ref: Vec<u32> = Vec::with_capacity(steps);
         let mut nref = llama::argmax(&ref_logits);
         gen_ref.push(nref);
         for step in 1..steps {
             qwen35::forward_scratch(
-                &mut gpus.devices[0], &weights_per_rank[0], &config, nref, base + step - 1,
-                &mut kv_ref, &mut dn_ref, &scratch_ref,
+                &mut gpus.devices[0],
+                &weights_per_rank[0],
+                &config,
+                nref,
+                base + step - 1,
+                &mut kv_ref,
+                &mut dn_ref,
+                &scratch_ref,
             )
             .expect("forward_scratch decode");
-            let l = gpus.devices[0].download_f32(&scratch_ref.logits).expect("dl ref");
+            let l = gpus.devices[0]
+                .download_f32(&scratch_ref.logits)
+                .expect("dl ref");
             nref = llama::argmax(&l);
             gen_ref.push(nref);
         }

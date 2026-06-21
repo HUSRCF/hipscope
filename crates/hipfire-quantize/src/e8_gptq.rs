@@ -278,7 +278,7 @@ fn ldlq_row_block(
         let col0 = g * 8;
         let sub = g / 4; // which 32-weight sub-block (8 sub-blocks per 256)
         let bs = block_scale[sub]; // decoded E4M3 block scale for this sub-block
-        // TWO-reciprocal normalization, byte-matching RTN (main.rs:1556).
+                                   // TWO-reciprocal normalization, byte-matching RTN (main.rs:1556).
         let inv_block_scale = if bs > 0.0 { 1.0 / bs } else { 0.0 };
         // (row_scale*block_scale) product — used ONLY for the feedback residual
         // (rotated-weight-domain reconstruction) and the per-column push cap.
@@ -352,7 +352,7 @@ fn ldlq_row_block(
 /// Returns (row_scale_a_f16_decoded, [block_scale_factor; n_blocks],
 ///          scale_bytes). All computed from the rotated row, frozen.
 struct FrozenScales {
-    row_scale_a: f32,    // exact (unrounded) — used for inv in encode, matching RTN
+    row_scale_a: f32, // exact (unrounded) — used for inv in encode, matching RTN
     inv_row_scale: f32,
     scale_bytes: Vec<u8>,
     block_scale: Vec<f32>, // decoded e4m3 per 32-block
@@ -366,20 +366,37 @@ fn freeze_row_scales(
     let k = row_rot.len();
     let n_blocks = k / 32;
     let row_max_abs = row_rot.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    let row_scale_a = if row_max_abs > 0.0 {
+        row_max_abs / 6.0
+    } else {
+        1.0
+    };
+    let inv_row_scale = if row_max_abs > 0.0 {
+        1.0 / row_scale_a
+    } else {
+        0.0
+    };
     let mut scale_bytes = vec![0u8; n_blocks];
     let mut block_scale = vec![0.0f32; n_blocks];
     for b in 0..n_blocks {
         let block = &row_rot[b * 32..b * 32 + 32];
         let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
         let block_max_normalized = block_max_abs * inv_row_scale;
-        let s = if block_max_normalized > 0.0 { block_max_normalized / 6.0 } else { 0.0 };
+        let s = if block_max_normalized > 0.0 {
+            block_max_normalized / 6.0
+        } else {
+            0.0
+        };
         let sb = e4m3_encode(s);
         scale_bytes[b] = sb;
         block_scale[b] = e4m3_decode(sb);
     }
-    FrozenScales { row_scale_a, inv_row_scale, scale_bytes, block_scale }
+    FrozenScales {
+        row_scale_a,
+        inv_row_scale,
+        scale_bytes,
+        block_scale,
+    }
 }
 
 /// Full GPTQ-E8 quantize of one weight matrix W[m, k] (row-major), already in
@@ -415,7 +432,11 @@ fn quantize_mfpn_e8_gptq_2d(
     e4m3_decode: &dyn Fn(u8) -> f32,
     f32_to_f16: &dyn Fn(f32) -> u16,
 ) -> Vec<u8> {
-    assert!(n == 2 || n == 3 || n == 4, "n must be 2, 3, or 4; got n={}", n);
+    assert!(
+        n == 2 || n == 3 || n == 4,
+        "n must be 2, 3, or 4; got n={}",
+        n
+    );
     assert_eq!(f32_data.len(), m * k);
     assert!(k % 256 == 0, "mfpN-E8 requires k%256==0, got k={}", k);
     let n_256 = k / 256;
@@ -515,9 +536,18 @@ pub fn quantize_mfp4g32_e8_gptq_2d(
     f32_to_f16: &dyn Fn(f32) -> u16,
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
-        f32_data, m, k, signs1, signs2, h_blocks,
-        4, e8::QUANT_STEP,
-        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        4,
+        e8::QUANT_STEP,
+        cpu_fwht,
+        e4m3_encode,
+        e4m3_decode,
+        f32_to_f16,
     )
 }
 
@@ -538,9 +568,18 @@ pub fn quantize_mfp3g32_e8_gptq_2d(
     f32_to_f16: &dyn Fn(f32) -> u16,
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
-        f32_data, m, k, signs1, signs2, h_blocks,
-        3, e8::QUANT_STEP_MFP3,
-        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        3,
+        e8::QUANT_STEP_MFP3,
+        cpu_fwht,
+        e4m3_encode,
+        e4m3_decode,
+        f32_to_f16,
     )
 }
 
@@ -561,9 +600,18 @@ pub fn quantize_mfp2g32_e8_gptq_2d(
     f32_to_f16: &dyn Fn(f32) -> u16,
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
-        f32_data, m, k, signs1, signs2, h_blocks,
-        2, e8::QUANT_STEP_MFP2,
-        cpu_fwht, e4m3_encode, e4m3_decode, f32_to_f16,
+        f32_data,
+        m,
+        k,
+        signs1,
+        signs2,
+        h_blocks,
+        2,
+        e8::QUANT_STEP_MFP2,
+        cpu_fwht,
+        e4m3_encode,
+        e4m3_decode,
+        f32_to_f16,
     )
 }
 
@@ -580,13 +628,19 @@ mod tests {
         (0..n)
             .map(|_| {
                 state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+                if (state >> 16) & 1 == 1 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
             })
             .collect()
     }
     fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         assert!(x.len() == 256);
-        for i in 0..256 { x[i] *= signs1[i]; }
+        for i in 0..256 {
+            x[i] *= signs1[i];
+        }
         let mut stride = 1;
         while stride < 256 {
             let mut i = 0;
@@ -602,22 +656,38 @@ mod tests {
             stride <<= 1;
         }
         let scale = 0.0625;
-        for i in 0..256 { x[i] *= scale * signs2[i]; }
+        for i in 0..256 {
+            x[i] *= scale * signs2[i];
+        }
     }
     fn e4m3_scale_decode(byte: u8) -> f32 {
         let exp = ((byte >> 3) & 0xf) as i32;
         let mant = (byte & 0x7) as u32;
-        if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
-        if exp == 0xf && mant == 7 { return 448.0; }
+        if exp == 0 {
+            return (2.0f32).powi(-6) * (mant as f32) / 8.0;
+        }
+        if exp == 0xf && mant == 7 {
+            return 448.0;
+        }
         (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
     }
     fn e4m3_scale_encode_roundup(s: f32) -> u8 {
-        if !(s > 0.0) { return 0x00; }
-        if s >= 448.0 { return 0x7E; }
-        for code in 0u8..=0x7E { if e4m3_scale_decode(code) >= s { return code; } }
+        if !(s > 0.0) {
+            return 0x00;
+        }
+        if s >= 448.0 {
+            return 0x7E;
+        }
+        for code in 0u8..=0x7E {
+            if e4m3_scale_decode(code) >= s {
+                return code;
+            }
+        }
         0x7E
     }
-    fn f32_to_f16(val: f32) -> u16 { half_round(val) }
+    fn f32_to_f16(val: f32) -> u16 {
+        half_round(val)
+    }
     // minimal round-to-nearest-even f32->f16 (good enough for tests; the
     // production path uses main.rs::f32_to_f16, but scales here are coarse).
     fn half_round(val: f32) -> u16 {
@@ -625,8 +695,12 @@ mod tests {
         let sign = ((bits >> 16) & 0x8000) as u16;
         let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
         let mant = bits & 0x7fffff;
-        if exp <= 0 { return sign; }
-        if exp >= 0x1f { return sign | 0x7c00; }
+        if exp <= 0 {
+            return sign;
+        }
+        if exp >= 0x1f {
+            return sign | 0x7c00;
+        }
         let mant16 = (mant >> 13) as u16;
         let _ = &mut exp;
         sign | ((exp as u16) << 10) | mant16
@@ -638,26 +712,42 @@ mod tests {
         let k = row_rot.len();
         let n_blocks = k / 32;
         let row_max_abs = row_rot.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-        let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-        let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+        let row_scale_a = if row_max_abs > 0.0 {
+            row_max_abs / 6.0
+        } else {
+            1.0
+        };
+        let inv_row_scale = if row_max_abs > 0.0 {
+            1.0 / row_scale_a
+        } else {
+            0.0
+        };
         let mut codes = Vec::with_capacity(n_blocks * 4);
         let mut recon = vec![0.0f32; k]; // rotated-domain reconstruction
         for b in 0..n_blocks {
             let block = &row_rot[b * 32..b * 32 + 32];
             let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
             let block_max_normalized = block_max_abs * inv_row_scale;
-            let s = if block_max_normalized > 0.0 { block_max_normalized / 6.0 } else { 0.0 };
+            let s = if block_max_normalized > 0.0 {
+                block_max_normalized / 6.0
+            } else {
+                0.0
+            };
             let sb = e4m3_scale_encode_roundup(s);
             let bsf = e4m3_scale_decode(sb);
             let inv_block_scale = if bsf > 0.0 { 1.0 / bsf } else { 0.0 };
             let scale = row_scale_a * bsf;
             for g in 0..4 {
                 let mut v = [0.0f32; 8];
-                for i in 0..8 { v[i] = block[g * 8 + i] * inv_row_scale * inv_block_scale; }
+                for i in 0..8 {
+                    v[i] = block[g * 8 + i] * inv_row_scale * inv_block_scale;
+                }
                 let idx = e8::quantize8_n(&v, quant_step, n);
                 codes.push(idx);
                 let dq = e8::dequantize8_n(idx, quant_step, n);
-                for i in 0..8 { recon[b * 32 + g * 8 + i] = dq[i] * scale; }
+                for i in 0..8 {
+                    recon[b * 32 + g * 8 + i] = dq[i] * scale;
+                }
             }
         }
         (codes, recon)
@@ -670,14 +760,28 @@ mod tests {
 
     // GPTQ-E8 single-tensor wrapper (generic on n), returning codewords + rotated recon.
     fn gptq_codewords_n(
-        f32_data: &[f32], m: usize, k: usize,
-        signs1: &[f32], signs2: &[f32], h_blocks: &[HBlock],
-        n: u32, quant_step: f32,
+        f32_data: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        h_blocks: &[HBlock],
+        n: u32,
+        quant_step: f32,
     ) -> (Vec<u32>, Vec<f32>) {
         let bytes = quantize_mfpn_e8_gptq_2d(
-            f32_data, m, k, signs1, signs2, h_blocks,
-            n, quant_step,
-            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+            f32_data,
+            m,
+            k,
+            signs1,
+            signs2,
+            h_blocks,
+            n,
+            quant_step,
+            &cpu_fwht_256,
+            &e4m3_scale_encode_roundup,
+            &e4m3_scale_decode,
+            &f32_to_f16,
         );
         // Decode codewords + rotated recon from bytes.
         // Per-block payload: 1 E4M3 scale + 4 codewords of n bytes.
@@ -703,7 +807,9 @@ mod tests {
                     let idx = u32::from_le_bytes(raw);
                     codes.push(idx);
                     let dq = e8::dequantize8_n(idx, quant_step, n);
-                    for i in 0..8 { recon[r * k + b * 32 + g * 8 + i] = dq[i] * scale; }
+                    for i in 0..8 {
+                        recon[r * k + b * 32 + g * 8 + i] = dq[i] * scale;
+                    }
                 }
             }
         }
@@ -712,8 +818,12 @@ mod tests {
 
     // GPTQ-E8 n=4 convenience wrapper (used by existing tests).
     fn gptq_codewords(
-        f32_data: &[f32], m: usize, k: usize,
-        signs1: &[f32], signs2: &[f32], h_blocks: &[HBlock],
+        f32_data: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        h_blocks: &[HBlock],
     ) -> (Vec<u32>, Vec<f32>) {
         gptq_codewords_n(f32_data, m, k, signs1, signs2, h_blocks, 4, e8::QUANT_STEP)
     }
@@ -723,11 +833,16 @@ mod tests {
         let exp = ((bits >> 10) & 0x1f) as u32;
         let mant = (bits & 0x3ff) as u32;
         let f = if exp == 0 {
-            if mant == 0 { sign << 31 } else {
+            if mant == 0 {
+                sign << 31
+            } else {
                 // subnormal
                 let mut e = exp as i32;
                 let mut m = mant;
-                while m & 0x400 == 0 { m <<= 1; e -= 1; }
+                while m & 0x400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
                 m &= 0x3ff;
                 let fe = (e + (127 - 15) + 1) as u32;
                 (sign << 31) | (fe << 23) | (m << 13)
@@ -743,7 +858,9 @@ mod tests {
 
     // Deterministic LCG (file convention).
     fn lcg_next(state: &mut u64) -> f32 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let hi = (*state >> 32) as u32;
         (hi as f32 / (u32::MAX as f32)) * 2.0 - 1.0
     }
@@ -752,8 +869,13 @@ mod tests {
     // the ROTATED Hessian (the objective LDLQ minimizes). Computed per
     // 256-block (block-diagonal).
     fn h_weighted_err(
-        f32_data: &[f32], recon_rot: &[f32], m: usize, k: usize,
-        signs1: &[f32], signs2: &[f32], h_blocks: &[HBlock],
+        f32_data: &[f32],
+        recon_rot: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        h_blocks: &[HBlock],
     ) -> f64 {
         let n_256 = k / 256;
         // rotated weights
@@ -776,9 +898,13 @@ mod tests {
                     e[i] = (w_rot[r * k + c] - recon_rot[r * k + c]) as f64;
                 }
                 for a in 0..256 {
-                    if e[a] == 0.0 { continue; }
+                    if e[a] == 0.0 {
+                        continue;
+                    }
                     let mut acc = 0.0f64;
-                    for bb in 0..256 { acc += hp[a * 256 + bb] * e[bb]; }
+                    for bb in 0..256 {
+                        acc += hp[a * 256 + bb] * e[bb];
+                    }
                     j += e[a] * acc;
                 }
             }
@@ -786,8 +912,14 @@ mod tests {
         j
     }
 
-    fn unweighted_mse(f32_data: &[f32], recon_rot: &[f32], m: usize, k: usize,
-        signs1: &[f32], signs2: &[f32]) -> f64 {
+    fn unweighted_mse(
+        f32_data: &[f32],
+        recon_rot: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+    ) -> f64 {
         let n_256 = k / 256;
         let mut buf = vec![0.0f32; k];
         let mut acc = 0.0f64;
@@ -815,29 +947,40 @@ mod tests {
             let mut col = [0.0f64; 256];
             col[j] = 1.0;
             fwht_256_f64(&mut col, &signs1, &signs2);
-            for i in 0..256 { rmat[i * 256 + j] = col[i]; }
+            for i in 0..256 {
+                rmat[i * 256 + j] = col[i];
+            }
         }
         // R R^T == I to 1e-4
         let mut max_off = 0.0f64;
         for i in 0..256 {
             for j in 0..256 {
                 let mut s = 0.0f64;
-                for k in 0..256 { s += rmat[i * 256 + k] * rmat[j * 256 + k]; }
+                for k in 0..256 {
+                    s += rmat[i * 256 + k] * rmat[j * 256 + k];
+                }
                 let target = if i == j { 1.0 } else { 0.0 };
                 max_off = max_off.max((s - target).abs());
             }
         }
-        assert!(max_off < 1e-4, "R not orthogonal: max|RR^T - I| = {max_off}");
+        assert!(
+            max_off < 1e-4,
+            "R not orthogonal: max|RR^T - I| = {max_off}"
+        );
 
         // Random symmetric H = A A^T.
         let mut state = 0x1234_5678_9abc_def0u64;
         let mut a = vec![0.0f32; 256 * 256];
-        for v in a.iter_mut() { *v = lcg_next(&mut state); }
+        for v in a.iter_mut() {
+            *v = lcg_next(&mut state);
+        }
         let mut h = vec![0.0f32; 256 * 256];
         for i in 0..256 {
             for jj in 0..256 {
                 let mut s = 0.0f64;
-                for k in 0..256 { s += a[i * 256 + k] as f64 * a[jj * 256 + k] as f64; }
+                for k in 0..256 {
+                    s += a[i * 256 + k] as f64 * a[jj * 256 + k] as f64;
+                }
                 h[i * 256 + jj] = s as f32;
             }
         }
@@ -846,7 +989,9 @@ mod tests {
         for i in 0..256 {
             for jj in 0..256 {
                 let mut s = 0.0f64;
-                for k in 0..256 { s += rmat[i * 256 + k] * h[k * 256 + jj] as f64; }
+                for k in 0..256 {
+                    s += rmat[i * 256 + k] * h[k * 256 + jj] as f64;
+                }
                 rh[i * 256 + jj] = s;
             }
         }
@@ -854,7 +999,9 @@ mod tests {
         for i in 0..256 {
             for jj in 0..256 {
                 let mut s = 0.0f64;
-                for k in 0..256 { s += rh[i * 256 + k] * rmat[jj * 256 + k]; } // R^T col == R row
+                for k in 0..256 {
+                    s += rh[i * 256 + k] * rmat[jj * 256 + k];
+                } // R^T col == R row
                 hp_ref[i * 256 + jj] = s;
             }
         }
@@ -865,8 +1012,10 @@ mod tests {
             maxref = maxref.max(hp_ref[i].abs());
             maxdiff = maxdiff.max((hp_ref[i] - hp_impl[i]).abs());
         }
-        assert!(maxdiff < 1e-3 * maxref,
-            "rotate_hblock != R H R^T: maxdiff={maxdiff}, maxref={maxref}");
+        assert!(
+            maxdiff < 1e-3 * maxref,
+            "rotate_hblock != R H R^T: maxdiff={maxdiff}, maxref={maxref}"
+        );
     }
 
     // ------- TEST 1: DISCRIMINATOR — correlated H, GPTQ beats RTN -------
@@ -879,7 +1028,9 @@ mod tests {
         // W = randn ~0.5 std (seeded).
         let mut state = 0xfeed_face_dead_beefu64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.9; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.9;
+        }
 
         // Build a strongly-correlated rotated-domain H' (AR(1) rho=0.95),
         // then set the captured pre-rotation H = R^T H' R so the impl
@@ -900,14 +1051,18 @@ mod tests {
             let mut col = [0.0f64; 256];
             col[j] = 1.0;
             fwht_256_f64(&mut col, &signs1, &signs2);
-            for i in 0..256 { rmat[i * 256 + j] = col[i]; }
+            for i in 0..256 {
+                rmat[i * 256 + j] = col[i];
+            }
         }
         // R^T H' : (R^T H')[i,j] = sum_k R[k,i] H'[k,j]
         let mut rth = vec![0.0f64; 256 * 256];
         for i in 0..256 {
             for j in 0..256 {
                 let mut s = 0.0f64;
-                for kk in 0..256 { s += rmat[kk * 256 + i] * hprime[kk * 256 + j]; }
+                for kk in 0..256 {
+                    s += rmat[kk * 256 + i] * hprime[kk * 256 + j];
+                }
                 rth[i * 256 + j] = s;
             }
         }
@@ -916,7 +1071,9 @@ mod tests {
         for i in 0..256 {
             for j in 0..256 {
                 let mut s = 0.0f64;
-                for kk in 0..256 { s += rth[i * 256 + kk] * rmat[kk * 256 + j]; }
+                for kk in 0..256 {
+                    s += rth[i * 256 + kk] * rmat[kk * 256 + j];
+                }
                 hcap[i * 256 + j] = s as f32;
             }
         }
@@ -935,12 +1092,22 @@ mod tests {
             assert_eq!(idx, idx2, "GPTQ codeword not a valid E8 bijection point");
         }
         // GPTQ must actually CHANGE some codewords vs RTN (anti-no-op).
-        let changed = codes_rtn.iter().zip(codes_gptq.iter()).filter(|(a, b)| a != b).count();
-        assert!(changed > 0, "GPTQ produced byte-identical output to RTN on correlated H (silent no-op)");
+        let changed = codes_rtn
+            .iter()
+            .zip(codes_gptq.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            changed > 0,
+            "GPTQ produced byte-identical output to RTN on correlated H (silent no-op)"
+        );
 
         let j_rtn = h_weighted_err(&w, &recon_rtn, m, k, &signs1, &signs2, &h_blocks);
         let j_gptq = h_weighted_err(&w, &recon_gptq, m, k, &signs1, &signs2, &h_blocks);
-        eprintln!("J_rtn={j_rtn:.6} J_gptq={j_gptq:.6} ratio={:.4} changed={changed}", j_gptq / j_rtn);
+        eprintln!(
+            "J_rtn={j_rtn:.6} J_gptq={j_gptq:.6} ratio={:.4} changed={changed}",
+            j_gptq / j_rtn
+        );
         assert!(j_gptq <= 0.90 * j_rtn,
             "GPTQ-E8 did not reduce H-weighted error by >=10%: J_gptq={j_gptq:.6} vs J_rtn={j_rtn:.6} (ratio {:.4})",
             j_gptq / j_rtn);
@@ -952,7 +1119,10 @@ mod tests {
         // legitimate trade. The H-weighted bound above is the true gate.
         let mse_rtn = unweighted_mse(&w, &recon_rtn, m, k, &signs1, &signs2);
         let mse_gptq = unweighted_mse(&w, &recon_gptq, m, k, &signs1, &signs2);
-        eprintln!("mse_rtn={mse_rtn:.6} mse_gptq={mse_gptq:.6} (ratio {:.3})", mse_gptq / mse_rtn);
+        eprintln!(
+            "mse_rtn={mse_rtn:.6} mse_gptq={mse_gptq:.6} (ratio {:.3})",
+            mse_gptq / mse_rtn
+        );
         assert!(mse_gptq <= 2.5 * mse_rtn,
             "GPTQ unweighted MSE blew up (runaway, not a legit H-trade): {mse_gptq:.6} vs {mse_rtn:.6}");
     }
@@ -966,17 +1136,25 @@ mod tests {
         let k = 256usize;
         let mut state = 0x0bad_c0de_1234_5678u64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.7; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.7;
+        }
 
         // H = I  ⇒  after rotate (R I R^T = I) and damping, feedback is
         // diagonal ⇒ zero off-diagonal propagation ⇒ byte-identical to RTN.
         let mut hi = vec![0.0f32; 256 * 256];
-        for i in 0..256 { hi[i * 256 + i] = 1.0; }
+        for i in 0..256 {
+            hi[i * 256 + i] = 1.0;
+        }
         let h_blocks = vec![hi];
 
         let (codes_rtn, _) = gptq_codewords(&w, m, k, &signs1, &signs2, &[]);
         let (codes_gptq, _) = gptq_codewords(&w, m, k, &signs1, &signs2, &h_blocks);
-        let changed = codes_rtn.iter().zip(codes_gptq.iter()).filter(|(a, b)| a != b).count();
+        let changed = codes_rtn
+            .iter()
+            .zip(codes_gptq.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert_eq!(changed, 0,
             "H=I must collapse to RTN exactly, but {changed} codewords differ (feedback firing on uncorrelated H)");
     }
@@ -990,10 +1168,20 @@ mod tests {
         let k = 512usize; // 2 blocks of 256
         let mut state = 0xaaaa_bbbb_cccc_ddddu64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.6; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.6;
+        }
         let bytes = quantize_mfp4g32_e8_gptq_2d(
-            &w, m, k, &signs1, &signs2, &[],
-            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+            &w,
+            m,
+            k,
+            &signs1,
+            &signs2,
+            &[],
+            &cpu_fwht_256,
+            &e4m3_scale_encode_roundup,
+            &e4m3_scale_decode,
+            &f32_to_f16,
         );
         let n_32 = k / 32;
         let block_bytes = 1 + 4 * 4usize; // n=4: 17 B
@@ -1019,12 +1207,22 @@ mod tests {
         let k = 512usize; // 2 × 256 blocks
         let mut state = 0x1234_abcd_ef01_2345u64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.8;
+        }
 
         // GPTQ with no Hessian — must degrade to RTN.
         let gptq_bytes = quantize_mfp3g32_e8_gptq_2d(
-            &w, m, k, &signs1, &signs2, &[], // empty h_blocks
-            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+            &w,
+            m,
+            k,
+            &signs1,
+            &signs2,
+            &[], // empty h_blocks
+            &cpu_fwht_256,
+            &e4m3_scale_encode_roundup,
+            &e4m3_scale_decode,
+            &f32_to_f16,
         );
 
         // RTN reference: manually apply FWHT then call rtn_row_codewords_n.
@@ -1044,8 +1242,16 @@ mod tests {
                 let (codes, _) = rtn_row_codewords_n(&row_buf, 3, e8::QUANT_STEP_MFP3);
                 // Re-emit to bytes using the same scale derivation.
                 let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
-                let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-                let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+                let row_scale_a = if row_max_abs > 0.0 {
+                    row_max_abs / 6.0
+                } else {
+                    1.0
+                };
+                let inv_rs = if row_max_abs > 0.0 {
+                    1.0 / row_scale_a
+                } else {
+                    0.0
+                };
                 let base = r * row_bytes_n3;
                 rtn_bytes[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
                 rtn_bytes[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
@@ -1062,7 +1268,8 @@ mod tests {
                     let po = base + 16 + b * block_bytes_n3;
                     rtn_bytes[po] = sb;
                     for g in 0..4 {
-                        let idx = codes[code_idx]; code_idx += 1;
+                        let idx = codes[code_idx];
+                        code_idx += 1;
                         let bytes = idx.to_le_bytes();
                         let cw_off = po + 1 + g * 3;
                         rtn_bytes[cw_off..cw_off + 3].copy_from_slice(&bytes[..3]);
@@ -1071,10 +1278,19 @@ mod tests {
             }
         }
 
-        assert_eq!(gptq_bytes.len(), rtn_bytes.len(),
-            "GPTQ-mfp3 (fb=None) output length mismatch: {} vs {}", gptq_bytes.len(), rtn_bytes.len());
+        assert_eq!(
+            gptq_bytes.len(),
+            rtn_bytes.len(),
+            "GPTQ-mfp3 (fb=None) output length mismatch: {} vs {}",
+            gptq_bytes.len(),
+            rtn_bytes.len()
+        );
         // Byte-exact comparison — any difference is a packing or scale divergence bug.
-        let diffs: usize = gptq_bytes.iter().zip(rtn_bytes.iter()).filter(|(a, b)| a != b).count();
+        let diffs: usize = gptq_bytes
+            .iter()
+            .zip(rtn_bytes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert_eq!(diffs, 0,
             "GPTQ-mfp3 (fb=None) is NOT byte-identical to RTN-mfp3: {diffs} byte(s) differ. \
              Layout parity BROKEN — the GPTQ path uses a different scale or codeword packing than RTN.");
@@ -1085,8 +1301,13 @@ mod tests {
     // two-reciprocal `rtn_row_codewords_n` normalization).  Used by the
     // multi-seed parity sweep below so it compares against the EXACT RTN bytes.
     fn rtn_mfpn_e8_2d_bytes(
-        f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32],
-        n: u32, quant_step: f32,
+        f32_data: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        n: u32,
+        quant_step: f32,
     ) -> Vec<u8> {
         let n_32 = k / 32;
         let block_bytes = 1 + 4 * n as usize;
@@ -1100,8 +1321,16 @@ mod tests {
             }
             let (codes, _) = rtn_row_codewords_n(&row_buf, n, quant_step);
             let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
-            let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-            let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+            let row_scale_a = if row_max_abs > 0.0 {
+                row_max_abs / 6.0
+            } else {
+                1.0
+            };
+            let inv_rs = if row_max_abs > 0.0 {
+                1.0 / row_scale_a
+            } else {
+                0.0
+            };
             let base = r * row_bytes;
             out[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
             out[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
@@ -1118,7 +1347,8 @@ mod tests {
                 let po = base + 16 + b * block_bytes;
                 out[po] = sb;
                 for g in 0..4 {
-                    let idx = codes[code_idx]; code_idx += 1;
+                    let idx = codes[code_idx];
+                    code_idx += 1;
                     let bytes = idx.to_le_bytes();
                     let cw_off = po + 1 + g * n as usize;
                     out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
@@ -1152,24 +1382,44 @@ mod tests {
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     .wrapping_add(0x1234_5678);
                 let mut w = vec![0.0f32; m * k];
-                for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+                for v in w.iter_mut() {
+                    *v = lcg_next(&mut state) * 0.8;
+                }
 
                 let gptq = if n == 3 {
                     quantize_mfp3g32_e8_gptq_2d(
-                        &w, m, k, &signs1, &signs2, &[],
-                        &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+                        &w,
+                        m,
+                        k,
+                        &signs1,
+                        &signs2,
+                        &[],
+                        &cpu_fwht_256,
+                        &e4m3_scale_encode_roundup,
+                        &e4m3_scale_decode,
+                        &f32_to_f16,
                     )
                 } else {
                     quantize_mfp2g32_e8_gptq_2d(
-                        &w, m, k, &signs1, &signs2, &[],
-                        &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+                        &w,
+                        m,
+                        k,
+                        &signs1,
+                        &signs2,
+                        &[],
+                        &cpu_fwht_256,
+                        &e4m3_scale_encode_roundup,
+                        &e4m3_scale_decode,
+                        &f32_to_f16,
                     )
                 };
                 let rtn = rtn_mfpn_e8_2d_bytes(&w, m, k, &signs1, &signs2, n, qs);
                 let d = gptq.iter().zip(rtn.iter()).filter(|(a, b)| a != b).count();
                 if d > 0 {
                     total_diffs += d;
-                    if failing_seeds.len() < 8 { failing_seeds.push(seed); }
+                    if failing_seeds.len() < 8 {
+                        failing_seeds.push(seed);
+                    }
                 }
             }
             assert_eq!(total_diffs, 0,
@@ -1189,11 +1439,21 @@ mod tests {
         let k = 512usize;
         let mut state = 0xdead_beef_cafe_f00du64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.8; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.8;
+        }
 
         let gptq_bytes = quantize_mfp2g32_e8_gptq_2d(
-            &w, m, k, &signs1, &signs2, &[], // empty h_blocks
-            &cpu_fwht_256, &e4m3_scale_encode_roundup, &e4m3_scale_decode, &f32_to_f16,
+            &w,
+            m,
+            k,
+            &signs1,
+            &signs2,
+            &[], // empty h_blocks
+            &cpu_fwht_256,
+            &e4m3_scale_encode_roundup,
+            &e4m3_scale_decode,
+            &f32_to_f16,
         );
 
         let n_32 = k / 32;
@@ -1209,8 +1469,16 @@ mod tests {
                 }
                 let (codes, _) = rtn_row_codewords_n(&row_buf, 2, e8::QUANT_STEP_MFP2);
                 let row_max_abs = row_buf.iter().cloned().fold(0.0f32, |a, v| a.max(v.abs()));
-                let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-                let inv_rs = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+                let row_scale_a = if row_max_abs > 0.0 {
+                    row_max_abs / 6.0
+                } else {
+                    1.0
+                };
+                let inv_rs = if row_max_abs > 0.0 {
+                    1.0 / row_scale_a
+                } else {
+                    0.0
+                };
                 let base = r * row_bytes_n2;
                 rtn_bytes[base..base + 2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
                 rtn_bytes[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
@@ -1227,7 +1495,8 @@ mod tests {
                     let po = base + 16 + b * block_bytes_n2;
                     rtn_bytes[po] = sb;
                     for g in 0..4 {
-                        let idx = codes[code_idx]; code_idx += 1;
+                        let idx = codes[code_idx];
+                        code_idx += 1;
                         let bytes = idx.to_le_bytes();
                         let cw_off = po + 1 + g * 2;
                         rtn_bytes[cw_off..cw_off + 2].copy_from_slice(&bytes[..2]);
@@ -1236,11 +1505,22 @@ mod tests {
             }
         }
 
-        assert_eq!(gptq_bytes.len(), rtn_bytes.len(),
-            "GPTQ-mfp2 (fb=None) output length mismatch: {} vs {}", gptq_bytes.len(), rtn_bytes.len());
-        let diffs: usize = gptq_bytes.iter().zip(rtn_bytes.iter()).filter(|(a, b)| a != b).count();
-        assert_eq!(diffs, 0,
-            "GPTQ-mfp2 (fb=None) is NOT byte-identical to RTN-mfp2: {diffs} byte(s) differ.");
+        assert_eq!(
+            gptq_bytes.len(),
+            rtn_bytes.len(),
+            "GPTQ-mfp2 (fb=None) output length mismatch: {} vs {}",
+            gptq_bytes.len(),
+            rtn_bytes.len()
+        );
+        let diffs: usize = gptq_bytes
+            .iter()
+            .zip(rtn_bytes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "GPTQ-mfp2 (fb=None) is NOT byte-identical to RTN-mfp2: {diffs} byte(s) differ."
+        );
     }
 
     // ------- TEST 6: GPTQ-mfp3/mfp2 decode via decode_index_n gives finite values -------
@@ -1256,31 +1536,48 @@ mod tests {
         let k = 256usize;
         let mut state = 0x5555_aaaa_5555_aaaau64;
         let mut w = vec![0.0f32; m * k];
-        for v in w.iter_mut() { *v = lcg_next(&mut state) * 0.7; }
+        for v in w.iter_mut() {
+            *v = lcg_next(&mut state) * 0.7;
+        }
 
         // Build a mildly correlated H (same form as TEST 1).
         let rho = 0.5f64;
         let mut hp = vec![0.0f64; 256 * 256];
-        for a in 0..256 { for b in 0..256 { hp[a * 256 + b] = rho.powi((a as i32 - b as i32).abs()); } }
+        for a in 0..256 {
+            for b in 0..256 {
+                hp[a * 256 + b] = rho.powi((a as i32 - b as i32).abs());
+            }
+        }
         // H = R^T H' R.
         let mut rmat = vec![0.0f64; 256 * 256];
         for j in 0..256 {
-            let mut col = [0.0f64; 256]; col[j] = 1.0;
+            let mut col = [0.0f64; 256];
+            col[j] = 1.0;
             fwht_256_f64(&mut col, &signs1, &signs2);
-            for i in 0..256 { rmat[i * 256 + j] = col[i]; }
+            for i in 0..256 {
+                rmat[i * 256 + j] = col[i];
+            }
         }
         let mut rth = vec![0.0f64; 256 * 256];
-        for i in 0..256 { for j in 0..256 {
-            let mut s = 0.0f64;
-            for kk in 0..256 { s += rmat[kk * 256 + i] * hp[kk * 256 + j]; }
-            rth[i * 256 + j] = s;
-        }}
+        for i in 0..256 {
+            for j in 0..256 {
+                let mut s = 0.0f64;
+                for kk in 0..256 {
+                    s += rmat[kk * 256 + i] * hp[kk * 256 + j];
+                }
+                rth[i * 256 + j] = s;
+            }
+        }
         let mut hcap = vec![0.0f32; 256 * 256];
-        for i in 0..256 { for j in 0..256 {
-            let mut s = 0.0f64;
-            for kk in 0..256 { s += rth[i * 256 + kk] * rmat[kk * 256 + j]; }
-            hcap[i * 256 + j] = s as f32;
-        }}
+        for i in 0..256 {
+            for j in 0..256 {
+                let mut s = 0.0f64;
+                for kk in 0..256 {
+                    s += rth[i * 256 + kk] * rmat[kk * 256 + j];
+                }
+                hcap[i * 256 + j] = s as f32;
+            }
+        }
         let h_blocks = vec![hcap];
 
         for &(n, qs) in &[(3u32, e8::QUANT_STEP_MFP3), (2u32, e8::QUANT_STEP_MFP2)] {

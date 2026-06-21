@@ -21,7 +21,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_mq3lloyd
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -79,7 +79,10 @@ fn f32_from_h16(h: u16) -> f32 {
     } else if exp == 0 {
         let mut m = mant;
         let mut e: i32 = -14;
-        while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         m &= 0x3ff;
         ((sign as u32) << 31) | (((e + 127) as u32) << 23) | (m << 13)
     } else if exp == 0x1f {
@@ -93,34 +96,39 @@ fn f32_from_h16(h: u16) -> f32 {
 }
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc_tensor u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc_tensor u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("memcpy_htod u8");
     t
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc_tensor f32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc_tensor f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod f32");
     t
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-    let t = gpu.alloc_tensor(&[data.len() * 4], DType::Raw).expect("alloc_tensor i32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 4], DType::Raw)
+        .expect("alloc_tensor i32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod i32");
     t
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
-    let t = gpu.alloc_tensor(&[data.len() * 8], DType::Raw).expect("alloc_tensor u64");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 8], DType::Raw)
+        .expect("alloc_tensor u64");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod u64");
     t
 }
@@ -133,10 +141,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -166,7 +175,7 @@ fn build_expert_weight_mq3lloyd(m: usize, k: usize, seed: u32) -> Vec<u8> {
             for (i, &v) in cb_vals.iter().enumerate() {
                 // f32 → f16 bits via round-trip.
                 let h = fp32_to_fp16_bits(v);
-                buf[off + i * 2]     = (h & 0xFF) as u8;
+                buf[off + i * 2] = (h & 0xFF) as u8;
                 buf[off + i * 2 + 1] = ((h >> 8) & 0xFF) as u8;
             }
             // Indices: 256 random 3-bit values packed 8-per-3-bytes LSB-first.
@@ -178,7 +187,7 @@ fn build_expert_weight_mq3lloyd(m: usize, k: usize, seed: u32) -> Vec<u8> {
                     pk |= idx << (bit * 3);
                 }
                 let byte_off = 16 + chunk * 3;
-                buf[off + byte_off]     = (pk & 0xFF) as u8;
+                buf[off + byte_off] = (pk & 0xFF) as u8;
                 buf[off + byte_off + 1] = ((pk >> 8) & 0xFF) as u8;
                 buf[off + byte_off + 2] = ((pk >> 16) & 0xFF) as u8;
             }
@@ -257,12 +266,12 @@ fn dequant_mq3lloyd_row_fp16(weight: &[u8], k: usize) -> Vec<f32> {
         // Walk K-tiles kt = 0..16, each 6 bytes = p0 (8 idx) + p1 (8 idx).
         for kt in 0..16_usize {
             let base = gp + 16 + kt * 6;
-            let p0 = (weight[base]     as u32)
-                   | ((weight[base + 1] as u32) << 8)
-                   | ((weight[base + 2] as u32) << 16);
+            let p0 = (weight[base] as u32)
+                | ((weight[base + 1] as u32) << 8)
+                | ((weight[base + 2] as u32) << 16);
             let p1 = (weight[base + 3] as u32)
-                   | ((weight[base + 4] as u32) << 8)
-                   | ((weight[base + 5] as u32) << 16);
+                | ((weight[base + 4] as u32) << 8)
+                | ((weight[base + 5] as u32) << 16);
             // 8 elements from p0, shifts 0/3/6/9/12/15/18/21.
             for sh in (0..24_u32).step_by(3) {
                 let idx = ((p0 >> sh) & 7) as usize;
@@ -299,7 +308,8 @@ fn cpu_reference(
 ) -> Vec<f32> {
     let mut y = vec![0f32; m_total * m];
     let tiles = m_total / 16;
-    let dequant: Vec<Vec<f32>> = expert_weights.iter()
+    let dequant: Vec<Vec<f32>> = expert_weights
+        .iter()
         .map(|w| {
             let groups_per_row = k / 256;
             let row_bytes = groups_per_row * 112;
@@ -318,15 +328,25 @@ fn cpu_reference(
 
     for tile_y in 0..tiles {
         let expert = tile_ids[tile_y];
-        if expert < 0 { continue; }
+        if expert < 0 {
+            continue;
+        }
         let dq = &dequant[expert as usize];
         let slot_start = tile_y * 16;
         for lane in 0..16 {
             let slot_idx = slot_start + lane;
-            if slot_idx >= m_total { continue; }
+            if slot_idx >= m_total {
+                continue;
+            }
             let flat = sorted[slot_idx];
-            if flat < 0 { continue; }
-            let x_row = if x_row_div > 1 { (flat as usize) / x_row_div } else { flat as usize };
+            if flat < 0 {
+                continue;
+            }
+            let x_row = if x_row_div > 1 {
+                (flat as usize) / x_row_div
+            } else {
+                flat as usize
+            };
             for mi in 0..m {
                 let mut acc = 0f64;
                 let dq_row_off = mi * k;
@@ -342,8 +362,19 @@ fn cpu_reference(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
     assert!(k % 256 == 0, "K must be a multiple of 256 (group size)");
@@ -390,27 +421,45 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("mq3lloyd grouped kernel launch");
-    gpu.hip.device_synchronize().expect("sync after mq3lloyd kernel");
+    )
+    .expect("mq3lloyd grouped kernel launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after mq3lloyd kernel");
 
     let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
-    let y_ref = cpu_reference(&expert_weights, &x_f32, 1, &sorted, &tile_ids, m, k, m_total);
+    let y_ref = cpu_reference(
+        &expert_weights,
+        &x_f32,
+        1,
+        &sorted,
+        &tile_ids,
+        m,
+        k,
+        m_total,
+    );
 
     let mut max_abs = 0f32;
-    let mut max_rel_large = 0f32;  // max rel error only for |ref| > max_abs_y * 0.1
+    let mut max_rel_large = 0f32; // max rel error only for |ref| > max_abs_y * 0.1
     let mut argmax_abs = 0usize;
     let mut argmax_rel_large = 0usize;
     // Dynamic range of the reference output.
     let max_abs_y: f32 = y_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
-    let large_thresh = max_abs_y * 0.1_f32;  // 10% of max output magnitude
+    let large_thresh = max_abs_y * 0.1_f32; // 10% of max output magnitude
 
     for (i, (a, b)) in y_ref.iter().zip(y_gpu_v.iter()).enumerate() {
         let d = (a - b).abs();
-        if d > max_abs { max_abs = d; argmax_abs = i; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
         // Relative error only for "large" reference values (above 10% of max).
         if a.abs() > large_thresh {
             let r = d / a.abs();
-            if r > max_rel_large { max_rel_large = r; argmax_rel_large = i; }
+            if r > max_rel_large {
+                max_rel_large = r;
+                argmax_rel_large = i;
+            }
         }
     }
     let ref_sample = &y_ref[argmax_abs];

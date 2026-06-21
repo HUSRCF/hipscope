@@ -11,7 +11,11 @@ use std::ffi::c_void;
 fn e8_strip_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_STRIP").map(|v| v == "1").unwrap_or(false))
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_E8_STRIP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// EXPERIMENT: HIPFIRE_E8_LDSX=1 routes gemv_mfp4g32_e8 (gfx1151) to the
@@ -19,7 +23,11 @@ fn e8_strip_enabled() -> bool {
 fn e8_ldsx_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("HIPFIRE_E8_LDSX").map(|v| v == "1").unwrap_or(false))
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_E8_LDSX")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
@@ -3023,7 +3031,10 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k % 256 == 0, "gemv_mfp4g32_lloyd requires K%256==0, got K={k}");
+        assert!(
+            k % 256 == 0,
+            "gemv_mfp4g32_lloyd requires K%256==0, got K={k}"
+        );
         self.ensure_kernel(
             "gemv_mfp4g32_lloyd",
             kernels::GEMV_MFP4G32_LLOYD_SRC,
@@ -3121,7 +3132,6 @@ impl Gpu {
         self.gemv_mfp4g32_p(a_raw, x_rot, y, m, k)
     }
 
-
     /// mfp4-E8 GEMV. mfp4+P byte layout (NO prefix) but the 16-B data region per block
     /// contains 4x32-bit E8 lattice codewords (8 weights/codeword), not E2M1 nibbles.
     /// x must already be FWHT-rotated. Decodes block scale as E4M3, then E8 coords * 0.88.
@@ -3177,9 +3187,15 @@ impl Gpu {
             // (same memory access, gutted decode) to measure the compute ceiling.
             // Output is garbage — perf-probe only.
             let (kname, ksrc) = if e8_strip_enabled() {
-                ("gemv_mfp4g32_e8_strip_gfx1151", kernels::GEMV_MFP4G32_E8_STRIP_GFX1151_SRC)
+                (
+                    "gemv_mfp4g32_e8_strip_gfx1151",
+                    kernels::GEMV_MFP4G32_E8_STRIP_GFX1151_SRC,
+                )
             } else {
-                ("gemv_mfp4g32_e8_gfx1151", kernels::GEMV_MFP4G32_E8_GFX1151_SRC)
+                (
+                    "gemv_mfp4g32_e8_gfx1151",
+                    kernels::GEMV_MFP4G32_E8_GFX1151_SRC,
+                )
             };
             self.ensure_kernel(kname, ksrc, kname)?;
             let a_ptr = a_raw.buf.as_ptr();
@@ -3207,7 +3223,11 @@ impl Gpu {
             };
         }
 
-        self.ensure_kernel("gemv_mfp4g32_e8", kernels::GEMV_MFP4G32_E8_SRC, "gemv_mfp4g32_e8")?;
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8",
+            kernels::GEMV_MFP4G32_E8_SRC,
+            "gemv_mfp4g32_e8",
+        )?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -3263,9 +3283,14 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k % 256 == 0, "fused_gate_up_mfp4g32_e8 requires K%256==0, got K={k}");
-        debug_assert!(self.arch_caps.is_gfx1151(),
-            "fused_gate_up_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        assert!(
+            k % 256 == 0,
+            "fused_gate_up_mfp4g32_e8 requires K%256==0, got K={k}"
+        );
+        debug_assert!(
+            self.arch_caps.is_gfx1151(),
+            "fused_gate_up_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)"
+        );
         self.ensure_kernel(
             "fused_gate_up_mfp4g32_e8_gfx1151",
             kernels::FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC,
@@ -3325,9 +3350,14 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k % 256 == 0, "fused_qkvza_mfp4g32_e8 requires K%256==0, got K={k}");
-        debug_assert!(self.arch_caps.is_gfx1151(),
-            "fused_qkvza_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)");
+        assert!(
+            k % 256 == 0,
+            "fused_qkvza_mfp4g32_e8 requires K%256==0, got K={k}"
+        );
+        debug_assert!(
+            self.arch_caps.is_gfx1151(),
+            "fused_qkvza_mfp4g32_e8 is gfx1151-only (guard must firewall the arch)"
+        );
         self.ensure_kernel(
             "fused_qkvza_mfp4g32_e8_gfx1151",
             kernels::FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC,
@@ -3388,7 +3418,10 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k % 256 == 0, "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}");
+        assert!(
+            k % 256 == 0,
+            "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}"
+        );
 
         if self.arch_caps.is_gfx1151() {
             self.ensure_kernel(
@@ -3421,7 +3454,11 @@ impl Gpu {
         }
 
         // Generic fallback for non-gfx1151
-        self.ensure_kernel("gemv_mfp4g32_e8_soa", kernels::GEMV_MFP4G32_E8_SOA_SRC, "gemv_mfp4g32_e8_soa")?;
+        self.ensure_kernel(
+            "gemv_mfp4g32_e8_soa",
+            kernels::GEMV_MFP4G32_E8_SOA_SRC,
+            "gemv_mfp4g32_e8_soa",
+        )?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -3486,20 +3523,80 @@ impl Gpu {
     }
 
     /// SoA E8 GEMV, 4-way unroll (bench experiment — cache-roofline MLP sweep).
-    pub fn gemv_mfp4g32_e8_soa_u4(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_u4", kernels::GEMV_MFP4G32_E8_SOA_U4_SRC, a, x, y, m, k)
+    pub fn gemv_mfp4g32_e8_soa_u4(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant(
+            "gemv_mfp4g32_e8_soa_u4",
+            kernels::GEMV_MFP4G32_E8_SOA_U4_SRC,
+            a,
+            x,
+            y,
+            m,
+            k,
+        )
     }
     /// SoA E8 GEMV, 8-way unroll (bench experiment — cache-roofline MLP sweep).
-    pub fn gemv_mfp4g32_e8_soa_u8(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_u8", kernels::GEMV_MFP4G32_E8_SOA_U8_SRC, a, x, y, m, k)
+    pub fn gemv_mfp4g32_e8_soa_u8(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant(
+            "gemv_mfp4g32_e8_soa_u8",
+            kernels::GEMV_MFP4G32_E8_SOA_U8_SRC,
+            a,
+            x,
+            y,
+            m,
+            k,
+        )
     }
     /// SoA E8 GEMV, lattice-decode STRIPPED (bench probe — compute ceiling, garbage out).
-    pub fn gemv_mfp4g32_e8_soa_strip(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_strip", kernels::GEMV_MFP4G32_E8_SOA_STRIP_SRC, a, x, y, m, k)
+    pub fn gemv_mfp4g32_e8_soa_strip(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant(
+            "gemv_mfp4g32_e8_soa_strip",
+            kernels::GEMV_MFP4G32_E8_SOA_STRIP_SRC,
+            a,
+            x,
+            y,
+            m,
+            k,
+        )
     }
     /// SoA E8 GEMV, LUT-based coordinate decode (bench experiment).
-    pub fn gemv_mfp4g32_e8_soa_lut(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.gemv_mfp4g32_e8_soa_variant("gemv_mfp4g32_e8_soa_lut", kernels::GEMV_MFP4G32_E8_SOA_LUT_SRC, a, x, y, m, k)
+    pub fn gemv_mfp4g32_e8_soa_lut(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8_soa_variant(
+            "gemv_mfp4g32_e8_soa_lut",
+            kernels::GEMV_MFP4G32_E8_SOA_LUT_SRC,
+            a,
+            x,
+            y,
+            m,
+            k,
+        )
     }
 
     /// mfp4-E8 SoA prerotated (x already FWHT-rotated by caller).
@@ -4174,7 +4271,6 @@ impl Gpu {
         }
     }
 
-
     /// HFQ6-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq6g256(
         &mut self,
@@ -4245,7 +4341,6 @@ impl Gpu {
             )
         }
     }
-
 
     /// HFQ8-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq8g256(
@@ -5122,7 +5217,6 @@ impl Gpu {
         result
     }
 
-
     /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in a
     /// single launch. Caller passes the 8 selected experts' weight
     /// tensors (in top-K order); the kernel's grid.y picks which expert
@@ -5464,13 +5558,14 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 or RDNA4");
+        debug_assert!(
+            self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 or RDNA4"
+        );
         // SoA path (decode): when experts were transposed AoS->SoA at load. Same
         // batched kernel interface (this launcher runs it with batch=1).
         let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
-        let use_dgpu_twin =
-            !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let use_dgpu_twin = !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
         let (kname, ksrc, kfn) = if use_soa {
             (
                 "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
@@ -5509,25 +5604,18 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            kname,
-            [m as u32, 8, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(kt_val);
-                b
-            },
-        )
+        self.launch_maybe_blob(kname, [m as u32, 8, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(ip);
+            b.push_ptr(xp);
+            b.push_ptr(ygp);
+            b.push_ptr(yup);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(kt_val);
+            b
+        })
     }
 
     /// Batched mfp4-E8 grouped MoE gate_up (k8 indexed). Same kernel as the decode
@@ -5551,14 +5639,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
-            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 or RDNA4");
+        debug_assert!(
+            self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 or RDNA4"
+        );
         // SoA-coalesced path takes priority when experts were transposed AoS->SoA at
         // load (RDNA3 dGPU + HIPFIRE_E8_SOA_EXPERTS=1). Same params/grid as the AoS
         // kernel; only the in-weight addressing differs.
         let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
-        let use_dgpu_twin =
-            !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
+        let use_dgpu_twin = !use_soa && self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
         let (kname, ksrc, kfn) = if use_soa {
             (
                 "gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched",
@@ -5635,8 +5724,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
-            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 or RDNA4");
+        debug_assert!(
+            self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 or RDNA4"
+        );
         let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
         let (kname, ksrc, kfn) = if use_dgpu_twin {
             (
@@ -5692,6 +5783,14 @@ impl Gpu {
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
     #[allow(clippy::too_many_arguments)]
+    /// `n_ranks` is the number of top-k ranks (grid.y workgroups) this launch
+    /// drives. In the uniform decode path it is the full `k` (=8); in the
+    /// mixed-tier path it is a per-tier bucket size (`n < 8`, possibly with a
+    /// non-zero base offset baked into the sub-viewed tensors). The kernel reads
+    /// `topk_indices[blockIdx.y]` and writes `y_gate/y_up[blockIdx.y*mi+…]`, so
+    /// launching `n_ranks` workgroups runs exactly ranks `0..n_ranks` — never
+    /// past the (sub-viewed) buffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
@@ -5701,6 +5800,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
@@ -5750,8 +5850,13 @@ impl Gpu {
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             bytes,
         );
-        let result =
-            self.launch_maybe_blob(func_name, [grid_x, 8, 1], block, 0, &mut params, || {
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid_x, n_ranks as u32, 1],
+            block,
+            0,
+            &mut params,
+            || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(pp);
                 b.push_ptr(ip);
@@ -5761,7 +5866,8 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b
-            });
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5771,6 +5877,9 @@ impl Gpu {
     /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV.
     /// wave32-only (gfx10/11/12) — no wave64 path yet because ParoQuant
     /// A3B is not currently validated on gfx94x.
+    /// `n_ranks` sets grid.y (the number of top-k ranks driven); see
+    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` for the uniform-vs-mixed contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_paro_q4g128_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
@@ -5780,6 +5889,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -5812,7 +5922,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_paro_q4g128_moe_gate_up_k8_indexed",
-            [m as u32, 8, 1],
+            [m as u32, n_ranks as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -6446,6 +6556,9 @@ impl Gpu {
     /// MQ4→MQ6 promotion) on the device-side top-K path under hipGraph
     /// capture.
     #[allow(clippy::too_many_arguments)]
+    /// `n_ranks` sets grid.y (the number of top-k ranks driven); see
+    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` for the uniform-vs-mixed contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq6g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -6455,6 +6568,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -6491,7 +6605,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_hfq6g256_moe_gate_up_k8_indexed",
-            [m as u32, 8, 1],
+            [m as u32, n_ranks as u32, 1],
             [32u32, 1, 1],
             0,
             &mut params,
@@ -6581,7 +6695,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// HFQ6G256 batched gate_up MoE GEMV. Same kernarg signature + grid
     /// (M, K_TOP, N) + gate/up output split as the HFQ4 batched gate_up
@@ -6811,7 +6924,6 @@ impl Gpu {
         result
     }
 
-
     /// HFQ6G256 counterpart to `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
     /// Atomic-free expand-then-combine for the MoE down step. Pairs with
     /// `moe_down_combine_k8_batched` (dtype-independent — operates on the
@@ -7024,7 +7136,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     pub fn gemv_q8_0(
@@ -7358,6 +7469,58 @@ impl Gpu {
 
         self.launch_maybe_blob(
             "gemv_f16_xf32",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
+    /// BF16-weight × F32-input GEMV (native-bf16 reference / KLD oracle).
+    /// Same shape contract as `gemv_f16_xf32`; the kernel widens bf16→f32
+    /// losslessly (16-bit shift) per element. arch_id 12 (Cohere2-MoE).
+    pub fn gemv_bf16_xf32(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_bf16_xf32",
+            kernels::GEMV_BF16_XF32_SRC,
+            "gemv_bf16_xf32",
+        )?;
+
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(w_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
+
+        self.launch_maybe_blob(
+            "gemv_bf16_xf32",
             [m as u32, 1, 1],
             [32, 1, 1],
             0,

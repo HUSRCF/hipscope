@@ -136,14 +136,12 @@ impl GraphState {
     }
 
     /// Replay the captured graph.
-    pub fn graph_launch(
-        &self,
-        hip: &HipRuntime,
-        device_id: i32,
-        stream: &Stream,
-    ) -> HipResult<()> {
+    pub fn graph_launch(&self, hip: &HipRuntime, device_id: i32, stream: &Stream) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        let exec = self.graph_exec.as_ref().expect("no captured graph to replay");
+        let exec = self
+            .graph_exec
+            .as_ref()
+            .expect("no captured graph to replay");
         hip.graph_launch(exec, stream)
     }
 
@@ -227,11 +225,15 @@ impl GraphState {
         b: usize,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        debug_assert!(self.verify.capturing.is_none(),
+        debug_assert!(
+            self.verify.capturing.is_none(),
             "begin_verify_graph_capture: already capturing for b={:?}",
-            self.verify.capturing);
-        debug_assert!(!self.capture_mode,
-            "begin_verify_graph_capture: capture_mode already set");
+            self.verify.capturing
+        );
+        debug_assert!(
+            !self.capture_mode,
+            "begin_verify_graph_capture: capture_mode already set"
+        );
         self.capture_blobs.clear();
         // A verify forward is about to run on the shared buffers — invalidate the
         // plain-AR graph so it can't replay across this spec excursion (the next
@@ -253,7 +255,10 @@ impl GraphState {
         stream: &Stream,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        let b = self.verify.capturing.take()
+        let b = self
+            .verify
+            .capturing
+            .take()
             .expect("end_verify_graph_capture without matching begin");
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
@@ -272,7 +277,10 @@ impl GraphState {
         b: usize,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        let entry = self.verify.cache.get(&b)
+        let entry = self
+            .verify
+            .cache
+            .get(&b)
             .unwrap_or_else(|| panic!("no captured verify graph for b={}", b));
         hip.graph_launch(&entry.1, stream)
     }
@@ -330,11 +338,15 @@ impl GraphState {
         n_steps: usize,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        debug_assert!(self.replay.capturing.is_none(),
+        debug_assert!(
+            self.replay.capturing.is_none(),
             "begin_replay_graph_capture: already capturing for n_steps={:?}",
-            self.replay.capturing);
-        debug_assert!(!self.capture_mode,
-            "begin_replay_graph_capture: capture_mode already set");
+            self.replay.capturing
+        );
+        debug_assert!(
+            !self.capture_mode,
+            "begin_replay_graph_capture: capture_mode already set"
+        );
         self.capture_blobs.clear();
         self.replay.capturing = Some(n_steps);
         self.capture_mode = true;
@@ -349,7 +361,10 @@ impl GraphState {
         stream: &Stream,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        let n_steps = self.replay.capturing.take()
+        let n_steps = self
+            .replay
+            .capturing
+            .take()
             .expect("end_replay_graph_capture without matching begin");
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
@@ -368,7 +383,10 @@ impl GraphState {
         n_steps: usize,
     ) -> HipResult<()> {
         bind_thread(hip, device_id)?;
-        let entry = self.replay.cache.get(&n_steps)
+        let entry = self
+            .replay
+            .cache
+            .get(&n_steps)
             .unwrap_or_else(|| panic!("no captured replay graph for n_steps={}", n_steps));
         hip.graph_launch(&entry.1, stream)
     }

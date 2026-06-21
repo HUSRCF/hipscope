@@ -138,11 +138,20 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 /// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
 fn default_mtp_p_min(arch: &str) -> f32 {
     if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
-        return v.trim().parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x)).unwrap_or(0.0);
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|x| (0.0..=1.0).contains(x))
+            .unwrap_or(0.0);
     }
     // is_rdna3_dgpu arch set (wide-BW GDDR6 dGPU); the iGPUs + gfx1103 APU are
     // deliberately excluded — p_min there is unvalidated.
-    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") { 0.6 } else { 0.0 }
+    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") {
+        0.6
+    } else {
+        0.0
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1412,10 +1421,7 @@ pub fn spec_step_mtp(
     // tracks exactly whether the tape was written this cycle. Mirror
     // compressed_serial (lines 2604-2616) and DFlash (speculative.rs:3452-3456).
     let n_verify = max_n + 1;
-    let moe_router_logits_present = state
-        .trunk_pbs
-        .moe_router_logits_batch
-        .is_some();
+    let moe_router_logits_present = state.trunk_pbs.moe_router_logits_batch.is_some();
     let tape_captured = qwen35::prefill_batch_pbs_eligible(
         trunk_weights,
         &target.config,

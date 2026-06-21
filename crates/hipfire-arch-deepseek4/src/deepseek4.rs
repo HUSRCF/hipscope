@@ -96,6 +96,17 @@ pub struct DeepseekV4Config {
 
     // ── hash-routing (DeepSeek V4-only) ─────────────────────────────────
     pub num_hash_layers: usize,
+
+    // ── REAP keep-map (optional expert-pruning emulation) ───────────────
+    /// When set (via `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir>`), the loader
+    /// keeps only `keep[l]` of the original routed experts per layer,
+    /// packed into compact slots `0..kept_per_layer`, and overrides
+    /// `n_routed_experts` to that kept count. Lets us emulate a
+    /// REAP-pruned checkpoint (e.g. 0xSero 162B, 256→144) by partial-load
+    /// of an existing full quant — no re-quant. Not (de)serialized;
+    /// populated at load time from the sidecar.
+    #[serde(skip)]
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -170,7 +181,7 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
-        Ok(DeepseekV4Config {
+        let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
             num_hidden_layers: raw.num_hidden_layers,
@@ -210,9 +221,33 @@ impl DeepseekV4Config {
             sliding_window: raw.sliding_window,
             num_nextn_predict_layers: raw.num_nextn_predict_layers,
             num_hash_layers: raw.num_hash_layers,
-        })
+            reap_keep: None,
+        };
+        // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
+        // 256→144) by partial-loading this full quant. Read BEFORE the
+        // n_routed_experts override so validation sees the original count.
+        // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
+        // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
+        // honored as a keep-only alias via ReapPlan::load_any.
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+            "deepseek4",
+            Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
+            config.num_hidden_layers,
+            config.n_routed_experts,
+        )? {
+            config.n_routed_experts = plan.kept_per_layer();
+            config.reap_keep = Some(std::sync::Arc::new(plan));
+        }
+        Ok(config)
     }
 }
+
+/// DeepSeek-V4-specific REAP extras. The generic `hipfire-reap` plan owns the
+/// keep-map; this hook owns the arch-specific sidecar layout — here, the
+/// remapped hash-router `tid2eid` tables that live alongside the plan dir.
+pub struct Ds4ReapHook;
+
+impl hipfire_reap::hook::ReapArchHook for Ds4ReapHook {}
 
 /// Per-layer GPU-resident weights. Slots match DeepSeek V4 shipped tensor
 /// inventory; each is `Option<GpuTensor>` so partial-upload paths
@@ -353,6 +388,16 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
+
+    /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
+    /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
+    /// here so it is reclaimed by `free_gpu` on unload and by the staging guard
+    /// on a mid-load failure; `None` for single-GPU / fully-owned shards. Must
+    /// outlive the device pointer table (`expert_gate_up_ptrs`) that bakes its
+    /// address. Mirrors `MiniMaxLayerWeights::dummy_gate_up`. GpuTensor has no
+    /// Drop, so this MUST be threaded into the layer (previously
+    /// `std::mem::forget`-leaked).
+    pub expert_gate_up_dummy: Option<rdna_compute::GpuTensor>,
 }
 
 impl DeepseekV4LayerWeights {
@@ -417,6 +462,7 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
+            expert_gate_up_dummy: None,
         }
     }
 
@@ -480,6 +526,11 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.expert_w3_ptrs);
         free_opt(gpu, &mut self.expert_gate_up_blob);
         free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
+        // Freed last so the pointer table that baked its address is already
+        // gone — no live aliasing into a returned buffer. No double-free: this
+        // is the sole owner.
+        free_opt(gpu, &mut self.expert_gate_up_dummy);
     }
 }
 

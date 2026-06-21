@@ -73,6 +73,8 @@
 //!   `+= 1.0` offset (see `load_norm_weight_raw`).
 
 pub mod arch;
+pub mod carrier;
 pub mod qwen2;
 
 pub use arch::Qwen2;
+pub use carrier::{load_bundle as load_qwen2_bundle, Qwen2Bundle};

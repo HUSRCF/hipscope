@@ -25,11 +25,11 @@ fn main() {
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
         //     moe_intermediate=512 — qwen35.rs:170,204) ---
         (1024, 2048, "A3B gate_up M=1024 K=2048 (expert)"), // M=2*moe_int, K=hidden, groups=8
-        (2048,  512, "A3B down    M=2048 K=512  (expert)"), // M=hidden, K=moe_int, groups=2
+        (2048, 512, "A3B down    M=2048 K=512  (expert)"),  // M=hidden, K=moe_int, groups=2
         // --- large-dense reference (where the SoA-coalescing wins showed up;
         //     crosses the 96 MB L3 boundary at ~91k rows) ---
-        (11008,  2048, "dense gate_up M=11008 K=2048"),
-        (32768,  2048, "sweep        M=32768  K=2048  (L3)"),
+        (11008, 2048, "dense gate_up M=11008 K=2048"),
+        (32768, 2048, "sweep        M=32768  K=2048  (L3)"),
         (131072, 2048, "sweep        M=131072 K=2048  (VRAM)"),
     ];
 
@@ -42,8 +42,12 @@ fn main() {
     let aos_data = synth_e8_aos(m, k, 0xDEAD_BEEF);
     let soa_data = aos_to_soa_full(&aos_data, m, k);
 
-    let aos_w = gpu.upload_raw(&aos_data, &[aos_data.len()]).expect("upload AoS");
-    let soa_w = gpu.upload_raw(&soa_data, &[soa_data.len()]).expect("upload SoA");
+    let aos_w = gpu
+        .upload_raw(&aos_data, &[aos_data.len()])
+        .expect("upload AoS");
+    let soa_w = gpu
+        .upload_raw(&soa_data, &[soa_data.len()])
+        .expect("upload SoA");
     let x = gpu.alloc_tensor(&[k], DType::F32).expect("alloc x");
     let y_aos = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y_aos");
     let y_soa = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y_soa");
@@ -51,28 +55,40 @@ fn main() {
     let xh = make_x(k, 0x1234_5678);
     gpu.hip.memcpy_htod(&x.buf, bytes_of(&xh)).unwrap();
 
-    gpu.gemv_mfp4g32_e8(&aos_w, &x, &y_aos, m, k).expect("AoS GEMV");
-    gpu.gemv_mfp4g32_e8_soa(&soa_w, &x, &y_soa, m, k).expect("SoA GEMV");
+    gpu.gemv_mfp4g32_e8(&aos_w, &x, &y_aos, m, k)
+        .expect("AoS GEMV");
+    gpu.gemv_mfp4g32_e8_soa(&soa_w, &x, &y_soa, m, k)
+        .expect("SoA GEMV");
     gpu.hip.device_synchronize().unwrap();
 
     let mut res_aos = vec![0f32; m];
     let mut res_soa = vec![0f32; m];
-    gpu.hip.memcpy_dtoh(bytes_of_mut(&mut res_aos), &y_aos.buf).unwrap();
-    gpu.hip.memcpy_dtoh(bytes_of_mut(&mut res_soa), &y_soa.buf).unwrap();
+    gpu.hip
+        .memcpy_dtoh(bytes_of_mut(&mut res_aos), &y_aos.buf)
+        .unwrap();
+    gpu.hip
+        .memcpy_dtoh(bytes_of_mut(&mut res_soa), &y_soa.buf)
+        .unwrap();
 
     let mut all_exact = true;
     let mut n_diff = 0usize;
     for i in 0..m {
         if res_aos[i].to_bits() != res_soa[i].to_bits() {
             if n_diff < 3 {
-                eprintln!("  MISMATCH at i={}: aos={} soa={}", i, res_aos[i], res_soa[i]);
+                eprintln!(
+                    "  MISMATCH at i={}: aos={} soa={}",
+                    i, res_aos[i], res_soa[i]
+                );
             }
             n_diff += 1;
             all_exact = false;
         }
     }
     if all_exact {
-        eprintln!("  CORRECTNESS PASS: SoA output == AoS output (bit-exact, {} outputs)", m);
+        eprintln!(
+            "  CORRECTNESS PASS: SoA output == AoS output (bit-exact, {} outputs)",
+            m
+        );
     } else {
         // SoA reorders the per-group reduction → low-FP-bit differences are expected
         // (e.g. -123.679184 vs -123.67917, ~1e-7 relative). Not a real failure; the
@@ -85,7 +101,9 @@ fn main() {
     eprintln!("--- Perf bench: MQ4(E8 AoS) vs E8-SoA-2w vs SoA-strip(decode off) vs SoA-LUT — GB/s (% of {:.0} VRAM) ---", VRAM_GBPS);
     eprintln!("  MQ4 = plain uniform HFQ4-G256 (136 B/group, gemv_hfq4g256); E8 columns = mfp4-G32 (17 B/block).");
     eprintln!("  Same-shape, weight-bytes-only denominator → MQ4 GB/s is directly comparable to the E8 AoS column.");
-    eprintln!("  L3-resident rows (weights < 96MB) read from Infinity Cache (~3500 GB/s) after warmup.");
+    eprintln!(
+        "  L3-resident rows (weights < 96MB) read from Infinity Cache (~3500 GB/s) after warmup."
+    );
     eprintln!(
         "  {:<34}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
         "shape", "MQ4", "E8-AoS", "E8-SoA-2w", "E8-strip", "E8-LUT", "resid"
@@ -111,10 +129,14 @@ fn main() {
         // warmup + timed trials → GB/s for the named gemv method on a given buffer
         macro_rules! gbps {
             ($method:ident, $w:expr, $bytes:expr) => {{
-                for _ in 0..warmup { gpu.$method($w, &x, &y, m, k).unwrap(); }
+                for _ in 0..warmup {
+                    gpu.$method($w, &x, &y, m, k).unwrap();
+                }
                 gpu.hip.device_synchronize().unwrap();
                 let t = Instant::now();
-                for _ in 0..trials { gpu.$method($w, &x, &y, m, k).unwrap(); }
+                for _ in 0..trials {
+                    gpu.$method($w, &x, &y, m, k).unwrap();
+                }
                 gpu.hip.device_synchronize().unwrap();
                 let us = t.elapsed().as_secs_f64() * 1e6 / trials as f64;
                 $bytes as f64 / (us * 1e-6) / 1e9
@@ -128,29 +150,46 @@ fn main() {
         let mq4_total = mq4_data.len(); // == profile::hfq4g256_weight_bytes(m,k)
         let mq4_w = gpu.upload_raw(&mq4_data, &[mq4_total]).unwrap();
 
-        let mq4   = gbps!(gemv_hfq4g256, &mq4_w, mq4_total);
-        let aos   = gbps!(gemv_mfp4g32_e8, &aos_w, aos_total);
-        let soa2  = gbps!(gemv_mfp4g32_e8_soa, &soa_w, soa_total);
+        let mq4 = gbps!(gemv_hfq4g256, &mq4_w, mq4_total);
+        let aos = gbps!(gemv_mfp4g32_e8, &aos_w, aos_total);
+        let soa2 = gbps!(gemv_mfp4g32_e8_soa, &soa_w, soa_total);
         let strip = gbps!(gemv_mfp4g32_e8_soa_strip, &soa_w, soa_total);
-        let lut   = gbps!(gemv_mfp4g32_e8_soa_lut, &soa_w, soa_total);
+        let lut = gbps!(gemv_mfp4g32_e8_soa_lut, &soa_w, soa_total);
 
         let cell = |g: f64| format!("{:4.0}({:3.0}%)", g, g / VRAM_GBPS * 100.0);
         eprintln!(
             "  {:<34}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>5}",
-            label, cell(mq4), cell(aos), cell(soa2), cell(strip), cell(lut), resid
+            label,
+            cell(mq4),
+            cell(aos),
+            cell(soa2),
+            cell(strip),
+            cell(lut),
+            resid
         );
     }
 
     eprintln!();
-    eprintln!("  cells = GB/s (% of {:.0} GB/s VRAM). L3-resident rows: true ceiling ~3500 GB/s.", VRAM_GBPS);
+    eprintln!(
+        "  cells = GB/s (% of {:.0} GB/s VRAM). L3-resident rows: true ceiling ~3500 GB/s.",
+        VRAM_GBPS
+    );
     eprintln!("  E8-strip = lattice-decode REMOVED (garbage out) = loads+scale+reduce ceiling.");
     eprintln!("  strip >> SoA-2w on L3 → decode-compute-bound; SoA-LUT≈strip → LUT is the win; LUT≈SoA-2w → parity/extract is the wall.");
     eprintln!();
     eprintln!("  H1 keystone (mq4 vs E8, weight bytes / row, from profile.rs):");
-    eprintln!("    A3B gate_up K=2048: MQ4 8*136=1088 B/row  vs  E8 16+64*17=1104 B/row  (E8 +1.5%)");
-    eprintln!("    A3B down    K=512 : MQ4 2*136= 272 B/row  vs  E8 16+16*17= 288 B/row  (E8 +5.9%)");
-    eprintln!("    If decode is memory-bound, MQ4 and E8-AoS GB/s should track within ~2-6% at the");
-    eprintln!("    A3B rows → the 150-vs-102 tok/s spread is NOT raw format bytes (it's layout/indexed");
+    eprintln!(
+        "    A3B gate_up K=2048: MQ4 8*136=1088 B/row  vs  E8 16+64*17=1104 B/row  (E8 +1.5%)"
+    );
+    eprintln!(
+        "    A3B down    K=512 : MQ4 2*136= 272 B/row  vs  E8 16+16*17= 288 B/row  (E8 +5.9%)"
+    );
+    eprintln!(
+        "    If decode is memory-bound, MQ4 and E8-AoS GB/s should track within ~2-6% at the"
+    );
+    eprintln!(
+        "    A3B rows → the 150-vs-102 tok/s spread is NOT raw format bytes (it's layout/indexed"
+    );
     eprintln!("    -context dilution for E8, and the graded MQ6-on-hot-experts traffic for mq4p).");
 
     // LUT decode must be bit-exact with the scalar SoA decode (same coordinates).
@@ -171,8 +210,14 @@ fn main() {
         let mut rl = vec![0f32; m];
         gpu.hip.memcpy_dtoh(bytes_of_mut(&mut r2), &y2.buf).unwrap();
         gpu.hip.memcpy_dtoh(bytes_of_mut(&mut rl), &yl.buf).unwrap();
-        let nd = (0..m).filter(|&i| r2[i].to_bits() != rl[i].to_bits()).count();
-        eprintln!("  LUT-decode correctness vs scalar SoA: {} / {} bit-exact", m - nd, m);
+        let nd = (0..m)
+            .filter(|&i| r2[i].to_bits() != rl[i].to_bits())
+            .count();
+        eprintln!(
+            "  LUT-decode correctness vs scalar SoA: {} / {} bit-exact",
+            m - nd,
+            m
+        );
     }
 }
 
@@ -216,7 +261,9 @@ fn synth_e8_aos(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut rng = || -> u32 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -252,7 +299,9 @@ fn synth_hfq4g256(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut rng = || -> u32 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -273,10 +322,14 @@ fn synth_hfq4g256(m: usize, k: usize, seed: u64) -> Vec<u8> {
 
 fn make_x(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((state >> 33) as f32) * 2.3e-10 - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) * 2.3e-10 - 0.5
+        })
+        .collect()
 }
 
 fn bytes_of(v: &[f32]) -> &[u8] {

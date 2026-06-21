@@ -15,7 +15,7 @@
 //! Run: HIP_VISIBLE_DEVICES=1 cargo run --release -p rdna-compute \
 //!        --example test_moe_grouped_wmma_e8
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -71,7 +71,10 @@ fn f32_from_h16(h: u16) -> f32 {
     } else if exp == 0 {
         let mut m = mant;
         let mut e: i32 = -14;
-        while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         m &= 0x3ff;
         ((sign as u32) << 31) | (((e + 127) as u32) << 23) | (m << 13)
     } else if exp == 0x1f {
@@ -88,8 +91,12 @@ fn f32_from_h16(h: u16) -> f32 {
 fn cvt_e4m3_scale_to_f32(b: u8) -> f32 {
     let exp = ((b >> 3) & 0xF) as i32;
     let mant = (b & 0x7) as u32;
-    if exp == 0 { return 0.015625 * (mant as f32) * 0.125; }
-    if exp == 0xF && mant == 7 { return 448.0; }
+    if exp == 0 {
+        return 0.015625 * (mant as f32) * 0.125;
+    }
+    if exp == 0xF && mant == 7 {
+        return 448.0;
+    }
     let pow2 = f32::from_bits(((exp + 120) as u32) << 23);
     pow2 * (1.0 + (mant as f32) * 0.125)
 }
@@ -98,7 +105,10 @@ fn e8_decode_index(idx: u32) -> [f32; 8] {
     let coset = ((idx >> 31) & 1) as i32;
     let mut e = [0u32; 8];
     let mut sl = 0u32;
-    for i in 0..7 { e[i] = (idx >> (4 * i as u32)) & 0xF; sl = sl.wrapping_add(e[i]); }
+    for i in 0..7 {
+        e[i] = (idx >> (4 * i as u32)) & 0xF;
+        sl = sl.wrapping_add(e[i]);
+    }
     let e7_high = (idx >> 28) & 0x7;
     let p7 = e7_high << 1;
     let lsb = (sl.wrapping_add(p7)) & 1;
@@ -112,25 +122,36 @@ fn e8_decode_index(idx: u32) -> [f32; 8] {
 }
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod u8");
     t
 }
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc f32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod f32");
     t
 }
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len() * 4], DType::Raw).expect("alloc i32");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 4], DType::Raw)
+        .expect("alloc i32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod i32");
     t
 }
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-    let t = gpu.alloc_tensor(&[data.len() * 8], DType::Raw).expect("alloc u64");
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
+    let t = gpu
+        .alloc_tensor(&[data.len() * 8], DType::Raw)
+        .expect("alloc u64");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod u64");
     t
 }
@@ -141,7 +162,8 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 }
 fn download_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
     gpu.hip.memcpy_dtoh(bytes, &t.buf).expect("dtoh");
     data
 }
@@ -189,7 +211,12 @@ fn dequant_e8_row_fp16(row: &[u8], k: usize) -> Vec<f32> {
         let ssc = row_scale * cvt_e4m3_scale_to_f32(blocks[boff]) * 0.88;
         for cw_idx in 0..4 {
             let cwoff = boff + 1 + cw_idx * 4;
-            let cw = u32::from_le_bytes([blocks[cwoff], blocks[cwoff + 1], blocks[cwoff + 2], blocks[cwoff + 3]]);
+            let cw = u32::from_le_bytes([
+                blocks[cwoff],
+                blocks[cwoff + 1],
+                blocks[cwoff + 2],
+                blocks[cwoff + 3],
+            ]);
             let p = e8_decode_index(cw);
             for j in 0..8 {
                 out[blk * 32 + cw_idx * 8 + j] = fp32_to_fp16_to_fp32(p[j] * ssc);
@@ -209,32 +236,51 @@ fn build_x_f32(n: usize, k: usize, seed: u32) -> Vec<f32> {
 }
 
 fn cpu_reference(
-    expert_weights: &[Vec<u8>], x: &[f32], x_row_div: usize,
-    sorted: &[i32], tile_ids: &[i32], m: usize, k: usize, m_total: usize,
+    expert_weights: &[Vec<u8>],
+    x: &[f32],
+    x_row_div: usize,
+    sorted: &[i32],
+    tile_ids: &[i32],
+    m: usize,
+    k: usize,
+    m_total: usize,
 ) -> Vec<f32> {
     let mut y = vec![0f32; m_total * m];
     let tiles = m_total / 16;
     let row_bytes = 16 + (k / 32) * 17;
-    let dequant: Vec<Vec<f32>> = expert_weights.iter().map(|w| {
-        let mut acc = Vec::with_capacity(m * k);
-        for row in 0..m {
-            let off = row * row_bytes;
-            acc.extend_from_slice(&dequant_e8_row_fp16(&w[off..off + row_bytes], k));
-        }
-        acc
-    }).collect();
+    let dequant: Vec<Vec<f32>> = expert_weights
+        .iter()
+        .map(|w| {
+            let mut acc = Vec::with_capacity(m * k);
+            for row in 0..m {
+                let off = row * row_bytes;
+                acc.extend_from_slice(&dequant_e8_row_fp16(&w[off..off + row_bytes], k));
+            }
+            acc
+        })
+        .collect();
     let x_f16: Vec<f32> = x.iter().map(|&v| fp32_to_fp16_to_fp32(v)).collect();
     for tile_y in 0..tiles {
         let expert = tile_ids[tile_y];
-        if expert < 0 { continue; }
+        if expert < 0 {
+            continue;
+        }
         let dq = &dequant[expert as usize];
         let slot_start = tile_y * 16;
         for lane in 0..16 {
             let slot_idx = slot_start + lane;
-            if slot_idx >= m_total { continue; }
+            if slot_idx >= m_total {
+                continue;
+            }
             let flat = sorted[slot_idx];
-            if flat < 0 { continue; }
-            let x_row = if x_row_div > 1 { (flat as usize) / x_row_div } else { flat as usize };
+            if flat < 0 {
+                continue;
+            }
+            let x_row = if x_row_div > 1 {
+                (flat as usize) / x_row_div
+            } else {
+                flat as usize
+            };
             for mi in 0..m {
                 let mut acc = 0f64;
                 let dq_off = mi * k;
@@ -249,8 +295,19 @@ fn cpu_reference(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) -> bool {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    seed_w: u32,
+    seed_x: u32,
+) -> bool {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0 && m_total % 16 == 0);
 
     let mut gpu = Gpu::init().expect("Gpu::init");
@@ -277,7 +334,9 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
 
     let sorted: Vec<i32> = (0..m_total as i32).collect();
     let sorted_slot_index = upload_i32(&mut gpu, &sorted);
-    let tile_ids: Vec<i32> = (0..(m_total / 16)).map(|t| (t % num_experts) as i32).collect();
+    let tile_ids: Vec<i32> = (0..(m_total / 16))
+        .map(|t| (t % num_experts) as i32)
+        .collect();
     let expert_tile_ids = upload_i32(&mut gpu, &tile_ids);
 
     let x_f32 = build_x_f32(m_total, k, seed_x);
@@ -285,13 +344,31 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     let y_gpu = alloc_f32_zeros(&mut gpu, m_total * m);
 
     gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
-        &expert_weight_ptrs, &expert_tile_ids, &sorted_slot_index,
-        &x_src, &y_gpu, m, k, 1, m_total, m_total,
-    ).expect("e8 grouped kernel launch");
+        &expert_weight_ptrs,
+        &expert_tile_ids,
+        &sorted_slot_index,
+        &x_src,
+        &y_gpu,
+        m,
+        k,
+        1,
+        m_total,
+        m_total,
+    )
+    .expect("e8 grouped kernel launch");
     gpu.hip.device_synchronize().expect("sync");
 
     let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
-    let y_ref = cpu_reference(&expert_weights, &x_f32, 1, &sorted, &tile_ids, m, k, m_total);
+    let y_ref = cpu_reference(
+        &expert_weights,
+        &x_f32,
+        1,
+        &sorted,
+        &tile_ids,
+        m,
+        k,
+        m_total,
+    );
 
     // Combined abs+rel tolerance: an element is a violation only when its error
     // exceeds BOTH bands. The kernel runs FP32-accumulated WMMA on f16 inputs;
@@ -309,15 +386,38 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     for (i, (a, b)) in y_ref.iter().zip(y_gpu_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if a.abs() > 1e-4 { d / a.abs() } else { 0.0 };
-        if d > max_abs { max_abs = d; argmax = i; }
-        if r > max_rel { max_rel = r; }
-        if d > ABS_TOL + REL_TOL * a.abs() { violations += 1; }
+        if d > max_abs {
+            max_abs = d;
+            argmax = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+        }
+        if d > ABS_TOL + REL_TOL * a.abs() {
+            violations += 1;
+        }
     }
-    println!("  max_abs_diff = {:.4e} (at {}: ref={:.4}, gpu={:.4})", max_abs, argmax, y_ref[argmax], y_gpu_v[argmax]);
-    println!("  max_rel_diff = {:.4e}  (near-zero cancellation, not error scale)", max_rel);
-    println!("  violations (d > {ABS_TOL:.0e} + {REL_TOL:.0e}|a|) = {violations} / {}", y_ref.len());
+    println!(
+        "  max_abs_diff = {:.4e} (at {}: ref={:.4}, gpu={:.4})",
+        max_abs, argmax, y_ref[argmax], y_gpu_v[argmax]
+    );
+    println!(
+        "  max_rel_diff = {:.4e}  (near-zero cancellation, not error scale)",
+        max_rel
+    );
+    println!(
+        "  violations (d > {ABS_TOL:.0e} + {REL_TOL:.0e}|a|) = {violations} / {}",
+        y_ref.len()
+    );
     let ok = violations == 0;
-    println!("  {}", if ok { "PASS" } else { "FAIL — abs+rel violations (layout/index bug?)" });
+    println!(
+        "  {}",
+        if ok {
+            "PASS"
+        } else {
+            "FAIL — abs+rel violations (layout/index bug?)"
+        }
+    );
     ok
 }
 

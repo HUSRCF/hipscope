@@ -72,7 +72,12 @@ fi
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
 # multi_gpu\.rs is listed here so that touching the PP dispatch path
 # triggers the coherence battery (same contract as single-GPU forward).
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs|mtp_head\.rs|mtp_spec\.rs|mtp_compose\.rs|mtp_probe\.rs'
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs|mtp_head\.rs|mtp_spec\.rs|mtp_compose\.rs|mtp_probe\.rs|examples/daemon\.rs|speculative\.rs'
+
+# Serve recurrent-state machine — files whose changes can leak DeltaNet/KV state
+# ACROSS requests (issue #462). These get an extra MULTI-REQUEST serve-output
+# gate (serve-loop-gate.sh) that the single-request coherence battery misses.
+SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs|cli/index\.ts'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise
@@ -154,6 +159,35 @@ echo "hard errors. Read the report above and confirm each model's output is"
 echo "coherent (fluent, on-topic, not stuck in a verbatim loop) before"
 echo "proceeding with the commit."
 echo
+
+# ── Multi-request serve OUTPUT gate (issue #462) ─────────────────────────
+# The coherence battery above drives the daemon SINGLE-request. Cross-request
+# recurrent-state contamination (DeltaNet/KV state bleeding between requests →
+# </think> / token-loop attractor) only shows on a real, multi-request serve —
+# every single-request gate passed while serve was broken. Path-gated to the
+# serve state machine (daemon.rs / speculative.rs / cli serve wrapper).
+if echo "$CHANGED" | grep -qE "$SERVE_HOTSPOT"; then
+    echo "=== Serve-loop gate (multi-request output) ==="
+    echo "Serve/daemon code changed. Firing repeated + distinct greedy requests at"
+    echo "one warm serve to catch cross-request state contamination (#462)..."
+    echo
+    if ! ./scripts/serve-loop-gate.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: serve-loop gate detected a cross-request attractor."
+        echo "========================================================================"
+        echo
+        echo "A multi-request serve produced a </think> / token-loop attractor —"
+        echo "recurrent DeltaNet/KV state is leaking across requests (the #462 class,"
+        echo "which every single-request gate passes). See the per-request output above."
+        echo
+        echo "  ./scripts/serve-loop-gate.sh         # re-run (DFlash path)"
+        echo "  ./scripts/serve-loop-gate.sh --ar    # also test the AR path"
+        echo
+        exit 1
+    fi
+    echo
+fi
 
 echo
 
