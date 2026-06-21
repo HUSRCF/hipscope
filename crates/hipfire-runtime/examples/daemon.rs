@@ -3066,6 +3066,33 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         return;
     }
 
+    // ── Cross-conversation reset (FIX: ds4 EP turn-to-turn contamination) ──
+    // ds4 EP replays the full prompt from position 0 every turn (no LCP reuse —
+    // see the capacity-guard comment above), so a CONTINUING conversation
+    // re-prefills its whole history straight from the prompt; nothing in the EP
+    // state is reusable across turns, so we reset unconditionally here. This is
+    // the EP analogue of the single-GPU cache-miss reset in generate_deepseek4:
+    // `reset()` alone only rewinds n_tokens — the position-indexed decode caches
+    // (SWA ring, compressed/full KV, indexer scratch) retain the PRIOR turn's
+    // residue and bleed into the next conversation (observed: turn 2 echoing
+    // turn 1's answer) unless explicitly zeroed. Do it per rank on its own
+    // device. Without this, ep_serve_ds4 only ever reset on abort (and even that
+    // path, ep_reset_after_abort, omitted zero_decode_caches).
+    if let Some(ep) = m.ep.as_mut() {
+        let EpState { gpus, inner } = ep;
+        if let EpArch::Ds4 { state, .. } = inner {
+            for (rank, s) in state.iter_mut().enumerate() {
+                let g = &mut gpus.devices[rank];
+                let _ = g.bind_thread();
+                s.reset();
+                s.zero_decode_caches(g);
+                g.invalidate_graph_state();
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
     let mut parser = match think_mode {
         ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
         ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
