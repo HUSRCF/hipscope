@@ -4551,13 +4551,22 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag && !nsSawDaemonReasoning);
+        const extracted = extractVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag && !nsSawDaemonReasoning);
+        content = extracted.content;
+        // Surface the reasoning the split pulled out of the token-text stream
+        // (Qwen / MiniMax open_think) under reasoning_content — UNLESS structured
+        // `reasoning` events already populated it (ds4/V4F) or preserve_thinking
+        // keeps it inline (then `reasoning` is "" anyway). Without this the
+        // reasoning was silently dropped, and an unclosed <think> nuked the whole
+        // answer. Mirrors the streaming path's inThink→reasoning_content routing.
+        if (extracted.reasoning && !reasoningContent) reasoningContent = extracted.reasoning;
 
-        // Diagnostic: detect empty-after-unclosed-think-strip.
+        // Diagnostic: the model produced no separate post-think answer. No longer
+        // data loss (the reasoning is surfaced above), kept as a quality signal.
         let thinkWarning: string | null = null;
         if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
-          thinkWarning = "empty after unclosed think strip";
-          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
+          thinkWarning = "no visible content after think (reasoning surfaced)";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens, all inside the think block`);
         }
 
         // Tool calls. V4F and qwen35 daemon arms yield them as
@@ -7214,21 +7223,34 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
-function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
-  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+// Split a token-text assistant turn into visible `content` and `reasoning`.
+// Token-text thinking models (Qwen, MiniMax via open_think) stream their
+// reasoning as literal `<think>…</think>` text in the content stream rather
+// than as structured `reasoning` events, so the non-stream path must pull the
+// reasoning OUT and SURFACE it under reasoning_content — not silently drop it
+// (the old `stripVisibleThinking` did), and crucially not NUKE the whole answer
+// when `</think>` is missing (the "empty after unclosed think strip" bug). This
+// mirrors the streaming path, which already routes inThink token text to
+// reasoning_content. Returns trimmed { content, reasoning }.
+function extractVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): { content: string; reasoning: string } {
+  if (preserveThinking) return { content: content.replace(/<\|im_end\|>/g, "").trim(), reasoning: "" };
+  let text = content.replace(/<\|im_end\|>/g, "");
   // `open_think` injects the opening <think> into the PROMPT, so the output
-  // begins INSIDE the think span and only a dangling </think> appears — none of
-  // the strips below (which key on a `<think>` opener) would fire, leaking the
-  // reasoning + a stray </think> into content. Prepend a synthetic opener so
-  // the closed case (strip the pair, keep the answer) and the unclosed case
-  // (strip <think>..end) are handled identically to a normal think span.
-  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
-  return content
-    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-    .replace(/<think>[\s\S]*$/, "")
-    .replace(/^\s*<\/think>\s*/, "")
-    .replace(/<\|im_end\|>/g, "")
-    .trim();
+  // begins INSIDE the think span and only a dangling </think> appears. Prepend a
+  // synthetic opener so the closed case (split the pair) and the unclosed case
+  // (everything is reasoning) are handled identically to a normal think span.
+  if (startedInThink && !text.includes("<think>")) text = "<think>" + text;
+  let reasoning = "";
+  // Closed `<think>…</think>` pairs: pull the inner text into reasoning, remove
+  // the block from the visible content (keep what follows — the answer).
+  text = text.replace(/<think>([\s\S]*?)<\/think>\s*/g, (_m, r: string) => { reasoning += r; return ""; });
+  // Unclosed `<think>…<EOS>`: the model never closed the block, so the rest IS
+  // reasoning. SURFACE it (don't nuke) — the answer, if any, is whatever the
+  // prior closed-pair pass already left in `text`.
+  text = text.replace(/<think>([\s\S]*)$/, (_m, r: string) => { reasoning += r; return ""; });
+  // Orphan leading </think> (open_think with no opener in the body).
+  text = text.replace(/^\s*<\/think>\s*/, "");
+  return { content: text.trim(), reasoning: reasoning.trim() };
 }
 
 function pruneCliRuntimePayload(cliDir: string): void {
