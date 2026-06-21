@@ -873,8 +873,18 @@ fn load_dflash_state(
         DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
     let max_n = block_size + 1;
-    let draft_scratch = DflashScratch::new(gpu, &draft_config, block_size, ctx_capacity)
-        .map_err(|e| format!("{e}"))?;
+    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
+    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
+    // refactor regressed this to the `with_mq=false` `::new` constructor →
+    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
+    let draft_scratch = DflashScratch::new_with_mq(
+        gpu,
+        &draft_config,
+        block_size,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .map_err(|e| format!("{e}"))?;
     let _ = draft_hfq;
     let hidden_rb = HiddenStateRingBuffer::new(
         gpu,
