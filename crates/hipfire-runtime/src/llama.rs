@@ -3568,6 +3568,52 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             c.n_kv_heads * c.head_dim,
         )
     }
+    fn attend_plan(
+        &self,
+        l: usize,
+    ) -> HipResult<Option<(KvTierPlan, AttnParams<'_>)>> {
+        let kv = self.kv_cache;
+        let s = self.scratch;
+        let c = self.config;
+        let plan = KvTierPlan::derive(KvTierInputs {
+            pos: self.pos,
+            ..kv.tier_inputs()
+        })
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        // HFQ8 flat-layout needs the per-layer scale tables; every other tier
+        // (int8c included) is self-contained.
+        let (k_scales, v_scales) = if kv.is_hfq8_kv() {
+            (Some(&kv.k_scales[l]), Some(&kv.v_scales[l]))
+        } else {
+            (None, None)
+        };
+        let io = AttnParams {
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            k_cache: &kv.k_gpu[l],
+            v_cache: &kv.v_gpu[l],
+            k_scales,
+            v_scales,
+            pos_buf: &s.pos_buf,
+            pos: self.pos,
+            positions: None,
+            n_heads: c.n_heads,
+            n_kv_heads: c.n_kv_heads,
+            head_dim: c.head_dim,
+            physical_cap: kv.physical_cap,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&s.attn_partials),
+            givens_cos: kv.givens_cos.as_ref(),
+            givens_sin: kv.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &s.attn_out,
+        };
+        Ok(Some((plan, io)))
+    }
 }
 
 pub fn forward_scratch_layers(

@@ -101,6 +101,23 @@ pub trait DenseArch {
     /// the attention result into `attn_out`. This is the one op that does NOT
     /// unify across arches (different KV layouts + attention kernel families).
     fn attend(&self, gpu: &mut Gpu, l: usize) -> HipResult<()>;
+    /// Optional data-returning companion to [`attend`]: build the
+    /// `(KvTierPlan, AttnParams)` for layer `l` so `dense_forward` can emit a
+    /// first-class `Step::Attend` in one contiguous step list. Default `None` →
+    /// the caller keeps using the side-effecting `attend`. Only arches whose
+    /// attention is a `KvTierPlan` family (llama) override this; bespoke-attention
+    /// arches (qwen2 GQA-flash) leave it `None`.
+    fn attend_plan(
+        &self,
+        _l: usize,
+    ) -> HipResult<
+        Option<(
+            hipfire_dispatch::families::kv_tier::KvTierPlan,
+            hipfire_dispatch::families::attention::AttnParams<'_>,
+        )>,
+    > {
+        Ok(None)
+    }
 }
 
 #[inline]
@@ -118,83 +135,114 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
 
-        // Attention QKV: rmsnorm-rotate + 3× Gemv (fused/per-op chosen by dispatch).
-        execute_steps(
-            gpu,
-            ctx,
-            &[
-                Step::RmsnormAutomatic {
-                    x: s.x,
-                    norm_weight: layer.attn_norm,
-                    x_plain: s.tmp,
-                    out: s.x_rot,
-                    awq_scale: layer.qkv_awq,
-                    k: layer.qkv_k,
-                    eps: k.norm_eps,
-                    rotation: layer.qkv_rot,
-                },
-                Step::Gemv {
-                    w: &layer.wq,
-                    input: GemvInput::Prerotated(s.x_rot),
-                    out: s.q,
-                },
-                Step::Gemv {
-                    w: &layer.wk,
-                    input: GemvInput::Prerotated(s.x_rot),
-                    out: s.k,
-                },
-                Step::Gemv {
-                    w: &layer.wv,
-                    input: GemvInput::Prerotated(s.x_rot),
-                    out: s.v,
-                },
-            ],
-        )
-        .map_err(herr)?;
+        // The attention block as one contiguous step list: QKV (fuses to
+        // FusedQkv*), bias, qk-norm, RoPE — then, on the `Some` path, the
+        // first-class `Step::Attend` + o-proj, so the whole block is one
+        // `execute_steps` invocation (future cross-boundary fusion seam).
+        // match_prefix slices each fused pattern to its own window, so the
+        // QKV3/Gemv fusion still fires inside the longer list.
+        let mut steps: Vec<Step> = vec![
+            Step::RmsnormAutomatic {
+                x: s.x,
+                norm_weight: layer.attn_norm,
+                x_plain: s.tmp,
+                out: s.x_rot,
+                awq_scale: layer.qkv_awq,
+                k: layer.qkv_k,
+                eps: k.norm_eps,
+                rotation: layer.qkv_rot,
+            },
+            Step::Gemv {
+                w: &layer.wq,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.q,
+            },
+            Step::Gemv {
+                w: &layer.wk,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.k,
+            },
+            Step::Gemv {
+                w: &layer.wv,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.v,
+            },
+        ];
 
         // QKV bias (qwen2).
         if k.attn_bias {
-            gpu.bias_add_f32(s.q, layer.wq_bias.expect("attn_bias: wq_bias"), 1, k.q_dim)?;
-            gpu.bias_add_f32(s.k, layer.wk_bias.expect("attn_bias: wk_bias"), 1, k.kv_dim)?;
-            gpu.bias_add_f32(s.v, layer.wv_bias.expect("attn_bias: wv_bias"), 1, k.kv_dim)?;
+            steps.push(Step::BiasAdd {
+                x: s.q,
+                bias: layer.wq_bias.expect("attn_bias: wq_bias"),
+                dim: k.q_dim,
+            });
+            steps.push(Step::BiasAdd {
+                x: s.k,
+                bias: layer.wk_bias.expect("attn_bias: wk_bias"),
+                dim: k.kv_dim,
+            });
+            steps.push(Step::BiasAdd {
+                x: s.v,
+                bias: layer.wv_bias.expect("attn_bias: wv_bias"),
+                dim: k.kv_dim,
+            });
         }
 
         // Per-head Q/K norm (Qwen3-style).
         if k.qk_norm {
             if let Some(qn) = layer.q_norm {
-                gpu.rmsnorm_batched(s.q, qn, s.q, k.n_heads, k.head_dim, k.norm_eps)?;
+                steps.push(Step::QkNorm {
+                    x: s.q,
+                    weight: qn,
+                    n_groups: k.n_heads,
+                    head_dim: k.head_dim,
+                    eps: k.norm_eps,
+                });
             }
             if let Some(kn) = layer.k_norm {
-                gpu.rmsnorm_batched(s.k, kn, s.k, k.n_kv_heads, k.head_dim, k.norm_eps)?;
+                steps.push(Step::QkNorm {
+                    x: s.k,
+                    weight: kn,
+                    n_groups: k.n_kv_heads,
+                    head_dim: k.head_dim,
+                    eps: k.norm_eps,
+                });
             }
         }
 
         // RoPE.
-        gpu.rope_f32(
-            s.q,
-            s.k,
-            s.pos_buf,
-            k.n_heads,
-            k.n_kv_heads,
-            k.head_dim,
-            k.rope_theta,
-        )?;
+        steps.push(Step::Rope {
+            q: s.q,
+            k: s.k,
+            pos_buf: s.pos_buf,
+            n_heads: k.n_heads,
+            n_kv_heads: k.n_kv_heads,
+            head_dim: k.head_dim,
+            theta: k.rope_theta,
+        });
 
-        // KV write + attention (arch-specific).
-        arch.attend(gpu, l)?;
-
-        // Attention output projection + residual.
-        execute_steps(
-            gpu,
-            ctx,
-            &[Step::GemvResidual {
-                w: &layer.wo,
-                input: GemvInput::Raw(s.attn_out),
-                residual: s.x,
-                out: s.o,
-            }],
-        )
-        .map_err(herr)?;
+        let o_proj = Step::GemvResidual {
+            w: &layer.wo,
+            input: GemvInput::Raw(s.attn_out),
+            residual: s.x,
+            out: s.o,
+        };
+        match arch.attend_plan(l)? {
+            Some((plan, attn_io)) => {
+                // llama: attention is a first-class step → one contiguous list.
+                steps.push(Step::Attend { plan, io: attn_io });
+                steps.push(o_proj);
+                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+            }
+            None => {
+                // Bespoke-attention arch (qwen2 GQA-flash): keep the split —
+                // pre-attend steps, then the side-effecting attend, then o-proj.
+                // Identical kernels/order to the pre-seam path.
+                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                arch.attend(gpu, l)?;
+                execute_steps(gpu, ctx, &[o_proj]).map_err(herr)?;
+            }
+        }
 
         // FFN: rmsnorm-rotate + gate/up.
         execute_steps(
