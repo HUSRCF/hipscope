@@ -1395,13 +1395,11 @@ fn load_fp16_weight_tensor_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (_, data) = source
+    let (info, data) = source
         .tensor_data(name)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
+    // Handles F16/BF16/F32 (raw HF checkpoints — incl. lm_head — are commonly BF16).
+    let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
@@ -1427,19 +1425,17 @@ fn paro_load_llama_norm_raw(
     let (info, data) = source
         .tensor_data(&full)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
-    let v: Vec<f32> = if info.dtype == "F16" {
-        data.chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    } else {
-        data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    };
+    // Handles F16/BF16/F32 (raw HF checkpoints — incl. the final norm — are commonly BF16).
+    let v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
     gpu.upload_f32(&v, shape)
 }
 
-/// Load LLaMA/Qwen3 weights from a ParoQuant safetensors model.
+/// Load LLaMA/Qwen3 weights from a safetensors model — ParoQuant/AWQ *or* raw
+/// unquantized FP. ParoQuant is a transparent layer: [`ParoBackend::proj`] tries
+/// the `.qweight` augmentors first and falls back to the raw `.weight`
+/// (F16/BF16/F32) when no quant sidecar is present, so a checkpoint with no
+/// `quantization_config` loads as plain FP. The `group_size`/`krot` below are
+/// only consumed by the quant path; raw checkpoints never read them.
 ///
 /// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
 /// (no `model.language_model.` prefix — that's Qwen3.5-specific).
@@ -1448,22 +1444,21 @@ pub fn load_weights_paroquant_llama(
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
-    let qc = source
+    // Raw (unquantized) checkpoints have no quantization_config; default the
+    // quant params (unused on the raw fallback path).
+    let (gs, kr) = source
         .quant_config()
-        .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
-    let gs = qc.group_size;
-    let kr = qc.krot;
+        .map(|qc| (qc.group_size, qc.krot))
+        .unwrap_or((128, 0));
 
     // Embedding
-    eprintln!("  loading token_embd (ParoQuant LLaMA/Qwen3)...");
+    eprintln!("  loading token_embd (LLaMA/Qwen3 safetensors)...");
     let embd_name = "model.embed_tokens.weight";
-    let (_, embd_data) = source
+    let (embd_info, embd_data) = source
         .tensor_data(embd_name)
         .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
-    let f32_embd: Vec<f32> = embd_data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
+    // Handles F16/BF16/F32 (raw HF checkpoints are commonly BF16).
+    let f32_embd = crate::safetensors_source::source_bytes_to_f32_vec(&embd_info.dtype, embd_data);
     let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
     let embd_fmt = EmbeddingFormat::F32;
 
@@ -1507,10 +1502,26 @@ pub fn load_weights_paroquant_llama(
             }
         },
         |gpu| {
-            let (_, td) = source.tensor_data(embd_name).ok_or_else(|| {
+            // Tied lm_head fallback: re-read the embedding as F32. Handles
+            // F16/BF16/F32 (raw HF checkpoints are commonly BF16) rather than
+            // the F16-only `reupload_f16_as_f32` (correct only for HFQ embeds).
+            let (info, td) = source.tensor_data(embd_name).ok_or_else(|| {
                 HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
             })?;
-            reupload_f16_as_f32(gpu, &td, config.vocab_size, config.dim)
+            let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, td);
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         },
     )?;
 

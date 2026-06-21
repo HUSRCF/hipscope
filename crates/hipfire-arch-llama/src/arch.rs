@@ -247,6 +247,9 @@ impl Llama {
                     quant_fwht: false,
                     quant_hfq4: kv_cache.quant_hfq4,
                     quant_q4,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: 8,
                     pos,
                     flash_mode: 0,
@@ -254,6 +257,8 @@ impl Llama {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
+                    q8_windowed: false,
+                    window: 0,
                 })
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {

@@ -584,6 +584,44 @@ fn dispatch_kv_write(
             hip!(gpu.kv_cache_write_q4(io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim,))?;
             hip!(gpu.kv_cache_write_q4(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim,))
         }
+        KernelKey::KvWriteInt8c => {
+            debug_assert_eq!(plan.batch_size, 1);
+            hip!(gpu.kv_cache_write_int8c_f16(
+                io.k_cache,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_int8c_f16(
+                io.v_cache,
+                io.v,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))
+        }
+        KernelKey::KvWriteHfq8 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let ks = io.k_scales.expect("hfq8 KV write requires k_scales");
+            let vs = io.v_scales.expect("hfq8 KV write requires v_scales");
+            hip!(gpu.kv_cache_write_hfq8(
+                io.k_cache,
+                ks,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_hfq8(
+                io.v_cache,
+                vs,
+                io.v,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))
+        }
 
         _ => Err(DispatchError::UnsupportedVariant {
             family: "attention/kv_write",
@@ -690,6 +728,27 @@ fn dispatch_attend(
                     io.head_dim,
                     io.physical_cap,
                     fp,
+                ))
+            }
+            KernelKey::AttnFlashQ8_0Windowed => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                // window comes from the plan (cohere2moe: sliding_window on
+                // Sliding layers, 0 on full layers; 0 == plain flash).
+                hip!(gpu.attention_flash_q8_0_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    fp,
+                    plan.window,
                 ))
             }
             KernelKey::AttnQ8_0Kv => {
@@ -858,6 +917,59 @@ fn dispatch_attend(
                     io.physical_cap,
                 ))
             }
+            // F32 GQA-flash decode family (qwen2). All three take the flash
+            // partials buffer; seq_len = io.pos+1, max_seq = io.physical_cap.
+            KernelKey::AttnGqaWarp => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_gqa_warp(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFlashGqa => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_gqa(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFlash => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
 
             // ── Llama legacy quant KV (decode only) ──
             KernelKey::AttnHfq4Kv => {
@@ -867,6 +979,42 @@ fn dispatch_attend(
                     io.q,
                     io.k_cache,
                     io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnInt8cKv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                hip!(gpu.attention_int8c_f16_kv(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnHfq8Kv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let ks = io.k_scales.expect("hfq8 attend requires k_scales");
+                let vs = io.v_scales.expect("hfq8 attend requires v_scales");
+                hip!(gpu.attention_hfq8_kv(
+                    io.q,
+                    io.k_cache,
+                    ks,
+                    io.v_cache,
+                    vs,
                     io.output,
                     io.pos_buf,
                     seq_len,
@@ -1091,6 +1239,29 @@ fn dispatch_attend(
                     ))
                 }
             }
+            KernelKey::AttnQ8_0KvBatchedMaskedWindowed => {
+                // cohere2moe sliding-window prefill — always the tiled kernel
+                // (no LDS crossover), window from the plan (0 == full causal).
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_q8_0_batched_masked_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                    plan.window,
+                ))
+            }
 
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "attention/attend",
@@ -1136,6 +1307,8 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     // Llama legacy
     KernelKey::KvWriteHfq4,
     KernelKey::KvWriteQ4,
+    KernelKey::KvWriteInt8c,
+    KernelKey::KvWriteHfq8,
 ];
 
 /// All `KernelKey` variants handled by `dispatch_attend`.
@@ -1143,6 +1316,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     // Single-token
     KernelKey::AttnF32,
     KernelKey::AttnFlashQ8_0,
+    KernelKey::AttnFlashQ8_0Windowed,
     KernelKey::AttnQ8_0Kv,
     KernelKey::AttnFlashAsym4,
     KernelKey::AttnFlashAsym4Fwht,
@@ -1151,6 +1325,9 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2,
     KernelKey::AttnFlashAsym2Fwht,
     KernelKey::AttnGqaFused,
+    KernelKey::AttnGqaWarp,
+    KernelKey::AttnFlashGqa,
+    KernelKey::AttnFlash,
     // Batched
     KernelKey::AttnFlashAsym4BatchedMasked,
     KernelKey::AttnFlashAsym4FwhtBatchedMasked,
@@ -1159,9 +1336,12 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2Batched,
     KernelKey::AttnFlashAsym2FwhtBatched,
     KernelKey::AttnQ8_0KvBatchedMasked,
+    KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
     // Llama legacy
     KernelKey::AttnHfq4Kv,
     KernelKey::AttnQ4Kv,
+    KernelKey::AttnInt8cKv,
+    KernelKey::AttnHfq8Kv,
 ];
 
 /// All `KernelKey` variants handled by `dispatch_full_attention`.
@@ -1247,6 +1427,8 @@ mod tests {
                 | KvWriteQ8_0Batched
                 | KvWriteHfq4
                 | KvWriteQ4
+                | KvWriteInt8c
+                | KvWriteHfq8
         )
     }
 
@@ -1337,6 +1519,7 @@ mod tests {
                 | AttnFlashAsym2Batched
                 | AttnFlashAsym2FwhtBatched
                 | AttnQ8_0KvBatchedMasked
+                | AttnQ8_0KvBatchedMaskedWindowed
         )
     }
 

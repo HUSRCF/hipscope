@@ -26,6 +26,7 @@
 use crate::llama::{f16_to_f32, f32_to_f16, KvCache};
 use crate::triattn::{EvictionCtx, EvictionResult};
 use hip_bridge::HipResult;
+use hipfire_dispatch::families::kv_tier::KTier;
 use rdna_compute::Gpu;
 
 /// Hard cap on per-slot fold factor. The per-slot slot table is a fixed
@@ -96,25 +97,11 @@ impl CaskCtx {
 
         // Detect KV mode and layout. V is always Q8_0 across modes (the
         // write path only rotates K), so V fold uses kv_fold_q8 uniformly.
-        #[derive(Copy, Clone)]
-        enum KMode {
-            Q8,
-            Asym3,
-            Asym4,
-            Asym2,
-        }
-        let k_mode = if kv.quant_q8 {
-            KMode::Q8
-        } else if kv.quant_asym3 {
-            KMode::Asym3
-        } else if kv.quant_asym4 {
-            KMode::Asym4
-        } else if kv.quant_asym2 {
-            KMode::Asym2
-        } else {
+        let tier = kv.k_tier();
+        if !tier.is_compactable() {
             // Unknown quant (e.g. quant_int8 legacy) — fall back to TriAttn.
             return self.base.maybe_evict(gpu, kv, current_physical);
-        };
+        }
 
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
@@ -141,12 +128,7 @@ impl CaskCtx {
         let d = self.base.head_dim;
         let n_blocks = d / 32;
         let v_row_bytes = n_kv * n_blocks * 34; // V is always Q8_0.
-        let k_row_bytes = match k_mode {
-            KMode::Q8 => v_row_bytes,
-            KMode::Asym3 => n_kv * (4 + (d * 3) / 8),
-            KMode::Asym4 => n_kv * (4 + d / 2),
-            KMode::Asym2 => n_kv * (4 + d / 4),
-        };
+        let k_row_bytes = tier.k_bytes_per_pos(n_kv, d);
 
         // Scratch GPU buffers for per-layer (indices, weights) table. Small
         // (budget × m × 4 B each), allocated once per call. Reusing across
@@ -166,8 +148,8 @@ impl CaskCtx {
                     .base
                     .centers_dev
                     .sub_offset(offset, self.base.centers_per_layer);
-                match k_mode {
-                    KMode::Q8 => gpu.triattn_score_q8(
+                match tier {
+                    KTier::Q8 => gpu.triattn_score_q8(
                         &kv.k_gpu[layer_idx],
                         &centers_layer,
                         &self.base.scores_buf,
@@ -179,7 +161,7 @@ impl CaskCtx {
                         p_q,
                         current_physical,
                     )?,
-                    KMode::Asym3 => gpu.triattn_score_asym3(
+                    KTier::Asym3 { .. } => gpu.triattn_score_asym3(
                         &kv.k_gpu[layer_idx],
                         &centers_layer,
                         kv.givens_cos
@@ -197,7 +179,7 @@ impl CaskCtx {
                         p_q,
                         current_physical,
                     )?,
-                    KMode::Asym4 => gpu.triattn_score_asym4(
+                    KTier::Asym4 { .. } => gpu.triattn_score_asym4(
                         &kv.k_gpu[layer_idx],
                         &centers_layer,
                         kv.givens_cos
@@ -215,7 +197,7 @@ impl CaskCtx {
                         p_q,
                         current_physical,
                     )?,
-                    KMode::Asym2 => gpu.triattn_score_asym2(
+                    KTier::Asym2 { .. } => gpu.triattn_score_asym2(
                         &kv.k_gpu[layer_idx],
                         &centers_layer,
                         kv.givens_cos
@@ -233,6 +215,7 @@ impl CaskCtx {
                         p_q,
                         current_physical,
                     )?,
+                    _ => unreachable!("gated by is_compactable"),
                 }
                 gpu.hip.device_synchronize()?;
                 let scores = gpu.download_f32(&self.base.scores_buf)?;
@@ -283,23 +266,20 @@ impl CaskCtx {
                     // rank-based pairing (consecutive scratch tokens by score)
                     // — simpler, no per-mode CPU dequant path. L2 grouping for
                     // asym is a follow-up once the simple version is validated.
-                    let groups: Vec<Vec<usize>> = match k_mode {
-                        KMode::Q8 => {
-                            let mut k_all = vec![0u8; current_physical * k_row_bytes];
-                            gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
-                            greedy_group_by_l2(&k_all, &scratch_idx, n_kv, d, self.fold_m)
-                        }
-                        _ => {
-                            // Rank-based: pair scratch tokens in score-sorted
-                            // order (already given by scratch_idx's order in
-                            // this loop). Consecutive-m groups.
-                            let n = scratch_idx.len();
-                            (0..n)
-                                .step_by(self.fold_m)
-                                .filter(|&start| start + self.fold_m <= n)
-                                .map(|start| (start..start + self.fold_m).collect())
-                                .collect()
-                        }
+                    let groups: Vec<Vec<usize>> = if tier.is_q8() {
+                        let mut k_all = vec![0u8; current_physical * k_row_bytes];
+                        gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
+                        greedy_group_by_l2(&k_all, &scratch_idx, n_kv, d, self.fold_m)
+                    } else {
+                        // Rank-based: pair scratch tokens in score-sorted
+                        // order (already given by scratch_idx's order in
+                        // this loop). Consecutive-m groups.
+                        let n = scratch_idx.len();
+                        (0..n)
+                            .step_by(self.fold_m)
+                            .filter(|&start| start + self.fold_m <= n)
+                            .map(|start| (start..start + self.fold_m).collect())
+                            .collect()
                     };
                     for group in &groups {
                         let abs_positions: Vec<u32> =
@@ -344,8 +324,8 @@ impl CaskCtx {
 
                 // K fold uses the mode-specific kernel. V is always Q8_0
                 // (rotation is K-only in RotorQuant), so V always uses kv_fold_q8.
-                match k_mode {
-                    KMode::Q8 => gpu.kv_fold_q8(
+                match tier {
+                    KTier::Q8 => gpu.kv_fold_q8(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -355,7 +335,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
-                    KMode::Asym3 => gpu.kv_fold_asym3(
+                    KTier::Asym3 { .. } => gpu.kv_fold_asym3(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -365,7 +345,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
-                    KMode::Asym4 => gpu.kv_fold_asym4(
+                    KTier::Asym4 { .. } => gpu.kv_fold_asym4(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -375,7 +355,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
-                    KMode::Asym2 => gpu.kv_fold_asym2(
+                    KTier::Asym2 { .. } => gpu.kv_fold_asym2(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -385,6 +365,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
+                    _ => unreachable!("gated by is_compactable"),
                 }
                 gpu.kv_fold_q8(
                     &kv.v_gpu[layer_idx],

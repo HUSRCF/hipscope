@@ -32,6 +32,12 @@ pub enum PipelineOp {
     /// Paired KV-write + flash-attention (Phase 0.3). Not fusible —
     /// the two ops are inherently coupled via KvTierPlan.
     Attend,
+    /// In-place RoPE on Q+K (per-op only; never in FUSED_TABLE).
+    Rope,
+    /// Per-head rmsnorm on one tensor (qk-norm; per-op only).
+    QkNorm,
+    /// In-place bias add on one tensor (per-op only).
+    BiasAdd,
 }
 
 // ── Variant enums ─────────────────────────────────────
@@ -359,11 +365,18 @@ pub enum KernelKey {
     AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
-    AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
+    AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
+    AttnQ8_0Kv,            // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
+    // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.
+    AttnGqaWarp,  // GQA, head_dim==128, long-ctx warp-reduce
+    AttnFlashGqa, // GQA, long-ctx split-K flash
+    AttnFlash,    // per-head split-K flash decode (GQA short-ctx + non-GQA fallback)
     // Llama legacy quant KV (decode only — no batched variants)
-    AttnHfq4Kv, // HFQ4-quantized KV cache attention
-    AttnQ4Kv,   // Q4-quantized KV cache attention
+    AttnHfq4Kv,  // HFQ4-quantized KV cache attention
+    AttnQ4Kv,    // Q4-quantized KV cache attention
+    AttnInt8cKv, // INT8-per-column KV cache attention (llama)
+    AttnHfq8Kv,  // HFQ8 flat-layout KV cache attention (llama)
     // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
@@ -371,9 +384,10 @@ pub enum KernelKey {
     AttnFlashAsym4FwhtBatchedMasked,
     AttnFlashAsym3BatchedMasked,
     AttnFlashAsym3FwhtBatchedMasked,
-    AttnFlashAsym2Batched,     // no _masked — 2-bit tree-verify gap
-    AttnFlashAsym2FwhtBatched, // no _masked — 2-bit tree-verify gap
-    AttnQ8_0KvBatchedMasked,   // P-1 no-LDS-cap tiled kernel
+    AttnFlashAsym2Batched,           // no _masked — 2-bit tree-verify gap
+    AttnFlashAsym2FwhtBatched,       // no _masked — 2-bit tree-verify gap
+    AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
+    AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal
@@ -388,8 +402,10 @@ pub enum KernelKey {
     KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
-    KvWriteHfq4, // HFQ4-quantized KV write (llama legacy)
-    KvWriteQ4,   // Q4-quantized KV write (llama legacy)
+    KvWriteHfq4,  // HFQ4-quantized KV write (llama legacy)
+    KvWriteQ4,    // Q4-quantized KV write (llama legacy)
+    KvWriteInt8c, // INT8-per-column KV write (llama)
+    KvWriteHfq8,  // HFQ8 flat-layout KV write (llama)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
     KvWriteAsym4Batched,

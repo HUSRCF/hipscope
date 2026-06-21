@@ -9658,20 +9658,12 @@ fn forward_prefill_chunk(
                 };
                 let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
                 let plan = KvTierPlan::derive(KvTierInputs {
-                    quant_asym4: kv_cache.quant_asym4,
-                    quant_asym3: kv_cache.quant_asym3,
-                    quant_asym2: kv_cache.quant_asym2,
-                    quant_q8: kv_cache.quant_q8,
-                    quant_fwht: kv_cache.quant_fwht,
-                    quant_hfq4: false,
-                    quant_q4: false,
-                    v_mode_bits: kv_cache.v_mode_bits(),
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
                     capture_mode: gpu.graphs.capture_mode,
                     batch_size: n,
                     is_tree,
-                    is_boundary: false,
+                    ..kv_cache.tier_inputs()
                 })
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
@@ -11191,20 +11183,12 @@ fn forward_prefill_chunk(
                 };
                 let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
                 let plan = KvTierPlan::derive(KvTierInputs {
-                    quant_asym4: kv_cache.quant_asym4,
-                    quant_asym3: kv_cache.quant_asym3,
-                    quant_asym2: kv_cache.quant_asym2,
-                    quant_q8: kv_cache.quant_q8,
-                    quant_fwht: kv_cache.quant_fwht,
-                    quant_hfq4: false,
-                    quant_q4: false,
-                    v_mode_bits: kv_cache.v_mode_bits(),
                     pos: start_pos,
                     flash_mode: s.flash_mode as usize,
                     capture_mode: gpu.graphs.capture_mode,
                     batch_size: n,
                     is_tree,
-                    is_boundary: false,
+                    ..kv_cache.tier_inputs()
                 })
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
@@ -13241,20 +13225,10 @@ fn kv_cache_attention_dispatch(
     pos: usize,
 ) -> HipResult<()> {
     let plan = KvTierPlan::derive(KvTierInputs {
-        quant_asym4: kv_cache.quant_asym4,
-        quant_asym3: kv_cache.quant_asym3,
-        quant_asym2: kv_cache.quant_asym2,
-        quant_q8: kv_cache.quant_q8,
-        quant_fwht: kv_cache.quant_fwht,
-        quant_hfq4: false,
-        quant_q4: false,
-        v_mode_bits: kv_cache.v_mode_bits(),
         pos,
         flash_mode: s.flash_mode as usize,
         capture_mode: gpu.graphs.capture_mode,
-        batch_size: 1,
-        is_tree: false,
-        is_boundary: false, // TODO: boundary producer not yet populated
+        ..kv_cache.tier_inputs()
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {

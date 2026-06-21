@@ -18,6 +18,7 @@
 
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
+use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -1767,9 +1768,13 @@ impl HiddenStateRingBuffer {
         src: &GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        debug_assert!(
+        // Hard assert (not debug_assert): a violation silently overran the
+        // staging buffer in release and surfaced as a cryptic d2d-bounds panic
+        // deep in ffi.rs. Fail loud and named instead.
+        assert!(
             n <= self.max_batch,
-            "write_rows_to_staging: n {} > max_batch {}",
+            "write_rows_to_staging: n {} > staging max_batch {} — staging buffer \
+             too small for this prefill chunk",
             n,
             self.max_batch
         );
@@ -5183,60 +5188,60 @@ pub fn spec_step_ddtree_batched(
             //    All asym* and q8 KV variants supported. F16 unquantized
             //    isn't on the batched path so we panic here — see the
             //    fa_batched_ok gate in qwen35.rs:3081.
-            if kv.quant_asym3 {
-                let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
-                let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
-                // The batched K writer expects a contiguous K source of
-                // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
-                // exactly that. We give it the REAL kv.v_gpu as the V
-                // dst (so writer indices stay in-bounds for absolute slot
-                // numbers). The V values it writes are garbage (sourced
-                // from pbs.fa_v_batch, leftover from the last FA layer)
-                // but we OVERWRITE every committed V slot below from a
-                // proper gather of the raced-but-correctly-quantized V
-                // values. So the garbage V write is a transient no-op.
-                gpu.kv_cache_write_asym3_batched(
-                    &kv.k_gpu[layer_idx],
-                    &kv.v_gpu[layer_idx],
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    &scratch.kv_gather_indices,
-                    ct,
-                    st,
-                    n_kv_heads,
-                    head_dim,
-                    n_positions,
-                )?;
-                // V byte-gather: read pre-quantized V from raced slots
-                // [position+0, position+1+acc[0], ...] into a contiguous
-                // scratch, then memcpy scratch → kv.v_gpu at committed
-                // slots [position..position+accept_len]. Using a scratch
-                // intermediate avoids same-slot src=dst memcpys (which
-                // are HIP UB) when the accept chain happens to hit the
-                // rank-0 prefix early.
-                gpu.kv_compact_gather(
-                    &kv.v_gpu[layer_idx],
-                    &scratch.kv_gather_scratch_v,
-                    &scratch.tape_gather_scratch,
-                    v_bpp,
-                    n_positions,
-                )?;
-                gpu.hip.memcpy_dtod_at(
-                    &kv.v_gpu[layer_idx].buf,
-                    position * v_bpp,
-                    &scratch.kv_gather_scratch_v.buf,
-                    0,
-                    n_positions * v_bpp,
-                )?;
-            } else {
-                // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
-                // but with the matching kv_cache_write_*_batched call.
-                // For initial Phase 2 prototype, panic so we notice if a
-                // non-asym3 model accidentally enables Path B.
-                panic!(
-                    "Path B Phase 2 only supports asym3 KV today (got: q8={} asym4={} asym2={})",
-                    kv.quant_q8, kv.quant_asym4, kv.quant_asym2
-                );
+            match kv.k_tier() {
+                KTier::Asym3 { .. } => {
+                    let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
+                    let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
+                    // The batched K writer expects a contiguous K source of
+                    // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
+                    // exactly that. We give it the REAL kv.v_gpu as the V
+                    // dst (so writer indices stay in-bounds for absolute slot
+                    // numbers). The V values it writes are garbage (sourced
+                    // from pbs.fa_v_batch, leftover from the last FA layer)
+                    // but we OVERWRITE every committed V slot below from a
+                    // proper gather of the raced-but-correctly-quantized V
+                    // values. So the garbage V write is a transient no-op.
+                    gpu.kv_cache_write_asym3_batched(
+                        &kv.k_gpu[layer_idx],
+                        &kv.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &scratch.kv_gather_indices,
+                        ct,
+                        st,
+                        n_kv_heads,
+                        head_dim,
+                        n_positions,
+                    )?;
+                    // V byte-gather: read pre-quantized V from raced slots
+                    // [position+0, position+1+acc[0], ...] into a contiguous
+                    // scratch, then memcpy scratch → kv.v_gpu at committed
+                    // slots [position..position+accept_len]. Using a scratch
+                    // intermediate avoids same-slot src=dst memcpys (which
+                    // are HIP UB) when the accept chain happens to hit the
+                    // rank-0 prefix early.
+                    gpu.kv_compact_gather(
+                        &kv.v_gpu[layer_idx],
+                        &scratch.kv_gather_scratch_v,
+                        &scratch.tape_gather_scratch,
+                        v_bpp,
+                        n_positions,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &kv.v_gpu[layer_idx].buf,
+                        position * v_bpp,
+                        &scratch.kv_gather_scratch_v.buf,
+                        0,
+                        n_positions * v_bpp,
+                    )?;
+                }
+                other => {
+                    // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
+                    // but with the matching kv_cache_write_*_batched call.
+                    // For initial Phase 2 prototype, panic so we notice if a
+                    // non-asym3 model accidentally enables Path B.
+                    panic!("Path B Phase 2 only supports asym3 KV today (got {other:?})");
+                }
             }
         }
 

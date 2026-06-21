@@ -55,31 +55,11 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
-    &HfqCarrier {
-        arch_id: 8,
-        name: "dots_ocr",
-        load: load_dots_ocr,
-    },
-    &HfqCarrier {
-        arch_id: 9,
-        name: "deepseek4",
-        load: load_deepseek4,
-    },
-    &HfqCarrier {
-        arch_id: 10,
-        name: "minimax",
-        load: load_minimax,
-    },
-    &HfqCarrier {
-        arch_id: 11,
-        name: "lfm2moe",
-        load: load_lfm2moe,
-    },
-    &HfqCarrier {
-        arch_id: 12,
-        name: "cohere2moe",
-        load: load_cohere2moe,
-    },
+    &DotsOcrCarrier,
+    &Deepseek4Carrier,
+    &MinimaxCarrier,
+    &Lfm2MoeCarrier,
+    &Cohere2MoeCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -502,7 +482,8 @@ pub enum EpArch {
 
 // ─── Helper functions ─────────────────────────────────────────────────
 
-fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
+/// Layer 1 (env var) + Layer 2 (per-model ~/.hipfire/templates) — source-agnostic.
+fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
     if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
         if !env_path.is_empty() {
             match std::fs::read_to_string(&env_path) {
@@ -542,6 +523,13 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
                 }
             }
         }
+    }
+    None
+}
+
+fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
+    if let Some(s) = resolve_chat_template_overrides(model_path) {
+        return Some(s);
     }
     match hfq.arch_id {
         5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
@@ -834,10 +822,9 @@ pub fn load_model(
         ));
     }
     let mut result = carrier.load(src, &mut ctx)?;
-    debug_assert!(
-        !(result.pp > 1) || result.pp_gpus.is_some(),
-        "pp>1 LoadedModel missing pp_gpus"
-    );
+    if result.pp > 1 && result.pp_gpus.is_none() {
+        return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
+    }
     // Author-recommended sampling defaults: pull temperature / top_p / top_k from
     // the .hfq's baked `generation_config` so the generate handler can fall back
     // to them when the request omits a knob. HFQ sources only — the raw
@@ -855,121 +842,6 @@ pub fn load_model(
         }
     }
     Ok(result)
-}
-
-fn load_dots_ocr(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_arch_dots_ocr::DotsOcr;
-    use hipfire_runtime::arch::Architecture;
-    let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
-        .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        qwen2_state: Some(state),
-        dots_ocr_config: Some(config),
-        dots_ocr_weights: Some(weights),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
-}
-
-fn load_deepseek4(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::arch::Architecture;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = deepseek4::DeepseekV4State::new(&config)?;
-    let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024);
-    let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
-    let eos_tok: u32 = {
-        let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
-        if ids.len() == 1 {
-            ids[0]
-        } else {
-            1
-        }
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        deepseek4_config: Some(config),
-        deepseek4_weights: Some(weights),
-        deepseek4_state: Some(state),
-        deepseek4_pbs: Some(pbs),
-        deepseek4_eos_tok: eos_tok,
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
-}
-
-fn load_lfm2moe(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
-    let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
-    let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
-        .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
-    let eos_tok: u32 = {
-        let try_one = |s: &str| -> Option<u32> {
-            let ids = tokenizer.encode(s);
-            if ids.len() == 1 {
-                Some(ids[0])
-            } else {
-                None
-            }
-        };
-        try_one("<|im_end|>")
-            .or_else(|| try_one("</s>"))
-            .or_else(|| try_one("<|endoftext|>"))
-            .unwrap_or(1)
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        state: Some(ModelState::Lfm2Moe(Lfm2MoeBundle {
-            config,
-            weights,
-            state,
-            eos_tok,
-        })),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
 }
 
 fn load_cohere2moe(
@@ -1017,52 +889,6 @@ fn load_cohere2moe(
     })
 }
 
-fn load_minimax(
-    mut hfq: HfqFile,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    gpu: &mut Gpu,
-    max_seq: usize,
-    path: &str,
-) -> Result<LoadedModel, String> {
-    use hipfire_runtime::arch::Architecture;
-    let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-    let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
-        .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-    let eos_tok: u32 = {
-        let try_one = |s: &str| -> Option<u32> {
-            let ids = tokenizer.encode(s);
-            if ids.len() == 1 {
-                Some(ids[0])
-            } else {
-                None
-            }
-        };
-        try_one("[e~[")
-            .or_else(|| try_one("<|im_end|>"))
-            .or_else(|| try_one("</s>"))
-            .or_else(|| try_one("<|endoftext|>"))
-            .unwrap_or(1)
-    };
-    let chat_template = resolve_chat_template(&hfq, path);
-    Ok(LoadedModel {
-        state: Some(ModelState::Minimax(MiniMaxBundle {
-            config,
-            weights,
-            state,
-            eos_tok,
-        })),
-        ..LoadedModel::skeleton(
-            hfq.arch_id,
-            tokenizer,
-            max_seq,
-            max_seq,
-            path.to_string(),
-            chat_template,
-        )
-    })
-}
-
 // ─── MMQ screening ────────────────────────────────────────────────────
 
 // ─── DFlash state load ────────────────────────────────────────────────
@@ -1085,16 +911,35 @@ fn load_dflash_state(
         DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
     let max_n = block_size + 1;
-    let draft_scratch = DflashScratch::new(gpu, &draft_config, block_size, ctx_capacity)
-        .map_err(|e| format!("{e}"))?;
+    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
+    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
+    // refactor regressed this to the `with_mq=false` `::new` constructor →
+    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
+    let draft_scratch = DflashScratch::new_with_mq(
+        gpu,
+        &draft_config,
+        block_size,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .map_err(|e| format!("{e}"))?;
     let _ = draft_hfq;
+    // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
+    // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
+    // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
+    // chunks of up to `PREFILL_MAX_BATCH` and captures each into staging via
+    // `write_rows_to_staging` (whose `n <= max_batch` guard is a debug_assert,
+    // silent in release). Sizing staging to only `max_n` overflowed the d2d
+    // copy on any prompt longer than block_size+1 tokens. Size it to the
+    // larger of the two so both paths fit.
+    let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
     let hidden_rb = HiddenStateRingBuffer::new(
         gpu,
         target_config.n_layers,
         draft_config.num_extract(),
         target_config.dim,
         ctx_capacity,
-        max_n,
+        staging_max_batch,
     )
     .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
     let hidden_k = target_config.dim.next_power_of_two();
@@ -1789,12 +1634,15 @@ mod registry_tests {
     }
 
     /// Pin the intended routing so a future probe edit can't silently move an
-    /// existing model to the wrong carrier. `is_dir` matters: Qwen2 is HFQ id
-    /// 7 but its dir form derives to id 1 (→ llama path).
+    /// existing model to the wrong carrier. `is_dir` matters in general, but
+    /// Qwen2 routes to the qwen2 carrier in BOTH forms (HFQ id 7 and dir, which
+    /// derives to id 7) so its Q/K/V attention biases load — the llama-family
+    /// dir loader (id 1) drops them.
     #[test]
     fn known_ids_route_as_expected() {
         let cases: &[(u32, bool, &str)] = &[
             (7, false, "qwen2"),
+            (7, true, "qwen2"),
             (5, false, "qwen35"),
             (6, false, "qwen35"),
             (5, true, "qwen35"),

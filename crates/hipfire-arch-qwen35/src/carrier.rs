@@ -5,7 +5,8 @@ use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::kv_mode::{self, ResolveResult};
+use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
@@ -62,80 +63,20 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         .map(|t| *t == LayerType::FullAttention)
         .collect();
 
-    let mut kv = match kv_mode.as_str() {
-        "q8" => KvCache::new_gpu_q8_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => KvCache::new_gpu_asym4_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => KvCache::new_gpu_asym2_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => KvCache::new_gpu_asym3_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "fwht3" => KvCache::new_gpu_fwht3_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "fwht2" => KvCache::new_gpu_fwht2_capped_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "fwht4" => KvCache::new_gpu_fwht4_filtered(
-            ctx.gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        other => {
-            eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            KvCache::new_gpu_asym3_capped_filtered(
-                ctx.gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                ctx.max_seq,
-                ctx.max_seq,
-            )
-            .map_err(|e| format!("{e}"))?
-        }
+    let ResolveResult { mode, warning } =
+        kv_mode::resolve(&kv_mode, &kv_mode::QWEN35_HFQ_POLICY, config.head_dim);
+    if let Some(w) = warning {
+        eprintln!("  KV cache: {w} (site {})", kv_mode::QWEN35_HFQ_POLICY.site);
+    }
+    let dims = KvDims {
+        layers: KvLayers::Mask(is_kv_layer),
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        max_seq: ctx.max_seq,
+        physical_cap: Some(ctx.max_seq),
     };
+    let mut kv =
+        KvCache::from_mode(mode, KvTarget::Single(ctx.gpu), &dims).map_err(|e| format!("{e}"))?;
 
     // ── V-mode override via env ──────────────────────────────
     let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
