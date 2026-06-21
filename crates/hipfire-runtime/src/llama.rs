@@ -5301,10 +5301,22 @@ impl KvCache {
     /// the llama legacy Q4 KV path. Shared by `tier_inputs()` and `k_tier()`
     /// so the two derivations can never silently diverge.
     fn quant_q4_residual(&self) -> bool {
+        // The llama-legacy "plain Q4" KV tier is the residual: quantized but
+        // none of the named tiers. MUST also exclude asym{2,3,4} — those set
+        // `quantized:true` with empty `k_scales`, so without this guard an asym
+        // cache reports BOTH its asym flag AND quant_q4, tripping classify()'s
+        // "at most one tier flag" debug_assert (debug-build panic on the qwen35
+        // asym3 default) and breaking the byte-identical-to-legacy-literal
+        // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
+        // Release classify() output is unchanged either way (asym is matched
+        // before q4), so this is a true no-op for kernel selection.
         self.quantized
             && !self.quant_hfq4
             && !self.quant_q8
             && !self.quant_int8
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
             && self.k_scales.is_empty()
     }
 
@@ -9112,6 +9124,73 @@ mod tests {
         assert_eq!(
             KvTierPlan::derive(got_prefill).unwrap().attend_key,
             KvTierPlan::derive(legacy_prefill).unwrap().attend_key,
+        );
+    }
+
+    /// Regression guard for the L1/L2 review finding: on an asym cache,
+    /// `tier_inputs()` must NOT also set `quant_q4` (the residual previously
+    /// did, double-flagging asym3+q4 → classify()'s "at most one tier flag"
+    /// debug_assert fired in debug builds on the qwen35 asym3 default, and the
+    /// no-op-vs-legacy-literal proof was false). The legacy qwen35 literals
+    /// hardcoded `quant_q4: false`; pin that `tier_inputs()` matches, and that
+    /// `derive()` (which routes through classify) does not panic in debug.
+    #[test]
+    fn tier_inputs_asym3_has_no_residual_q4_flag() {
+        let mut gpu = match Gpu::init() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        // asym3 requires head_dim == 256.
+        let kv = KvCache::new_gpu_asym3(&mut gpu, 1, 8, 256, 16).unwrap();
+
+        let got = KvTierInputs {
+            pos: 100,
+            ..kv.tier_inputs()
+        };
+        assert!(kv.quant_asym3, "test setup: expected an asym3 cache");
+        assert!(
+            !got.quant_q4,
+            "tier_inputs() must not set quant_q4 on an asym cache (double-flag bug)"
+        );
+        // Exactly one tier flag set — what classify()'s debug_assert requires.
+        let tier_flags = [
+            got.quant_asym4,
+            got.quant_asym3,
+            got.quant_asym2,
+            got.quant_q8,
+            got.quant_hfq4,
+            got.quant_q4,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        assert_eq!(tier_flags, 1, "exactly one KV tier flag must be set");
+
+        // Byte-identical to the legacy literal (which hardcoded quant_q4=false),
+        // and derive() must not panic on the classify debug_assert.
+        let legacy = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+        };
+        assert_eq!(
+            got, legacy,
+            "tier_inputs() must match the legacy asym3 literal"
+        );
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().write_key,
+            KvTierPlan::derive(legacy).unwrap().write_key,
         );
     }
 }
