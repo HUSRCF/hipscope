@@ -454,13 +454,49 @@ fn attn_mixer_block(
     gpu.rope_f32(&state.fa_q, &state.fa_k, &state.pos_buf, n_heads, n_kv, head_dim, cfg.rope_theta)
         .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
     let kv_idx = a.kv_idx;
-    gpu.kv_cache_write_q8_0(&state.kv.k_gpu[kv_idx], &state.fa_k, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("lfm2moe L{l}: kv write k: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(&state.kv.v_gpu[kv_idx], &state.fa_v, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("lfm2moe L{l}: kv write v: {e:?}"))?;
-    gpu.attention_q8_0_kv(
-        &state.fa_q, &state.kv.k_gpu[kv_idx], &state.kv.v_gpu[kv_idx], &state.fa_attn_out,
-        &state.pos_buf, seq_len, n_heads, n_kv, head_dim, state.kv.physical_cap,
+    // KV write (Q8) + attention via the shared KV-usage abstraction. lfm2moe is
+    // Q8 non-flash unconditional → derive's q8_attend_key returns AttnQ8_0Kv at
+    // pos+1<=15000 (byte-identical; needs no partials, hence flash_partials:
+    // None). It flips to AttnFlashQ8_0 at pos+1>15000 (the documented
+    // Q8-fidelity edge — rare for this decode model). capture_mode is NOT
+    // threaded: the non-flash kernel is capture-safe and lfm2moe captures it.
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
+        hipfire_dispatch::families::kv_tier::KvTierInputs {
+            pos: seq_len - 1,
+            ..state.kv.tier_inputs()
+        },
+    )
+    .map_err(|e| format!("lfm2moe L{l}: kv tier: {e}"))?;
+    let io = hipfire_dispatch::families::attention::AttnParams {
+        q: &state.fa_q,
+        k: &state.fa_k,
+        v: &state.fa_v,
+        k_cache: &state.kv.k_gpu[kv_idx],
+        v_cache: &state.kv.v_gpu[kv_idx],
+        k_scales: None,
+        v_scales: None,
+        pos_buf: &state.pos_buf,
+        pos: seq_len - 1,
+        positions: None,
+        n_heads,
+        n_kv_heads: n_kv,
+        head_dim,
+        physical_cap: state.kv.physical_cap,
+        batch_size: 1,
+        max_ctx_len: 0,
+        flash_partials: None,
+        givens_cos: None,
+        givens_sin: None,
+        tree_bias: None,
+        block_start: 0,
+        block_cols: 0,
+        output: &state.fa_attn_out,
+    };
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        &ctx,
+        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
     weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)
