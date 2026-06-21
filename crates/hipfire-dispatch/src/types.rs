@@ -76,8 +76,8 @@ pub enum TileImpl {
     DflashV3Causal,
     DflashV3CausalGfx12,
     // Scalar floors — separate for causal vs non-causal
-    DflashScalar,    // non-causal → gpu.attention_dflash_f32
-    CausalScalar,     // causal → gpu.attention_causal_batched
+    DflashScalar, // non-causal → gpu.attention_dflash_f32
+    CausalScalar, // causal → gpu.attention_causal_batched
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -111,9 +111,8 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256
-        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
         | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
@@ -129,9 +128,10 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
-        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => GemvVariant::Prerotated,
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
+            GemvVariant::Prerotated
+        }
         _ => GemvVariant::Plain,
     }
 }
@@ -147,21 +147,30 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
-        FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd
-        | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0 | FusedQkvHfq3G256
-        | FusedQkvHfp4G32
-        | FusedQkvParo4G128T => {
+        FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256
+        | FusedQkvQ4K | FusedQkvQ8_0 | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => {
             Some(FusedQkvVariant::Qkv)
         }
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
-        FusedQkvzaHfq4G256 | FusedQkvzaMq3G256Lloyd | FusedQkvzaMq4G256Lloyd
-        | FusedQkvzaHfq6G256 | FusedQkvzaQ8_0 | FusedQkvzaHfq3G256
-        | FusedQkvzaHfp4G32 | FusedQkvzaMfp4G32E8
+        FusedQkvzaHfq4G256
+        | FusedQkvzaMq3G256Lloyd
+        | FusedQkvzaMq4G256Lloyd
+        | FusedQkvzaHfq6G256
+        | FusedQkvzaQ8_0
+        | FusedQkvzaHfq3G256
+        | FusedQkvzaHfp4G32
+        | FusedQkvzaMfp4G32E8
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         // 2-way Fused Gate+Up (FFN, incl. Q8_0, HFQ3, HFP4 and Paro 4G128T)
-        FusedGateUpHfq4G256 | FusedGateUpMq3G256Lloyd | FusedGateUpMq4G256Lloyd
-        | FusedGateUpHfq6G256 | FusedGateUpQ4K | FusedGateUpQ8_0
-        | FusedGateUpHfq3G256 | FusedGateUpHfp4G32 | FusedGateUpMfp4G32E8
+        FusedGateUpHfq4G256
+        | FusedGateUpMq3G256Lloyd
+        | FusedGateUpMq4G256Lloyd
+        | FusedGateUpHfq6G256
+        | FusedGateUpQ4K
+        | FusedGateUpQ8_0
+        | FusedGateUpHfq3G256
+        | FusedGateUpHfp4G32
+        | FusedGateUpMfp4G32E8
         | FusedGateUpParo4G128T => Some(FusedQkvVariant::GateUp),
         _ => None,
     }
@@ -174,6 +183,7 @@ pub enum KernelKey {
     // GEMV plain
     GemvF32,
     GemvF16,
+    GemvBf16,
     GemvQ8_0,
     GemvQ4K,
     GemvQ6K,
@@ -349,11 +359,11 @@ pub enum KernelKey {
     AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
-    AttnQ8_0Kv,    // non-flash short-context Q8_0 decode (ship 3.1 B0)
+    AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // Llama legacy quant KV (decode only — no batched variants)
-    AttnHfq4Kv,       // HFQ4-quantized KV cache attention
-    AttnQ4Kv,         // Q4-quantized KV cache attention
+    AttnHfq4Kv, // HFQ4-quantized KV cache attention
+    AttnQ4Kv,   // Q4-quantized KV cache attention
     // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
@@ -361,15 +371,15 @@ pub enum KernelKey {
     AttnFlashAsym4FwhtBatchedMasked,
     AttnFlashAsym3BatchedMasked,
     AttnFlashAsym3FwhtBatchedMasked,
-    AttnFlashAsym2Batched,       // no _masked — 2-bit tree-verify gap
-    AttnFlashAsym2FwhtBatched,   // no _masked — 2-bit tree-verify gap
-    AttnQ8_0KvBatchedMasked,     // P-1 no-LDS-cap tiled kernel
+    AttnFlashAsym2Batched,     // no _masked — 2-bit tree-verify gap
+    AttnFlashAsym2FwhtBatched, // no _masked — 2-bit tree-verify gap
+    AttnQ8_0KvBatchedMasked,   // P-1 no-LDS-cap tiled kernel
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
-    AttnFullF16,         // F16 K/V, non-causal
-    AttnFullF32,         // F32 K/V, non-causal
-    AttnFullF16Causal,   // F16 K/V, causal
-    AttnFullF32Causal,   // F32 K/V, causal
+    AttnFullF16,       // F16 K/V, non-causal
+    AttnFullF32,       // F32 K/V, non-causal
+    AttnFullF16Causal, // F16 K/V, causal
+    AttnFullF32Causal, // F32 K/V, causal
     // KV Cache Write
     KvWriteAsym4,
     KvWriteAsym4Fwht,
@@ -378,8 +388,8 @@ pub enum KernelKey {
     KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
-    KvWriteHfq4,    // HFQ4-quantized KV write (llama legacy)
-    KvWriteQ4,      // Q4-quantized KV write (llama legacy)
+    KvWriteHfq4, // HFQ4-quantized KV write (llama legacy)
+    KvWriteQ4,   // Q4-quantized KV write (llama legacy)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
     KvWriteAsym4Batched,
@@ -515,7 +525,12 @@ pub enum DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedVariant { family, variant, arch, quant } => {
+            Self::UnsupportedVariant {
+                family,
+                variant,
+                arch,
+                quant,
+            } => {
                 write!(f, "unsupported {family}.{variant} for {arch}/{quant}")
             }
             Self::MissingImpl { key } => write!(f, "no implementation for {key:?}"),
@@ -535,15 +550,18 @@ impl From<DispatchError> for hip_bridge::HipError {
     }
 }
 
-
-
 impl KernelKey {
-    pub fn for_gemv(dtype: DType, variant: GemvVariant, _has_awq: bool) -> Result<Self, DispatchError> {
+    pub fn for_gemv(
+        dtype: DType,
+        variant: GemvVariant,
+        _has_awq: bool,
+    ) -> Result<Self, DispatchError> {
         use DType::*;
         use GemvVariant::*;
         match (dtype, variant) {
             (F32, Plain) => Ok(Self::GemvF32),
             (F16, Plain) => Ok(Self::GemvF16),
+            (BF16, Plain) => Ok(Self::GemvBf16),
             (Q8_0, Plain) => Ok(Self::GemvQ8_0),
             (Q4K, Plain) => Ok(Self::GemvQ4K),
             (Q6K, Plain) => Ok(Self::GemvQ6K),
@@ -575,8 +593,10 @@ impl KernelKey {
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
             _ => Err(DispatchError::UnsupportedVariant {
-                family: "gemv", variant: "unknown",
-                arch: "", quant: "",
+                family: "gemv",
+                variant: "unknown",
+                arch: "",
+                quant: "",
             }),
         }
     }
@@ -616,8 +636,10 @@ impl KernelKey {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
                 } else {
                     Err(DispatchError::UnsupportedVariant {
-                        family: "gemv", variant: "prerotated",
-                        arch: "", quant: "",
+                        family: "gemv",
+                        variant: "prerotated",
+                        arch: "",
+                        quant: "",
                     })
                 }
             }
@@ -637,8 +659,10 @@ impl KernelKey {
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
             _ => Err(DispatchError::UnsupportedVariant {
-                family: "gemv", variant: "residual",
-                arch: "", quant: "",
+                family: "gemv",
+                variant: "residual",
+                arch: "",
+                quant: "",
             }),
         }
     }
@@ -656,8 +680,10 @@ impl KernelKey {
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
             _ => Err(DispatchError::UnsupportedVariant {
-                family: "gemv", variant: "swiglu_residual",
-                arch: "", quant: "",
+                family: "gemv",
+                variant: "swiglu_residual",
+                arch: "",
+                quant: "",
             }),
         }
     }
@@ -666,7 +692,7 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)
@@ -707,21 +733,19 @@ impl KernelKey {
         use DType::*;
         use GemvVariant::*;
         match variant {
-            Plain => {
-                match dtype_rotation_plan(dtype) {
-                    RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
-                    RotationPlan::None => &[PipelineOp::Gemv],
-                    _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
-                }
-            }
-            Prerotated => {
-                &[PipelineOp::Gemv]
-            }
+            Plain => match dtype_rotation_plan(dtype) {
+                RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
+                RotationPlan::None => &[PipelineOp::Gemv],
+                _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+            },
+            Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
-                        &[PipelineOp::RotateFwht, PipelineOp::Gemv, PipelineOp::ResidualAdd]
-                    }
+                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
+                        PipelineOp::RotateFwht,
+                        PipelineOp::Gemv,
+                        PipelineOp::ResidualAdd,
+                    ],
                     _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
                 };
                 steps
@@ -731,7 +755,11 @@ impl KernelKey {
                     MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
                         &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
                     }
-                    _ => &[PipelineOp::SiluMul, PipelineOp::Gemv, PipelineOp::ResidualAdd],
+                    _ => &[
+                        PipelineOp::SiluMul,
+                        PipelineOp::Gemv,
+                        PipelineOp::ResidualAdd,
+                    ],
                 };
                 steps
             }
@@ -745,9 +773,23 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
     use DType::*;
     matches!(
         dtype,
-        MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
-            | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-            | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
-            | MFP3G32E8 | MFP2G32E8 | ParoQ4G128
+        MQ4G256
+            | MQ4G128
+            | MQ3G256
+            | MQ2G256
+            | MQ5G256
+            | MQ6G256
+            | MQ8G256
+            | MQ2G256Lloyd
+            | MQ3G256Lloyd
+            | MQ4G256Lloyd
+            | MFP4G32
+            | MFP4G32Lloyd
+            | MFP4G32P
+            | MFP4G32E8
+            | MFP4G32E8SOA
+            | MFP3G32E8
+            | MFP2G32E8
+            | ParoQ4G128
     )
 }

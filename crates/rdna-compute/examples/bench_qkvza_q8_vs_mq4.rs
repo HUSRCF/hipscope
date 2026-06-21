@@ -22,7 +22,9 @@ fn synth_q8(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row];
     let mut st = seed;
     for b in out.iter_mut() {
-        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (st >> 56) as u8;
     }
     // valid fp16 scales (avoid NaN/Inf in the scale slot)
@@ -43,7 +45,9 @@ fn synth_hfq4g256(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row];
     let mut st = seed;
     let mut rng = || {
-        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (st >> 33) as u32
     };
     for r in 0..m {
@@ -61,18 +65,37 @@ fn synth_hfq4g256(m: usize, k: usize, seed: u64) -> Vec<u8> {
 
 fn main() {
     let mut gpu = Gpu::init().expect("init");
-    eprintln!("arch={}  A3B LA: qkv={QKV_M} z={Z_M} b={B_M} a={A_M} K={K}", gpu.arch);
+    eprintln!(
+        "arch={}  A3B LA: qkv={QKV_M} z={Z_M} b={B_M} a={A_M} K={K}",
+        gpu.arch
+    );
 
     // Q8 weights + buffers
-    let q_qkv = gpu.upload_raw(&synth_q8(QKV_M, K, 1), &[QKV_M * (K / 32) * 34]).unwrap();
-    let q_z = gpu.upload_raw(&synth_q8(Z_M, K, 2), &[Z_M * (K / 32) * 34]).unwrap();
-    let q_b = gpu.upload_raw(&synth_q8(B_M, K, 3), &[B_M * (K / 32) * 34]).unwrap();
-    let q_a = gpu.upload_raw(&synth_q8(A_M, K, 4), &[A_M * (K / 32) * 34]).unwrap();
+    let q_qkv = gpu
+        .upload_raw(&synth_q8(QKV_M, K, 1), &[QKV_M * (K / 32) * 34])
+        .unwrap();
+    let q_z = gpu
+        .upload_raw(&synth_q8(Z_M, K, 2), &[Z_M * (K / 32) * 34])
+        .unwrap();
+    let q_b = gpu
+        .upload_raw(&synth_q8(B_M, K, 3), &[B_M * (K / 32) * 34])
+        .unwrap();
+    let q_a = gpu
+        .upload_raw(&synth_q8(A_M, K, 4), &[A_M * (K / 32) * 34])
+        .unwrap();
     // MQ4 weights
-    let m_qkv = gpu.upload_raw(&synth_hfq4g256(QKV_M, K, 1), &[QKV_M * (K / 256) * 136]).unwrap();
-    let m_z = gpu.upload_raw(&synth_hfq4g256(Z_M, K, 2), &[Z_M * (K / 256) * 136]).unwrap();
-    let m_b = gpu.upload_raw(&synth_hfq4g256(B_M, K, 3), &[B_M * (K / 256) * 136]).unwrap();
-    let m_a = gpu.upload_raw(&synth_hfq4g256(A_M, K, 4), &[A_M * (K / 256) * 136]).unwrap();
+    let m_qkv = gpu
+        .upload_raw(&synth_hfq4g256(QKV_M, K, 1), &[QKV_M * (K / 256) * 136])
+        .unwrap();
+    let m_z = gpu
+        .upload_raw(&synth_hfq4g256(Z_M, K, 2), &[Z_M * (K / 256) * 136])
+        .unwrap();
+    let m_b = gpu
+        .upload_raw(&synth_hfq4g256(B_M, K, 3), &[B_M * (K / 256) * 136])
+        .unwrap();
+    let m_a = gpu
+        .upload_raw(&synth_hfq4g256(A_M, K, 4), &[A_M * (K / 256) * 136])
+        .unwrap();
 
     let x: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
     let dx = gpu.upload_f32(&x, &[K]).unwrap();
@@ -89,20 +112,40 @@ fn main() {
 
     macro_rules! time_q8 {
         () => {{
-            for _ in 0..30 { gpu.fused_qkvza_q8_0(&q_qkv,&q_z,&q_b,&q_a,&dx,&yq,&yz,&yb,&ya,QKV_M,Z_M,B_M,A_M,K).unwrap(); }
+            for _ in 0..30 {
+                gpu.fused_qkvza_q8_0(
+                    &q_qkv, &q_z, &q_b, &q_a, &dx, &yq, &yz, &yb, &ya, QKV_M, Z_M, B_M, A_M, K,
+                )
+                .unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
-            for _ in 0..n { gpu.fused_qkvza_q8_0(&q_qkv,&q_z,&q_b,&q_a,&dx,&yq,&yz,&yb,&ya,QKV_M,Z_M,B_M,A_M,K).unwrap(); }
+            for _ in 0..n {
+                gpu.fused_qkvza_q8_0(
+                    &q_qkv, &q_z, &q_b, &q_a, &dx, &yq, &yz, &yb, &ya, QKV_M, Z_M, B_M, A_M, K,
+                )
+                .unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
             t0.elapsed().as_secs_f64() * 1e6 / n as f64
         }};
     }
     macro_rules! time_mq4 {
         () => {{
-            for _ in 0..30 { gpu.fused_qkvza_hfq4g256(&m_qkv,&m_z,&m_b,&m_a,&dx,&yq,&yz,&yb,&ya,QKV_M,Z_M,B_M,A_M,K).unwrap(); }
+            for _ in 0..30 {
+                gpu.fused_qkvza_hfq4g256(
+                    &m_qkv, &m_z, &m_b, &m_a, &dx, &yq, &yz, &yb, &ya, QKV_M, Z_M, B_M, A_M, K,
+                )
+                .unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
-            for _ in 0..n { gpu.fused_qkvza_hfq4g256(&m_qkv,&m_z,&m_b,&m_a,&dx,&yq,&yz,&yb,&ya,QKV_M,Z_M,B_M,A_M,K).unwrap(); }
+            for _ in 0..n {
+                gpu.fused_qkvza_hfq4g256(
+                    &m_qkv, &m_z, &m_b, &m_a, &dx, &yq, &yz, &yb, &ya, QKV_M, Z_M, B_M, A_M, K,
+                )
+                .unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
             t0.elapsed().as_secs_f64() * 1e6 / n as f64
         }};
@@ -114,10 +157,27 @@ fn main() {
     let gbps = |bytes: usize, us: f64| bytes as f64 / us / 1e3;
 
     eprintln!("\n  fused_qkvza  bytes/call    µs/call    GB/s");
-    eprintln!("  Q8_0        {:>8.2} MiB  {:>7.1}  {:>6.0}", q8_bytes as f64 / 1048576.0, q8_us, gbps(q8_bytes, q8_us));
-    eprintln!("  MQ4         {:>8.2} MiB  {:>7.1}  {:>6.0}", mq4_bytes as f64 / 1048576.0, mq4_us, gbps(mq4_bytes, mq4_us));
-    eprintln!("\n  byte ratio (Q8/MQ4) = {:.2}   TIME ratio (Q8/MQ4) = {:.2}", q8_bytes as f64 / mq4_bytes as f64, q8_us / mq4_us);
-    eprintln!("  GB/s ratio (MQ4/Q8) = {:.2}", gbps(mq4_bytes, mq4_us) / gbps(q8_bytes, q8_us));
+    eprintln!(
+        "  Q8_0        {:>8.2} MiB  {:>7.1}  {:>6.0}",
+        q8_bytes as f64 / 1048576.0,
+        q8_us,
+        gbps(q8_bytes, q8_us)
+    );
+    eprintln!(
+        "  MQ4         {:>8.2} MiB  {:>7.1}  {:>6.0}",
+        mq4_bytes as f64 / 1048576.0,
+        mq4_us,
+        gbps(mq4_bytes, mq4_us)
+    );
+    eprintln!(
+        "\n  byte ratio (Q8/MQ4) = {:.2}   TIME ratio (Q8/MQ4) = {:.2}",
+        q8_bytes as f64 / mq4_bytes as f64,
+        q8_us / mq4_us
+    );
+    eprintln!(
+        "  GB/s ratio (MQ4/Q8) = {:.2}",
+        gbps(mq4_bytes, mq4_us) / gbps(q8_bytes, q8_us)
+    );
     eprintln!("\n  READ: time ratio ≈ byte ratio (~2.0) AND similar GB/s → Q8 is BYTE-FLOORED");
     eprintln!("        (only MQ4 attention reaches mq4 decode parity). time ratio ≫ 2 OR");
     eprintln!("        Q8 GB/s ≪ MQ4 GB/s → Q8 kernel is INEFFICIENT (tunable on-box).");

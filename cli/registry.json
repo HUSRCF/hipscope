@@ -49,6 +49,7 @@
       "file": "deepseek-v4-flash.mq2lloyd",
       "size_gb": 82,
       "min_vram_gb": 96,
+      "sampling": { "temperature": 1.0, "top_p": 1.0 },
       "mtp": {
         "file": "deepseek-v4-flash-mtp.mq2lloyd"
       },
@@ -70,6 +71,14 @@
         "system_prompt": "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
       },
       "desc": "MiniMax-M2.7 Mixtral-style 256-expert MoE (arch_id=10). MQ2 SKU (~79GB); fits gfx1151/96GB or multi-GPU EP. Card temp=1.0/top_p=0.95/top_k=40 + default identity system prompt."
+    },
+    "north-mini-code": {
+      "repo": "nwoolmer/hipfire-north-mini-code",
+      "file": "north-mini-code.mq4.hfq",
+      "size_gb": 16,
+      "min_vram_gb": 24,
+      "sampling": { "temperature": 1.0, "top_p": 0.95 },
+      "desc": "CohereLabs North-Mini-Code-1.0 (Cohere2-MoE, arch_id=12). MQ4 4-bit. Agentic code model: parallel block, sigmoid 128-expert MoE; <|START_THINKING|>/<|START_TEXT|>/<|START_ACTION|> tool-call format. ~880 tok/s prefill, ~37 tok/s decode on gfx1151."
     },
     "qwen3.6:35b-a3b": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",

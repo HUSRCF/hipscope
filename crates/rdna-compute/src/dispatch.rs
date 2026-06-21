@@ -113,7 +113,9 @@ impl GpuTensor {
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0)
+            },
             shape: vec![0],
             dtype: crate::DType::F32,
         }
@@ -131,12 +133,26 @@ impl GpuTensor {
             dtype: self.dtype,
         }
     }
+
+    /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
+    /// The returned tensor shares the source's device pointer; it is a VIEW —
+    /// do NOT pass it to `free_tensor`. `DeviceBuffer::from_raw` has no
+    /// Drop-time free, so the alias and source coexist safely until the OWNER
+    /// is freed exactly once.
+    pub fn shallow_clone(&self) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), self.buf.size()) },
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
     F16,
+    BF16,         // 2 bytes; native bf16 reference (KLD oracle). Widen→f32 = high-16-bit shift.
     Q4K,          // 144 bytes per 256 elements
     Q6K,          // 210 bytes per 256 elements
     Q8_0,         // 34 bytes per 32 elements
@@ -180,9 +196,9 @@ pub enum DType {
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
-    HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
-    HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
+    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
@@ -194,7 +210,7 @@ impl DType {
     pub fn size(self) -> usize {
         match self {
             DType::F32 => 4,
-            DType::F16 => 2,
+            DType::F16 | DType::BF16 => 2,
             DType::Q4K
             | DType::Q6K
             | DType::Q8_0
@@ -296,6 +312,27 @@ impl DType {
                 | DType::MQ3G256Lloyd
                 | DType::MQ2G256Lloyd
         )
+    }
+
+    /// Per-row byte stride for split-metadata layouts. Q8HFQ packs `n_groups*2`
+    /// scale bytes + `k` value bytes per row, padded to a 128-byte boundary; all
+    /// other dtypes encode their layout internally and ignore this value (returns 0).
+    /// Single source of truth for the formula previously inlined at hfq.rs:748.
+    pub fn row_stride(self, k: usize) -> usize {
+        match self {
+            DType::Q8HFQ => {
+                let raw_row = (k / 32) * 2 + k;
+                (raw_row + 127) & !127
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
+    /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
+    /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
+    pub fn requires_k_mod_256(self) -> bool {
+        matches!(self, DType::HFP4G32 | DType::MFP4G32)
     }
 }
 
@@ -480,7 +517,11 @@ impl BlockHessianAcc {
                 n += 1;
             }
         }
-        if n == 0 { 0.0 } else { s / n as f64 }
+        if n == 0 {
+            0.0
+        } else {
+            s / n as f64
+        }
     }
 }
 
@@ -575,10 +616,8 @@ impl HessianCapture {
         let ptrs: Vec<(SyncPtr, &[f32], usize)> = items
             .iter()
             .map(|(name, x, k)| {
-                let acc: &mut BlockHessianAcc = self
-                    .entries
-                    .get_mut(name)
-                    .expect("entry ensured above");
+                let acc: &mut BlockHessianAcc =
+                    self.entries.get_mut(name).expect("entry ensured above");
                 (SyncPtr(acc as *mut BlockHessianAcc), *x, *k)
             })
             .collect();
@@ -1022,7 +1061,6 @@ impl Gpu {
             )
         }
     }
-
 
     /// Dequantize an mfp4-E8 matrix [M x K] to FP16 [M x K] row-major.
     /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical footprint to mfp4+P).
@@ -2398,7 +2436,50 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::DType;
     use super::HessianCapture;
+
+    #[test]
+    fn q8hfq_row_stride_matches_legacy_formula() {
+        // Hard-coded expected stride (128B-aligned) — independent oracle, NOT the
+        // formula re-run. raw_row = (k/32)*2 + k, then padded up to a 128B boundary.
+        assert_eq!(DType::Q8HFQ.row_stride(4096), 4352); // raw 4352, already aligned
+        assert_eq!(DType::Q8HFQ.row_stride(11008), 11776); // raw 11696 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(5120), 5504); // raw 5440 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(14336), 15232); // raw 15232, already aligned
+        assert_eq!(DType::Q8HFQ.row_stride(256), 384); // raw 272 → padded
+        assert_eq!(DType::Q8HFQ.row_stride(96), 128); // raw 102 → padded
+    }
+
+    #[test]
+    fn non_q8hfq_row_stride_is_zero() {
+        for dt in [
+            DType::HFQ4G256,
+            DType::MQ4G256,
+            DType::Q8_0,
+            DType::F16,
+            DType::HFP4G32,
+            DType::MFP4G32,
+        ] {
+            assert_eq!(dt.row_stride(4096), 0, "{dt:?} must have stride 0");
+        }
+    }
+
+    #[test]
+    fn only_hfp4_family_requires_k_mod_256() {
+        assert!(DType::HFP4G32.requires_k_mod_256());
+        assert!(DType::MFP4G32.requires_k_mod_256());
+        for dt in [
+            DType::HFQ4G256,
+            DType::MQ4G256,
+            DType::Q8HFQ,
+            DType::Q8_0,
+            DType::F16,
+            DType::F32,
+        ] {
+            assert!(!dt.requires_k_mod_256(), "{dt:?} must NOT require k%256");
+        }
+    }
 
     /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
     /// signed-zero, negatives, and large/small magnitudes to exercise the
@@ -2491,7 +2572,8 @@ mod tests {
                         pb[idx].to_bits(),
                         sb[idx].to_bits(),
                         "{name} block={b} idx={idx}: parallel {} != serial {} (NOT bit-identical)",
-                        pb[idx], sb[idx]
+                        pb[idx],
+                        sb[idx]
                     );
                 }
             }

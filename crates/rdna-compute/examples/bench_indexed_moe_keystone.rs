@@ -44,28 +44,36 @@ const N_MOE_LAYERS: usize = 40; // num_hidden_layers (all sparse-MoE on A3B)
 const FULL_DECODE_US: f64 = 1.0e6 / 150.0; // 6667 us/token at the mq4 150 tok/s anchor
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod u8");
     t
 }
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc f32");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod f32");
     t
 }
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len() * 4], DType::Raw).expect("alloc i32");
+    let t = gpu
+        .alloc_tensor(&[data.len() * 4], DType::Raw)
+        .expect("alloc i32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod i32");
     t
 }
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-    let t = gpu.alloc_tensor(&[data.len() * 8], DType::Raw).expect("alloc u64");
+    let t = gpu
+        .alloc_tensor(&[data.len() * 8], DType::Raw)
+        .expect("alloc u64");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod u64");
     t
 }
@@ -192,7 +200,14 @@ fn main() {
     macro_rules! launch_mq4 {
         ($tk:expr) => {
             gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-                &expert_ptrs_mq4, $tk, &xr, &gate_batch, &up_batch, M, K,
+                &expert_ptrs_mq4,
+                $tk,
+                &xr,
+                &gate_batch,
+                &up_batch,
+                M,
+                K,
+                K_TOP,
             )
             .expect("mq4 idx")
         };
@@ -200,7 +215,14 @@ fn main() {
     macro_rules! launch_mq6 {
         ($tk:expr) => {
             gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
-                &expert_ptrs_mq6, $tk, &xr, &gate_batch, &up_batch, M, K,
+                &expert_ptrs_mq6,
+                $tk,
+                &xr,
+                &gate_batch,
+                &up_batch,
+                M,
+                K,
+                K_TOP,
             )
             .expect("mq6 idx")
         };
@@ -208,7 +230,16 @@ fn main() {
     macro_rules! launch_mixed {
         ($tk:expr) => {
             gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
-                &expert_ptrs_mq4, &tags_all_mq4, $tk, &xr, &gate_batch, &up_batch, M, K, K_TOP, 1,
+                &expert_ptrs_mq4,
+                &tags_all_mq4,
+                $tk,
+                &xr,
+                &gate_batch,
+                &up_batch,
+                M,
+                K,
+                K_TOP,
+                1,
             )
             .expect("mixed idx")
         };
@@ -258,24 +289,48 @@ fn main() {
 
     eprintln!();
     eprintln!("--- per-launch (gate_up only), N={n}, GPU-throughput (1 sync / N launches) ---");
-    eprintln!("  {:<22}  {:>22}  {:>22}", "config", "HOT (L3-resident 8)", "COLD (256-expert WS)");
+    eprintln!(
+        "  {:<22}  {:>22}  {:>22}",
+        "config", "HOT (L3-resident 8)", "COLD (256-expert WS)"
+    );
     eprintln!("  {}", "-".repeat(70));
-    eprintln!("  {:<22}  {:>22}  {:>22}", "(a) mq4-uniform", cell(mq4_hot, mq4_bytes_launch), cell(mq4_cold, mq4_bytes_launch));
-    eprintln!("  {:<22}  {:>22}  {:>22}", "(b) mq6-uniform", cell(mq6_hot, mq6_bytes_launch), cell(mq6_cold, mq6_bytes_launch));
-    eprintln!("  {:<22}  {:>22}  {:>22}", "(c) merged@MQ4 data", cell(mix_hot, mq4_bytes_launch), cell(mix_cold, mq4_bytes_launch));
+    eprintln!(
+        "  {:<22}  {:>22}  {:>22}",
+        "(a) mq4-uniform",
+        cell(mq4_hot, mq4_bytes_launch),
+        cell(mq4_cold, mq4_bytes_launch)
+    );
+    eprintln!(
+        "  {:<22}  {:>22}  {:>22}",
+        "(b) mq6-uniform",
+        cell(mq6_hot, mq6_bytes_launch),
+        cell(mq6_cold, mq6_bytes_launch)
+    );
+    eprintln!(
+        "  {:<22}  {:>22}  {:>22}",
+        "(c) merged@MQ4 data",
+        cell(mix_hot, mq4_bytes_launch),
+        cell(mix_cold, mq4_bytes_launch)
+    );
     eprintln!();
 
     // ---- H2: kernel-fixable overhead (c)-(a) on identical mq4 data ----
     let h2_hot = (mix_hot - mq4_hot) / mq4_hot * 100.0;
     let h2_cold = (mix_cold - mq4_cold) / mq4_cold * 100.0;
     eprintln!("H2 (merged kernel overhead vs uniform mq4, SAME data, all-MQ4 tags):");
-    eprintln!("   HOT  (c)/(a) = {:+.1}%   COLD (c)/(a) = {:+.1}%", h2_hot, h2_cold);
+    eprintln!(
+        "   HOT  (c)/(a) = {:+.1}%   COLD (c)/(a) = {:+.1}%",
+        h2_hot, h2_cold
+    );
     eprintln!("   → this is the pure 'restore the quad-unroll' upside at the real indexed grid.");
     eprintln!();
 
     // ---- byte-transfer check: does mq6 +47% bytes → proportional slowdown? ----
     let byte_ratio = mq6_bytes_launch / mq4_bytes_launch;
-    eprintln!("Byte-transfer (mq6 vs mq4 uniform): bytes ×{:.2}", byte_ratio);
+    eprintln!(
+        "Byte-transfer (mq6 vs mq4 uniform): bytes ×{:.2}",
+        byte_ratio
+    );
     eprintln!("   HOT  us ×{:.2}   COLD us ×{:.2}   (==byte_ratio → BW-bound; <ratio → compute/launch-bound)",
         mq6_hot / mq4_hot, mq6_cold / mq4_cold);
     eprintln!();
@@ -288,8 +343,15 @@ fn main() {
         let routed_tok = gu_tok * 1.5; // + down (~0.5× gate_up)
         (gu_tok, routed_tok, routed_tok / FULL_DECODE_US * 100.0)
     };
-    eprintln!("FRACTION of the {:.0} us/token decode (mq4@150 anchor), COLD (realistic) rate:", FULL_DECODE_US);
-    for (name, gu) in [("mq4", mq4_cold), ("mq6", mq6_cold), ("merged@MQ4", mix_cold)] {
+    eprintln!(
+        "FRACTION of the {:.0} us/token decode (mq4@150 anchor), COLD (realistic) rate:",
+        FULL_DECODE_US
+    );
+    for (name, gu) in [
+        ("mq4", mq4_cold),
+        ("mq6", mq6_cold),
+        ("merged@MQ4", mix_cold),
+    ] {
         let (gu_tok, routed_tok, pct) = frac(gu);
         eprintln!(
             "   {:<12} gate_up ×40 = {:6.0}us  +down(est) = {:6.0}us  = {:4.1}% of token",
@@ -300,7 +362,9 @@ fn main() {
     eprintln!("READ: if routed % is LARGE (~30%+), WS1's byte ceilings (122/102) bind and the");
     eprintln!("graded gap is dominantly format-inherent. If SMALL (~5%), the 150-vs-110 spread");
     eprintln!("lives outside the routed GEMV (shared expert / attn / hipGraph) and the byte model");
-    eprintln!("is a proxy — WS2 'capture the 150' would then be a kernel/launch problem, not format.");
+    eprintln!(
+        "is a proxy — WS2 'capture the 150' would then be a kernel/launch problem, not format."
+    );
 
     // non-NaN sanity (gross-setup guard)
     let g = {
@@ -310,6 +374,9 @@ fn main() {
         gpu.hip.memcpy_dtoh(bytes, &gate_batch.buf).expect("dtoh");
         v[0]
     };
-    eprintln!("\nsanity: gate_batch[0] = {g:.5} (finite={})", g.is_finite());
+    eprintln!(
+        "\nsanity: gate_batch[0] = {g:.5} (finite={})",
+        g.is_finite()
+    );
     drop(keep);
 }

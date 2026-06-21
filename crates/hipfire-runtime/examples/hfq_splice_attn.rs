@@ -51,7 +51,7 @@ fn is_attn_proj(name: &str) -> bool {
         // MoE gate-side (NOT routed experts) → MQ4 to enable the fused gate path
         || name.ends_with(".mlp.gate.weight")              // router
         || name.ends_with(".mlp.shared_expert_gate.weight") // shared-expert scalar gate
-        || name.contains(".mlp.shared_expert.")            // shared expert gate/up/down
+        || name.contains(".mlp.shared_expert.") // shared expert gate/up/down
 }
 
 fn parse_hfq(path: &PathBuf) -> std::io::Result<(File, ParsedHfq)> {
@@ -59,7 +59,10 @@ fn parse_hfq(path: &PathBuf) -> std::io::Result<(File, ParsedHfq)> {
     let mut header = [0u8; 32];
     file.read_exact(&mut header)?;
     if &header[0..4] != b"HFQM" {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an .hfq file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not an .hfq file",
+        ));
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -74,12 +77,29 @@ fn parse_hfq(path: &PathBuf) -> std::io::Result<(File, ParsedHfq)> {
 
     let (mut depth, mut in_str, mut esc, mut json_end) = (0i32, false, false, 0usize);
     for (i, &b) in meta_region.iter().enumerate() {
-        if esc { esc = false; continue; }
-        if b == b'\\' && in_str { esc = true; continue; }
-        if b == b'"' { in_str = !in_str; continue; }
+        if esc {
+            esc = false;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            esc = true;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            continue;
+        }
         if !in_str {
-            if b == b'{' { depth += 1; }
-            if b == b'}' { depth -= 1; if depth == 0 { json_end = i + 1; break; } }
+            if b == b'{' {
+                depth += 1;
+            }
+            if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
         }
     }
     let metadata_json_bytes = meta_region[..json_end].to_vec();
@@ -95,16 +115,40 @@ fn parse_hfq(path: &PathBuf) -> std::io::Result<(File, ParsedHfq)> {
         pos += 2;
         let name = String::from_utf8_lossy(&idx_buf[pos..pos + name_len]).to_string();
         pos += name_len;
-        let quant_type = idx_buf[pos]; pos += 1;
-        let n_dims = idx_buf[pos] as usize; pos += 1;
+        let quant_type = idx_buf[pos];
+        pos += 1;
+        let n_dims = idx_buf[pos] as usize;
+        pos += 1;
         let mut shape = Vec::with_capacity(n_dims);
-        for _ in 0..n_dims { shape.push(u32::from_le_bytes(idx_buf[pos..pos + 4].try_into().unwrap())); pos += 4; }
-        let group_size = u32::from_le_bytes(idx_buf[pos..pos + 4].try_into().unwrap()); pos += 4;
-        let data_size = u64::from_le_bytes(idx_buf[pos..pos + 8].try_into().unwrap()); pos += 8;
-        tensors.push(TensorEntry { name, quant_type, shape, group_size, data_offset_src: cumulative, data_size });
+        for _ in 0..n_dims {
+            shape.push(u32::from_le_bytes(
+                idx_buf[pos..pos + 4].try_into().unwrap(),
+            ));
+            pos += 4;
+        }
+        let group_size = u32::from_le_bytes(idx_buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let data_size = u64::from_le_bytes(idx_buf[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        tensors.push(TensorEntry {
+            name,
+            quant_type,
+            shape,
+            group_size,
+            data_offset_src: cumulative,
+            data_size,
+        });
         cumulative += data_size;
     }
-    Ok((file, ParsedHfq { version, arch_id, metadata_json_bytes, tensors }))
+    Ok((
+        file,
+        ParsedHfq {
+            version,
+            arch_id,
+            metadata_json_bytes,
+            tensors,
+        },
+    ))
 }
 
 fn main() -> ExitCode {
@@ -116,23 +160,46 @@ fn main() -> ExitCode {
             "--donor" => donor = args.next().map(PathBuf::from),
             "--out" => out = args.next().map(PathBuf::from),
             "--dry-run" => dry = true,
-            s => { eprintln!("unknown arg {s}"); return ExitCode::from(1); }
+            s => {
+                eprintln!("unknown arg {s}");
+                return ExitCode::from(1);
+            }
         }
     }
     let (base, donor, out) = match (base, donor, out) {
         (Some(b), Some(d), Some(o)) => (b, d, o),
-        _ => { eprintln!("usage: hfq_splice_attn --base <mq4p> --donor <mq4-fresh> --out <mq4r> [--dry-run]"); return ExitCode::from(1); }
+        _ => {
+            eprintln!(
+                "usage: hfq_splice_attn --base <mq4p> --donor <mq4-fresh> --out <mq4r> [--dry-run]"
+            );
+            return ExitCode::from(1);
+        }
     };
 
     let (mut base_f, base_p) = parse_hfq(&base).expect("parse base");
     let (mut donor_f, donor_p) = parse_hfq(&donor).expect("parse donor");
-    eprintln!("base  : {} tensors, arch_id={}", base_p.tensors.len(), base_p.arch_id);
-    eprintln!("donor : {} tensors, arch_id={}", donor_p.tensors.len(), donor_p.arch_id);
+    eprintln!(
+        "base  : {} tensors, arch_id={}",
+        base_p.tensors.len(),
+        base_p.arch_id
+    );
+    eprintln!(
+        "donor : {} tensors, arch_id={}",
+        donor_p.tensors.len(),
+        donor_p.arch_id
+    );
 
     // Build output plan: for each base tensor, swap to donor if attn-proj + donor has it (matching shape).
     use std::collections::HashMap;
-    let donor_by_name: HashMap<&str, &TensorEntry> = donor_p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
-    enum Src { Base(usize), Donor(usize) }
+    let donor_by_name: HashMap<&str, &TensorEntry> = donor_p
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    enum Src {
+        Base(usize),
+        Donor(usize),
+    }
     let mut plan: Vec<Src> = Vec::with_capacity(base_p.tensors.len());
     let mut swapped = 0usize;
     let (mut swap_q8, mut swap_other) = (0usize, 0usize);
@@ -148,20 +215,36 @@ fn main() -> ExitCode {
     let uniform_gate_up = std::env::var("HIPFIRE_UNIFORM_GATE_UP").is_ok();
     for (i, bt) in base_p.tensors.iter().enumerate() {
         let demote = demote_mq6 && bt.quant_type == 15 && bt.name.contains(".mlp.experts.");
-        let ug = uniform_gate_up && bt.name.contains(".mlp.experts.") && bt.name.contains("gate_up_proj");
+        let ug = uniform_gate_up
+            && bt.name.contains(".mlp.experts.")
+            && bt.name.contains("gate_up_proj");
         if is_attn_proj(&bt.name) || demote || ug {
             if let Some(dt) = donor_by_name.get(bt.name.as_str()) {
                 if dt.shape == bt.shape {
-                    if bt.quant_type == 3 { swap_q8 += 1; } else { swap_other += 1; }
+                    if bt.quant_type == 3 {
+                        swap_q8 += 1;
+                    } else {
+                        swap_other += 1;
+                    }
                     if swapped < 8 {
-                        eprintln!("  SWAP {} : base_qt={} -> donor_qt={} shape={:?}", bt.name, bt.quant_type, dt.quant_type, bt.shape);
+                        eprintln!(
+                            "  SWAP {} : base_qt={} -> donor_qt={} shape={:?}",
+                            bt.name, bt.quant_type, dt.quant_type, bt.shape
+                        );
                     }
                     swapped += 1;
-                    let di = donor_p.tensors.iter().position(|t| t.name == dt.name).unwrap();
+                    let di = donor_p
+                        .tensors
+                        .iter()
+                        .position(|t| t.name == dt.name)
+                        .unwrap();
                     plan.push(Src::Donor(di));
                     continue;
                 } else {
-                    eprintln!("  WARN shape mismatch {} base={:?} donor={:?} — keeping base", bt.name, bt.shape, dt.shape);
+                    eprintln!(
+                        "  WARN shape mismatch {} base={:?} donor={:?} — keeping base",
+                        bt.name, bt.shape, dt.shape
+                    );
                 }
             } else {
                 eprintln!("  WARN attn-proj {} not in donor — keeping base", bt.name);
@@ -172,24 +255,38 @@ fn main() -> ExitCode {
     eprintln!("\nswapped {swapped} attn-proj tensors ({swap_q8} were Q8/qt=3, {swap_other} other); {} kept from base", base_p.tensors.len() - swapped);
 
     // resolve each plan entry to (name, quant_type, shape, group_size, data_size, src_file_offset, from_donor)
-    let resolved: Vec<(&TensorEntry, bool)> = plan.iter().map(|s| match s {
-        Src::Base(i) => (&base_p.tensors[*i], false),
-        Src::Donor(i) => (&donor_p.tensors[*i], true),
-    }).collect();
+    let resolved: Vec<(&TensorEntry, bool)> = plan
+        .iter()
+        .map(|s| match s {
+            Src::Base(i) => (&base_p.tensors[*i], false),
+            Src::Donor(i) => (&donor_p.tensors[*i], true),
+        })
+        .collect();
 
     if dry {
         let total: u64 = resolved.iter().map(|(t, _)| t.data_size).sum();
-        eprintln!("dry-run: out would be {} tensors / {:.2} GB", resolved.len(), total as f64 / 1e9);
+        eprintln!(
+            "dry-run: out would be {} tensors / {:.2} GB",
+            resolved.len(),
+            total as f64 / 1e9
+        );
         return ExitCode::from(0);
     }
 
     // Write merged .hfq (metadata + index from base; data from base/donor per plan).
     let mut index_len = 4usize;
-    for (t, _) in &resolved { index_len += 2 + t.name.len() + 1 + 1 + t.shape.len() * 4 + 4 + 8; }
+    for (t, _) in &resolved {
+        index_len += 2 + t.name.len() + 1 + 1 + t.shape.len() * 4 + 4 + 8;
+    }
     let metadata_offset = 32u64;
     let data_offset = metadata_offset + base_p.metadata_json_bytes.len() as u64 + index_len as u64;
 
-    let mut of = OpenOptions::new().write(true).create(true).truncate(true).open(&out).expect("open out");
+    let mut of = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&out)
+        .expect("open out");
     let mut header = [0u8; 32];
     header[0..4].copy_from_slice(b"HFQM");
     header[4..8].copy_from_slice(&base_p.version.to_le_bytes());
@@ -207,7 +304,9 @@ fn main() -> ExitCode {
         idx.extend_from_slice(t.name.as_bytes());
         idx.push(t.quant_type);
         idx.push(t.shape.len() as u8);
-        for &d in &t.shape { idx.extend_from_slice(&d.to_le_bytes()); }
+        for &d in &t.shape {
+            idx.extend_from_slice(&d.to_le_bytes());
+        }
         idx.extend_from_slice(&t.group_size.to_le_bytes());
         idx.extend_from_slice(&t.data_size.to_le_bytes());
     }
@@ -217,7 +316,11 @@ fn main() -> ExitCode {
     let mut buf = vec![0u8; 16 * 1024 * 1024];
     let mut total: u64 = 0;
     for (i, (t, from_donor)) in resolved.iter().enumerate() {
-        let src = if *from_donor { &mut donor_f } else { &mut base_f };
+        let src = if *from_donor {
+            &mut donor_f
+        } else {
+            &mut base_f
+        };
         src.seek(SeekFrom::Start(t.data_offset_src)).unwrap();
         let mut rem = t.data_size;
         while rem > 0 {
@@ -228,7 +331,12 @@ fn main() -> ExitCode {
             total += want as u64;
         }
         if (i + 1) % 2000 == 0 || i + 1 == resolved.len() {
-            eprintln!("  wrote {}/{} tensors ({:.2} GB)", i + 1, resolved.len(), total as f64 / 1e9);
+            eprintln!(
+                "  wrote {}/{} tensors ({:.2} GB)",
+                i + 1,
+                resolved.len(),
+                total as f64 / 1e9
+            );
         }
     }
     of.sync_data().unwrap();

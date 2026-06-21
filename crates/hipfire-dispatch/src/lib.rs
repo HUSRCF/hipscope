@@ -9,6 +9,7 @@
 
 pub mod context;
 pub mod families;
+pub mod ops;
 pub mod pipeline;
 pub mod resource;
 pub mod tables;

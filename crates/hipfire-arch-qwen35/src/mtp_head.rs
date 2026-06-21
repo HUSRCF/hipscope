@@ -1818,6 +1818,7 @@ fn mtp_moe_ffn_decode(
         up_batch,
         2 * mi,
         e0.gate_up.k,
+        k_top,
     )?;
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
@@ -1917,7 +1918,9 @@ pub fn mtp_head_apply_lm_head_batched(
             // the head lm_head is ALSO scalar today — gets the fix too. WMMA
             // needs wave32 (gfx11+) and K%32==0; else fall back to scalar.
             // Opt out with HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0.
-            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA").ok().as_deref()
+            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
+                .ok()
+                .as_deref()
                 != Some("0")
                 && gpu.arch_caps.has_wmma()
                 && lm_head_weights.k % 32 == 0;

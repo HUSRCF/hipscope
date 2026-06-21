@@ -518,6 +518,15 @@ pub struct Message {
     /// `is defined` against it don't see a misleading null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assistant-turn reasoning that preceded a tool call ("interleaved
+    /// thinking"). Rendered into the Cohere/North chat template's
+    /// `<|START_THINKING|>{{message.tool_plan}}<|END_THINKING|>` slot so a
+    /// multi-turn agentic flow preserves prior reasoning (per the
+    /// North-Mini-Code model card — "pass model-generated thinking to future
+    /// agentic steps/turns"). Empty for plain turns / non-thinking models;
+    /// always serialized (templates that don't reference it ignore the field).
+    #[serde(default)]
+    pub tool_plan: String,
 }
 
 /// One assistant-emitted tool call, attached to an assistant `Message`.
@@ -577,7 +586,10 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
     value.serialize(&mut ser).map_err(|e| {
-        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"))
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
     })?;
     String::from_utf8(buf).map_err(|e| {
         minijinja::Error::new(
@@ -656,6 +668,7 @@ impl<'a> JinjaChatFrame<'a> {
                 content: sys.to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             });
         }
         messages.push(Message {
@@ -663,6 +676,7 @@ impl<'a> JinjaChatFrame<'a> {
             content: self.user.to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         });
         self.render_messages(&messages, None, None)
     }
@@ -691,11 +705,19 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja_contrib::pycompat::unknown_method_callback;
 
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Lenient undefined: undefined renders as "", is falsy in boolean
+        // context, and compares false — matching HuggingFace's jinja2 DEFAULT
+        // environment, which is what upstream chat templates are authored
+        // against. REQUIRED by Cohere2's tool_use template, which legitimately
+        // references optional fields the engine doesn't always populate
+        // (`message.tool_plan`, per-tool_call `id`, `{% if developer_preamble %}`,
+        // `{% if enable_citations %}`). Strict/SemiStrict raised on those and
+        // forced a fallback to the hand-rolled ChatML frame mid-conversation —
+        // the agentic multi-turn derail (the model then saw <|im_start|> markers
+        // and hallucinated). Complete templates (qwen, etc.) never hit undefined,
+        // so they render byte-identically; this only changes the
+        // previously-erroring paths, degrading them to HF-equivalent "".
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into
@@ -729,7 +751,8 @@ impl<'a> JinjaChatFrame<'a> {
 
         env.add_template("chat", self.template)
             .map_err(|e| format!("template parse: {e}"))?;
-        let tmpl = env.get_template("chat")
+        let tmpl = env
+            .get_template("chat")
             .map_err(|e| format!("template lookup: {e}"))?;
 
         // Pass bos_token to the template context. Caller may override via
@@ -805,7 +828,8 @@ impl<'a> JinjaChatFrame<'a> {
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
         };
-        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+        tmpl.render(ctx)
+            .map_err(|e| format!("template render: {e}"))
     }
 }
 
@@ -823,27 +847,43 @@ fn pick_splice_sentinel(tok: &Tokenizer) -> Option<String> {
     // Tokens the chat templates emit structurally — never use these as a
     // sentinel (their post-render count wouldn't equal the spliced-turn count).
     const STRUCTURAL: &[&str] = &[
-        "<|im_start|>", "<|im_end|>", "<think>", "</think>",
-        "<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>",
-        "<s>", "</s>", "<bos>", "<eos>", "<unk>", "<pad>", "<|file_separator|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<|endoftext|>",
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<s>",
+        "</s>",
+        "<bos>",
+        "<eos>",
+        "<unk>",
+        "<pad>",
+        "<|file_separator|>",
     ];
     let atomic = |s: &str| -> bool {
-        tok.special_token_id(s).map_or(false, |id| tok.encode(s) == vec![id])
+        tok.special_token_id(s)
+            .map_or(false, |id| tok.encode(s) == vec![id])
     };
     // First pass: obviously-reserved scratch tokens.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
         let ls = s.to_ascii_lowercase();
-        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad"))
-            && atomic(s)
-        {
+        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad")) && atomic(s) {
             return Some(s.clone());
         }
     }
     // Second pass: any non-structural special token that round-trips atomically.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
-        if atomic(s) { return Some(s.clone()); }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
+        if atomic(s) {
+            return Some(s.clone());
+        }
     }
     None
 }
@@ -903,6 +943,7 @@ pub fn build_cached_history_jinja(
                     content: sentinel.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    tool_plan: String::new(),
                 });
                 continue;
             }
@@ -920,7 +961,8 @@ pub fn build_cached_history_jinja(
     if toks.iter().filter(|&&t| t == sentinel_id).count() != cached.len() {
         return plain(frame);
     }
-    let mut out: Vec<u32> = Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
+    let mut out: Vec<u32> =
+        Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
     let mut k = 0usize;
     for &t in &toks {
         if t == sentinel_id {
@@ -974,8 +1016,8 @@ mod tests {
         entries.push(r#""\n": 7"#.to_string());
         entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
         entries.push(r#""<|reserved_0|>": 9"#.to_string()); // splice sentinel (atomic special)
-        // All 256 GPT-2-byte characters get unique ids 100..356 so
-        // any short string round-trips byte-by-byte.
+                                                            // All 256 GPT-2-byte characters get unique ids 100..356 so
+                                                            // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -1053,7 +1095,10 @@ mod tests {
                 n += 1;
             }
         }
-        let idx = bs.iter().position(|&x| x == b as u32).expect("byte in table");
+        let idx = bs
+            .iter()
+            .position(|&x| x == b as u32)
+            .expect("byte in table");
         char::from_u32(cs[idx]).expect("valid char")
     }
 
@@ -1124,13 +1169,20 @@ mod tests {
         .build();
         // The test tokenizer always registers `<think>` as a special
         // token, so OpenThink must append exactly `<think>\n`.
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
         let mut expected = plain.clone();
         expected.push(think_id);
         expected.extend_from_slice(&t.encode("\n"));
-        assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
-        assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+        assert_eq!(
+            opened, expected,
+            "OpenThink should append <think>\\n after the assistant prefix"
+        );
+        assert!(
+            opened.len() > plain.len(),
+            "OpenThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -1152,9 +1204,11 @@ mod tests {
             raw: false,
         }
         .build();
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
-        let close_id = t.special_token_id("</think>")
+        let close_id = t
+            .special_token_id("</think>")
             .expect("test tokenizer registers </think> as special");
         let nl = t.encode("\n");
         let mut expected = plain.clone();
@@ -1165,8 +1219,14 @@ mod tests {
         expected.push(close_id);
         expected.extend_from_slice(&nl);
         expected.extend_from_slice(&nl);
-        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
-        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+        assert_eq!(
+            closed, expected,
+            "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix"
+        );
+        assert!(
+            closed.len() > plain.len(),
+            "ClosedThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -1189,7 +1249,10 @@ mod tests {
             raw: false,
         }
         .build();
-        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
+        assert_eq!(
+            closed, plain,
+            "ClosedThink without special tokens must fall back to Plain"
+        );
     }
 
     #[test]
@@ -1210,8 +1273,7 @@ mod tests {
     #[test]
     fn build_multi_turn_two_turn_history() {
         let t = make_tokenizer();
-        let history: [(Role, &str); 2] =
-            [(Role::User, "hello"), (Role::Assistant, "hi")];
+        let history: [(Role, &str); 2] = [(Role::User, "hello"), (Role::Assistant, "hi")];
         let frame = ChatFrame {
             tokenizer: &t,
             system: None,
@@ -1268,7 +1330,10 @@ mod tests {
         };
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
-        assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+        assert_eq!(
+            via_string, via_tokens,
+            "build_with_user_tokens must match build() when tokens align"
+        );
     }
 
     #[test]
@@ -1328,14 +1393,28 @@ mod tests {
         // the assistant turn and (thinking-on) primes `<think>\n`.
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
         let frame = JinjaChatFrame {
-            tokenizer: &t, template, system: None, user: "",
-            enable_thinking: true, bos_token: Some(""),
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
         };
 
         // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
         // then generates `reason</think>ok`.
-        let u1 = Message { role: Role::User, content: "hi".to_string(), tool_calls: vec![], tool_call_id: None };
-        let r1 = t.encode(&frame.render_messages(std::slice::from_ref(&u1), None, None).unwrap());
+        let u1 = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
         let t1_gen = t.encode("reason</think>ok");
         let mut conv_after_t1 = r1.clone();
         conv_after_t1.extend_from_slice(&t1_gen);
@@ -1348,27 +1427,52 @@ mod tests {
             v.extend_from_slice(&t1_gen);
             v
         };
-        let a1 = Message { role: Role::Assistant, content: "ok".to_string(), tool_calls: vec![], tool_call_id: None };
-        let u2 = Message { role: Role::User, content: "again".to_string(), tool_calls: vec![], tool_call_id: None };
+        let a1 = Message {
+            role: Role::Assistant,
+            content: "ok".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u2 = Message {
+            role: Role::User,
+            content: "again".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
         let messages_t2 = vec![u1.clone(), a1, u2];
 
-        let rendered_t2 = build_cached_history_jinja(
-            &frame, &messages_t2, None,
-            |m| if matches!(m.role, Role::Assistant) { Some(asst_slot.clone()) } else { None },
-        ).expect("jinja splice render");
+        let rendered_t2 = build_cached_history_jinja(&frame, &messages_t2, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(asst_slot.clone())
+            } else {
+                None
+            }
+        })
+        .expect("jinja splice render");
 
         // No sentinel leaked.
         let sentinel_id = t.special_token_id("<|reserved_0|>").unwrap();
-        assert!(!rendered_t2.contains(&sentinel_id), "sentinel must be fully replaced: {rendered_t2:?}");
+        assert!(
+            !rendered_t2.contains(&sentinel_id),
+            "sentinel must be fully replaced: {rendered_t2:?}"
+        );
         // Verbatim splice happened.
         assert!(
-            rendered_t2.windows(asst_slot.len()).any(|w| w == asst_slot.as_slice()),
+            rendered_t2
+                .windows(asst_slot.len())
+                .any(|w| w == asst_slot.as_slice()),
             "cached assistant slot must be spliced verbatim",
         );
         // THE KEY PROPERTY: turn 2 strictly extends turn 1's conversation_tokens.
-        assert!(rendered_t2.len() > conv_after_t1.len(), "turn 2 must be longer than turn 1");
+        assert!(
+            rendered_t2.len() > conv_after_t1.len(),
+            "turn 2 must be longer than turn 1"
+        );
         assert_eq!(
-            &rendered_t2[..conv_after_t1.len()], conv_after_t1.as_slice(),
+            &rendered_t2[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
             "turn 2 render must extend turn 1's conversation_tokens as a strict prefix",
         );
 
@@ -1401,6 +1505,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1463,12 +1568,14 @@ mod tests {
                 content: "be brief".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Assistant,
@@ -1478,19 +1585,27 @@ mod tests {
                     arguments: serde_json::json!({"city":"SF"}),
                 }],
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Tool,
                 content: "72F".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
+                tool_plan: String::new(),
             },
         ];
         let out = frame
             .render_messages(&messages, None, None)
             .expect("multi-turn render succeeds");
-        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
-        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("system:be brief;"),
+            "system content visible: {out:?}"
+        );
+        assert!(
+            out.contains("user:weather?;"),
+            "user content visible: {out:?}"
+        );
         assert!(
             out.contains("assistant:call=get_weather(SF);"),
             "assistant tool_call rendered: {out:?}",
@@ -1598,12 +1713,14 @@ SYS:{{ build_system_message(system_message) }}:END
                 content: "Be concise.".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::User,
                 content: "hi".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
         ];
 
@@ -1655,6 +1772,7 @@ SYS:{{ build_system_message(system_message) }}:END
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         }];
 
         let out = frame

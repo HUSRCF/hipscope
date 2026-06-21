@@ -10,7 +10,7 @@
 //! Run: HIP_VISIBLE_DEVICES=0 cargo run --release -p rdna-compute \
 //!        --example bench_moe_e8_prefill
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 fn lcg(state: &mut u32) -> u32 {
@@ -61,19 +61,22 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
     t
 }
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu.alloc_tensor(&[data.len()], DType::F32).unwrap();
     gpu.hip.memcpy_htod(&t.buf, bytes).unwrap();
     t
 }
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu.alloc_tensor(&[data.len() * 4], DType::Raw).unwrap();
     gpu.hip.memcpy_htod(&t.buf, bytes).unwrap();
     t
 }
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu.alloc_tensor(&[data.len() * 8], DType::Raw).unwrap();
     gpu.hip.memcpy_htod(&t.buf, bytes).unwrap();
     t
@@ -92,11 +95,14 @@ fn main() {
         println!("SKIP — arch {} lacks RDNA3/RDNA4 WMMA", arch);
         return;
     }
-    println!("arch={}  (gate_up A/B: per-token GEMV[1 launch] vs grouped-WMMA[x2])", arch);
+    println!(
+        "arch={}  (gate_up A/B: per-token GEMV[1 launch] vs grouped-WMMA[x2])",
+        arch
+    );
 
     let k = 2048usize; // hidden
-    let m = 768usize;  // expert intermediate
-    let e = 128usize;  // experts
+    let m = 768usize; // expert intermediate
+    let e = 128usize; // experts
     let k_top = 8usize;
 
     let mut keep: Vec<GpuTensor> = Vec::new();
@@ -121,7 +127,9 @@ fn main() {
         let y_grouped = alloc_f32_zeros(&mut gpu, m_total * m);
 
         let mut s = 0x99u32 ^ n as u32;
-        let topk: Vec<i32> = (0..n * k_top).map(|_| (lcg(&mut s) % e as u32) as i32).collect();
+        let topk: Vec<i32> = (0..n * k_top)
+            .map(|_| (lcg(&mut s) % e as u32) as i32)
+            .collect();
         let topk_t = upload_i32(&mut gpu, &topk);
         let y_gate = alloc_f32_zeros(&mut gpu, n * k_top * m);
         let y_up = alloc_f32_zeros(&mut gpu, n * k_top * m);
@@ -129,11 +137,30 @@ fn main() {
         // warmup (JIT both kernels + DPM)
         for _ in 0..10 {
             gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
-                &expert_ptrs, &topk_t, &x_t, &y_gate, &y_up, m, k, k_top, n,
-            ).unwrap();
+                &expert_ptrs,
+                &topk_t,
+                &x_t,
+                &y_gate,
+                &y_up,
+                m,
+                k,
+                k_top,
+                n,
+            )
+            .unwrap();
             gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
-                &expert_ptrs, &tile_t, &sorted_t, &x_t, &y_grouped, m, k, k_top, m_total, n,
-            ).unwrap();
+                &expert_ptrs,
+                &tile_t,
+                &sorted_t,
+                &x_t,
+                &y_grouped,
+                m,
+                k,
+                k_top,
+                m_total,
+                n,
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
 
@@ -141,8 +168,17 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..iters {
             gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
-                &expert_ptrs, &topk_t, &x_t, &y_gate, &y_up, m, k, k_top, n,
-            ).unwrap();
+                &expert_ptrs,
+                &topk_t,
+                &x_t,
+                &y_gate,
+                &y_up,
+                m,
+                k,
+                k_top,
+                n,
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let gemv_us = t0.elapsed().as_micros() as f64 / iters as f64;
@@ -151,11 +187,31 @@ fn main() {
         let t1 = Instant::now();
         for _ in 0..iters {
             gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
-                &expert_ptrs, &tile_t, &sorted_t, &x_t, &y_grouped, m, k, k_top, m_total, n,
-            ).unwrap();
+                &expert_ptrs,
+                &tile_t,
+                &sorted_t,
+                &x_t,
+                &y_grouped,
+                m,
+                k,
+                k_top,
+                m_total,
+                n,
+            )
+            .unwrap();
             gpu.gemm_mfp4g32_e8_moe_grouped_wmma(
-                &expert_ptrs, &tile_t, &sorted_t, &x_t, &y_grouped, m, k, k_top, m_total, n,
-            ).unwrap();
+                &expert_ptrs,
+                &tile_t,
+                &sorted_t,
+                &x_t,
+                &y_grouped,
+                m,
+                k,
+                k_top,
+                m_total,
+                n,
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let grp_us = t1.elapsed().as_micros() as f64 / iters as f64;
