@@ -9935,44 +9935,61 @@ fn generate_lfm2moe(
 
     let eos_tok = m.lfm2moe().unwrap().eos_tok;
 
-    // Capacity guard. No eviction on arch_id=11 — reset the KV + conv-state
-    // cursors when the requested run would overflow the budget.
-    let overflow = {
-        let state = &m.lfm2moe().unwrap().state;
-        state
-            .n_tokens
-            .saturating_add(prompt_ids.len())
-            .saturating_add(max_tokens)
-            > state.max_seq
-    };
-    if overflow {
-        let (n, cap) = {
-            let state = &m.lfm2moe().unwrap().state;
-            (state.n_tokens, state.max_seq)
-        };
-        eprintln!("[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",);
-        let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-
-        // O2b-2 capacity guard (lfm2moe single): the reset above (n_tokens=0)
-        // recovers a grown multi-turn conversation, but a SINGLE prompt larger
-        // than the whole context still overflows — the prefill decode_step loop
-        // writes past the KV (sized for state.max_seq) and panics, taking down
-        // serve. After the reset, if prompt + generation still overflows, emit a
-        // clean error and return BEFORE prefill — mirror the minimax/qwen2 guard.
-        // saturating_add: an adversarially huge max_tokens must not wrap usize
-        // and slip under the cap.
-        let cap = m.lfm2moe().unwrap().state.max_seq;
-        if prompt_ids.len().saturating_add(max_tokens) > cap {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-                id, prompt_ids.len(), max_tokens, cap
-            );
-            let _ = stdout.flush();
-            return;
+    // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
+    // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
+    // `<|endoftext|>` (and rarely `</s>`). The single `next_tok == eos_tok` stop
+    // in the decode loop misses the others, so the model LEAKS a literal
+    // `<|endoftext|>` into the visible answer (observed: "...Paris.<|endoftext|>")
+    // and wastefully keeps generating. This id-set is the FAST path: it catches
+    // any EOS-class token whose literal string round-trips through `encode` to a
+    // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
+    // `<|endoftext|>` (encode yields subwords, not the special id), so the
+    // reliable catch for that one is the string-level guard in the decode loop
+    // below, which matches on the DECODED frag.
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
         }
+        v
+    };
+
+    // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
+    // prior design only reset on capacity overflow, so every request APPENDED to
+    // the KV at the growing `n_tokens` and the model attended to all prior
+    // requests' tokens at offset RoPE positions — benign for a couple of short
+    // turns (RoPE decay + the prompt re-establishes context) but it bloats the KV
+    // and degrades quality over a real multi-request serve session, only
+    // recovering at overflow. LFM2.5's hybrid conv+GQA state can't be cheaply
+    // rewound to an arbitrary prefix (the conv window chains back to token 0, like
+    // ds4's SWA ring), so partial prefix-reuse is unsafe → cold-rebuild every
+    // turn. This is NOT a perf regression: the path already re-prefills the full
+    // prompt each turn; it now does so from position 0 with no stale KV. A
+    // continuing conversation re-prefills its whole history from the prompt, so
+    // multi-turn is preserved (validated: Bjorn/axolotl recall).
+    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
+    // prompt+generation larger than the whole context — the prefill decode_step
+    // loop would write past the KV (sized for state.max_seq) and panic, taking
+    // down serve. Emit a clean error BEFORE prefill — mirror the minimax/qwen2
+    // guard. saturating_add: an adversarially huge max_tokens must not wrap usize
+    // and slip under the cap.
+    let cap = m.lfm2moe().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_ids.len(), max_tokens, cap
+        );
+        let _ = stdout.flush();
+        return;
     }
 
     let t0 = Instant::now();
@@ -10016,7 +10033,7 @@ fn generate_lfm2moe(
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if next_tok == eos_tok {
+        if stop_toks.contains(&next_tok) {
             break;
         }
 
@@ -10024,6 +10041,15 @@ fn generate_lfm2moe(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
+        // String-level EOS-class guard. The id-based `stop_toks` above misses
+        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
+        // to the special-token id (it yields subwords), so the real token id is
+        // never in the set. The daemon decodes one token at a time, so the
+        // leaking turn-end token arrives as its own frag — catch it on the
+        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
+        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+            break;
+        }
         let envelope = serde_json::json!({
             "type": "token",
             "id": id,
