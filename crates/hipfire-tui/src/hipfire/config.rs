@@ -115,6 +115,7 @@ impl ConfigState {
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
             Some("thinking"),
+            Some("thinking_budget"),
             None, // Serve host:port (composite)
         ]
     }
@@ -158,6 +159,7 @@ impl ConfigState {
             self.is_override("prefill_compression"),                 // Prefill
             self.is_override("kv_cache"),                            // KV cache
             self.is_override("thinking"),                            // Thinking
+            self.is_override("thinking_budget"),                     // Reasoning budget
             self.is_override("host") || self.is_override("port"),    // Serve
         ]
     }
@@ -174,6 +176,7 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "thinking",            // Thinking
+            "thinking_budget",     // Reasoning budget
             "host",                // Serve
         ]
     }
@@ -235,6 +238,14 @@ impl ConfigState {
                 "Whether reasoning models emit a hidden think block.",
             ),
             (
+                "Reasoning budget",
+                self.values
+                    .get("thinking_budget")
+                    .cloned()
+                    .unwrap_or_else(|| "med".into()),
+                "Named <think> token cap (low/med/high/xhigh/max/uncapped).",
+            ),
+            (
                 "Serve",
                 format!("{}:{}", self.host, self.port),
                 "OpenAI-compatible endpoint used by chat and API clients.",
@@ -255,6 +266,7 @@ fn defaults() -> BTreeMap<String, String> {
         ("max_tokens", "4096"),
         ("max_seq", "32768"),
         ("thinking", "on"),
+        ("thinking_budget", "med"),
         ("max_think_tokens", "2048"),
         ("max_total_think_tokens", "0"),
         ("host", "0.0.0.0"),

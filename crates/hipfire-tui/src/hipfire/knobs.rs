@@ -124,6 +124,23 @@ pub const KNOBS: &[KnobInfo] = &[
         ],
     },
     KnobInfo {
+        key: "thinking_budget",
+        title: "Reasoning budget",
+        summary: "Named per-turn cap on tokens the model may spend inside <think>.",
+        effect: "Higher budgets allow deeper reasoning at the cost of latency; lower budgets force the model to commit to an answer sooner. Picks a preset instead of a raw token count.",
+        default: "med",
+        when: "med for everyday use; low for snappy chat; high/xhigh/max for hard reasoning; uncapped only if latency is no concern.",
+        note: Some("Drives max_think_tokens unless a raw max_think_tokens override is set (the advanced knob wins). Only applies when thinking is on; thinking=off caps reasoning to a single token regardless."),
+        options: &[
+            ("low", "512 tokens — quick answers, minimal reasoning."),
+            ("med", "2048 tokens — the default; balanced reasoning vs latency."),
+            ("high", "8192 tokens — deeper reasoning for harder prompts."),
+            ("xhigh", "24576 tokens — very deep reasoning; watch latency."),
+            ("max", "32768 tokens — the ceiling; longest bounded reasoning."),
+            ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
+        ],
+    },
+    KnobInfo {
         key: "prefill_compression",
         title: "Prefill compression (pflash)",
         summary: "Compresses a long prompt's KV during prefill using a drafter's importance scoring.",

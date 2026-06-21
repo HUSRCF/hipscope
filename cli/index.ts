@@ -61,6 +61,15 @@ const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
 const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
+// Named thinking budgets → per-turn <think> token cap. uncapped=0 means unlimited.
+// `med: 2048` preserves the historical default; `max` is the existing 32768
+// validation ceiling; `uncapped: 0` matches max_think_tokens' "0 = unlimited"
+// semantics. The thinking_budget preset drives max_think_tokens in
+// resolveModelConfig unless the user set a raw max_think_tokens override.
+const THINKING_BUDGET: Record<string, number> = {
+  low: 512, med: 2048, high: 8192, xhigh: 24576, max: 32768, uncapped: 0,
+};
+const THINKING_BUDGET_KEYS = Object.keys(THINKING_BUDGET);
 // NOTE: the legacy global `TEMP_CORRECTION = 0.82` (an April-2026 ×0.82 fudge
 // "for HFQ4 logit noise") was REMOVED 2026-06-18. It silently scaled every
 // resolved temperature — including W7 card-recommended temps and explicit API
@@ -100,7 +109,15 @@ export interface HipfireConfig {
   max_tokens: number;     // per-turn generation cap
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
-  max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  // Named thinking budget preset (low/med/high/xhigh/max/uncapped). Drives the
+  // effective max_think_tokens in resolveModelConfig. This is the user-facing
+  // knob; max_think_tokens is the raw advanced override that still wins if set.
+  thinking_budget: string;
+  // per-turn budget for <think>...</think> reasoning (0 = unlimited). OPTIONAL:
+  // absent-by-default so the thinking_budget preset drives it. Present only when
+  // a user explicitly sets a raw override. resolveModelConfig ALWAYS resolves
+  // this to a concrete number, so downstream readers stay numeric.
+  max_think_tokens?: number;
   max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
@@ -299,12 +316,13 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_tokens: 4096,
   max_seq: 32768,
   thinking: "on",
-  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
-  // <think> span so a long-reasoning turn force-closes and commits to its
-  // answer (daemon splices the continuation) instead of running until the
-  // client times out and terminates the stream mid-think. Override per-model
-  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
-  max_think_tokens: 2048,
+  // Named thinking budget preset. "med" (=2048 tokens) preserves the historical
+  // max_think_tokens default. resolveModelConfig resolves this preset to a
+  // concrete max_think_tokens unless the user set a raw max_think_tokens
+  // override. The raw `max_think_tokens` default is intentionally ABSENT here so
+  // it is undefined-by-default and the preset can drive it; it remains a valid
+  // explicit advanced override (validated in validateConfigValue).
+  thinking_budget: "med",
   max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
@@ -390,6 +408,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 131072;
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
+    case "thinking_budget": return typeof value === "string" && THINKING_BUDGET_KEYS.includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
     case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
@@ -455,6 +474,13 @@ function loadConfig(): HipfireConfig {
         (result as any)[key] = raw[key];
       }
     }
+    // max_think_tokens is an OPTIONAL raw override with no entry in
+    // CONFIG_DEFAULTS (the thinking_budget preset is the default driver), so the
+    // loop above won't copy it. Carry an explicitly-saved value through so power
+    // users keep their raw override; absence is the signal that the preset drives.
+    if ("max_think_tokens" in raw && validateConfigValue("max_think_tokens", raw.max_think_tokens)) {
+      result.max_think_tokens = raw.max_think_tokens;
+    }
     return result;
   } catch { return { ...CONFIG_DEFAULTS }; }
 }
@@ -482,7 +508,7 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
   "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "thinking_budget", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -499,6 +525,14 @@ const PER_MODEL_KEYS = [
   "mtp_mode", "mtp_k",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
+
+// All settable config keys. CONFIG_DEFAULTS no longer carries max_think_tokens
+// (the thinking_budget preset is its default driver), but it remains a valid
+// raw override — both `config get/set` and the listing must still recognize it.
+const ALL_CONFIG_KEYS = [
+  ...(Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]),
+  "max_think_tokens" as keyof HipfireConfig,
+];
 
 type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
@@ -547,9 +581,15 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // win over global. If tag is null/undefined, returns the global config.
 // Reads the global config fresh each call so edits via `hipfire config set`
 // take effect without restarting a running `hipfire serve`.
-function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
+// resolveModelConfig ALWAYS resolves max_think_tokens to a concrete number (via
+// resolveThinkingBudget), so its return type narrows the optional field to
+// required — downstream readers can use `cfg.max_think_tokens > 0` without a
+// possibly-undefined check.
+type ResolvedConfig = HipfireConfig & { max_think_tokens: number };
+
+function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
-  if (!tag) return base;
+  if (!tag) { resolveThinkingBudget(base); return base as ResolvedConfig; }
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
   const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
@@ -570,13 +610,33 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
     if (typeof card.top_p === "number") cardLayer.top_p = card.top_p;
     if (typeof card.repeat_penalty === "number") cardLayer.repeat_penalty = card.repeat_penalty;
   }
-  return {
+  const merged: HipfireConfig = {
     ...base,
     ...cardLayer,
     ...(catalogId ? (all[catalogId] ?? {}) : {}),
     ...(all[resolved] ?? {}),
     ...(tag !== resolved ? (all[tag] ?? {}) : {}),
   };
+  resolveThinkingBudget(merged);
+  return merged as ResolvedConfig;
+}
+
+// thinking_budget preset drives max_think_tokens unless the user set a raw
+// max_think_tokens override explicitly (back-compat / power users). After this
+// runs, `cfg.max_think_tokens` is ALWAYS a concrete number, so downstream
+// genMsg/genParams readers stay numeric and unchanged.
+//
+// "Explicitly set" = max_think_tokens is present (not undefined/null) on the
+// MERGED config. Because the raw `max_think_tokens` default was removed from
+// CONFIG_DEFAULTS — and loadConfig only carries it through when the user saved
+// it explicitly, and the per-model layers are sparse (only keys the user set) —
+// a present value can ONLY have come from an explicit global save or a per-model
+// override. Absence is the signal that the preset should drive.
+function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfig {
+  if (cfg.max_think_tokens === undefined || cfg.max_think_tokens === null) {
+    const tb = cfg.thinking_budget ?? "med";
+    cfg.max_think_tokens = THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
+  }
 }
 
 /// Sampling fields to actually TRANSMIT to the daemon, with the explicit-send
@@ -6251,7 +6311,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     : {};
 
   // In per-model mode only show keys that can actually be overridden.
-  const allKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  // max_think_tokens has no CONFIG_DEFAULTS entry (the thinking_budget preset is
+  // the default driver), so append it explicitly so the advanced raw override
+  // stays reachable in this TUI too.
+  const allKeys = [
+    ...(Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]),
+    "max_think_tokens" as keyof HipfireConfig,
+  ];
   const keys = isPerModel
     ? allKeys.filter(k => (PER_MODEL_KEYS as readonly string[]).includes(k))
     : allKeys;
@@ -6271,8 +6337,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   let profilePickerSelected = 0;
 
   // Effective value for a key: override wins in per-model mode, else cfg.
-  const effective = (k: keyof HipfireConfig): any =>
-    isPerModel && (overrides as any)[k] !== undefined ? (overrides as any)[k] : cfg[k];
+  const effective = (k: keyof HipfireConfig): any => {
+    const v = isPerModel && (overrides as any)[k] !== undefined ? (overrides as any)[k] : cfg[k];
+    // max_think_tokens is absent-by-default; show the value the thinking_budget
+    // preset resolves to so the row never renders "undefined".
+    if (k === "max_think_tokens" && (v === undefined || v === null)) {
+      const tb = (effective("thinking_budget" as keyof HipfireConfig) as string) ?? "med";
+      return THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
+    }
+    return v;
+  };
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
@@ -6333,9 +6407,14 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Reasoning mode. on = model uses <think>...</think> (stripped from display); off = suppress thinking, answer directly",
       options: ["on", "off"],
     },
+    thinking_budget: {
+      label: "thinking_budget",
+      desc: "Named reasoning budget → <think> token cap. low=512, med=2048, high=8192, xhigh=24576, max=32768, uncapped=0 (unlimited). Drives max_think_tokens unless a raw override is set.",
+      options: THINKING_BUDGET_KEYS,
+    },
     max_think_tokens: {
       label: "max_think_tokens",
-      desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
+      desc: "Advanced raw override for the reasoning budget (0 = unlimited). Wins over thinking_budget when set. Leave unset to let the preset drive it.",
       range: [0, 32768], step: 128,
     },
     max_total_think_tokens: {
@@ -6600,8 +6679,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const commitEdit = () => {
     const k = keys[selected];
     const defaultVal = CONFIG_DEFAULTS[k];
+    // A key with no CONFIG_DEFAULTS entry (e.g. max_think_tokens) is still
+    // numeric when its meta carries a `range`; coerce off that too.
+    const isNumeric = typeof defaultVal === "number" || meta[k]?.range !== undefined;
     let parsed: any;
-    if (typeof defaultVal === "number") parsed = Number(editBuffer);
+    if (isNumeric) parsed = Number(editBuffer);
     else if (typeof defaultVal === "boolean") {
       if (editBuffer === "true") parsed = true;
       else if (editBuffer === "false") parsed = false;
@@ -7069,10 +7151,17 @@ function modelPickerTui(): Promise<string | null> {
 }
 
 function listConfig(cfg: HipfireConfig): void {
-  const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  const validKeys = ALL_CONFIG_KEYS;
   console.log(`Config: ${CONFIG_PATH}\n`);
   for (const k of validKeys) {
     const v = cfg[k];
+    // max_think_tokens is absent-by-default (thinking_budget drives it). Show the
+    // preset-resolved value with a marker instead of a bare "undefined".
+    if (k === "max_think_tokens" && (v === undefined || v === null)) {
+      const eff = THINKING_BUDGET[cfg.thinking_budget ?? "med"] ?? THINKING_BUDGET.med;
+      console.log(`  ${k.padEnd(18)} ${String(eff).padEnd(14)}(from thinking_budget)`);
+      continue;
+    }
     const isDefault = v === CONFIG_DEFAULTS[k];
     console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
   }
@@ -8753,7 +8842,7 @@ Examples:
       }
     }
 
-    const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+    const validKeys = ALL_CONFIG_KEYS;
 
     // Per-model scripting helpers (shared between get/set/reset)
     const writePerModel = (k: PerModelKey, v: any) => {
@@ -8848,7 +8937,10 @@ Examples:
         if (cfgJson) console.log(JSON.stringify({ scope: modelScope, key, value: v }));
         else console.log(v);
       } else {
-        const v = cfg[key as keyof HipfireConfig];
+        // Read through resolveModelConfig(null) so preset-driven keys (e.g.
+        // max_think_tokens, absent-by-default) report their resolved value
+        // rather than `undefined`.
+        const v = (resolveModelConfig(null) as any)[key];
         if (cfgJson) console.log(JSON.stringify({ scope: "global", key, value: v }));
         else console.log(v);
       }
@@ -8864,14 +8956,17 @@ Examples:
         process.exit(1);
       }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
+      // max_think_tokens is numeric but has no CONFIG_DEFAULTS entry (preset-
+      // driven); treat it as numeric explicitly so `config set` coerces it.
+      const wantsNumber = typeof defaultVal === "number" || key === "max_think_tokens";
       // Tri-state aware: "true"/"false" coerce to bool regardless of default
       // type, so fields like dflash_ngram_block ("auto" | boolean) accept
       // all three string forms cleanly.
-      const parsed = typeof defaultVal === "number" ? Number(value)
+      const parsed = wantsNumber ? Number(value)
                    : value === "true" ? true
                    : value === "false" ? false
                    : value;
-      if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
+      if (wantsNumber && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
           kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
@@ -8919,7 +9014,10 @@ Examples:
         if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}`); process.exit(1); }
         (cfg as any)[key] = CONFIG_DEFAULTS[key as keyof HipfireConfig];
         saveConfig(cfg);
-        console.log(`${key} reset to ${CONFIG_DEFAULTS[key as keyof HipfireConfig]}`);
+        const resetTo = key === "max_think_tokens"
+          ? "preset-driven (thinking_budget)"
+          : String(CONFIG_DEFAULTS[key as keyof HipfireConfig]);
+        console.log(`${key} reset to ${resetTo}`);
       } else {
         saveConfig({ ...CONFIG_DEFAULTS });
         console.log("All config reset to defaults");

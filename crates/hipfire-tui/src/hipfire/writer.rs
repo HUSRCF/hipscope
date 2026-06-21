@@ -72,6 +72,10 @@ const KV_ADAPTIVE: &[&str] = &[
 const MTP_MODE: &[&str] = &["off", "on", "auto"];
 const DFLASH_MODE: &[&str] = &["on", "off", "auto"];
 const THINKING: &[&str] = &["on", "off"];
+// thinking_budget: named reasoning budgets, mirrors bun THINKING_BUDGET keys
+// (cli/index.ts) 1:1 — low=512, med=2048, high=8192, xhigh=24576, max=32768,
+// uncapped=0. The preset drives max_think_tokens unless a raw override is set.
+const THINKING_BUDGET: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
 const FLASH_MODE: &[&str] = &["auto", "always", "never"];
 const MMQ_SCREEN: &[&str] = &["off", "on", "auto"];
 const PREFILL_COMPRESSION: &[&str] = &["off", "auto", "always"];
@@ -84,6 +88,7 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec { key: "mtp_mode", kind: FieldKind::Enum(MTP_MODE) },
     FieldSpec { key: "dflash_mode", kind: FieldKind::Enum(DFLASH_MODE) },
     FieldSpec { key: "thinking", kind: FieldKind::Enum(THINKING) },
+    FieldSpec { key: "thinking_budget", kind: FieldKind::Enum(THINKING_BUDGET) },
     FieldSpec {
         key: "chat_template",
         kind: FieldKind::FreeStr { require_existing_file: true },
