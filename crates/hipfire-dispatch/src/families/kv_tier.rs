@@ -14,14 +14,17 @@ use crate::types::KernelKey;
 pub enum KTier {
     F32,
     Q8,
-    Hfq4, // llama legacy
-    Q4,   // llama legacy
+    Hfq4,  // llama legacy
+    Q4,    // llama legacy
+    Int8c, // llama INT8-per-column
+    Hfq8,  // llama HFQ8 flat-layout
     Asym4 { fwht: bool },
     Asym3 { fwht: bool },
     Asym2 { fwht: bool },
 }
 
 /// The single bool→tier decode. The only sanctioned producer of `KTier`.
+#[allow(clippy::too_many_arguments)]
 pub fn classify(
     quant_q8: bool,
     quant_asym4: bool,
@@ -29,20 +32,46 @@ pub fn classify(
     quant_asym2: bool,
     quant_hfq4: bool,
     quant_q4: bool,
+    quant_int8: bool,
+    quant_hfq8: bool,
     quant_fwht: bool,
 ) -> KTier {
     debug_assert!(
-        [quant_asym4, quant_asym3, quant_asym2, quant_q8, quant_hfq4, quant_q4]
-            .iter().filter(|&&b| b).count() <= 1,
+        [
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_q8,
+            quant_hfq4,
+            quant_q4,
+            quant_int8,
+            quant_hfq8
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+            <= 1,
         "at most one KV quant tier flag should be set"
     );
-    if quant_asym4 { KTier::Asym4 { fwht: quant_fwht } }
-    else if quant_asym3 { KTier::Asym3 { fwht: quant_fwht } }
-    else if quant_asym2 { KTier::Asym2 { fwht: quant_fwht } }
-    else if quant_q8 { KTier::Q8 }
-    else if quant_hfq4 { KTier::Hfq4 }
-    else if quant_q4 { KTier::Q4 }
-    else { KTier::F32 }
+    if quant_asym4 {
+        KTier::Asym4 { fwht: quant_fwht }
+    } else if quant_asym3 {
+        KTier::Asym3 { fwht: quant_fwht }
+    } else if quant_asym2 {
+        KTier::Asym2 { fwht: quant_fwht }
+    } else if quant_q8 {
+        KTier::Q8
+    } else if quant_int8 {
+        KTier::Int8c
+    } else if quant_hfq8 {
+        KTier::Hfq8
+    } else if quant_hfq4 {
+        KTier::Hfq4
+    } else if quant_q4 {
+        KTier::Q4
+    } else {
+        KTier::F32
+    }
 }
 
 impl KTier {
@@ -54,7 +83,7 @@ impl KTier {
             KTier::Asym4 { .. } => n_kv_heads * (4 + head_dim / 2),
             KTier::Asym3 { .. } => n_kv_heads * (4 + (head_dim * 3) / 8),
             KTier::Asym2 { .. } => n_kv_heads * (4 + head_dim / 4),
-            KTier::F32 | KTier::Hfq4 | KTier::Q4 => {
+            KTier::F32 | KTier::Hfq4 | KTier::Q4 | KTier::Int8c | KTier::Hfq8 => {
                 panic!("k_bytes_per_pos undefined for {self:?}")
             }
         }
@@ -79,7 +108,9 @@ impl KTier {
         )
     }
 
-    pub fn is_q8(self) -> bool { matches!(self, KTier::Q8) }
+    pub fn is_q8(self) -> bool {
+        matches!(self, KTier::Q8)
+    }
 }
 
 /// GPU-free scalar inputs for tier derivation. NO runtime types (avoids the
@@ -92,8 +123,10 @@ pub struct KvTierInputs {
     pub quant_asym2: bool,
     pub quant_q8: bool,
     pub quant_fwht: bool,
-    pub quant_hfq4: bool,   // llama legacy HFQ4 KV mode
-    pub quant_q4: bool,     // llama legacy Q4 KV mode
+    pub quant_hfq4: bool, // llama legacy HFQ4 KV mode
+    pub quant_q4: bool,   // llama legacy Q4 KV mode
+    pub quant_int8: bool, // llama INT8-per-column KV mode
+    pub quant_hfq8: bool, // llama HFQ8 flat-layout KV mode
     pub v_mode_bits: i32,
     // q8 use_flash heuristic inputs (moved from qwen35.rs:12885)
     pub pos: usize,
@@ -162,6 +195,8 @@ impl KvTierPlan {
             quant_fwht,
             quant_hfq4,
             quant_q4,
+            quant_int8,
+            quant_hfq8,
             v_mode_bits,
             pos,
             flash_mode,
@@ -176,17 +211,51 @@ impl KvTierPlan {
             let attend = q8_attend_key(pos, flash_mode, capture_mode);
             (KernelKey::KvWriteQ8_0, attend, false)
         } else {
-            match classify(quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_hfq4, quant_q4, quant_fwht) {
-                KTier::Asym4 { fwht: true }  => (KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht, true),
-                KTier::Asym4 { fwht: false } => (KernelKey::KvWriteAsym4,     KernelKey::AttnFlashAsym4,     true),
-                KTier::Asym3 { fwht: true }  => (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht, true),
-                KTier::Asym3 { fwht: false } => (KernelKey::KvWriteAsym3,     KernelKey::AttnFlashAsym3,     true),
-                KTier::Asym2 { fwht: true }  => (KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht, true),
-                KTier::Asym2 { fwht: false } => (KernelKey::KvWriteAsym2,     KernelKey::AttnFlashAsym2,     true),
-                KTier::Q8   => (KernelKey::KvWriteQ8_0, q8_attend_key(pos, flash_mode, capture_mode), false),
+            match classify(
+                quant_q8,
+                quant_asym4,
+                quant_asym3,
+                quant_asym2,
+                quant_hfq4,
+                quant_q4,
+                quant_int8,
+                quant_hfq8,
+                quant_fwht,
+            ) {
+                KTier::Asym4 { fwht: true } => (
+                    KernelKey::KvWriteAsym4Fwht,
+                    KernelKey::AttnFlashAsym4Fwht,
+                    true,
+                ),
+                KTier::Asym4 { fwht: false } => {
+                    (KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4, true)
+                }
+                KTier::Asym3 { fwht: true } => (
+                    KernelKey::KvWriteAsym3Fwht,
+                    KernelKey::AttnFlashAsym3Fwht,
+                    true,
+                ),
+                KTier::Asym3 { fwht: false } => {
+                    (KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3, true)
+                }
+                KTier::Asym2 { fwht: true } => (
+                    KernelKey::KvWriteAsym2Fwht,
+                    KernelKey::AttnFlashAsym2Fwht,
+                    true,
+                ),
+                KTier::Asym2 { fwht: false } => {
+                    (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
+                }
+                KTier::Q8 => (
+                    KernelKey::KvWriteQ8_0,
+                    q8_attend_key(pos, flash_mode, capture_mode),
+                    false,
+                ),
                 KTier::Hfq4 => (KernelKey::KvWriteHfq4, KernelKey::AttnHfq4Kv, false),
-                KTier::Q4   => (KernelKey::KvWriteQ4,   KernelKey::AttnQ4Kv,   false),
-                KTier::F32  => (KernelKey::KvWriteF32,  KernelKey::AttnF32,    false),
+                KTier::Q4 => (KernelKey::KvWriteQ4, KernelKey::AttnQ4Kv, false),
+                KTier::Int8c => (KernelKey::KvWriteInt8c, KernelKey::AttnInt8cKv, false),
+                KTier::Hfq8 => (KernelKey::KvWriteHfq8, KernelKey::AttnHfq8Kv, false),
+                KTier::F32 => (KernelKey::KvWriteF32, KernelKey::AttnF32, false),
             }
         };
 
@@ -220,10 +289,8 @@ impl KvTierPlan {
 /// attention based on context length and capture mode. Shared between the
 /// `is_boundary` and `quant_q8` branches of `derive`.
 fn q8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
-    let use_flash = capture_mode
-        || flash_mode == 2
-        || (flash_mode == 1 && pos + 1 >= 2048)
-        || pos + 1 > 15000;
+    let use_flash =
+        capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
     if use_flash {
         KernelKey::AttnFlashQ8_0
     } else {
@@ -242,16 +309,12 @@ fn batched_keys(
     use KernelKey::*;
     match (write_single, attend_single) {
         // asym4 → batched-masked (serves both causal and tree-verify)
-        (KvWriteAsym4, AttnFlashAsym4) => {
-            Ok((KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked))
-        }
+        (KvWriteAsym4, AttnFlashAsym4) => Ok((KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked)),
         (KvWriteAsym4Fwht, AttnFlashAsym4Fwht) => {
             Ok((KvWriteAsym4FwhtBatched, AttnFlashAsym4FwhtBatchedMasked))
         }
         // asym3 → batched-masked
-        (KvWriteAsym3, AttnFlashAsym3) => {
-            Ok((KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked))
-        }
+        (KvWriteAsym3, AttnFlashAsym3) => Ok((KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked)),
         (KvWriteAsym3Fwht, AttnFlashAsym3Fwht) => {
             Ok((KvWriteAsym3FwhtBatched, AttnFlashAsym3FwhtBatchedMasked))
         }
@@ -286,9 +349,7 @@ fn batched_keys(
         // batch_size > 1 will cause MissingImpl at resolve (BatchEq(1) gate).
         // Intentionally fall through to the default arm rather than silently
         // returning single-token keys that can never resolve batched.
-        (KvWriteF32, AttnF32) => {
-            Ok((KvWriteF32, AttnF32))
-        }
+        (KvWriteF32, AttnF32) => Ok((KvWriteF32, AttnF32)),
         _ => Ok((write_single, attend_single)),
     }
 }
@@ -316,6 +377,9 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         | (KvWriteHfq4, AttnHfq4Kv)
         // q4 single-token (llama legacy)
         | (KvWriteQ4, AttnQ4Kv)
+        // int8c / hfq8 single-token (llama)
+        | (KvWriteInt8c, AttnInt8cKv)
+        | (KvWriteHfq8, AttnHfq8Kv)
         // f32 single-token
         | (KvWriteF32, AttnF32)
         // asym4 batched
@@ -346,6 +410,8 @@ mod tests {
             quant_fwht: false,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
             v_mode_bits: 8,
             pos: 0,
             flash_mode: 0,
@@ -401,6 +467,37 @@ mod tests {
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
         assert_eq!(plan.attend_key, KernelKey::AttnFlashQ8_0);
+    }
+
+    #[test]
+    fn int8c_tier() {
+        let inputs = KvTierInputs {
+            quant_int8: true,
+            ..default_inputs()
+        };
+        let plan = KvTierPlan::derive(inputs).unwrap();
+        assert_eq!(plan.write_key, KernelKey::KvWriteInt8c);
+        assert_eq!(plan.attend_key, KernelKey::AttnInt8cKv);
+        assert!(!plan.uses_givens);
+    }
+
+    #[test]
+    fn hfq8_tier() {
+        let inputs = KvTierInputs {
+            quant_hfq8: true,
+            ..default_inputs()
+        };
+        let plan = KvTierPlan::derive(inputs).unwrap();
+        assert_eq!(plan.write_key, KernelKey::KvWriteHfq8);
+        assert_eq!(plan.attend_key, KernelKey::AttnHfq8Kv);
+        assert!(!plan.uses_givens);
+    }
+
+    #[test]
+    fn tiers_match_int8c_hfq8() {
+        assert!(tiers_match(KernelKey::KvWriteInt8c, KernelKey::AttnInt8cKv));
+        assert!(tiers_match(KernelKey::KvWriteHfq8, KernelKey::AttnHfq8Kv));
+        assert!(!tiers_match(KernelKey::KvWriteInt8c, KernelKey::AttnHfq8Kv));
     }
 
     #[test]
@@ -683,9 +780,7 @@ mod tests {
     #[test]
     fn batched_f32_returns_single_token_keys() {
         // F32 has no batched keys — returns single-token for per-token fallback.
-        let inputs = KvTierInputs {
-            ..batched_inputs()
-        };
+        let inputs = KvTierInputs { ..batched_inputs() };
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteF32);
         assert_eq!(plan.attend_key, KernelKey::AttnF32);
@@ -725,41 +820,102 @@ mod tests {
     #[test]
     fn tiers_match_valid_pairs() {
         assert!(tiers_match(KernelKey::KvWriteF32, KernelKey::AttnF32));
-        assert!(tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0));
+        assert!(tiers_match(
+            KernelKey::KvWriteQ8_0,
+            KernelKey::AttnFlashQ8_0
+        ));
         assert!(tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv));
-        assert!(tiers_match(KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4));
-        assert!(tiers_match(KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht));
-        assert!(tiers_match(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3));
-        assert!(tiers_match(KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht));
-        assert!(tiers_match(KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2));
-        assert!(tiers_match(KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4,
+            KernelKey::AttnFlashAsym4
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4Fwht,
+            KernelKey::AttnFlashAsym4Fwht
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3,
+            KernelKey::AttnFlashAsym3
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3Fwht,
+            KernelKey::AttnFlashAsym3Fwht
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2,
+            KernelKey::AttnFlashAsym2
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2Fwht,
+            KernelKey::AttnFlashAsym2Fwht
+        ));
         // batched
-        assert!(tiers_match(KernelKey::KvWriteAsym4Batched, KernelKey::AttnFlashAsym4BatchedMasked));
-        assert!(tiers_match(KernelKey::KvWriteAsym3Batched, KernelKey::AttnFlashAsym3BatchedMasked));
-        assert!(tiers_match(KernelKey::KvWriteAsym2Batched, KernelKey::AttnFlashAsym2Batched));
-        assert!(tiers_match(KernelKey::KvWriteQ8_0Batched, KernelKey::AttnQ8_0KvBatchedMasked));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4Batched,
+            KernelKey::AttnFlashAsym4BatchedMasked
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3Batched,
+            KernelKey::AttnFlashAsym3BatchedMasked
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2Batched,
+            KernelKey::AttnFlashAsym2Batched
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteQ8_0Batched,
+            KernelKey::AttnQ8_0KvBatchedMasked
+        ));
     }
 
     #[test]
     fn tiers_match_rejects_cross_tier() {
-        assert!(!tiers_match(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym4));
+        assert!(!tiers_match(
+            KernelKey::KvWriteAsym3,
+            KernelKey::AttnFlashAsym4
+        ));
         assert!(!tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnF32));
-        assert!(!tiers_match(KernelKey::KvWriteF32, KernelKey::AttnFlashAsym3Fwht));
+        assert!(!tiers_match(
+            KernelKey::KvWriteF32,
+            KernelKey::AttnFlashAsym3Fwht
+        ));
     }
 
     // ── KTier enum and classify tests ──
 
     #[test]
     fn classify_carries_fwht_bit() {
-        assert_eq!(classify(false, false, true, false, false, false, true),  KTier::Asym3 { fwht: true });
-        assert_eq!(classify(false, false, true, false, false, false, false), KTier::Asym3 { fwht: false });
-        assert_eq!(classify(true,  false, false, false, false, false, false), KTier::Q8);
-        assert_eq!(classify(false, false, false, false, false, false, false), KTier::F32);
+        assert_eq!(
+            classify(false, false, true, false, false, false, false, false, true),
+            KTier::Asym3 { fwht: true }
+        );
+        assert_eq!(
+            classify(false, false, true, false, false, false, false, false, false),
+            KTier::Asym3 { fwht: false }
+        );
+        assert_eq!(
+            classify(true, false, false, false, false, false, false, false, false),
+            KTier::Q8
+        );
+        assert_eq!(
+            classify(false, false, false, false, false, false, false, false, false),
+            KTier::F32
+        );
+        assert_eq!(
+            classify(false, false, false, false, false, false, true, false, false),
+            KTier::Int8c
+        );
+        assert_eq!(
+            classify(false, false, false, false, false, false, false, true, false),
+            KTier::Hfq8
+        );
     }
 
     #[test]
     fn ktier_queries() {
-        assert!(KTier::Q8.is_compactable() && KTier::Q8.is_q8() && KTier::Q8.storage_ok_for_pflash());
+        assert!(
+            KTier::Q8.is_compactable() && KTier::Q8.is_q8() && KTier::Q8.storage_ok_for_pflash()
+        );
         assert!(KTier::Asym3 { fwht: true }.storage_ok_for_pflash());
         assert!(!KTier::Asym3 { fwht: false }.storage_ok_for_pflash());
         assert!(!KTier::F32.is_compactable());

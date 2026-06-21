@@ -584,6 +584,44 @@ fn dispatch_kv_write(
             hip!(gpu.kv_cache_write_q4(io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim,))?;
             hip!(gpu.kv_cache_write_q4(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim,))
         }
+        KernelKey::KvWriteInt8c => {
+            debug_assert_eq!(plan.batch_size, 1);
+            hip!(gpu.kv_cache_write_int8c_f16(
+                io.k_cache,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_int8c_f16(
+                io.v_cache,
+                io.v,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))
+        }
+        KernelKey::KvWriteHfq8 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let ks = io.k_scales.expect("hfq8 KV write requires k_scales");
+            let vs = io.v_scales.expect("hfq8 KV write requires v_scales");
+            hip!(gpu.kv_cache_write_hfq8(
+                io.k_cache,
+                ks,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_hfq8(
+                io.v_cache,
+                vs,
+                io.v,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))
+        }
 
         _ => Err(DispatchError::UnsupportedVariant {
             family: "attention/kv_write",
@@ -876,6 +914,42 @@ fn dispatch_attend(
                     io.physical_cap,
                 ))
             }
+            KernelKey::AttnInt8cKv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                hip!(gpu.attention_int8c_f16_kv(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnHfq8Kv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let ks = io.k_scales.expect("hfq8 attend requires k_scales");
+                let vs = io.v_scales.expect("hfq8 attend requires v_scales");
+                hip!(gpu.attention_hfq8_kv(
+                    io.q,
+                    io.k_cache,
+                    ks,
+                    io.v_cache,
+                    vs,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
             KernelKey::AttnQ4Kv => {
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
@@ -1136,6 +1210,8 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     // Llama legacy
     KernelKey::KvWriteHfq4,
     KernelKey::KvWriteQ4,
+    KernelKey::KvWriteInt8c,
+    KernelKey::KvWriteHfq8,
 ];
 
 /// All `KernelKey` variants handled by `dispatch_attend`.
@@ -1162,6 +1238,8 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     // Llama legacy
     KernelKey::AttnHfq4Kv,
     KernelKey::AttnQ4Kv,
+    KernelKey::AttnInt8cKv,
+    KernelKey::AttnHfq8Kv,
 ];
 
 /// All `KernelKey` variants handled by `dispatch_full_attention`.
@@ -1247,6 +1325,8 @@ mod tests {
                 | KvWriteQ8_0Batched
                 | KvWriteHfq4
                 | KvWriteQ4
+                | KvWriteInt8c
+                | KvWriteHfq8
         )
     }
 

@@ -32,6 +32,12 @@ pub enum PipelineOp {
     /// Paired KV-write + flash-attention (Phase 0.3). Not fusible —
     /// the two ops are inherently coupled via KvTierPlan.
     Attend,
+    /// In-place RoPE on Q+K (per-op only; never in FUSED_TABLE).
+    Rope,
+    /// Per-head rmsnorm on one tensor (qk-norm; per-op only).
+    QkNorm,
+    /// In-place bias add on one tensor (per-op only).
+    BiasAdd,
 }
 
 // ── Variant enums ─────────────────────────────────────
@@ -362,8 +368,10 @@ pub enum KernelKey {
     AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // Llama legacy quant KV (decode only — no batched variants)
-    AttnHfq4Kv, // HFQ4-quantized KV cache attention
-    AttnQ4Kv,   // Q4-quantized KV cache attention
+    AttnHfq4Kv,  // HFQ4-quantized KV cache attention
+    AttnQ4Kv,    // Q4-quantized KV cache attention
+    AttnInt8cKv, // INT8-per-column KV cache attention (llama)
+    AttnHfq8Kv,  // HFQ8 flat-layout KV cache attention (llama)
     // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
@@ -388,8 +396,10 @@ pub enum KernelKey {
     KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
-    KvWriteHfq4, // HFQ4-quantized KV write (llama legacy)
-    KvWriteQ4,   // Q4-quantized KV write (llama legacy)
+    KvWriteHfq4,  // HFQ4-quantized KV write (llama legacy)
+    KvWriteQ4,    // Q4-quantized KV write (llama legacy)
+    KvWriteInt8c, // INT8-per-column KV write (llama)
+    KvWriteHfq8,  // HFQ8 flat-layout KV write (llama)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
     KvWriteAsym4Batched,

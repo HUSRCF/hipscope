@@ -56,6 +56,31 @@ pub enum Step<'a> {
         plan: crate::families::kv_tier::KvTierPlan,
         io: crate::families::attention::AttnParams<'a>,
     },
+    /// In-place RoPE on Q and K. Per-op only (no fused entry) — present so the
+    /// attention block can be one contiguous step list (future fusion seam).
+    Rope {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        pos_buf: &'a hip_bridge::DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        theta: f32,
+    },
+    /// Per-head rmsnorm on one tensor (Qwen3-style qk-norm). One step per tensor.
+    QkNorm {
+        x: &'a GpuTensor,
+        weight: &'a GpuTensor,
+        n_groups: usize, // n_heads (Q) or n_kv_heads (K)
+        head_dim: usize,
+        eps: f32,
+    },
+    /// In-place bias add on one tensor (e.g. qwen2 QKV bias).
+    BiasAdd {
+        x: &'a GpuTensor,
+        bias: &'a GpuTensor,
+        dim: usize,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -65,6 +90,9 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
         Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
         Step::Attend { .. } => PipelineOp::Attend,
+        Step::Rope { .. } => PipelineOp::Rope,
+        Step::QkNorm { .. } => PipelineOp::QkNorm,
+        Step::BiasAdd { .. } => PipelineOp::BiasAdd,
     }
 }
 
@@ -780,6 +808,29 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             let attn = ATTENTION.get_or_init(AttentionFamily::new);
             attn.run_attention(ctx, gpu, plan, io)
         }
+        Step::Rope {
+            q,
+            k,
+            pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            theta,
+        } => gpu
+            .rope_f32(q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim, *theta)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::QkNorm {
+            x,
+            weight,
+            n_groups,
+            head_dim,
+            eps,
+        } => gpu
+            .rmsnorm_batched(x, weight, x, *n_groups, *head_dim, *eps)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::BiasAdd { x, bias, dim } => gpu
+            .bias_add_f32(x, bias, 1, *dim)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
     }
 }
 

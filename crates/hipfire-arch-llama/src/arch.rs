@@ -247,6 +247,8 @@ impl Llama {
                     quant_fwht: false,
                     quant_hfq4: kv_cache.quant_hfq4,
                     quant_q4,
+                    quant_int8: false,
+                    quant_hfq8: false,
                     v_mode_bits: 8,
                     pos,
                     flash_mode: 0,

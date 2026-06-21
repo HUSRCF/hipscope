@@ -5320,6 +5320,23 @@ impl KvCache {
             && self.k_scales.is_empty()
     }
 
+    /// HFQ8 flat-layout KV: quantized with a separate per-block scale table,
+    /// and none of the other named tiers. Mirrors the hand ladder's hfq8 branch
+    /// condition (`llama.rs` `llama_kv_write_attend` `quantized && !k_scales.is_empty()
+    /// && !int8 && !q8`), extended with the exclusions that keep exactly one tier
+    /// flag set (asym caches set `quantized` with EMPTY `k_scales`; hfq4 is matched
+    /// earlier) so classify()'s "at most one tier flag" debug_assert holds.
+    fn is_hfq8_kv(&self) -> bool {
+        self.quantized
+            && !self.k_scales.is_empty()
+            && !self.quant_int8
+            && !self.quant_q8
+            && !self.quant_hfq4
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
+    }
+
     pub fn tier_inputs(&self) -> KvTierInputs {
         let quant_q4 = self.quant_q4_residual();
         KvTierInputs {
@@ -5330,6 +5347,8 @@ impl KvCache {
             quant_fwht: self.quant_fwht,
             quant_hfq4: self.quant_hfq4,
             quant_q4,
+            quant_int8: self.quant_int8,
+            quant_hfq8: self.is_hfq8_kv(),
             v_mode_bits: self.v_mode_bits(),
             // ── per-call defaults (note batch_size = 1, not 0), overwritten
             //    by the caller via functional update ──
@@ -5355,6 +5374,8 @@ impl KvCache {
             self.quant_asym2,
             self.quant_hfq4,
             quant_q4,
+            self.quant_int8,
+            self.is_hfq8_kv(),
             self.quant_fwht,
         )
     }
@@ -9064,6 +9085,8 @@ mod tests {
             quant_fwht: kv.quant_fwht,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 0,
@@ -9105,6 +9128,8 @@ mod tests {
             quant_fwht: kv.quant_fwht,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 2,
@@ -9176,6 +9201,8 @@ mod tests {
             quant_fwht: kv.quant_fwht,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 0,
