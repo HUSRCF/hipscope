@@ -375,9 +375,10 @@ reset/checkpoint/abort sites keep reading the now-`None` direct fields, silently
 no-op, and bleed into a `</think>` thinking-loop attractor (catastrophic on
 DFlash, mild-but-detectable on AR). Reach for this when touching the daemon's
 reset/checkpoint/prefix-cache/abort state machine, `ModelState` bundles, or any
-recurrent-state lifecycle. AR is the always-on guard; DFlash is opt-in
-(`HIPFIRE_SERVE_GATE_DFLASH=1`, needs a 27B target+draft and is currently robust
-only on gfx1100). Exit 1 = a request degraded across the session.
+recurrent-state lifecycle. AR is the always-on guard; the DFlash arm (the
+catastrophic case) auto-runs when a 27B target+draft are present under
+`MODELS_DIR` (`HIPFIRE_SERVE_GATE_DFLASH=0` to force-skip). Exit 1 = a request
+degraded across the session.
 
 ## DFlash Coherence Gate (spec-decode token-attractor guard)
 

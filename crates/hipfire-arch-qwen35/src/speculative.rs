@@ -1768,9 +1768,13 @@ impl HiddenStateRingBuffer {
         src: &GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        debug_assert!(
+        // Hard assert (not debug_assert): a violation silently overran the
+        // staging buffer in release and surfaced as a cryptic d2d-bounds panic
+        // deep in ffi.rs. Fail loud and named instead.
+        assert!(
             n <= self.max_batch,
-            "write_rows_to_staging: n {} > max_batch {}",
+            "write_rows_to_staging: n {} > staging max_batch {} — staging buffer \
+             too small for this prefill chunk",
             n,
             self.max_batch
         );
@@ -5236,9 +5240,7 @@ pub fn spec_step_ddtree_batched(
                     // but with the matching kv_cache_write_*_batched call.
                     // For initial Phase 2 prototype, panic so we notice if a
                     // non-asym3 model accidentally enables Path B.
-                    panic!(
-                        "Path B Phase 2 only supports asym3 KV today (got {other:?})"
-                    );
+                    panic!("Path B Phase 2 only supports asym3 KV today (got {other:?})");
                 }
             }
         }

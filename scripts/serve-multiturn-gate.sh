@@ -161,16 +161,12 @@ if [ -n "$AR_MODEL" ]; then
     run_session "AR multi-request — $(basename "$AR_MODEL")" "${lines[@]}"
 fi
 
-# ── DFlash multi-request (the *catastrophic* path; opt-in) ────────────────
-# DFlash is the worst case for the #462 bleed, but it needs a 27B target +
-# draft and is currently robust only on gfx1100 (where the fix was validated
-# 8/8). On gfx1151 the 27B DFlash prefill hits SEPARATE pre-existing scratch
-# bugs (mq_x_rot — now fixed; and a prompt-length-sensitive d2d-copy bounds
-# assertion in verify/hidden scratch) that would make this gate flaky there.
-# So it's opt-in: set HIPFIRE_SERVE_GATE_DFLASH=1 on a box where 27B DFlash
-# serve is known-good. AR above is the always-on regression guard.
+# ── DFlash multi-request (the *catastrophic* path) ────────────────────────
+# DFlash is the worst case for the #462 bleed. It needs a 27B target + draft,
+# so it auto-runs only when both are present under MODELS_DIR (skipped
+# otherwise). Set HIPFIRE_SERVE_GATE_DFLASH=0 to force-skip even when present.
 DF_TARGET=""; DF_DRAFT="${HIPFIRE_DFLASH_DRAFT:-}"
-if [ "${HIPFIRE_SERVE_GATE_DFLASH:-0}" = "1" ]; then
+if [ "${HIPFIRE_SERVE_GATE_DFLASH:-1}" != "0" ]; then
     for c in qwen3.6-27b.mq4 qwen3.5-27b.mq4; do
         [ -f "$MODELS_DIR/$c" ] && { DF_TARGET="$MODELS_DIR/$c"; break; }
     done

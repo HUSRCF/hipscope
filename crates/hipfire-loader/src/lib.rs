@@ -886,13 +886,22 @@ fn load_dflash_state(
     )
     .map_err(|e| format!("{e}"))?;
     let _ = draft_hfq;
+    // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
+    // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
+    // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
+    // chunks of up to `PREFILL_MAX_BATCH` and captures each into staging via
+    // `write_rows_to_staging` (whose `n <= max_batch` guard is a debug_assert,
+    // silent in release). Sizing staging to only `max_n` overflowed the d2d
+    // copy on any prompt longer than block_size+1 tokens. Size it to the
+    // larger of the two so both paths fit.
+    let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
     let hidden_rb = HiddenStateRingBuffer::new(
         gpu,
         target_config.n_layers,
         draft_config.num_extract(),
         target_config.dim,
         ctx_capacity,
-        max_n,
+        staging_max_batch,
     )
     .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
     let hidden_k = target_config.dim.next_power_of_two();
