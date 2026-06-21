@@ -559,33 +559,53 @@ fn minimax_attn_block(
         cfg.rope_theta,
     )
     .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(
-        &state.kv.k_gpu[l],
-        &state.fa_k,
-        &state.pos_buf,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
+    // KV write (Q8) + attention via the shared KV-usage abstraction. minimax is
+    // Q8 non-flash unconditional → derive returns AttnQ8_0Kv at pos+1<=15000
+    // (no partials → flash_partials: None; >15k flips to flash — documented
+    // Q8-fidelity edge). capture_mode NOT threaded (non-flash kernel is
+    // capture-safe; minimax captures it under HIPFIRE_MINIMAX_GRAPH).
+    // NOTE: the hand path passed `state.max_seq` as the kernel's seq_len_hint
+    // (LDS-sizing only; the kernel reads the true length from pos_buf), while
+    // the dispatch arm passes pos+1. The attended-position count comes from
+    // pos_buf either way, so output is unchanged — VALIDATED by hand≡lowered A/B.
+    let pos = state.pos_host[0] as usize;
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
+        hipfire_dispatch::families::kv_tier::KvTierInputs {
+            pos,
+            ..state.kv.tier_inputs()
+        },
     )
-    .map_err(|e| format!("minimax L{l}: kv write k: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(
-        &state.kv.v_gpu[l],
-        &state.fa_v,
-        &state.pos_buf,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-    )
-    .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
-    gpu.attention_q8_0_kv(
-        &state.fa_q,
-        &state.kv.k_gpu[l],
-        &state.kv.v_gpu[l],
-        &state.fa_attn_out,
-        &state.pos_buf,
-        state.max_seq,
-        cfg.num_attention_heads,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-        state.kv.physical_cap,
+    .map_err(|e| format!("minimax L{l}: kv tier: {e}"))?;
+    let io = hipfire_dispatch::families::attention::AttnParams {
+        q: &state.fa_q,
+        k: &state.fa_k,
+        v: &state.fa_v,
+        k_cache: &state.kv.k_gpu[l],
+        v_cache: &state.kv.v_gpu[l],
+        k_scales: None,
+        v_scales: None,
+        pos_buf: &state.pos_buf,
+        pos,
+        positions: None,
+        n_heads: cfg.num_attention_heads,
+        n_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        physical_cap: state.kv.physical_cap,
+        batch_size: 1,
+        max_ctx_len: 0,
+        flash_partials: None,
+        givens_cos: None,
+        givens_sin: None,
+        tree_bias: None,
+        block_start: 0,
+        block_cols: 0,
+        output: &state.fa_attn_out,
+    };
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        &ctx,
+        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
     weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
