@@ -1559,117 +1559,58 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     // - Fwht4: kv_cache_write_fwht4_fused + attention_flash_fwht4 (FWHT signs
     //   stored in kv_cache.givens_cos/givens_sin slots — field-name reuse
     //   per Phase 1 fwht4 commit `c64c0e3f`).
-    match kv.kv_mode {
-        MtpKvMode::Q8 => {
-            gpu.kv_cache_write_q8_0(
-                &kv.inner.k_gpu[0],
-                &scratch.k,
-                pos_buf,
-                cfg.n_head_kv,
-                cfg.head_dim,
-            )?;
-            gpu.kv_cache_write_q8_0(
-                &kv.inner.v_gpu[0],
-                &scratch.v,
-                pos_buf,
-                cfg.n_head_kv,
-                cfg.head_dim,
-            )?;
-            gpu.attention_q8_0_kv(
-                &scratch.q,
-                &kv.inner.k_gpu[0],
-                &kv.inner.v_gpu[0],
-                &scratch.attn_out,
-                pos_buf,
-                seq_len_hint,
-                cfg.n_head,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                kv.inner.physical_cap,
-            )?;
-        }
-        MtpKvMode::Asym3 => {
-            let ct = kv
-                .inner
-                .givens_cos
-                .as_ref()
-                .expect("MtpKvMode::Asym3 requires kv.inner.givens_cos to be Some");
-            let st = kv
-                .inner
-                .givens_sin
-                .as_ref()
-                .expect("MtpKvMode::Asym3 requires kv.inner.givens_sin to be Some");
-            gpu.kv_cache_write_asym3_fused(
-                &kv.inner.k_gpu[0],
-                &kv.inner.v_gpu[0],
-                &scratch.k,
-                &scratch.v,
-                pos_buf,
-                ct,
-                st,
-                cfg.n_head_kv,
-                cfg.head_dim,
-            )?;
-            gpu.attention_flash_asym3(
-                &scratch.q,
-                &kv.inner.k_gpu[0],
-                &kv.inner.v_gpu[0],
-                &scratch.attn_out,
-                pos_buf,
-                ct,
-                st,
-                seq_len_hint,
-                cfg.n_head,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                kv.inner.physical_cap,
-                &scratch.flash_partials,
-            )?;
-        }
-        MtpKvMode::Fwht4 => {
-            // Fwht uses the asym4-shaped k/v buffers + the cos/sin slots hold
-            // signs1/signs2 (128 elements each). FWHT operates on 128-element
-            // halves; head_dim=256 processes 2 halves reusing the same signs.
-            let ct = kv
-                .inner
-                .givens_cos
-                .as_ref()
-                .expect("MtpKvMode::Fwht4 requires kv.inner.givens_cos (signs1) to be Some");
-            let st = kv
-                .inner
-                .givens_sin
-                .as_ref()
-                .expect("MtpKvMode::Fwht4 requires kv.inner.givens_sin (signs2) to be Some");
-            gpu.kv_cache_write_fwht4_fused(
-                &kv.inner.k_gpu[0],
-                &kv.inner.v_gpu[0],
-                &scratch.k,
-                &scratch.v,
-                pos_buf,
-                ct,
-                st,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                kv.inner.v_mode_bits(),
-            )?;
-            gpu.attention_flash_fwht4(
-                &scratch.q,
-                &kv.inner.k_gpu[0],
-                &kv.inner.v_gpu[0],
-                &scratch.attn_out,
-                pos_buf,
-                ct,
-                st,
-                seq_len_hint,
-                cfg.n_head,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                kv.inner.physical_cap,
-                &scratch.flash_partials,
-                kv.inner.v_mode_bits(),
-            )?;
-        }
-    }
+    // KV write + attention via the shared KV-usage abstraction. kv.inner is
+    // built per kv_mode (new_gpu_q8/asym3/fwht4), so kv.inner.tier_inputs()
+    // produces exactly the tier kv.kv_mode used to dispatch: Q8→AttnQ8_0Kv
+    // (non-flash), Asym3→AttnFlashAsym3, Fwht4→AttnFlashAsym4Fwht — byte-
+    // identical kernels (incl. the Givens cos/sin + v_mode_bits sub-plan). The
+    // dispatch arm computes seq_len = pos+1, so pos = seq_len_hint-1 reproduces
+    // the hand seq_len_hint exactly (the write position flows via pos_buf).
+    // SPEC-DECODE: draft logits stay byte-identical → τ unchanged (validated by
+    // coherence-gate-dflash.sh + a τ A/B). flash_partials is always Some (the Q8
+    // non-flash arm ignores it; asym3/fwht4 require it). Q8 non-flash is
+    // unconditional → derive returns AttnQ8_0Kv at seq_len_hint<=15000 (the
+    // documented >15k Q8-fidelity edge).
+    let dispatch_pos = seq_len_hint - 1;
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
+        hipfire_dispatch::families::kv_tier::KvTierInputs {
+            pos: dispatch_pos,
+            ..kv.inner.tier_inputs()
+        },
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    let io = hipfire_dispatch::families::attention::AttnParams {
+        q: &scratch.q,
+        k: &scratch.k,
+        v: &scratch.v,
+        k_cache: &kv.inner.k_gpu[0],
+        v_cache: &kv.inner.v_gpu[0],
+        k_scales: None,
+        v_scales: None,
+        pos_buf,
+        pos: dispatch_pos,
+        positions: None,
+        n_heads: cfg.n_head,
+        n_kv_heads: cfg.n_head_kv,
+        head_dim: cfg.head_dim,
+        physical_cap: kv.inner.physical_cap,
+        batch_size: 1,
+        max_ctx_len: 0,
+        flash_partials: Some(&scratch.flash_partials),
+        givens_cos: kv.inner.givens_cos.as_ref(),
+        givens_sin: kv.inner.givens_sin.as_ref(),
+        tree_bias: None,
+        block_start: 0,
+        block_cols: 0,
+        output: &scratch.attn_out,
+    };
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        &ctx,
+        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     // ── 8. Apply gate (sigmoid(gate) * attn_out, in-place on attn_out) ───
     gpu.sigmoid_mul_f32(&scratch.attn_out, &scratch.gate)?;
