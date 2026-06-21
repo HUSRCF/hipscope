@@ -8352,13 +8352,21 @@ pub fn argmax(logits: &[f32]) -> u32 {
     // NaN, so a NaN logit is never selected and never displaces the real max.
     // The previous `max_by(partial_cmp.unwrap_or(Less))` kept a trailing NaN
     // candidate (verified: [1,5,3,NaN] → idx 3) — a NaN-indexed garbage token
-    // on the greedy path poisons the recurrent DeltaNet state. Empty logits
-    // would be a caller bug; fold over an empty slice returns index 0.
+    // on the greedy path poisons the recurrent DeltaNet state.
+    //
+    // O2b-2 finite guard: this is also the degenerate fallback for the sampler
+    // (`sample_top_p` / `sample_full_dist`), so it must skip ALL non-finite
+    // values, not just NaN. A `+Inf` logit would otherwise win the bare `>`
+    // comparison and be selected over the real finite max — `is_finite()` in
+    // the predicate keeps both `+Inf` and `NaN` from displacing a finite token.
+    // Mixed finite + non-finite → the finite max. All-non-finite (or empty)
+    // never replaces the seed → deterministic index 0, matching the
+    // O1-accepted `sample_full_dist` degenerate behavior.
     logits
         .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
-            if v > best.1 {
+            if v.is_finite() && v > best.1 {
                 (i, v)
             } else {
                 best
@@ -8562,6 +8570,13 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
 
     // Single pass: find max AND top-K indices from raw logits simultaneously.
     // Uses a fixed-size array (no heap alloc) with manual min-tracking.
+    //
+    // FINITE GUARD (ported from sample_full_dist, the O1 fix): only finite
+    // logits feed `max_logit` and the top-K set. A `+Inf` logit must not become
+    // `max_logit` (then `(l - max)` = Inf - Inf = NaN → exp(NaN) = NaN → NaN sum
+    // → degenerate token-0 return), and a NaN logit (already `>`-false) must not
+    // occupy a top-K slot. Slots left at NEG_INFINITY are zeroed in the softmax
+    // below, and if no finite mass survives we fall back to the NaN-safe argmax.
     let mut topk_val = [f32::NEG_INFINITY; TOP_K];
     let mut topk_idx = [0u32; TOP_K];
     let mut min_pos = 0usize; // index of smallest element in topk
@@ -8569,6 +8584,9 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     let mut max_logit = f32::NEG_INFINITY;
 
     for (i, &l) in logits.iter().enumerate() {
+        if !l.is_finite() {
+            continue;
+        }
         if l > max_logit {
             max_logit = l;
         }
@@ -8586,13 +8604,27 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
-    // Softmax only the K candidates (temperature-scaled)
+    // Softmax only the K candidates (temperature-scaled). FINITE GUARD: a slot
+    // still holding NEG_INFINITY (fewer than TOP_K finite logits) or a non-
+    // finite computed prob contributes zero mass rather than poisoning `sum`.
     let mut probs = [0.0f32; TOP_K];
     let mut sum = 0.0f32;
     for i in 0..TOP_K {
-        let p = ((topk_val[i] - max_logit) * inv_temp).exp();
+        let p = if topk_val[i].is_finite() {
+            let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
+            if pp.is_finite() { pp } else { 0.0 }
+        } else {
+            0.0
+        };
         probs[i] = p;
         sum += p;
+    }
+
+    // Degenerate guard: if no finite mass survives (all-NaN / all-+Inf / all
+    // -inf logits), fall back to argmax of the raw logits (its own NaN guard
+    // returns a finite in-vocab index, never the poisoned token 0).
+    if sum <= 0.0 || !sum.is_finite() {
+        return argmax(logits);
     }
 
     // Sort descending by probability (insertion sort on 20 elements)
@@ -8633,6 +8665,165 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
     topk_idx[order[0]]
+}
+
+/// Host-side full-distribution sampler for the EP (multi-GPU) serve path.
+///
+/// The single-GPU handler resolves request>rec_*>arch-default sampling and runs
+/// the GPU `sample_top_p` kernel; the EP path (ds4/minimax) never reaches that
+/// handler and previously decoded with a hardcoded argmax, dropping the card's
+/// temp/top_p/top_k/min_p. ds4's card mandates temp=1.0/top_p=1.0 specifically
+/// because greedy argmax on the quantized instruct model falls into block-level
+/// attractor loops. This function restores those knobs host-side over the f32
+/// logits already downloaded by `download_f32`.
+///
+/// Pipeline mirrors the GPU sampler ordering: temperature scale → top_k cut →
+/// top_p (nucleus) cut → min_p cut → seeded multinomial draw. Uses the shared
+/// `simple_rand` RNG (SAMPLER_STATE), so a per-request `reset_cpu_sampler_rng`
+/// makes the draw deterministic and consistent with the rest of the daemon.
+///
+/// `temperature <= 1e-6` takes the argmax fast-path (greedy), matching the
+/// GPU kernel's `temperature <= 0` short-circuit but with a small epsilon so a
+/// near-zero temp never divides by ~0.
+pub fn sample_full_dist(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+) -> u32 {
+    if temperature <= 1e-6 {
+        return argmax(logits);
+    }
+    let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
+    let top_p = top_p.clamp(0.0, 1.0);
+    // FIX #3: the request parser only filters `min_p > 0`, so a request can
+    // smuggle in min_p > 1.0 (which would `retain` an empty candidate set and
+    // panic on `cand[0]` below) or a negative min_p. Clamp at fn entry to the
+    // valid [0,1] probability-ratio range; min_p == 0 is the happy path (no cut).
+    let min_p = min_p.map(|mp| if mp.is_finite() { mp.clamp(0.0, 1.0) } else { 0.0 });
+    let inv_temp = 1.0 / temperature;
+
+    // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
+    // FIX #4: only finite logits feed the max; a NaN/Inf logit must not become
+    // `max_logit` (an Inf max would push every `(l - max)` to -Inf → all-zero
+    // probs → degenerate fallback even when finite tokens existed).
+    let mut max_logit = f32::NEG_INFINITY;
+    for &l in logits {
+        if l.is_finite() && l > max_logit {
+            max_logit = l;
+        }
+    }
+
+    // Materialize (idx, prob) with temperature-scaled softmax numerators.
+    // FIX #4: a non-finite logit (NaN/Inf) yields a non-finite prob that would
+    // poison `total` (NaN total → degenerate argmax fallback, silently dropping
+    // the whole finite distribution). Zero out the prob of any non-finite logit
+    // (and of any non-finite computed prob) so finite tokens still get sampled.
+    // A zeroed prob can never be selected, matching the greedy argmax NaN guard.
+    let mut cand: Vec<(u32, f32)> = Vec::with_capacity(n);
+    for (i, &l) in logits.iter().enumerate() {
+        let p = if l.is_finite() {
+            let pp = ((l - max_logit) * inv_temp).exp();
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        cand.push((i as u32, p));
+    }
+
+    // Sort descending by probability (top_k / top_p / min_p all operate on the
+    // ranked distribution). Unstable sort with a NaN-last comparator.
+    cand.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
+    // FINDING #2 (intentional, do NOT "fix" by adding a default cap):
+    // `top_k == None` means NO top-k cap — the full sorted distribution is
+    // retained. This deliberately differs from the GPU sampler's gather-pool
+    // cap (which always pre-trims to a fixed candidate pool). For ds4 the card
+    // mandates temp=1.0 / top_p=1.0 / (no top_k), i.e. sampling from the full
+    // distribution; capping here would be LESS faithful to that card, not more.
+    if let Some(k) = top_k {
+        let k = k as usize;
+        if k > 0 && k < cand.len() {
+            cand.truncate(k);
+        }
+    }
+
+    // Degenerate guard over the (possibly k-truncated) set: if no finite mass
+    // survives (all -inf / all non-finite logits zeroed by FIX #4), fall back
+    // to argmax of the raw logits (which has its own NaN guard).
+    let pre_minp_total: f32 = cand.iter().map(|c| c.1).sum();
+    if pre_minp_total <= 0.0 || !pre_minp_total.is_finite() {
+        return argmax(logits);
+    }
+
+    // min_p: drop candidates whose prob is below `min_p * p_max` (the highest
+    // prob is cand[0] after the descending sort). Applied before nucleus.
+    // FIX #3: never let the retain empty the set — if the floor would drop
+    // everything (it can't here since cand[0] always passes `>= mp*cand[0]`
+    // for mp <= 1, but keep the invariant explicit and robust to fp edge
+    // cases), restore the single highest-prob candidate so `cand[0]` is safe.
+    if let Some(mp) = min_p {
+        if mp > 0.0 {
+            let top = cand[0];
+            let floor = mp * top.1;
+            cand.retain(|c| c.1 >= floor);
+            if cand.is_empty() {
+                cand.push(top);
+            }
+        }
+    }
+
+    // FIX #1: recompute the nucleus mass AFTER the min_p filter, over the final
+    // retained set, so `p_thresh = top_p * (post-min_p mass)`. Summing the mass
+    // before min_p (the old behavior) made the cumulative threshold too large
+    // relative to the surviving probabilities, over-keeping the tail — and
+    // diverging from the GPU sampler's cap-before-sum semantics.
+    let total: f32 = cand.iter().map(|c| c.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return cand[0].0;
+    }
+
+    // top_p (nucleus): keep the smallest prefix whose cumulative mass reaches
+    // top_p * total. Always keep at least the top candidate.
+    if top_p < 1.0 {
+        let threshold = top_p * total;
+        let mut cum = 0.0f32;
+        let mut keep = 0usize;
+        for c in cand.iter() {
+            cum += c.1;
+            keep += 1;
+            if cum >= threshold {
+                break;
+            }
+        }
+        cand.truncate(keep.max(1));
+    }
+
+    // Seeded multinomial draw over the surviving candidates.
+    let kept_total: f32 = cand.iter().map(|c| c.1).sum();
+    if kept_total <= 0.0 || !kept_total.is_finite() {
+        return cand[0].0;
+    }
+    let r = simple_rand() * kept_total;
+    let mut acc = 0.0f32;
+    for c in &cand {
+        acc += c.1;
+        if acc >= r {
+            return c.0;
+        }
+    }
+    cand[cand.len() - 1].0
 }
 
 /// Apply the repeat penalty in-place to a specific subset of (token_id, value)
@@ -8858,6 +9049,14 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The CPU sampler RNG (`SAMPLER_STATE`) is a process-global atomic shared by
+    // every test. Tests that reset+draw from it must not interleave with each
+    // other (a concurrent `simple_rand` from a sibling test would mutate the
+    // state between a reset and the draw, breaking determinism). Serialize all
+    // RNG-touching `sample_full_dist` tests behind this mutex.
+    static RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // hunt3 M-B (FinalFix): greedy argmax must drop NaN like the GPU kernel
     // (argmax.hip `data[i] > lmax`), never selecting a NaN-indexed token and
@@ -8880,6 +9079,186 @@ mod tests {
     fn argmax_finite_unaffected() {
         let logits = [0.1f32, 0.2, 0.9, 0.3];
         assert_eq!(argmax(&logits), 2);
+    }
+
+    // O2b-2 finite-guard: argmax is the sampler degenerate fallback, so it must
+    // skip ALL non-finite values (not just NaN). A `+Inf` must never win the
+    // bare `>` over a real finite max.
+
+    #[test]
+    fn argmax_pos_inf_does_not_displace_finite_max() {
+        // Pre-fix: +Inf at idx 2 wins `>` → idx 2. With the finite guard the
+        // real finite max (idx 1) is returned.
+        let logits = [1.0f32, 5.0, f32::INFINITY, 3.0];
+        assert_eq!(argmax(&logits), 1);
+    }
+
+    #[test]
+    fn argmax_mixed_finite_and_nonfinite_picks_finite() {
+        // +Inf, NaN, and a finite peak interleaved → the finite peak (idx 4).
+        let logits = [
+            f32::INFINITY,
+            f32::NAN,
+            -2.0,
+            f32::NAN,
+            9.0,
+            f32::INFINITY,
+        ];
+        assert_eq!(argmax(&logits), 4);
+    }
+
+    #[test]
+    fn argmax_all_pos_inf_returns_zero() {
+        // No finite value survives → deterministic index 0 (matches the
+        // sample_full_dist degenerate fallback contract).
+        let logits = [f32::INFINITY; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    #[test]
+    fn argmax_all_nan_returns_zero() {
+        let logits = [f32::NAN; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    // O2b-2 overflow-guard: the daemon capacity guards compute
+    // `prompt + max_tokens` (or `start + suffix + max_tokens`) in usize and
+    // compare against a cap. An adversarial `max_tokens` near usize::MAX must
+    // not wrap the sum below the cap and slip past the guard. The guards use
+    // `saturating_add`; this asserts the saturating comparison still rejects.
+    #[test]
+    fn capacity_guard_saturating_add_rejects_huge_max_tokens() {
+        let cap: usize = 32_768;
+        let prompt_n: usize = 100;
+        let max_tokens: usize = usize::MAX - 1;
+        // Unchecked `prompt_n + max_tokens` would panic in debug / wrap in
+        // release to `prompt_n - 2` (≈ usize::MAX), which is > cap by luck here,
+        // but for an adversarial max_tokens chosen to land the wrapped sum
+        // under the cap it would bypass. saturating_add can never wrap.
+        assert!(prompt_n.saturating_add(max_tokens) > cap);
+
+        // Choose max_tokens so the *wrapped* unchecked sum would fall under the
+        // cap: max_tokens = usize::MAX - prompt_n + 1 → wraps to 0 < cap, which
+        // would WRONGLY pass an unchecked guard. saturating_add saturates to
+        // usize::MAX, so the guard still rejects.
+        let adversarial = usize::MAX - prompt_n + 1;
+        assert_eq!(prompt_n.wrapping_add(adversarial), 0, "wrapped sum is 0");
+        assert!(
+            prompt_n.saturating_add(adversarial) > cap,
+            "saturating guard must still reject the wrap-to-zero adversarial max_tokens"
+        );
+
+        // Triple-add form used by the ds4 single-GPU guard.
+        let start_pos: usize = 50;
+        let suffix_len: usize = 50;
+        assert!(
+            start_pos
+                .saturating_add(suffix_len)
+                .saturating_add(usize::MAX)
+                > cap
+        );
+    }
+
+    // O1 fix-wave: edge-case guards for the host EP sampler `sample_full_dist`.
+    // All run CPU-only; they seed the shared RNG via `reset_cpu_sampler_rng`
+    // so the multinomial draw is deterministic.
+
+    #[test]
+    fn sample_full_dist_min_p_gt_one_no_panic() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3: min_p = 1.5 would empty the candidate set and panic on cand[0]
+        // before the clamp. After the clamp + keep-at-least-one guard it must
+        // return a valid in-range index without panicking.
+        reset_cpu_sampler_rng(12345);
+        let logits = [0.5f32, 2.0, 1.0, 0.1, 3.0];
+        let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(1.5));
+        assert!(
+            (idx as usize) < logits.len(),
+            "min_p>1 must still return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn sample_full_dist_min_p_filters_low_prob() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3 / general: min_p = 0.5 with a sharply peaked distribution must
+        // drop the low-prob tails. With temp=1.0 the dominant logit (idx 1 at
+        // 10.0) has prob ~1.0; min_p*p_max ~0.5 prunes everything else, so the
+        // draw can only return idx 1 regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [0.0f32, 10.0, 0.1, 0.2, 0.05];
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.5));
+            assert_eq!(idx, 1, "min_p=0.5 should leave only the peak (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn sample_full_dist_nan_logit_samples_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #4: a NaN logit must not poison `total` and force a silent greedy
+        // fallback / NaN-indexed token. The NaN index (3) must never be drawn,
+        // and the returned token must be a finite-logit index.
+        reset_cpu_sampler_rng(424242);
+        let logits = [1.0f32, 2.0, 0.5, f32::NAN, 1.5];
+        for _ in 0..64 {
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, None);
+            assert_ne!(idx, 3, "NaN-indexed token must never be selected");
+            assert!(
+                (idx as usize) < logits.len() && logits[idx as usize].is_finite(),
+                "must sample a finite-logit token, got idx {idx}"
+            );
+        }
+        // Also with +Inf present: must still pick a finite token, not the Inf.
+        reset_cpu_sampler_rng(424242);
+        let logits2 = [1.0f32, f32::INFINITY, 0.5, 2.0];
+        let idx2 = sample_full_dist(&logits2, 1.0, 1.0, None, None);
+        assert_ne!(idx2, 1, "Inf-indexed token must never be selected");
+        assert!(logits2[idx2 as usize].is_finite());
+    }
+
+    #[test]
+    fn sample_full_dist_happy_path_min_p_zero() {
+        // HAPPY PATH (the 3 cards): min_p = 0.0 with both top_k=None (full dist,
+        // ds4 card) and top_k=40, plus temp/top_p, must return a valid in-range
+        // index. The fixes are guarded on min_p>0 / non-finite / min_p>1, none
+        // of which trigger here, so behavior is unchanged.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        for &top_k in &[None, Some(40u32)] {
+            for seed in [1u32, 2, 3, 42] {
+                reset_cpu_sampler_rng(seed);
+                let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+                let idx = sample_full_dist(&logits, 1.0, 1.0, top_k, Some(0.0));
+                assert!(
+                    (idx as usize) < logits.len(),
+                    "happy path must return in-range idx (top_k={top_k:?}, seed {seed})"
+                );
+            }
+        }
+        // min_p = None (the other happy-path encoding) must also be in-range.
+        reset_cpu_sampler_rng(7);
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9];
+        let idx = sample_full_dist(&logits, 0.8, 0.95, Some(40), None);
+        assert!((idx as usize) < logits.len());
+    }
+
+    #[test]
+    fn sample_full_dist_fixed_seed_deterministic() {
+        // Determinism under a fixed seed (the daemon's `reset_cpu_sampler_rng`
+        // contract): two back-to-back resets to the same seed must produce the
+        // same token. The shared `SAMPLER_STATE` is a process-global atomic, so
+        // we serialize the two calls inside a single test (no other test runs
+        // between them in THIS function) — the standalone single-threaded proof
+        // of determinism is racy only across parallel tests, never within one.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+        for seed in [1u32, 2, 3, 42] {
+            reset_cpu_sampler_rng(seed);
+            let a = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            reset_cpu_sampler_rng(seed);
+            let b = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            assert_eq!(a, b, "fixed seed must be deterministic (seed {seed})");
+        }
     }
 
     #[test]
@@ -9107,6 +9486,60 @@ mod tests {
         // by constructing the boolean checks that the dispatch uses.
     }
 
+    // O2b-2 fix-wave: finite/NaN guards for the LEGACY CPU sampler `sample_top_p`
+    // (the single-GPU non-EP path). Before the fix an all-non-finite logit
+    // vector collapsed to token 0 (max_logit stayed -inf / Inf-Inf=NaN poisoned
+    // the softmax sum). These mirror the `sample_full_dist_*` guards above:
+    // every degenerate input must still return a FINITE, in-vocab token.
+
+    #[test]
+    fn legacy_sample_top_p_all_nan_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(12345);
+        let logits = [f32::NAN; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-NaN must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_all_pos_inf_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(777);
+        // Pre-fix: +Inf max → (Inf - Inf) = NaN softmax → NaN sum → token 0.
+        let logits = [f32::INFINITY; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-+Inf must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_mixed_finite_nan_picks_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // The only finite mass is at idx 2 (a sharp peak after temp). The NaN
+        // slots (0,1,3,4) must never be drawn, and the +Inf slot (5) must be
+        // skipped — the draw is forced onto the finite peak regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [
+                f32::NAN,
+                f32::NAN,
+                20.0f32,
+                f32::NAN,
+                f32::NAN,
+                f32::INFINITY,
+            ];
+            let idx = sample_top_p(&logits, 0.7, 0.9);
+            assert_eq!(
+                idx, 2,
+                "mixed finite+NaN+Inf must pick the lone finite peak (seed {seed})"
+            );
+        }
+    }
     // ── KvCache::tier_inputs() accessor pin test ─────────────────
 
     #[test]

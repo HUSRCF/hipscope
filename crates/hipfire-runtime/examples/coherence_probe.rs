@@ -227,13 +227,40 @@ impl DaemonChild {
 
 fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
     let mut cmd = Command::new(daemon);
+    // stderr is `piped()` (owned by us), NOT `inherit()`. Over ssh, an
+    // inherited stderr fd keeps the daemon's write end attached to the
+    // parent terminal/ssh channel: when the daemon child exits, the channel
+    // can stay open (the inherited pipe is never closed by us), hanging the
+    // probe and the ssh session. We never parse daemon stderr — diagnostics
+    // we rely on come from the stdout JSONL stream — so we drain stderr on a
+    // detached thread, forwarding it to the probe's own stderr to preserve
+    // the daemon's diagnostics. Because the read end is owned by this thread,
+    // the daemon's exit yields EOF here and the thread ends cleanly; the ssh
+    // channel is never held open by an inherited fd.
     cmd.env("HIPFIRE_EMIT_TOKEN_IDS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn daemon: {}", e))?;
     let stdin = child.stdin.take().ok_or("daemon stdin")?;
     let stdout = BufReader::new(child.stdout.take().ok_or("daemon stdout")?);
+    if let Some(child_stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(child_stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        // Forward daemon diagnostics to our own stderr so they
+                        // are not lost, prefixed for clarity.
+                        eprint!("[daemon] {}", line);
+                    }
+                }
+            }
+        });
+    }
     Ok(DaemonChild {
         child,
         stdin: Some(stdin),

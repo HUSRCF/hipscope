@@ -397,6 +397,12 @@ pub struct MiniMaxLayerWeights {
     pub experts: Vec<MiniMaxExpertWeights>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
+    /// pointers index into (→ 0 silu output ⇒ 0 contribution). Owned here so it
+    /// is reclaimed by `free_gpu` on unload and by the staging guard on a
+    /// mid-load failure; `None` for single-GPU / fully-owned shards. Must
+    /// outlive the device pointer table that bakes its address.
+    pub dummy_gate_up: Option<GpuTensor>,
 }
 
 pub struct MiniMaxExpertWeights {
@@ -662,16 +668,23 @@ impl MiniMaxWeights {
             // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
             // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
             // input is 0, so it reuses the compact down base).
-            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+            // Owned (not forgotten): held in `dummy_gate_up` on the layer below
+            // so the staging guard reclaims it if a later layer fails to load,
+            // and `free_gpu` reclaims it on a successful EP unload. GpuTensor has
+            // no Drop, so leaving it on the stack here would leak its buffer; we
+            // must thread it into the layer struct.
+            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
                     .zeros(&[gu_stride / 4], DType::F32)
                     .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
-                let p = z.buf.as_ptr() as u64;
-                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
-                p
+                Some(z)
             } else {
-                gu_base
+                None
             };
+            let dummy_gu = dummy_gate_up
+                .as_ref()
+                .map(|z| z.buf.as_ptr() as u64)
+                .unwrap_or(gu_base);
             let gu_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
@@ -719,6 +732,7 @@ impl MiniMaxWeights {
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                dummy_gate_up,
             });
         }
 
@@ -768,6 +782,7 @@ impl MiniMaxLayerWeights {
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            dummy_gate_up,
         } = self;
         let _ = gpu.free_tensor(attn_norm);
         let _ = gpu.free_tensor(ffn_norm);
@@ -784,6 +799,9 @@ impl MiniMaxLayerWeights {
         }
         let _ = gpu.free_tensor(expert_gate_up_ptrs);
         let _ = gpu.free_tensor(expert_down_ptrs);
+        if let Some(dummy) = dummy_gate_up {
+            let _ = gpu.free_tensor(dummy);
+        }
     }
 }
 
@@ -1031,6 +1049,7 @@ impl MiniMaxState {
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
+
 }
 
 // ──────────────── ModelSource (safetensors) load helpers ────────────────
@@ -1391,6 +1410,7 @@ pub fn load_weights_from_safetensors(
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            dummy_gate_up: None,
         });
     }
 

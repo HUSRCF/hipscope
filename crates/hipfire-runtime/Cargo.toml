@@ -49,6 +49,14 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-cohere2moe = []
 arch-dots-ocr = []
+# ep-fault-inject: enables the EP partial-load fault-injection knob
+# (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
+# return a synthetic Err after uploading its weights so the staging-guard VRAM
+# cleanup can be exercised on real GPUs without forcing an OOM. NOT in the
+# default set: a production build (`--features deltanet`) compiles the env read
+# and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
+# Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
+ep-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

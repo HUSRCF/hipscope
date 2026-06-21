@@ -599,6 +599,52 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     })
 }
 
+/// Render-time `YYYY-MM-DD` date string for chat templates that surface a
+/// "Current date:" line (MiniMax-M2's `system_message.current_date`, and any
+/// future template using the same convention).
+///
+/// Some templates (MiniMax-M2) read `current_date` as an attribute of the
+/// **system message dict**, gated behind `{% if system_message and
+/// system_message.current_date %}`. Under minijinja strict-undefined a system
+/// message that lacks the key raises a render error instead of skipping the
+/// branch — so [`render_messages`](JinjaChatFrame::render_messages) injects this
+/// value onto the leading system message (see that method).
+///
+/// Determinism note: this is the **prompt-build** path, not the
+/// forward/sampler determinism path, so a wall-clock date here does not affect
+/// token-level reproducibility. To keep renders byte-stable across a test (or
+/// to honour a daemon request-time clock) callers can pin the value via the
+/// `HIPFIRE_CHAT_CURRENT_DATE` env var; otherwise we derive it from
+/// `SystemTime::now()` (NOT a determinism-forbidden argless engine `Date::now`).
+pub fn render_time_date() -> String {
+    if let Ok(pinned) = std::env::var("HIPFIRE_CHAT_CURRENT_DATE") {
+        if !pinned.trim().is_empty() {
+            return pinned;
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert days-since-Unix-epoch to a proleptic-Gregorian `(year, month, day)`.
+/// Howard Hinnant's `civil_from_days` algorithm — no `chrono` dependency.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -735,8 +781,46 @@ impl<'a> JinjaChatFrame<'a> {
             Some(k) => Value::from_serialize(k),
             None => Value::from_serialize(&empty_map),
         };
+        // Inject `current_date` onto the leading system message so templates
+        // that read `system_message.current_date` (MiniMax-M2, chat.jinja:37)
+        // don't raise under strict-undefined. The no-system-message path needs
+        // nothing — those templates gate the access behind `if system_message
+        // and …`, which short-circuits when `system_message` is `none` (the
+        // built-in model identity is injected instead). Adding the key here
+        // makes both paths render identically modulo the date line that the
+        // upstream template intends a system turn to carry. Only the FIRST
+        // message is patched, and only when it is a system turn — every other
+        // template / model serializes through unchanged.
+        let messages_val = {
+            let mut arr: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+                .collect();
+            if let Some(serde_json::Value::Object(map)) = arr.first_mut() {
+                let is_system = matches!(
+                    map.get("role"),
+                    Some(serde_json::Value::String(r)) if r == "system"
+                );
+                if is_system {
+                    // Populated date → the template's "Current date:" line
+                    // renders (its intended behaviour for a system turn).
+                    map.entry("current_date".to_string()).or_insert_with(|| {
+                        serde_json::Value::String(render_time_date())
+                    });
+                    // Sibling optional attributes the same templates probe
+                    // (also gated `{% if system_message and system_message.X %}`)
+                    // would equally raise under strict-undefined on a system
+                    // dict that lacks them. Seed an empty string: falsy, so the
+                    // gate short-circuits and the line stays absent — matching
+                    // upstream "unset" semantics — without a render error.
+                    map.entry("current_location".to_string())
+                        .or_insert_with(|| serde_json::Value::String(String::new()));
+                }
+            }
+            Value::from_serialize(&arr)
+        };
         let ctx = minijinja::context! {
-            messages => Value::from_serialize(messages),
+            messages => messages_val,
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
@@ -1569,5 +1653,148 @@ mod tests {
             with_sys, expected,
             "system message should be a prefix of the rest of the frame"
         );
+    }
+
+    /// Faithful excerpt of the MiniMax-M2 `tokenizer_config.chat_template`
+    /// system-message logic. It reads `system_message.current_date` (and
+    /// `current_location`) as attributes of the leading system message dict,
+    /// gated behind `{% if system_message and system_message.<attr> %}`.
+    /// Under minijinja strict-undefined a system message that lacks the key
+    /// raises a render error — this is the exact byte sequence (chat.jinja:37)
+    /// the O1 e2e tripped when serving MiniMax with an explicit system message.
+    const MINIMAX_SYSTEM_TEMPLATE: &str = "\
+{%- macro build_system_message(system_message) -%}
+    {%- if system_message and system_message.content -%}
+        {{- system_message.content }}
+    {%- else -%}
+        {%- if model_identity is not defined -%}
+            {%- set model_identity = \"You are MiniMax AI.\" -%}
+        {%- endif -%}
+        {{- model_identity }}
+    {%- endif -%}
+    {%- if system_message and system_message.current_date -%}
+        {{- '\\n' ~ 'Current date: ' + system_message.current_date }}
+    {%- endif -%}
+    {%- if system_message and system_message.current_location -%}
+        {{- '\\n' ~ 'Current location: ' + system_message.current_location }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set system_message = none -%}
+{%- set conversation_messages = messages -%}
+{%- if messages and messages[0].role == \"system\" -%}
+    {%- set system_message = messages[0] -%}
+    {%- set conversation_messages = messages[1:] -%}
+{%- endif -%}
+SYS:{{ build_system_message(system_message) }}:END
+{%- for m in conversation_messages -%}
+{{ m.role }}={{ m.content }};
+{%- endfor -%}";
+
+    #[test]
+    fn minimax_explicit_system_message_renders_with_current_date() {
+        // Regression: serving MiniMax with an EXPLICIT system message must NOT
+        // crash on `system_message.current_date` under strict-undefined. The
+        // render path injects `current_date` onto the leading system message
+        // so the gated access resolves to a populated string instead of
+        // raising. GPU-free, no model load — uses the embedded template excerpt.
+        std::env::set_var("HIPFIRE_CHAT_CURRENT_DATE", "2026-06-18");
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: MINIMAX_SYSTEM_TEMPLATE,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "Be concise.".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::User,
+                content: "hi".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+
+        // The crux: this previously errored with
+        //   "template render: ... system_message.current_date ... is undefined"
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("explicit system message must render without strict-undefined error");
+
+        assert!(
+            out.contains("Be concise."),
+            "explicit system content must be present: {out:?}"
+        );
+        assert!(
+            out.contains("Current date: 2026-06-18"),
+            "current_date must be injected + rendered: {out:?}"
+        );
+        assert!(
+            out.contains("user=hi;"),
+            "conversation messages must still render: {out:?}"
+        );
+        // current_location is NOT supplied → its gated branch must stay silent
+        // (the `if system_message and system_message.current_location` guard
+        // short-circuits on the absent key without raising).
+        assert!(
+            !out.contains("Current location:"),
+            "current_location must not appear when unset: {out:?}"
+        );
+        std::env::remove_var("HIPFIRE_CHAT_CURRENT_DATE");
+    }
+
+    #[test]
+    fn minimax_no_system_message_injects_builtin_identity() {
+        // The no-system-message path must be unchanged: `system_message` stays
+        // `none`, the built-in model identity is injected, and the gated
+        // current_date/current_location accesses short-circuit on the falsy
+        // `none` so no date line appears.
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: MINIMAX_SYSTEM_TEMPLATE,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("no-system-message render must succeed");
+        assert!(
+            out.contains("You are MiniMax AI."),
+            "built-in identity must be injected on the no-system path: {out:?}"
+        );
+        assert!(
+            !out.contains("Current date:"),
+            "no date line on the no-system path (gated access short-circuits): {out:?}"
+        );
+        assert!(out.contains("user=hi;"), "user turn renders: {out:?}");
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        // Spot-check the chrono-free date conversion against known epochs.
+        assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
+        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+        // 2026-06-18 = 20622 days after 1970-01-01
+        assert_eq!(civil_from_days(20_622), (2026, 6, 18));
     }
 }

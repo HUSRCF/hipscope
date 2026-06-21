@@ -900,27 +900,6 @@ struct GenerateVLParams<'a> {
     max_think_tokens: usize,
 }
 
-/// Optional DFlash speculative-decoding state. Populated when `load` supplies
-/// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
-/// `generate` fast path when temperature == 0 — falls back to AR sampling
-/// otherwise (DFlash is greedy-only in this integration).
-
-/// Side state for DDTree-mode speculative decoding. Allocated alongside
-/// the rest of `DflashState` at model-load time when DDTree is enabled,
-/// reused across all decode cycles.
-
-/// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
-/// Present only when the load message requested `tp > 1`. Mirrors the PP path
-/// (`pp_gpus`) but routes the forward through `forward_ep` (replicated attention
-/// + sharded experts + all-reduce) instead of pipeline layer-split. When
-/// `Some`, the single-GPU arch fields stay `None` and generate routes through
-/// `generate_ep`.
-#[allow(dead_code)] // gpus/inner consumed by load_model_ep + generate_ep (next increment)
-
-/// Per-arch EP rank state. One `Vec` entry per rank (rank r owns experts
-/// `e % tp == r`). Add `Qwen35`/`Minimax` variants with their increments.
-#[allow(dead_code)] // populated by load_model_ep (next increment)
-
 fn ckpt_resume_enabled() -> bool {
     std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
 }
@@ -1150,6 +1129,19 @@ fn main() {
 
         match msg_type {
             "load" => {
+                // FIX #1 (transactional EP load): the unload of the prior model
+                // is deferred for the EP (tp>1) path until AFTER the new load
+                // succeeds, so a partial EP load failure leaves the prior model
+                // intact (and load_model_ep's staging guard frees the partial
+                // ranks). For the single-GPU / pp path the prior model is
+                // unloaded eagerly here as before (load_model uses the daemon's
+                // `gpu` directly, so it can't be deferred without a major
+                // refactor). `tp` is parsed authoritatively below; peek it here.
+                let load_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1157,18 +1149,32 @@ fn main() {
                 // drain, leaving drafter VRAM resident across the next
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
-                if let Some(mut pf) = pflash_state.take() {
-                    if let Some(mut dg) = pflash_drafter_gpu.take() {
-                        dg.bind_thread_or_warn();
-                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
-                    } else {
-                        pf.unload_drafter(&mut gpu);
+                //
+                // FIX (transactional pflash teardown): pflash_state is part of
+                // the PRIOR model (it holds that model's PFlash drafter). For
+                // the deferred tp>1 EP path it must NOT be torn down here —
+                // otherwise a partial EP load failure (whose FIX #1 deferral
+                // keeps `model` alive) would leave the surviving prior model
+                // stripped of its drafter. Defer it to the success branch
+                // alongside the deferred model unload. For load_tp <= 1 the
+                // prior model is unloaded eagerly, so tear pflash down here in
+                // the original order. (EP archs are ds4/minimax and refuse
+                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
+                // the outgoing model's drafter at the deferred site.)
+                if load_tp <= 1 {
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
                     }
-                }
-                pflash_cfg = None;
-                if let Some(m) = model.take() {
-                    hipfire_loader::unload_model(m, &mut gpu);
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        hipfire_loader::unload_model(m, &mut gpu);
+                    }
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -1525,6 +1531,30 @@ fn main() {
                 };
                 match loaded {
                     Ok(mut m) => {
+                        // FIX #1 (deferred EP unload): the new EP model loaded
+                        // successfully — NOW it's safe to free the prior model
+                        // (single-GPU/pp models were already unloaded eagerly
+                        // above; this branch only fires for the deferred tp>1
+                        // path). The prior model's PFlash drafter (pflash_state)
+                        // is part of that prior model, so it's torn down here in
+                        // the same drainer-before-unload order used elsewhere:
+                        // unload_drafter queues the drafter tensors into the
+                        // pool, then unload_model drains it.
+                        if load_tp > 1 {
+                            if let Some(mut pf) = pflash_state.take() {
+                                if let Some(mut dg) = pflash_drafter_gpu.take() {
+                                    dg.bind_thread_or_warn();
+                                    pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                                    gpu.bind_thread_or_warn();
+                                } else {
+                                    pf.unload_drafter(&mut gpu);
+                                }
+                            }
+                            pflash_cfg = None;
+                            if let Some(old) = model.take() {
+                                hipfire_loader::unload_model(old, &mut gpu);
+                            }
+                        }
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -1638,7 +1668,23 @@ fn main() {
                         // the operator gets a clear "model is up, but
                         // compression isn't" signal rather than losing
                         // the entire session.
-                        if let Some(ref pf_drafter_path) = pflash_drafter {
+                        //
+                        // EP guard (load_tp > 1): the EP path serves through
+                        // `generate_ep`, which bypasses PFlash entirely (the
+                        // EP archs ds4/minimax refuse/ignore PFlash drafters).
+                        // Loading a drafter here would just pin GPU memory it
+                        // never reads until unload, so skip the load outright.
+                        // Warn once if the operator actually supplied a drafter
+                        // so the silent no-op is visible.
+                        if load_tp > 1 {
+                            if pflash_drafter.is_some() && pflash_mode_str != "off" {
+                                eprintln!(
+                                    "[pflash] WARN: ignoring PFlash drafter on EP (tp={}) model \
+                                     — generate_ep bypasses PFlash; drafter would only waste GPU memory",
+                                    load_tp
+                                );
+                            }
+                        } else if let Some(ref pf_drafter_path) = pflash_drafter {
                             if pflash_mode_str != "off" {
                                 if let Some(ref reason) = pflash_load_err {
                                     let _ = writeln!(
@@ -1883,7 +1929,16 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 11 {
+                // Hardcoded arch ladder — the LAST-RESORT fallback for the
+                // sampling defaults. The author-recommended values baked into
+                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
+                // populated at load time via HfqFile::recommended_sampling) take
+                // precedence over this ladder; an explicit per-request field
+                // (set below via `msg.get(...)`) overrides both. The CLI's
+                // curated registry `recommended_settings` reach this handler as
+                // explicit request fields (CLI explicit-send guard), so they sit
+                // above the .hfq layer on that path.
+                let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
                     // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
                     // top_k=50, repetition_penalty=1.05. The daemon sampler is
                     // temp + top_p + repeat_penalty (no user-facing top_k — the
@@ -1905,6 +1960,14 @@ fn main() {
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
+                // Layer the .hfq-baked author recommendation OVER the arch
+                // ladder. Per-knob: a model that bakes only `temperature` still
+                // gets the arch-ladder `top_p`.
+                let default_temp = m
+                    .rec_temperature
+                    .map(|x| x as f64)
+                    .unwrap_or(arch_default_temp);
+                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
                 let temp = msg
                     .get("temperature")
                     .and_then(|v| v.as_f64())
@@ -1931,8 +1994,12 @@ fn main() {
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
                 let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                // Accept HF-style `repetition_penalty` as a request ALIAS for our
+                // `repeat_penalty` field, used only when the canonical key is
+                // absent. (OpenAI/HF clients send `repetition_penalty`.)
                 let repeat_penalty = msg
                     .get("repeat_penalty")
+                    .or_else(|| msg.get("repetition_penalty"))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
@@ -1954,16 +2021,36 @@ fn main() {
                 // flat across the (now long) window, which is what breaks the
                 // block-level repetition loops on long reasoning generations.
                 // Clamp negatives to 0 (negative would REWARD repetition).
+                // Fallback ladder: explicit request `presence_penalty` >
+                // .hfq-baked `m.rec_presence_penalty` > 0.0 (off). The .hfq's
+                // generation_config does not carry presence_penalty today, so
+                // m.rec_presence_penalty is always None on the load path; the
+                // field is wired so a curated registry card value still flows in
+                // as an explicit request field (CLI explicit-send guard). presence_penalty IS honored by the sampler.
                 let presence_penalty = (msg
                     .get("presence_penalty")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32)
+                    .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64)
+                    as f32)
                     .max(0.0);
-                let frequency_penalty = (msg
-                    .get("frequency_penalty")
+                let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                // Request-driven top_k / min_p (W7 P2). Fallback ladder:
+                // explicit request field > .hfq/registry-baked rec_top_k /
+                // rec_min_p > None. None reproduces the legacy sampler exactly
+                // (top-K candidate gather of 20, no min-p cut). top_k <= 0 is
+                // treated as "unset" (None) so 0 never collapses to argmax.
+                let top_k: Option<u32> = msg
+                    .get("top_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|k| k as u32)
+                    .or_else(|| m.rec_top_k.map(|k| k as u32))
+                    .filter(|&k| k > 0);
+                let min_p: Option<f32> = msg
+                    .get("min_p")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32)
-                    .max(0.0);
+                    .map(|p| p as f32)
+                    .or(m.rec_min_p)
+                    .filter(|&p| p > 0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -2213,23 +2300,10 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m,
-                        &mut gpu,
-                        pflash_drafter_gpu.as_mut(),
-                        &mut stdout,
-                        id,
-                        prompt,
-                        system,
-                        temp,
-                        top_p,
-                        max_tokens,
-                        repeat_penalty,
-                        repeat_window,
-                        presence_penalty,
-                        frequency_penalty,
-                        budget_alert_at_tok,
-                        &budget_alert_text,
-                        max_think_tokens,
+                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
+                        temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
+                        presence_penalty, frequency_penalty,
+                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -2452,10 +2526,10 @@ fn main() {
                 // tensors live on Gpus instead. Refuse cleanly per snapshot
                 // review patch f253472. A pp>1 prefill bench is out of scope
                 // for v1.
-                if m.pp > 1 {
+                if m.pp > 1 || m.ep.is_some() {
                     let _ = writeln!(
                         stdout,
-                        r#"{{"type":"error","message":"bench_prefill requires pp=1 (multi-GPU bench not implemented)"}}"#
+                        r#"{{"type":"error","message":"bench_prefill requires a single-GPU model (pp=1, non-EP); multi-GPU/EP bench not implemented"}}"#
                     );
                     let _ = stdout.flush();
                     continue;
@@ -2465,7 +2539,7 @@ fn main() {
                 // generate request against the loaded model still has room. We guard
                 // on the *physical* buffer (not the advertised max_seq) because this
                 // bench intentionally bypasses eviction to measure raw prefill.
-                if n + 32 > m.physical_cap {
+                if n.saturating_add(32) > m.physical_cap {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
@@ -2720,49 +2794,6 @@ fn main() {
     }
 }
 
-/// Resolve the chat_template to use for a loaded model, walking the
-/// override-precedence chain:
-///
-///   1. `HIPFIRE_CHAT_TEMPLATE_FILE` env var → if set and file readable,
-///      that template wins. Operator escape hatch / debugging knob.
-///   2. Per-model file at `~/.hipfire/templates/<sanitized-tag>.j2`
-///      where the tag is derived from the model file basename
-///      (`qwen3.5-9b.mq4` → `qwen3.5-9b.mq4.j2`). User-controllable
-///      override for a specific model without env-var globalness.
-///   3. HFQ-embedded `tokenizer_config.chat_template`. Default — what
-///      the model was trained with.
-///   4. None of the above → `None`. The render path falls back to the
-///      hand-rolled `ChatFrame::Plain` scaffold (current default
-///      behavior under Stage 2's `HIPFIRE_JINJA_CHAT=1` gate). Stage 5+
-///      will tighten this to a hard error once Plain is removed.
-///
-/// Per-request inline override (`chat_template_kwargs.chat_template`,
-/// vLLM-style) is the responsibility of the per-request render call,
-/// not load-time resolution. It belongs in Stage 5 alongside the CLI
-/// passthrough refactor; this resolver only handles the load-time
-/// sources.
-/// Bundled production chat templates (defaults flipped ON 2026-06-09).
-/// Qwen3.5/3.6 (arch 5/6) render through froggeric (HF-byte-exact, agentic
-/// fixes); LFM2.5 (arch 11) renders through LiquidAI's template, bundled here so
-/// the A1B export (which ships no embedded chat_template) still gets correct
-/// jinja framing instead of the hand-rolled ChatML fallback.
-
-/// Parse a HIPFIRE_KV_ADAPTIVE-style string (env value OR per-load
-/// `params.kv_adaptive`) into `(named-preset, k_floor, v_floor)`.
-///
-/// Accepts: `""`/`"off"` (⇒ None, adaptive disabled),
-/// `conservative` | `balanced` | `aggressive` (named presets), and
-/// `advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>`.
-///
-/// Returns `None` for off/empty AND for malformed/unknown input (logging a
-/// diagnostic in the latter case). The named-preset slot is `Some(_)` only for
-/// the three named presets so the caller can preserve their named interleave
-/// via `KvAdaptive::from_preset`; `advanced` returns `None` there and the caller
-/// uses `KvAdaptive::new` with the explicit floors.
-///
-/// Both the per-load param and the env var feed this single helper (param wins;
-/// env is the fallback) so the resolution logic stays DRY.
-
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
 /// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
@@ -2770,6 +2801,18 @@ fn main() {
 /// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
 /// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
 #[allow(clippy::too_many_arguments)]
+/// Resolved sampling config for the EP (multi-GPU) decode loops. Carries the
+/// single-GPU handler's request>rec_*>arch-default resolution (computed at the
+/// `generate` call site) into `ep_serve_ds4` / `ep_serve_minimax`, which apply
+/// it host-side over the downloaded f32 logits via `llama::sample_full_dist`.
+#[derive(Clone, Copy)]
+struct EpSampling {
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+}
+
 fn generate_ep(
     m: &mut LoadedModel,
     stdout: &mut std::io::Stdout,
@@ -2782,6 +2825,7 @@ fn generate_ep(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    sampling: EpSampling,
 ) {
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
@@ -2897,34 +2941,15 @@ fn generate_ep(
         return;
     }
     let eos_tok = if m.arch_id == 10 {
-        m.minimax()
-            .expect("arch_id=10 requires minimax bundle")
-            .eos_tok
+        // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
+        // None here — read the EP eos carried on LoadedModel (set at load).
+        m.minimax_eos_tok
     } else {
         m.deepseek4_eos_tok
     };
     match m.arch_id {
-        10 => ep_serve_minimax(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            stop,
-            primed_think,
-        ),
-        _ => ep_serve_ds4(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            think_mode,
-            tools,
-            stop,
-        ),
+        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think, sampling),
+        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop, sampling),
     }
 }
 
@@ -2974,22 +2999,99 @@ fn ep_emit_done(
     let _ = stdout.flush();
 }
 
+/// FIX #3 (ep-no-abort): reset every EP rank's KV cursor to a clean state and
+/// clear the shared conversation history. The mid-generation per-rank KV /
+/// position is advanced past the (un-committed) `conversation_tokens`, so the
+/// next turn must cold-start; both arch states expose `reset()` which rewinds
+/// the per-rank token cursor (`n_tokens`). Mirrors the single-GPU abort reset
+/// (`m.seq_pos = 0; m.conversation_tokens.clear();`).
+fn ep_reset_after_abort(m: &mut LoadedModel) {
+    if let Some(ep) = m.ep.as_mut() {
+        match &mut ep.inner {
+            EpArch::Ds4 { state, .. } => {
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+            EpArch::Minimax { state, .. } => {
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+}
+
+/// FIX #3: emit the standard `aborted` + `done(finish_reason=aborted)` event
+/// pair (mirrors the single-GPU AR abort path) then reset EP state.
+fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, completion_tokens: usize) {
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+        id
+    );
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+        id, completion_tokens
+    );
+    let _ = stdout.flush();
+    ep_reset_after_abort(m);
+}
+
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt_ids: &[u32],
-    eos_tok: u32,
-    max_tokens: usize,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    stop: &[String],
-) {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
+fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String], sampling: EpSampling) {
     use std::time::Instant;
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
 
     let prompt_n = prompt_ids.len();
+
+    // O2b-2 capacity guard (ds4 EP): this path replays the full prompt from
+    // position 0 every turn (no LCP reuse), so the absolute KV span is
+    // prompt_n + max_tokens. Without eviction the EP state KV was allocated
+    // for `m.physical_cap` (== max_seq at load). Overrunning it drives
+    // forward_ep past the KV buffer → corruption/panic (serve-wide crash).
+    // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Cross-conversation reset (FIX: ds4 EP turn-to-turn contamination) ──
+    // ds4 EP replays the full prompt from position 0 every turn (no LCP reuse —
+    // see the capacity-guard comment above), so a CONTINUING conversation
+    // re-prefills its whole history straight from the prompt; nothing in the EP
+    // state is reusable across turns, so we reset unconditionally here. This is
+    // the EP analogue of the single-GPU cache-miss reset in generate_deepseek4:
+    // `reset()` alone only rewinds n_tokens — the position-indexed decode caches
+    // (SWA ring, compressed/full KV, indexer scratch) retain the PRIOR turn's
+    // residue and bleed into the next conversation (observed: turn 2 echoing
+    // turn 1's answer) unless explicitly zeroed. Do it per rank on its own
+    // device. Without this, ep_serve_ds4 only ever reset on abort (and even that
+    // path, ep_reset_after_abort, omitted zero_decode_caches).
+    if let Some(ep) = m.ep.as_mut() {
+        let EpState { gpus, inner } = ep;
+        if let EpArch::Ds4 { state, .. } = inner {
+            for (rank, s) in state.iter_mut().enumerate() {
+                let g = &mut gpus.devices[rank];
+                let _ = g.bind_thread();
+                s.reset();
+                s.zero_decode_caches(g);
+                g.invalidate_graph_state();
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
 
     let mut parser = match think_mode {
         ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
@@ -3065,6 +3167,10 @@ fn ep_serve_ds4(
     };
 
     let t_prefill = Instant::now();
+    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
+    // loop. Declared outside the borrow scope so the post-loop abort guard can
+    // read it after the `gpus`/`state` borrow is dropped.
+    let mut aborted_in_prefill = false;
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 {
@@ -3083,19 +3189,39 @@ fn ep_serve_ds4(
             return;
         };
         for (pos, &t) in prompt_ids.iter().enumerate() {
-            if let Err(e) = deepseek4::forward::forward_ep(
-                gpus, weights, config, state, partials, t, pos as u32,
-            ) {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
-                    id,
-                    format!("{e}").replace('"', "'")
-                );
+            // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
+            // every prefill iteration, not just after the loop. A long prompt
+            // (thousands of tokens) means the post-loop check below would still
+            // run the entire multi-GPU prefill before honoring a cancel. Mirror
+            // the decode loop: on abort, emit aborted+done, reset KV cursors,
+            // and stop. We must drop the `gpus`/`state` borrow before calling
+            // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
+            // the post-loop guard fire — but set the abort flag is consumed by
+            // check_abort, so call it here and short-circuit via a flag.
+            if check_abort(id) {
+                // Drop the EpState borrow by breaking; the post-loop guard
+                // re-checks via a sentinel. Simpler: emit + return is blocked
+                // by the borrow, so we set `aborted` and break.
+                aborted_in_prefill = true;
+                break;
+            }
+            if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
                 let _ = stdout.flush();
                 return;
             }
         }
+    }
+    // FIX #1 / FIX #3 (ep-no-abort): a client cancel during the (potentially
+    // long) prefill should stop here instead of running the whole decode loop.
+    // `aborted_in_prefill` is set when check_abort fired mid-loop (it already
+    // consumed the signal, so we don't re-call check_abort); the post-loop
+    // check_abort catches a cancel that arrived after the final iteration.
+    // Mirror the single-GPU paths: emit aborted+done and reset every rank's KV
+    // cursor.
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(stdout, id, m, 0);
+        return;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let mut logits = {
@@ -3111,7 +3237,17 @@ fn ep_serve_ds4(
         };
         let _ = gpus.devices[0].bind_thread();
         match state[0].logits.as_ref() {
-            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            // FIX #4 (ep-download-swallow): on a download failure, emit a JSON
+            // error and STOP — never `unwrap_or_default()` into an all-zero
+            // logits vec (argmax → token 0, an undetectable corruption).
+            Some(l) => match gpus.devices[0].download_f32(l) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            },
             None => {
                 let _ = writeln!(
                     stdout,
@@ -3130,21 +3266,28 @@ fn ep_serve_ds4(
     let mut text_acc = String::new();
     let mut local_emitted_ids: Vec<u32> = Vec::new();
     while generated < max_tokens {
+        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
+        // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
+        // decode loop running for the full max_tokens of wasted multi-GPU work.
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, generated);
+            return;
+        }
         if grammar_active && !matcher.is_free() {
             matcher.token_mask(decoded_vocab, &mut grammar_mask);
             deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
         }
-        let mut next = 0u32;
-        let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() {
-            if x > best {
-                best = x;
-                next = i as u32;
-            }
-        }
-        if next == eos_tok {
-            break;
-        }
+        // Host-side sampler over the downloaded f32 logits (temp → top_k →
+        // top_p → min_p → seeded draw, temp<=1e-6 = argmax). RNG seeded once
+        // per request via reset_cpu_sampler_rng(0x13579BDF) in generate().
+        let next = hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
+        if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         for ev in parser.feed(&piece) {
             absorb_event(&ev);
@@ -3190,8 +3333,18 @@ fn ep_serve_ds4(
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
+        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
+        // logits download — emit a JSON error and stop, never feed a zeroed
+        // (token-0) logits vec.
         logits = match state[0].logits.as_ref() {
-            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            Some(l) => match gpus.devices[0].download_f32(l) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            },
             None => break,
         };
     }
@@ -3264,18 +3417,27 @@ fn ep_serve_ds4(
 /// reuse — see generate_minimax for the full rationale). `primed_think`
 /// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
 #[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt_ids: &[u32],
-    eos_tok: u32,
-    max_tokens: usize,
-    stop: &[String],
-    primed_think: bool,
-) {
+fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool, sampling: EpSampling) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
+
+    // O2b-2 capacity guard (minimax EP): even with LCP reuse the KV ends up
+    // holding [0, prompt_n) after prefill, then decode appends max_tokens, so
+    // the absolute span is prompt_n + max_tokens. The EP state KV was allocated
+    // for `m.physical_cap` (== max_seq at load); overrunning it writes past the
+    // per-rank KV buffer → corruption/panic (serve-wide crash). Emit a clean
+    // error and return BEFORE any state mutation — mirror the qwen35 guard.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // ── LCP partial reuse. The per-rank KV holds [0, prior_total) from last
     // turn; `conversation_tokens` mirrors it. Rewind n_tokens to the common
@@ -3320,6 +3482,14 @@ fn ep_serve_minimax(
 
     // ── Prefill the suffix [prefill_from, prompt_n) across ranks. ──
     let t_prefill = Instant::now();
+    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
+    // loop. Declared outside the borrow scope so the abort guard below can read
+    // it after the `gpus`/`state` borrow is dropped.
+    let mut aborted_in_prefill = false;
+    // Track how many suffix tokens were actually prefilled so that, on a
+    // mid-prefill abort, we don't mirror un-prefilled tokens into
+    // `conversation_tokens` (which would desync the cache from KV state).
+    let mut prefilled_n = 0usize;
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax {
@@ -3338,6 +3508,16 @@ fn ep_serve_minimax(
             return;
         };
         for (i, &t) in prompt_ids[prefill_from..].iter().enumerate() {
+            // FIX #1 (ep-prefill-abort): honor a client cancel at the TOP of
+            // every prefill iteration, not just after the loop. Without this a
+            // long prompt runs the full multi-GPU prefill before the post-loop
+            // check fires. check_abort consumes the signal, so record it in a
+            // flag and break; the borrow on `m.ep` is dropped before we call
+            // ep_emit_abort below.
+            if check_abort(id) {
+                aborted_in_prefill = true;
+                break;
+            }
             let pos = (prefill_from + i) as u32;
             if let Err(e) =
                 minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
@@ -3351,13 +3531,22 @@ fn ep_serve_minimax(
                 let _ = stdout.flush();
                 return;
             }
+            prefilled_n = i + 1;
         }
     }
-    // Mirror the prefilled suffix into conversation_tokens (the prefix is kept).
-    for &t in &prompt_ids[prefill_from..] {
-        m.conversation_tokens.push(t);
-    }
+    // Mirror only the actually-prefilled suffix into conversation_tokens (the
+    // prefix is kept). On a mid-prefill abort, ep_emit_abort resets every
+    // rank's KV cursor, so leaving conversation_tokens at the prefix keeps the
+    // cache consistent with KV state.
+    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] { m.conversation_tokens.push(t); }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    // FIX #1 / FIX #3 (ep-no-abort): client cancel during prefill → stop
+    // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
+    // post-loop check_abort catches a cancel that arrived after the last token.
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(stdout, id, m, 0);
+        return;
+    }
 
     // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
     // assistant message is a well-formed think block (parity with single-GPU).
@@ -3376,26 +3565,40 @@ fn ep_serve_minimax(
             return;
         };
         let _ = gpus.devices[0].bind_thread();
-        gpus.devices[0]
-            .download_f32(&state[0].logits)
-            .unwrap_or_default()
+        // FIX #4 (ep-download-swallow): explicit error handling — never feed a
+        // zeroed (token-0) logits vec on a download failure.
+        match gpus.devices[0].download_f32(&state[0].logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
     };
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
     let mut text_acc = String::new();
     while generated < max_tokens {
-        let mut next = 0u32;
-        let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() {
-            if x > best {
-                best = x;
-                next = i as u32;
-            }
+        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
+        // reset EP cursors, stop.
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, generated);
+            return;
         }
-        if next == eos_tok {
-            break;
-        }
+        // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
+        // min_p → seeded draw, temp<=1e-6 = argmax). MiniMax's card carries
+        // top_k=40, threaded here via sampling.top_k. RNG seeded per request in
+        // generate() (reset_cpu_sampler_rng).
+        let next = hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
+        if next == eos_tok { break; }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
@@ -3425,19 +3628,21 @@ fn ep_serve_minimax(
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
-        logits = gpus.devices[0]
-            .download_f32(&state[0].logits)
-            .unwrap_or_default();
+        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
+        // download — emit a JSON error and stop, never feed a zeroed (token-0)
+        // logits vec.
+        logits = match gpus.devices[0].download_f32(&state[0].logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = stdout.flush();
+                return;
+            }
+        };
     }
-    ep_emit_done(
-        stdout,
-        id,
-        generated,
-        prompt_n,
-        prefill_ms,
-        t_decode.elapsed().as_secs_f64() * 1000.0,
-    );
+    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
 }
+
 
 /// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
 struct PromptCachePlan {
@@ -3925,7 +4130,7 @@ fn generate_dflash(
     } else {
         ctx_capacity
     };
-    if prompt_tokens.len() + df.block_size > eff_prompt_cap {
+    if prompt_tokens.len().saturating_add(df.block_size) > eff_prompt_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+block_size exceeds {} {} (eviction {})"}}"#,
@@ -3948,7 +4153,13 @@ fn generate_dflash(
         }));
         return;
     }
-    if m.eviction.is_none() && prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
+    if m.eviction.is_none()
+        && prompt_tokens
+            .len()
+            .saturating_add(max_tokens)
+            .saturating_add(df.block_size)
+            > ctx_capacity
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)"}}"#,
@@ -4382,7 +4593,7 @@ fn generate_dflash(
             let _ = stdout.flush();
             return;
         }
-        if position + df.block_size >= ctx_capacity {
+        if position.saturating_add(df.block_size) >= ctx_capacity {
             break;
         }
 
@@ -4836,6 +5047,8 @@ fn generate_multi(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
     max_tokens: usize,
     repeat_penalty: f32,
     _repeat_window: usize,
@@ -4851,7 +5064,7 @@ fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -5140,7 +5353,12 @@ fn generate_multi(
     }
 
     let trailer = nl.len();
-    if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+    if m.seq_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.physical_cap
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -5335,6 +5553,8 @@ fn generate_multi(
         presence_penalty,
         frequency_penalty,
         blocked_tokens: blocked0,
+        top_k,
+        min_p,
     };
     // hunt3 M-C: grammar-gated first sample (GPU fast path when matcher free;
     // CPU mask-then-sample when constraining). Matches generate()'s tok0 site.
@@ -5659,6 +5879,8 @@ fn generate_multi(
                     presence_penalty,
                     frequency_penalty,
                     blocked_tokens: blocked,
+                    top_k,
+                    min_p,
                 };
                 // hunt3 M-C: grammar-gated budget-alert resample.
                 next_token = {
@@ -5696,7 +5918,11 @@ fn generate_multi(
             let nudge_tokens = tokenizer.encode(budget_alert_text);
             let budget_left = max_tokens.saturating_sub(generated);
             let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv = m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+            let need_kv = m
+                .seq_pos
+                .saturating_add(nudge_len)
+                .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.conversation_tokens.push(tok);
@@ -5780,6 +6006,8 @@ fn generate_multi(
             presence_penalty,
             frequency_penalty,
             blocked_tokens: blocked,
+            top_k,
+            min_p,
         };
         // hunt3 M-C: grammar-gated steady-state sample.
         next_token = {
@@ -5877,32 +6105,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    drafter_gpu: Option<&mut rdna_compute::Gpu>,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    repeat_penalty: f32,
-    repeat_window: usize,
-    presence_penalty: f32,
-    frequency_penalty: f32,
-    budget_alert_at_tok: usize,
-    budget_alert_text: &str,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    think_mode: ThinkMode,
-    stop: &[String],
-) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: Option<u32>, min_p: Option<f32>, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -5913,19 +6116,15 @@ fn generate(
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
     if m.ep.is_some() {
-        generate_ep(
-            m,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            max_tokens,
-            max_think_tokens,
-            think_mode,
-            tools,
-            messages_history,
-            stop,
-        );
+        // EP serve (ds4/minimax): thread the SAME resolved sampling the
+        // single-GPU handler computed (request field > m.rec_* > arch-default
+        // ladder, all done at the call site above) into the EP decode loops.
+        // Previously the EP path dropped these to a hardcoded greedy argmax,
+        // which loops on ds4's quantized instruct model (card mandates
+        // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
+        // called above, so the host-side draw in ep_serve_* is deterministic.
+        let ep_sampling = EpSampling { temp, top_p, top_k, min_p };
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop, ep_sampling);
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -6102,24 +6301,10 @@ fn generate(
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
         generate_multi(
-            m,
-            gpu,
-            pflash_state,
-            pflash_cfg,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            max_tokens,
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-            budget_alert_at_tok,
-            budget_alert_text,
-            max_think_tokens,
+            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
+            temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
+            presence_penalty, frequency_penalty,
+            budget_alert_at_tok, budget_alert_text, max_think_tokens,
             assistant_prefix,
             tools,
             messages_history,
@@ -6227,7 +6412,9 @@ fn generate(
             m.seq_pos
         );
     }
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+    {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -7042,7 +7229,12 @@ fn generate(
             .unwrap_or(0),
     );
     if m.eviction.is_none() {
-        if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+        if m.seq_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.physical_cap
+    {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -7056,7 +7248,12 @@ fn generate(
             let _ = stdout.flush();
             return;
         }
-    } else if absolute_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
+    } else if absolute_pos
+        .saturating_add(new_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > m.max_seq
+    {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
@@ -7419,6 +7616,8 @@ fn generate(
             presence_penalty,
             frequency_penalty,
             blocked_tokens: blocked0,
+            top_k,
+            min_p,
         };
         // Grammar-gated sample: GPU fast path when the matcher is free
         // (the common case — no tool_call mid-flight); CPU slow path when
@@ -7883,6 +8082,8 @@ fn generate(
                         presence_penalty,
                         frequency_penalty,
                         blocked_tokens: blocked,
+                        top_k,
+                        min_p,
                     };
                     next_token = if grammar_active && !grammar_matcher.is_free() {
                         let mut logits = gpu
@@ -7921,8 +8122,10 @@ fn generate(
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv =
-                    m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                let need_kv = m.seq_pos
+                    .saturating_add(nudge_len)
+                    .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                    .saturating_add(nl.len());
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
@@ -8018,6 +8221,8 @@ fn generate(
                 presence_penalty,
                 frequency_penalty,
                 blocked_tokens: blocked,
+                top_k,
+                min_p,
             };
             // Grammar-gated sample (see setup block + tok0 site above).
             // GPU sample is the fast path; CPU mask-then-sample is the
@@ -8968,6 +9173,30 @@ fn generate_deepseek4(
     // that adds N new tokens this is just those N.
     let suffix_tokens: &[u32] = &prompt_ids[lcp..];
 
+    // O2b-2 capacity guard (ds4 single-GPU): after any cache reset above, the
+    // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
+    // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
+    // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
+    // down serve. Emit a clean error and return BEFORE prefill.
+    // saturating_add: an adversarially huge max_tokens must not wrap usize and
+    // slip under the cap.
+    if (start_pos as usize)
+        .saturating_add(suffix_tokens.len())
+        .saturating_add(max_tokens)
+        > m.physical_cap
+    {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id,
+            start_pos as usize + suffix_tokens.len(),
+            max_tokens,
+            m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
     // Prefill: batched chunked through PBS. If spec_mode, also fill the
     // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
     // draft step sees a populated MTP history.
@@ -9728,21 +9957,61 @@ fn generate_lfm2moe(
 
     let eos_tok = m.lfm2moe().unwrap().eos_tok;
 
-    // Capacity guard. No eviction on arch_id=11 — reset the KV + conv-state
-    // cursors when the requested run would overflow the budget.
-    let overflow = {
-        let state = &m.lfm2moe().unwrap().state;
-        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
+    // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
+    // `<|endoftext|>` (and rarely `</s>`). The single `next_tok == eos_tok` stop
+    // in the decode loop misses the others, so the model LEAKS a literal
+    // `<|endoftext|>` into the visible answer (observed: "...Paris.<|endoftext|>")
+    // and wastefully keeps generating. This id-set is the FAST path: it catches
+    // any EOS-class token whose literal string round-trips through `encode` to a
+    // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
+    // `<|endoftext|>` (encode yields subwords, not the special id), so the
+    // reliable catch for that one is the string-level guard in the decode loop
+    // below, which matches on the DECODED frag.
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
     };
-    if overflow {
-        let (n, cap) = {
-            let state = &m.lfm2moe().unwrap().state;
-            (state.n_tokens, state.max_seq)
-        };
-        eprintln!("[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",);
-        let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+
+    // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
+    // prior design only reset on capacity overflow, so every request APPENDED to
+    // the KV at the growing `n_tokens` and the model attended to all prior
+    // requests' tokens at offset RoPE positions — benign for a couple of short
+    // turns (RoPE decay + the prompt re-establishes context) but it bloats the KV
+    // and degrades quality over a real multi-request serve session, only
+    // recovering at overflow. LFM2.5's hybrid conv+GQA state can't be cheaply
+    // rewound to an arbitrary prefix (the conv window chains back to token 0, like
+    // ds4's SWA ring), so partial prefix-reuse is unsafe → cold-rebuild every
+    // turn. This is NOT a perf regression: the path already re-prefills the full
+    // prompt each turn; it now does so from position 0 with no stale KV. A
+    // continuing conversation re-prefills its whole history from the prompt, so
+    // multi-turn is preserved (validated: Bjorn/axolotl recall).
+    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
+    // prompt+generation larger than the whole context — the prefill decode_step
+    // loop would write past the KV (sized for state.max_seq) and panic, taking
+    // down serve. Emit a clean error BEFORE prefill — mirror the minimax/qwen2
+    // guard. saturating_add: an adversarially huge max_tokens must not wrap usize
+    // and slip under the cap.
+    let cap = m.lfm2moe().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_ids.len(), max_tokens, cap
+        );
+        let _ = stdout.flush();
+        return;
     }
 
     let t0 = Instant::now();
@@ -9786,7 +10055,7 @@ fn generate_lfm2moe(
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if next_tok == eos_tok {
+        if stop_toks.contains(&next_tok) {
             break;
         }
 
@@ -9794,6 +10063,15 @@ fn generate_lfm2moe(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
+        // String-level EOS-class guard. The id-based `stop_toks` above misses
+        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
+        // to the special-token id (it yields subwords), so the real token id is
+        // never in the set. The daemon decodes one token at a time, so the
+        // leaking turn-end token arrives as its own frag — catch it on the
+        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
+        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+            break;
+        }
         let envelope = serde_json::json!({
             "type": "token",
             "id": id,
@@ -9995,7 +10273,7 @@ fn generate_minimax(
     // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
     let overflow = {
         let state = &m.minimax().unwrap().state;
-        prompt_ids.len() + max_tokens > state.max_seq
+        prompt_ids.len().saturating_add(max_tokens) > state.max_seq
     };
     if overflow {
         let (n, cap) = {
@@ -10006,6 +10284,24 @@ fn generate_minimax(
         m.minimax_mut().unwrap().state.reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+
+        // O2b-2 capacity guard (minimax single): the reset above recovers a
+        // grown multi-turn conversation, but a SINGLE prompt larger than the
+        // whole context can never fit — prefilling it would write past the KV
+        // (sized for state.max_seq) and panic, taking down serve. After the
+        // reset, if prompt + generation still overflows, emit a clean error.
+        let cap = m.minimax().unwrap().state.max_seq;
+        // saturating_add: an adversarially huge max_tokens must not wrap usize
+        // and slip under the cap.
+        if prompt_ids.len().saturating_add(max_tokens) > cap {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+                id, prompt_ids.len(), max_tokens, cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 
     // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
@@ -11115,7 +11411,12 @@ fn generate_qwen2(
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    if state.next_pos + prompt_ids.len() + max_tokens > state.max_seq {
+    if state
+        .next_pos
+        .saturating_add(prompt_ids.len())
+        .saturating_add(max_tokens)
+        > state.max_seq
+    {
         eprintln!(
             "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
             state.next_pos, state.max_seq,
@@ -11123,6 +11424,24 @@ fn generate_qwen2(
         state.reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+
+        // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
+        // recovers a grown multi-turn conversation, but a SINGLE prompt larger
+        // than the whole context still overflows — prefilling it writes past
+        // the KV (sized for state.max_seq) and panics, taking down serve. After
+        // the reset, if prompt + generation still overflows, emit a clean error.
+        // saturating_add: an adversarially huge max_tokens must not wrap usize
+        // and slip under the cap.
+        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
+            let cap = state.max_seq;
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+                id, prompt_ids.len(), max_tokens, cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 
     let t0 = Instant::now();
@@ -11337,7 +11656,9 @@ fn generate_vl(
         .unwrap_or(0);
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+    {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -11370,13 +11691,13 @@ fn generate_vl(
         }
     }
 
-    if m.eviction.is_none() && prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.max_seq {
         write_error(
             stdout,
             id,
             &format!(
                 "request size ({} tokens) exceeds loaded KV budget ({})",
-                prompt_est + max_tokens,
+                prompt_est.saturating_add(max_tokens),
                 m.max_seq,
             ),
         );
@@ -11423,11 +11744,19 @@ fn generate_vl(
     // Mirrors the textual generate() contract; reserves trailer slots so
     // natural im_end termination can still write the ChatML \n.
     let trailer = nl.len();
-    let absolute_pos_vl = m.seq_pos + kv.compact_offset;
+    let absolute_pos_vl = m.seq_pos.saturating_add(kv.compact_offset);
     let over_budget = if m.eviction.is_none() {
-        m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.physical_cap
+        m.seq_pos
+            .saturating_add(prompt_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.physical_cap
     } else {
-        absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
+        absolute_pos_vl
+            .saturating_add(prompt_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.max_seq
     };
     if over_budget {
         write_error(stdout, id, &format!(
@@ -11530,6 +11859,10 @@ fn generate_vl(
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
+        // VL path samples on the CPU (sample_cpu), which does not yet honor
+        // top_k / min_p; keep None so behavior is unchanged.
+        top_k: None,
+        min_p: None,
     };
     let vl_cfg = SamplerConfig {
         temperature: temp,
@@ -11539,6 +11872,8 @@ fn generate_vl(
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
+        top_k: None,
+        min_p: None,
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
     let t_prefill = Instant::now();
@@ -11872,7 +12207,7 @@ fn generate_vl_dots_ocr(
 
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
-    if prompt_ids.len() + max_tokens > max_seq {
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
         write_error(stdout, id, &format!(
             "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
             prompt_ids.len(), max_tokens, max_seq));

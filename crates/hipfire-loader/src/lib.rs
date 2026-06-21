@@ -278,6 +278,10 @@ pub struct LoadedModel {
     pub deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     pub deepseek4_eos_tok: u32,
+    // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
+    // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
+    // models — the eos must be carried here (mirrors `deepseek4_eos_tok`).
+    pub minimax_eos_tok: u32,
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
     // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
     // compiler-enforced (see ModelState).
@@ -306,6 +310,18 @@ pub struct LoadedModel {
     pub model_path: String,
     pub dflash: Option<DflashState>,
     pub chat_template: Option<String>,
+    // Author-recommended sampling defaults, baked into the .hfq's
+    // `generation_config` metadata and read at load time on the HFQ source
+    // path (raw-safetensors PP path leaves them `None`). The generate handler
+    // falls back to these when the request omits the matching knob, before the
+    // arch-ladder defaults. `rec_min_p` / `rec_presence_penalty` are NOT carried
+    // in generation_config (they reach the daemon only via the request), so they
+    // stay `None` on the load path.
+    pub rec_temperature: Option<f32>,
+    pub rec_top_p: Option<f32>,
+    pub rec_top_k: Option<f32>,
+    pub rec_min_p: Option<f32>,
+    pub rec_presence_penalty: Option<f32>,
 }
 
 impl LoadedModel {
@@ -336,6 +352,7 @@ impl LoadedModel {
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -357,6 +374,11 @@ impl LoadedModel {
             model_path,
             dflash: None,
             chat_template,
+            rec_temperature: None,
+            rec_top_p: None,
+            rec_top_k: None,
+            rec_min_p: None,
+            rec_presence_penalty: None,
         }
     }
 
@@ -799,9 +821,25 @@ pub fn load_model(
             other.name()
         ));
     }
-    let result = carrier.load(src, &mut ctx)?;
+    let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
+    }
+    // Author-recommended sampling defaults: pull temperature / top_p / top_k from
+    // the .hfq's baked `generation_config` so the generate handler can fall back
+    // to them when the request omits a knob. HFQ sources only — the raw
+    // safetensors PP path carries no generation_config, so rec_* stay `None`
+    // there. min_p / presence_penalty are not in generation_config (request-only),
+    // so they remain `None`. Re-open the source by path (cheap: header parse only,
+    // no weight upload) since the carrier consumed `src`.
+    if matches!(ModelSource::from_path(path), Ok(ModelSource::Hfq(_))) {
+        if let Ok(hfq) = HfqFile::open(Path::new(path)) {
+            if let Some(rec) = hfq.recommended_sampling() {
+                result.rec_temperature = rec.temperature;
+                result.rec_top_p = rec.top_p;
+                result.rec_top_k = rec.top_k.map(|k| k as f32);
+            }
+        }
     }
     Ok(result)
 }
@@ -979,6 +1017,193 @@ fn load_dflash_state(
 
 // ─── EP load functions ────────────────────────────────────────────────
 
+/// EP partial-load fault injector. Reads `HIPFIRE_EP_FAIL_RANK` so the GPU
+/// cleanup test can force a deterministic mid-load failure after a given rank and
+/// assert the staging guard reclaimed every loaded rank's VRAM. Gated behind the
+/// `ep-fault-inject` feature: production/default builds compile the `None` stub
+/// below, so a stray `HIPFIRE_EP_FAIL_RANK` in the environment can NEVER fail a
+/// real EP load.
+#[cfg(feature = "ep-fault-inject")]
+fn ep_fail_rank() -> Option<usize> {
+    match std::env::var("HIPFIRE_EP_FAIL_RANK").ok() {
+        Some(s) if !s.is_empty() => s.parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "ep-fault-inject"))]
+fn ep_fail_rank() -> Option<usize> {
+    None
+}
+
+/// Staging guard for the ds4 EP load (transactional partial-load cleanup). Owns
+/// the `Gpus` orchestrator plus the per-rank weights / state / partials as they
+/// are built up. If the load fails mid-way (a `?` early return, or the
+/// `HIPFIRE_EP_FAIL_RANK` fault), `Drop` explicitly frees every rank's VRAM
+/// (weights → state → partial) and drains each device's pool, so a failed EP load
+/// leaks NO VRAM. On success the caller calls `into_parts()` to disarm the guard
+/// and move ownership into the `LoadedModel`.
+struct Ds4EpStaging {
+    /// `Option` so `into_parts` can move the `Gpus` out on success without a
+    /// placeholder. `None` after a successful disarm.
+    gpus: Option<Gpus>,
+    weights: Vec<deepseek4::DeepseekV4Weights>,
+    state: Vec<deepseek4::DeepseekV4State>,
+    partials: Vec<rdna_compute::GpuTensor>,
+}
+
+impl Ds4EpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            weights: Vec::new(),
+            state: Vec::new(),
+            partials: Vec::new(),
+        }
+    }
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staging gpus taken")
+    }
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<deepseek4::DeepseekV4Weights>,
+        Vec<deepseek4::DeepseekV4State>,
+        Vec<rdna_compute::GpuTensor>,
+    ) {
+        let gpus = self.gpus.take().expect("into_parts called twice");
+        let weights = std::mem::take(&mut self.weights);
+        let state = std::mem::take(&mut self.state);
+        let partials = std::mem::take(&mut self.partials);
+        (gpus, weights, state, partials)
+    }
+}
+
+impl Drop for Ds4EpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        eprintln!(
+            "[loader] EP ds4 load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
+            self.weights.len()
+        );
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
+            }
+        }
+        for (r, s) in self.state.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                s.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+    }
+}
+
+/// Staging guard for the MiniMax EP load — mirror of `Ds4EpStaging` with the
+/// MiniMax weight/state types.
+struct MinimaxEpStaging {
+    gpus: Option<Gpus>,
+    weights: Vec<minimax::MiniMaxWeights>,
+    state: Vec<minimax::MiniMaxState>,
+    partials: Vec<rdna_compute::GpuTensor>,
+}
+
+impl MinimaxEpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            weights: Vec::new(),
+            state: Vec::new(),
+            partials: Vec::new(),
+        }
+    }
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staging gpus taken")
+    }
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<minimax::MiniMaxWeights>,
+        Vec<minimax::MiniMaxState>,
+        Vec<rdna_compute::GpuTensor>,
+    ) {
+        let gpus = self.gpus.take().expect("into_parts called twice");
+        let weights = std::mem::take(&mut self.weights);
+        let state = std::mem::take(&mut self.state);
+        let partials = std::mem::take(&mut self.partials);
+        (gpus, weights, state, partials)
+    }
+}
+
+impl Drop for MinimaxEpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        eprintln!(
+            "[loader] EP minimax load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
+            self.weights.len()
+        );
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
+            }
+        }
+        for (r, s) in self.state.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                s.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+    }
+}
+
+/// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
+/// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
+/// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
+/// at the call site left intact). ds4 (arch_id 9) and MiniMax (arch_id 10) only.
+///
+/// KNOWN RESIDUAL — constructor-mid-failure leak (scoped follow-up, NOT fixed):
+/// the staging guard frees every rank that has been COMPLETED and `push`ed, so a
+/// failure BETWEEN ranks leaks no VRAM. But a failure INSIDE a single rank's
+/// constructor — after it uploaded some tensors but before it returns `Ok` —
+/// leaks those partial allocations (`GpuTensor` has no `Drop`). The fault injector
+/// (`HIPFIRE_EP_FAIL_RANK`) fires AFTER a rank's constructor returns `Ok`, so it
+/// tests the completed-rank cleanup path (which IS fixed), not this inner window.
+/// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
@@ -992,37 +1217,79 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
 
 fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
     let arch_id = hfq.arch_id;
-    let mut gpus =
-        Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
-    let weights: Vec<deepseek4::DeepseekV4Weights> = (0..tp)
-        .map(|rank| {
-            let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-            <deepseek4::DeepseekV4 as Architecture>::load_weights(
-                &mut hfq,
-                &config,
-                &mut gpus.devices[rank],
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let state: Vec<deepseek4::DeepseekV4State> = (0..tp)
-        .map(|rank| {
-            let _ = rank;
-            deepseek4::DeepseekV4State::new(&config).unwrap()
-        })
-        .collect();
-    let partials: Vec<rdna_compute::GpuTensor> = (0..tp)
-        .map(|rank| {
-            let g = &mut gpus.devices[rank];
-            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32)
-                .unwrap()
-        })
-        .collect();
+    let n_exp = config.n_routed_experts;
+
+    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    // Transactional partial-load: build per-rank weights/state/partials INTO the
+    // staging guard. Every `?` below early-returns while `staging` is alive, so
+    // its `Drop` frees the ranks already loaded.
+    let fail_rank = ep_fail_rank();
+    let _ = fail_rank;
+    let mut staging = Ds4EpStaging::new(gpus);
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let dev = &mut staging.gpus_mut().devices[r];
+        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, dev, &shard, r)
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        staging.weights.push(w);
+        // Deterministic partial-load fault for testing the cleanup path. Fires
+        // AFTER ranks 0..=r loaded; the guard's Drop frees them all.
+        if fail_rank == Some(r) {
+            return Err(format!(
+                "HIPFIRE_EP_FAIL_RANK={r}: synthetic ds4 EP load failure after rank {r} (testing partial-load cleanup)"
+            ));
+        }
+    }
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        let st =
+            deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?;
+        staging.state.push(st);
+        let p = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+            .map_err(|e| format!("partial {r}: {e:?}"))?;
+        staging.partials.push(p);
+    }
+    let peer = staging
+        .gpus_mut()
+        .enable_peer_all()
+        .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
+    let (gpus, weights, state, partials) = staging.into_parts();
+
+    let eos_tok: u32 = {
+        let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            1
+        }
+    };
     let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
@@ -1033,6 +1300,10 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
                 partials,
             },
         }),
+        deepseek4_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1046,37 +1317,84 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
 
 fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
     let arch_id = hfq.arch_id;
-    let mut gpus =
-        Gpus::init_uniform(tp, config.num_hidden_layers).map_err(|e| format!("Gpus: {e}"))?;
-    let weights: Vec<minimax::MiniMaxWeights> = (0..tp)
-        .map(|rank| {
-            let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-            <minimax::MiniMaxM2 as Architecture>::load_weights(
-                &mut hfq,
-                &config,
-                &mut gpus.devices[rank],
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let state: Vec<minimax::MiniMaxState> = (0..tp)
-        .map(|rank| {
-            minimax::MiniMaxState::new_with_max_seq(&mut gpus.devices[rank], &config, max_seq)
-                .unwrap()
-        })
-        .collect();
-    let partials: Vec<rdna_compute::GpuTensor> = (0..tp)
-        .map(|rank| {
-            let g = &mut gpus.devices[rank];
-            g.alloc_tensor(&[config.hidden_size], rdna_compute::DType::F32)
-                .unwrap()
-        })
-        .collect();
+    let n_exp = config.num_local_experts;
+
+    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let fail_rank = ep_fail_rank();
+    let _ = fail_rank;
+    let mut staging = MinimaxEpStaging::new(gpus);
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let dev = &mut staging.gpus_mut().devices[r];
+        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)))
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        staging.weights.push(w);
+        if fail_rank == Some(r) {
+            return Err(format!(
+                "HIPFIRE_EP_FAIL_RANK={r}: synthetic minimax EP load failure after rank {r} (testing partial-load cleanup)"
+            ));
+        }
+    }
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        let st = {
+            let dev = &mut staging.gpus_mut().devices[r];
+            minimax::MiniMaxState::new_with_max_seq(dev, &config, max_seq)
+                .map_err(|e| format!("state {r}: {e:?}"))?
+        };
+        staging.state.push(st);
+        let p = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+            .map_err(|e| format!("partial {r}: {e:?}"))?;
+        staging.partials.push(p);
+    }
+    let peer = staging
+        .gpus_mut()
+        .enable_peer_all()
+        .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
+    let (gpus, weights, state, partials) = staging.into_parts();
+
+    let eos_tok: u32 = {
+        let try_one = |s: &str| -> Option<u32> {
+            let ids = tokenizer.encode(s);
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
+        };
+        try_one("[e~[")
+            .or_else(|| try_one("<|im_end|>"))
+            .or_else(|| try_one("</s>"))
+            .or_else(|| try_one("<|endoftext|>"))
+            .unwrap_or(1)
+    };
     let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
@@ -1087,6 +1405,10 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
                 partials,
             },
         }),
+        minimax_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
         ..LoadedModel::skeleton(
             arch_id,
             tokenizer,
@@ -1101,6 +1423,77 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
 // ─── Unload ───────────────────────────────────────────────────────────
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
+    // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
+    // per-rank weight / state / partial. Free per-rank weights → state → partials
+    // on each owning device, invalidate caches + graph state, drain each pool, then
+    // drop the `Gpus` (tears down comms + devices). The daemon's `gpu` is untouched.
+    // (The `partials` free here is what reclaims the ds4/minimax per-rank dummy
+    // all-reduce buffer that would otherwise leak per load/unload cycle.)
+    if let Some(ep) = m.ep.take() {
+        let EpState { mut gpus, inner } = ep;
+        match inner {
+            EpArch::Ds4 {
+                weights,
+                state,
+                partials,
+                ..
+            } => {
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
+                    }
+                }
+                for (r, s) in state.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        s.free_gpu(dev);
+                    }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
+                    }
+                }
+            }
+            EpArch::Minimax {
+                weights,
+                state,
+                partials,
+                ..
+            } => {
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
+                    }
+                }
+                for (r, s) in state.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        s.free_gpu(dev);
+                    }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
+                    }
+                }
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        let _ = gpu;
+        return;
+        // `gpus` drops here, tearing down comms + devices.
+    }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
         if let Some(scratch_set) = m.pp_scratch_set {

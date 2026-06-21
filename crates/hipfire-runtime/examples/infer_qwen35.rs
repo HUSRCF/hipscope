@@ -315,6 +315,8 @@ fn main() {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
+            top_k: None,
+            min_p: None,
         };
         sampler::sample(
             &mut gpu,
@@ -428,6 +430,8 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 blocked_tokens: Vec::new(),
+                top_k: None,
+                min_p: None,
             };
             sampler::sample(
                 &mut gpu,

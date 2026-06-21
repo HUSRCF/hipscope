@@ -876,43 +876,19 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         // ── HFQ6G256 fused — cross-arch (batched gemm_*_hfq6g256 ladder:
         //    wmma_gfx12/wmma/dp4a/dot2/fp16/scalar). Was wrongly gfx906-only
         //    (HasDp4a), which dead-gated the AWQ A3B trunk on RDNA3/4. ──
-        FusedKeyUse {
-            key: KernelKey::FusedQkvHfq6G256,
-            archs: ALL,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedQkvzaHfq6G256,
-            archs: ALL,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedGateUpHfq6G256,
-            archs: ALL,
-        },
-        // ── WMMA-only kernels (RDNA3/RDNA4) ──
-        FusedKeyUse {
-            key: KernelKey::FusedQkvMq3G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedQkvMq4G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedQkvzaMq3G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedQkvzaMq4G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedGateUpMq3G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedGateUpMq4G256Lloyd,
-            archs: WMMA_ARCHS,
-        },
+        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,  archs: ALL },
+        // ── MQ3/MQ4-Lloyd fused (W4: WMMA-free [32,1,1] wave32 scalar, run on
+        //    every RDNA gen). Gate is HasWave32 (was a HasWmma dead-gate). Listed
+        //    on WMMA_ARCHS here as a MUST-resolve floor; w4_* tests below assert
+        //    the full RDNA1/2 admit + CDNA rejection on the GEMV-side siblings. ──
+        FusedKeyUse { key: KernelKey::FusedQkvMq3G256Lloyd,  archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvMq4G256Lloyd,  archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvzaMq3G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvzaMq4G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedGateUpMq3G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedGateUpMq4G256Lloyd, archs: WMMA_ARCHS },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
         // cross-arch internal ladder (MMQ→dp4a→dot2→fp16→scalar gfx1010), and
@@ -1120,5 +1096,145 @@ fn f16_full_attention_rejected_on_non_wmma_archs() {
     assert!(
         r.is_err(),
         "AttnFullF16 should NOT resolve on gfx906 — no WMMA"
+    );
+}
+
+// ── W4: un-brick RDNA2 (gfx1030/1031/1032) MQ3/Lloyd dispatch ─────────────────
+//
+// MQ3G256 + MQ2/MQ3/MQ4-Lloyd GEMVs are WMMA-free [32,1,1] wave32 scalar kernels
+// that already run on RDNA1/2 via the qwen35 direct path, but resolve() dead-gated
+// them as HasWmma → MissingImpl on RDNA1/2. W4 flips the gate to HasWave32. These
+// tests pin the new behavior AND the hard non-regression constraint: because
+// HasWave32 ⊇ HasWmma on RDNA3/4, the resolved variant must be BYTE-IDENTICAL on
+// gfx1100/gfx1201 vs before (same KernelKey from the same single registered entry).
+
+/// W4 dtypes whose GEMV gate is HasWave32 after the fix (the un-bricked set).
+const W4_WAVE32_DTYPES: &[DType] = &[MQ3G256, MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd];
+
+/// W4: MQ3/Lloyd GEMVs resolve Ok on RDNA1 (gfx1010) + RDNA2 (gfx1030/1031/1032)
+/// AFTER the HasWmma→HasWave32 fix. (Was MissingImpl before.)
+#[test]
+fn w4_mq3_lloyd_resolve_on_rdna1_and_rdna2() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let archs: &[&str] = &["gfx1010", "gfx1030", "gfx1031", "gfx1032"];
+    let mut failures = Vec::new();
+    for &d in W4_WAVE32_DTYPES {
+        for &arch in archs {
+            let ctx = DispatchCtx::for_test(arch);
+            // Both the Plain and Prerotated GEMV variants must resolve (MQ-family
+            // weights are always pre-rotated at the call site; Plain is the floor).
+            for variant in [GemvVariant::Plain, GemvVariant::Prerotated] {
+                if fam.resolve(d, variant, false, &ctx, None).is_err() {
+                    failures.push(format!("  {:?} / {:?} dead-gated on {}", d, variant, arch));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\nW4 regression: MQ3/Lloyd GEMV still dead-gated on RDNA1/2:\n{}\n",
+        failures.join("\n")
+    );
+}
+
+/// W4 (FIX B): the MQ3/MQ4-Lloyd FUSED keys (QKV / QKVZA / GateUp) resolve on
+/// RDNA1/2 after the fused_qkv_table HasWmma→HasWave32 flip, and STILL Err on
+/// CDNA wave64. Covers the fused-table dead-gate distinct from the GEMV one above.
+#[test]
+fn w4_lloyd_fused_keys_un_bricked_on_rdna2_not_cdna() {
+    use crate::families::fused_qkv::FusedQkvFamily;
+    let family = FusedQkvFamily::new();
+    let lloyd_fused: &[KernelKey] = &[
+        KernelKey::FusedQkvMq3G256Lloyd,
+        KernelKey::FusedQkvMq4G256Lloyd,
+        KernelKey::FusedQkvzaMq3G256Lloyd,
+        KernelKey::FusedQkvzaMq4G256Lloyd,
+        KernelKey::FusedGateUpMq3G256Lloyd,
+        KernelKey::FusedGateUpMq4G256Lloyd,
+    ];
+    let mut failures = Vec::new();
+    for &key in lloyd_fused {
+        // RDNA1/2 must now resolve.
+        for arch in ["gfx1010", "gfx1030", "gfx1031", "gfx1032"] {
+            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_err() {
+                failures.push(format!("  {:?} dead-gated on {} (FIX B)", key, arch));
+            }
+        }
+        // CDNA wave64 must still Err.
+        for arch in ["gfx906", "gfx942"] {
+            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_ok() {
+                failures.push(format!("  {:?} wrongly admitted on CDNA {}", key, arch));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\nW4 FIX B regression on fused Lloyd keys:\n{}\n",
+        failures.join("\n")
+    );
+}
+
+/// W4 NON-REGRESSION: RDNA3 (gfx1100) and RDNA4 (gfx1201) resolve MQ3/Lloyd to the
+/// SAME KernelKey as each other and as RDNA2 — byte-identical routing. A dispatch-
+/// core superset change MUST NOT perturb the resolved variant on RDNA3/4.
+#[test]
+fn w4_mq3_lloyd_routing_byte_identical_on_rdna3_rdna4() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let mut failures = Vec::new();
+    for &d in W4_WAVE32_DTYPES {
+        for variant in [GemvVariant::Plain, GemvVariant::Prerotated] {
+            let key_rdna2 = fam
+                .resolve(d, variant, false, &DispatchCtx::for_test("gfx1030"), None)
+                .ok()
+                .map(|v| v.key);
+            let key_rdna3 = fam
+                .resolve(d, variant, false, &DispatchCtx::for_test("gfx1100"), None)
+                .ok()
+                .map(|v| v.key);
+            let key_rdna4 = fam
+                .resolve(d, variant, false, &DispatchCtx::for_test("gfx1201"), None)
+                .ok()
+                .map(|v| v.key);
+            // All three must resolve to the same Some(KernelKey).
+            if !(key_rdna3.is_some() && key_rdna3 == key_rdna4 && key_rdna3 == key_rdna2) {
+                failures.push(format!(
+                    "  {:?} / {:?}: rdna2={:?} rdna3={:?} rdna4={:?} (routing diverged)",
+                    d, variant, key_rdna2, key_rdna3, key_rdna4
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\nW4 NON-REGRESSION FAIL — RDNA3/4 routing changed:\n{}\n",
+        failures.join("\n")
+    );
+}
+
+/// W4: CDNA (gfx906/gfx942 wave64) MUST STILL Err — HasWave32 excludes wave64;
+/// a [32,1,1] kernel can't run on a wave64 lane layout. Guards against the lazy
+/// "blanket Always" fix that would wrongly admit CDNA.
+#[test]
+fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let cdna: &[&str] = &["gfx906", "gfx942"];
+    let mut admitted = Vec::new();
+    for &d in W4_WAVE32_DTYPES {
+        for &arch in cdna {
+            let ctx = DispatchCtx::for_test(arch);
+            for variant in [GemvVariant::Plain, GemvVariant::Prerotated] {
+                if fam.resolve(d, variant, false, &ctx, None).is_ok() {
+                    admitted.push(format!("  {:?} / {:?} wrongly admitted on {}", d, variant, arch));
+                }
+            }
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "\nW4: CDNA wave64 wrongly admitted to wave32 [32,1,1] kernel:\n{}\n",
+        admitted.join("\n")
     );
 }

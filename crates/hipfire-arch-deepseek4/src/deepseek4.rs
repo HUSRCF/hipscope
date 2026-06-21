@@ -440,6 +440,16 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
+
+    /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
+    /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
+    /// here so it is reclaimed by `free_gpu` on unload and by the staging guard
+    /// on a mid-load failure; `None` for single-GPU / fully-owned shards. Must
+    /// outlive the device pointer table (`expert_gate_up_ptrs`) that bakes its
+    /// address. Mirrors `MiniMaxLayerWeights::dummy_gate_up`. GpuTensor has no
+    /// Drop, so this MUST be threaded into the layer (previously
+    /// `std::mem::forget`-leaked).
+    pub expert_gate_up_dummy: Option<rdna_compute::GpuTensor>,
 }
 
 impl DeepseekV4LayerWeights {
@@ -504,6 +514,7 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
+            expert_gate_up_dummy: None,
         }
     }
 
@@ -567,6 +578,11 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.expert_w3_ptrs);
         free_opt(gpu, &mut self.expert_gate_up_blob);
         free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
+        // Freed last so the pointer table that baked its address is already
+        // gone — no live aliasing into a returned buffer. No double-free: this
+        // is the sole owner.
+        free_opt(gpu, &mut self.expert_gate_up_dummy);
     }
 }
 
