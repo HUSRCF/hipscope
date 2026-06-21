@@ -184,6 +184,16 @@ impl ModelSource for SafetensorsSource {
     }
 
     fn chat_template(&self) -> Option<String> {
+        // Newer HF convention (transformers 5.x): a standalone
+        // `chat_template.jinja` file (e.g. North-Mini-Code / cohere2_moe).
+        let jinja = self.dir.join("chat_template.jinja");
+        if let Ok(mut f) = File::open(&jinja) {
+            let mut s = String::new();
+            if f.read_to_string(&mut s).is_ok() && !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+        // Older convention: a `chat_template` field in tokenizer_config.json.
         let p = self.dir.join("tokenizer_config.json");
         let mut s = String::new();
         File::open(p).ok()?.read_to_string(&mut s).ok()?;
@@ -257,6 +267,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "deepseek_v4" => 9,
         "minimax_m2" => 10,
         "lfm2_moe" | "lfm2" => 11,
+        "cohere2_moe" => 12,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -436,6 +447,7 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "deepseek_v4" })), 9);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).

@@ -27,6 +27,7 @@ pub mod arch;
 pub mod cohere2moe;
 pub mod config;
 pub mod forward;
+pub mod paro_dir;
 
 pub use arch::Cohere2Moe;
 pub use cohere2moe::{

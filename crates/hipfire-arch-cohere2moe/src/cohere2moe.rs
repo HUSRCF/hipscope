@@ -145,12 +145,27 @@ pub struct ExpertWeights {
     pub down: WeightTensor,    // [hidden, moe_inter]
 }
 
+/// Per-layer shared ParoQuant rotation sidecars (Dir/safetensors path only).
+/// All experts in a MoE layer reference these via non-owning `ParoRotation`
+/// aliases, so the owner must outlive the experts — `MoeFfn` holds it.
+pub struct Cohere2MoeParoSidecars {
+    pub gate_up_pairs: GpuTensor,
+    pub gate_up_theta: GpuTensor,
+    pub gate_up_channel_scales: GpuTensor,
+    pub down_pairs: GpuTensor,
+    pub down_theta: GpuTensor,
+    pub down_channel_scales: GpuTensor,
+}
+
 /// 128-expert MoE FFN (sigmoid selection, no bias, no shared expert).
 pub struct MoeFfn {
     pub router: WeightTensor,           // mlp.gate.weight [n_exp, hidden]
     pub experts: Vec<ExpertWeights>,    // per-expert buffers (owned here)
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Owned per-layer PARO sidecars (Some on the Dir/paro path; None for HFQ).
+    /// The experts' ParoRotation aliases reference these — keep them alive.
+    pub paro_shared: Option<Cohere2MoeParoSidecars>,
 }
 
 pub enum Ffn {
@@ -312,6 +327,7 @@ impl Cohere2MoeWeights {
                     experts,
                     expert_gate_up_ptrs,
                     expert_down_ptrs,
+                    paro_shared: None,
                 })
             };
 
@@ -361,6 +377,7 @@ impl MoeFfn {
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            paro_shared,
         } = self;
         router.free_all(gpu);
         for e in experts {
@@ -368,6 +385,22 @@ impl MoeFfn {
         }
         let _ = gpu.free_tensor(expert_gate_up_ptrs);
         let _ = gpu.free_tensor(expert_down_ptrs);
+        if let Some(s) = paro_shared {
+            let Cohere2MoeParoSidecars {
+                gate_up_pairs,
+                gate_up_theta,
+                gate_up_channel_scales,
+                down_pairs,
+                down_theta,
+                down_channel_scales,
+            } = s;
+            let _ = gpu.free_tensor(gate_up_pairs);
+            let _ = gpu.free_tensor(gate_up_theta);
+            let _ = gpu.free_tensor(gate_up_channel_scales);
+            let _ = gpu.free_tensor(down_pairs);
+            let _ = gpu.free_tensor(down_theta);
+            let _ = gpu.free_tensor(down_channel_scales);
+        }
     }
 }
 

@@ -799,19 +799,56 @@ impl Carrier for Cohere2MoeCarrier {
     fn name(&self) -> &'static str {
         "cohere2moe"
     }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        !is_dir && arch_id == 12
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
+        arch_id == 12
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("cohere2moe: pp>1 unsupported via registry".into());
         }
-        let ModelSource::Hfq(hfq) = src else {
-            return Err("cohere2moe: directory source unsupported".into());
-        };
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-        crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        match src {
+            ModelSource::Hfq(hfq) => {
+                let tokenizer =
+                    hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                        .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
+                crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+            }
+            ModelSource::Dir(source) => {
+                // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
+                let config = hipfire_arch_cohere2moe::Cohere2MoeConfig::from_safetensors(&source)
+                    .map_err(|e| format!("failed to parse Cohere2-MoE config from config.json: {e}"))?;
+                let weights =
+                    hipfire_arch_cohere2moe::paro_dir::load_from_source(&source, &config, ctx.gpu)?;
+                let state = hipfire_arch_cohere2moe::Cohere2MoeState::new_with_max_seq(
+                    ctx.gpu,
+                    &config,
+                    ctx.max_seq,
+                )
+                .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
+                let eos_tok = resolve_eos_tok(
+                    &meta.tokenizer,
+                    &["<|END_OF_TURN_TOKEN|>", "</s>", "<|endoftext|>"],
+                );
+                Ok(LoadedModel {
+                    state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                    })),
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        meta.chat_template,
+                    )
+                })
+            }
+        }
     }
 }
