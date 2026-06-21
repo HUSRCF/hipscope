@@ -2058,20 +2058,10 @@ fn main() {
                         m.conversation_tokens.clear();
                         free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
                         free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
-                        if let Some(ref dn) = m.dn_state {
-                            for s in &dn.s_matrices {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for s in &dn.s_scales {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for s in &dn.conv_states {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                        }
-                        if let Some(kv) = m.kv_cache.as_mut() {
-                            kv.compact_offset = 0;
-                        }
+                        // qwen35(-vl) recurrent state lives in the bundle
+                        // (ModelState::Qwen35), not the always-None
+                        // m.dn_state/m.kv_cache direct fields.
+                        reset_qwen35_recurrent(m, &mut gpu);
                         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                             b.kv.compact_offset = 0;
                         }
@@ -2267,44 +2257,10 @@ fn main() {
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
                     // alone — its scratch state isn't aliased to per-device
-                    // tensors when pp > 1.
-                    if m.pp > 1 {
-                        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-                            m.dn_state.as_ref(),
-                            m.pp_gpus.as_mut(),
-                            m.pp_dn_la_to_device.as_ref(),
-                        ) {
-                            for (i, s) in dn.s_matrices.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for (i, s) in dn.s_scales.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for (i, s) in dn.conv_states.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                        }
-                    } else if let Some(ref dn) = m.dn_state {
-                        // Zero DeltaNet recurrent state (Qwen3.5)
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                    }
-                    if let Some(kv) = m.kv_cache.as_mut() {
-                        kv.compact_offset = 0;
-                    }
+                    // tensors when pp > 1. Sourced from the bundle (qwen35
+                    // dn_state moved into ModelState::Qwen35), not the
+                    // always-None m.dn_state/m.kv_cache direct fields.
+                    reset_qwen35_recurrent(m, &mut gpu);
                     if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                         b.kv.compact_offset = 0;
                     }
@@ -2525,20 +2481,11 @@ fn main() {
                 let synthetic: Vec<u32> = (0..n as u32).map(|i| 10 + (i % 1000)).collect();
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
-                // prefill-on-top-of-prior-state.
+                // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
+                // the bundle (ModelState::Qwen35), not the always-None m.dn_state.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                if let Some(ref dn) = m.dn_state {
-                    for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                }
+                reset_qwen35_recurrent(m, &mut gpu);
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
                 // cursor here so bench_prefill measures cold prefill.
@@ -2700,19 +2647,11 @@ fn main() {
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
+                // qwen35 recurrent state lives in the bundle (ModelState::Qwen35),
+                // not the always-None m.dn_state.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                if let Some(ref dn) = m.dn_state {
-                    for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                    for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                    }
-                }
+                reset_qwen35_recurrent(m, &mut gpu);
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
                 if let Some(b) = m.lfm2moe_mut() {
@@ -3631,6 +3570,29 @@ fn plan_prompt_cache(
     }
 }
 
+/// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
+/// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
+/// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
+/// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
+fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    if m.pp > 1 {
+        if let (Some(ModelState::Qwen35(b)), Some(gpus), Some(la)) =
+            (m.state.as_ref(), m.pp_gpus.as_mut(), m.pp_dn_la_to_device.as_ref())
+        {
+            let dn = &b.dn_state;
+            for (i, s) in dn.s_matrices.iter().enumerate() { let g=&mut gpus.devices[la[i] as usize]; let _=g.bind_thread(); let _=g.hip.memset(&s.buf,0,s.buf.size()); }
+            for (i, s) in dn.s_scales.iter().enumerate()   { let g=&mut gpus.devices[la[i] as usize]; let _=g.bind_thread(); let _=g.hip.memset(&s.buf,0,s.buf.size()); }
+            for (i, s) in dn.conv_states.iter().enumerate() { let g=&mut gpus.devices[la[i] as usize]; let _=g.bind_thread(); let _=g.hip.memset(&s.buf,0,s.buf.size()); }
+        }
+    } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+        let dn = &b.dn_state;
+        for s in &dn.s_matrices { let _=gpu.hip.memset(&s.buf,0,s.buf.size()); }
+        for s in &dn.s_scales   { let _=gpu.hip.memset(&s.buf,0,s.buf.size()); }
+        for s in &dn.conv_states { let _=gpu.hip.memset(&s.buf,0,s.buf.size()); }
+    }
+    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() { b.kv_cache.compact_offset = 0; }
+}
+
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
 /// token-streaming output but replaces the AR sample loop with
 /// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
@@ -3831,10 +3793,14 @@ fn generate_dflash(
     // the draft's target_hidden[0..ckpt] is preserved from the prior turn.
     if let Some(ckpt) = resume_from {
         if let Some(idx) = m.dflash_checkpoints.iter().rposition(|(p, _)| *p == ckpt) {
-            if let (Some(dn), Some((_, snap))) =
-                (m.dn_state.as_mut(), m.dflash_checkpoints.get(idx))
+            // RESTORE only (do NOT zero): roll the bundle's DeltaNet state back
+            // to the checkpoint. State lives in ModelState::Qwen35, not the
+            // always-None m.dn_state. Disjoint split: m.state and
+            // m.dflash_checkpoints are different fields of `m`.
+            if let (Some(ModelState::Qwen35(b)), Some((_, snap))) =
+                (m.state.as_mut(), m.dflash_checkpoints.get(idx))
             {
-                let _ = snap.restore_to(dn, gpu);
+                let _ = snap.restore_to(&mut b.dn_state, gpu);
             }
             m.seq_pos = ckpt;
             m.conversation_tokens.truncate(ckpt);
@@ -3843,11 +3809,14 @@ fn generate_dflash(
     }
 
     if !cache_hit {
-        // Fresh target state — full prefill from position 0.
+        // Fresh target state — full prefill from position 0. Zero the bundle's
+        // DeltaNet recurrent state (qwen35 moved it into ModelState::Qwen35;
+        // m.dn_state is permanently None). This runs BEFORE the m.state.take()
+        // below, so m.state is still present.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        {
-            let dn = m.dn_state.as_ref().unwrap();
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -4047,13 +4016,6 @@ fn generate_dflash(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-        }));
         // hunt3 #5-SLIVER: the suffix/cache_hit seed
         // (seed_target_hidden_suffix_abortable) partially advances the COMMITTED
         // dn_state through the new tokens then returns Ok(true) WITHOUT resetting
@@ -4061,23 +4023,27 @@ fn generate_dflash(
         // turn cold-prefills at seq_pos=0 but generate()'s DeltaNet memset is
         // gated on the context-full branch (won't fire after this reset to
         // seq_pos=0), so it would accumulate over the dirty recurrent state →
-        // drift / premature EOS. Zero it here, mirroring the decode-abort (H1)
-        // handler below. (The cold from_prompt seed already self-resets on
-        // abort, so this is a harmless no-op for that case.)
-        if let Some(ref dn) = m.dn_state {
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
+        // drift / premature EOS. Zero the LOCAL `target` (the bundle pieces we
+        // own here) BEFORE putting them back into m.state — m.dn_state/m.kv_cache
+        // are permanently None. (The cold from_prompt seed already self-resets
+        // on abort, so this is a harmless no-op for that case.)
+        for s in &target.dn_state.s_matrices {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        for s in &target.dn_state.s_scales {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
+        for s in &target.dn_state.conv_states {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        target.kv_cache.compact_offset = 0;
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
         let _ = writeln!(
             stdout,
             r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -4355,9 +4321,22 @@ fn generate_dflash(
             // Restore the borrowed slot before returning, then full-reset the
             // conversation. The mid-decode KV/DeltaNet are advanced past the
             // (un-baked) conversation_tokens, so the next turn must cold-start
-            // (which re-seeds + resets the recurrent state). CRITICAL: without
-            // putting the slot fields back, m.dn_state/kv_cache stay None and the
-            // NEXT request panics at the cold-reset unwrap (daemon.rs ~4031).
+            // (which re-seeds + resets the recurrent state). Zero DeltaNet
+            // recurrent state on the LOCAL `target` BEFORE putting it back so the
+            // next AR turn cold-prefills over clean buffers — m.dn_state/kv_cache
+            // are permanently None (state lives in the bundle). Without this,
+            // stale mid-decode recurrent state from the aborted DFlash run
+            // corrupts the next generation (drift → premature EOS).
+            for s in &target.dn_state.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &target.dn_state.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &target.dn_state.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            target.kv_cache.compact_offset = 0;
             m.state = Some(ModelState::Qwen35(Qwen35Bundle {
                 config: orig_config,
                 weights: target.weights,
@@ -4368,24 +4347,6 @@ fn generate_dflash(
             m.seq_pos = 0;
             m.conversation_tokens.clear();
             free_checkpoints(&mut m.dflash_checkpoints, gpu);
-            // Zero DeltaNet recurrent state so the next AR turn cold-prefills
-            // over clean buffers. Without this, stale mid-decode recurrent
-            // state from the aborted DFlash run corrupts the next generation
-            // (drift → premature EOS). Mirrors grammar-dflash reset above.
-            if let Some(ref dn) = m.dn_state {
-                for s in &dn.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-            if let Some(kv) = m.kv_cache.as_mut() {
-                kv.compact_offset = 0;
-            }
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -4677,7 +4638,12 @@ fn generate_dflash(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
         m.seq_pos = 0;
-        if let Some(ref dn) = m.dn_state {
+        // State was already put back into m.state above; zero the bundle's
+        // DeltaNet + reset compact_offset. Inlined (disjoint field access)
+        // rather than `reset_qwen35_recurrent` because a `&tokenizer` borrow of
+        // `m` is live here. m.dn_state/m.kv_cache are permanently None.
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -4688,8 +4654,8 @@ fn generate_dflash(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
     }
 
@@ -4872,29 +4838,47 @@ fn generate_multi(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-            m.dn_state.as_ref(),
-            m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
-        ) {
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
+        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
+        // because a `&tokenizer` borrow of `m` is live here; covers both the
+        // pp>1 per-LA-device path and the single-GPU path.
+        if m.pp > 1 {
+            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
+                m.state.as_ref(),
+                m.pp_gpus.as_mut(),
+                m.pp_dn_la_to_device.as_ref(),
+            ) {
+                let dn = &b.dn_state;
+                for (i, s) in dn.s_matrices.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.s_scales.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.conv_states.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
             }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             ad.reset();
@@ -5088,29 +5072,45 @@ fn generate_multi(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-            m.dn_state.as_ref(),
-            m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
-        ) {
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
+        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
+        if m.pp > 1 {
+            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
+                m.state.as_ref(),
+                m.pp_gpus.as_mut(),
+                m.pp_dn_la_to_device.as_ref(),
+            ) {
+                let dn = &b.dn_state;
+                for (i, s) in dn.s_matrices.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.s_scales.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.conv_states.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
             }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
@@ -6214,8 +6214,12 @@ fn generate(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // Zero DeltaNet state on reset
-        if let Some(ref dn) = m.dn_state {
+        // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
+        // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
+        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
+        // is live here.
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -6226,8 +6230,8 @@ fn generate(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
@@ -6856,15 +6860,20 @@ fn generate(
             // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
-                && m.kv_cache
-                    .as_ref()
-                    .map(|k| k.compact_offset == 0)
-                    .unwrap_or(true)
                 && m.state.as_ref().map_or(true, |s| match s {
                     ModelState::Llama(b) => b.kv.compact_offset == 0,
+                    // qwen35's KV compact_offset lives in the bundle, not the
+                    // always-None m.kv_cache direct field.
+                    ModelState::Qwen35(b) => b.kv_cache.compact_offset == 0,
                     _ => true,
                 });
-            let resume_idx = if ckpt_resume_enabled() && evict_safe && m.dn_state.is_some() {
+            // Resume is only valid for qwen35 (the DeltaNet recurrent state in the
+            // bundle). The gate used to read the always-None m.dn_state → resume
+            // was silently disabled post-merge; gate on the bundle instead.
+            let resume_idx = if ckpt_resume_enabled()
+                && evict_safe
+                && matches!(m.state.as_ref(), Some(ModelState::Qwen35(_)))
+            {
                 m.prefill_checkpoints
                     .iter()
                     .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
@@ -6873,10 +6882,13 @@ fn generate(
             };
             let resumed = if let Some(idx) = resume_idx {
                 let rpos = m.prefill_checkpoints[idx].0;
-                let ok = if let (Some(ck), Some(dn)) =
-                    (m.prefill_checkpoints.get(idx), m.dn_state.as_mut())
+                // RESTORE only (do NOT zero): roll the bundle's DeltaNet state
+                // back to the checkpoint. Disjoint split: m.state and
+                // m.prefill_checkpoints are different fields of `m`.
+                let ok = if let (Some(ModelState::Qwen35(b)), Some(ck)) =
+                    (m.state.as_mut(), m.prefill_checkpoints.get(idx))
                 {
-                    ck.1.restore_to(dn, gpu).is_ok()
+                    ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
                 } else {
                     false
                 };
@@ -6905,11 +6917,14 @@ fn generate(
                     // No usable checkpoint — full cold reset. DeltaNet recurrent
                     // state is non-reversible; treat as a miss. Inlined (not
                     // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
-                    // live here; these are disjoint field accesses.
+                    // live here; these are disjoint field accesses. qwen35 state
+                    // lives in the bundle (ModelState::Qwen35), not the always-None
+                    // m.dn_state/m.kv_cache.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     free_checkpoints(&mut m.prefill_checkpoints, gpu);
-                    if let Some(ref dn) = m.dn_state {
+                    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+                        let dn = &b.dn_state;
                         for s in &dn.s_matrices {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
@@ -6920,8 +6935,8 @@ fn generate(
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(kv) = m.kv_cache.as_mut() {
-                        kv.compact_offset = 0;
+                    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+                        b.kv_cache.compact_offset = 0;
                     }
                     if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                         b.kv.compact_offset = 0;
@@ -6961,7 +6976,11 @@ fn generate(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        if let Some(ref dn) = m.dn_state {
+        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
+        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
+        // because a `&tokenizer` borrow of `m` is live here.
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -6972,8 +6991,8 @@ fn generate(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
             b.kv.compact_offset = 0;
@@ -6988,15 +7007,18 @@ fn generate(
     // the advertised context window (max_seq) — refuse requests that would
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
-    let absolute_pos = m.seq_pos
-        + m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
-        + m.state
+    let absolute_pos = m.seq_pos.saturating_add(
+        m.state
             .as_ref()
             .and_then(|s| match s {
                 ModelState::Llama(b) => Some(b.kv.compact_offset),
+                // qwen35 KV compact_offset lives in the bundle, not the
+                // always-None m.kv_cache direct field.
+                ModelState::Qwen35(b) => Some(b.kv_cache.compact_offset),
                 _ => None,
             })
-            .unwrap_or(0);
+            .unwrap_or(0),
+    );
     if m.eviction.is_none() {
         if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
             let _ = writeln!(
@@ -11302,7 +11324,12 @@ fn generate_vl(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        if let Some(ref dn) = m.dn_state {
+        // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
+        // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
+        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
+        // is live here.
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -11313,8 +11340,8 @@ fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             ad.reset();
