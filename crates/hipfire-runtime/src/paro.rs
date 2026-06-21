@@ -229,15 +229,8 @@ pub fn paro_load_norm(
     let (info, data) = source
         .tensor_data(&full)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
-    let mut v: Vec<f32> = if info.dtype == "F16" {
-        data.chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    } else {
-        data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    };
+    // Handles F16/BF16/F32 (raw unquantized checkpoints are commonly BF16).
+    let mut v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
     for x in &mut v {
         *x += bias;
     }
@@ -256,15 +249,8 @@ pub fn paro_load_f32(
     let (info, data) = source
         .tensor_data(&full)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
-    let v: Vec<f32> = if info.dtype == "F16" {
-        data.chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    } else {
-        data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    };
+    // Handles F16/BF16/F32 (raw unquantized checkpoints are commonly BF16).
+    let v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
     gpu.upload_f32(&v, &[n])
 }
 
@@ -307,13 +293,11 @@ pub fn load_fp16_weight_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (_, data) = source
+    let (info, data) = source
         .tensor_data(name)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
+    // Handles F16/BF16/F32 (raw unquantized checkpoints are commonly BF16).
+    let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
