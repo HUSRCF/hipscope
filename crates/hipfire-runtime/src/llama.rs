@@ -3176,7 +3176,47 @@ fn llama_kv_write_attend(
     head_dim: usize,
     kv_dim: usize,
 ) -> HipResult<()> {
-    if kv_cache.quant_hfq4 {
+    if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+        // Asym/Givens KV: this hand ladder has no asym kernels, so route
+        // KV-write + flash-attend through the dispatch attention family (the
+        // same path qwen35 uses). tier_inputs() classifies the tier from the
+        // cache's quant flags; run_attention does both write and single-token
+        // attend. (This is the Phase A3b migration the helper doc anticipated.)
+        let ctx = DispatchCtx::new(gpu);
+        let plan = KvTierPlan::derive(KvTierInputs {
+            pos,
+            ..kv_cache.tier_inputs()
+        })
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        let io = AttnParams {
+            q: &scratch.q,
+            k: &scratch.k,
+            v: &scratch.v,
+            k_cache: &kv_cache.k_gpu[layer_idx],
+            v_cache: &kv_cache.v_gpu[layer_idx],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &scratch.pos_buf,
+            pos,
+            positions: None,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap: kv_cache.physical_cap,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&scratch.attn_partials),
+            givens_cos: kv_cache.givens_cos.as_ref(),
+            givens_sin: kv_cache.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &scratch.attn_out,
+        };
+        attention_family()
+            .run_attention(&ctx, gpu, &plan, &io)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    } else if kv_cache.quant_hfq4 {
         gpu.kv_cache_write_hfq4(
             &kv_cache.k_gpu[layer_idx],
             &scratch.k,
@@ -3607,7 +3647,47 @@ pub fn forward_scratch_layers(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_hfq4 {
+        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // route KV-write + flash-attend through the dispatch attention
+            // family (the same path qwen35 uses). tier_inputs() classifies the
+            // tier from the cache's quant flags; run_attention does both the
+            // KV write and the single-token flash attend.
+            let ctx = DispatchCtx::new(gpu);
+            let plan = KvTierPlan::derive(KvTierInputs {
+                pos,
+                ..kv_cache.tier_inputs()
+            })
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &scratch.q,
+                k: &scratch.k,
+                v: &scratch.v,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &scratch.pos_buf,
+                pos,
+                positions: None,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: 1,
+                max_ctx_len: 0,
+                flash_partials: Some(&scratch.attn_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias: None,
+                block_start: 0,
+                block_cols: 0,
+                output: &scratch.attn_out,
+            };
+            attention_family()
+                .run_attention(&ctx, gpu, &plan, &io)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        } else if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(
                 &kv_cache.k_gpu[layer_idx],
                 &scratch.k,
@@ -4130,7 +4210,47 @@ pub fn forward_scratch_compute(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_hfq4 {
+        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // route KV-write + flash-attend through the dispatch attention
+            // family (the same path qwen35 uses). tier_inputs() classifies the
+            // tier from the cache's quant flags; run_attention does both the
+            // KV write and the single-token flash attend.
+            let ctx = DispatchCtx::new(gpu);
+            let plan = KvTierPlan::derive(KvTierInputs {
+                pos,
+                ..kv_cache.tier_inputs()
+            })
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &scratch.q,
+                k: &scratch.k,
+                v: &scratch.v,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &scratch.pos_buf,
+                pos,
+                positions: None,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: 1,
+                max_ctx_len: 0,
+                flash_partials: Some(&scratch.attn_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias: None,
+                block_start: 0,
+                block_cols: 0,
+                output: &scratch.attn_out,
+            };
+            attention_family()
+                .run_attention(&ctx, gpu, &plan, &io)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        } else if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(
                 &kv_cache.k_gpu[layer_idx],
                 &scratch.k,
@@ -5183,8 +5303,13 @@ impl KvCache {
         // derive() would see.
         let quant_q4 = self.quant_q4_residual();
         hipfire_dispatch::families::kv_tier::classify(
-            self.quant_q8, self.quant_asym4, self.quant_asym3, self.quant_asym2,
-            self.quant_hfq4, quant_q4, self.quant_fwht,
+            self.quant_q8,
+            self.quant_asym4,
+            self.quant_asym3,
+            self.quant_asym2,
+            self.quant_hfq4,
+            quant_q4,
+            self.quant_fwht,
         )
     }
 
@@ -8879,7 +9004,10 @@ mod tests {
         let kv = KvCache::new_gpu_q8(&mut gpu, 1, 8, 64, 16).unwrap();
 
         // What the unified accessor produces for a decode call at pos=100.
-        let got = KvTierInputs { pos: 100, ..kv.tier_inputs() };
+        let got = KvTierInputs {
+            pos: 100,
+            ..kv.tier_inputs()
+        };
 
         // The exact literal the qwen35 decode site used before this refactor.
         let legacy = KvTierInputs {
@@ -8899,7 +9027,10 @@ mod tests {
             is_boundary: false,
         };
 
-        assert_eq!(got, legacy, "tier_inputs() must be byte-identical to the legacy literal");
+        assert_eq!(
+            got, legacy,
+            "tier_inputs() must be byte-identical to the legacy literal"
+        );
         assert_eq!(
             KvTierPlan::derive(got).unwrap().write_key,
             KvTierPlan::derive(legacy).unwrap().write_key,
