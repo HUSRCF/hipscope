@@ -9192,6 +9192,8 @@ mod tests {
             batch_size: 4,
             is_tree: true,
             is_boundary: false,
+            q8_windowed: false,
+            window: 0,
         };
         assert_eq!(
             got_prefill, legacy_prefill,
