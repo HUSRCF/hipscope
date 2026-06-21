@@ -33,15 +33,15 @@ use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
     HfqBackend, WeightBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
-use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
-use hipfire_runtime::model_source::ModelSource;
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
 ///
@@ -497,25 +497,36 @@ fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
 fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8], n_elements: usize) -> Vec<u8> {
     match source_dtype {
         "F16" => {
-            assert_eq!(data.len(), 2 * n_elements,
-                "qwen2: F16 tensor has {} bytes, expected 2 * {n_elements}", data.len());
+            assert_eq!(
+                data.len(),
+                2 * n_elements,
+                "qwen2: F16 tensor has {} bytes, expected 2 * {n_elements}",
+                data.len()
+            );
             data.to_vec()
         }
         "BF16" => {
             let f32_vals = bf16_bytes_to_f32(data);
             assert_eq!(f32_vals.len(), n_elements);
-            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_vals
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
         "F32" => {
-            let f32_vals: Vec<f32> = data.chunks_exact(4)
+            let f32_vals: Vec<f32> = data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(f32_vals.len(), n_elements);
-            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_vals
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
-        other => panic!(
-            "qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
-        ),
+        other => {
+            panic!("qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)")
+        }
     }
 }
 
@@ -523,7 +534,8 @@ fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8], n_elements: usize
 fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8], n: usize) -> Vec<f32> {
     match source_dtype {
         "F16" => {
-            let v: Vec<f32> = data.chunks_exact(2)
+            let v: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             assert_eq!(v.len(), n);
@@ -535,15 +547,16 @@ fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8], n: usize) -> Vec<f32
             v
         }
         "F32" => {
-            let v: Vec<f32> = data.chunks_exact(4)
+            let v: Vec<f32> = data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(v.len(), n);
             v
         }
-        other => panic!(
-            "qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
-        ),
+        other => {
+            panic!("qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)")
+        }
     }
 }
 
@@ -554,7 +567,8 @@ fn load_norm_weight_raw_from_source(
     name: &str,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
     gpu.upload_f32(&f32_data, &[n])
@@ -567,7 +581,8 @@ fn load_bias_f32_from_source(
     name: &str,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
     gpu.upload_f32(&f32_data, &[n])
@@ -581,15 +596,20 @@ fn load_weight_tensor_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (info, data) = source.tensor_data(name)
-        .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
+    // Clean error (not panic) on a missing tensor — e.g. a ParoQuant qwen2 dir
+    // that ships only `.qweight` (no F16 `.weight`). The caller turns this into
+    // a load failure instead of aborting the daemon.
+    let (info, data) = source
+        .tensor_data(name)
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("qwen2: tensor not found: {name}")))?;
     let n_elements = m * k;
     let f16_bytes = source_bytes_to_f16_stream(&info.dtype, data, n_elements);
     let buf = gpu.upload_raw(&f16_bytes, &[n_elements])?;
     Ok(WeightTensor {
         buf,
         gpu_dtype: DType::F16,
-        m, k,
+        m,
+        k,
         row_stride: 0,
         paro: None,
         awq_scale: None,
@@ -603,7 +623,8 @@ fn load_embed_tokens_from_source(
     cfg: &Qwen2Config,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     let name = "model.embed_tokens.weight";
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let n = cfg.vocab_size * cfg.hidden_size;
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
@@ -622,7 +643,8 @@ fn load_lm_head_from_source(
 ) -> HipResult<(WeightTensor, bool)> {
     if cfg.tie_word_embeddings {
         let name = "model.embed_tokens.weight";
-        let (info, data) = source.tensor_data(name)
+        let (info, data) = source
+            .tensor_data(name)
             .unwrap_or_else(|| panic!("qwen2: tensor not found for tied lm_head: {name}"));
         let n = cfg.vocab_size * cfg.hidden_size;
         let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
@@ -641,8 +663,13 @@ fn load_lm_head_from_source(
         };
         Ok((wt, true))
     } else {
-        let wt = load_weight_tensor_from_source(source, gpu, "lm_head.weight",
-            cfg.vocab_size, cfg.hidden_size)?;
+        let wt = load_weight_tensor_from_source(
+            source,
+            gpu,
+            "lm_head.weight",
+            cfg.vocab_size,
+            cfg.hidden_size,
+        )?;
         Ok((wt, false))
     }
 }
@@ -658,39 +685,90 @@ fn load_layer_from_source(
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    let attn_norm = load_norm_weight_raw_from_source(source, gpu,
-        &format!("{p}.input_layernorm.weight"), cfg.hidden_size)?;
+    let attn_norm = load_norm_weight_raw_from_source(
+        source,
+        gpu,
+        &format!("{p}.input_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let wq = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.q_proj.weight"), q_dim, cfg.hidden_size)?;
-    let wq_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
-    let wk = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.k_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wk_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
-    let wv = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.v_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wv_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
-    let wo = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.o_proj.weight"), cfg.hidden_size, q_dim)?;
+    let wq = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.q_proj.weight"),
+        q_dim,
+        cfg.hidden_size,
+    )?;
+    let wq_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
+    let wk = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.k_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
+    let wk_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
+    let wv = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.v_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
+    let wv_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
+    let wo = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.o_proj.weight"),
+        cfg.hidden_size,
+        q_dim,
+    )?;
 
-    let ffn_norm = load_norm_weight_raw_from_source(source, gpu,
-        &format!("{p}.post_attention_layernorm.weight"), cfg.hidden_size)?;
+    let ffn_norm = load_norm_weight_raw_from_source(
+        source,
+        gpu,
+        &format!("{p}.post_attention_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let w_gate = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.gate_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_up = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.up_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_down = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.down_proj.weight"), cfg.hidden_size, cfg.intermediate_size)?;
+    let w_gate = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.gate_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_up = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.up_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_down = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.down_proj.weight"),
+        cfg.hidden_size,
+        cfg.intermediate_size,
+    )?;
 
     Ok(Qwen2LayerWeights {
         attn_norm,
-        wq, wq_bias, wk, wk_bias, wv, wv_bias, wo,
+        wq,
+        wq_bias,
+        wk,
+        wk_bias,
+        wv,
+        wv_bias,
+        wo,
         ffn_norm,
-        w_gate, w_up, w_down,
+        w_gate,
+        w_up,
+        w_down,
     })
 }
 
@@ -704,14 +782,20 @@ pub fn load_weights_from_source(
     let (embd_token, embd_format) = load_embed_tokens_from_source(source, gpu, cfg)?;
 
     eprintln!("qwen2: loading model.norm...");
-    let output_norm = load_norm_weight_raw_from_source(source, gpu, "model.norm.weight", cfg.hidden_size)?;
+    let output_norm =
+        load_norm_weight_raw_from_source(source, gpu, "model.norm.weight", cfg.hidden_size)?;
 
     eprintln!("qwen2: loading lm_head...");
-    let (output, tied_lm_head) = load_lm_head_from_source(source, gpu, cfg, &embd_token, embd_format)?;
+    let (output, tied_lm_head) =
+        load_lm_head_from_source(source, gpu, cfg, &embd_token, embd_format)?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
-        eprintln!("qwen2: loading layer {}/{} (from source)...", i + 1, cfg.num_hidden_layers);
+        eprintln!(
+            "qwen2: loading layer {}/{} (from source)...",
+            i + 1,
+            cfg.num_hidden_layers
+        );
         layers.push(load_layer_from_source(source, gpu, cfg, i)?);
     }
 

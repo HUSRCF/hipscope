@@ -2,6 +2,8 @@ use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
 use crate::Qwen2;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+// Trait in scope for `tensor_info`/`quant_config` on the Dir source.
+use hipfire_runtime::model_source::ModelSource as _;
 
 pub struct Qwen2Bundle {
     pub config: Qwen2Config,
@@ -33,6 +35,31 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
             let config = crate::qwen2::config_from_source(&source).ok_or_else(|| {
                 "qwen2: failed to parse Qwen2Config from safetensors config.json".to_string()
             })?;
+            // The Dir path loads the F16 `.weight` tensors; the ParoQuant 4-bit
+            // qweight decode is NOT implemented for qwen2 dirs. Fail cleanly if
+            // the F16 weights are absent (a paro-only / qweight-only dir) rather
+            // than panicking deep in the tensor loader, and warn when we ignore
+            // a present paro quant_config (loading F16 ≈ 2x the VRAM of 4-bit).
+            let has_f16_weights = source
+                .tensor_info("model.layers.0.self_attn.q_proj.weight")
+                .is_some();
+            let is_paro = source.quant_config().is_some();
+            if !has_f16_weights {
+                return Err(format!(
+                    "qwen2: safetensors dir has no F16 `.weight` tensors{} — 4-bit \
+                     qwen2 dir loading is not implemented; use the HFQ (arch_id=7) build",
+                    if is_paro {
+                        " (ParoQuant qweight-only)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if is_paro {
+                eprintln!(
+                    "  qwen2: loading F16 `.weight` (ParoQuant 4-bit qweight ignored — ~2x VRAM)"
+                );
+            }
             let weights = crate::qwen2::load_weights_from_source(&source, &config, ctx.gpu)
                 .map_err(|e| format!("qwen2: load_weights_from_source: {e:?}"))?;
             (config, weights)
