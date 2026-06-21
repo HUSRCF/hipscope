@@ -4047,6 +4047,14 @@ async function serve(port: number, host: string) {
                 // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
                 // decide whether the message ended with a callable action).
                 let structuredToolCallsEmitted = false;
+                // ds4/V4F: the daemon's DSML StreamParser splits reasoning
+                // (type:"reasoning") from content (type:"token") server-side and
+                // strips `<think>`/`</think>`. Once we've seen a structured
+                // reasoning event the daemon OWNS that split, so we must stop
+                // applying the CLI's own `</think>` heuristic (which can never
+                // fire on the already-stripped stream and would re-trap the
+                // post-think answer in reasoning_content).
+                let sawDaemonReasoning = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
@@ -4076,7 +4084,7 @@ async function serve(port: number, host: string) {
                       }
                       continue;
                     }
-                    if (sawReasoningFlag) inThink = false;
+                    if (sawReasoningFlag || sawDaemonReasoning) inThink = false;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
                       if (text.includes("</think>")) {
@@ -4134,6 +4142,10 @@ async function serve(port: number, host: string) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "reasoning") {
+                    // The daemon owns the split now — see sawDaemonReasoning
+                    // comment above. Latch it so subsequent token events stream
+                    // as content instead of being trapped by the inThink gate.
+                    sawDaemonReasoning = true;
                     // V4F daemon arm emits structured `reasoning` events
                     // from the DSML StreamParser; `<think>` / `</think>`
                     // have already been stripped server-side. Forward as
@@ -4433,6 +4445,14 @@ async function serve(port: number, host: string) {
         // (it would prepend a synthetic `<think>` and, finding no `</think>`,
         // strip the whole answer).
         let nsSawReasoningFlag = false;
+        // Latches when the daemon emits a STRUCTURED `reasoning` event (ds4/V4F's
+        // DSML StreamParser). Like nsSawReasoningFlag, this means the daemon has
+        // already split reasoning from content server-side — so `content` here is
+        // the clean visible answer and the open_think `<think>`-strip below MUST
+        // be skipped (it would prepend a synthetic `<think>`, find no `</think>`,
+        // and strip the whole answer). ds4 uses reasoning EVENTS, not the
+        // `reasoning:true` flag, so nsSawReasoningFlag alone doesn't cover it.
+        let nsSawDaemonReasoning = false;
         for await (const msg of e.generate(genParams)) {
           if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
           if (msg.type === "token") {
@@ -4446,6 +4466,7 @@ async function serve(port: number, host: string) {
             // completion response can surface it under
             // `message.reasoning_content` — without this the reasoning
             // text was silently dropped on every think-mode V4F turn.
+            nsSawDaemonReasoning = true;
             if (typeof msg.text === "string") reasoningContent += msg.text;
           }
           else if (msg.type === "done") {
@@ -4530,7 +4551,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag);
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag && !nsSawDaemonReasoning);
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
