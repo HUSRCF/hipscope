@@ -3033,13 +3033,30 @@ pub struct ForwardScratch {
 }
 
 impl ForwardScratch {
+    /// Allocate scratch sized for the model's declared context. Callers that
+    /// know the runtime KV cap should prefer [`Self::new_with_max_seq`] so the
+    /// flash-attention partials buffer matches the cache (avoids both OOB at
+    /// large `max_seq` and over-allocation when the cap is small).
     pub fn new(gpu: &mut Gpu, config: &LlamaConfig) -> HipResult<Self> {
+        Self::new_with_max_seq(gpu, config, config.max_seq_len)
+    }
+
+    /// `max_seq` MUST be ≥ the KV cache's `physical_cap` — the flash-decoding
+    /// partials buffer is sized `n_heads × ceil(max_seq/128) × (2 + head_dim)`
+    /// and the asym/flash attends index it by `ceil(physical_cap/128)` tiles.
+    /// (Was hardcoded to 16 chunks = max_seq 2048; running at a larger cap
+    /// overflowed it → silent OOB / garbage on the flash-attention path.)
+    pub fn new_with_max_seq(
+        gpu: &mut Gpu,
+        config: &LlamaConfig,
+        max_seq: usize,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
-        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats
-        // max_chunks = ceil(2048 / 128) = 16
-        let max_chunks = 16;
+        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats.
+        // TILE_SIZE = 128 matches the flash attend kernels (attention.rs).
+        let max_chunks = max_seq.div_ceil(128);
         let partial_stride = 2 + config.head_dim;
         let partials_size = config.n_heads * max_chunks * partial_stride;
         Ok(Self {

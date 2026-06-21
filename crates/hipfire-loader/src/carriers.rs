@@ -494,8 +494,12 @@ impl Carrier for LlamaCarrier {
                     &dims,
                 )
                 .map_err(|e| format!("KvCache: {e}"))?;
-                let scratch = hipfire_runtime::llama::ForwardScratch::new(ctx.gpu, &config)
-                    .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
+                let scratch = hipfire_runtime::llama::ForwardScratch::new_with_max_seq(
+                    ctx.gpu,
+                    &config,
+                    ctx.max_seq,
+                )
+                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
                 hipfire_arch_llama::LlamaBundle {
                     config,
                     weights,

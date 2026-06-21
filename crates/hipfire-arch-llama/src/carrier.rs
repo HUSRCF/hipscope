@@ -1,6 +1,8 @@
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
-use hipfire_runtime::llama::{ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::{
+    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
+};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct LlamaBundle {
@@ -17,7 +19,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
     };
     let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
     let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-    let scratch = <Llama as Architecture>::new_state(ctx.gpu, &config)?;
+    // Size scratch (flash-attention partials) for the runtime KV cap so the
+    // asym/flash attends, which index partials by ceil(physical_cap/128), don't
+    // overflow it (the trait `new_state` only knows the model's declared max).
+    let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+        .map_err(|e| format!("llama: ForwardScratch::new_with_max_seq failed: {e:?}"))?;
     let dims = KvDims {
         layers: KvLayers::Flat(config.n_layers),
         n_kv_heads: config.n_kv_heads,
@@ -26,7 +32,12 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         physical_cap: None,
     };
     let kv = KvCache::from_mode(
-        hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY, config.head_dim).mode,
+        hipfire_runtime::kv_mode::resolve(
+            "",
+            &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
+            config.head_dim,
+        )
+        .mode,
         KvTarget::Single(ctx.gpu),
         &dims,
     )
