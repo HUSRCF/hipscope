@@ -216,7 +216,12 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         {
             return if has_experts { 6 } else { 5 };
         }
-        if arch_lower.contains("qwen3") || arch_lower.contains("qwen2") {
+        // qwen2 → arch_id=7 (Qwen2Carrier loads the Q/K/V attention biases the
+        // llama-family Dir loader drops); qwen3 → arch_id=1 (LlamaCarrier).
+        if arch_lower.contains("qwen2") {
+            return 7;
+        }
+        if arch_lower.contains("qwen3") {
             return 1;
         }
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
@@ -239,7 +244,11 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
                 5
             }
         }
-        "qwen3" | "qwen2" => 1,
+        "qwen3" => 1,
+        // qwen2 dirs route to arch_id=7 (Qwen2Carrier / hipfire-arch-qwen2) so
+        // the Q/K/V `attention_bias=true` biases load — the llama-family Dir
+        // loader (arch_id=1) drops them and produces garbage.
+        "qwen2" => 7,
         "llama" | "mistral" => 0,
         // Per-expert / VLM arches whose safetensors Dir paths route to their
         // dedicated carriers. model_type strings mirror the quantizer ingest
@@ -403,7 +412,17 @@ mod tests {
     fn known_model_types_route_as_expected() {
         assert_eq!(derive_arch_id(&json!({ "model_type": "llama" })), 0);
         assert_eq!(derive_arch_id(&json!({ "model_type": "mistral" })), 0);
-        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen2" })), 1);
+        // qwen2 → 7 (Qwen2Carrier, loads attn biases); qwen3 → 1 (LlamaCarrier).
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen2" })), 7);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3" })), 1);
+        assert_eq!(
+            derive_arch_id(&json!({ "architectures": ["Qwen2ForCausalLM"] })),
+            7
+        );
+        assert_eq!(
+            derive_arch_id(&json!({ "architectures": ["Qwen3ForCausalLM"] })),
+            1
+        );
         assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3.5" })), 5);
         assert_eq!(
             derive_arch_id(&json!({ "model_type": "qwen3.5", "num_experts": 8 })),

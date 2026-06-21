@@ -1222,12 +1222,15 @@ mod registry_tests {
     }
 
     /// Pin the intended routing so a future probe edit can't silently move an
-    /// existing model to the wrong carrier. `is_dir` matters: Qwen2 is HFQ id
-    /// 7 but its dir form derives to id 1 (→ llama path).
+    /// existing model to the wrong carrier. `is_dir` matters in general, but
+    /// Qwen2 routes to the qwen2 carrier in BOTH forms (HFQ id 7 and dir, which
+    /// derives to id 7) so its Q/K/V attention biases load — the llama-family
+    /// dir loader (id 1) drops them.
     #[test]
     fn known_ids_route_as_expected() {
         let cases: &[(u32, bool, &str)] = &[
             (7, false, "qwen2"),
+            (7, true, "qwen2"),
             (5, false, "qwen35"),
             (6, false, "qwen35"),
             (5, true, "qwen35"),

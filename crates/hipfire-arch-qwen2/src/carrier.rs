@@ -9,11 +9,12 @@ pub struct Qwen2Bundle {
     pub state: Qwen2State,
 }
 
-/// Build the Qwen2 GPU bundle from an HFQ source. Refusals owned here.
+/// Build the Qwen2 GPU bundle from an HFQ or safetensors-directory source.
+/// Refusals owned here. The Dir arm loads the full-precision F16 `.weight`
+/// tensors (and the Q/K/V `attention_bias=true` biases) via the source
+/// loaders — Qwen2 needs those biases, which the llama-family Dir loader
+/// drops, so Qwen2 dirs route here (arch_id=7) instead of to LlamaCarrier.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, String> {
-    let ModelSource::Hfq(mut hfq) = src else {
-        return Err("qwen2: directory source unsupported".into());
-    };
     if ctx.draft_path.is_some() {
         return Err(
             "DFlash not supported on arch_id=7 (qwen2 bring-up). Reload without a draft.".into(),
@@ -22,8 +23,21 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
     if ctx.cask.sidecar.is_some() {
         return Err("CASK eviction not supported on arch_id=7 (qwen2 bring-up). Reload without --cask-sidecar.".into());
     }
-    let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
-    let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    let (config, weights) = match src {
+        ModelSource::Hfq(mut hfq) => {
+            let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
+            let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            (config, weights)
+        }
+        ModelSource::Dir(source) => {
+            let config = crate::qwen2::config_from_source(&source).ok_or_else(|| {
+                "qwen2: failed to parse Qwen2Config from safetensors config.json".to_string()
+            })?;
+            let weights = crate::qwen2::load_weights_from_source(&source, &config, ctx.gpu)
+                .map_err(|e| format!("qwen2: load_weights_from_source: {e:?}"))?;
+            (config, weights)
+        }
+    };
     let state = Qwen2State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
         .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     Ok(Qwen2Bundle {

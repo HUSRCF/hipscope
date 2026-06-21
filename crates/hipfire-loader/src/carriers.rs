@@ -96,17 +96,16 @@ impl Carrier for Qwen2Carrier {
     fn name(&self) -> &'static str {
         "qwen2"
     }
-    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
-        // HFQ id 7 only; qwen2 dirs derive to id 1 → handled by LlamaCarrier.
-        !is_dir && arch_id == 7
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // HFQ id 7 and qwen2 safetensors dirs (derive_arch_id → 7). Both route
+        // here so the qwen2 Q/K/V `attention_bias=true` biases load (the
+        // llama-family Dir loader drops them).
+        arch_id == 7
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
         }
-        let ModelSource::Hfq(_) = &src else {
-            return Err("qwen2: directory source unsupported".into());
-        };
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
         Ok(LoadedModel {
