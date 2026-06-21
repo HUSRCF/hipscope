@@ -70,6 +70,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::AttnQ4Kv,          ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnInt8cKv,       ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnHfq8Kv,        ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        // F32 GQA-flash decode family (qwen2). derive does the shape selection;
+        // the registry just arch/batch-gates. Generic split-K kernels → Always.
+        (KernelKey::AttnGqaWarp,       ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (KernelKey::AttnFlashGqa,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (KernelKey::AttnFlash,         ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
     ];
     for (key, arch, shape) in attn_variants {
         registry.register(KernelVariant {

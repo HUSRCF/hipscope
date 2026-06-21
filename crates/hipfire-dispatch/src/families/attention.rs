@@ -896,6 +896,59 @@ fn dispatch_attend(
                     io.physical_cap,
                 ))
             }
+            // F32 GQA-flash decode family (qwen2). All three take the flash
+            // partials buffer; seq_len = io.pos+1, max_seq = io.physical_cap.
+            KernelKey::AttnGqaWarp => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_gqa_warp(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFlashGqa => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_gqa(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFlash => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    fp,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
 
             // ── Llama legacy quant KV (decode only) ──
             KernelKey::AttnHfq4Kv => {
@@ -1227,6 +1280,9 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2,
     KernelKey::AttnFlashAsym2Fwht,
     KernelKey::AttnGqaFused,
+    KernelKey::AttnGqaWarp,
+    KernelKey::AttnFlashGqa,
+    KernelKey::AttnFlash,
     // Batched
     KernelKey::AttnFlashAsym4BatchedMasked,
     KernelKey::AttnFlashAsym4FwhtBatchedMasked,

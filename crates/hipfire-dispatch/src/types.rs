@@ -367,6 +367,10 @@ pub enum KernelKey {
     AttnFlashQ8_0,
     AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
+    // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.
+    AttnGqaWarp,  // GQA, head_dim==128, long-ctx warp-reduce
+    AttnFlashGqa, // GQA, long-ctx split-K flash
+    AttnFlash,    // per-head split-K flash decode (GQA short-ctx + non-GQA fallback)
     // Llama legacy quant KV (decode only — no batched variants)
     AttnHfq4Kv,  // HFQ4-quantized KV cache attention
     AttnQ4Kv,    // Q4-quantized KV cache attention

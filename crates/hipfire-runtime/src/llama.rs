@@ -5395,6 +5395,9 @@ impl KvCache {
             quant_q4,
             quant_int8: self.quant_int8,
             quant_hfq8: self.is_hfq8_kv(),
+            // llama F32 KV uses the plain attention_f32 kernel (qwen2's GQA-flash
+            // selector is set only by qwen2's own attend_plan).
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: self.v_mode_bits(),
             // ── per-call defaults (note batch_size = 1, not 0), overwritten
             //    by the caller via functional update ──
@@ -9133,6 +9136,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 0,
@@ -9176,6 +9180,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 2,
@@ -9249,6 +9254,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
             flash_mode: 0,

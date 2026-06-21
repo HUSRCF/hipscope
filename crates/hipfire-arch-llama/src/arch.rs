@@ -249,6 +249,7 @@ impl Llama {
                     quant_q4,
                     quant_int8: false,
                     quant_hfq8: false,
+                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: 8,
                     pos,
                     flash_mode: 0,

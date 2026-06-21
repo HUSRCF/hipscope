@@ -1808,6 +1808,78 @@ impl DenseArch for Qwen2Dense<'_> {
             )
         }
     }
+    fn attend_plan(
+        &self,
+        l: usize,
+    ) -> HipResult<
+        Option<(
+            hipfire_dispatch::families::kv_tier::KvTierPlan,
+            hipfire_dispatch::families::attention::AttnParams<'_>,
+        )>,
+    > {
+        use hipfire_dispatch::families::kv_tier::{F32AttnPolicy, KvTierInputs, KvTierPlan};
+        let st = self.state;
+        let k = &self.knobs;
+        // Read HIPFIRE_GQA_FUSED here, mirroring the hand attend() (which also
+        // reads it per layer) — same result, strict no-op.
+        let fused = std::env::var("HIPFIRE_GQA_FUSED")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let pos = self.seq_len - 1;
+        let plan = KvTierPlan::derive(KvTierInputs {
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_q8: false,
+            quant_fwht: false,
+            quant_hfq4: false,
+            quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: F32AttnPolicy::Gqa {
+                n_heads: k.n_heads,
+                n_kv_heads: k.n_kv_heads,
+                head_dim: k.head_dim,
+                fused,
+            },
+            v_mode_bits: 8,
+            pos,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+        })
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        let io = hipfire_dispatch::families::attention::AttnParams {
+            q: &st.q,
+            k: &st.k,
+            v: &st.v,
+            k_cache: &st.k_cache[l],
+            v_cache: &st.v_cache[l],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &st.pos_buf,
+            pos,
+            positions: None,
+            n_heads: k.n_heads,
+            n_kv_heads: k.n_kv_heads,
+            head_dim: k.head_dim,
+            // KILL 3: the GQA kernels take max_seq as their last arg; the dispatch
+            // arm forwards io.physical_cap there, so it MUST be state.max_seq.
+            physical_cap: st.max_seq,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&st.attn_partials),
+            givens_cos: None,
+            givens_sin: None,
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &st.attn_out,
+        };
+        Ok(Some((plan, io)))
+    }
 }
 
 #[cfg(test)]

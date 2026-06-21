@@ -7,6 +7,23 @@
 
 use crate::types::KernelKey;
 
+/// F32-KV decode attention policy. Default `Simple` = the plain `attention_f32`
+/// kernel (llama/qwen35 F32 decode unchanged). `Gqa` = qwen2's 4-way GQA-flash
+/// selector (algorithm/occupancy choice, not a quant tier). The arch reads
+/// `HIPFIRE_GQA_FUSED` once per forward and passes it as `fused` — `derive`
+/// itself stays pure/GPU-free/unit-testable (no env reads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum F32AttnPolicy {
+    #[default]
+    Simple,
+    Gqa {
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        fused: bool,
+    },
+}
+
 /// Sealed decode of the KV-cache storage tier. Produced ONLY by `classify`.
 /// Carries every distinction any consumer branches on, including the
 /// Givens-vs-FWHT rotation distinction (the `fwht` field on asym variants).
@@ -127,6 +144,8 @@ pub struct KvTierInputs {
     pub quant_q4: bool,   // llama legacy Q4 KV mode
     pub quant_int8: bool, // llama INT8-per-column KV mode
     pub quant_hfq8: bool, // llama HFQ8 flat-layout KV mode
+    /// F32-KV attention policy (Simple = attention_f32; Gqa = qwen2 selector).
+    pub f32_policy: F32AttnPolicy,
     pub v_mode_bits: i32,
     // q8 use_flash heuristic inputs (moved from qwen35.rs:12885)
     pub pos: usize,
@@ -197,6 +216,7 @@ impl KvTierPlan {
             quant_q4,
             quant_int8,
             quant_hfq8,
+            f32_policy,
             v_mode_bits,
             pos,
             flash_mode,
@@ -255,7 +275,32 @@ impl KvTierPlan {
                 KTier::Q4 => (KernelKey::KvWriteQ4, KernelKey::AttnQ4Kv, false),
                 KTier::Int8c => (KernelKey::KvWriteInt8c, KernelKey::AttnInt8cKv, false),
                 KTier::Hfq8 => (KernelKey::KvWriteHfq8, KernelKey::AttnHfq8Kv, false),
-                KTier::F32 => (KernelKey::KvWriteF32, KernelKey::AttnF32, false),
+                KTier::F32 => {
+                    // F32 decode: Simple = plain attention_f32 (llama/qwen35);
+                    // Gqa = qwen2's 4-way selector (exact mirror of
+                    // Qwen2Dense::attend, qwen2.rs:1756-1809). seq_len == pos+1.
+                    let attend = match f32_policy {
+                        F32AttnPolicy::Simple => KernelKey::AttnF32,
+                        F32AttnPolicy::Gqa {
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            fused,
+                        } => {
+                            let gqa = n_kv_heads < n_heads;
+                            if fused && gqa {
+                                KernelKey::AttnGqaFused
+                            } else if gqa && head_dim == 128 && pos + 1 >= 4096 {
+                                KernelKey::AttnGqaWarp
+                            } else if gqa && pos + 1 >= 4096 {
+                                KernelKey::AttnFlashGqa
+                            } else {
+                                KernelKey::AttnFlash
+                            }
+                        }
+                    };
+                    (KernelKey::KvWriteF32, attend, false)
+                }
             }
         };
 
@@ -380,8 +425,12 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         // int8c / hfq8 single-token (llama)
         | (KvWriteInt8c, AttnInt8cKv)
         | (KvWriteHfq8, AttnHfq8Kv)
-        // f32 single-token
+        // f32 single-token (Simple + qwen2 GQA-flash family)
         | (KvWriteF32, AttnF32)
+        | (KvWriteF32, AttnGqaFused)
+        | (KvWriteF32, AttnGqaWarp)
+        | (KvWriteF32, AttnFlashGqa)
+        | (KvWriteF32, AttnFlash)
         // asym4 batched
         | (KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked)
         | (KvWriteAsym4FwhtBatched, AttnFlashAsym4FwhtBatchedMasked)
@@ -412,6 +461,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            f32_policy: F32AttnPolicy::Simple,
             v_mode_bits: 8,
             pos: 0,
             flash_mode: 0,
@@ -436,9 +486,90 @@ mod tests {
     fn f32_tier() {
         let plan = KvTierPlan::derive(default_inputs()).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteF32);
+        // Simple policy (default; llama/qwen35) → plain attention_f32, unchanged.
         assert_eq!(plan.attend_key, KernelKey::AttnF32);
         assert!(!plan.uses_givens);
         assert_eq!(plan.batch_size, 1);
+    }
+
+    // ── qwen2 F32 GQA-flash selector (exact mirror of Qwen2Dense::attend) ──
+    fn gqa_inputs(n_heads: usize, n_kv_heads: usize, head_dim: usize, fused: bool) -> KvTierInputs {
+        KvTierInputs {
+            f32_policy: F32AttnPolicy::Gqa {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                fused,
+            },
+            ..default_inputs()
+        }
+    }
+
+    #[test]
+    fn f32_gqa_fused() {
+        // fused && gqa → AttnGqaFused (write stays KvWriteF32).
+        let p = KvTierPlan::derive(gqa_inputs(14, 2, 128, true)).unwrap();
+        assert_eq!(p.write_key, KernelKey::KvWriteF32);
+        assert_eq!(p.attend_key, KernelKey::AttnGqaFused);
+    }
+
+    #[test]
+    fn f32_gqa_fused_needs_gqa() {
+        // fused but n_kv==n_heads (not gqa) → falls through to AttnFlash.
+        let p = KvTierPlan::derive(gqa_inputs(14, 14, 128, true)).unwrap();
+        assert_eq!(p.attend_key, KernelKey::AttnFlash);
+    }
+
+    #[test]
+    fn f32_gqa_warp_head128_long() {
+        // gqa && head_dim==128 && pos+1>=4096 → AttnGqaWarp.
+        let inputs = KvTierInputs {
+            pos: 4095,
+            ..gqa_inputs(14, 2, 128, false)
+        };
+        assert_eq!(
+            KvTierPlan::derive(inputs).unwrap().attend_key,
+            KernelKey::AttnGqaWarp
+        );
+    }
+
+    #[test]
+    fn f32_flash_gqa_long_non128() {
+        // gqa && pos+1>=4096 but head_dim!=128 → AttnFlashGqa.
+        let inputs = KvTierInputs {
+            pos: 5000,
+            ..gqa_inputs(14, 2, 64, false)
+        };
+        assert_eq!(
+            KvTierPlan::derive(inputs).unwrap().attend_key,
+            KernelKey::AttnFlashGqa
+        );
+    }
+
+    #[test]
+    fn f32_flash_short_ctx() {
+        // gqa but pos+1<4096 → AttnFlash (the else).
+        let inputs = KvTierInputs {
+            pos: 100,
+            ..gqa_inputs(14, 2, 128, false)
+        };
+        assert_eq!(
+            KvTierPlan::derive(inputs).unwrap().attend_key,
+            KernelKey::AttnFlash
+        );
+    }
+
+    #[test]
+    fn f32_flash_non_gqa_long() {
+        // not gqa (n_kv==n_heads), long ctx → AttnFlash.
+        let inputs = KvTierInputs {
+            pos: 5000,
+            ..gqa_inputs(14, 14, 128, false)
+        };
+        assert_eq!(
+            KvTierPlan::derive(inputs).unwrap().attend_key,
+            KernelKey::AttnFlash
+        );
     }
 
     #[test]
