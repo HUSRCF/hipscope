@@ -199,6 +199,19 @@ pub trait Speculator {
         Ok(position)
     }
 
+    /// The drafter's speculation window (DFlash block size / MTP K). The daemon
+    /// uses it for capacity checks and the decode-loop overflow guard.
+    fn block_size(&self) -> usize;
+
+    /// The target's usable context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Divergent-render checkpoint positions (ascending), for prompt-cache
+    /// resume planning. Default empty for drafters with no checkpoint ring.
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
     /// error rather than a silent VRAM leak.

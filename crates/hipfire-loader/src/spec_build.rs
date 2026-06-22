@@ -442,8 +442,40 @@ impl Speculator for DflashSpeculator {
         }
     }
 
-    // checkpoint / rewind_to use the trait's default no-op; the divergent-render
-    // rewind is wired through the daemon at the next step (prompt-cache reconcile).
+    fn block_size(&self) -> usize {
+        self.df.block_size
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.df.ctx_capacity
+    }
+
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        self.checkpoints.iter().map(|(p, _)| *p).collect()
+    }
+
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        // Restore the target's DeltaNet recurrent state to the checkpoint at
+        // `position` and drop the now-stale tail of the ring (mirrors the old
+        // divergent-render resume at generate_dflash 4021-4036). Caller rewinds
+        // seq_pos / conversation_tokens to match.
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        if let Some(idx) = self.checkpoints.iter().rposition(|(p, _)| *p == position) {
+            let _ = self.checkpoints[idx].1.restore_to(&mut slot.dn_state, gpu);
+            for (_, snap) in self.checkpoints.drain(idx + 1..) {
+                snap.free_gpu(gpu);
+            }
+        }
+        Ok(position)
+    }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         // Mirrors the `unload_model` dflash teardown + the checkpoint-ring free.
