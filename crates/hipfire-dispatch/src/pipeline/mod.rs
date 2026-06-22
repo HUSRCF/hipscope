@@ -511,73 +511,21 @@ pub fn run_moe_decode(
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
 
-    if res.mixed {
-        // ── Intra-layer MIXED-TIER routed dispatch (REAP SP2 Task 3) ──────────
+    {
+        // ── Routed-expert dispatch via device-indexed merged kernels ──────────
         //
-        // [GPU-GATE DEFERRED — implemented under embargo, numeric gate owed.]
-        // See the `mixed_dispatch_bucketing_equivalence` test stub below and the
-        // closing NOTE for exactly what a GPU session must verify.
+        // Mixed-tier graded quants (mq4p/mq3p/mq4r/mq4rug) carry a per-expert
+        // `expert_dtype_tags` table.  The merged kernels
+        // (`gemv_mixed_moe_gate_up_k8_indexed_batched` and
+        // `gemv_mixed_moe_down_k8_indexed_batched_expanded`) read that table
+        // on-device — no D2H, fully hipGraph-capturable — and branch the dequant
+        // per-block.  Uniform quants simply have `expert_dtype_tags = None` and
+        // fall through to the single-dtype arms below, which is byte-identical to
+        // the old pre-SP2 behaviour.
         //
-        // PROBLEM (the rank-alignment crux). The indexed kernels hardwire the
-        // top-k RANK to `blockIdx.y` (call it `krank`) and use it for BOTH the
-        // weight lookup AND the output address:
-        //   gate_up: expert_id = topk_indices[krank];
-        //            y_gate[krank*mi + row] / y_up[krank*mi + (row-mi)] = acc;
-        //   down   : expert_id = topk_indices[bid*K_TOP + krank];
-        //            expert_outputs[(bid*K_TOP + krank)*M + row] = acc;
-        //   combine: x_residual[token] += Σ_k topk_weights[k] * expert_outputs[k];
-        // `krank` always runs 0..gridDim.y starting at 0 — there is NO output-rank
-        // OFFSET parameter. So we canNOT hand a tier's kernel an arbitrary subset
-        // of ranks: it would write ranks 0,1,… (wrong slots) and the combine would
-        // pair them with the wrong weights.
+        // `run_moe_decode_mixed` (the old host-bucketing path) is retained below
+        // as dead code for reference and easy revert; it is no longer called.
         //
-        // APPROACH (A) PERMUTE-TO-CONTIGUOUS — chosen. We reorder the top-k so
-        // every tier's selected experts occupy a CONTIGUOUS rank range [lo, lo+n),
-        // then drive each tier's existing kernel over that range via byte-offset
-        // sub-views (`GpuTensor::sub_offset`) of every per-rank buffer. With the
-        // grid launched as `n` workgroups and the views based at `lo`, the kernel's
-        // internal `krank ∈ 0..n` lands exactly in slots `lo..lo+n` of
-        // gate_batch / up_batch / rot_batch / down_expanded, and reads
-        // topk_indices[lo+krank] — correct by construction. No new kernel arg.
-        //
-        // Why (A) and not (B) compact+scatter: the down kernel writes one row per
-        // (krank) with no scatter map, so a compact temp buffer would still need a
-        // SEPARATE scatter kernel to fan rows back to their real rank slots — a new
-        // kernel. (A) needs zero new kernels: contiguity makes a single sub-view
-        // address the whole bucket. The only cost is a host permute of the (small,
-        // k≤8) top-k arrays + one H2D re-upload.
-        //
-        // BUCKETING-EQUIVALENCE INVARIANT (the deferred GPU gate): for an all-ONE-
-        // tier table the partition yields a single bucket, the permutation is the
-        // IDENTITY (ranks already 0..k in order), lo=0, n=k, and the sub-views are
-        // full-buffer views — so the mixed path executes byte-for-byte the same
-        // kernel calls as the uniform `else` arm. Equivalence therefore holds by
-        // construction; the GPU gate confirms it numerically (bit-identical
-        // down_expanded). NOTE: in practice `resolve()` sets mixed=false for an
-        // all-one-tier table, so the mixed path is only entered with ≥2 tiers; the
-        // identity case is the equivalence proof, not a live decode path.
-        //
-        // PER-TIER STRIDES. A mixed layer's experts differ ONLY in quant tier, not
-        // in logical shape: every expert has the same gate_up M/K and down M/K
-        // (REAP re-quantizes an expert in place; it never reshapes it). The kernel
-        // `m`/`k` args are ELEMENT counts (the per-group BYTE stride — 136 B MQ4 vs
-        // 200 B MQ6 — is hardcoded inside each kernel, never passed). Hence the
-        // uniform `p.routed_gate_up_k` / `routed_down_m` / `routed_down_k` are
-        // tier-INVARIANT and reused verbatim for every bucket. The ONLY per-tier
-        // decision is which kernel symbol to dispatch (selected from the bucket's
-        // `tier`). This assumption is asserted at the dispatch switch (an
-        // unsupported tier returns UnsupportedVariant rather than miscomputing).
-        //
-        // HOST TOP-K SYNC. The top-k indices are produced on-device by
-        // `moe_topk_renorm_k8` above; to bucket them we need them host-side. This
-        // path does a single blocking D2H of `topk_indices` (k≤8 i32) and
-        // `topk_weights` (k≤8 f32) — negligible at decode, and the only
-        // host/device sync the mixed path adds over the uniform path. (The uniform
-        // path keeps the top-k fully on-device; mixing is inherently a
-        // host-routing decision, so one small D2H is unavoidable without a
-        // device-side partition kernel — a possible future optimization.)
-        run_moe_decode_mixed(gpu, p, &res, xr, gate_up_k, down_m, down_k, out_target)?;
-    } else {
         // Select gate_up + down GEMVs by their INDIVIDUAL dtypes, not a coupled
         // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
         // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
@@ -850,7 +798,7 @@ pub fn run_moe_decode(
                 1,
             ))?;
         }
-    } // end `else` (uniform path — BYTE-UNCHANGED from pre-SP2)
+    } // end routed-expert dispatch block
 
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     // EP: routed combine accumulates into `out_target` (the zeroed partial when
