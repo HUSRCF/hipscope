@@ -1050,35 +1050,15 @@ fn greedy_trunk_spine_accept(
         argmax_per_pos.len(),
         candidates.len(),
     );
-
-    let mut accept_count = 0usize;
-    let mut hit_eos = false;
-    let mut committed: Vec<u32> = Vec::with_capacity(candidates.len() + 1);
-
-    for (k, &candidate) in candidates.iter().enumerate() {
-        if argmax_per_pos[k] == candidate {
-            committed.push(candidate);
-            accept_count += 1;
-            if candidate == eos_token_id {
-                hit_eos = true;
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if !hit_eos {
-        let bonus = argmax_per_pos[accept_count];
-        committed.push(bonus);
-        if bonus == eos_token_id {
-            hit_eos = true;
-        }
-    }
-
+    // Delegate to the shared greedy accept rule. MTP enables EOS-early-stop
+    // (eos=Some): an accepted candidate equal to EOS stops the prefix with no
+    // bonus. The trunk argmax IS the `target_pick`.
+    let acc =
+        hipfire_runtime::spec::accept_greedy_prefix(candidates, argmax_per_pos, Some(eos_token_id));
     GreedyTrunkSpineAccept {
-        committed,
-        accept_count,
-        hit_eos,
+        committed: acc.committed,
+        accept_count: acc.accepted,
+        hit_eos: acc.hit_eos,
     }
 }
 

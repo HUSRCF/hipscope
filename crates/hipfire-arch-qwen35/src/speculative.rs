@@ -3466,14 +3466,13 @@ pub fn spec_step_dflash(
         } else {
             std::borrow::Cow::Borrowed(verify_out.argmax_per_pos.as_slice())
         };
-        for i in 0..b - 1 {
-            if argmax_per_pos[i] == block[i + 1] {
-                accept_len += 1;
-            } else {
-                break;
-            }
-        }
-        bonus_token = argmax_per_pos[accept_len];
+        // Shared greedy accept-prefix (eos=None: DFlash never early-stops on EOS
+        // here — the daemon handles EOS downstream). drafts = block[1..b],
+        // target_pick = the (repeat-penalty / n-gram-adjusted) argmax;
+        // bonus = target_pick[accept_len].
+        let acc = hipfire_runtime::spec::accept_greedy_prefix(&block[1..b], &argmax_per_pos, None);
+        accept_len = acc.accepted;
+        bonus_token = *acc.committed.last().expect("eos=None yields a bonus");
 
         if logit_dump_active {
             // Inspect the acceptance boundary. If accept_len < b-1 the block
