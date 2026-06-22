@@ -3949,7 +3949,31 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// rows — so DFlash keeps its decode speedup AND skips re-prefilling the cached
 /// prefix. A divergent / first / raw-prompt turn full-resets and prefills the
 /// whole conversation as before.
-#[allow(clippy::too_many_arguments)]
+/// Arch-dispatched borrow of the spec-decode target as `&mut dyn SpecTarget`.
+///
+/// qwen35 moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
+/// (which reopens the HfqFile and restores the bundle on Drop); llama borrows its
+/// `LlamaBundle` in place (pure attention needs no HfqFile reopen). This is what
+/// lets `generate_dflash` stay arch-generic — it only ever sees `&mut dyn
+/// SpecTarget`.
+// One short-lived stack local per generate_dflash call; the qwen35 variant
+// carries the moved bundle by value (same rationale as Qwen35SlotGuard's own
+// `Parked` enum). Boxing to flatten the delta isn't worth it here.
+#[allow(clippy::large_enum_variant)]
+enum SpecSlotGuard<'m> {
+    Qwen35(Qwen35SlotGuard<'m>),
+    Llama(&'m mut hipfire_arch_llama::LlamaBundle),
+}
+
+impl SpecSlotGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        match self {
+            SpecSlotGuard::Qwen35(g) => Ok(g.slot()? as &mut dyn SpecTarget),
+            SpecSlotGuard::Llama(b) => Ok(&mut **b as &mut dyn SpecTarget),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_dflash(
     m: &mut LoadedModel,
@@ -4151,16 +4175,35 @@ fn generate_dflash(
             return;
         }
     };
-    let mut guard = match Qwen35SlotGuard::take(&mut m.state, &m.model_path) {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            return;
+    // Arch-dispatched target borrow (`m.arch_id` is Copy → no borrow conflict
+    // with the `&mut m.state` below). qwen35 moves the bundle out + reopens its
+    // HfqFile via the RAII guard (restored on Drop); llama borrows its bundle in
+    // place (no HfqFile needed). Both yield `&mut dyn SpecTarget`.
+    let mut guard = if m.arch_id == 5 || m.arch_id == 6 {
+        match Qwen35SlotGuard::take(&mut m.state, &m.model_path) {
+            Ok(g) => SpecSlotGuard::Qwen35(g),
+            Err(e) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                    id, e
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    } else {
+        match m.state.as_mut() {
+            Some(ModelState::Llama(b)) => SpecSlotGuard::Llama(b),
+            _ => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"spec path: unsupported arch state for arch_id {}"}}"#,
+                    id, m.arch_id
+                );
+                let _ = stdout.flush();
+                return;
+            }
         }
     };
     let spec = m.speculator.as_mut().unwrap();
@@ -4404,11 +4447,12 @@ fn generate_dflash(
     // forwards inside the speculator read it for RoPE phase automatically. The
     // drafter-local hidden cache is compacted to match via `on_evict`.
     if let Some(ref ev) = m.eviction {
-        if let Some(res) = ev.maybe_evict(gpu, &mut slot.kv_cache, position).unwrap() {
+        if let Some(res) = ev.maybe_evict(gpu, slot.kv_cache_mut(), position).unwrap() {
             let pre_phys = position;
+            let compact_offset = slot.kv_cache_mut().compact_offset;
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                pre_phys, res.new_physical, slot.kv_cache.compact_offset,
+                pre_phys, res.new_physical, compact_offset,
             );
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
@@ -4459,7 +4503,7 @@ fn generate_dflash(
     // NOT enter the spec loop, otherwise spec_step_dflash drafts + verifies a whole
     // block seeded on an already-terminal token before stopping. The committed-tail
     // check inside the loop applies this identical triple to every subsequent token.
-    let first_token_is_eos = first_token == slot.config.eos_token
+    let first_token_is_eos = first_token == slot.eos_token()
         || im_end_token == Some(first_token)
         || tokenizer.is_terminator(first_token);
 
@@ -4580,9 +4624,7 @@ fn generate_dflash(
                 let _ = stdout.flush();
             }
             generated += 1;
-            if tok == slot.config.eos_token
-                || im_end_token == Some(tok)
-                || tokenizer.is_terminator(tok)
+            if tok == slot.eos_token() || im_end_token == Some(tok) || tokenizer.is_terminator(tok)
             {
                 hit_eos = true;
                 break;
@@ -4648,7 +4690,7 @@ fn generate_dflash(
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
         if let Some(ref ev) = m.eviction {
-            if let Some(res) = ev.maybe_evict(gpu, &mut slot.kv_cache, position).unwrap() {
+            if let Some(res) = ev.maybe_evict(gpu, slot.kv_cache_mut(), position).unwrap() {
                 let pre_phys = position;
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
@@ -6214,7 +6256,7 @@ fn generate(
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
     if m.speculator.is_some()
         && temp <= 1e-6
-        && (m.arch_id == 5 || m.arch_id == 6)
+        && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
     {

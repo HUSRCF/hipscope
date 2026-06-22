@@ -286,4 +286,8 @@ impl SpecTarget for ModelSlot {
     fn ctx_capacity(&self) -> usize {
         self.kv_cache.physical_cap
     }
+
+    fn kv_cache_mut(&mut self) -> &mut hipfire_runtime::llama::KvCache {
+        &mut self.kv_cache
+    }
 }

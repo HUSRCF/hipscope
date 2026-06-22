@@ -49,6 +49,8 @@
 
 pub mod arch;
 pub mod carrier;
+/// LLaMA-family implementation of the arch-generic speculative-decode seam.
+pub mod spec_impl;
 
 /// Re-export the LLaMA-family model module so callers can write
 /// `hipfire_arch_llama::llama::forward_scratch(...)` etc., matching the

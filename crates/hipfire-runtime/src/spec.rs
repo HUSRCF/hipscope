@@ -166,6 +166,11 @@ pub trait SpecTarget {
 
     /// The target's usable context capacity (decode-loop overflow guard).
     fn ctx_capacity(&self) -> usize;
+
+    /// The target's KV cache, for the daemon's FlashCASK eviction (which operates
+    /// on the shared `llama::KvCache` for all spec-capable arches). Eviction is
+    /// `None` by default for pure-attention arches, so this is exercised rarely.
+    fn kv_cache_mut(&mut self) -> &mut crate::llama::KvCache;
 }
 
 /// Erased, arch-specific verify scratch owned by a model-free speculator.

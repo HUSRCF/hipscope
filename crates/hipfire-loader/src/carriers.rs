@@ -510,8 +510,13 @@ impl Carrier for LlamaCarrier {
         };
 
         // ── single shared tail ──
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
+        // no DFlash draft and no eviction by default; the arm builds its verify
+        // scratch lazily on first prefill, so only ctx_capacity is needed here.
+        let speculator = crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

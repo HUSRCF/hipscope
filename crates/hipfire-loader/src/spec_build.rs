@@ -555,7 +555,9 @@ pub fn build_speculator(
         return Some(build_dflash_speculator(df, eviction_is_none));
     }
     let ngram_enabled = std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() == Some("1");
-    if ngram_enabled && (arch_id == 5 || arch_id == 6) {
+    // Spec-capable arches with a `SpecTarget` impl: qwen35 DeltaNet (5/6) and
+    // the dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2).
+    if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6) {
         let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
             .ok()
             .and_then(|v| v.parse().ok())
