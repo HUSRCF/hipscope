@@ -489,3 +489,36 @@ impl Speculator for DflashSpeculator {
         }
     }
 }
+
+/// Construct the DFlash speculator from a freshly-loaded `DflashState`, resolving
+/// the env config the daemon's old `generate_dflash` read inline: `path_c_mode`
+/// (`HIPFIRE_DDTREE_PATH_C`), checkpoint resume (`HIPFIRE_DFLASH_CKPT_RESUME` +
+/// no-eviction), and interval/cap (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching
+/// the daemon's `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
+pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
+    let path_c_mode: Option<&'static str> =
+        match std::env::var("HIPFIRE_DDTREE_PATH_C").ok().as_deref() {
+            Some("phase1") => Some("phase1"),
+            Some("phase2") => Some("phase2"),
+            _ => None,
+        };
+    let resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
+        && eviction_is_none;
+    let ck_interval = std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048usize)
+        .max(256);
+    let ck_cap = std::env::var("HIPFIRE_CACHE_CKPT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8usize)
+        .max(1);
+    Box::new(DflashSpeculator::new(
+        df,
+        path_c_mode,
+        resume_enabled,
+        ck_interval,
+        ck_cap,
+    ))
+}
