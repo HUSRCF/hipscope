@@ -12,9 +12,7 @@
 //! [`NgramSpeculator`] from `spec_ngram`. The registry is what lets the loader
 //! pick a drafter at load time without the daemon learning which arm ran.
 
-use crate::spec_ngram::NgramSpeculator;
 use crate::{DflashState, ModelState};
-use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35Config};
 use hipfire_arch_qwen35::speculative::{
     apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
@@ -26,6 +24,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
     EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
+use hipfire_runtime::spec_ngram::NgramSpeculator;
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -541,17 +540,15 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
 ///    speedup with no draft model. Opt-in until validated.
 /// 3. Otherwise `None` (AR-only).
 ///
-/// The n-gram arm needs target-side verify scratch, so it takes the target
-/// `config` / DeltaNet shape / context capacity (the same inputs
-/// `load_dflash_state` already has at the call site).
-#[allow(clippy::too_many_arguments)]
+/// The n-gram arm is arch-typeless: it builds its target-side verify scratch
+/// lazily on first `prefill` via `SpecTarget::new_spec_scratch`, so this fn needs
+/// only `arch_id`, the drafter env, and the target's `ctx_capacity`. `arch_id`
+/// gates which arches the model-free arm is enabled for (qwen35 5/6 today; llama
+/// added with its `SpecTarget` impl).
 pub fn build_speculator(
     arch_id: u32,
     dflash: Option<DflashState>,
     eviction_is_none: bool,
-    gpu: &mut Gpu,
-    target_config: &Qwen35Config,
-    target_dn: &DeltaNetState,
     ctx_capacity: usize,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
@@ -568,26 +565,15 @@ pub fn build_speculator(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2u32);
-        match NgramSpeculator::new(
-            gpu,
-            target_config,
-            target_dn,
-            ctx_capacity,
+        eprintln!(
+            "  n-gram speculator enabled (model-free, K={}, min_count={})",
+            block_size, min_count
+        );
+        return Some(Box::new(NgramSpeculator::new(
             block_size,
+            ctx_capacity,
             min_count,
-        ) {
-            Ok(s) => {
-                eprintln!(
-                    "  n-gram speculator enabled (model-free, K={}, min_count={})",
-                    block_size, min_count
-                );
-                return Some(Box::new(s));
-            }
-            Err(e) => {
-                eprintln!("  n-gram speculator init failed: {e} — AR only");
-                return None;
-            }
-        }
+        )));
     }
     None
 }

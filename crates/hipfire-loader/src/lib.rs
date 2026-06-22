@@ -11,9 +11,6 @@ pub use carriers::*;
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel`/`ModelState` and the arch crates are in scope.
 pub mod spec_build;
-/// Model-free n-gram / PLD speculator — the second `Speculator` arm, picked by
-/// `spec_build::build_speculator` when no DFlash draft is loaded.
-pub mod spec_ngram;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -706,15 +703,8 @@ fn finish_qwen35_load(
     // `config`/`dn_state` are borrowed only for the duration of the n-gram arm's
     // scratch construction (snapshot copied to GPU), released before `bundle`
     // moves into `state`. `None` ⇒ AR-only model.
-    let speculator = crate::spec_build::build_speculator(
-        arch_id,
-        dflash,
-        eviction.is_none(),
-        ctx.gpu,
-        config,
-        dn_state,
-        physical_cap,
-    );
+    let speculator =
+        crate::spec_build::build_speculator(arch_id, dflash, eviction.is_none(), physical_cap);
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
