@@ -223,6 +223,15 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
 
+        // Mirror the daemon's pre-seed drafter setup (generate_dflash 4064-4072):
+        // always clear the host hidden buffer; on a full prefill drop the draft's
+        // upload/projection tracking. On a cache HIT it is PRESERVED so the draft
+        // reuses the cached [0..start_pos] projections and only projects the suffix.
+        self.df.target_hidden_host.clear();
+        if !cache_hit {
+            self.df.draft_scratch.reset_upload_tracking();
+        }
+
         // Seed the target's hidden state into the drafter ring (chunked prefill
         // with hidden extraction). Cache hit → seed only the suffix from
         // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
