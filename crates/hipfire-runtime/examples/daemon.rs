@@ -8933,6 +8933,13 @@ fn generate_deepseek4(
             Some("off") => false,
             _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
         });
+    // Default k=2. The K+1 verify (full-accept bonus, shared accept-core) makes
+    // k=2 both highest-accept AND highest-throughput on the deepseek4-mtp bench
+    // (code +28% / prose +22% / math +5% vs the old k=3 default; k=3 itself
+    // regresses 9-12% under K+1 because full-accepts are rare there). `m.mtp_k`
+    // was only ever the generic skeleton default (3) for deepseek4 — nothing
+    // sets it from the model — so a fixed 2 here is the deepseek4-specific
+    // default, still overridable via HIPFIRE_DEEPSEEK4_SPEC_K / HIPFIRE_MTP_K.
     let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -8941,7 +8948,7 @@ fn generate_deepseek4(
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
-        .unwrap_or(m.mtp_k);
+        .unwrap_or(2);
 
     let t0 = Instant::now();
 
