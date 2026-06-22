@@ -52,6 +52,25 @@ pub struct SpecStep {
     pub accepted: usize,
 }
 
+impl SpecStep {
+    /// Build a step from an `emit` iterator, hiding the `SmallVec` backing from
+    /// caller crates that don't depend on `smallvec` (the per-arch lowering
+    /// adapters `lower_qwen35` / `lower_mtp` live in the loader / arch crates).
+    pub fn new(
+        emit: impl IntoIterator<Item = u32>,
+        next_seed: u32,
+        proposed: usize,
+        accepted: usize,
+    ) -> Self {
+        Self {
+            emit: emit.into_iter().collect(),
+            next_seed,
+            proposed,
+            accepted,
+        }
+    }
+}
+
 /// The verifier (target) model's GPU state, borrowed by [`Speculator::step`]
 /// for the duration of one window. A `Speculator` impl recovers its concrete
 /// target via `as_any_mut().downcast_mut::<T>()` (e.g. the qwen35 `ModelSlot`).
