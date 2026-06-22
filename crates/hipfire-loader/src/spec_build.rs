@@ -5,13 +5,16 @@
 //! `LoadedModel`/`ModelState` and the arch crates are in scope.
 //!
 //! Contents: the [`Qwen35SlotGuard`] RAII target borrow, the [`DflashSpeculator`]
-//! impl (which owns `DflashState` + the divergent-render checkpoint ring), and
-//! [`build_dflash_speculator`], the load-time constructor. A generic
-//! `build_speculator` registry that dispatches on arch / draft kind is future
-//! work — it only earns its keep once a second drafter family (n-gram, MTP)
-//! exists.
+//! impl (which owns `DflashState` + the divergent-render checkpoint ring),
+//! [`build_dflash_speculator`] (its load-time constructor), and the generic
+//! [`build_speculator`] registry that dispatches on draft kind: a loaded DFlash
+//! draft → [`DflashSpeculator`], else (opt-in) the model-free
+//! [`NgramSpeculator`] from `spec_ngram`. The registry is what lets the loader
+//! pick a drafter at load time without the daemon learning which arm ran.
 
+use crate::spec_ngram::NgramSpeculator;
 use crate::{DflashState, ModelState};
+use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35Config};
 use hipfire_arch_qwen35::speculative::{
     apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
@@ -525,4 +528,66 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         ck_interval,
         ck_cap,
     ))
+}
+
+/// Pick the speculative-decode drafter for a freshly-loaded model. This is the
+/// single load-time registry the daemon's `generate_dflash` routes through —
+/// it never learns which arm was chosen.
+///
+/// Dispatch:
+/// 1. A loaded DFlash draft (`dflash = Some`) → [`DflashSpeculator`].
+/// 2. Else, when `HIPFIRE_NGRAM_DRAFT=1` and the target is a qwen35 DeltaNet
+///    arch (`arch_id` 5/6), the model-free [`NgramSpeculator`] — spec-decode
+///    speedup with no draft model. Opt-in until validated.
+/// 3. Otherwise `None` (AR-only).
+///
+/// The n-gram arm needs target-side verify scratch, so it takes the target
+/// `config` / DeltaNet shape / context capacity (the same inputs
+/// `load_dflash_state` already has at the call site).
+#[allow(clippy::too_many_arguments)]
+pub fn build_speculator(
+    arch_id: u32,
+    dflash: Option<DflashState>,
+    eviction_is_none: bool,
+    gpu: &mut Gpu,
+    target_config: &Qwen35Config,
+    target_dn: &DeltaNetState,
+    ctx_capacity: usize,
+) -> Option<Box<dyn Speculator>> {
+    if let Some(df) = dflash {
+        return Some(build_dflash_speculator(df, eviction_is_none));
+    }
+    let ngram_enabled = std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() == Some("1");
+    if ngram_enabled && (arch_id == 5 || arch_id == 6) {
+        let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize)
+            .max(2);
+        let min_count = std::env::var("HIPFIRE_NGRAM_MIN_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2u32);
+        match NgramSpeculator::new(
+            gpu,
+            target_config,
+            target_dn,
+            ctx_capacity,
+            block_size,
+            min_count,
+        ) {
+            Ok(s) => {
+                eprintln!(
+                    "  n-gram speculator enabled (model-free, K={}, min_count={})",
+                    block_size, min_count
+                );
+                return Some(Box::new(s));
+            }
+            Err(e) => {
+                eprintln!("  n-gram speculator init failed: {e} — AR only");
+                return None;
+            }
+        }
+    }
+    None
 }

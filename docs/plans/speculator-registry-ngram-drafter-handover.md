@@ -1,5 +1,29 @@
 # Handover — `build_speculator` registry + n-gram drafter
 
+> **STATUS 2026-06-22 (implemented):** Both items landed.
+> `spec_build::build_speculator` registry dispatches DFlash → else opt-in
+> `NgramSpeculator` (new `crates/hipfire-loader/src/spec_ngram.rs`), gated
+> `HIPFIRE_NGRAM_DRAFT=1` for qwen35 arch 5/6 with no draft. The daemon gate
+> needed **no** change (greedy `Some(speculator)` already routes through
+> `generate_dflash`; n-gram is greedy).
+>
+> **Validation:** `serve-multiturn-gate.sh` PASS (AR + DFlash arms — registry
+> refactor no-regression). n-gram arm **coherent on 9B** (`coherence_probe`
+> verdict OK on code + copy prompts).
+>
+> **Perf is situational (the headline finding).** The DeltaNet verify runs the
+> GDN recurrence *sequentially* over the `b`-token block, so a window costs ~`b`×
+> the DeltaNet part for `accept+1` tokens. It WINS only when PLD acceptance is
+> high (high prompt-copy: edit/refactor/verbatim) — measured **+15% decode** on a
+> 9B copy task (46.3 vs 40.2 tok/s). On low-copy "write" prompts the verify cost
+> dominates and it LOSES to AR (~22 vs 40 tok/s on the 9B lru-cache prompt).
+> Implemented two cheap-path optimizations: skip the rewind on full-accept, and
+> batched (not per-token) replay on partial-accept. The tiny 0.8B loops under the
+> arm (batched-verify greedy ≠ per-token AR; the model is too fragile) — opt-in
+> + 9B-coherent makes that acceptable, but it's why the flag stays off by default.
+> A broad win needs a draft *model* (DFlash: block-parallel verify + GDN-tape
+> rollback), which the model-free arm structurally cannot match on DeltaNet.
+
 **Branch:** `feature/speculator-abstraction`
 **Written:** 2026-06-22 (after the daemon DFlash fold landed)
 **Goal of next session:** (1) introduce a generic `build_speculator` registry that
