@@ -42,7 +42,14 @@ n-gram (`eos=None`), deepseek4 **non-grammar** path. Stays bespoke: DFlash
 4. **MTP onto core** — replace `greedy_trunk_spine_accept` body with the core
    (eos=Some). → verify: MTP coherence (mtp gate / deepseek4-or-qwen35-MTP run).
 5. **deepseek4 non-grammar onto core**; grammar path stays sequential. → verify:
-   deepseek4 coherence (no-tools + tool-call).
+   deepseek4 coherence (no-tools + tool-call). **DONE (e8fb7191).** Routed the
+   non-grammar accept through `accept_greedy_prefix` by widening verify K→K+1
+   (the (K+1)'th position is the full-accept bonus the core requires); grammar
+   path stays sequential + appends the same bonus. Spec output byte-identical to
+   fresh greedy decode; coherence-gate-deepseek4-mtp --full OK on all 6. Default
+   `spec_k` flipped 3→2: K+1 makes k=2 highest-accept AND highest-throughput
+   (before→after: k2 code +28%/prose +22%/math +5%; k3 regresses 9-12% so it's
+   no longer the default, but k2-after beats the old k3 default everywhere).
 6. **Unify `SpecStepResult`** — single struct in runtime (`{drafted, accepted,
    bonus, committed}`); qwen35 + deepseek4 lower from it. → verify: build all.
 7. **`ChainSpeculator<BlockDrafter>`** — `BlockDrafter::propose(emitted, seed, k)
