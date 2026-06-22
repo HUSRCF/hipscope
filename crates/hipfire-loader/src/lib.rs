@@ -31,6 +31,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::spec::Speculator;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -313,7 +314,12 @@ pub struct LoadedModel {
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
-    pub dflash: Option<DflashState>,
+    /// The model's speculative-decode drafter+verifier, when a draft model is
+    /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
+    /// DFlash chain / DDTree tree / future MTP). Replaces the old
+    /// `dflash: Option<DflashState>` field — the `DflashState` now lives inside
+    /// the `DflashSpeculator` impl behind this trait object.
+    pub speculator: Option<Box<dyn Speculator>>,
     pub chat_template: Option<String>,
     // Author-recommended sampling defaults, baked into the .hfq's
     // `generation_config` metadata and read at load time on the HFQ source
@@ -377,7 +383,7 @@ impl LoadedModel {
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,
-            dflash: None,
+            speculator: None,
             chat_template,
             rec_temperature: None,
             rec_top_p: None,
@@ -691,12 +697,17 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // Wrap the loaded DFlash state in the arch-generic speculator. `eviction`
+    // is borrowed (not moved) here, so it is still available for the struct
+    // literal below. `None` draft ⇒ no speculator (AR-only model).
+    let speculator =
+        dflash.map(|s| crate::spec_build::build_dflash_speculator(s, eviction.is_none()));
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
         state,
         eviction,
-        dflash,
+        speculator,
         vision_config,
         vision_weights,
         max_seq: ctx.max_seq,
@@ -1543,9 +1554,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
-    if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+    if let Some(spec) = m.speculator {
+        // Frees the drafter's GPU buffers (draft weights + scratch) AND its
+        // checkpoint ring — a drafter that forgets is a compile error, not a
+        // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
+        // empty) is still drained below for defense-in-depth.
+        spec.free(gpu);
     }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);

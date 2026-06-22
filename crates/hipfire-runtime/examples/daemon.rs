@@ -30,7 +30,6 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -41,8 +40,9 @@ use std::path::Path;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 
+use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::spec::{EvictRetain, PrefillOutcome, SpecTarget};
 
 /// Abort-target request ID. Set asynchronously by the background
 /// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
@@ -2033,7 +2033,11 @@ fn main() {
                     .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64)
                     as f32)
                     .max(0.0);
-                let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                let frequency_penalty = (msg
+                    .get("frequency_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
                 // Request-driven top_k / min_p (W7 P2). Fallback ladder:
                 // explicit request field > .hfq/registry-baked rec_top_k /
                 // rec_min_p > None. None reproduces the legacy sampler exactly
@@ -2145,6 +2149,13 @@ fn main() {
                         m.conversation_tokens.clear();
                         free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
                         free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                        // The DFlash checkpoint ring now lives inside the
+                        // speculator (m.dflash_checkpoints is vestigial/empty),
+                        // so free THAT ring on conversation reset too — else its
+                        // GPU snapshots persist until the next prefill-miss.
+                        if let Some(s) = m.speculator.as_mut() {
+                            s.reset(&mut gpu);
+                        }
                         // qwen35(-vl) recurrent state lives in the bundle
                         // (ModelState::Qwen35), not the always-None
                         // m.dn_state/m.kv_cache direct fields.
@@ -2300,10 +2311,25 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
-                        presence_penalty, frequency_penalty,
-                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        m,
+                        &mut gpu,
+                        pflash_drafter_gpu.as_mut(),
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        top_k,
+                        min_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                        presence_penalty,
+                        frequency_penalty,
+                        budget_alert_at_tok,
+                        &budget_alert_text,
+                        max_think_tokens,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -2327,6 +2353,10 @@ fn main() {
                     m.conversation_tokens.clear();
                     free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
                     free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                    // Free the speculator's (relocated) checkpoint ring on reset.
+                    if let Some(s) = m.speculator.as_mut() {
+                        s.reset(&mut gpu);
+                    }
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -2948,8 +2978,29 @@ fn generate_ep(
         m.deepseek4_eos_tok
     };
     match m.arch_id {
-        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think, sampling),
-        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop, sampling),
+        10 => ep_serve_minimax(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            stop,
+            primed_think,
+            sampling,
+        ),
+        _ => ep_serve_ds4(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            think_mode,
+            tools,
+            stop,
+            sampling,
+        ),
     }
 }
 
@@ -3026,7 +3077,12 @@ fn ep_reset_after_abort(m: &mut LoadedModel) {
 
 /// FIX #3: emit the standard `aborted` + `done(finish_reason=aborted)` event
 /// pair (mirrors the single-GPU AR abort path) then reset EP state.
-fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, completion_tokens: usize) {
+fn ep_emit_abort(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    m: &mut LoadedModel,
+    completion_tokens: usize,
+) {
     let _ = writeln!(
         stdout,
         r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -3042,9 +3098,20 @@ fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, co
 }
 
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String], sampling: EpSampling) {
-    use std::time::Instant;
+fn ep_serve_ds4(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    stop: &[String],
+    sampling: EpSampling,
+) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
+    use std::time::Instant;
 
     let prompt_n = prompt_ids.len();
 
@@ -3205,8 +3272,15 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
                 aborted_in_prefill = true;
                 break;
             }
-            if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            if let Err(e) = deepseek4::forward::forward_ep(
+                gpus, weights, config, state, partials, t, pos as u32,
+            ) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
+                    id,
+                    format!("{e}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -3243,7 +3317,12 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#,
+                        id,
+                        format!("{e:?}").replace('"', "'")
+                    );
                     let _ = stdout.flush();
                     return;
                 }
@@ -3287,7 +3366,9 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             sampling.top_k,
             sampling.min_p,
         );
-        if next == eos_tok { break; }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         for ev in parser.feed(&piece) {
             absorb_event(&ev);
@@ -3340,7 +3421,12 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#,
+                        id,
+                        format!("{e:?}").replace('"', "'")
+                    );
                     let _ = stdout.flush();
                     return;
                 }
@@ -3417,7 +3503,17 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 /// reuse — see generate_minimax for the full rationale). `primed_think`
 /// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
 #[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool, sampling: EpSampling) {
+fn ep_serve_minimax(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    stop: &[String],
+    primed_think: bool,
+    sampling: EpSampling,
+) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
 
@@ -3538,7 +3634,9 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     // prefix is kept). On a mid-prefill abort, ep_emit_abort resets every
     // rank's KV cursor, so leaving conversation_tokens at the prefix keeps the
     // cache consistent with KV state.
-    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] { m.conversation_tokens.push(t); }
+    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] {
+        m.conversation_tokens.push(t);
+    }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     // FIX #1 / FIX #3 (ep-no-abort): client cancel during prefill → stop
     // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
@@ -3570,7 +3668,12 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#,
+                    id,
+                    format!("{e:?}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -3598,7 +3701,9 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
             sampling.top_k,
             sampling.min_p,
         );
-        if next == eos_tok { break; }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
@@ -3634,15 +3739,26 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         logits = match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#,
+                    id,
+                    format!("{e:?}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
         };
     }
-    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
+    ep_emit_done(
+        stdout,
+        id,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+    );
 }
-
 
 /// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
 struct PromptCachePlan {
@@ -3851,10 +3967,11 @@ fn generate_dflash(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
 ) {
-    use hipfire_arch_qwen35::speculative::{
-        spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
-        ModelSlotConfig, Phase2Snapshots, SpecStats,
-    };
+    // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
+    // SpecStats that this function used to drive inline now live behind the
+    // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
+    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/on_evict/
+    // reset/rewind_to calls below.
 
     // Prompt build: same two-path branch as the AR-path generate() — when
     // `HIPFIRE_JINJA_CHAT=1` AND the model carries a chat_template, render
@@ -3968,7 +4085,11 @@ fn generate_dflash(
     let dflash_resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
         != Some("0")
         && m.eviction.is_none();
-    let dflash_ckpt_positions: Vec<usize> = m.dflash_checkpoints.iter().map(|(p, _)| *p).collect();
+    let dflash_ckpt_positions: Vec<usize> = m
+        .speculator
+        .as_ref()
+        .map(|s| s.checkpoint_positions())
+        .unwrap_or_default();
     let cache_plan: Option<PromptCachePlan> = if !try_jinja {
         messages_history.map(|hist| {
             let tok = m.tokenizer.as_ref().unwrap();
@@ -4012,48 +4133,70 @@ fn generate_dflash(
         None => (prompt_tokens.clone(), 0, false, 0),
     };
 
-    // Divergent-render RESUME: restore the DeltaNet recurrent state to the
-    // checkpoint and rewind seq_pos/conversation_tokens/checkpoints to it. The
-    // turn then proceeds exactly like a HIT with start_pos == ckpt (the cache
-    // plan already set cache_hit=true + start_pos=ckpt), re-prefilling only the
-    // tail. The FullAttention KV[0..ckpt] is still resident (positional), and
-    // the draft's target_hidden[0..ckpt] is preserved from the prior turn.
-    if let Some(ckpt) = resume_from {
-        if let Some(idx) = m.dflash_checkpoints.iter().rposition(|(p, _)| *p == ckpt) {
-            // RESTORE only (do NOT zero): roll the bundle's DeltaNet state back
-            // to the checkpoint. State lives in ModelState::Qwen35, not the
-            // always-None m.dn_state. Disjoint split: m.state and
-            // m.dflash_checkpoints are different fields of `m`.
-            if let (Some(ModelState::Qwen35(b)), Some((_, snap))) =
-                (m.state.as_mut(), m.dflash_checkpoints.get(idx))
-            {
-                let _ = snap.restore_to(&mut b.dn_state, gpu);
-            }
-            m.seq_pos = ckpt;
-            m.conversation_tokens.truncate(ckpt);
-            truncate_checkpoints(&mut m.dflash_checkpoints, idx + 1, gpu);
+    // Acquire the target via the RAII slot guard — it restores the bundle into
+    // m.state on EVERY exit path (return, `?`, panic), which structurally
+    // eliminates the eight hand-written reconstruction sites that were the
+    // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
+    // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
+    // so the guard, the speculator borrow, and the bookkeeping below coexist.
+    let (block_size, ctx_capacity) = match m.speculator.as_ref() {
+        Some(s) => (s.block_size(), s.ctx_capacity()),
+        None => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"dflash path entered without a loaded speculator"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return;
         }
+    };
+    let mut guard = match Qwen35SlotGuard::take(&mut m.state, &m.model_path) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, e
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let spec = m.speculator.as_mut().unwrap();
+
+    // Divergent-render RESUME: restore the drafter-local + target recurrent
+    // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
+    // checkpoint ring (`rewind_to` does both), then rewind the daemon's seq_pos
+    // / conversation_tokens. The turn then proceeds exactly like a HIT with
+    // start_pos == ckpt (the cache plan already set cache_hit=true).
+    if let Some(ckpt) = resume_from {
+        let slot = match guard.slot() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                    id, e
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        };
+        let _ = spec.rewind_to(gpu, slot, ckpt);
+        m.seq_pos = ckpt;
+        m.conversation_tokens.truncate(ckpt);
     }
 
     if !cache_hit {
-        // Fresh target state — full prefill from position 0. Zero the bundle's
-        // DeltaNet recurrent state (qwen35 moved it into ModelState::Qwen35;
-        // m.dn_state is permanently None). This runs BEFORE the m.state.take()
-        // below, so m.state is still present.
+        // Fresh target state — full prefill from position 0. The DeltaNet
+        // recurrent state is zeroed by the prefill seed itself
+        // (`seed_target_hidden_from_prompt_abortable` calls `target.reset_state`,
+        // which also zeroes s_ef_residual — more complete than the memset loop
+        // the old inline path ran here), so only the daemon-side position
+        // bookkeeping remains.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
     } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
@@ -4061,76 +4204,19 @@ fn generate_dflash(
             prefill_tokens.len()
         );
     }
-    let df = m.dflash.as_mut().unwrap();
-    df.target_hidden_host.clear();
-    if !cache_hit {
-        // Reset the draft's upload/projection tracking only on a full prefill.
-        // On a hit we PRESERVE uploaded_target_hidden_rows / draft_ctx_cached_rows
-        // / target_hidden_abs_positions from the prior turn so the draft reuses
-        // the cached [0..start_pos] projections and only projects the suffix.
-        df.draft_scratch.reset_upload_tracking();
-    }
-
-    // Assemble a transient ModelSlot for the spec helpers — they both take
-    // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
-    // take them, build the ModelSlot, run, then put them back.
-    //
-    // ModelSlot needs its own HfqFile field but spec_step_dflash doesn't
-    // actually touch it. Reopening via mmap is essentially free (few µs).
-    let Qwen35Bundle {
-        config: orig_config,
-        weights,
-        scratch,
-        kv_cache,
-        dn_state,
-    } = match m.state.take() {
-        Some(ModelState::Qwen35(b)) => b,
-        _ => unreachable!(),
-    };
-    let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"reopen model: {}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights,
-                scratch,
-                kv_cache,
-                dn_state,
-            }));
-            return;
-        }
-    };
-    let slot_config = ModelSlotConfig::default();
-    let mut target = ModelSlot {
-        name: String::from("target"),
-        hfq,
-        config: target_config,
-        weights,
-        kv_cache,
-        dn_state,
-        scratch,
-        slot_config,
-    };
 
     let t0 = Instant::now();
-    let ctx_capacity = df.ctx_capacity;
     // Capacity checks. With eviction enabled the advertised context window is
     // effectively unbounded (eviction fires between spec cycles), but the
-    // *prompt* must still fit in one physical_cap span because
-    // seed_target_hidden_from_prompt writes it per-token without chunking.
+    // *prompt* must still fit in one physical_cap span because the prompt seed
+    // writes it per-token without chunking. Error returns just `return` — the
+    // slot guard restores the bundle into m.state on the way out.
     let eff_prompt_cap = if m.eviction.is_some() {
         m.physical_cap
     } else {
         ctx_capacity
     };
-    if prompt_tokens.len().saturating_add(df.block_size) > eff_prompt_cap {
+    if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+block_size exceeds {} {} (eviction {})"}}"#,
@@ -4144,20 +4230,13 @@ fn generate_dflash(
             if m.eviction.is_some() { "on" } else { "off" },
         );
         let _ = stdout.flush();
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-        }));
         return;
     }
     if m.eviction.is_none()
         && prompt_tokens
             .len()
             .saturating_add(max_tokens)
-            .saturating_add(df.block_size)
+            .saturating_add(block_size)
             > ctx_capacity
     {
         let _ = writeln!(
@@ -4166,66 +4245,63 @@ fn generate_dflash(
             id, ctx_capacity,
         );
         let _ = stdout.flush();
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-        }));
         return;
     }
 
-    // Seed target_hidden via the demo's helper — runs a chunked prefill
-    // with hidden extraction into hidden_rb, then downloads chunk-by-chunk
-    // into target_hidden_host. The draft's first forward uses these as
-    // context.
-    //
-    // Abortable variant: the prefill chunks at PREFILL_MAX_BATCH (256)
-    // boundaries and checks `abort_for_id()` between chunks. On client
-    // cancellation, state is fully reset (DeltaNet non-reversible) and
-    // we return early — no decode, no tokens emitted to the wire.
+    // Prefill: the speculator seeds the target's hidden state (advancing its KV
+    // + recurrent state), primes the drafter's cached target-hidden, snapshots
+    // the divergent-render checkpoint ring, and returns the target's first
+    // token. On a cache hit only the suffix is seeded; on a miss the seed
+    // self-resets target state and the full prompt is seeded. Client cancel is
+    // surfaced as `PrefillOutcome::Aborted`.
     let id_for_abort = id.to_string();
-    // DeltaNet checkpoint ring (divergent-render resume). `Some` only when
-    // HIPFIRE_DFLASH_CKPT_RESUME=1 + no eviction; the seed snapshots the
-    // recurrent state every ck_int tokens so a future divergent render resumes
-    // from a checkpoint instead of cold-prefilling.
-    let (ck_int, ck_cap) = (ckpt_interval(), ckpt_max());
-    let ckpt_sink: Option<&mut Vec<(usize, speculative::DeltaNetSnapshot)>> =
-        if dflash_resume_enabled {
-            Some(&mut m.dflash_checkpoints)
-        } else {
-            None
-        };
-    let seed_result = if cache_hit {
-        // Incremental: prefill only the suffix, continuing from start_pos with
-        // the reused target KV + DeltaNet state (no reset).
-        speculative::seed_target_hidden_suffix_abortable(
-            gpu,
-            &mut target,
-            &mut df.hidden_rb,
-            &prefill_tokens,
-            prefill_start,
-            &|| check_abort(&id_for_abort),
-            ckpt_sink,
-            ck_int,
-            ck_cap,
-        )
-    } else {
-        speculative::seed_target_hidden_from_prompt_abortable(
-            gpu,
-            &mut target,
-            &mut df.hidden_rb,
-            &mut df.target_hidden_host,
-            &prompt_tokens,
-            &|| check_abort(&id_for_abort),
-            ckpt_sink,
-            ck_int,
-            ck_cap,
-        )
+    let slot = match guard.slot() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, e
+            );
+            let _ = stdout.flush();
+            return;
+        }
     };
-    let aborted = match seed_result {
-        Ok(b) => b,
+    let prefill_outcome = spec.prefill(
+        gpu,
+        slot,
+        &prompt_tokens,
+        &prefill_tokens,
+        prefill_start,
+        cache_hit,
+        resume_from,
+        &|| check_abort(&id_for_abort),
+    );
+    let first_token = match prefill_outcome {
+        Ok(PrefillOutcome::Ready { first_token }) => first_token,
+        Ok(PrefillOutcome::Aborted) => {
+            // Full state reset on abort: zero the target recurrent state + KV
+            // eviction offset (reset_recurrent, which also clears s_ef_residual)
+            // and free the speculator's checkpoint ring, then emit aborted+done
+            // for the CLI's drain loop. The slot guard restores the bundle on
+            // the way out.
+            slot.reset_recurrent(gpu);
+            spec.reset(gpu);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+                id
+            );
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            return;
+        }
         Err(e) => {
             let _ = writeln!(
                 stdout,
@@ -4233,138 +4309,9 @@ fn generate_dflash(
                 id, e
             );
             let _ = stdout.flush();
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-            }));
             return;
         }
     };
-    if aborted {
-        // Full state reset on abort. Return target's reset state to m
-        // and emit aborted+done events for the CLI's drain loop.
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // hunt3 #5-SLIVER: the suffix/cache_hit seed
-        // (seed_target_hidden_suffix_abortable) partially advances the COMMITTED
-        // dn_state through the new tokens then returns Ok(true) WITHOUT resetting
-        // ("state left as-is; caller must full-reset" per its doc). The next AR
-        // turn cold-prefills at seq_pos=0 but generate()'s DeltaNet memset is
-        // gated on the context-full branch (won't fire after this reset to
-        // seq_pos=0), so it would accumulate over the dirty recurrent state →
-        // drift / premature EOS. Zero the LOCAL `target` (the bundle pieces we
-        // own here) BEFORE putting them back into m.state — m.dn_state/m.kv_cache
-        // are permanently None. (The cold from_prompt seed already self-resets
-        // on abort, so this is a harmless no-op for that case.)
-        for s in &target.dn_state.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &target.dn_state.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &target.dn_state.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        target.kv_cache.compact_offset = 0;
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-        }));
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
-            id
-        );
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    // Prime/extend the draft's GPU target_hidden buffer.
-    if cache_hit {
-        // Scatter ONLY the suffix rows at offset start_pos; the [0..start_pos]
-        // rows are preserved from the prior turn. The cumulative abs-positions
-        // extend to the full conversation length. `draft_ctx_cached_rows` is
-        // left untouched (still == start_pos), so the first spec step projects
-        // only [start_pos..position) — the same delta path decode uses.
-        let suffix_len = prefill_tokens.len();
-        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-            gpu,
-            &df.hidden_rb,
-            &df.draft_scratch.target_hidden,
-            prefill_start,
-            suffix_len,
-            suffix_len,
-        ) {
-            eprintln!("[dflash] suffix scatter failed: {e}");
-        }
-    } else {
-        // Full prefill: scatter all prompt rows from offset 0.
-        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-            gpu,
-            &df.hidden_rb,
-            &df.draft_scratch.target_hidden,
-            0,
-            prompt_tokens.len(),
-            prompt_tokens.len(),
-        ) {
-            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
-        }
-    }
-    df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    df.draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
-    if let Some(ckpt) = resume_from {
-        // Rows [ckpt..len) of target_hidden were just overwritten with the new
-        // (divergent) content, so the draft's projection cache for them is
-        // stale. Drop the cursor to ckpt; the first spec step re-projects
-        // [ckpt..position) from the fresh rows (the same delta path a HIT uses,
-        // just from ckpt instead of the prior length).
-        df.draft_scratch.draft_ctx_cached_rows = ckpt;
-    }
-
-    // First emit = target's argmax at the final prompt position. seed_target_hidden
-    // already ran the per-token forward for every prompt token; its scratch.logits
-    // holds the post-prompt logits.
-    let first_logits = match gpu.download_f32(&target.scratch.logits) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"download logits: {}"}}"#,
-                id, e
-            );
-            let _ = stdout.flush();
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-            }));
-            return;
-        }
-    };
-    let first_token = first_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
 
     let t_prefill = Instant::now();
 
@@ -4428,7 +4375,7 @@ fn generate_dflash(
     let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_dflash);
     let mut grammar_violated = false;
 
-    // Decode loop — spec_step_dflash returns a committed batch per cycle.
+    // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     let mut emitted: Vec<u32> = vec![first_token];
     let mut streamed_tokens: Vec<u32> = Vec::new();
     // `bytes_fed_to_filter` is the index into the freshly-decoded byte
@@ -4440,7 +4387,11 @@ fn generate_dflash(
     let mut filter = EosFilter::new(EosFilterConfig::default());
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
-    let mut stats = SpecStats::new(df.block_size);
+    // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
+    // type took the arch-specific `SpecStepResult`, which the daemon no longer
+    // sees): τ = accepted drafts / cycle.
+    let mut spec_cycles = 0usize;
+    let mut spec_accepted = 0usize;
     // max_think_tokens enforcement state (mirrors the AR path).
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
@@ -4448,25 +4399,25 @@ fn generate_dflash(
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
-    // entering the spec loop so the first spec_step writes at physical slot
-    // `budget`. compact_offset is maintained on target.kv_cache; subsequent
-    // forwards inside spec_step_dflash read it for RoPE phase automatically.
+    // entering the spec loop so the first spec step writes at physical slot
+    // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
+    // forwards inside the speculator read it for RoPE phase automatically. The
+    // drafter-local hidden cache is compacted to match via `on_evict`.
     if let Some(ref ev) = m.eviction {
-        if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+        if let Some(res) = ev.maybe_evict(gpu, &mut slot.kv_cache, position).unwrap() {
             let pre_phys = position;
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                pre_phys, res.new_physical, target.kv_cache.compact_offset,
+                pre_phys, res.new_physical, slot.kv_cache.compact_offset,
             );
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
-                let _ = speculative::apply_eviction_retain_to_draft(
+                let _ = spec.on_evict(
                     gpu,
-                    &mut df.draft_scratch,
-                    &res.retain_mask,
-                    df.draft_config.num_extract(),
-                    df.draft_config.hidden,
-                    pre_phys,
+                    &EvictRetain {
+                        retain_mask: res.retain_mask,
+                        pre_phys,
+                    },
                 );
             }
         }
@@ -4508,39 +4459,13 @@ fn generate_dflash(
     // NOT enter the spec loop, otherwise spec_step_dflash drafts + verifies a whole
     // block seeded on an already-terminal token before stopping. The committed-tail
     // check inside the loop applies this identical triple to every subsequent token.
-    let first_token_is_eos = first_token == target.config.eos_token
+    let first_token_is_eos = first_token == slot.config.eos_token
         || im_end_token == Some(first_token)
         || tokenizer.is_terminator(first_token);
 
-    let mut rng_state: u64 = 0x13579BDFu64;
-
-    // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
-    // previous version re-read the env-var on every spec cycle which
-    // is microseconds of waste on a hot path. Validate eagerly: invalid
-    // values fall back to spec_step_ddtree_batched (the documented
-    // behavior) but warn so misconfigurations don't fail silently.
-    //
-    // Only meaningful when DDTree itself is enabled (HIPFIRE_DDTREE_BUDGET).
-    // `phase1` runs Step 1 only (linear main-path verify); `phase2` adds
-    // the lazy branch FA-only re-verify (Steps 2+3). See
-    // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
-    let path_c_mode_owned: Option<&'static str> = match std::env::var("HIPFIRE_DDTREE_PATH_C").ok()
-    {
-        None => None,
-        Some(s) if s.is_empty() => None,
-        Some(s) if s == "phase1" => Some("phase1"),
-        Some(s) if s == "phase2" => Some("phase2"),
-        Some(s) => {
-            if df.ddtree.is_some() {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_PATH_C={:?} is not 'phase1' or 'phase2'. \
-                     Falling back to spec_step_ddtree_batched.",
-                    s
-                );
-            }
-            None
-        }
-    };
+    // (The DFlash RNG cell and the `HIPFIRE_DDTREE_PATH_C` chain-vs-tree-vs-path_c
+    // resolution that used to live here are now resolved once at build time and
+    // owned inside the speculator — see `build_dflash_speculator`.)
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
@@ -4551,35 +4476,16 @@ fn generate_dflash(
         // mid-decode leaves the spec-decode loop running for max_tokens
         // worth of wasted work.
         if check_abort(id) {
-            // Restore the borrowed slot before returning, then full-reset the
-            // conversation. The mid-decode KV/DeltaNet are advanced past the
-            // (un-baked) conversation_tokens, so the next turn must cold-start
-            // (which re-seeds + resets the recurrent state). Zero DeltaNet
-            // recurrent state on the LOCAL `target` BEFORE putting it back so the
-            // next AR turn cold-prefills over clean buffers — m.dn_state/kv_cache
-            // are permanently None (state lives in the bundle). Without this,
-            // stale mid-decode recurrent state from the aborted DFlash run
-            // corrupts the next generation (drift → premature EOS).
-            for s in &target.dn_state.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &target.dn_state.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &target.dn_state.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            target.kv_cache.compact_offset = 0;
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-            }));
+            // Mid-decode cancel: the KV/DeltaNet are advanced past the
+            // (un-baked) conversation_tokens, so the next turn must cold-start.
+            // Zero the target recurrent state + KV eviction offset and free the
+            // speculator's checkpoint ring; the slot guard restores the bundle
+            // into m.state on return. Without this, stale mid-decode recurrent
+            // state corrupts the next generation (drift → premature EOS).
+            slot.reset_recurrent(gpu);
+            spec.reset(gpu);
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            free_checkpoints(&mut m.dflash_checkpoints, gpu);
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -4593,93 +4499,15 @@ fn generate_dflash(
             let _ = stdout.flush();
             return;
         }
-        if position.saturating_add(df.block_size) >= ctx_capacity {
+        if position.saturating_add(block_size) >= ctx_capacity {
             break;
         }
 
-        // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
-        // at startup), route through `spec_step_ddtree_batched`. Otherwise
-        // keep the existing chain-mode `spec_step_dflash` path. The two
-        // produce the same `SpecStepResult` shape so the rest of the loop
-        // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
-        // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
-        let path_c_mode = path_c_mode_owned;
-        let step_result = if let Some(dd) = df.ddtree.as_mut() {
-            if path_c_mode == Some("phase1") || path_c_mode == Some("phase2") {
-                let phase2_snaps = if path_c_mode == Some("phase2") {
-                    Some(Phase2Snapshots {
-                        parent_pre_snap: &mut dd.path_c_parent_pre_snap,
-                        main_end_snap: &mut dd.path_c_main_end_snap,
-                    })
-                } else {
-                    None
-                };
-                spec_step_ddtree_path_c(
-                    gpu,
-                    &mut target,
-                    &df.draft_weights,
-                    &df.draft_config,
-                    &mut df.draft_scratch,
-                    &mut df.hidden_rb,
-                    &mut df.target_hidden_host,
-                    &mut df.target_snap,
-                    &mut df.gdn_tape,
-                    &df.verify_scratch,
-                    position,
-                    seed_token,
-                    None, // ctx_slice = full history
-                    dd.budget,
-                    dd.topk,
-                    phase2_snaps,
-                )
-            } else {
-                spec_step_ddtree_batched(
-                    gpu,
-                    &mut target,
-                    &df.draft_weights,
-                    &df.draft_config,
-                    &mut df.draft_scratch,
-                    &mut df.hidden_rb,
-                    &mut df.target_hidden_host,
-                    &mut df.target_snap,
-                    &mut dd.post_seed_snap,
-                    &mut df.gdn_tape,
-                    &dd.scratch,
-                    &df.verify_scratch,
-                    position,
-                    seed_token,
-                    None, // ctx_slice = full history
-                    dd.budget,
-                    dd.topk,
-                )
-            }
-        } else {
-            spec_step_dflash(
-                gpu,
-                &mut target,
-                &df.draft_weights,
-                &df.draft_config,
-                &mut df.draft_scratch,
-                &mut df.hidden_rb,
-                &mut df.target_hidden_host,
-                &mut df.target_snap,
-                &df.verify_scratch,
-                position,
-                seed_token,
-                None, // ctx_slice = full history
-                Some(&mut df.gdn_tape),
-                0.0_f32, // temperature
-                &mut rng_state,
-                None, // block_size override
-                None, // ngram_cache
-                &emitted,
-                0.0_f32, // cactus_delta
-                None,    // pld_spine
-                1.0_f32, // repeat_penalty (off)
-                0,       // repeat_window
-            )
-        };
-        let step = match step_result {
+        // One acceptance window. The speculator owns chain-vs-tree-vs-path_c
+        // dispatch internally; the daemon just hands it the borrowed target and
+        // the prior committed tokens (drafter repeat / n-gram context). Grammar
+        // is enforced post-hoc below, so `None` is passed for the mask.
+        let step = match spec.step(gpu, slot, position, seed_token, &emitted, None) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4691,8 +4519,10 @@ fn generate_dflash(
                 break;
             }
         };
-        stats.record(&step);
-        let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+        spec_cycles += 1;
+        spec_accepted += step.accepted;
+        // `emit` is already the committed tail with the seed re-echo stripped.
+        let committed_tail: Vec<u32> = step.emit.to_vec();
 
         let mut hit_eos = false;
         let mut think_cap_hit = false;
@@ -4750,7 +4580,7 @@ fn generate_dflash(
                 let _ = stdout.flush();
             }
             generated += 1;
-            if tok == target.config.eos_token
+            if tok == slot.config.eos_token
                 || im_end_token == Some(tok)
                 || tokenizer.is_terminator(tok)
             {
@@ -4810,23 +4640,24 @@ fn generate_dflash(
                 }
             }
         }
-        position += step.accepted + 1;
-        seed_token = step.bonus_token;
+        // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
+        // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
+        position += step.emit.len();
+        seed_token = step.next_seed;
         // Per-cycle eviction (FlashCASK). Fires whenever current physical
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
         if let Some(ref ev) = m.eviction {
-            if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+            if let Some(res) = ev.maybe_evict(gpu, &mut slot.kv_cache, position).unwrap() {
                 let pre_phys = position;
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
-                    let _ = speculative::apply_eviction_retain_to_draft(
+                    let _ = spec.on_evict(
                         gpu,
-                        &mut df.draft_scratch,
-                        &res.retain_mask,
-                        df.draft_config.num_extract(),
-                        df.draft_config.hidden,
-                        pre_phys,
+                        &EvictRetain {
+                            retain_mask: res.retain_mask,
+                            pre_phys,
+                        },
                     );
                 }
             }
@@ -4836,16 +4667,6 @@ fn generate_dflash(
         }
     }
 
-    // Put target state back on LoadedModel so the next request sees fresh
-    // (reset) state. We zero DN/kv on entry anyway, but we still need the
-    // ownership back.
-    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-        config: orig_config,
-        weights: target.weights,
-        scratch: target.scratch,
-        kv_cache: target.kv_cache,
-        dn_state: target.dn_state,
-    }));
     m.seq_pos = position;
     // Bake the FULL conversation (prefill + decode) into conversation_tokens
     // so subsequent turns can compute LCP against it. Previously this stored
@@ -4858,39 +4679,23 @@ fn generate_dflash(
         v
     };
 
-    // Grammar-violation cleanup: spec_step wrote KV + DN state for the
-    // rejected token(s) before the post-acceptance grammar check saw
-    // them. Those slots are now poisoned — leaving them in place would
-    // cause the next turn's forward to read corrupt context. Force a
-    // full reset so the next request starts from a clean baseline. The
-    // user pays the prefill cost on the retry but never sees the bad
-    // tokens; see Pi turn-12 incident for why we'd rather reset than
-    // emit garbage.
+    // Grammar-violation cleanup: the speculator wrote KV + DN state for the
+    // rejected token(s) before the post-acceptance grammar check saw them.
+    // Those slots are now poisoned — force a full reset (target recurrent state
+    // + KV eviction offset via reset_recurrent, plus the drafter's checkpoint
+    // ring via spec.reset) so the next request starts clean. The user pays the
+    // prefill cost on the retry but never sees the bad tokens; see Pi turn-12.
     if grammar_violated {
         eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
+        slot.reset_recurrent(gpu);
+        spec.reset(gpu);
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         m.seq_pos = 0;
-        // State was already put back into m.state above; zero the bundle's
-        // DeltaNet + reset compact_offset. Inlined (disjoint field access)
-        // rather than `reset_qwen35_recurrent` because a `&tokenizer` borrow of
-        // `m` is live here. m.dn_state/m.kv_cache are permanently None.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
     }
+
+    // Restore the target bundle into m.state via the slot guard's Drop, before
+    // the end-of-turn cache bookkeeping below (which no longer needs the slot).
+    drop(guard);
 
     // ── parse tool_calls + populate asst_turn_cache ──────────────
     //
@@ -4973,8 +4778,8 @@ fn generate_dflash(
     } else {
         0.0
     };
-    let tau = if stats.cycles > 0 {
-        stats.accepted_tokens as f64 / stats.cycles as f64
+    let tau = if spec_cycles > 0 {
+        spec_accepted as f64 / spec_cycles as f64
     } else {
         0.0
     };
@@ -5018,7 +4823,7 @@ fn generate_dflash(
         decode_tok_s,
         prefill_s * 1000.0,
         tau,
-        stats.cycles,
+        spec_cycles,
         cached_tokens_dflash,
         finish_reason,
         pflash_done_field,
@@ -5064,7 +4869,11 @@ fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq {
+    if m.seq_pos
+        .saturating_add(prompt_est)
+        .saturating_add(max_tokens)
+        > m.max_seq
+    {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -5921,7 +5730,11 @@ fn generate_multi(
             let need_kv = m
                 .seq_pos
                 .saturating_add(nudge_len)
-                .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                .saturating_add(
+                    max_tokens
+                        .saturating_sub(generated)
+                        .saturating_sub(nudge_len),
+                )
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
@@ -6105,7 +5918,34 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: Option<u32>, min_p: Option<f32>, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    stop: &[String],
+) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -6123,8 +5963,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // which loops on ds4's quantized instruct model (card mandates
         // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
         // called above, so the host-side draw in ep_serve_* is deterministic.
-        let ep_sampling = EpSampling { temp, top_p, top_k, min_p };
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop, ep_sampling);
+        let ep_sampling = EpSampling {
+            temp,
+            top_p,
+            top_k,
+            min_p,
+        };
+        generate_ep(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            think_mode,
+            tools,
+            messages_history,
+            stop,
+            ep_sampling,
+        );
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -6301,10 +6159,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
         generate_multi(
-            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
-            presence_penalty, frequency_penalty,
-            budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m,
+            gpu,
+            pflash_state,
+            pflash_cfg,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
             assistant_prefix,
             tools,
             messages_history,
@@ -6338,7 +6212,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
-    if m.dflash.is_some()
+    if m.speculator.is_some()
         && temp <= 1e-6
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
@@ -6413,7 +6287,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
     }
     if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+        && m.seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > m.max_seq
     {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
@@ -6423,6 +6300,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        // Free the speculator's (relocated) checkpoint ring on reset — this AR
+        // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
+        // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
+        if let Some(s) = m.speculator.as_mut() {
+            s.reset(gpu);
+        }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
@@ -7185,6 +7068,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        // Free the speculator's (relocated) checkpoint ring on reset — this AR
+        // path is reachable by a DFlash-capable model.
+        if let Some(s) = m.speculator.as_mut() {
+            s.reset(gpu);
+        }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
         // because a `&tokenizer` borrow of `m` is live here.
@@ -7230,11 +7118,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     );
     if m.eviction.is_none() {
         if m.seq_pos
-        .saturating_add(new_tokens.len())
-        .saturating_add(max_tokens)
-        .saturating_add(trailer)
-        > m.physical_cap
-    {
+            .saturating_add(new_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.physical_cap
+        {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -8122,9 +8010,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv = m.seq_pos
+                let need_kv = m
+                    .seq_pos
                     .saturating_add(nudge_len)
-                    .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                    .saturating_add(
+                        max_tokens
+                            .saturating_sub(generated)
+                            .saturating_sub(nudge_len),
+                    )
                     .saturating_add(nl.len());
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
@@ -10008,7 +9901,10 @@ fn generate_lfm2moe(
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-            id, prompt_ids.len(), max_tokens, cap
+            id,
+            prompt_ids.len(),
+            max_tokens,
+            cap
         );
         let _ = stdout.flush();
         return;
@@ -10297,7 +10193,10 @@ fn generate_minimax(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-                id, prompt_ids.len(), max_tokens, cap
+                id,
+                prompt_ids.len(),
+                max_tokens,
+                cap
             );
             let _ = stdout.flush();
             return;
@@ -11437,7 +11336,10 @@ fn generate_qwen2(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-                id, prompt_ids.len(), max_tokens, cap
+                id,
+                prompt_ids.len(),
+                max_tokens,
+                cap
             );
             let _ = stdout.flush();
             return;
@@ -11657,7 +11559,10 @@ fn generate_vl(
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
     if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+        && m.seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > m.max_seq
     {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
@@ -11667,6 +11572,10 @@ fn generate_vl(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        // Free the speculator's (relocated) checkpoint ring on reset.
+        if let Some(s) = m.speculator.as_mut() {
+            s.reset(gpu);
+        }
         // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
         // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
