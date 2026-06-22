@@ -5,10 +5,10 @@
 //! Qwen3.5 implementations of the arch-generic speculative-decode seam
 //! (`hipfire_runtime::spec`).
 //!
-//! Stage 0: `impl SpecTarget for ModelSlot` only — the borrowed-verifier hook
-//! the daemon's spec loop will hand to a `Speculator`. The `DflashSpeculator`
-//! itself (which owns `DflashState`) lives in `hipfire-loader` because that is
-//! where `DflashState` lives; it lands here in spirit but is wired at Stage 1.
+//! Provides `impl SpecTarget for ModelSlot` — the borrowed-verifier hook the
+//! daemon's spec loop hands to a `Speculator`. The `DflashSpeculator` impl
+//! itself lives in `hipfire-loader` (alongside `DflashState`, which it owns),
+//! not here: the orphan rule plus where `DflashState` is defined put it there.
 
 use crate::speculative::ModelSlot;
 use hipfire_runtime::spec::SpecTarget;

@@ -4,9 +4,12 @@
 //! Speculative-decode build/glue that lives at the top of the DAG, where both
 //! `LoadedModel`/`ModelState` and the arch crates are in scope.
 //!
-//! Stage 0: the [`Qwen35SlotGuard`] only — the RAII scope that the daemon's
-//! DFlash loop will use to borrow the target bundle. `DflashSpeculator` and
-//! `build_speculator` land here at Stages 1-2.
+//! Contents: the [`Qwen35SlotGuard`] RAII target borrow, the [`DflashSpeculator`]
+//! impl (which owns `DflashState` + the divergent-render checkpoint ring), and
+//! [`build_dflash_speculator`], the load-time constructor. A generic
+//! `build_speculator` registry that dispatches on arch / draft kind is future
+//! work — it only earns its keep once a second drafter family (n-gram, MTP)
+//! exists.
 
 use crate::{DflashState, ModelState};
 use hipfire_arch_qwen35::speculative::{
@@ -184,7 +187,8 @@ impl DflashSpeculator {
     /// `path_c_mode` is the validated `HIPFIRE_DDTREE_PATH_C` value
     /// (`Some("phase1"|"phase2")` or `None`); `resume_enabled`/`ck_interval`/
     /// `ck_cap` mirror the daemon's `ckpt_resume_enabled()`/`ckpt_interval()`/
-    /// `ckpt_max()` — passed in by `build_speculator` so this crate doesn't read env.
+    /// `ckpt_max()` — passed in by `build_dflash_speculator` so `new` itself is
+    /// env-free (and unit-testable).
     pub fn new(
         df: DflashState,
         path_c_mode: Option<&'static str>,

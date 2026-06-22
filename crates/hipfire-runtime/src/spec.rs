@@ -16,9 +16,13 @@
 //! arch-coupled impls (which need `qwen35::*` / `deepseek4::*` symbols) stay in
 //! their arch crates and `impl` this trait under the orphan rule.
 //!
-//! Stage 0 (this file): the trait + the unified result + the borrowed-target
-//! and erased-grammar interfaces. No wiring yet — the daemon still calls the
-//! arch `spec_step_*` functions directly until Stage 1 routes through the trait.
+//! Status: the trait, the unified [`SpecStep`] result, and the borrowed-target /
+//! erased-grammar interfaces are live. The daemon's DFlash decode loop drives a
+//! `&mut dyn Speculator` (`examples/daemon.rs::generate_dflash`), with the
+//! loader's `DflashSpeculator` as the sole impl. Still future work: a generic
+//! `build_speculator` registry (dispatch on arch/draft kind) and additional
+//! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through
+//! `generate()`, not this trait.
 
 use rdna_compute::Gpu;
 use smallvec::SmallVec;
@@ -40,8 +44,8 @@ pub struct SpecStep {
     /// Tokens to emit this window, in order, with any seed re-echo already
     /// stripped. `position += emit.len()`. Non-empty on `Ok` (forward progress).
     ///
-    /// `SmallVec` so the autoregressive fast path (one token / step, wired at
-    /// Stage 2) stays heap-alloc-free; only large spec windows spill to the heap.
+    /// `SmallVec` so a future one-token-per-step drafter (e.g. n-gram) stays
+    /// heap-alloc-free; only large spec windows spill to the heap.
     pub emit: SmallVec<[u32; 8]>,
     /// Seed for the next window — the verifier's preferred token at the
     /// divergence point (qwen35 `bonus_token`; MTP `accepted_tokens.last()`).
@@ -96,8 +100,9 @@ pub trait SpecTarget {
 /// threaded through the trait as an erased `&mut dyn SpecGrammar`, not a shared
 /// concrete struct (a shared struct would invert the crate dependency graph; an
 /// associated type would break `Box<dyn Speculator>`). Marker for now; the
-/// mask-fill / accept method set is defined at Stage 3, when the MTP speculator
-/// first consumes it.
+/// mask-fill / accept method set will be defined when a grammar-consuming
+/// drafter (MTP / EAGLE) first needs it. `DflashSpeculator` ignores grammar —
+/// qwen35 enforces tool-call grammar post-hoc in the daemon.
 pub trait SpecGrammar {}
 
 /// Outcome of [`Speculator::prefill`].
