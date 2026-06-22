@@ -100,12 +100,54 @@ pub trait SpecTarget {
 /// first consumes it.
 pub trait SpecGrammar {}
 
+/// Outcome of [`Speculator::prefill`].
+#[derive(Debug, Clone)]
+pub enum PrefillOutcome {
+    /// Prompt prefilled; `first_token` is the target's argmax at the last prompt
+    /// position (the seed for the first decode window).
+    Ready { first_token: u32 },
+    /// Client cancelled mid-prefill. The caller resets conversation state and
+    /// emits the aborted/done events; the slot guard restores the target bundle.
+    Aborted,
+}
+
+/// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
+/// compact its cached target-hidden rows to match the target KV after a
+/// FlashCASK eviction the daemon already applied to the target.
+#[derive(Debug, Clone)]
+pub struct EvictRetain {
+    /// Per-physical-slot retain mask from the eviction policy.
+    pub retain_mask: Vec<u32>,
+    /// Physical fill before the eviction (rows to compact).
+    pub pre_phys: usize,
+}
+
 /// A speculative-decode drafter+verifier, owned by the loaded model behind a
 /// `Box<dyn Speculator>`. The daemon's decode loop holds `&mut dyn Speculator`
 /// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
 /// head, or a future n-gram / EAGLE drafter — chain-vs-tree, path_c, K, budget,
 /// and topk are all resolved at build time and stored inside the impl.
 pub trait Speculator {
+    /// Prefill the prompt: seed the target's hidden state (advancing its KV +
+    /// recurrent state) and prime the drafter's cached target-hidden buffer,
+    /// returning the target's first token. `prefill_tokens` is the suffix to
+    /// seed on a cache hit (from `prefill_start`) or the full prompt on a miss;
+    /// `prompt_tokens` is the full rendered prompt (used to size the drafter
+    /// cursor). `resume_from`, when set, drops the drafter projection cursor to a
+    /// divergent-render checkpoint position.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        resume_from: Option<usize>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String>;
+
     /// Run one acceptance window starting from `seed` at absolute `position`.
     /// `target` is the borrowed verifier; `emitted` is the prior committed
     /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
@@ -120,19 +162,42 @@ pub trait Speculator {
         grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<SpecStep, String>;
 
+    /// Compact drafter-local cached state after a target KV eviction the daemon
+    /// already applied. Default no-op for drafters with no target-hidden cache.
+    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        let _ = (gpu, retain);
+        Ok(())
+    }
+
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
     fn reset(&mut self, gpu: &mut Gpu);
 
     /// Snapshot drafter-local recurrent state at `position` for divergent-render
-    /// prompt-cache reuse. No-op for stateless drafters (n-gram).
-    fn checkpoint(&mut self, gpu: &mut Gpu, position: usize) -> Result<(), String>;
+    /// prompt-cache reuse. Default no-op for stateless drafters (n-gram).
+    fn checkpoint(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<(), String> {
+        let _ = (gpu, target, position);
+        Ok(())
+    }
 
     /// Restore drafter-local state to the nearest checkpoint `<= position`,
-    /// returning the position actually restored to. No-op (returns `position`)
-    /// for stateless drafters.
-    fn rewind_to(&mut self, gpu: &mut Gpu, position: usize) -> Result<usize, String>;
+    /// returning the position actually restored to. Default no-op (returns
+    /// `position`) for stateless drafters.
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        let _ = (gpu, target);
+        Ok(position)
+    }
 
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
@@ -140,8 +205,8 @@ pub trait Speculator {
     fn free(self: Box<Self>, gpu: &mut Gpu);
 
     /// Whether this drafter requires greedy verification (temperature 0).
-    /// DFlash / DDTree / MTP all return `true` today; a sampling-capable EAGLE
-    /// could return `false`. `build_speculator` returns `None` for a non-greedy
+    /// DFlash / DDTree return `true`; a sampling-capable MTP / EAGLE could
+    /// return `false`. `build_speculator` returns `None` for a non-greedy
     /// request against a greedy-only drafter, routing it to the AR path.
     fn requires_greedy(&self) -> bool {
         true

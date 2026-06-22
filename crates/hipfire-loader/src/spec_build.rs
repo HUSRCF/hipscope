@@ -10,12 +10,16 @@
 
 use crate::{DflashState, ModelState};
 use hipfire_arch_qwen35::speculative::{
-    spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
-    ModelSlotConfig, Phase2Snapshots, SpecStepResult,
+    apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
+    spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, DeltaNetSnapshot,
+    ModelSlot, ModelSlotConfig, Phase2Snapshots, SpecStepResult,
 };
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::spec::{SpecGrammar, SpecStep, SpecTarget, Speculator};
+use hipfire_runtime::spec::{
+    EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
+};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -162,31 +166,151 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
 /// path_c are internal detail resolved at build (`ddtree` presence comes from
 /// the loaded `DflashState`; `path_c_mode` from `HIPFIRE_DDTREE_PATH_C`).
 ///
-/// Owns the `DflashState` moved out of `LoadedModel.dflash`. The divergent-
-/// render checkpoint ring (`dflash_checkpoints`) stays daemon-managed until
-/// Stage 2 reconciles the prompt-cache, so `checkpoint`/`rewind_to` are no-ops
-/// here.
+/// Owns the `DflashState` moved out of `LoadedModel.dflash`, plus the divergent-
+/// render DeltaNet checkpoint ring folded in from `LoadedModel.dflash_checkpoints`.
 pub struct DflashSpeculator {
     df: DflashState,
     path_c_mode: Option<&'static str>,
     rng_state: u64,
+    /// Divergent-render checkpoint ring. Populated by `prefill`'s seed when
+    /// `resume_enabled`; freed on `reset`/`free`.
+    checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    resume_enabled: bool,
+    ck_interval: usize,
+    ck_cap: usize,
 }
 
 impl DflashSpeculator {
     /// `path_c_mode` is the validated `HIPFIRE_DDTREE_PATH_C` value
-    /// (`Some("phase1"|"phase2")` or `None`), resolved once at build.
-    pub fn new(df: DflashState, path_c_mode: Option<&'static str>) -> Self {
+    /// (`Some("phase1"|"phase2")` or `None`); `resume_enabled`/`ck_interval`/
+    /// `ck_cap` mirror the daemon's `ckpt_resume_enabled()`/`ckpt_interval()`/
+    /// `ckpt_max()` — passed in by `build_speculator` so this crate doesn't read env.
+    pub fn new(
+        df: DflashState,
+        path_c_mode: Option<&'static str>,
+        resume_enabled: bool,
+        ck_interval: usize,
+        ck_cap: usize,
+    ) -> Self {
         Self {
             df,
             path_c_mode,
             // Same fixed seed the daemon's DFlash loop used (greedy decode does
             // not consume it, but the signature requires an RNG state cell).
             rng_state: 0x13579BDF,
+            checkpoints: Vec::new(),
+            resume_enabled,
+            ck_interval,
+            ck_cap,
         }
     }
 }
 
 impl Speculator for DflashSpeculator {
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        resume_from: Option<usize>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+
+        // Seed the target's hidden state into the drafter ring (chunked prefill
+        // with hidden extraction). Cache hit → seed only the suffix from
+        // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
+        // seed the full prompt (the seed fn resets target state itself).
+        let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
+        let ckpt_sink = if self.resume_enabled {
+            Some(&mut self.checkpoints)
+        } else {
+            None
+        };
+        let aborted = if cache_hit {
+            seed_target_hidden_suffix_abortable(
+                gpu,
+                slot,
+                &mut self.df.hidden_rb,
+                prefill_tokens,
+                prefill_start,
+                abort,
+                ckpt_sink,
+                ck_interval,
+                ck_cap,
+            )
+        } else {
+            seed_target_hidden_from_prompt_abortable(
+                gpu,
+                slot,
+                &mut self.df.hidden_rb,
+                &mut self.df.target_hidden_host,
+                prefill_tokens,
+                abort,
+                ckpt_sink,
+                ck_interval,
+                ck_cap,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        if aborted {
+            // Caller resets conversation state + emits aborted/done; the slot
+            // guard restores the target bundle on the way out.
+            return Ok(PrefillOutcome::Aborted);
+        }
+
+        // Prime/extend the draft's GPU target_hidden buffer. On a hit, scatter
+        // only the suffix rows at `prefill_start` (the prefix is preserved);
+        // on a miss, scatter all prompt rows from 0.
+        let (scatter_off, scatter_len) = if cache_hit {
+            (prefill_start, prefill_tokens.len())
+        } else {
+            (0, prompt_tokens.len())
+        };
+        if let Err(e) = scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            scatter_off,
+            scatter_len,
+            scatter_len,
+        ) {
+            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        }
+        self.df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+        self.df.draft_scratch.target_hidden_abs_positions =
+            (0..prompt_tokens.len() as i32).collect();
+        if let Some(ckpt) = resume_from {
+            // Divergent rows [ckpt..len) were just overwritten; drop the draft's
+            // projection cursor so the first spec step re-projects from `ckpt`.
+            self.df.draft_scratch.draft_ctx_cached_rows = ckpt;
+        }
+
+        // First emit = target argmax at the final prompt position (seed already
+        // ran the per-token forward; scratch.logits holds the post-prompt logits).
+        let first_logits = gpu
+            .download_f32(&slot.scratch.logits)
+            .map_err(|e| e.to_string())?;
+        let first_token = first_logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0;
+        Ok(PrefillOutcome::Ready { first_token })
+    }
+
     fn step(
         &mut self,
         gpu: &mut Gpu,
@@ -283,27 +407,44 @@ impl Speculator for DflashSpeculator {
         result.map(lower_qwen35).map_err(|e| e.to_string())
     }
 
-    fn reset(&mut self, _gpu: &mut Gpu) {
-        // Drafter-local reset: invalidate cached suffix projections so the next
-        // conversation re-projects from scratch. Target KV/recurrent reset is
-        // the daemon's job (it owns the bundle).
+    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        // Compact the drafter's cached target-hidden rows to match the target KV
+        // after the FlashCASK eviction the daemon already applied to the target.
+        let ne = self.df.draft_config.num_extract();
+        let h = self.df.draft_config.hidden;
+        apply_eviction_retain_to_draft(
+            gpu,
+            &mut self.df.draft_scratch,
+            &retain.retain_mask,
+            ne,
+            h,
+            retain.pre_phys,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) {
+        // Drafter-local reset: invalidate cached suffix projections and free the
+        // divergent-render checkpoint ring (the target KV/recurrent reset is the
+        // daemon's job — it owns the bundle).
         self.df.draft_scratch.reset_upload_tracking();
+        for (_, snap) in self.checkpoints.drain(..) {
+            snap.free_gpu(gpu);
+        }
     }
 
-    fn checkpoint(&mut self, _gpu: &mut Gpu, _position: usize) -> Result<(), String> {
-        // Divergent-render checkpoints stay on `LoadedModel.dflash_checkpoints`
-        // (daemon-managed) until Stage 2 reconciles the prompt-cache.
-        Ok(())
-    }
-
-    fn rewind_to(&mut self, _gpu: &mut Gpu, position: usize) -> Result<usize, String> {
-        Ok(position)
-    }
+    // checkpoint / rewind_to use the trait's default no-op; the divergent-render
+    // rewind is wired through the daemon at the next step (prompt-cache reconcile).
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
-        // Mirrors the current `unload_model` dflash teardown exactly.
-        let DflashSpeculator { df, .. } = *self;
+        // Mirrors the `unload_model` dflash teardown + the checkpoint-ring free.
+        let DflashSpeculator {
+            df, checkpoints, ..
+        } = *self;
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+        for (_, snap) in checkpoints {
+            snap.free_gpu(gpu);
+        }
     }
 }
