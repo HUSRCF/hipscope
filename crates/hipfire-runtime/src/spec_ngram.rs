@@ -26,8 +26,8 @@
 //! verify is block-parallel, so model-free spec wins broadly.
 
 use crate::spec::{
-    NgramCache, PldMatcher, PrefillOutcome, SpecAdvance, SpecGrammar, SpecScratch, SpecStep,
-    SpecTarget, Speculator,
+    accept_greedy_prefix, NgramCache, PldMatcher, PrefillOutcome, SpecAdvance, SpecGrammar,
+    SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 
@@ -174,29 +174,33 @@ impl Speculator for NgramSpeculator {
         // returns per-position greedy argmax, leaves state advanced by b.
         let argmax = target.verify_block(gpu, &block, position, scratch)?;
 
-        // Greedy acceptance: longest prefix where argmax[i] == block[i+1].
-        let mut accept_len = 0usize;
-        while accept_len < draft.len() && argmax[accept_len] == block[accept_len + 1] {
-            accept_len += 1;
-        }
-        let bonus = argmax[accept_len];
+        // Shared greedy accept-prefix (eos=None: never early-stops, always emits
+        // a bonus — EOS is handled downstream by the daemon decode loop).
+        // `emit` = accepted drafts ++ bonus = the committed tail.
+        let acc = accept_greedy_prefix(&draft, &argmax, None);
+        let accept_len = acc.accepted;
+        let bonus = *acc
+            .committed
+            .last()
+            .expect("eos=None always yields a bonus");
 
         // Fix target state to the committed prefix block[..accept_len+1] (the
         // target decides full-accept-skip vs rewind+replay vs no-op internally).
         target.commit_prefix(gpu, &block, accept_len, position, scratch)?;
 
-        // emit = accepted drafts ++ bonus (seed re-echo stripped); next = bonus.
-        let mut emit: Vec<u32> = block[1..=accept_len].to_vec();
-        emit.push(bonus);
-
         // Grow the bigram cache with the new tokens, including the triples
         // spanning the previous-context boundary.
         let pre = ctx.len().saturating_sub(2);
         let mut window: Vec<u32> = ctx[pre..].to_vec();
-        window.extend_from_slice(&emit);
+        window.extend_from_slice(&acc.committed);
         self.ngram.observe_many(&window);
 
-        Ok(SpecStep::new(emit, bonus, draft.len(), accept_len))
+        Ok(SpecStep::new(
+            acc.committed.iter().copied(),
+            bonus,
+            draft.len(),
+            accept_len,
+        ))
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) {

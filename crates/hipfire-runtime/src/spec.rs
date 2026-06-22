@@ -75,6 +75,76 @@ impl SpecStep {
     }
 }
 
+/// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreedyAccept {
+    /// Accepted drafts in order, followed by the bonus token — UNLESS an
+    /// accepted draft was itself the EOS token (then it stops there, no bonus).
+    /// This is the committed tail the caller emits (callers that track a seed
+    /// prepend it themselves).
+    pub committed: Vec<u32>,
+    /// Number of drafts accepted (excludes the bonus). `0..=drafts.len()`.
+    pub accepted: usize,
+    /// Whether decoding hit EOS inside this window (only possible when `eos`
+    /// was `Some`): either an accepted draft or the bonus was the EOS token.
+    pub hit_eos: bool,
+}
+
+/// The one greedy speculative-accept rule, shared by every drafter (DFlash,
+/// MTP, deepseek4 non-grammar, n-gram). **Precompute-then-match**: the caller
+/// supplies `target_pick[i]` — the verifier's chosen token at slot `i`, computed
+/// however that arch needs (plain argmax, grammar-masked argmax, n-gram /
+/// repeat-penalty-overridden argmax) — and this does ONLY the arch-invariant
+/// part: accept the longest prefix where `target_pick[i] == drafts[i]`, then take
+/// the bonus `target_pick[accepted]`.
+///
+/// `eos = Some(id)` enables EOS-early-stop *inside* the prefix (MTP semantics):
+/// if an accepted draft equals `id`, stop there and emit no bonus. `eos = None`
+/// (DFlash / n-gram) never early-stops and always appends the bonus.
+///
+/// Non-greedy rules (DFlash `temp>0` rejection sampling, MTP residual
+/// acceptance) and stateful per-position grammar masking (deepseek4 tool-call
+/// path, where `target_pick[i+1]` depends on the token accepted at `i`) are NOT
+/// expressible here and stay at their call sites.
+///
+/// Requires `target_pick.len() >= drafts.len() + 1` (one extra slot for the
+/// bonus at full acceptance).
+pub fn accept_greedy_prefix(drafts: &[u32], target_pick: &[u32], eos: Option<u32>) -> GreedyAccept {
+    debug_assert!(
+        target_pick.len() >= drafts.len() + 1,
+        "accept_greedy_prefix: target_pick (len {}) needs drafts+1 (len {})",
+        target_pick.len(),
+        drafts.len() + 1,
+    );
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    let mut accepted = 0usize;
+    let mut hit_eos = false;
+    for (i, &d) in drafts.iter().enumerate() {
+        if target_pick[i] == d {
+            committed.push(d);
+            accepted += 1;
+            if eos == Some(d) {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = target_pick[accepted];
+        committed.push(bonus);
+        if eos == Some(bonus) {
+            hit_eos = true;
+        }
+    }
+    GreedyAccept {
+        committed,
+        accepted,
+        hit_eos,
+    }
+}
+
 /// The verifier (target) model's GPU state, borrowed by [`Speculator::step`]
 /// for the duration of one window. A `Speculator` impl recovers its concrete
 /// target via `as_any_mut().downcast_mut::<T>()` (e.g. the qwen35 `ModelSlot`).
@@ -543,5 +613,53 @@ mod tests {
         };
         assert_eq!(step.emit.len(), step.accepted + 1);
         assert_eq!(*step.emit.last().unwrap(), step.next_seed);
+    }
+
+    // ── accept_greedy_prefix ────────────────────────────────────────────────
+
+    #[test]
+    fn accept_greedy_none_partial() {
+        // drafts [11,12,13]; target picks [11,12,99,..] → accept 11,12; diverge
+        // at slot 2 (99 != 13); bonus = target_pick[2] = 99.
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 99, 0], None);
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 12, 99]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_full() {
+        // all drafts match; bonus = target_pick[3].
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 13, 77], None);
+        assert_eq!(r.accepted, 3);
+        assert_eq!(r.committed, vec![11, 12, 13, 77]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_zero() {
+        // first draft rejected; accept nothing, bonus = target_pick[0].
+        let r = accept_greedy_prefix(&[11, 12], &[42, 0, 0], None);
+        assert_eq!(r.accepted, 0);
+        assert_eq!(r.committed, vec![42]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_stop_midprefix() {
+        // eos=2; drafts [11,2,13]; accept 11, then 2==eos → stop, NO bonus.
+        let r = accept_greedy_prefix(&[11, 2, 13], &[11, 2, 13, 0], Some(2));
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_as_bonus() {
+        // eos=2; drafts [11] accepted; bonus = target_pick[1] = 2 == eos.
+        let r = accept_greedy_prefix(&[11], &[11, 2], Some(2));
+        assert_eq!(r.accepted, 1);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
     }
 }
