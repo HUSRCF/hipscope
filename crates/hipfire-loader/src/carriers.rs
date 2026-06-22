@@ -108,8 +108,13 @@ impl Carrier for Qwen2Carrier {
         }
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
+        // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
+        // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
+        let speculator = crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

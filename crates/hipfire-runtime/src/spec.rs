@@ -237,10 +237,17 @@ pub trait SpecTarget {
     /// The target's usable context capacity (decode-loop overflow guard).
     fn ctx_capacity(&self) -> usize;
 
-    /// The target's KV cache, for the daemon's FlashCASK eviction (which operates
-    /// on the shared `llama::KvCache` for all spec-capable arches). Eviction is
-    /// `None` by default for pure-attention arches, so this is exercised rarely.
-    fn kv_cache_mut(&mut self) -> &mut crate::llama::KvCache;
+    /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
+    /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
+    /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
+    /// (e.g. qwen2's `Qwen2State`) return `None` (the default): they don't support
+    /// eviction, and the daemon's eviction sites are `if let Some(ev)`-gated so
+    /// this is never reached for a non-evicting target. Keeping it `Option` is
+    /// what lets a `Qwen2State`-backed target implement `SpecTarget` at all
+    /// (it has no `llama::KvCache` to hand back).
+    fn kv_cache_mut(&mut self) -> Option<&mut crate::llama::KvCache> {
+        None
+    }
 }
 
 /// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched

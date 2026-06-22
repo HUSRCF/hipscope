@@ -163,6 +163,19 @@ impl SpecTargetGuard for LlamaSlotGuard<'_> {
     }
 }
 
+/// Qwen2 (arch_id=7, e.g. VibeThinker) spec-target borrow. Like llama it is pure
+/// attention borrowed in place — but its KV lives in its own `Qwen2State`, so it
+/// implements `SpecTarget` with the default (`None`) `kv_cache_mut` (no eviction).
+struct Qwen2SlotGuard<'m> {
+    bundle: &'m mut hipfire_arch_qwen2::Qwen2Bundle,
+}
+
+impl SpecTargetGuard for Qwen2SlotGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(&mut *self.bundle as &mut dyn SpecTarget)
+    }
+}
+
 /// Arch-dispatched borrow of the spec-decode target as a boxed [`SpecTargetGuard`].
 ///
 /// qwen35 (5/6) moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
@@ -182,6 +195,7 @@ pub fn spec_target_guard<'m>(
     } else {
         match state.as_mut() {
             Some(ModelState::Llama(bundle)) => Ok(Box::new(LlamaSlotGuard { bundle })),
+            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(Qwen2SlotGuard { bundle })),
             _ => Err(format!(
                 "spec path: unsupported arch state for arch_id {arch_id}"
             )),
@@ -215,9 +229,10 @@ pub fn build_speculator(
         return Some(build_dflash_speculator(df, eviction_is_none));
     }
     let ngram_enabled = std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() == Some("1");
-    // Spec-capable arches with a `SpecTarget` impl: qwen35 DeltaNet (5/6) and
-    // the dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2).
-    if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6) {
+    // Spec-capable arches with a `SpecTarget` impl: qwen35 DeltaNet (5/6), the
+    // dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3), and Qwen2 (7 =
+    // VibeThinker etc., its own `Qwen2State` KV).
+    if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6 | 7) {
         let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
             .ok()
             .and_then(|v| v.parse().ok())

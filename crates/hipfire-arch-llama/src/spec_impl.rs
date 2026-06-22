@@ -148,7 +148,7 @@ impl SpecTarget for LlamaBundle {
         self.kv.physical_cap
     }
 
-    fn kv_cache_mut(&mut self) -> &mut KvCache {
-        &mut self.kv
+    fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+        Some(&mut self.kv)
     }
 }

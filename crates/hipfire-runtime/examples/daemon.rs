@@ -4413,9 +4413,14 @@ fn generate_dflash(
     // forwards inside the speculator read it for RoPE phase automatically. The
     // drafter-local hidden cache is compacted to match via `on_evict`.
     if let Some(ref ev) = m.eviction {
-        if let Some(res) = ev.maybe_evict(gpu, slot.kv_cache_mut(), position).unwrap() {
+        // Eviction is only ever configured for KvCache-backed arches
+        // (qwen35/llama); a `Qwen2State`-backed target never reaches here.
+        let kv = slot
+            .kv_cache_mut()
+            .expect("eviction configured ⇒ KvCache-backed spec target");
+        if let Some(res) = ev.maybe_evict(gpu, kv, position).unwrap() {
             let pre_phys = position;
-            let compact_offset = slot.kv_cache_mut().compact_offset;
+            let compact_offset = slot.kv_cache_mut().unwrap().compact_offset;
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
                 pre_phys, res.new_physical, compact_offset,
@@ -4656,7 +4661,11 @@ fn generate_dflash(
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
         if let Some(ref ev) = m.eviction {
-            if let Some(res) = ev.maybe_evict(gpu, slot.kv_cache_mut(), position).unwrap() {
+            // Eviction ⇒ KvCache-backed target (qwen35/llama); never qwen2.
+            let kv = slot
+                .kv_cache_mut()
+                .expect("eviction configured ⇒ KvCache-backed spec target");
+            if let Some(res) = ev.maybe_evict(gpu, kv, position).unwrap() {
                 let pre_phys = position;
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
@@ -6003,6 +6012,35 @@ fn generate(
     // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
     // / ChatML scaffolding since none of those are wired for
     // arch_id=7 yet (R3 bring-up scope).
+    // arch_id=7 with an opt-in model-free n-gram speculator loaded (qwen2
+    // `SpecTarget`) routes to the arch-generic spec loop, exactly like llama
+    // (0/1). Without a speculator it falls through to the plain qwen2 decode
+    // short-circuit below.
+    if m.arch_id == 7 && m.speculator.is_some() {
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+        );
+        generate_dflash(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            assistant_prefix,
+            None, // pflash_bypass_reason — no pflash on the n-gram path
+            None, // pflash_alpha
+            tools,
+            messages_history,
+            stop,
+        );
+        return;
+    }
     if m.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
         // honor on this path. See generate_qwen2 doc for the deferral
