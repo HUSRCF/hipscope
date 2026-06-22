@@ -41,6 +41,7 @@ pub mod multi_gpu;
 pub mod paro;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod spec;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
