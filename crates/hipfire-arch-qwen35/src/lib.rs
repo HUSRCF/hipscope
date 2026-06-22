@@ -29,6 +29,12 @@
 pub mod arch;
 #[cfg(feature = "deltanet")]
 pub mod carrier;
+/// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
+/// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic
+/// `hipfire_runtime::spec::Speculator`. Deltanet-gated — it owns `ModelSlot`-
+/// based draft verify.
+#[cfg(feature = "deltanet")]
+pub mod dflash_spec;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

@@ -13,7 +13,8 @@
 //! the Q8 error-feedback residual the snapshot type omits, and the
 //! full-accept-skip / partial-replay state fixup) all live here so the
 //! speculator stays 100% arch-agnostic. The `DflashSpeculator` impl itself lives
-//! in `hipfire-loader` (alongside `DflashState`, which it owns).
+//! in the sibling [`crate::dflash_spec`] module (alongside `DflashState`, which
+//! it owns).
 
 use crate::qwen35::{self, DeltaNetState};
 use crate::speculative::{

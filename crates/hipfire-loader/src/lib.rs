@@ -18,15 +18,11 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
-use hipfire_arch_qwen35::speculative::{
-    DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
-};
+use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
-use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
@@ -119,34 +115,10 @@ impl Eviction {
     }
 }
 
-// ─── DDTree side state ────────────────────────────────────────────────
-
-/// Side state for DDTree-mode speculative decoding.
-pub struct DdtreeState {
-    pub post_seed_snap: DeltaNetSnapshot,
-    pub scratch: DdtreeScratch,
-    pub budget: usize,
-    pub topk: usize,
-    pub path_c_parent_pre_snap: DeltaNetSnapshot,
-    pub path_c_main_end_snap: DeltaNetSnapshot,
-}
-
-// ─── DFlash state ─────────────────────────────────────────────────────
-
-/// Optional DFlash speculative-decoding state.
-pub struct DflashState {
-    pub draft_config: DflashConfig,
-    pub draft_weights: DflashWeights,
-    pub draft_scratch: DflashScratch,
-    pub hidden_rb: HiddenStateRingBuffer,
-    pub verify_scratch: VerifyScratch,
-    pub target_snap: DeltaNetSnapshot,
-    pub gdn_tape: GdnTape,
-    pub target_hidden_host: Vec<f32>,
-    pub ctx_capacity: usize,
-    pub block_size: usize,
-    pub ddtree: Option<DdtreeState>,
-}
+// `DdtreeState`, `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
+// impl now live in `hipfire_arch_qwen35::dflash_spec` — all qwen35 + runtime
+// types, so the loader only constructs and routes them, never owns the DFlash
+// mechanics.
 
 // ─── AsstTurnCache ────────────────────────────────────────────────────
 
@@ -678,7 +650,13 @@ fn finish_qwen35_load(
 
     // ── DFlash ─────────────────────────────────────────────────────
     let dflash = if let Some(dp) = ctx.draft_path {
-        match load_dflash_state(dp, physical_cap, config, dn_state, ctx.gpu) {
+        match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
+            dp,
+            physical_cap,
+            config,
+            dn_state,
+            ctx.gpu,
+        ) {
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
@@ -909,130 +887,6 @@ fn load_cohere2moe(
 }
 
 // ─── MMQ screening ────────────────────────────────────────────────────
-
-// ─── DFlash state load ────────────────────────────────────────────────
-
-fn load_dflash_state(
-    draft_path: &str,
-    ctx_capacity: usize,
-    target_config: &qwen35::Qwen35Config,
-    target_dn: &DeltaNetState,
-    gpu: &mut Gpu,
-) -> Result<DflashState, String> {
-    use hipfire_arch_qwen35::qwen35::LayerType;
-    use hipfire_arch_qwen35::speculative::{
-        DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
-    };
-    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
-    let draft_config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let draft_weights =
-        DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
-    let block_size = draft_config.block_size;
-    let max_n = block_size + 1;
-    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
-    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
-    // refactor regressed this to the `with_mq=false` `::new` constructor →
-    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = DflashScratch::new_with_mq(
-        gpu,
-        &draft_config,
-        block_size,
-        ctx_capacity,
-        draft_weights.has_mq,
-    )
-    .map_err(|e| format!("{e}"))?;
-    let _ = draft_hfq;
-    // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
-    // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
-    // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
-    // chunks of up to `PREFILL_MAX_BATCH` and captures each into staging via
-    // `write_rows_to_staging` (whose `n <= max_batch` guard is a debug_assert,
-    // silent in release). Sizing staging to only `max_n` overflowed the d2d
-    // copy on any prompt longer than block_size+1 tokens. Size it to the
-    // larger of the two so both paths fit.
-    let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    let hidden_rb = HiddenStateRingBuffer::new(
-        gpu,
-        target_config.n_layers,
-        draft_config.num_extract(),
-        target_config.dim,
-        ctx_capacity,
-        staging_max_batch,
-    )
-    .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
-    let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = VerifyScratch::with_prefill(
-        gpu,
-        max_n,
-        target_config.dim,
-        target_config.vocab_size,
-        hidden_k,
-        target_config,
-    )
-    .map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
-    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-        .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?;
-    let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
-        .map_err(|e| format!("GdnTape::new_for_config: {e}"))?;
-    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
-    // DDTree
-    let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let ddtree = if ddtree_budget > 0 {
-        let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
-        let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
-            + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
-        let n_fa_layers = target_config
-            .layer_types
-            .iter()
-            .filter(|t| **t == LayerType::FullAttention)
-            .count();
-        let post_seed_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let scratch = DdtreeScratch::new(
-            gpu,
-            ddtree_budget,
-            target_config.n_kv_heads,
-            target_config.head_dim,
-            qkv_dim,
-            n_fa_layers,
-        )
-        .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
-        let path_c_parent_pre_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let path_c_main_end_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        Some(DdtreeState {
-            post_seed_snap,
-            scratch,
-            budget: ddtree_budget,
-            topk,
-            path_c_parent_pre_snap,
-            path_c_main_end_snap,
-        })
-    } else {
-        None
-    };
-    Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
-        verify_scratch,
-        target_snap,
-        gdn_tape,
-        target_hidden_host,
-        ctx_capacity,
-        block_size,
-        ddtree,
-    })
-}
 
 // ─── EP load functions ────────────────────────────────────────────────
 
