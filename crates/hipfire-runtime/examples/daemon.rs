@@ -40,9 +40,9 @@ use std::path::Path;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hipfire_loader::spec_build::Qwen35SlotGuard;
+use hipfire_loader::spec_build::spec_target_guard;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
-use hipfire_runtime::spec::{EvictRetain, PrefillOutcome, SpecTarget};
+use hipfire_runtime::spec::{EvictRetain, PrefillOutcome};
 
 /// Abort-target request ID. Set asynchronously by the background
 /// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
@@ -3949,31 +3949,11 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// rows — so DFlash keeps its decode speedup AND skips re-prefilling the cached
 /// prefix. A divergent / first / raw-prompt turn full-resets and prefills the
 /// whole conversation as before.
-/// Arch-dispatched borrow of the spec-decode target as `&mut dyn SpecTarget`.
 ///
-/// qwen35 moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
-/// (which reopens the HfqFile and restores the bundle on Drop); llama borrows its
-/// `LlamaBundle` in place (pure attention needs no HfqFile reopen). This is what
-/// lets `generate_dflash` stay arch-generic — it only ever sees `&mut dyn
-/// SpecTarget`.
-// One short-lived stack local per generate_dflash call; the qwen35 variant
-// carries the moved bundle by value (same rationale as Qwen35SlotGuard's own
-// `Parked` enum). Boxing to flatten the delta isn't worth it here.
-#[allow(clippy::large_enum_variant)]
-enum SpecSlotGuard<'m> {
-    Qwen35(Qwen35SlotGuard<'m>),
-    Llama(&'m mut hipfire_arch_llama::LlamaBundle),
-}
-
-impl SpecSlotGuard<'_> {
-    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
-        match self {
-            SpecSlotGuard::Qwen35(g) => Ok(g.slot()? as &mut dyn SpecTarget),
-            SpecSlotGuard::Llama(b) => Ok(&mut **b as &mut dyn SpecTarget),
-        }
-    }
-}
-
+/// The arch-dispatched borrow of the spec-decode target as `&mut dyn SpecTarget`
+/// now lives behind the loader's `spec_target_guard()` + the runtime
+/// `SpecTargetGuard` trait — this fn only ever sees `&mut dyn SpecTarget` and
+/// never learns which arch (qwen35 moved-bundle vs llama borrow-in-place) it drives.
 #[allow(clippy::too_many_arguments)]
 fn generate_dflash(
     m: &mut LoadedModel,
@@ -4175,35 +4155,21 @@ fn generate_dflash(
             return;
         }
     };
-    // Arch-dispatched target borrow (`m.arch_id` is Copy → no borrow conflict
-    // with the `&mut m.state` below). qwen35 moves the bundle out + reopens its
-    // HfqFile via the RAII guard (restored on Drop); llama borrows its bundle in
-    // place (no HfqFile needed). Both yield `&mut dyn SpecTarget`.
-    let mut guard = if m.arch_id == 5 || m.arch_id == 6 {
-        match Qwen35SlotGuard::take(&mut m.state, &m.model_path) {
-            Ok(g) => SpecSlotGuard::Qwen35(g),
-            Err(e) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"{}"}}"#,
-                    id, e
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        }
-    } else {
-        match m.state.as_mut() {
-            Some(ModelState::Llama(b)) => SpecSlotGuard::Llama(b),
-            _ => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","id":"{}","message":"spec path: unsupported arch state for arch_id {}"}}"#,
-                    id, m.arch_id
-                );
-                let _ = stdout.flush();
-                return;
-            }
+    // Arch-dispatched target borrow via the loader's `spec_target_guard()`
+    // (`m.arch_id` is Copy + `m.model_path` is a disjoint field → no borrow
+    // conflict with the `&mut m.state` the guard takes). qwen35 moves the bundle
+    // out + reopens its HfqFile (restored on Drop); llama borrows its bundle in
+    // place. The boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
+    let mut guard = match spec_target_guard(&mut m.state, &m.model_path, m.arch_id) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, e
+            );
+            let _ = stdout.flush();
+            return;
         }
     };
     let spec = m.speculator.as_mut().unwrap();

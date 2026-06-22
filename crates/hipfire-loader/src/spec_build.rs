@@ -17,7 +17,7 @@ use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::spec::Speculator;
+use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;
 
@@ -33,8 +33,8 @@ use std::path::Path;
 /// path on which the bundle fails to return to `m.state`.
 ///
 /// The `HfqFile` (an mmap handle that `ModelSlot` carries but the spec kernels
-/// never read) is opened **lazily**, on the first [`slot`](Self::slot) call.
-/// Two payoffs: (1) an autoregressive caller that only needs the bundle fields
+/// never read) is opened **lazily**, on the first [`model_slot`](Self::model_slot)
+/// call. Two payoffs: (1) an autoregressive caller that only needs the bundle fields
 /// never pays the mmap, and (2) an open failure leaves the bundle parked for
 /// `Drop` to restore — so a reopen error can surface as `Err` without ever
 /// leaving `m.state == None`.
@@ -80,10 +80,11 @@ impl<'m> Qwen35SlotGuard<'m> {
         })
     }
 
-    /// Borrow the target as a [`ModelSlot`], opening the `HfqFile` on first use.
-    /// On reopen failure the bundle stays parked (so `Drop` still restores it)
-    /// and the error is returned.
-    pub fn slot(&mut self) -> Result<&mut ModelSlot, String> {
+    /// Borrow the target as a concrete [`ModelSlot`], opening the `HfqFile` on
+    /// first use. On reopen failure the bundle stays parked (so `Drop` still
+    /// restores it) and the error is returned. The arch-erased
+    /// [`SpecTargetGuard::slot`] impl upcasts this to `&mut dyn SpecTarget`.
+    pub fn model_slot(&mut self) -> Result<&mut ModelSlot, String> {
         if let Some(Parked::Bundle(_)) = self.parked {
             let Some(Parked::Bundle(bundle)) = self.parked.take() else {
                 unreachable!("guarded by the if-let above")
@@ -116,7 +117,7 @@ impl<'m> Qwen35SlotGuard<'m> {
         }
         match self.parked.as_mut() {
             Some(Parked::Slot(slot)) => Ok(slot),
-            _ => unreachable!("slot() leaves `parked` as Slot on success"),
+            _ => unreachable!("model_slot() leaves `parked` as Slot on success"),
         }
     }
 }
@@ -139,6 +140,52 @@ impl Drop for Qwen35SlotGuard<'_> {
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
         *self.state_back = Some(ModelState::Qwen35(bundle));
+    }
+}
+
+impl SpecTargetGuard for Qwen35SlotGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(self.model_slot()? as &mut dyn SpecTarget)
+    }
+}
+
+/// Pure-attention (LLaMA / plain Qwen3 / Qwen2) spec-target borrow: the bundle is
+/// a `SpecTarget` in place, so — unlike qwen35 — there is no `HfqFile` to reopen
+/// and nothing to move out of `m.state`. The `&mut` is held for the guard's life
+/// and released on `Drop` like any borrow; there is no restore step.
+struct LlamaSlotGuard<'m> {
+    bundle: &'m mut hipfire_arch_llama::LlamaBundle,
+}
+
+impl SpecTargetGuard for LlamaSlotGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(&mut *self.bundle as &mut dyn SpecTarget)
+    }
+}
+
+/// Arch-dispatched borrow of the spec-decode target as a boxed [`SpecTargetGuard`].
+///
+/// qwen35 (5/6) moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
+/// (reopens the `HfqFile` lazily, restores the bundle on Drop); the dense LLaMA
+/// family (0/1) borrows its `LlamaBundle` in place. The returned box borrows
+/// `state` for `'m`, so the caller can still borrow `m`'s disjoint fields
+/// (`m.speculator`, `m.seq_pos`, …) alongside it. This is the single dispatch the
+/// daemon's `generate_dflash` routes through — it then only ever sees
+/// `&mut dyn SpecTarget`, never an arch type.
+pub fn spec_target_guard<'m>(
+    state: &'m mut Option<ModelState>,
+    model_path: &str,
+    arch_id: u32,
+) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+    if arch_id == 5 || arch_id == 6 {
+        Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
+    } else {
+        match state.as_mut() {
+            Some(ModelState::Llama(bundle)) => Ok(Box::new(LlamaSlotGuard { bundle })),
+            _ => Err(format!(
+                "spec path: unsupported arch state for arch_id {arch_id}"
+            )),
+        }
     }
 }
 

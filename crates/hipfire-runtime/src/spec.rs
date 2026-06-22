@@ -243,6 +243,24 @@ pub trait SpecTarget {
     fn kv_cache_mut(&mut self) -> &mut crate::llama::KvCache;
 }
 
+/// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched
+/// per-arch by the loader's `spec_target_guard()`.
+///
+/// The guard restores any moved-out model state on Drop — the qwen35 arm moves
+/// its bundle out of `ModelState`, reopens its `HfqFile`, and rebuilds the bundle
+/// on *every* exit path (return / `?` / panic), which is what structurally
+/// eliminates the #462 cross-request state-bleed class; a pure-attention arm
+/// borrows its bundle in place (no reopen needed). `generate_dflash` only ever
+/// sees `Box<dyn SpecTargetGuard>` and never learns which arch it drives — this
+/// folds the old hand-written `SpecSlotGuard` enum into a single trait object.
+pub trait SpecTargetGuard {
+    /// Borrow the target. The qwen35 arm opens its `HfqFile` lazily on first
+    /// call (an AR-only caller never pays the mmap); a reopen failure returns
+    /// `Err` with the bundle still parked for `Drop` to restore, so `m.state` is
+    /// never left `None`.
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String>;
+}
+
 /// Erased, arch-specific verify scratch owned by a model-free speculator.
 ///
 /// The concrete scratch (qwen35: `VerifyScratch` + `DeltaNetSnapshot` + s_ef

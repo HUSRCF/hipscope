@@ -49,14 +49,25 @@ n-gram (`eos=None`), deepseek4 **non-grammar** path. Stays bespoke: DFlash
    -> Vec<u32>`; `NgramSpeculator` becomes a `BlockDrafter`; `ChainSpeculator`
    does prefill/verify_block/accept-core/commit_prefix. → verify: byte-identical
    to step 2.
-8. **Move qwen35 DFlash → qwen crate** — `DflashState`, `load_dflash_state`,
-   `DflashSpeculator`, `build_dflash_speculator`, `Qwen35SlotGuard` substance →
-   `hipfire-arch-qwen35` (types are runtime::dflash + qwen35::speculative, no
-   loader types). Loader keeps a thin `ModelState` dispatch. → verify: build +
-   serve-multiturn DFlash arm.
+8. **Move qwen35 DFlash → qwen crate** — `DflashState`, `DdtreeState`,
+   `load_dflash_state`, `lower_qwen35`, `DflashSpeculator`,
+   `build_dflash_speculator` → `hipfire_arch_qwen35::dflash_spec` (runtime::dflash
+   + qwen35::speculative types only, no loader types). Loader keeps `Qwen35SlotGuard`
+   + the `build_speculator` registry. → verify: build + serve-multiturn DFlash arm.
+   **DONE (e2e92a84).** Byte-identical relocation; builds + 6 accept-core tests
+   green. NOTE: `Qwen35SlotGuard` substance was NOT split into qwen35 — the guard
+   fundamentally needs `ModelState` (a loader type), so splitting it into a
+   loader-wrapper + qwen35-substance would make two shallow modules (interface ≈
+   guts). Kept whole in the loader per the deep-module principle; the seam goal is
+   unaffected (see step 9).
 9. **Generic `SpecTargetGuard`** — trait in runtime; loader `spec_target_guard()`
-   dispatch; daemon drops the `SpecSlotGuard` enum. → verify: serve-multiturn
-   (AR+DFlash) + llama n-gram still route.
+   dispatch (qwen35 → `Qwen35SlotGuard`, llama → new `LlamaSlotGuard`); daemon
+   drops the `SpecSlotGuard` enum. → verify: serve-multiturn (AR+DFlash) + llama
+   n-gram still route. **DONE.** serve-multiturn PASS (AR qwen35 + DFlash 27B, all
+   4 cross-session requests coherent, uniq 0.81–0.86); llama n-gram route via
+   `coherence_probe` on qwen3-0.6b-llama + `HIPFIRE_NGRAM_DRAFT=1` → OK (0 hard, 0
+   soft). A future llama-DFlash/MTP adds one arm to `spec_target_guard` + a
+   `SpecTarget` impl — no daemon edits.
 
 ## Validation (mandatory)
 - Greedy byte-identical checks use **fresh daemon** (rebuild daemon + probe — see
