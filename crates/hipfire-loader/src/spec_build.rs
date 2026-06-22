@@ -8,9 +8,9 @@
 //! impl (which owns `DflashState` + the divergent-render checkpoint ring),
 //! [`build_dflash_speculator`] (its load-time constructor), and the generic
 //! [`build_speculator`] registry that dispatches on draft kind: a loaded DFlash
-//! draft → [`DflashSpeculator`], else (opt-in) the model-free
-//! [`NgramSpeculator`] from `spec_ngram`. The registry is what lets the loader
-//! pick a drafter at load time without the daemon learning which arm ran.
+//! draft → [`DflashSpeculator`], else (opt-in) the model-free n-gram drafter
+//! (`ChainSpeculator<NgramDrafter>` from `spec_ngram`). The registry is what lets
+//! the loader pick a drafter at load time without the daemon learning which ran.
 
 use crate::{DflashState, ModelState};
 use hipfire_arch_qwen35::speculative::{
@@ -24,7 +24,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
     EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
 };
-use hipfire_runtime::spec_ngram::NgramSpeculator;
+use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -535,9 +535,9 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
 ///
 /// Dispatch:
 /// 1. A loaded DFlash draft (`dflash = Some`) → [`DflashSpeculator`].
-/// 2. Else, when `HIPFIRE_NGRAM_DRAFT=1` and the target is a qwen35 DeltaNet
-///    arch (`arch_id` 5/6), the model-free [`NgramSpeculator`] — spec-decode
-///    speedup with no draft model. Opt-in until validated.
+/// 2. Else, when `HIPFIRE_NGRAM_DRAFT=1` and the arch has a `SpecTarget` impl
+///    (qwen35 5/6, llama 0/1), the model-free `ChainSpeculator<NgramDrafter>` —
+///    spec-decode with no draft model. Opt-in until validated.
 /// 3. Otherwise `None` (AR-only).
 ///
 /// The n-gram arm is arch-typeless: it builds its target-side verify scratch
@@ -571,10 +571,10 @@ pub fn build_speculator(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",
             block_size, min_count
         );
-        return Some(Box::new(NgramSpeculator::new(
+        return Some(Box::new(ChainSpeculator::new(
+            NgramDrafter::new(min_count, block_size),
             block_size,
             ctx_capacity,
-            min_count,
         )));
     }
     None

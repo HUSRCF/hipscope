@@ -1,29 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! Model-free n-gram / PLD speculator — the arch-agnostic [`Speculator`] arm.
+//! Generic model-free chain speculator + the n-gram / PLD block drafter.
 //!
-//! Carries **no draft model**. It proposes a continuation block from two
-//! training-free sources over the committed token history (prompt + emitted):
-//! (1) Prompt Lookup Decoding (Saxena 2023) — context-suffix self-match, and
-//! (2) a rolling bigram chain ([`NgramCache`]) as the fallback. It then verifies
-//! with the **target only**, accepting the longest prefix the target's greedy
-//! argmax agrees with. Verification is exact, so an over-eager draft only costs
-//! τ, never coherence.
+//! [`ChainSpeculator<D>`] is the arch-agnostic [`Speculator`] skeleton for any
+//! **token-only block drafter**: propose a block from token ids → verify with
+//! the target (`SpecTarget::verify_block`) → [`accept_greedy_prefix`] → fix
+//! target state (`SpecTarget::commit_prefix`). It owns the target-side verify
+//! scratch and the whole verify/accept/commit flow; the drafter (a
+//! [`BlockDrafter`]) owns only *propose + bookkeeping*. A future classic
+//! "small model drafts for big model" drafter implements `BlockDrafter` and gets
+//! this skeleton for free — no new accept/rewind code.
 //!
-//! This type is **100% arch-agnostic**: it never names a `ModelSlot`, a forward
-//! function, or a verify-scratch type. All target mechanics — the batched verify
-//! forward, the per-position lm_head/argmax, the recurrent snapshot/rewind, and
-//! the arch-specific GPU scratch — live behind [`SpecTarget`]
-//! (`verify_block` / `commit_prefix` / `spec_advance` / `new_spec_scratch`). Any
-//! arch that implements `SpecTarget` gets this drafter for free. The drafter owns
-//! only *policy*: drafting + acceptance.
+//! [`NgramDrafter`] is the model-free drafter: Prompt Lookup Decoding (Saxena
+//! 2023, context-suffix self-match) with a rolling bigram fallback
+//! ([`NgramCache`]), over the committed token history (prompt + emitted).
+//! Verification is exact, so an over-eager draft only costs τ, never coherence.
 //!
-//! **Perf is situational on recurrent (DeltaNet) targets** — opt-in for that
-//! reason (`HIPFIRE_NGRAM_DRAFT=1`). On those, the verify forward runs the
-//! recurrence sequentially over the `b`-token block, so it only wins when PLD
-//! acceptance is high (high prompt-copy content). On pure-attention targets the
-//! verify is block-parallel, so model-free spec wins broadly.
+//! **Perf is situational on recurrent (DeltaNet) targets** — opt-in
+//! (`HIPFIRE_NGRAM_DRAFT=1`): the verify forward runs the recurrence
+//! sequentially over the block there, so it only wins on high PLD acceptance
+//! (high prompt-copy). On pure-attention targets the verify is block-parallel,
+//! so model-free spec wins broadly.
 
 use crate::spec::{
     accept_greedy_prefix, NgramCache, PldMatcher, PrefillOutcome, SpecAdvance, SpecGrammar,
@@ -31,56 +29,71 @@ use crate::spec::{
 };
 use rdna_compute::Gpu;
 
-/// Model-free n-gram / PLD drafter. See module docs for the contract.
-pub struct NgramSpeculator {
-    /// Max block size including the seed: a window verifies `[seed, draft..]`
-    /// with `draft.len() <= block_size - 1`, so `b <= block_size`.
-    block_size: usize,
-    ctx_capacity: usize,
-    /// Bigram fallback predictor; seeded from the prompt at prefill and grown
-    /// from committed tokens each step.
+/// A token-only block drafter: it proposes a continuation block from the
+/// committed token history and maintains whatever CPU state it needs. The GPU
+/// verify/accept/commit is [`ChainSpeculator`]'s job, not the drafter's.
+pub trait BlockDrafter {
+    /// Seed drafter state from the full rendered prompt (called at prefill).
+    fn prefill_seed(&mut self, prompt_tokens: &[u32]);
+
+    /// Propose up to `max_draft` continuation tokens after `seed` (whose absolute
+    /// history is the prompt seeded above ++ `emitted`, with `emitted.last() ==
+    /// seed`). Empty ⇒ a pure AR step (block is just `[seed]`).
+    fn propose(&mut self, emitted: &[u32], seed: u32, max_draft: usize) -> Vec<u32>;
+
+    /// Grow drafter state with the tokens committed this window. `emitted` is the
+    /// pre-commit history; `committed` is the newly-emitted tail.
+    fn observe(&mut self, emitted: &[u32], committed: &[u32]);
+
+    /// Clear drafter-local state for a fresh conversation.
+    fn reset(&mut self);
+}
+
+/// Model-free n-gram / PLD drafter. See module docs.
+pub struct NgramDrafter {
+    /// Bigram fallback predictor; seeded from the prompt, grown from output.
     ngram: NgramCache,
     /// PLD self-match matcher (primary draft source).
     pld: PldMatcher,
     /// The rendered prompt, kept so PLD/bigram see the full context (prompt +
-    /// emitted), not just the decode tail — PLD's biggest wins are copies from
-    /// the prompt. Refreshed each `prefill`.
+    /// emitted) — PLD's biggest wins are copies from the prompt.
     prompt: Vec<u32>,
-    /// Arch-specific target verify scratch, created lazily on first `prefill`
-    /// via [`SpecTarget::new_spec_scratch`] (the target isn't available at
-    /// construction). Reused across requests; freed in [`Speculator::free`].
-    scratch: Option<Box<dyn SpecScratch>>,
 }
 
-impl NgramSpeculator {
-    /// `block_size` is the n-gram draft window (incl. seed); `min_count` is the
-    /// bigram trust threshold. No GPU / arch types — scratch is lazy.
-    pub fn new(block_size: usize, ctx_capacity: usize, min_count: u32) -> Self {
+impl NgramDrafter {
+    /// `block_size` sizes the PLD spine cap (`block_size - 1`); `min_count` is the
+    /// bigram trust threshold.
+    pub fn new(min_count: u32, block_size: usize) -> Self {
         let block_size = block_size.max(2);
-        // PLD extracts at most block_size-1 continuation tokens (cap b at
-        // block_size). min_extract = 1 keeps even short self-matches usable —
-        // exact verify gates them anyway.
+        // min_extract = 1 keeps even short self-matches usable — exact verify
+        // gates them anyway.
         let pld = PldMatcher {
             ngram_lens: vec![5, 4, 3],
             max_extract: block_size - 1,
             min_extract: 1,
         };
         Self {
-            block_size,
-            ctx_capacity,
             ngram: NgramCache::new(min_count),
             pld,
             prompt: Vec::new(),
-            scratch: None,
         }
     }
+}
 
-    /// Propose up to `block_size - 1` continuation tokens after `ctx`'s last
-    /// token (the seed). PLD first (longest self-match), bigram chain as
-    /// fallback. Returns an empty vec when neither source fires (→ pure AR step).
-    fn build_draft(&self, ctx: &[u32]) -> Vec<u32> {
-        let max_draft = self.block_size - 1;
-        if let Some(m) = self.pld.lookup(ctx) {
+impl BlockDrafter for NgramDrafter {
+    fn prefill_seed(&mut self, prompt_tokens: &[u32]) {
+        self.prompt.clear();
+        self.prompt.extend_from_slice(prompt_tokens);
+        self.ngram.observe_many(prompt_tokens);
+    }
+
+    fn propose(&mut self, emitted: &[u32], _seed: u32, max_draft: usize) -> Vec<u32> {
+        // ctx = prompt ++ emitted; its last token is the seed.
+        let mut ctx = Vec::with_capacity(self.prompt.len() + emitted.len());
+        ctx.extend_from_slice(&self.prompt);
+        ctx.extend_from_slice(emitted);
+        // PLD first (longest self-match), bigram chain as fallback.
+        if let Some(m) = self.pld.lookup(&ctx) {
             let mut d = m.tokens;
             d.truncate(max_draft);
             if !d.is_empty() {
@@ -105,9 +118,54 @@ impl NgramSpeculator {
         }
         Vec::new()
     }
+
+    fn observe(&mut self, emitted: &[u32], committed: &[u32]) {
+        // Grow the bigram cache with the new tokens, including the triples
+        // spanning the previous-context boundary (last 2 of prompt++emitted).
+        let plen = self.prompt.len();
+        let total = plen + emitted.len();
+        let mut window: Vec<u32> = Vec::with_capacity(2 + committed.len());
+        for i in total.saturating_sub(2)..total {
+            window.push(if i < plen {
+                self.prompt[i]
+            } else {
+                emitted[i - plen]
+            });
+        }
+        window.extend_from_slice(committed);
+        self.ngram.observe_many(&window);
+    }
+
+    fn reset(&mut self) {
+        self.ngram = NgramCache::new(self.ngram.min_count);
+        self.prompt.clear();
+    }
 }
 
-impl Speculator for NgramSpeculator {
+/// Arch-agnostic chain speculator over any [`BlockDrafter`]. Owns the target
+/// verify scratch (built lazily on first `prefill` via
+/// [`SpecTarget::new_spec_scratch`]) and the verify/accept/commit flow.
+pub struct ChainSpeculator<D: BlockDrafter> {
+    drafter: D,
+    /// Max block size including the seed: a window verifies `[seed, draft..]`
+    /// with `draft.len() <= block_size - 1`, so `b <= block_size`.
+    block_size: usize,
+    ctx_capacity: usize,
+    scratch: Option<Box<dyn SpecScratch>>,
+}
+
+impl<D: BlockDrafter> ChainSpeculator<D> {
+    pub fn new(drafter: D, block_size: usize, ctx_capacity: usize) -> Self {
+        Self {
+            drafter,
+            block_size: block_size.max(2),
+            ctx_capacity,
+            scratch: None,
+        }
+    }
+}
+
+impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -134,12 +192,7 @@ impl Speculator for NgramSpeculator {
             SpecAdvance::Ready { last_argmax } => last_argmax,
         };
 
-        // Refresh drafter context: keep the full prompt for PLD self-match and
-        // seed the bigram cache from it.
-        self.prompt.clear();
-        self.prompt.extend_from_slice(prompt_tokens);
-        self.ngram.observe_many(prompt_tokens);
-
+        self.drafter.prefill_seed(prompt_tokens);
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -152,13 +205,8 @@ impl Speculator for NgramSpeculator {
         emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<SpecStep, String> {
-        // Full context = prompt ++ emitted; its last token is `seed`. Build the
-        // draft (pure CPU) BEFORE borrowing scratch so the `&self` draft borrow
-        // doesn't collide with the `&mut self.scratch` field borrow below.
-        let mut ctx = Vec::with_capacity(self.prompt.len() + emitted.len());
-        ctx.extend_from_slice(&self.prompt);
-        ctx.extend_from_slice(emitted);
-        let draft = self.build_draft(&ctx);
+        // Propose the draft (pure CPU) BEFORE borrowing scratch.
+        let draft = self.drafter.propose(emitted, seed, self.block_size - 1);
 
         // block = [seed, draft..] ; b = block.len() in 1..=block_size.
         let mut block = Vec::with_capacity(draft.len() + 1);
@@ -168,17 +216,15 @@ impl Speculator for NgramSpeculator {
         let scratch = self
             .scratch
             .as_deref_mut()
-            .ok_or("NgramSpeculator: step before prefill")?;
+            .ok_or("ChainSpeculator: step before prefill")?;
 
         // Verify: target snapshots its pre-state into `scratch`, runs the block,
         // returns per-position greedy argmax, leaves state advanced by b.
         let argmax = target.verify_block(gpu, &block, position, scratch)?;
 
-        // Shared greedy accept-prefix (eos=None: never early-stops, always emits
-        // a bonus — EOS is handled downstream by the daemon decode loop).
-        // `emit` = accepted drafts ++ bonus = the committed tail.
+        // Shared greedy accept-prefix (eos=None: EOS handled downstream by the
+        // daemon decode loop). `committed` = accepted drafts ++ bonus.
         let acc = accept_greedy_prefix(&draft, &argmax, None);
-        let accept_len = acc.accepted;
         let bonus = *acc
             .committed
             .last()
@@ -186,28 +232,21 @@ impl Speculator for NgramSpeculator {
 
         // Fix target state to the committed prefix block[..accept_len+1] (the
         // target decides full-accept-skip vs rewind+replay vs no-op internally).
-        target.commit_prefix(gpu, &block, accept_len, position, scratch)?;
+        target.commit_prefix(gpu, &block, acc.accepted, position, scratch)?;
 
-        // Grow the bigram cache with the new tokens, including the triples
-        // spanning the previous-context boundary.
-        let pre = ctx.len().saturating_sub(2);
-        let mut window: Vec<u32> = ctx[pre..].to_vec();
-        window.extend_from_slice(&acc.committed);
-        self.ngram.observe_many(&window);
+        self.drafter.observe(emitted, &acc.committed);
 
         Ok(SpecStep::new(
             acc.committed.iter().copied(),
             bonus,
             draft.len(),
-            accept_len,
+            acc.accepted,
         ))
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) {
-        // Drafter-local reset for a fresh conversation: clear CPU draft state.
-        // The verify scratch is reusable GPU state — kept across conversations.
-        self.ngram = NgramCache::new(self.ngram.min_count);
-        self.prompt.clear();
+        // Drafter-local reset; the verify scratch is reusable GPU state — kept.
+        self.drafter.reset();
     }
 
     fn block_size(&self) -> usize {
