@@ -28,6 +28,7 @@ pub mod cohere2moe;
 pub mod config;
 pub mod forward;
 pub mod paro_dir;
+pub mod spec_impl;
 
 pub use arch::Cohere2Moe;
 pub use cohere2moe::{
@@ -35,3 +36,4 @@ pub use cohere2moe::{
 };
 pub use config::{AttnKind, Cohere2MoeConfig};
 pub use forward::decode_step;
+pub use spec_impl::Cohere2MoeBundle;
