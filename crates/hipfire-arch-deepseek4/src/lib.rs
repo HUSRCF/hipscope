@@ -56,6 +56,7 @@ pub mod deepseek4;
 pub mod dsml;
 pub mod forward;
 pub mod grammar;
+pub mod mtp_speculator;
 pub mod sampling;
 pub mod spec_decode;
 pub mod spec_impl;
