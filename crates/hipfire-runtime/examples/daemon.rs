@@ -1947,10 +1947,20 @@ fn main() {
                     // top_p=0.80; at temp 0.1 the top_k-vs-top_p choice is near
                     // moot (the distribution is already peaked).
                     (0.1_f64, 0.80_f64)
-                } else if m.arch_id == 9 || m.arch_id == 10 {
-                    // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
-                    // models that fall into block-level attractors at lower
-                    // temperatures — use the card-recommended temp=1.0/top_p=1.0.
+                } else if m.arch_id == 9 {
+                    // DeepSeek V4 Flash (9): MTP spec-decode is greedy-only and,
+                    // since the k=2 + K+1 shared-accept-core work, ~3× faster than
+                    // AR (measured 81.7% accept / 24 vs 7.8 tok/s on the
+                    // deepseek4-mtp code bench). Default to temp=0 so an omitted
+                    // `temperature` gets that spec speedup; explicit temp>0 is
+                    // still honored and routes to the AR sampler (spec is
+                    // greedy-only). Was 1.0 to dodge block-level attractors at low
+                    // temp — coherence-gate-deepseek4-mtp re-validates greedy.
+                    (0.0_f64, 1.0_f64)
+                } else if m.arch_id == 10 {
+                    // MiniMax-M2 (10): quantized instruct model that falls into
+                    // block-level attractors at lower temperatures — keep the
+                    // card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
                 } else if m.arch_id == 12 {
                     // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
@@ -8963,7 +8973,7 @@ fn generate_deepseek4(
 
     // Triaged config resolution for MTP speculative decode.
     // Priority: 1. legacy env var → 2. generic env var → 3. stored config → default.
-    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
+    let spec_requested = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
         .ok()
         .map(|v| v == "1")
         .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
@@ -8971,6 +8981,22 @@ fn generate_deepseek4(
             Some("off") => false,
             _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
         });
+    // Honor the requested temperature (pre-existing-bug fix). MTP spec-decode
+    // here is GREEDY-ONLY: the verifier takes argmax and the K-step draft chain
+    // never samples (`spec_decode::speculative_decode_step_with_pbs` takes no
+    // temp/rng), so its output is correct ONLY at temp≈0. At temp>0 the caller
+    // asked to SAMPLE; running spec anyway silently emits greedy output that
+    // ignores `temp` — the bug, masked by the arch-default temp=1.0 (which made
+    // every default request take the greedy spec path regardless of intent).
+    // Fall to the plain AR sampler at temp>0 instead.
+    let spec_mode = spec_requested && temp <= 1e-6;
+    if spec_requested && !spec_mode {
+        eprintln!(
+            "[deepseek4] spec-decode requested but temp={temp:.3} > 0 — the MTP draft is \
+             greedy-only; honoring the requested temperature via the AR sampler \
+             (set temperature=0 for greedy spec-decode)"
+        );
+    }
     // Default k=2. The K+1 verify (full-accept bonus, shared accept-core) makes
     // k=2 both highest-accept AND highest-throughput on the deepseek4-mtp bench
     // (code +28% / prose +22% / math +5% vs the old k=3 default; k=3 itself
