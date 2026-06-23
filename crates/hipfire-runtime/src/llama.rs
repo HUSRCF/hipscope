@@ -1451,6 +1451,28 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        // MQ4G256 = HFQ4G256 weight layout + an offline FWHT rotation, so the
+        // batched GEMM is: FWHT-rotate all `batch_size` activation columns once
+        // (`mq_rotate_x`, AWQ-aware), then feed the same INT4-G256 WMMA kernel
+        // HFQ4G256 uses. This is the batched twin of `weight_gemv`'s single-row
+        // `ensure_mq_signs + rotate_x_mq_for + gemv(Prerotated)` path, and mirrors
+        // DFlash's proven `gemm_dispatch` MQ4 arm (dflash.rs). Replaces the per-row
+        // GEMV fallback that re-read the weight `batch_size`× (the spec-verify
+        // bottleneck). NOTE: the WMMA path quantizes x to F16, so it is NOT
+        // bit-identical to the F32 GEMV — fine for any batched-prefill / spec-verify
+        // use (validated by coherence), same as HFQ4G256 already is.
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            // The rotated bytes occupy a freshly-pooled pointer that may alias a
+            // previously-freed x buffer; invalidate gemm_hfq4g256's FP16-x cache so
+            // `ensure_fp16_x` re-quantizes from x_rot rather than stale-hitting.
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            let r = gpu.gemm_hfq4g256(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
