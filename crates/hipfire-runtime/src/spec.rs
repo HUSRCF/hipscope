@@ -434,6 +434,181 @@ pub trait Speculator {
     }
 }
 
+// ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
+//
+// Every MTP drafter (qwen35 MTP head, deepseek4 MTP layer) shares one shape: a
+// prompt prefill that primes the arch's MTP history + recurrent/KV state and
+// returns a greedy seed, then a per-window draft+verify+accept step returning
+// the committed tail (accepted prefix + bonus, seed excluded). The arches differ
+// only in the fused kernels they run — that difference is [`MtpDrafter`], and
+// [`MtpSpeculator`] adapts any `MtpDrafter` to the generic [`Speculator`]
+// interface (prefill→`PrefillOutcome`, window→`SpecStep`) ONCE, so a new MTP arch
+// implements only `MtpDrafter` (+ `SpecTarget`), never a whole `Speculator`.
+
+/// One acceptance window's committed tokens: the accepted draft prefix plus the
+/// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
+/// `MtpSpecResult.committed` and deepseek4's `accepted_tokens`.
+#[derive(Debug, Clone)]
+pub struct MtpWindow {
+    /// Tokens committed this window (accepted drafts + bonus, seed excluded).
+    /// `committed.len()` is what drives the daemon's `position += emit.len()`.
+    pub committed: Vec<u32>,
+    /// Drafts accepted, excluding the bonus (τ numerator).
+    pub accepted: usize,
+    /// Drafts offered this window, ≤ `k` (τ denominator).
+    pub drafts_generated: usize,
+}
+
+/// Per-arch MTP draft+verify core. The impl owns its draft scratch (qwen35:
+/// `MtpSpecState` + head; deepseek4: the relocated `PrefillBatchScratch`) and
+/// downcasts `target` (`&mut dyn SpecTarget`) to its concrete model type to run
+/// the fused head-draft + trunk-verify kernels. Everything arch-INvariant
+/// (prefill outcome, window→step lowering, position/seed advance) lives once in
+/// [`MtpSpeculator`].
+pub trait MtpDrafter {
+    /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
+    /// KV/recurrent state AND the MTP head's position-aligned cache, returning
+    /// the greedy seed (argmax at the last prefilled position). `cache_hit=false`
+    /// ⇒ cold start (reset recurrent + MTP cache first); `true` ⇒ warm suffix
+    /// extension (preserve prior state).
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String>;
+
+    /// One acceptance window: seed at absolute `position`; draft `k`, verify,
+    /// greedily accept the longest matching prefix + bonus. `grammar` is the
+    /// IN-STEP grammar (deepseek4 masks draft+verify logits with it; qwen35
+    /// ignores it and relies on post-hoc grammar in the emission layer).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String>;
+
+    /// Reset drafter-local state for a fresh conversation (MTP cache + any
+    /// captured graphs). The target's KV/recurrent reset is the daemon's job.
+    fn mtp_reset(&mut self, gpu: &mut Gpu);
+
+    /// Release all GPU buffers the drafter owns.
+    fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Draft window size (K).
+    fn k(&self) -> usize;
+
+    /// Target context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Whether verification is greedy-only (temp≈0). qwen35 MTP → `true`.
+    fn requires_greedy(&self) -> bool;
+}
+
+/// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
+/// interface. One impl serves every MTP arch; the arch-specific work is the
+/// `MtpDrafter` (+ `SpecTarget`) impl in the arch crate.
+pub struct MtpSpeculator<A: MtpDrafter> {
+    arch: A,
+}
+
+impl<A: MtpDrafter> MtpSpeculator<A> {
+    pub fn new(arch: A) -> Self {
+        Self { arch }
+    }
+}
+
+/// Lower an [`MtpWindow`] to the generic [`SpecStep`]. `committed` already
+/// excludes the seed and includes the bonus, so it maps 1:1 to `emit`; the next
+/// window's seed is the last committed token (the daemon's `position +=
+/// emit.len()` / `seed = next_seed` contract). An empty `committed` would stall
+/// the loop (no position/`generated` advance) — surface it as an error so the
+/// loop breaks instead of spinning.
+fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
+    let next_seed = *w
+        .committed
+        .last()
+        .ok_or("MtpSpeculator: drafter committed 0 tokens (would stall the decode loop)")?;
+    Ok(SpecStep::new(
+        w.committed.iter().copied(),
+        next_seed,
+        w.drafts_generated,
+        w.accepted,
+    ))
+}
+
+impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        _resume_from: Option<usize>,
+        _abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        // Cache hit ⇒ warm suffix prefill from `prefill_start`; miss ⇒ full
+        // prefill from 0 (the drafter resets recurrent + MTP cache on miss).
+        let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
+            (prefill_tokens, prefill_start)
+        } else {
+            (prompt_tokens, 0)
+        };
+        let first_token = self
+            .arch
+            .mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
+        Ok(PrefillOutcome::Ready { first_token })
+    }
+
+    fn step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        _emitted: &[u32],
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<SpecStep, String> {
+        let k = self.arch.k();
+        let eos = target.eos_token();
+        let window = self
+            .arch
+            .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
+        lower_mtp_window(window)
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) {
+        self.arch.mtp_reset(gpu);
+    }
+
+    fn block_size(&self) -> usize {
+        self.arch.k()
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.arch.ctx_capacity()
+    }
+
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        // Move the drafter out of the box and hand it its own boxed-self free.
+        Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn requires_greedy(&self) -> bool {
+        self.arch.requires_greedy()
+    }
+}
+
 // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────
 //
 // Moved here from `hipfire-arch-qwen35::speculative` so the arch-generic
@@ -686,5 +861,49 @@ mod tests {
         assert_eq!(r.accepted, 1);
         assert_eq!(r.committed, vec![11, 2]);
         assert!(r.hit_eos);
+    }
+
+    // ── lower_mtp_window (MtpWindow → SpecStep) ─────────────────────────────
+
+    #[test]
+    fn lower_mtp_window_maps_committed_and_last_seed() {
+        // 4 drafts offered, 2 accepted + bonus ⇒ committed = [a, b, bonus].
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![10, 11, 12],
+            accepted: 2,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[10, 11, 12]);
+        assert_eq!(step.next_seed, 12); // committed.last() == bonus
+        assert_eq!(step.proposed, 4);
+        assert_eq!(step.accepted, 2);
+        // The load-bearing loop contract still holds for the MTP lowering.
+        assert_eq!(step.emit.len(), step.accepted + 1);
+    }
+
+    #[test]
+    fn lower_mtp_window_single_bonus_only() {
+        // 0 accepted ⇒ committed = [bonus] (still non-empty).
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![99],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[99]);
+        assert_eq!(step.next_seed, 99);
+        assert_eq!(step.accepted, 0);
+    }
+
+    #[test]
+    fn lower_mtp_window_empty_is_error() {
+        // An empty window would stall the daemon loop — must be an error.
+        assert!(lower_mtp_window(MtpWindow {
+            committed: vec![],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .is_err());
     }
 }
