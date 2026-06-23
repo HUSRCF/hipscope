@@ -262,13 +262,11 @@ pub use lfm2moe::Lfm2MoeBundle;
 /// prior loader-local struct (`config`/`weights`/`state`/`eos_tok`).
 pub use minimax::MiniMaxBundle;
 
-/// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle.
-pub struct Cohere2MoeBundle {
-    pub config: cohere2moe::Cohere2MoeConfig,
-    pub weights: cohere2moe::Cohere2MoeWeights,
-    pub state: cohere2moe::Cohere2MoeState,
-    pub eos_tok: u32,
-}
+/// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle. Re-exported from the
+/// arch crate, which owns it so `impl SpecTarget for Cohere2MoeBundle` (the
+/// n-gram verify seam) lives next to the forward it drives (orphan rule).
+/// Field-identical to the prior loader-local struct.
+pub use cohere2moe::Cohere2MoeBundle;
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 

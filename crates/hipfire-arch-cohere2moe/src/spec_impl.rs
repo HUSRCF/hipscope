@@ -119,6 +119,45 @@ impl SpecTarget for Cohere2MoeBundle {
                 .map_err(|e| format!("cohere2moe spec_advance reset: {e}"))?;
         }
         self.state.n_tokens = start_pos;
+        // Bulk prefill (reset path): mirror the AR `generate_cohere2moe` BATCHED
+        // `forward_batch` chunked prefill so the spec path's KV is numerically
+        // identical to AR's. Per-token `decode_step` prefill is *correct* but not
+        // bit-identical to batched (different GEMM accumulation) — enough to drift
+        // greedy decode a few tokens in. `forward_batch` advances `state.n_tokens`
+        // internally (= start+b) and returns the last position's host logits.
+        if reset && tokens.len() > 1 && forward::forward_batch_supported(&self.weights) {
+            let mut last_logits: Vec<f32> = Vec::new();
+            let mut i = 0;
+            while i < tokens.len() {
+                if abort() {
+                    self.state
+                        .reset(gpu)
+                        .map_err(|e| format!("cohere2moe spec_advance abort reset: {e}"))?;
+                    return Ok(SpecAdvance::Aborted);
+                }
+                let end = (i + 256).min(tokens.len());
+                let start = self.state.n_tokens;
+                last_logits = forward::forward_batch(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    gpu,
+                    &tokens[i..end],
+                    start,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+                i = end;
+            }
+            // Host argmax over the final position's logits (greedy first seed) —
+            // matches AR's `sample_token(temp=0)` on the same `forward_batch` output.
+            let last_argmax = last_logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            return Ok(SpecAdvance::Ready { last_argmax });
+        }
         for &tok in tokens {
             if abort() {
                 self.state
@@ -129,7 +168,9 @@ impl SpecTarget for Cohere2MoeBundle {
             let pos = self.state.n_tokens as u32;
             forward::decode_step(&self.config, &self.weights, &mut self.state, gpu, tok, pos)
                 .map_err(|e| format!("{e:?}"))?;
-            self.state.n_tokens += 1;
+            // `decode_step` (via `decode_step_body`) already sets
+            // `state.n_tokens = position + 1`; do NOT advance again or the cursor
+            // double-steps (KV scattered across 0,2,4,… → corrupt context).
         }
         // decode_step leaves the logits in state.logits. Take the argmax.
         let last_argmax = gpu
@@ -162,7 +203,8 @@ impl SpecTarget for Cohere2MoeBundle {
             let pos = self.state.n_tokens as u32;
             forward::decode_step(&self.config, &self.weights, &mut self.state, gpu, tok, pos)
                 .map_err(|e| format!("{e:?}"))?;
-            self.state.n_tokens += 1;
+            // `decode_step` already advances `state.n_tokens` to `position + 1`
+            // — no manual step (see spec_advance).
             out.push(
                 gpu.argmax_f32(&self.state.logits, self.config.vocab_size)
                     .map_err(|e| format!("{e:?}"))?,

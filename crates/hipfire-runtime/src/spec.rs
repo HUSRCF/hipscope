@@ -751,6 +751,10 @@ pub struct SpecEmitCtx<'a> {
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
     pub max_think: usize,
+    /// The turn's `max_tokens` cap. Used by arches whose emitter sizes a
+    /// think-token reserve against it (cohere2moe's think-budget force-close);
+    /// ignored by emitters without a generation-side think guard.
+    pub max_tokens: usize,
     /// Whether the prompt opened a `<think>` span via the assistant prefix.
     pub assistant_prefix: crate::prompt_frame::AssistantPrefix,
     /// Requested reasoning-effort level (arch interprets the frame mapping).
@@ -810,6 +814,22 @@ pub trait SpecEmit {
     /// attractor-detect log message can report the same number it did inline.
     /// Default no-op.
     fn set_generated_hint(&mut self, _generated: usize) {}
+
+    /// Generation-intervention hook: tokens the emitter wants the loop to FORCE
+    /// into the stream after the just-observed token, suppressing this step's
+    /// terminator. The decode loop, when this returns non-empty, advances the
+    /// target over each token, re-feeds it through [`observe`](Self::observe),
+    /// and continues WITHOUT honoring the current step's `stop` — used by arches
+    /// whose bespoke AR loop does generation-side recovery a pure emitter cannot
+    /// express (e.g. cohere2moe's empty-turn guard force-injects `<|START_TEXT|>`
+    /// when the model ends thinking with no visible output, and its think-budget
+    /// force-close injects `<|END_THINKING|><|START_TEXT|>`). The emitter must
+    /// drain the queue (return-and-clear) and bound its own re-entry (e.g. a max
+    /// suppression count) so forcing terminates. Default empty ⇒ the loop never
+    /// enters the force path, so every other emitter is byte-identical no-op.
+    fn take_forced(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────

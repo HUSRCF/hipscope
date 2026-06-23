@@ -968,6 +968,25 @@ impl Carrier for Cohere2MoeCarrier {
     fn name(&self) -> &'static str {
         "cohere2moe"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Cohere2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("cohere2moe: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Arch-specific emitter: North's agentic-marker state machine (markers
+        // never surfaced, reasoning channel, ACTION→tool_calls) + the empty-turn
+        // and think-budget generation guards via `take_forced`.
+        Ok(hipfire_arch_cohere2moe::spec_emit::Cohere2MoeEmit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
@@ -983,7 +1002,17 @@ impl Carrier for Cohere2MoeCarrier {
                 let tokenizer =
                     hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                         .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-                crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+                let mut lm =
+                    crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)?;
+                // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
+                lm.speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                );
+                Ok(lm)
             }
             ModelSource::Dir(source) => {
                 // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
@@ -1003,6 +1032,13 @@ impl Carrier for Cohere2MoeCarrier {
                     &meta.tokenizer,
                     &["<|END_OF_TURN_TOKEN|>", "</s>", "<|endoftext|>"],
                 );
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                );
                 Ok(LoadedModel {
                     state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {
                         config,
@@ -1010,6 +1046,7 @@ impl Carrier for Cohere2MoeCarrier {
                         state,
                         eos_tok,
                     })),
+                    speculator,
                     ..LoadedModel::skeleton(
                         meta.arch_id,
                         meta.tokenizer,

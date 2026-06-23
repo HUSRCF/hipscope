@@ -4385,6 +4385,7 @@ fn generate_spec(
         tools: emit_req.tools.as_deref(),
         stop: emit_req.stop,
         max_think: emit_req.max_think,
+        max_tokens,
         assistant_prefix: emit_req.assistant_prefix,
         think_mode: emit_req.think_mode,
         decoded_vocab: emit_req.decoded_vocab,
@@ -4532,6 +4533,7 @@ fn generate_spec(
 
         let mut hit_eos = false;
         let mut think_cap_hit = false;
+        let mut forced_after: Vec<u32> = Vec::new();
         for &tok in &committed_tail {
             if generated >= max_tokens {
                 break;
@@ -4562,6 +4564,17 @@ fn generate_spec(
                 render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
                 generated += 1;
             }
+            // Generation-intervention hook: the emitter may request tokens to
+            // FORCE after this one, suppressing the step's terminator (cohere2moe
+            // empty-turn guard / think-budget force-close). Default empty for
+            // every other emitter ⇒ this branch never taken, loop byte-identical.
+            // Processed after the post-loop `position += emit.len()` so forced
+            // tokens advance from the target's true (batch-advanced) cursor.
+            let forced = emit.take_forced();
+            if !forced.is_empty() {
+                forced_after = forced;
+                break;
+            }
             match outcome.stop {
                 Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
                     hit_eos = true;
@@ -4579,6 +4592,39 @@ fn generate_spec(
         // — the loop contract pinned by spec.rs's `emit_len_drives_advance`.
         position += step.emit.len();
         seed_token = step.next_seed;
+
+        // Forced-token injection (cohere2moe generation guards; no-op for every
+        // other emitter — `take_forced` defaulted empty). The target already
+        // batch-advanced over the whole committed tail, so `position` is now its
+        // true cursor: advance it over each forced token, re-feed the token
+        // through the emitter (a marker transitions its state machine + emits a
+        // Committed event), set the next draft seed to it, and continue WITHOUT
+        // honoring the suppressed terminator. Bounded by the emitter's own
+        // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
+        if !forced_after.is_empty() {
+            for ft in std::mem::take(&mut forced_after) {
+                if let Err(e) = slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id))
+                {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"forced-token advance: {}"}}"#,
+                        id, e
+                    );
+                    let _ = stdout.flush();
+                    hit_eos = true;
+                    break;
+                }
+                position += 1;
+                emit.set_generated_hint(generated);
+                let fo = emit.observe(ft);
+                if !fo.events.is_empty() {
+                    emitted.push(ft);
+                    render_client_events(stdout, id, &fo.events, t0.elapsed().as_millis() as u64);
+                    generated += 1;
+                }
+                seed_token = ft;
+            }
+        }
         // Per-cycle eviction (FlashCASK). Fires whenever current physical
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
@@ -5999,6 +6045,36 @@ fn generate(
             max_think_tokens,
             tools,
             messages_history,
+        );
+        return;
+    }
+    // arch_id=12 (Cohere2-MoE) with an opt-in model-free n-gram speculator loaded
+    // (cohere2moe `SpecTarget` + `Cohere2MoeEmit`, which ports the agentic-marker
+    // state machine + empty-turn / think-budget generation guards) routes to the
+    // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
+    // Without a speculator it falls through to the plain `generate_cohere2moe`.
+    if m.arch_id == 12 && m.speculator.is_some() {
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+        );
+        generate_dflash(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            assistant_prefix,
+            None, // pflash_bypass_reason — no pflash on the n-gram path
+            None, // pflash_alpha
+            tools,
+            messages_history,
+            stop,
         );
         return;
     }
@@ -10291,177 +10367,6 @@ fn generate_minimax(
     let _ = stdout.flush();
 }
 
-/// Parse a Cohere `<|START_ACTION|>` … `<|END_ACTION|>` body — a JSON array of
-/// `{tool_call_id, tool_name, parameters}` — into the daemon's tool_calls wire
-/// shape `[{name, arguments}]`. Tolerant of surrounding whitespace and trailing
-/// junk (slices from the first `[` to the last `]`); returns empty on any parse
-/// failure so a malformed/truncated action never crashes the stream.
-fn parse_cohere_action(buf: &str) -> Vec<serde_json::Value> {
-    let t = buf.trim();
-    let slice = match (t.find('['), t.rfind(']')) {
-        (Some(s), Some(e)) if e > s => &t[s..=e],
-        _ => return Vec::new(),
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(slice) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let arr = match parsed.as_array() {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    arr.iter()
-        .filter_map(|tc| {
-            let name = tc.get("tool_name").and_then(|v| v.as_str())?;
-            let args = tc
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            Some(serde_json::json!({"name": name, "arguments": args}))
-        })
-        .collect()
-}
-
-/// Snap a hallucinated/verbose tool name back to a real tool from the request.
-/// North (driven by a non-Cohere agentic harness) sometimes emits the tool name
-/// with descriptive words glued on, e.g. `bash immediate return command` instead
-/// of `bash`. Match by exact name, then leading whitespace token, then any
-/// whitespace token, preferring the longest known match; pass through unchanged
-/// if nothing matches (the client then reports an unknown tool, as before).
-fn snap_tool_name(name: &str, known: &[String]) -> String {
-    if known.is_empty() || known.iter().any(|k| k == name) {
-        return name.to_string();
-    }
-    let toks: Vec<&str> = name.split_whitespace().collect();
-    let mut best: Option<&str> = None;
-    for k in known {
-        let hit = toks.first() == Some(&k.as_str()) || toks.iter().any(|t| *t == k.as_str());
-        if hit && best.map_or(true, |b| k.len() > b.len()) {
-            best = Some(k.as_str());
-        }
-    }
-    best.map(String::from).unwrap_or_else(|| name.to_string())
-}
-
-/// Snap a glitched argument key (e.g. `path_`, `path_l`) to a real parameter of
-/// the tool. Match exact, then prefix either way, preferring the longest valid
-/// parameter; pass through unchanged if nothing matches.
-fn snap_param_name(key: &str, valid: &[String]) -> String {
-    if valid.is_empty() || valid.iter().any(|v| v == key) {
-        return key.to_string();
-    }
-    let mut best: Option<&str> = None;
-    for v in valid {
-        if key.starts_with(v.as_str()) || v.starts_with(key) {
-            if best.map_or(true, |b| v.len() > b.len()) {
-                best = Some(v.as_str());
-            }
-        }
-    }
-    best.map(String::from).unwrap_or_else(|| key.to_string())
-}
-
-/// Normalize each parsed tool_call against the request's tool schemas: snap the
-/// tool `name` to a known tool, then snap each argument key to a real parameter
-/// of that tool (`tool_params` maps tool name → its parameter names).
-fn snap_call_names(
-    calls: &mut [serde_json::Value],
-    known: &[String],
-    tool_params: &[(String, Vec<String>)],
-) {
-    for c in calls.iter_mut() {
-        let name = match c.get("name").and_then(|v| v.as_str()) {
-            Some(n) => snap_tool_name(n, known),
-            None => continue,
-        };
-        c["name"] = serde_json::Value::String(name.clone());
-        if let Some((_, valid)) = tool_params.iter().find(|(tn, _)| *tn == name) {
-            if !valid.is_empty() {
-                if let Some(args) = c.get_mut("arguments").and_then(|a| a.as_object_mut()) {
-                    for k in args.keys().cloned().collect::<Vec<_>>() {
-                        let sk = snap_param_name(&k, valid);
-                        if sk != k && !args.contains_key(&sk) {
-                            if let Some(v) = args.remove(&k) {
-                                args.insert(sk, v);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod toolcall_robustness_tests {
-    use super::{parse_cohere_action, snap_call_names, snap_param_name, snap_tool_name};
-
-    #[test]
-    fn snaps_glitched_param_key() {
-        let valid = ["path".to_string()];
-        assert_eq!(snap_param_name("path_", &valid), "path"); // the retest glitch
-        assert_eq!(snap_param_name("path_l", &valid), "path");
-        assert_eq!(snap_param_name("path", &valid), "path"); // correct passes through
-        assert_eq!(snap_param_name("command", &valid), "command"); // no match → as-is
-    }
-
-    #[test]
-    fn snaps_verbose_hallucinated_name() {
-        let known = ["bash".to_string(), "read".to_string(), "write".to_string()];
-        // the exact failures observed driving North from the tb harness
-        assert_eq!(
-            snap_tool_name("bash immediate return command", &known),
-            "bash"
-        );
-        assert_eq!(snap_tool_name("bash immediate", &known), "bash");
-        // already-correct names pass through unchanged
-        assert_eq!(snap_tool_name("read", &known), "read");
-        // any-token match
-        assert_eq!(snap_tool_name("please write the file", &known), "write");
-        // no match → left as-is (client reports unknown, as before)
-        assert_eq!(snap_tool_name("frobnicate", &known), "frobnicate");
-        // prefer the longest known match
-        let k2 = ["bash".to_string(), "bash_script".to_string()];
-        assert_eq!(snap_tool_name("bash_script now", &k2), "bash_script");
-    }
-
-    #[test]
-    fn recovers_tool_call_written_as_text() {
-        // the exact JSON the model emitted as TEXT instead of <|START_ACTION|>
-        let text = r#"[
-    {"tool_call_id": "12", "tool_name": "read", "parameters": {"path": "/home/nick/CLionProjects/tb/.idea/.gitignore"}}
-]"#;
-        let mut calls = parse_cohere_action(text);
-        assert_eq!(calls.len(), 1);
-        snap_call_names(
-            &mut calls,
-            &["read".to_string()],
-            &[("read".to_string(), vec!["path".to_string()])],
-        );
-        assert_eq!(calls[0]["name"], "read");
-        assert_eq!(
-            calls[0]["arguments"]["path"],
-            "/home/nick/CLionProjects/tb/.idea/.gitignore"
-        );
-        // prose / incidental brackets are NOT mistaken for a tool call
-        assert!(parse_cohere_action("I'll read the file now.").is_empty());
-        assert!(parse_cohere_action("The result is [1, 2, 3].").is_empty());
-    }
-
-    #[test]
-    fn snaps_name_inside_recovered_call() {
-        let text =
-            r#"[{"tool_name": "bash immediate return command", "parameters": {"command": "ls"}}]"#;
-        let mut calls = parse_cohere_action(text);
-        snap_call_names(
-            &mut calls,
-            &["bash".to_string()],
-            &[("bash".to_string(), vec!["command".to_string()])],
-        );
-        assert_eq!(calls[0]["name"], "bash");
-    }
-}
-
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
 /// `generate_minimax`, plus: BATCHED `forward_batch` prefill (≈9×, see the
 /// prefill block) and a Cohere agentic-marker state machine in the decode loop
@@ -10997,8 +10902,8 @@ fn generate_cohere2moe(
         } else if next_tok == mk_act1 {
             // End of an action block → parse the JSON array into tool_calls,
             // snapping any verbose/hallucinated tool name to a real tool.
-            let mut calls = parse_cohere_action(&action_buf);
-            snap_call_names(&mut calls, &known_tools, &tool_params);
+            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&action_buf);
+            cohere2moe::spec_emit::snap_call_names(&mut calls, &known_tools, &tool_params);
             if !calls.is_empty() {
                 let _ = writeln!(
                     stdout,
@@ -11087,9 +10992,9 @@ fn generate_cohere2moe(
     // generic tool-call format — parse it out and emit it as a real tool_calls
     // event so the harness can actually execute it.
     if !tool_calls_emitted {
-        let mut recovered = parse_cohere_action(&vis_buf);
+        let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&vis_buf);
         if !recovered.is_empty() {
-            snap_call_names(&mut recovered, &known_tools, &tool_params);
+            cohere2moe::spec_emit::snap_call_names(&mut recovered, &known_tools, &tool_params);
             eprintln!(
                 "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
                 recovered.len()

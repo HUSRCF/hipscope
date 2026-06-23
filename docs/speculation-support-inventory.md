@@ -132,7 +132,7 @@ compile-check only; the shared wiring is integrated afterward.
 |---|---|---|---|
 | **minimax (10)** | ✅ (re-export bundle, carrier guard+emitter, build_speculator, spec_build gate +10, daemon arm) | `Qwen35Emit` (ChatML-clean) | ✅ **token-identical** generation (AR vs n-gram, greedy, `MiniMax-M2.7.mq2` 74GB on gfx1151/96GB): `AR[8:] == n-gram` exactly. Sole delta = the leading `<think>\n` delimiter (8 chars) that the bespoke AR path emits raw and `Qwen35Emit` consumes — cosmetic emitter rendering, NOT a generation divergence |
 | **lfm2moe (11)** | ✅ (same pattern; conv-state rollback) | `Qwen35Emit` (ChatML-clean) | ✅ **AR == n-gram byte-identical** (575 chars greedy, `lfm2.5-8b-a1b.mq4`); detectors all clean → conv-state snapshot/rollback correct |
-| **cohere2moe (12)** | ❌ DEFERRED | needs `Cohere2MoeEmit` | — |
+| **cohere2moe (12)** | ✅ (bundle re-export, carrier guard+emitter, build_speculator, spec_build gate +12, daemon arm) | `Cohere2MoeEmit` (ported marker state machine + guards) | ✅ **AR == n-gram byte-identical** (669 chars greedy, `North-Mini-Code-1.0.mq4.hfq`); zero marker leaks |
 | **dots-ocr (8)** | ❌ DEFERRED | — (VL path) | — |
 
 **minimax + lfm2moe** loader + daemon both build clean (`-p hipfire-loader`,
@@ -150,13 +150,29 @@ token-identical; only the delimiter surface differs. If exact AR-emitter match i
 ever required, minimax would need its own `SpecEmit`; for now the shared ChatML
 emitter is correct and arguably cleaner (reasoning-channel handling).
 
-**cohere2moe DEFERRED — emitter blocker (not mechanical):** its decode loop has a
-Cohere agentic-marker state machine (6 `<|START/END_THINKING/TEXT/ACTION|>`
-markers + empty-turn guard + EOS-suppression + ACTION→tool_calls parsing).
-`Qwen35Emit` lacks all of it; routing through it would leak markers into visible
-output and **fail the cohere2moe coherence gate**. Needs a `Cohere2MoeEmit`
-(a real `SpecEmit` port, like `Deepseek4Emit`). The `SpecTarget` impl compiles;
-the daemon arm / spec_build gate / carrier emitter were intentionally NOT added.
+**cohere2moe DONE — both blockers resolved + a latent bug fixed:**
+1. *Generation-intervention hook* (the architectural piece): `SpecEmit::take_forced()`
+   (default empty → byte-identical no-op for all other emitters). When non-empty
+   the `generate_spec` loop advances the target over each forced token, re-feeds it
+   through `observe`, sets it as the next draft seed, and continues without honoring
+   the suppressed terminator. Validated as a true no-op (lfm2moe + minimax re-ran
+   byte-identical after the loop change).
+2. *Emitter*: `Cohere2MoeEmit` (`crates/hipfire-arch-cohere2moe/src/spec_emit.rs`)
+   ports the `Sec` state machine (marker ids resolved from tokenizer w/ North
+   fixed-id fallback), reasoning-channel routing, defense-in-depth `<|MARKER|>`
+   suppression, END_ACTION→`tool_calls`, finish-time tool-call-as-text recovery,
+   AND both generation guards via `take_forced` (empty-turn guard force-injects
+   `<|START_TEXT|>`; think-budget force-close injects `<|END_THINKING|><|START_TEXT|>`,
+   sized off the new `SpecEmitCtx.max_tokens`). The four tool-call helpers
+   (`parse_cohere_action`/`snap_*`) moved to the arch crate; the daemon AR path
+   now imports them (single source).
+3. *Latent bug found + fixed*: the agent's cohere2moe `spec_impl` `spec_advance`/
+   `verify_block` did `state.n_tokens += 1` AFTER `decode_step` — but `decode_step`
+   (via `decode_step_body`) ALREADY sets `n_tokens = position + 1`, so the cursor
+   double-advanced, scattering prefill KV across positions 0,2,4,… → coherent-but-
+   off-topic output. Removed the redundant `+= 1`. Also switched the bulk prefill
+   to `forward_batch` (mirroring AR) so the KV is bit-identical to the batched AR
+   path (per-token vs batched GEMM accumulation otherwise drifts greedy decode).
 
 **dots-ocr DEFERRED — VL routing:** arch_id 8 decodes via `generate_vl_dots_ocr`
 (image-conditioned, CPU-sampled), not the text spec loop. Engaging n-gram needs a
