@@ -780,6 +780,24 @@ impl Carrier for MinimaxCarrier {
     fn name(&self) -> &'static str {
         "minimax"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Minimax(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("minimax: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Shared ChatML emitter (same one qwen2 reuses): MiniMax-M2 is ChatML
+        // (`<|im_end|>`), so the generic think/tool-call/EOS scanning applies.
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
     }
@@ -827,6 +845,12 @@ impl Carrier for MinimaxCarrier {
             &meta.tokenizer,
             &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
         );
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). MiniMax-M2
+        // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
+        // can be driven by the arch-generic spec loop with no draft model.
+        // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -834,6 +858,7 @@ impl Carrier for MinimaxCarrier {
                 state,
                 eos_tok,
             })),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -852,6 +877,24 @@ pub struct Lfm2MoeCarrier;
 impl Carrier for Lfm2MoeCarrier {
     fn name(&self) -> &'static str {
         "lfm2moe"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Lfm2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("lfm2moe: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Shared ChatML emitter (same one qwen2/minimax reuse): LFM2.5 is ChatML
+        // (`<|im_end|>`), no bespoke marker state machine.
+        Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
@@ -887,6 +930,12 @@ impl Carrier for Lfm2MoeCarrier {
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). LFM2.5-MoE
+        // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
+        // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
+        // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
                 config,
@@ -894,6 +943,7 @@ impl Carrier for Lfm2MoeCarrier {
                 state,
                 eos_tok,
             })),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

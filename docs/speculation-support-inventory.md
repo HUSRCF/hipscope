@@ -1,0 +1,185 @@
+# Speculation Support Inventory (per architecture)
+
+**Status:** living document — updated while the n-gram seam work proceeds.
+**Last updated:** 2026-06-23
+**Branch:** `feature/speculator-abstraction`
+**Scope:** what speculative-decode mechanism each model architecture supports in
+hipfire today, plus — for arches with no native drafter — what (if anything)
+exists upstream. Compiled from a per-architecture audit (one agent per arch crate
++ web search), 2026-06-23.
+
+## Vocabulary
+
+- **n-gram drafter** — model-free, arch-generic (`crates/hipfire-runtime/src/spec_ngram.rs`),
+  opt-in `HIPFIRE_NGRAM_DRAFT=1`. Any arch can opt in by implementing the
+  `SpecTarget` verify seam (`crates/hipfire-runtime/src/spec.rs`).
+- **MTP** — learned multi-token-prediction head shipped *with* the model weights
+  (DeepSeek-V3/V4, Qwen3.5/3.6 style).
+- **DFlash** — hipfire's block-diffusion drafter (published technique, arXiv
+  2602.06036 / Z Lab). Currently qwen35-specific (`crates/hipfire-arch-qwen35/src/dflash_spec.rs`).
+- **SpecTarget verify seam** — arch-generic verify interface
+  (`SpecTarget`/`Speculator`, shared `accept_greedy_prefix`). An arch's
+  `spec_impl.rs` plugs in as the verify target. Sequential `verify_block`
+  (one `forward_step` per token) is a correct byte-identical baseline; a
+  block-parallel kernel is an optional perf optimization on top.
+
+## Master table
+
+| Arch crate | arch_id | Model family | In-repo spec support | Native drafter? | Daemon-wired? |
+|---|---|---|---|---|---|
+| qwen35 | 5/6 | Qwen3.5/3.6 (DeltaNet hybrid) | DFlash + MTP + n-gram + SpecTarget verify | ✅ DFlash (default greedy) + MTP head | ✅ DFlash & n-gram default-wired; MTP gated `HIPFIRE_QWEN35_MTP=1` |
+| deepseek4 | 9 | DeepSeek-V4 (MLA+MoE) | MTP + SpecTarget verify | ✅ MTP head (ships in weights) | ✅ auto at temp=0 if MTP weights present (spec_k=2, greedy-only) |
+| llama | 0/1 | Llama/Mistral/Qwen3 dense | n-gram + SpecTarget verify | ❌ (model-free n-gram only) | ✅ n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
+| qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget verify (block-parallel) | ❌ (model-free n-gram only) | ✅ n-gram opt-in |
+| qwen35-vl | 5 | Qwen3.5/3.6-VL | none (VL path is AR, CPU-sampled) | ❌ | ❌ (text backbone *is* qwen35 — reusable) |
+| minimax | 10 | MiniMax-M2 (MoE) | none; per-token AR | ❌ | ❌ (carrier stubs return "unsupported") |
+| lfm2moe | 11 | LFM2.5-MoE (Liquid) | none; per-token AR | ❌ | ❌ (recurrent conv-state ⇒ needs rollback seam) |
+| cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | none; per-token AR | ❌ | ❌ (sliding-window ⇒ verify must replicate mask) |
+| dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | none; per-token AR VL path | ❌ | ❌ |
+
+**Has real speculation today:** qwen35 (DFlash + MTP), deepseek4 (MTP),
+llama/qwen2 (model-free n-gram only). Everything else is plain autoregressive.
+
+## Per-arch detail
+
+### qwen35 (arch 5/6, DeltaNet) — richest
+- **DFlash** diffusion drafter: `dflash_spec.rs` (`DflashSpeculator`/`DflashState`),
+  default production path for greedy generation, daemon-wired via `generate_dflash`→`generate_spec`.
+- **MTP** head: `mtp_head.rs`/`mtp_speculator.rs` (`Qwen35MtpDrafter`), daemon-wired
+  but gated `HIPFIRE_QWEN35_MTP=1` + requires `.mq4-mtp` bundle.
+- **n-gram**: opt-in `HIPFIRE_NGRAM_DRAFT=1`.
+- **SpecTarget verify**: `spec_impl.rs` (`ModelSlot`), with DeltaNet snapshot/rollback.
+- **Gap:** DFlash+MTP *composite* (`mtp_compose.rs`) validated in demos only, not
+  promoted into the `Speculator`/`generate_spec` loop.
+
+### deepseek4 (arch 9, MLA+MoE)
+- **MTP** drafter: `mtp_speculator.rs` (`Deepseek4MtpDrafter`), daemon-wired via
+  `generate_deepseek4_spec`→`generate_spec`. Auto-activates at `temp=0` when MTP
+  weights present (`mtp_mode=auto`). spec_k default 2 (`HIPFIRE_DEEPSEEK4_SPEC_K`→`HIPFIRE_MTP_K`→2).
+- **Greedy-only** (`requires_greedy()=true`); **no n-gram fallback** (`spec_impl.rs`
+  n-gram primitives intentionally return `Err`).
+- Upstream: DeepSeek-V3/V4 ship 1 MTP module in public weights (`num_nextn_predict_layers=1`).
+
+### llama (arch 0/1) & qwen2 (arch 7)
+- Both implement `SpecTarget` and route to `generate_dflash`→`generate_spec` when
+  `m.speculator.is_some()` (daemon arm: qwen2 at `daemon.rs:5836`, the template
+  for the work below).
+- qwen2's verify is block-parallel (`forward_verify_block_batched`,
+  `attention_decode_batched_history`); llama's is `verify_block_argmax`.
+- Both: model-free n-gram only, opt-in. **Ceiling:** unbatched MQ4G256/HFQ4
+  projection GEMMs mean spec doesn't beat AR on every workload yet.
+
+## Models missing a native drafter — what exists upstream
+
+### A learned drafter exists upstream (adoptable)
+- **llama/qwen3/mistral (0/1):** EAGLE-3 heads ship pretrained
+  (`nvidia/Llama-3.3-70B-Instruct-Eagle3`, `AngelSlim/Qwen3-32B_eagle3`);
+  Qwen3-0.6B/1.7B + Llama-3.2-1B work as same-family draft models.
+- **qwen2/2.5 (7):** EAGLE-3 heads (`ruipeterpan/Qwen2.5-14B-Instruct_EAGLE3_UltraChat`,
+  2.06–2.39×); Qwen2.5-0.5B/1.5B as draft models. No MTP head (predates it).
+- **minimax-M2 (10):** MiniMax *declined* to ship MTP ("no bandwidth"), but
+  community EAGLE-3 heads exist (`thoughtworks/MiniMax-M2.5-Eagle3` 2.11×;
+  Together `Aurora-Spec-Minimax-M2.5`/`M2.1`).
+- **qwen35-vl (VLM):** no VL-specific MTP, but VLM research drafters exist —
+  SpecVLM (2.5–2.9×), ViSpec (Qwen2.5-VL, 1.49–1.87×), Spec-LLaVA (3.28×). Require training.
+
+### Nothing exists upstream (n-gram is the only path)
+- **lfm2moe (11):** Liquid says EAGLE-3 not worth it at LFM2 scale; no MTP head.
+- **cohere2moe (12):** no public MTP/EAGLE; Cohere's Command-A spec-decode is proprietary.
+- **dots-ocr (8):** no MTP/EAGLE for the Qwen2-1.5B decoder. But structured layout-JSON
+  output makes n-gram a likely cheap win.
+
+## n-gram seam — opportunity & cost
+
+Enabling n-gram on a pure-AR arch requires (mirrors the qwen2 template):
+1. `crates/hipfire-arch-<arch>/src/spec_impl.rs` — `impl SpecTarget for <Bundle>`
+   (NEW; sequential `verify_block` is a correct baseline).
+2. `lib.rs` — register `mod spec_impl;`.
+3. `crates/hipfire-loader/src/carriers.rs` — the arch's `Carrier::spec_target_guard`
+   returns `InPlaceGuard { bundle }`; ensure `build_speculator(...)` is called in `load`.
+4. `crates/hipfire-loader/src/spec_build.rs` — extend n-gram arch_id gate
+   (currently `matches!(arch_id, 0|1|5|6|7)`) to include the new arch.
+5. `crates/hipfire-runtime/examples/daemon.rs` — insert
+   `if m.arch_id == X && m.speculator.is_some() { generate_dflash(...); return; }`
+   **before** that arch's bespoke `generate_<arch>` short-circuit.
+
+Per-arch wrinkles:
+- **minimax (10):** pure GQA AR — straight port of the qwen2 arm.
+- **cohere2moe (12):** sliding-window attention — a block-parallel verify must
+  replicate the windowed mask (sliding layers clip to last 4096; global/NoPE = full causal).
+  Sequential verify sidesteps this for the baseline.
+- **dots-ocr (8):** Qwen2-1.5B decoder, but decode is the **VL** path
+  (`generate_vl_dots_ocr`, CPU-sampled) — routing differs from the text arches.
+- **lfm2moe (11):** recurrent **conv-state** (`conv_states: Vec<GpuTensor>`, one
+  `[hidden, K-1]` ring per conv layer) needs GPU snapshot/restore in
+  `verify_block`/`commit_prefix` — same shape of problem as qwen35 DeltaNet. (Complex.)
+
+## n-gram seam — work log
+
+| Arch | Agent | spec_impl.rs | Bundle type | Status |
+|---|---|---|---|---|
+| minimax (10) | sonnet | ✅ compiles `-p hipfire-arch-minimax` | `hipfire_arch_minimax::MiniMaxBundle` (new) | impl done; wiring pending |
+| cohere2moe (12) | sonnet | ✅ compiles `-p hipfire-arch-cohere2moe` | `hipfire_arch_cohere2moe::Cohere2MoeBundle` (new) | impl done; wiring pending |
+| dots-ocr (8) | sonnet | ✅ compiles `-p hipfire-arch-dots-ocr` | `hipfire_arch_dots_ocr::DotsOcrBundle` (new) | impl done; wiring + VL-routing pending |
+| lfm2moe (11) | opus | ✅ compiles `-p hipfire-arch-lfm2moe` | `hipfire_arch_lfm2moe::Lfm2MoeBundle` (new) | impl done (conv-state snapshot/restore); wiring pending |
+
+Agents were scoped to their own arch crate (`spec_impl.rs` + `lib.rs` mod) and
+compile-check only; the shared wiring is integrated afterward.
+
+### Wiring + validation status (2026-06-23, after shared-wiring pass)
+
+| Arch | Loader+daemon wired? | Emitter | GPU validation |
+|---|---|---|---|
+| **minimax (10)** | ✅ (re-export bundle, carrier guard+emitter, build_speculator, spec_build gate +10, daemon arm) | `Qwen35Emit` (ChatML-clean) | ✅ **token-identical** generation (AR vs n-gram, greedy, `MiniMax-M2.7.mq2` 74GB on gfx1151/96GB): `AR[8:] == n-gram` exactly. Sole delta = the leading `<think>\n` delimiter (8 chars) that the bespoke AR path emits raw and `Qwen35Emit` consumes — cosmetic emitter rendering, NOT a generation divergence |
+| **lfm2moe (11)** | ✅ (same pattern; conv-state rollback) | `Qwen35Emit` (ChatML-clean) | ✅ **AR == n-gram byte-identical** (575 chars greedy, `lfm2.5-8b-a1b.mq4`); detectors all clean → conv-state snapshot/rollback correct |
+| **cohere2moe (12)** | ❌ DEFERRED | needs `Cohere2MoeEmit` | — |
+| **dots-ocr (8)** | ❌ DEFERRED | — (VL path) | — |
+
+**minimax + lfm2moe** loader + daemon both build clean (`-p hipfire-loader`,
+`--example daemon`). The integration mirrors the qwen2 template exactly:
+`pub use <arch>::<Bundle>` (delete loader-local struct) + carrier
+`spec_target_guard`(`InPlaceGuard`)+`make_spec_emitter`(`Qwen35Emit`) +
+`build_speculator(arch_id, None, None, true, max_seq)` in `load` + spec_build
+n-gram gate `0|1|5|6|7|10|11` + daemon arm `if arch_id==X && speculator.is_some()
+{ generate_dflash(); return; }` before the bespoke `generate_<arch>`.
+
+**minimax emitter nuance (cosmetic, not blocking):** the n-gram path renders
+`<think>` via `Qwen35Emit`'s think-state-machine (delimiter consumed), whereas the
+bespoke `generate_minimax` AR path emits the `<think>` tag inline. Generation is
+token-identical; only the delimiter surface differs. If exact AR-emitter match is
+ever required, minimax would need its own `SpecEmit`; for now the shared ChatML
+emitter is correct and arguably cleaner (reasoning-channel handling).
+
+**cohere2moe DEFERRED — emitter blocker (not mechanical):** its decode loop has a
+Cohere agentic-marker state machine (6 `<|START/END_THINKING/TEXT/ACTION|>`
+markers + empty-turn guard + EOS-suppression + ACTION→tool_calls parsing).
+`Qwen35Emit` lacks all of it; routing through it would leak markers into visible
+output and **fail the cohere2moe coherence gate**. Needs a `Cohere2MoeEmit`
+(a real `SpecEmit` port, like `Deepseek4Emit`). The `SpecTarget` impl compiles;
+the daemon arm / spec_build gate / carrier emitter were intentionally NOT added.
+
+**dots-ocr DEFERRED — VL routing:** arch_id 8 decodes via `generate_vl_dots_ocr`
+(image-conditioned, CPU-sampled), not the text spec loop. Engaging n-gram needs a
+VL-aware routing decision. `SpecTarget` impl compiles; not wired.
+
+### Key integration finding (all 4 arches)
+The orphan rule forced each agent to define a NEW bundle struct *in the arch crate*
+(parallel to the existing `hipfire_loader::*Bundle`), because `SpecTarget` is a
+foreign trait. Wiring therefore requires reconciling the two: `ModelState::X` must
+hold the **arch-crate** bundle so the carrier's `spec_target_guard` can return
+`InPlaceGuard { bundle }`. This is exactly the pattern qwen2 already uses
+(`crate::carrier::Qwen2Bundle` in the arch crate ↔ `ModelState::Qwen2`). The four
+new bundles are field-identical to the loader bundles, so the swap is mechanical.
+
+### Remaining shared wiring (per arch)
+1. `ModelState::X` → hold the arch-crate bundle (replace loader bundle / flat fields).
+2. `<Arch>Carrier::load` → construct the arch-crate bundle + call `build_speculator`.
+3. `<Arch>Carrier::spec_target_guard` → return `InPlaceGuard { bundle }`.
+4. `spec_build.rs` → add arch_id to the n-gram gate (`matches!(arch_id, 0|1|5|6|7)`).
+5. `daemon.rs` → insert `if arch_id==X && speculator.is_some() { generate_dflash(); return; }` before the bespoke `generate_<arch>` short-circuit.
+
+Per-arch wrinkles confirmed by the agents:
+- **minimax (10):** `decode_step` returns host logits (argmax host-side); `eos_tok` baked at load; `ctx_capacity = state.max_seq`. Cleanest swap.
+- **cohere2moe (12):** `decode_step` takes explicit `position: u32`; `reset(gpu)` zeros device KV. Sequential verify sidesteps the sliding-window batched-mask problem (a windowed `attention_decode_batched_history` is the perf follow-up).
+- **dots-ocr (8):** `State = Qwen2State`; reuses `qwen2::forward_step`/`forward_verify_block_batched` directly. BUT decode is the VL path (`generate_vl_dots_ocr`, CPU-sampled), so step 5 needs a VL-aware routing decision, not the plain text arm.
+- **lfm2moe (11):** conv-state snapshot/restore implemented (`Lfm2MoeSpecScratch` owns one F32 snapshot buffer per conv ring; `memcpy_dtod`; `commit_prefix` restores+replays on partial accept). `kv_cache_mut=None` (FlashCASK eviction unsound on hybrid). Needs GPU partial-accept byte-parity validation (keep `HIPFIRE_LFM2_GRAPH` off).

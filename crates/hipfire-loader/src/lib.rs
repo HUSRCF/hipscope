@@ -249,22 +249,18 @@ pub enum ModelState {
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
 }
 
-/// LFM2.5-MoE (arch_id=11) GPU bundle. `eos_tok` is resolved at load time and
-/// rides along so the generate path doesn't re-tokenize.
-pub struct Lfm2MoeBundle {
-    pub config: lfm2moe::config::Lfm2MoeConfig,
-    pub weights: lfm2moe::lfm2moe::Lfm2MoeWeights,
-    pub state: lfm2moe::lfm2moe::Lfm2MoeState,
-    pub eos_tok: u32,
-}
+/// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
+/// owns it so `impl SpecTarget for Lfm2MoeBundle` (the n-gram verify seam, incl.
+/// the conv-state snapshot/rollback) can live next to the forward it drives
+/// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
+/// resolved at load time and rides along so the generate path doesn't re-tokenize.
+pub use lfm2moe::Lfm2MoeBundle;
 
-/// MiniMax-M2 (arch_id=10) GPU bundle.
-pub struct MiniMaxBundle {
-    pub config: minimax::MiniMaxConfig,
-    pub weights: minimax::MiniMaxWeights,
-    pub state: minimax::MiniMaxState,
-    pub eos_tok: u32,
-}
+/// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
+/// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
+/// live next to the forward it drives (orphan rule). Field-identical to the
+/// prior loader-local struct (`config`/`weights`/`state`/`eos_tok`).
+pub use minimax::MiniMaxBundle;
 
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle.
 pub struct Cohere2MoeBundle {

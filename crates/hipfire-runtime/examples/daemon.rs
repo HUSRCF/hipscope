@@ -5942,6 +5942,35 @@ fn generate(
         }
         return;
     }
+    // arch_id=11 (LFM2.5-MoE) with an opt-in model-free n-gram speculator loaded
+    // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
+    // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
+    // it falls through to the plain `generate_lfm2moe` short-circuit below.
+    if m.arch_id == 11 && m.speculator.is_some() {
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+        );
+        generate_dflash(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            assistant_prefix,
+            None, // pflash_bypass_reason — no pflash on the n-gram path
+            None, // pflash_alpha
+            tools,
+            messages_history,
+            stop,
+        );
+        return;
+    }
     if m.arch_id == 11 {
         // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
         // the deepseek4 short-circuit above. PFlash / DFlash / VL / multi-GPU
@@ -6000,6 +6029,35 @@ fn generate(
             max_think_tokens,
             tools,
             messages_history,
+        );
+        return;
+    }
+    // arch_id=10 (MiniMax-M2) with an opt-in model-free n-gram speculator loaded
+    // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
+    // qwen2 (7) above. Without a speculator it falls through to the plain
+    // `generate_minimax` short-circuit below.
+    if m.arch_id == 10 && m.speculator.is_some() {
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+        );
+        generate_dflash(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            assistant_prefix,
+            None, // pflash_bypass_reason — no pflash on the n-gram path
+            None, // pflash_alpha
+            tools,
+            messages_history,
+            stop,
         );
         return;
     }

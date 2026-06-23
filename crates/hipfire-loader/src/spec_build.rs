@@ -188,7 +188,7 @@ pub fn build_speculator(
     // Spec-capable arches with a `SpecTarget` impl: qwen35 DeltaNet (5/6), the
     // dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3), and Qwen2 (7 =
     // VibeThinker etc., its own `Qwen2State` KV).
-    if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6 | 7) {
+    if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 10 | 11) {
         // Default K=12: the batched (weight-BW-bound) verify makes wider draft
         // windows nearly free, and an n-gram K-sweep (vibethinker-3b, 2026-06-23)
         // showed acceptance saturates at K≈12 (tau ~0.38) — K=12 peaks decode
