@@ -51,6 +51,7 @@ pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 
+pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod tokenizer;

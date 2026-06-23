@@ -32,8 +32,10 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
+use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -104,23 +106,6 @@ fn check_force_answer(req_id: &str) -> bool {
 /// answer" nudge (keep it short — it's prepended to the visible answer).
 fn think_continuation() -> String {
     std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
-}
-
-/// Whether the model is currently inside an open `<think>` span, from the
-/// generated text so far plus whether thinking was opened via the assistant
-/// prefix. `assistant_prefix=open_think` injects the `<think>` opener into the
-/// PROMPT, so it never shows up in the generated stream: without
-/// `started_in_think` the `(None, None)` case reads as "not thinking", the
-/// `max_think_tokens` force-close never fires, and a model that out-thinks its
-/// budget runs away to `max_tokens`. Centralises the scan used by every
-/// force-close / budget-alert site so they stay consistent.
-fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
-    match (raw_str.rfind("<think>"), raw_str.rfind("</think>")) {
-        (Some(o), Some(c)) => o > c, // both present: in-think iff opener is latest
-        (Some(_), None) => true,     // generated opener, not yet closed
-        (None, Some(_)) => false,    // closed (e.g. a prompt-injected opener) → answering
-        (None, None) => started_in_think, // no tags generated yet → trust the prompt prefix
-    }
 }
 
 /// Message types pushed from the stdin-reader thread to the main
@@ -368,268 +353,6 @@ fn strip_think_for_fingerprint(s: &str) -> String {
         out.replace_range(idx..idx + "<|im_end|>".len(), "");
     }
     out
-}
-
-/// Extract `<tool_call>{json}</tool_call>` blocks from emitted assistant
-/// text. Mirrors `cli/index.ts:parseToolCalls` minus the MQ4 #111
-/// repair paths — we don't need round-tripping fidelity for malformed
-/// blocks since the fingerprint just needs to MATCH what the CLI sends
-/// back, and the CLI normalizes through the same parser.
-fn extract_tool_calls_from_text(s: &str) -> Vec<hipfire_runtime::prompt_frame::ToolCall> {
-    let mut out: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-    let mut search_pos = 0;
-    while let Some(open_rel) = s[search_pos..].find("<tool_call>") {
-        let body_start = search_pos + open_rel + "<tool_call>".len();
-        // Unclosed `<tool_call>` — model hit max_tokens or truncated;
-        // treat the rest of the string as the body. CLI parser does
-        // the same via the `<tool_call>\s*(.*)` regex branch. Without
-        // this, a truncated emit stores `tool_calls=0`, the CLI on the
-        // wire parses `tool_calls=1`, and the asst-turn fingerprint
-        // mismatches on echo-back → cache miss.
-        let (body_end, advance) = match s[body_start..].find("</tool_call>") {
-            Some(i) => (body_start + i, body_start + i + "</tool_call>".len()),
-            None => (s.len(), s.len()),
-        };
-        let body_raw = &s[body_start..body_end];
-        // Sanitize ChatML special-token leakage (mirrors CLI's
-        // parseOneToolCall: cli/index.ts:2273-2278). qwen3.6:27b
-        // occasionally glues `<|im_start|>` / `<|im_end|>` / etc. into
-        // the JSON body when the tokenizer's special-token boundary
-        // catches the JSON key opener.
-        let body_clean: String = body_raw
-            .replace("<|im_start|>", "")
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .replace("<|im_sep|>", "");
-        // Strip nested `<tool_call>` openers (MQ4 attractor: model
-        // stacks 1-2 nested openers before the JSON body lands).
-        let mut body_stripped = body_clean.trim_start();
-        while body_stripped.starts_with("<tool_call>") {
-            body_stripped = body_stripped["<tool_call>".len()..].trim_start();
-        }
-        let body = body_stripped.trim();
-        if !body.is_empty() {
-            // Form 1: strict JSON parse
-            let mut parsed: Option<(String, serde_json::Value)> = None;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-                let name = val
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !name.is_empty() {
-                    let arguments = val
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    parsed = Some((name, arguments));
-                }
-            }
-            // Form 4 (regex fallback): when JSON parse fails, recover
-            // name + arguments via a relaxed key-delimiter pattern.
-            // Mirrors cli/index.ts:2287-2295.
-            if parsed.is_none() {
-                if let Some(name) = extract_tool_call_name_fallback(body) {
-                    if let Some(arguments) = extract_tool_call_arguments_fallback(body) {
-                        // Recovered a complete, strict-valid args object.
-                        parsed = Some((name, arguments));
-                    } else if tool_call_args_object_complete(body) {
-                        // The args object is present and brace-balanced but not
-                        // strict JSON (trailing comma, unquoted key, …) — a
-                        // model formatting glitch, not a truncation. Preserve
-                        // the call by name with empty args (legacy behavior).
-                        parsed = Some((name, serde_json::Value::Object(Default::default())));
-                    }
-                    // else: NO balanced args object — the call was cut off
-                    // mid-value by `max_tokens` or a grammar force-close.
-                    // Dropping it (rather than fabricating empty `{}`) keeps a
-                    // broken call from being delivered as executable: the
-                    // client would otherwise invoke e.g. `write({})` and fail
-                    // schema validation (the write-tool empty-args incident).
-                    // The truncated emission instead surfaces as content +
-                    // finish_reason so the client retries.
-                }
-            }
-            if let Some((name, arguments)) = parsed {
-                out.push(hipfire_runtime::prompt_frame::ToolCall { name, arguments });
-            }
-        }
-        search_pos = advance;
-        if advance == s.len() {
-            break;
-        }
-    }
-    out
-}
-
-/// Relaxed name extraction: matches `"name": "X"` (or `'name': 'X'`,
-/// or with an opening quote replaced by a special-token boundary —
-/// `name": "X"`). Mirrors CLI Form 4 regex in `parseOneToolCall`.
-///
-/// Walks the string looking for `name` substring occurrences. For each,
-/// validates the byte before it is a JSON key-position char ({ , " ' or
-/// whitespace) — false matches like `firstname` get skipped and the
-/// walk continues. First valid `name: "value"` match wins.
-fn extract_tool_call_name_fallback(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut search_from = 0usize;
-    while let Some(idx_rel) = s[search_from..].find("name") {
-        let abs = search_from + idx_rel;
-        // Advance search anchor past this "name" regardless of outcome
-        // so the next iteration looks for the next occurrence.
-        let after_name = abs + "name".len();
-        search_from = after_name;
-        // Key-position check: byte before `name` must be a JSON key
-        // boundary char. Skips false matches like the `name` substring
-        // inside `firstname` / `lastname` / etc.
-        let pre = if abs == 0 { b' ' } else { bytes[abs - 1] };
-        let pre_ok = matches!(pre, b'{' | b',' | b' ' | b'\n' | b'\t' | b'"' | b'\'');
-        if !pre_ok {
-            continue;
-        }
-        let mut j = after_name;
-        // Skip optional closing quote on the key.
-        if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
-            j += 1;
-        }
-        // Skip whitespace before `:`.
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        // Require `:`.
-        if j >= bytes.len() || bytes[j] != b':' {
-            continue;
-        }
-        j += 1;
-        // Skip whitespace after `:`.
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        // Require opening quote for the value.
-        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
-            continue;
-        }
-        let q = bytes[j];
-        j += 1;
-        let val_start = j;
-        while j < bytes.len() && bytes[j] != q {
-            j += 1;
-        }
-        if j >= bytes.len() {
-            continue;
-        }
-        let name = &s[val_start..j];
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
-        {
-            continue;
-        }
-        return Some(name.to_string());
-    }
-    None
-}
-
-/// Best-effort `arguments` extraction: find the first balanced `{...}`
-/// after the `arguments`-style key, parse it as JSON. Returns None if
-/// no balanced object is found or the object isn't valid JSON.
-fn extract_tool_call_arguments_fallback(s: &str) -> Option<serde_json::Value> {
-    let key_idx = s.find("arguments")?;
-    let tail = &s[key_idx + "arguments".len()..];
-    // Skip key terminator + colon + whitespace
-    let mut chars = tail.char_indices().peekable();
-    while let Some(&(_, c)) = chars.peek() {
-        if c == '"' || c == '\'' || c == ':' || c.is_whitespace() {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    let obj_rel_start = chars.next().map(|(i, _)| i)?;
-    let obj_start = key_idx + "arguments".len() + obj_rel_start;
-    let after_key = &s[obj_start..];
-    // Need to find the opening brace
-    let brace_off = after_key.find('{')?;
-    let abs_start = obj_start + brace_off;
-    // Walk to find the matching close brace
-    let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escape = false;
-    let mut k = abs_start;
-    while k < bytes.len() {
-        let ch = bytes[k];
-        if in_str {
-            if escape {
-                escape = false;
-            } else if ch == b'\\' {
-                escape = true;
-            } else if ch == b'"' {
-                in_str = false;
-            }
-        } else if ch == b'"' {
-            in_str = true;
-        } else if ch == b'{' {
-            depth += 1;
-        } else if ch == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                let slice = &s[abs_start..=k];
-                return serde_json::from_str(slice).ok();
-            }
-        }
-        k += 1;
-    }
-    None
-}
-
-/// True iff a brace-balanced `{...}` object exists after the `arguments`
-/// key — i.e. the args object is COMPLETE (not truncated), regardless of
-/// whether it is strict-valid JSON. Distinguishes a model formatting glitch
-/// (trailing comma / unquoted key — keep the call) from a generation cut off
-/// mid-args (drop the call). Mirrors the brace walk in
-/// [`extract_tool_call_arguments_fallback`] but stops at the matching close
-/// brace without requiring valid JSON.
-fn tool_call_args_object_complete(s: &str) -> bool {
-    let key_idx = match s.find("arguments") {
-        Some(i) => i,
-        None => return false,
-    };
-    let after_key = &s[key_idx + "arguments".len()..];
-    let brace_off = match after_key.find('{') {
-        Some(i) => i,
-        None => return false,
-    };
-    let abs_start = key_idx + "arguments".len() + brace_off;
-    let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escape = false;
-    let mut k = abs_start;
-    while k < bytes.len() {
-        let ch = bytes[k];
-        if in_str {
-            if escape {
-                escape = false;
-            } else if ch == b'\\' {
-                escape = true;
-            } else if ch == b'"' {
-                in_str = false;
-            }
-        } else if ch == b'"' {
-            in_str = true;
-        } else if ch == b'{' {
-            depth += 1;
-        } else if ch == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                return true;
-            }
-        }
-        k += 1;
-    }
-    false
 }
 
 /// Walk a [`serde_json::Value`] and produce a canonical-key
@@ -6437,10 +6160,10 @@ fn generate(
         );
         let _ = (repeat_penalty, repeat_window);
         let _ = stop; // hunt3 M-F: not wired for arch_id=9 (deepseek4 bring-up)
-        // Route the MTP spec-decode path (greedy, speculator present) through the
-        // unified `generate_spec`; the AR sampler path (temp>0) and the
-        // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
-        // deletes the latter's now-redundant spec loop).
+                      // Route the MTP spec-decode path (greedy, speculator present) through the
+                      // unified `generate_spec`; the AR sampler path (temp>0) and the
+                      // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
+                      // deletes the latter's now-redundant spec loop).
         let spec_mode = deepseek4_spec_requested(m) && temp <= 1e-6;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
@@ -8943,39 +8666,6 @@ fn generate(
 /// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
 /// eviction path of its own and the SWA cache wraps automatically below
 /// the sliding-window bound.
-/// HuggingFace DeepSeek V4 thinking modes (per `encoding/README.md`).
-///
-/// The chat template choice changes the open-token after `<｜Assistant｜>`
-/// and (for `Max`) prepends an extended reasoning instruction.
-#[derive(Copy, Clone, Debug)]
-pub enum ThinkMode {
-    /// Non-thinking. Frame: `<｜Assistant｜></think>{response}`.
-    /// Model skips reasoning, replies directly. HF default for chat.
-    NonThink,
-    /// Thinking-high. Frame: `<｜Assistant｜><think>{reasoning}</think>{response}`.
-    /// Model produces a `<think>` block before responding.
-    High,
-    /// Thinking-max. Same frame as `High`, plus prepended
-    /// "Reasoning Effort: Absolute maximum..." system instruction.
-    /// HF recommends context ≥ 384K for this mode.
-    Max,
-}
-
-impl ThinkMode {
-    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
-    /// project-custom `thinking_mode`) to a mode.
-    /// Accepted: "none|off|chat|minimal" → NonThink;
-    ///           "low|medium|high|thinking" → High;
-    ///           "max" → Max. Anything else → NonThink (safe default).
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "max" => Self::Max,
-            "high" | "thinking" | "low" | "medium" => Self::High,
-            _ => Self::NonThink,
-        }
-    }
-}
-
 fn build_deepseek4_dsml_prompt(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     system_prompt: Option<&str>,
@@ -13051,7 +12741,7 @@ mod tool_call_parser_tests {
         // shape that triggers fallback.)
         let body = r#"{"firstname":"X","name":"read","arguments":{"path":"/x"}}"#;
         assert_eq!(
-            super::extract_tool_call_name_fallback(body),
+            hipfire_runtime::emit_text::extract_tool_call_name_fallback(body),
             Some("read".to_string())
         );
     }
@@ -13073,7 +12763,7 @@ mod tool_call_parser_tests {
         // Off-spec JSON with unquoted key.
         let body = r#"{name: "read"}"#;
         assert_eq!(
-            super::extract_tool_call_name_fallback(body),
+            hipfire_runtime::emit_text::extract_tool_call_name_fallback(body),
             Some("read".to_string())
         );
     }
