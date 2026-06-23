@@ -289,6 +289,13 @@ pub struct LoadedModel {
     pub mtp_mode: String,
     pub mtp_k: usize,
     pub mtp_weights_present: bool,
+    // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
+    // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
+    // present alongside the trunk. Persistent for the life of the model;
+    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
+    // against it (so the recurrent MTP-KV never bleeds across requests). None
+    // for every other arch and for qwen35 trunks without an MTP head.
+    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
     // dots.ocr state
     pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
     pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
@@ -356,6 +363,7 @@ impl LoadedModel {
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
+            qwen35_mtp_head: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             vision_config: None,
@@ -687,8 +695,67 @@ fn finish_qwen35_load(
         None
     };
 
+    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
+    //
+    // Load the arch_id=21 MTP head when it is present either bundled in the
+    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
+    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
+    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
+    // the model serves via the unchanged DFlash/AR path. Failures here are
+    // non-fatal — log and continue with `qwen35_mtp_head = None`.
+    //
+    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
+    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
+    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
+        use hipfire_arch_qwen35::mtp_head;
+        let trunk_path = Path::new(ctx.path);
+        // 1. Bundled trailer inside the trunk file?
+        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
+                None
+            }
+        };
+        match bundled {
+            Some(h) => {
+                eprintln!(
+                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
+                    h.config.n_embd, h.config.vocab_size
+                );
+                Some(h)
+            }
+            None => {
+                // 2. Sidecar `<trunk>.mtp` next to the model path?
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            Some(h)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
+                                sidecar.display()
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
     let state = Some(ModelState::Qwen35(bundle));
-    Ok(LoadedModel {
+    let mut model = LoadedModel {
         state,
         eviction,
         dflash,
@@ -703,7 +770,13 @@ fn finish_qwen35_load(
             ctx.path.to_string(),
             chat_template,
         )
-    })
+    };
+    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
+    // ds4 probe set in the daemon's load handler). For qwen35 the presence of a
+    // loaded MTP head IS the signal.
+    model.mtp_weights_present = qwen35_mtp_head.is_some();
+    model.qwen35_mtp_head = qwen35_mtp_head;
+    Ok(model)
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
@@ -1226,7 +1299,8 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1234,8 +1308,13 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     // Transactional partial-load: build per-rank weights/state/partials INTO the
     // staging guard. Every `?` below early-returns while `staging` is alive, so
     // its `Drop` frees the ranks already loaded.
@@ -1326,7 +1405,8 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let arch_id = hfq.arch_id;
     let n_exp = config.num_local_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1334,8 +1414,13 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = MinimaxEpStaging::new(gpus);
@@ -1529,6 +1614,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+    }
+    if let Some(head) = m.qwen35_mtp_head {
+        head.free_gpu(gpu);
     }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
