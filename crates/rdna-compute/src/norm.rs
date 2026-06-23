@@ -37,6 +37,36 @@ fn dn_requant_per_token() -> bool {
     })
 }
 
+/// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
+/// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
+/// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
+/// Numerically EQUAL to batch_seq (oracle gdn_chunked_f32, 1.3e-15).
+pub fn gdn_chunked() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_GDN_CHUNKED")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Chunk size CS for the chunked FP32 GDN kernel. Default 16 (fits 64 KB LDS
+/// with occupancy headroom). Clamped to [1, 32] (CS_MAX). CS=32 is opt-in and
+/// occupancy-1; CS>32 is refused (LDS overflow).
+pub fn gdn_chunk_size() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let cs = std::env::var("HIPFIRE_GDN_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16);
+        cs.clamp(1, 32)
+    })
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -2553,6 +2583,115 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Chunked (parallel) FP32 GDN — numerically EQUAL to
+    /// `gated_delta_net_f32_batch_seq` (oracle gdn_chunked_f32). Same buffer
+    /// args plus a `chunk_size` scalar. The cross-chunk dependency (chunk ci's
+    /// S_in = chunk ci-1's S_out) is serialized HERE by a host loop over
+    /// chunks: one launch per chunk, grid `[n_heads, 1, 1]`, `chunk_index`
+    /// passed as a scalar. S advances in place in `s_f32` (same as batch_seq).
+    /// `chunk_size` is clamped to [1, 32]; the kernel's static LDS is sized for
+    /// CS_MAX=32.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_chunked(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_f32: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        chunk_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_chunked",
+            kernels::GATED_DELTA_NET_F32_CHUNKED_SRC,
+            "gated_delta_net_f32_chunked",
+        )?;
+
+        let cs = chunk_size.clamp(1, 32);
+        let n_chunks = n_tokens.div_ceil(cs);
+
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sp = s_f32.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f32_chunked",
+            bytes,
+        );
+
+        // Host loop over chunks — cross-chunk is serial (S_in = prev S_out).
+        for ci in 0..n_chunks {
+            let mut qp = qp;
+            let mut kp = kp;
+            let mut vp = vp;
+            let mut gp = gp;
+            let mut bp = bp;
+            let mut sp = sp;
+            let mut op = op;
+            let mut nt = n_tokens as i32;
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut cs_i = cs as i32;
+            let mut ci_i = ci as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut cs_i as *mut _ as *mut c_void,
+                &mut ci_i as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_f32_chunked",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(cs_i);
+                    b.push_i32(ci_i);
+                    b
+                },
+            )?;
+        }
+
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        Ok(())
     }
 
     /// GDN recurrence with Q4-quantized S state.

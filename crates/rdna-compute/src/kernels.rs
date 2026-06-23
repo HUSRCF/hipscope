@@ -3183,6 +3183,16 @@ pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
 pub const GATED_DELTA_NET_F32_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_batch_seq.hip");
 
+/// Chunked (parallel) FP32 GDN recurrence — chunked sibling of
+/// GATED_DELTA_NET_F32_BATCH_SEQ_SRC. One wave32 workgroup per (head, chunk);
+/// intra-chunk parallelism replaces the per-token serial inner loop.
+/// Numerically EQUAL to the sequential recurrence (oracle gdn_chunked_f32).
+/// Cross-chunk dependency is serialized host-side (one launch per chunk).
+/// Grid: [n_heads, n_chunks]. Block: [32]. Default OFF (HIPFIRE_GDN_CHUNKED).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_CHUNKED_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_chunked.hip");
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
