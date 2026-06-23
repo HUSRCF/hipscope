@@ -4440,6 +4440,65 @@ fn generate_dflash(
         None => (prompt_tokens.clone(), 0, false, 0),
     };
 
+    // The decode core (slot guard, prefill, accept-window loop, bake, done) is the
+    // arch-generic `generate_spec`. This wrapper owns only the qwen35/llama-specific
+    // prologue: the jinja/Plain prompt render and the LCP cache plan. A future ds4
+    // wrapper (Phase 4 T4c) prepares its DSML render + ds4 cache plan and calls the
+    // same `generate_spec`.
+    generate_spec(
+        m,
+        gpu,
+        stdout,
+        id,
+        prompt_tokens,
+        prefill_tokens,
+        prefill_start,
+        cache_hit,
+        cached_tokens_dflash,
+        resume_from,
+        im_end_token,
+        max_tokens,
+        max_think_tokens,
+        assistant_prefix,
+        pflash_bypass_reason,
+        pflash_alpha,
+        tools,
+        stop,
+    );
+}
+
+/// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
+/// Drives any `Speculator` (`m.speculator`) + `SpecTarget` (via `spec_target_guard`)
+/// + `SpecEmit` through one prefill → accept-window loop → bake → done. The caller
+/// (`generate_dflash` for qwen35/llama today) prepares the arch-specific inputs:
+/// the already-rendered `prompt_tokens`, the LCP cache decision
+/// (`prefill_tokens`/`prefill_start`/`cache_hit`/`cached_tokens_dflash`/`resume_from`),
+/// and the `im_end_token`. Behaviour is byte-identical to the pre-extraction
+/// `generate_dflash` — T4c generalizes the remaining arch-coupled seams (emit
+/// construction, in-step grammar, cache-miss teardown, bake/done tail) for ds4.
+#[allow(clippy::too_many_arguments)]
+fn generate_spec(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_tokens: Vec<u32>,
+    prefill_tokens: Vec<u32>,
+    prefill_start: usize,
+    cache_hit: bool,
+    cached_tokens_dflash: usize,
+    resume_from: Option<usize>,
+    im_end_token: Option<u32>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pflash_bypass_reason: Option<&str>,
+    pflash_alpha: Option<f32>,
+    tools: Option<&[serde_json::Value]>,
+    stop: &[String],
+) {
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+
     // Acquire the target via the RAII slot guard — it restores the bundle into
     // m.state on EVERY exit path (return, `?`, panic), which structurally
     // eliminates the eight hand-written reconstruction sites that were the
