@@ -9748,48 +9748,11 @@ fn generate_deepseek4(
         eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
     }
 
-    // Triaged config resolution for MTP speculative decode.
-    // Priority: 1. legacy env var → 2. generic env var → 3. stored config → default.
-    let spec_requested = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
-            Some("on") => true,
-            Some("off") => false,
-            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
-        });
-    // Honor the requested temperature (pre-existing-bug fix). MTP spec-decode
-    // here is GREEDY-ONLY: the verifier takes argmax and the K-step draft chain
-    // never samples (`spec_decode::speculative_decode_step_with_pbs` takes no
-    // temp/rng), so its output is correct ONLY at temp≈0. At temp>0 the caller
-    // asked to SAMPLE; running spec anyway silently emits greedy output that
-    // ignores `temp` — the bug, masked by the arch-default temp=1.0 (which made
-    // every default request take the greedy spec path regardless of intent).
-    // Fall to the plain AR sampler at temp>0 instead.
-    let spec_mode = spec_requested && temp <= 1e-6;
-    if spec_requested && !spec_mode {
-        eprintln!(
-            "[deepseek4] spec-decode requested but temp={temp:.3} > 0 — the MTP draft is \
-             greedy-only; honoring the requested temperature via the AR sampler \
-             (set temperature=0 for greedy spec-decode)"
-        );
-    }
-    // Default k=2. The K+1 verify (full-accept bonus, shared accept-core) makes
-    // k=2 both highest-accept AND highest-throughput on the deepseek4-mtp bench
-    // (code +28% / prose +22% / math +5% vs the old k=3 default; k=3 itself
-    // regresses 9-12% under K+1 because full-accepts are rare there). `m.mtp_k`
-    // was only ever the generic skeleton default (3) for deepseek4 — nothing
-    // sets it from the model — so a fixed 2 here is the deepseek4-specific
-    // default, still overridable via HIPFIRE_DEEPSEEK4_SPEC_K / HIPFIRE_MTP_K.
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            std::env::var("HIPFIRE_MTP_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(2);
+    // This function is now AR-only: the MTP spec-decode path (greedy, temp≈0,
+    // speculator present) is dispatched to `generate_deepseek4_spec` (T4c-2),
+    // which owns the spec_requested/spec_mode/spec_k resolution. Reaching here
+    // means either temp>0 (sample) or no speculator (fallback) — either way the
+    // plain AR sampler below honours the requested `temp`/`top_p`.
 
     let t0 = Instant::now();
 
@@ -9946,30 +9909,17 @@ fn generate_deepseek4(
         return;
     }
 
-    // Prefill: batched chunked through PBS. If spec_mode, also fill the
-    // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
-    // draft step sees a populated MTP history.
-    let prefill_result = if spec_mode {
-        deepseek4::forward::prefill_with_mtp_fill(
-            cfg,
-            weights,
-            state,
-            gpu,
-            pbs,
-            suffix_tokens,
-            start_pos,
-        )
-    } else {
-        deepseek4::forward::forward_prefill_batch_chunked(
-            cfg,
-            weights,
-            state,
-            gpu,
-            suffix_tokens,
-            start_pos,
-            pbs,
-        )
-    };
+    // Prefill: batched chunked through PBS. (The MTP-fill prefill variant moved
+    // to the drafter's `mtp_prefill`, driven by `generate_deepseek4_spec`.)
+    let prefill_result = deepseek4::forward::forward_prefill_batch_chunked(
+        cfg,
+        weights,
+        state,
+        gpu,
+        suffix_tokens,
+        start_pos,
+        pbs,
+    );
     let last_logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
@@ -9982,12 +9932,8 @@ fn generate_deepseek4(
     // `state.n_tokens = pos as u64;` at deepseek4_chat.rs:324). Without this,
     // the next decode_step queries the SWA cache at the BOS position
     // instead of the next-prediction position and the model emits
-    // attractor garbage at greedy temp=0. The MTP-fill prefill DOES
-    // advance internally (forward.rs:7453), so we only need to update
-    // for the plain-prefill branch.
-    if !spec_mode {
-        state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
-    }
+    // attractor garbage at greedy temp=0.
+    state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
     // Keep `m.conversation_tokens` in lockstep with what's actually
     // resident in the KV/SWA/compressed-KV rings:
     //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
@@ -10017,9 +9963,6 @@ fn generate_deepseek4(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let pos_after_prefill = state.n_tokens as u32;
-    let mut spec_windows: u64 = 0;
-    let mut spec_drafts_offered: u64 = 0;
-    let mut spec_drafts_accepted: u64 = 0;
 
     // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
     // for local deployment; we honor that as the default. Pure greedy
@@ -10044,187 +9987,12 @@ fn generate_deepseek4(
     // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
     // `done` envelope below.
     let mut tool_calls_parsed_count: usize = 0;
-    if spec_mode {
-        // Spec-decode loop. The verifier picks argmax (greedy) so accept
-        // semantics stay deterministic. When tools are present, thread
-        // the same DSML grammar matcher through the MTP draft and main
-        // verifier logits, then parse the emitted stream into tool_calls
-        // events just like the plain decode loop.
-        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
-            .map(|arr| {
-                arr.iter()
-                    .map(|t| {
-                        let func = t.get("function").unwrap_or(t);
-                        let name = func
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let parameters = func.get("parameters");
-                        let params: Vec<String> = parameters
-                            .and_then(|p| p.get("properties"))
-                            .and_then(|p| p.as_object())
-                            .map(|m| m.keys().cloned().collect())
-                            .unwrap_or_default();
-                        let required: Vec<String> = parameters
-                            .and_then(|p| p.get("required"))
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        deepseek4::grammar::ToolSchema {
-                            name,
-                            params,
-                            required,
-                        }
-                    })
-                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let grammar_active = !tool_schemas.is_empty();
-        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
-        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
-            if m.decoded_vocab.is_none() {
-                let n = tokenizer.vocab_size();
-                let v: Vec<String> = (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
-            }
-            m.decoded_vocab.clone()
-        } else {
-            None
-        };
-        let empty_vocab: Vec<String> = Vec::new();
-        let decoded_vocab: &[String] = decoded_vocab_arc
-            .as_deref()
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty_vocab);
-        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
-
-        // DSML emission behind the arch-generic `SpecEmit` seam (`Deepseek4Emit`):
-        // owns the `StreamParser` + tool-call accumulation buffer. The decode loop
-        // keeps all loop/cache state (position/seed advance, conversation-token
-        // bake, `generated_count`, `max_tokens` guard) and the in-step grammar
-        // (matcher/mask threaded INTO the spec step), and renders the returned
-        // `ClientEvent`s via `render_client_events` — byte-identical to the old
-        // inline `parser.feed` → `emit_stream_event` → `emit_committed_event`.
-        let mut emit = Deepseek4Emit::new(tokenizer, think_mode, eos_tok);
-
-        let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
-        let mut spec_last_position = pos_after_prefill;
-        let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
-        // Emit the FIRST generated token (the prefill argmax). The loop below
-        // consumes `spec_last_token` as the decode-FROM token and only emits
-        // the drafted continuation (`r.accepted_tokens`), so without this the
-        // first token is dropped from every spec-decode response — a regression
-        // vs the non-spec path (e.g. "Here's…" → "'s…"). Mirrors the in-loop
-        // emission; EOS-first yields an empty turn (loop then no-ops).
-        if generated_count < max_tokens {
-            let outcome = emit.begin(spec_last_token);
-            render_client_events(
-                stdout,
-                id,
-                &outcome.events,
-                decode_t0.elapsed().as_millis() as u64,
-            );
-            let _ = stdout.flush();
-            // The first-token EOS guard is now `begin`'s `StopReason::Eos` (empty
-            // events): only bake the token + advance `generated_count` when it was
-            // actually emitted (no stop).
-            if outcome.stop.is_none() {
-                m.conversation_tokens.push(spec_last_token);
-                generated_count += 1;
-            }
-        }
-        'outer: while generated_count < max_tokens {
-            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
-                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
-            };
-            let r = match if grammar_active {
-                deepseek4::spec_decode::speculative_decode_step_with_pbs_grammar(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    pbs,
-                    spec_last_token,
-                    spec_last_position,
-                    lh,
-                    spec_k,
-                    &mut matcher,
-                    decoded_vocab,
-                    &mut grammar_mask,
-                )
-            } else {
-                deepseek4::spec_decode::speculative_decode_step_with_pbs(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    pbs,
-                    spec_last_token,
-                    spec_last_position,
-                    lh,
-                    spec_k,
-                )
-            } {
-                Ok(r) => r,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("deepseek4spec-decode failed: {e:?}"));
-                    let _ = stdout.flush();
-                    return;
-                }
-            };
-            spec_windows += 1;
-            spec_drafts_offered += spec_k as u64;
-            spec_drafts_accepted += r.n_accepted as u64;
-
-            for &t in &r.accepted_tokens {
-                // `generated_count >= max_tokens` is loop state; the `t == eos_tok`
-                // early-stop is now `observe`'s `StopReason::Eos` (empty events —
-                // the inline path emitted nothing for an accepted EOS, then broke).
-                if generated_count >= max_tokens {
-                    break 'outer;
-                }
-                // Always route through the DSML StreamParser (new_in_think in
-                // thinking modes) so `<think>…</think>` is split into reasoning
-                // vs content server-side and emitted as structured events. The
-                // old non-grammar branch emitted raw tokens, leaving the CLI to
-                // client-side-parse a stream that (for V4 thinking mode) starts
-                // INSIDE the think block with no `<think>` opener in the output.
-                let outcome = emit.observe(t);
-                render_client_events(
-                    stdout,
-                    id,
-                    &outcome.events,
-                    decode_t0.elapsed().as_millis() as u64,
-                );
-                let _ = stdout.flush();
-                if outcome.stop.is_some() {
-                    // Accepted EOS: emitted nothing, broke out — the position/seed
-                    // update below is intentionally skipped (mirrors `break 'outer`).
-                    break 'outer;
-                }
-                m.conversation_tokens.push(t);
-                generated_count += 1;
-            }
-            if let Some(&t) = r.accepted_tokens.last() {
-                spec_last_position += r.accepted_tokens.len() as u32;
-                spec_last_token = t;
-            }
-            last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
-        }
-        // Flush buffered partial markers / unclosed think — always, not only
-        // when tools are present. A thinking turn that fills max_tokens without
-        // closing </think> must still surface its buffered reasoning.
-        let finish = Box::new(emit).finish();
-        render_client_events(stdout, id, &finish.events, 0);
-        let _ = stdout.flush();
-        tool_calls_parsed_count = finish.tool_calls;
-    } else {
+    // Plain autoregressive decode. The MTP spec-decode path now routes through
+    // `generate_deepseek4_spec` + the unified `generate_spec` (T4c-2); this
+    // function is the AR sampler path (temp>0) and the no-speculator fallback.
+    // The bare block scopes the parser/matcher/sampler locals (was the old
+    // `else` arm of the now-deleted `if spec_mode` spec loop).
+    {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
         // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
@@ -10527,8 +10295,7 @@ fn generate_deepseek4(
     //                because the spec-decode loop accepted EOS in the
     //                middle of an accepted-tokens chunk.
     //
-    // `tool_calls_parsed_count` is set inside the non-spec branch
-    // immediately after parser.finish(); spec_mode leaves it at 0.
+    // `tool_calls_parsed_count` is set immediately after parser.finish() below.
     let finish_reason: &'static str = if tool_calls_parsed_count > 0 {
         "tool_calls"
     } else if generated_count >= max_tokens {
@@ -10536,41 +10303,18 @@ fn generate_deepseek4(
     } else {
         "stop"
     };
-    let done_envelope = if spec_mode {
-        let accept_pct = if spec_drafts_offered > 0 {
-            spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
-        } else {
-            0.0
-        };
-        serde_json::json!({
-            "type": "done",
-            "id": id,
-            "tokens": generated_count,
-            "tok_s": tok_s,
-            "prompt_tokens": prompt_tokens_total,
-            "prefill_tokens": prefill_tokens_actual,
-            "cached_tokens": cached_tokens,
-            "prefill_ms": prefill_ms,
-            "total_ms": total_ms,
-            "finish_reason": finish_reason,
-            "spec_k": spec_k,
-            "spec_windows": spec_windows,
-            "spec_accept_pct": accept_pct,
-        })
-    } else {
-        serde_json::json!({
-            "type": "done",
-            "id": id,
-            "tokens": generated_count,
-            "tok_s": tok_s,
-            "prompt_tokens": prompt_tokens_total,
-            "prefill_tokens": prefill_tokens_actual,
-            "cached_tokens": cached_tokens,
-            "prefill_ms": prefill_ms,
-            "total_ms": total_ms,
-            "finish_reason": finish_reason,
-        })
-    };
+    let done_envelope = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": tok_s,
+        "prompt_tokens": prompt_tokens_total,
+        "prefill_tokens": prefill_tokens_actual,
+        "cached_tokens": cached_tokens,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "finish_reason": finish_reason,
+    });
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
 }
