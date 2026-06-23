@@ -675,14 +675,58 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // ── qwen35 MTP head (opt-in, bundled .mq4-mtp only) ────────────
+    // Loaded ONLY when HIPFIRE_QWEN35_MTP=1, the trunk is a bundled `.mq4-mtp`
+    // file, no DFlash draft was requested (DFlash wins), eviction is None (the
+    // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
+    // here — not in build_speculator — because this is the only site with a
+    // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
+    let mtp = if dflash.is_none()
+        && eviction.is_none()
+        && matches!(arch_id, 5 | 6)
+        && std::env::var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
+        && ctx.path.ends_with(".mq4-mtp")
+    {
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
+            std::path::Path::new(ctx.path),
+            ctx.gpu,
+            ctx.max_seq,
+        ) {
+            Ok(Some(head)) => {
+                eprintln!(
+                    "  MTP head loaded from bundle: n_embd={} vocab={} (compressed_lm_head_draft={})",
+                    head.config.n_embd,
+                    head.config.vocab_size,
+                    head.weights.lm_head_draft.is_some(),
+                );
+                Some(head)
+            }
+            Ok(None) => {
+                eprintln!(
+                    "  HIPFIRE_QWEN35_MTP=1 but {} has no bundled MTP trailer — AR/n-gram only",
+                    ctx.path
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "  MTP head load failed ({}): {e} — AR/n-gram only",
+                    ctx.path
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
-    // else (opt-in) the model-free n-gram drafter. `eviction` is borrowed (not
-    // moved) here, so it is still available for the struct literal below;
-    // `config`/`dn_state` are borrowed only for the duration of the n-gram arm's
-    // scratch construction (snapshot copied to GPU), released before `bundle`
-    // moves into `state`. `None` ⇒ AR-only model.
+    // else a bundled MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in)
+    // the model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
+    // it is still available for the struct literal below; `config`/`dn_state` are
+    // borrowed only for the n-gram arm's scratch construction (snapshot copied to
+    // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
     let speculator =
-        crate::spec_build::build_speculator(arch_id, dflash, eviction.is_none(), physical_cap);
+        crate::spec_build::build_speculator(arch_id, dflash, mtp, eviction.is_none(), physical_cap);
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {

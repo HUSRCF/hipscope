@@ -111,7 +111,8 @@ impl Carrier for Qwen2Carrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
         // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
         // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
-        let speculator = crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq);
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
             speculator,
@@ -518,7 +519,8 @@ impl Carrier for LlamaCarrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
         // no DFlash draft and no eviction by default; the arm builds its verify
         // scratch lazily on first prefill, so only ctx_capacity is needed here.
-        let speculator = crate::spec_build::build_speculator(meta.arch_id, None, true, ctx.max_seq);
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
             speculator,
