@@ -3,13 +3,26 @@
 Measured on gfx1100 (RX 7900-class), dense Qwen3.6-27B (`qwen3.6-27b.mq4`), q8 KV,
 greedy (temp=0), 3-run median. **AR decode baseline ≈ 43 tok/s** (genre-independent).
 
-> **CORRECTION (config matters).** The durability numbers below use the **chatml serving
-> config** — the mode the daemon actually serves in. An earlier draft used `--no-chatml` (raw
-> open-ended *continuation*, the canonical code-bench config), which is the single worst case for
-> a drafter and made prose look retrain-bound. Under the serving config, DFlash clears every
-> standard genre; only pure *creative fiction* (the least-predictable content) stays below the
-> DFlash 1.3× bar — and MTP covers that at its 1.15× floor. **Always measure durability under the
-> serving config.**
+> **CORRECTION (measure on the daemon, not the demo).** Authoritative durability is measured
+> through the **daemon** (the real serving path), NOT `dflash_spec_demo`. The demo measures raw
+> continuation and under-reports — it made creative fiction look like a 0.97× failure. On the
+> daemon, the serving behavior (chatml + a structured *thinking* block before the answer) makes
+> even creative fiction predictable enough that **DFlash clears every genre ≥1.3× + τ>1.5**:
+>
+> | genre | daemon DFlash tok/s | AR× | τ |
+> |---|---|---|---|
+> | code | 112.9 | 2.63× | 5.15 |
+> | reason | 114.8 | 2.67× | 5.23 |
+> | instruct | 96.9 | 2.25× | 4.23 |
+> | prose (expository) | 77.1 | 1.79× | 3.10 |
+> | creative fiction (lighthouse) | 60.2 | 1.40× | 2.20 |
+> | creative fiction (clockmaker) | 65.3 | 1.52× | 2.48 |
+>
+> **All genres PASS.** The earlier "creative fiction is retrain-bound" verdict was a
+> demo-harness artifact (raw continuation never triggers the daemon's thinking-mode serving).
+> No adaptive switch and no retrain are required — DFlash alone is durable across every genre on
+> the serving path. **Lesson: measure durability on the daemon (the path users hit), never the
+> raw demo harness.**
 
 **Durability floors (the goal):**
 - **DFlash:** every genre `τ > 1.5` **AND** `tok/s ≥ 1.30× AR` (= 56 tok/s).
@@ -17,27 +30,30 @@ greedy (temp=0), 3-run median. **AR decode baseline ≈ 43 tok/s** (genre-indepe
 
 ---
 
-## TL;DR — durable across every genre via a lossless hybrid (serving config, chatml)
+## TL;DR — DFlash is durable across EVERY genre on the serving path
 
-| Genre | DFlash tok/s | AR× (floor 1.3×, τ>1.5) | MTP tok/s | AR× (floor 1.15×) |
-|---|---|---|---|---|
-| code | 98 | 2.28× ✓ τ4.05 | 83 | 1.93× ✓ |
-| reason | 124 | 2.89× ✓ τ5.59 | 72 | 1.67× ✓ |
-| instruct | 89 | 2.07× ✓ τ3.55 | 67 | 1.57× ✓ |
-| prose (expository/reflective/descriptive) | 66–76 | 1.55–1.77× ✓ τ2.3–2.84 | 65 | 1.50× ✓ |
-| prose (**creative fiction**) | 42 | 0.97× ✗ τ1.05 | 50 | 1.16× ✓ |
+Measured through the **daemon** (the path users actually hit), greedy, 27B-3.6:
 
-**DFlash clears every standard genre** (code/reason/instruct + representative prose) at ≥1.3× and
-τ>1.5. **MTP clears everything — including creative fiction — at ≥1.15%, losslessly.** The durable
-answer: DFlash where it wins (1.3×+), MTP for the creative-fiction tail (1.15×). **Every content
-type is covered, losslessly, deployable** (MTP via `HIPFIRE_QWEN_MTP=1`).
+| Genre | DFlash tok/s | AR× (floor 1.3×, τ>1.5) |
+|---|---|---|
+| code | 112.9 | 2.63× ✓ τ5.15 |
+| reason | 114.8 | 2.67× ✓ τ5.23 |
+| instruct | 96.9 | 2.25× ✓ τ4.23 |
+| prose (expository) | 77.1 | 1.79× ✓ τ3.10 |
+| creative fiction (lighthouse) | 60.2 | 1.40× ✓ τ2.20 |
+| creative fiction (clockmaker) | 65.3 | 1.52× ✓ τ2.48 |
 
-The only content DFlash can't clear at 1.3× is **pure creative fiction** (novel narrative, τ1.05) —
-a *fundamental* spec-decode limit (the content is unpredictable for any drafter, the drafter can't
-match what the target invents), not a hipfire-specific gap. MTP covers it at the lower floor. The
-earlier "DFlash prose retrain-bound" verdict was a **measurement-config artifact** — it used
-`--no-chatml` raw continuation (the canonical *code*-bench config), the worst case for prose;
-under the chatml serving config, representative prose clears DFlash comfortably.
+**DFlash clears every genre ≥1.3× and τ>1.5 on the daemon** — the durability target is met by
+DFlash alone. **MTP independently clears every genre ≥1.15× on the daemon too** (daemon-wired via
+`HIPFIRE_QWEN_MTP=1`, lossless): code 1.64×, reason 1.73×, instruct 1.64×, prose 1.63×, creative
+fiction 1.26–1.48× (τ2.37–2.79) — the same thinking-mode lift the `mtp_only_demo` missed. **Both
+modes are durable across every genre on the serving path; all three requirements met.** No adaptive
+switch, no retrain required.
+
+The earlier "creative fiction is retrain-bound (0.97×)" verdict was a **demo-harness artifact**:
+`dflash_spec_demo` measures raw open-ended continuation, but the daemon's serving behavior (chatml +
+a structured thinking block before the answer) makes even novel fiction predictable enough that τ
+jumps 1.05 → 2.2–2.5. Lesson: measure durability on the daemon, never the raw demo harness.
 
 ---
 
