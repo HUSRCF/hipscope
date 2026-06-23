@@ -124,11 +124,113 @@ fn main() {
         }
     }
 
+    // ---- optional perf bench: chunked wrapper vs batch_seq at prefill shapes ----
+    if std::env::var("HIPFIRE_GDN_BENCH").as_deref() == Ok("1") {
+        bench(&mut gpu);
+    }
+
     if overall_ok {
         println!("\nPARITY OK (chunked == batch_seq, all configs incl. tail, tol {TOL:.0e})");
     } else {
         eprintln!("\nPARITY FAIL");
         std::process::exit(1);
+    }
+}
+
+/// Time the chunked wrapper vs the sequential batch_seq kernel at realistic
+/// prefill shapes (HD=128 fixed, n_heads=16). Isolates the GDN kernel: H2D of
+/// the fresh S clone is OUTSIDE the sync-bracketed timed region; warm median of
+/// 13 (the cold first-use JIT is the max, dropped by the median).
+#[cfg(feature = "deltanet")]
+fn bench(gpu: &mut rdna_compute::Gpu) {
+    use rdna_compute::DType;
+    use std::time::Instant;
+    const HD: usize = 128;
+    const N_HEADS: usize = 16;
+    const ITERS: usize = 13;
+    let shapes: &[(usize, usize)] = &[(128, 16), (256, 16), (256, 32), (512, 16), (512, 32)];
+
+    println!("\n=== BENCH  HD={HD} n_heads={N_HEADS}  (warm median-of-{ITERS}, ms) ===");
+    println!(
+        "{:>5} {:>4} {:>12} {:>12} {:>9}",
+        "T", "CS", "seq_ms", "chunk_ms", "speedup"
+    );
+
+    for &(t_tokens, cs) in shapes {
+        let mut rng = Lcg::new(0xBEEF ^ ((t_tokens as u64) << 8) ^ cs as u64);
+        let mut q = vec![0f32; t_tokens * N_HEADS * HD];
+        let mut k = vec![0f32; t_tokens * N_HEADS * HD];
+        let mut v = vec![0f32; t_tokens * N_HEADS * HD];
+        for x in q.iter_mut() {
+            *x = rng.normal() * 0.5;
+        }
+        for x in k.iter_mut() {
+            *x = rng.normal() * 0.5;
+        }
+        for x in v.iter_mut() {
+            *x = rng.normal() * 0.5;
+        }
+        l2_normalize_rows(&mut q, t_tokens * N_HEADS, HD);
+        l2_normalize_rows(&mut k, t_tokens * N_HEADS, HD);
+        let mut gate = vec![0f32; t_tokens * N_HEADS];
+        let mut beta = vec![0f32; t_tokens * N_HEADS];
+        for g in gate.iter_mut() {
+            *g = -rng.normal().abs() * 0.1 - 0.01;
+        }
+        for b in beta.iter_mut() {
+            *b = rng.uniform();
+        }
+        let s0: Vec<f32> = (0..N_HEADS * HD * HD).map(|_| rng.normal() * 0.1).collect();
+
+        let q_gpu = gpu.upload_f32(&q, &[t_tokens, N_HEADS * HD]).unwrap();
+        let k_gpu = gpu.upload_f32(&k, &[t_tokens, N_HEADS * HD]).unwrap();
+        let v_gpu = gpu.upload_f32(&v, &[t_tokens, N_HEADS * HD]).unwrap();
+        let g_gpu = gpu.upload_f32(&gate, &[t_tokens, N_HEADS]).unwrap();
+        let b_gpu = gpu.upload_f32(&beta, &[t_tokens, N_HEADS]).unwrap();
+        let out = gpu.zeros(&[t_tokens, N_HEADS * HD], DType::F32).unwrap();
+
+        let mut seq_t = Vec::with_capacity(ITERS);
+        let mut chunk_t = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let s = gpu.upload_f32(&s0, &[N_HEADS * HD * HD]).unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            gpu.gated_delta_net_f32_batch_seq(
+                &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &s, &out, t_tokens, N_HEADS, HD,
+            )
+            .unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            seq_t.push(t0.elapsed().as_secs_f64() * 1e3);
+            gpu.free_tensor(s).unwrap();
+        }
+        for _ in 0..ITERS {
+            let s = gpu.upload_f32(&s0, &[N_HEADS * HD * HD]).unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            gpu.gated_delta_net_f32_chunked(
+                &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &s, &out, t_tokens, N_HEADS, HD, cs,
+            )
+            .unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            chunk_t.push(t0.elapsed().as_secs_f64() * 1e3);
+            gpu.free_tensor(s).unwrap();
+        }
+        seq_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        chunk_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let seq_ms = seq_t[ITERS / 2];
+        let chunk_ms = chunk_t[ITERS / 2];
+        println!(
+            "{:>5} {:>4} {:>12.4} {:>12.4} {:>8.2}x",
+            t_tokens,
+            cs,
+            seq_ms,
+            chunk_ms,
+            seq_ms / chunk_ms
+        );
+
+        for tns in [q_gpu, k_gpu, v_gpu, g_gpu, b_gpu, out] {
+            gpu.free_tensor(tns).unwrap();
+        }
     }
 }
 

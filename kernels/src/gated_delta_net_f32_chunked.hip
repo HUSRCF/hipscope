@@ -9,12 +9,19 @@
 // recurrence (alpha-inside-delta convention), proven by the numpy oracle
 // gdn_chunk_parity_3.py (gdn_chunked_f32) at 1.3e-15 max abs diff.
 //
-// One wave32 workgroup processes exactly ONE chunk of C<=CS tokens for ONE
-// head. Cross-chunk dependency (chunk ci's S_in = chunk ci-1's S_out) is
-// serialized by the host: the Rust wrapper launches one kernel per chunk in a
-// loop, advancing the persistent FP32 state in place (same s_f32 buffer the
+// One workgroup processes exactly ONE chunk of C<=CS tokens for ONE head.
+// Cross-chunk dependency (chunk ci's S_in = chunk ci-1's S_out) is serialized
+// by the host: the Rust wrapper launches one kernel per chunk in a loop,
+// advancing the persistent FP32 state in place (same s_f32 buffer the
 // sequential kernel uses). The win is the INTRA-chunk parallelism replacing
 // the per-token serial inner loop of the sequential kernel.
+//
+// THREADING: parameterized over blockDim.x (BLK). The HD=128 row-parallel work
+// (S_in@k, S_in@q, state carry, fwd-subst columns) is distributed `r = tid;
+// r < HD; r += BLK`, so BLK=32 gives 4 rows/lane (1 wave), BLK=128 gives 1
+// row/lane (4 waves → latency hiding), BLK=256 adds waves for the CxC sections.
+// The inclusive cumsum's __shfl_up only needs lanes 0..C-1 (C<=32, wave 0), so
+// it is correct at any BLK. Launched with BLK from HIPFIRE_GDN_BLK (default 128).
 //
 // Recurrence decomposition (matches gdn_chunked_f32 EXACTLY):
 //   G_i      = sum_{m<=i} g_m                       (INCLUSIVE cumsum)
@@ -29,14 +36,12 @@
 //   S_out    = exp(G_{C-1})*S_in
 //              + sum_j exp(G_{C-1}-G_j) * outer(delta_j, k_j)
 //
-// LDS budget (CS_MAX=32, HD=128): to stay under the 64 KB/workgroup RDNA10/11
-// limit, K and Q chunk tiles are NOT cached in LDS — they are re-read from
-// global in the GEMM loops (correctness-first PoC; the win is intra-chunk
-// parallelism, not LDS reuse). Resident LDS:
+// LDS budget (CS_MAX=32, HD=128): K and Q chunk tiles are NOT cached in LDS
+// (re-read from global), staying ~45.7 KB < 64 KB/workgroup. Resident LDS:
 //   5 * CS_MAX vectors (g/G/expG/decay/beta)        =   640 B
 //   3 * CS_MAX*CS_MAX matrices (D / L / Mkq)         = 12288 B
 //   2 * CS_MAX*HD intermediates (wrhs / delta)       = 32768 B
-//   total ≈ 45.7 KB  (fits 64 KB; occupancy headroom)
+//   total ≈ 45.7 KB
 //
 // V1 is F32-only. Q8/EF requant-at-chunk-seams is stage 2 (a separate
 // gated_delta_net_q8_chunked.hip mirroring the q8 EF block).
@@ -46,28 +51,31 @@
 
 // ─── 1. inclusive prefix sum (Kogge-Stone __shfl_up over C<=32 lanes) ───────
 // G_i = sum_{m<=i} g_m. INCLUSIVE (G_i includes g_i). Exclusive shifts every
-// decay exponent by one gate and breaks parity.
+// decay exponent by one gate and breaks parity. Only lanes 0..C-1 (wave 0,
+// since C<=32) participate meaningfully; higher waves shuffle harmlessly and
+// never write (the L<C guard).
 __device__ static __forceinline__ void inclusive_cumsum(
     const float* __restrict__ g_lds, float* __restrict__ G_lds, int C) {
-    const int L = threadIdx.x;
-    float val = (L < C) ? g_lds[L] : 0.0f;
+    const int Lx = threadIdx.x;
+    float val = (Lx < C) ? g_lds[Lx] : 0.0f;
     // Kogge-Stone inclusive scan; lane L adds the value from lane L-d when L>=d.
     for (int d = 1; d < 32; d <<= 1) {
         float up = __shfl_up(val, d);
-        if (L >= d) val += up;
+        if (Lx >= d) val += up;
     }
-    if (L < C) G_lds[L] = val;
+    if (Lx < C) G_lds[Lx] = val;
 }
 
 // ─── 2. pairwise decay mask D[i][j] = exp(G_i - G_j) ───────────────────────
-// CxC; lanes stride over the flattened (i*C+j) index. expf (precise), NOT
-// __expf. D is reused to mask BOTH the strict-lower A term and the
+// CxC; lanes stride the flattened (i*C+j) index by blockDim.x. expf (precise),
+// NOT __expf. D is reused to mask BOTH the strict-lower A term and the
 // lower-incl-diag output term (the masking differs; the matrix is shared).
 __device__ static __forceinline__ void build_decay_mask(
     const float* __restrict__ G_lds, float* __restrict__ D_lds, int C) {
     const int tid = threadIdx.x;
+    const int blk = blockDim.x;
     const int CC = C * C;
-    for (int idx = tid; idx < CC; idx += 32) {
+    for (int idx = tid; idx < CC; idx += blk) {
         int i = idx / C;
         int j = idx - i * C;
         D_lds[idx] = expf(G_lds[i] - G_lds[j]);
@@ -77,34 +85,27 @@ __device__ static __forceinline__ void build_decay_mask(
 // ─── 3. unit-lower forward substitution  (I + L) delta = rhs ───────────────
 // L is strict-lower CxC (L = diag(beta)*A); rhs is C x HD. UNIT diagonal =>
 //   delta_i = rhs_i - sum_{l<i} L[i][l]*delta_l        (NO division).
-// Sequential in i (data dependency), parallel over the HD columns: each lane
-// owns HD/32 = 4 strided columns d in {tid, tid+32, tid+64, tid+96}.
-// __syncthreads() after each i so row l is visible before row i>l reads it.
+// Sequential in i (data dependency), parallel over the HD columns: lane owns
+// strided columns d in {tid, tid+blk, ...}. __syncthreads() after each i so
+// row l is visible before row i>l reads it.
 __device__ static __forceinline__ void forward_subst_unit_lower(
     const float* __restrict__ L_lds, const float* __restrict__ rhs,
     float* __restrict__ delta, int C) {
     const int tid = threadIdx.x;
+    const int blk = blockDim.x;
     for (int i = 0; i < C; i++) {
-        float acc0 = rhs[i * HD + tid];
-        float acc1 = rhs[i * HD + tid + 32];
-        float acc2 = rhs[i * HD + tid + 64];
-        float acc3 = rhs[i * HD + tid + 96];
-        for (int l = 0; l < i; l++) {
-            float lil = L_lds[i * C + l];
-            acc0 -= lil * delta[l * HD + tid];
-            acc1 -= lil * delta[l * HD + tid + 32];
-            acc2 -= lil * delta[l * HD + tid + 64];
-            acc3 -= lil * delta[l * HD + tid + 96];
+        for (int d = tid; d < HD; d += blk) {
+            float acc = rhs[i * HD + d];
+            for (int l = 0; l < i; l++) {
+                acc -= L_lds[i * C + l] * delta[l * HD + d];
+            }
+            delta[i * HD + d] = acc;
         }
-        delta[i * HD + tid] = acc0;
-        delta[i * HD + tid + 32] = acc1;
-        delta[i * HD + tid + 64] = acc2;
-        delta[i * HD + tid + 96] = acc3;
         __syncthreads();  // row i visible before row i'>i reads it
     }
 }
 
-extern "C" __launch_bounds__(32, 8)
+extern "C" __launch_bounds__(256, 1)
 __global__ void gated_delta_net_f32_chunked(
     const float* __restrict__ q,
     const float* __restrict__ k,        // must be L2-normalized per (t,h) by caller
@@ -124,6 +125,7 @@ __global__ void gated_delta_net_f32_chunked(
     if (h >= n_heads) return;
     const int ci = chunk_index;           // chunk index (host-serialized loop)
     const int tid = threadIdx.x;
+    const int blk = blockDim.x;
     const int stride = n_heads * HD;
 
     const int c0 = ci * chunk_size;
@@ -171,11 +173,10 @@ __global__ void gated_delta_net_f32_chunked(
     __syncthreads();
 
     // ── 3. inter-chunk pull  w_j = exp(G_j) * (S_in @ k_j) ─────────────────
-    // Sk[j,r] = sum_c S_in[r,c]*k_j[c]; lane owns 4 strided rows r.
+    // Sk[j,r] = sum_c S_in[r,c]*k_j[c]; lane owns strided rows r.
     for (int j = 0; j < C; j++) {
         const float* k_j = k_base + j * stride;
-        for (int slot = 0; slot < 4; slot++) {
-            int r = tid + 32 * slot;
+        for (int r = tid; r < HD; r += blk) {
             const float* srow = s_head + r * HD;
             float acc = 0.0f;
             #pragma unroll 4
@@ -188,7 +189,7 @@ __global__ void gated_delta_net_f32_chunked(
     // ── 4. strict-lower A[j][l] = exp(G_j-G_l)*(k_j.k_l), l<j; L = diag(beta)*A
     {
         const int CC = C * C;
-        for (int idx = tid; idx < CC; idx += 32) {
+        for (int idx = tid; idx < CC; idx += blk) {
             int j = idx / C;
             int l = idx - j * C;
             float Ljl = 0.0f;
@@ -209,10 +210,9 @@ __global__ void gated_delta_net_f32_chunked(
     for (int j = 0; j < C; j++) {
         const float* v_j = v_base + j * stride;
         float bj = beta_lds[j];
-        wrhs[j * HD + tid] = bj * (v_j[tid] - wrhs[j * HD + tid]);
-        wrhs[j * HD + tid + 32] = bj * (v_j[tid + 32] - wrhs[j * HD + tid + 32]);
-        wrhs[j * HD + tid + 64] = bj * (v_j[tid + 64] - wrhs[j * HD + tid + 64]);
-        wrhs[j * HD + tid + 96] = bj * (v_j[tid + 96] - wrhs[j * HD + tid + 96]);
+        for (int d = tid; d < HD; d += blk) {
+            wrhs[j * HD + d] = bj * (v_j[d] - wrhs[j * HD + d]);
+        }
     }
     __syncthreads();
 
@@ -223,7 +223,7 @@ __global__ void gated_delta_net_f32_chunked(
     // ── 7. build Mkq = tril(D .* (q_i.k_j), 0)  (lower-INCL-diag, j<=i) ─────
     {
         const int CC = C * C;
-        for (int idx = tid; idx < CC; idx += 32) {
+        for (int idx = tid; idx < CC; idx += blk) {
             int i = idx / C;
             int j = idx - i * C;
             float m = 0.0f;
@@ -243,8 +243,7 @@ __global__ void gated_delta_net_f32_chunked(
     // ── 7c. out_i = exp(G_i)*(S_in @ q_i) + sum_{j<=i} Mkq[i,j]*delta_j ─────
     for (int i = 0; i < C; i++) {
         const float* q_i = q_base + i * stride;
-        for (int slot = 0; slot < 4; slot++) {
-            int r = tid + 32 * slot;
+        for (int r = tid; r < HD; r += blk) {
             const float* srow = s_head + r * HD;
             float sq = 0.0f;
             #pragma unroll 4
@@ -260,8 +259,7 @@ __global__ void gated_delta_net_f32_chunked(
     // Each lane owns its own (r,c) cells; reads S_in[r,c] then overwrites it.
     // The outer-product term uses delta + k (not S), so no cross-lane S race.
     const float expGC = expf(G_C);
-    for (int slot = 0; slot < 4; slot++) {
-        int r = tid + 32 * slot;
+    for (int r = tid; r < HD; r += blk) {
         float* srow = s_head + r * HD;
         for (int c = 0; c < HD; c++) {
             float acc = expGC * srow[c];

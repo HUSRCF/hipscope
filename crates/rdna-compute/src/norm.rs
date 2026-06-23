@@ -2618,6 +2618,15 @@ impl Gpu {
 
         let cs = chunk_size.clamp(1, 32);
         let n_chunks = n_tokens.div_ceil(cs);
+        // Threads per workgroup (BLK). The chunked kernel is parameterized over
+        // blockDim.x: 32 = 1 wave/4-rows-per-lane, 128 = 4 waves (latency
+        // hiding + 1 HD row/lane), 256 = 8 waves. Default 128; override for
+        // perf sweeps via HIPFIRE_GDN_BLK.
+        let blk: u32 = std::env::var("HIPFIRE_GDN_BLK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|b| (b.clamp(32, 256) / 32) * 32)
+            .unwrap_or(128);
 
         let qp = q_batch.buf.as_ptr();
         let kp = k_batch.buf.as_ptr();
@@ -2666,7 +2675,7 @@ impl Gpu {
             self.launch_maybe_blob(
                 "gated_delta_net_f32_chunked",
                 [n_heads as u32, 1, 1],
-                [32, 1, 1],
+                [blk, 1, 1],
                 0,
                 &mut params,
                 || {
