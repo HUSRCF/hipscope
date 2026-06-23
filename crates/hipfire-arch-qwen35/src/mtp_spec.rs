@@ -762,6 +762,19 @@ impl MtpSpecState {
         )
     }
 
+    /// Drafter-local reset for a fresh conversation. Zeros the MTP head KV
+    /// (stale absolute positions from the prior turn must not be re-read) and
+    /// destroys any captured proposal graph (its node positions are turn-stale).
+    /// The trunk's KV + DeltaNet reset is the daemon's concern (it owns the
+    /// bundle and calls `reset_recurrent`); this clears only head-local state.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        destroy_mtp_proposal_graph(gpu, self);
+        self.mtp_proposal_graph_warmed = false;
+        self.mtp_proposal_graph_seq_cap = 0;
+        self.mtp_kv.reset(gpu)?;
+        Ok(())
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.prev_hidden);
         let _ = gpu.free_tensor(self.verify_hidden);

@@ -45,6 +45,10 @@ pub mod mtp_head;
 pub mod mtp_probe;
 #[cfg(feature = "deltanet")]
 pub mod mtp_spec;
+/// Qwen3.5 `MtpDrafter` impl (the arch half of the unified MTP spec-decode
+/// core). Deltanet-gated — it touches `ModelSlot` + `MtpSpecState`.
+#[cfg(feature = "deltanet")]
+pub mod mtp_speculator;
 #[cfg(feature = "deltanet")]
 pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
@@ -71,3 +75,5 @@ pub use arch::Qwen35;
 pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
+#[cfg(feature = "deltanet")]
+pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
