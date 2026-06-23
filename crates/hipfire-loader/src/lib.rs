@@ -208,6 +208,7 @@ pub enum ModelState {
     Lfm2Moe(Lfm2MoeBundle),
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
+    Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. `eos_tok` is resolved at load time and
@@ -250,11 +251,13 @@ pub struct LoadedModel {
     pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 Flash state
-    pub deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
-    pub deepseek4_weights: Option<hipfire_arch_deepseek4::DeepseekV4Weights>,
-    pub deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
+    // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
+    // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
+    // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
+    // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
+    // models — the eos must be carried here (mirrors `minimax_eos_tok`).
     pub deepseek4_eos_tok: u32,
     // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
@@ -330,9 +333,6 @@ impl LoadedModel {
             kv_cache: None,
             dn_state: None,
             qwen2_state: None,
-            deepseek4_config: None,
-            deepseek4_weights: None,
-            deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
@@ -406,6 +406,22 @@ impl LoadedModel {
     pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
         match &mut self.state {
             Some(ModelState::Cohere2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
+    /// (EP/pp ds4 keeps its state in `ep` (EpArch::Ds4), so this is None there.)
+    pub fn deepseek4(&self) -> Option<&hipfire_arch_deepseek4::Deepseek4Bundle> {
+        match &self.state {
+            Some(ModelState::Deepseek4(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
+        match &mut self.state {
+            Some(ModelState::Deepseek4(b)) => Some(b),
             _ => None,
         }
     }
@@ -1445,6 +1461,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             | Some(ModelState::Lfm2Moe(_))
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1507,22 +1524,22 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::Deepseek4(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
         }
     }
     // Non-core arch weights
     if let Some(s) = m.qwen2_state {
         s.free_gpu(gpu);
     }
-    if let Some(s) = m.deepseek4_state {
-        s.free_gpu(gpu);
-    }
+    // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
+    // its config/weights/state freed via ModelState::Deepseek4 above.
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
-    }
-    if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
     }
     // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive

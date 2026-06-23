@@ -649,11 +649,13 @@ impl Carrier for Deepseek4Carrier {
         let pbs = deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         Ok(LoadedModel {
-            deepseek4_config: Some(config),
-            deepseek4_weights: Some(weights),
-            deepseek4_state: Some(state),
+            state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
             deepseek4_pbs: Some(pbs),
-            deepseek4_eos_tok: eos_tok,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

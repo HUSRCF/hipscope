@@ -177,6 +177,20 @@ impl SpecTargetGuard for Qwen2SlotGuard<'_> {
     }
 }
 
+/// DeepSeek V4 (arch_id=9) spec-target borrow. Its `Deepseek4Bundle` implements
+/// `SpecTarget` in place (MLA KV + recurrent state live inside the bundle), so —
+/// like llama/qwen2 — there is no `HfqFile` to reopen and nothing to move out of
+/// `m.state`; the `&mut` is held for the guard's life and released on `Drop`.
+struct Deepseek4SlotGuard<'m> {
+    bundle: &'m mut hipfire_arch_deepseek4::Deepseek4Bundle,
+}
+
+impl SpecTargetGuard for Deepseek4SlotGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(&mut *self.bundle as &mut dyn SpecTarget)
+    }
+}
+
 /// Arch-dispatched borrow of the spec-decode target as a boxed [`SpecTargetGuard`].
 ///
 /// qwen35 (5/6) moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
@@ -197,6 +211,9 @@ pub fn spec_target_guard<'m>(
         match state.as_mut() {
             Some(ModelState::Llama(bundle)) => Ok(Box::new(LlamaSlotGuard { bundle })),
             Some(ModelState::Qwen2(bundle)) => Ok(Box::new(Qwen2SlotGuard { bundle })),
+            Some(ModelState::Deepseek4(bundle)) if arch_id == 9 => {
+                Ok(Box::new(Deepseek4SlotGuard { bundle }))
+            }
             _ => Err(format!(
                 "spec path: unsupported arch state for arch_id {arch_id}"
             )),

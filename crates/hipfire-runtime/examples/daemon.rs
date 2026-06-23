@@ -1604,9 +1604,8 @@ fn main() {
                         // model (DeepSeek V4 only today). Used by mtp_mode=auto
                         // to decide whether to enable spec-decode at generate time.
                         m.mtp_weights_present = m
-                            .deepseek4_weights
-                            .as_ref()
-                            .and_then(|w| w.mtp_layer.as_ref())
+                            .deepseek4()
+                            .and_then(|b| b.weights.mtp_layer.as_ref())
                             .is_some();
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
@@ -2176,8 +2175,8 @@ fn main() {
                         if let Some(ref mut s) = m.qwen2_state {
                             s.reset();
                         }
-                        if let Some(ref mut s) = m.deepseek4_state {
-                            s.reset();
+                        if let Some(b) = m.deepseek4_mut() {
+                            b.state.reset();
                         }
                         if let Some(ref mut ad) = m.kv_adaptive {
                             ad.reset();
@@ -2394,8 +2393,8 @@ fn main() {
                     // pi-coding-agent corruption (`CLion` for
                     // `CLionProjects`, `/home/n/` for `/home/nick/`).
                     // See `DeepseekV4State::reset` doc.
-                    if let Some(ref mut s) = m.deepseek4_state {
-                        s.reset();
+                    if let Some(b) = m.deepseek4_mut() {
+                        b.state.reset();
                         // Drop the captured V4F decode hipGraph alongside
                         // the state. The captured kernarg blobs hold
                         // session-1's device-buffer pointers; a fresh
@@ -2655,9 +2654,10 @@ fn main() {
                     // before any user-facing generate. Not the
                     // production prefill path (that's
                     // forward_prefill_batch_chunked in `generate`).
-                    let config = m.deepseek4_config.as_ref().unwrap();
-                    let weights = m.deepseek4_weights.as_ref().unwrap();
-                    let state = m.deepseek4_state.as_mut().unwrap();
+                    let b = m.deepseek4_mut().unwrap();
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if deepseek4::forward::decode_step(
@@ -8904,31 +8904,29 @@ fn generate_deepseek4(
             return;
         }
     };
-    let cfg = match m.deepseek4_config.as_ref() {
-        Some(c) => c,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let weights = m
-        .deepseek4_weights
-        .as_ref()
-        .expect("deepseek4_weights missing on arch_id=9 generate");
+    // `pbs` is a disjoint field from `m.state`, so it borrows independently of
+    // the bundle's `&mut state` below.
     let pbs = m
         .deepseek4_pbs
         .as_ref()
         .expect("deepseek4_pbs missing on arch_id=9 generate");
-    let state = m
-        .deepseek4_state
-        .as_mut()
-        .expect("deepseek4_state missing on arch_id=9 generate");
-    let eos_tok = m.deepseek4_eos_tok;
+    // The single-GPU ds4 bundle (config/weights/state/eos) lives in
+    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
+    // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
+    // forward path needs.
+    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    };
+    let cfg = &b.config;
+    let weights = &b.weights;
+    let state = &mut b.state;
+    let eos_tok = b.eos_tok;
 
     let prompt_ids = build_deepseek4_dsml_prompt(
         tokenizer,
@@ -9542,8 +9540,8 @@ fn generate_deepseek4(
         // as an `Arc<Vec<String>>` and is cleared on model unload.
         //
         // Borrow note: `m.decoded_vocab` is a disjoint field from
-        // `m.deepseek4_state` (which `state` holds `&mut` to) and from
-        // `m.tokenizer` (which `tokenizer` holds `&` to), so the
+        // `m.state` (whose `ModelState::Deepseek4` bundle `state` holds `&mut`
+        // to) and from `m.tokenizer` (which `tokenizer` holds `&` to), so the
         // assignment compiles under Rust's split-borrows.
         let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
             if m.decoded_vocab.is_none() {
