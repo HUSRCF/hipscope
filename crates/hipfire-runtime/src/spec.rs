@@ -609,6 +609,129 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     }
 }
 
+// ─── Per-token emission seam (SpecEmit) ─────────────────────────────────────
+//
+// The daemon's spec-decode loops emit committed tokens twice over: qwen35/llama
+// in `generate_dflash` (an `EosFilter` byte stream + post-hoc grammar matcher +
+// max-think force-close + user stop-sequence match), and deepseek4 in
+// `generate_deepseek4` (a DSML `StreamParser`). `SpecEmit` is the arch-generic
+// boundary between "the loop committed token N" and "what the client sees" so a
+// future single decode loop can drive any arch's emission without learning its
+// quirks. The trait returns SEMANTIC events ([`ClientEvent`]) — the daemon owns
+// the JSONL rendering and timing, and the loop-state bookkeeping (KV/recurrent
+// resets, position/seed advance, conversation-token bake, eviction) stays in the
+// decode loop; only the per-token emit decisions move behind this seam.
+
+/// One client-visible emission produced by a [`SpecEmit`] step. The daemon
+/// renders these to its JSONL wire format (`{"type":"token",...}` etc.) and
+/// supplies its own timing; this carries only the semantic payload.
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    /// Visible answer text (post-filter, post-think-strip). → `{"type":"token"}`.
+    Token(String),
+    /// Reasoning/think-block text surfaced separately (DSML reasoning channel).
+    /// → `{"type":"reasoning"}`. Unused by the qwen35 emitter (it strips think
+    /// only when configured and never emits a separate reasoning channel), but
+    /// part of the shared vocabulary the deepseek4 emitter will populate.
+    Reasoning(String),
+    /// Parsed tool calls for this turn. → `{"type":"tool_calls"}`.
+    ToolCalls(Vec<crate::prompt_frame::ToolCall>),
+    /// A committed token id at output index `idx`. → `{"type":"committed"}`
+    /// (gated by `HIPFIRE_EMIT_TOKEN_IDS=1` at the daemon). The daemon attaches
+    /// its own `t_ms` timestamp when rendering.
+    Committed { id: u32, idx: usize },
+}
+
+/// Why a [`SpecEmit`] decided this token ends generation. The daemon maps this
+/// to its `done` envelope's `finish_reason` and to the post-loop cleanup
+/// (grammar-violation forces a full KV/recurrent reset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// A natural end-of-turn terminator (EOS / `<|im_end|>` / tokenizer
+    /// terminator). `finish_reason` resolves to `stop` (or `tool_calls` when the
+    /// turn parsed any).
+    Eos,
+    /// `max_think_tokens` reached inside an open `<think>` block — the emitter
+    /// force-closed the block. `finish_reason` = `stop`.
+    ThinkCap,
+    /// A user-supplied stop sequence matched the decoded suffix. `finish_reason`
+    /// = `stop`.
+    StopSequence,
+    /// A committed token violated the active tool-call grammar. The daemon
+    /// treats this as EOS for the turn AND forces a full KV/recurrent reset so
+    /// the next turn starts clean.
+    GrammarViolation,
+}
+
+/// Outcome of a single [`SpecEmit::begin`] / [`SpecEmit::observe`] step: the
+/// client events to render (in order) plus an optional stop signal. A non-`None`
+/// `stop` means the decode loop must stop AFTER rendering `events`.
+#[derive(Debug, Clone, Default)]
+pub struct EmitOutcome {
+    /// Events to render this step, in order.
+    pub events: Vec<ClientEvent>,
+    /// If set, generation stops after this step's events.
+    pub stop: Option<StopReason>,
+}
+
+impl EmitOutcome {
+    /// An empty outcome (filter held all bytes; no stop). The common case when
+    /// the `EosFilter` is buffering a partial UTF-8 codepoint or marker prefix.
+    pub fn held() -> Self {
+        Self::default()
+    }
+}
+
+/// Terminal flush of a [`SpecEmit`], consumed by value at end of turn. Carries
+/// any final events (e.g. a `tool_calls` event parsed from the full decoded
+/// text) plus the resolved `finish_reason` and parsed tool-call count for the
+/// daemon's `done` envelope. The daemon still owns the length-cap decision
+/// (`generated >= max_tokens` ⇒ `length`), so `finish_reason` here is the
+/// emitter's view (`stop` / `tool_calls`); the caller overrides with `length`
+/// when the loop hit the token cap.
+#[derive(Debug, Clone, Default)]
+pub struct FinishSummary {
+    /// Final events to render (e.g. the turn's `ToolCalls`).
+    pub events: Vec<ClientEvent>,
+    /// The emitter's finish reason (`stop` or `tool_calls`); the caller may
+    /// override with `length` on a token-cap exit.
+    pub finish_reason: &'static str,
+    /// Number of tool calls parsed this turn (for the `done` envelope).
+    pub tool_calls: usize,
+}
+
+/// Per-token emission policy for a spec-decode turn. The decode loop calls
+/// [`begin`](Self::begin) once for the prefill's first token, then
+/// [`observe`](Self::observe) for each subsequently-committed token, rendering
+/// the returned [`EmitOutcome::events`] and stopping when a step returns a
+/// [`StopReason`]. At end of turn it calls [`finish`](Self::finish) for the
+/// terminal flush.
+///
+/// The emitter OWNS the per-turn emission state (byte filter, grammar matcher,
+/// think counter, decoded-token history) so the decode loop stays arch-agnostic.
+/// It does NOT own loop/cache state (position, seed, KV/recurrent resets,
+/// conversation-token bake) — those stay in the loop.
+pub trait SpecEmit {
+    /// Emit the prefill's first token. Returns the events to render and any
+    /// immediate stop (the first token can itself be a terminator).
+    fn begin(&mut self, first_token: u32) -> EmitOutcome;
+
+    /// Emit one subsequently-committed token. Returns the events to render and
+    /// any stop signal (EOS / grammar / stop-sequence / think-cap).
+    fn observe(&mut self, token: u32) -> EmitOutcome;
+
+    /// Terminal flush at end of turn (parse tool calls, resolve finish reason).
+    fn finish(self: Box<Self>) -> FinishSummary;
+
+    /// In-step grammar mask interface, when the emitter applies grammar to the
+    /// verifier's logits. The qwen35 emitter applies grammar POST-hoc inside
+    /// `observe` and returns `None` here; a future in-step grammar consumer
+    /// returns its erased matcher.
+    fn grammar(&mut self) -> Option<&mut dyn SpecGrammar> {
+        None
+    }
+}
+
 // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────
 //
 // Moved here from `hipfire-arch-qwen35::speculative` so the arch-generic
@@ -905,5 +1028,34 @@ mod tests {
             drafts_generated: 4,
         })
         .is_err());
+    }
+
+    // ── SpecEmit seam types ─────────────────────────────────────────────────
+
+    #[test]
+    fn emit_outcome_held_is_empty_no_stop() {
+        let o = EmitOutcome::held();
+        assert!(o.events.is_empty());
+        assert!(o.stop.is_none());
+    }
+
+    #[test]
+    fn emit_outcome_carries_events_and_stop() {
+        let o = EmitOutcome {
+            events: vec![
+                ClientEvent::Committed { id: 42, idx: 7 },
+                ClientEvent::Token("hi".to_string()),
+            ],
+            stop: Some(StopReason::Eos),
+        };
+        assert_eq!(o.events.len(), 2);
+        assert_eq!(o.stop, Some(StopReason::Eos));
+        // Ordering is load-bearing: committed before token, matching the
+        // daemon's emit_committed_event-then-token-write order.
+        assert!(matches!(
+            o.events[0],
+            ClientEvent::Committed { id: 42, idx: 7 }
+        ));
+        assert!(matches!(&o.events[1], ClientEvent::Token(t) if t == "hi"));
     }
 }
