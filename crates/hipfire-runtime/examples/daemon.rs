@@ -4264,7 +4264,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 /// `Deepseek4Emit<'a>` borrow the tokenizer, which is derived from `m` *inside*
 /// `generate_spec`, so an externally-supplied closure can't capture it. The enum
 /// carries only owned, arch-side data; `generate_spec` matches it to construct
-/// the `Box<dyn SpecEmit>`. (T4c-2 adds a `Deepseek4` variant.)
+/// the `Box<dyn SpecEmit>`.
 enum EmitSpec {
     Qwen35 {
         tool_schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema>,
@@ -4272,6 +4272,13 @@ enum EmitSpec {
         stop: Vec<String>,
         max_think: usize,
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    },
+    /// deepseek4 DSML emitter. `grammar` is the in-step tool-call matcher
+    /// (`Some` when the request carries tools), threaded into the fused spec step
+    /// via `Deepseek4Emit::grammar()`.
+    Deepseek4 {
+        think_mode: ThinkMode,
+        grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
     },
 }
 
@@ -4284,9 +4291,14 @@ struct SpecRun {
     spec_cycles: usize,
     spec_accepted: usize,
     /// Full committed stream (from the emitter) for the wrapper's cache store.
+    /// Empty for emitters that don't track it (deepseek4 — its spec path stores
+    /// no asst-turn cache).
     streamed_tokens: Vec<u32>,
     /// Newly-prefilled token count (the suffix actually fed through the model).
     prefill_tokens_len: usize,
+    /// The terminal flush summary (tool-call count drives the wrapper's
+    /// `finish_reason`; events were already rendered inside `generate_spec`).
+    finish: FinishSummary,
     prefill_s: f64,
     total_s: f64,
     decode_s: f64,
@@ -4895,6 +4907,12 @@ fn generate_spec(
             max_think,
             assistant_prefix,
         )),
+        EmitSpec::Deepseek4 {
+            think_mode,
+            grammar,
+        } => Box::new(
+            Deepseek4Emit::new(tokenizer, think_mode, slot.eos_token()).with_grammar(grammar),
+        ),
     };
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
@@ -4953,7 +4971,12 @@ fn generate_spec(
         &first_begin.events,
         t0.elapsed().as_millis() as u64,
     );
-    generated += 1;
+    // Count the first token only when the emitter emitted it (see the same guard
+    // in the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
+    // returns no events for an EOS-first prefill argmax, yielding an empty turn.
+    if !first_begin.events.is_empty() {
+        generated += 1;
+    }
     let first_token_is_eos = first_begin.stop.is_some();
 
     // (The DFlash RNG cell and the `HIPFIRE_DDTREE_PATH_C` chain-vs-tree-vs-path_c
@@ -5040,9 +5063,18 @@ fn generate_spec(
                 hit_eos = true;
                 break;
             }
-            emitted.push(tok);
-            render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
-            generated += 1;
+            // Count/bake/render a committed token only when the emitter actually
+            // emitted it (non-empty events). qwen35 always emits a `Committed`
+            // event (even on EOS / held bytes), so this is a no-op there; the
+            // deepseek4 emitter returns NO events for an accepted EOS, so that
+            // terminator is neither counted into `generated` nor baked into
+            // `conversation_tokens` — byte-matching the bespoke ds4 loop (which
+            // broke on accepted-EOS before push/increment).
+            if !outcome.events.is_empty() {
+                emitted.push(tok);
+                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
+                generated += 1;
+            }
             match outcome.stop {
                 Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
                     hit_eos = true;
@@ -5139,6 +5171,7 @@ fn generate_spec(
         spec_accepted,
         streamed_tokens,
         prefill_tokens_len: prefill_tokens.len(),
+        finish,
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
         decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
@@ -6386,20 +6419,40 @@ fn generate(
         );
         let _ = (repeat_penalty, repeat_window);
         let _ = stop; // hunt3 M-F: not wired for arch_id=9 (deepseek4 bring-up)
-        generate_deepseek4(
-            m,
-            gpu,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            max_tokens,
-            think_mode,
-            tools,
-            messages_history,
-        );
+        // Route the MTP spec-decode path (greedy, speculator present) through the
+        // unified `generate_spec`; the AR sampler path (temp>0) and the
+        // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
+        // deletes the latter's now-redundant spec loop).
+        let spec_mode = deepseek4_spec_requested(m) && temp <= 1e-6;
+        if spec_mode && m.speculator.is_some() {
+            generate_deepseek4_spec(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                max_tokens,
+                think_mode,
+                tools,
+                messages_history,
+            );
+        } else {
+            generate_deepseek4(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                think_mode,
+                tools,
+                messages_history,
+            );
+        }
         return;
     }
     if m.arch_id == 11 {
@@ -9350,6 +9403,258 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
             tool_calls,
         }
     }
+}
+
+/// Resolve whether deepseek4 spec-decode is requested for this model, mirroring
+/// the env/config chain inside `generate_deepseek4` (daemon.rs spec_requested).
+/// The dispatch uses this (plus `temp <= 1e-6` and `m.speculator.is_some()`) to
+/// route the spec path through the unified `generate_spec`; the AR path (and the
+/// no-speculator fallback) stay in `generate_deepseek4`.
+fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
+    std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or_else(|| match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
+            Some("on") => true,
+            Some("off") => false,
+            _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+        })
+}
+
+/// Build the deepseek4 in-step tool-call grammar from the request's `tools`,
+/// using (and lazily populating) the model's cached decoded-vocab. Returns `None`
+/// when no usable tool schema is present. Mirrors the bespoke spec loop's grammar
+/// setup (daemon.rs generate_deepseek4 spec branch) but packages the matcher +
+/// vocab + mask into the `Deepseek4SpecGrammar` the unified step consumes.
+fn build_deepseek4_spec_grammar(
+    m: &mut LoadedModel,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar> {
+    let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    let func = t.get("function").unwrap_or(t);
+                    let name = func
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parameters = func.get("parameters");
+                    let params: Vec<String> = parameters
+                        .and_then(|p| p.get("properties"))
+                        .and_then(|p| p.as_object())
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let required: Vec<String> = parameters
+                        .and_then(|p| p.get("required"))
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    deepseek4::grammar::ToolSchema {
+                        name,
+                        params,
+                        required,
+                    }
+                })
+                .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if tool_schemas.is_empty() {
+        return None;
+    }
+    // Lazily build (and cache) the decoded-vocab Arc, mirroring the bespoke loop.
+    if m.decoded_vocab.is_none() {
+        let tok = m.tokenizer.as_ref().expect("tokenizer present");
+        let n = tok.vocab_size();
+        let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
+        m.decoded_vocab = Some(std::sync::Arc::new(v));
+    }
+    let decoded_vocab = m.decoded_vocab.clone().expect("just built");
+    Some(deepseek4::mtp_speculator::Deepseek4SpecGrammar::new(
+        tool_schemas,
+        decoded_vocab,
+    ))
+}
+
+/// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
+///
+/// This is the ds4 sibling of `generate_dflash`: it owns the arch-specific
+/// prologue (DSML prompt render + `plan_cache(CachePolicy::deepseek4())` + the
+/// DSA decode-cache miss teardown) and epilogue (the ds4 `done` envelope), and
+/// drives the shared decode core via `m.speculator` (a `Deepseek4MtpDrafter`),
+/// the `Deepseek4Bundle` target (via `spec_target_guard`), and `Deepseek4Emit`.
+/// Greedy-only — the dispatch routes here only at `temp <= 1e-6`.
+#[allow(clippy::too_many_arguments)]
+fn generate_deepseek4_spec(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    // eos token (for the DSML prompt build) from the bundle — immutable peek.
+    let eos_tok = match m.state.as_ref() {
+        Some(ModelState::Deepseek4(b)) => b.eos_tok,
+        _ => {
+            emit_error_with_id(stdout, id, "deepseek4 bundle missing on arch_id=9 spec");
+            return;
+        }
+    };
+
+    // DSML prompt render (same builder the bespoke loop uses).
+    let prompt_ids = {
+        let tokenizer = match m.tokenizer.as_ref() {
+            Some(t) => t,
+            None => {
+                emit_error_with_id(stdout, id, "tokenizer not loaded");
+                return;
+            }
+        };
+        build_deepseek4_dsml_prompt(
+            tokenizer,
+            system_prompt,
+            tools,
+            messages_history,
+            prompt,
+            think_mode,
+            eos_tok,
+            &mut m.asst_turn_cache,
+        )
+    };
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+
+    // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
+    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("HIPFIRE_MTP_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(2);
+
+    // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
+    // guard, step-back exact). Pure decision; the GPU teardown is applied below.
+    let plan = hipfire_runtime::cache_plan::plan_cache(
+        &prompt_ids,
+        &m.conversation_tokens,
+        &hipfire_runtime::cache_plan::CachePolicy::deepseek4(),
+        &[],
+        false,
+    );
+    let cached_tokens = plan.cached_tokens;
+    let suffix: Vec<u32> = prompt_ids[plan.start_pos..].to_vec();
+
+    // Capacity guard (KV sized for physical_cap; overrun is a serve-killing
+    // panic). Mirrors the bespoke ds4 pre-prefill guard — generate_spec's own
+    // guard checks ctx_capacity (max_position_embeddings), which for ds4 can far
+    // exceed physical_cap, so keep this explicit one.
+    if plan
+        .start_pos
+        .saturating_add(suffix.len())
+        .saturating_add(max_tokens)
+        > m.physical_cap
+    {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
+                plan.start_pos + suffix.len(),
+                max_tokens,
+                m.physical_cap
+            ),
+        );
+        return;
+    }
+
+    // DSA decode-cache miss teardown (the part NOT done by the drafter's
+    // cache-miss `state.reset()` or generate_spec's seq_pos/conversation clear):
+    // zero the position-indexed rings + invalidate the captured decode graph so a
+    // fresh conversation reproduces a freshly-launched daemon's clean state.
+    if !plan.cache_hit {
+        if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+            b.state.zero_decode_caches(gpu);
+        }
+        gpu.invalidate_graph_state();
+    }
+
+    let grammar = build_deepseek4_spec_grammar(m, tools);
+
+    let prompt_tokens_total = prompt_ids.len();
+    let run = match generate_spec(
+        m,
+        gpu,
+        stdout,
+        id,
+        prompt_ids,
+        suffix,
+        plan.start_pos,
+        plan.cache_hit,
+        None, // resume_from — ds4 has no DeltaNet checkpoints
+        max_tokens,
+        EmitSpec::Deepseek4 {
+            think_mode,
+            grammar,
+        },
+    ) {
+        Some(r) => r,
+        // Abort / error early-exit already wrote its own done/error envelope.
+        None => return,
+    };
+
+    // ── ds4 done envelope ────────────────────────────────────────
+    let tok_s = if run.decode_s > 0.0 {
+        run.generated as f64 / run.decode_s
+    } else {
+        0.0
+    };
+    // accept_pct denominator is windows × k (the bespoke loop added `spec_k` per
+    // window to `spec_drafts_offered`, not the actual n_proposed).
+    let accept_pct = if run.spec_cycles > 0 && spec_k > 0 {
+        run.spec_accepted as f64 / (run.spec_cycles * spec_k) as f64 * 100.0
+    } else {
+        0.0
+    };
+    let finish_reason: &'static str = if run.finish.tool_calls > 0 {
+        "tool_calls"
+    } else if run.generated >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
+    let done_envelope = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": run.generated,
+        "tok_s": tok_s,
+        "prompt_tokens": prompt_tokens_total,
+        "prefill_tokens": run.prefill_tokens_len,
+        "cached_tokens": cached_tokens,
+        "prefill_ms": (run.prefill_s * 1000.0) as u128,
+        "total_ms": (run.total_s * 1000.0) as u128,
+        "finish_reason": finish_reason,
+        "spec_k": spec_k,
+        "spec_windows": run.spec_cycles,
+        "spec_accept_pct": accept_pct,
+    });
+    let _ = writeln!(stdout, "{}", done_envelope);
+    let _ = stdout.flush();
 }
 
 fn generate_deepseek4(
