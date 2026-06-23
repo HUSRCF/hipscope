@@ -1465,11 +1465,12 @@ pub fn weight_gemm(
             gpu.ensure_mq_signs()?;
             let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
             rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
-            // The rotated bytes occupy a freshly-pooled pointer that may alias a
-            // previously-freed x buffer; invalidate gemm_hfq4g256's FP16-x cache so
-            // `ensure_fp16_x` re-quantizes from x_rot rather than stale-hitting.
-            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            let r = gpu.gemm_hfq4g256(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            // `_batched_lmhead` routes batch>1 to the WMMA residual kernel on
+            // gfx11/gfx12 (zero-inits Y, so residual `+=` collapses to `=`), which
+            // the scalar `gemm_hfq4g256` path falls 8-10× short of at small batch
+            // (its own dispatch comment). It also invalidates the FP16-x cache for
+            // the freshly-pooled x_rot pointer, so no manual reset is needed here.
+            let r = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
             gpu.free_tensor(x_rot)?;
             r
         }
