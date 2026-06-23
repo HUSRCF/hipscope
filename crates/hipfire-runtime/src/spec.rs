@@ -737,6 +737,25 @@ pub trait SpecEmit {
     fn grammar(&mut self) -> Option<&mut dyn SpecGrammar> {
         None
     }
+
+    /// The full committed-token stream (incl. the first token), for the decode
+    /// loop's post-turn bookkeeping (the qwen35 asst-turn cache store). Default
+    /// empty for emitters whose wrapper does no token-replay cache.
+    fn streamed_tokens(&self) -> &[u32] {
+        &[]
+    }
+
+    /// Whether a committed token tripped the grammar matcher — the decode loop
+    /// forces a full KV/recurrent reset for the next turn when true. Default
+    /// `false` for emitters without post-hoc grammar enforcement.
+    fn grammar_violated(&self) -> bool {
+        false
+    }
+
+    /// Hint the emitter of the decode loop's current `generated` count so an
+    /// attractor-detect log message can report the same number it did inline.
+    /// Default no-op.
+    fn set_generated_hint(&mut self, _generated: usize) {}
 }
 
 // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────

@@ -4086,24 +4086,6 @@ impl<'a> Qwen35Emit<'a> {
         }
     }
 
-    /// The full committed-token stream (incl. the first token), for the daemon's
-    /// post-loop asst-turn cache store. Mirrors the old inline `streamed_tokens`.
-    fn streamed_tokens(&self) -> &[u32] {
-        &self.streamed_tokens
-    }
-
-    /// Whether a committed token tripped the grammar matcher (daemon forces a
-    /// full KV/recurrent reset for the next turn when true).
-    fn grammar_violated(&self) -> bool {
-        self.grammar_violated
-    }
-
-    /// Hint the emitter of the daemon's current `generated` count so the
-    /// attractor-detect log message reports the same number it did inline.
-    fn set_generated_hint(&mut self, generated: usize) {
-        self.generated_hint = generated;
-    }
-
     /// Push a committed token, run it through the byte filter, and return the
     /// `Committed` + (optional) `Token` events — the shared tail of `begin`'s
     /// first-token emit and `observe`'s per-token emit.
@@ -4256,6 +4238,58 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             tool_calls,
         }
     }
+
+    /// The full committed-token stream (incl. the first token), for the daemon's
+    /// post-loop asst-turn cache store.
+    fn streamed_tokens(&self) -> &[u32] {
+        &self.streamed_tokens
+    }
+
+    /// Whether a committed token tripped the grammar matcher (daemon forces a
+    /// full KV/recurrent reset for the next turn when true).
+    fn grammar_violated(&self) -> bool {
+        self.grammar_violated
+    }
+
+    /// Hint the emitter of the daemon's current `generated` count so the
+    /// attractor-detect log message reports the same number it did inline.
+    fn set_generated_hint(&mut self, generated: usize) {
+        self.generated_hint = generated;
+    }
+}
+
+/// Arch-specific data a `generate_spec` wrapper supplies so the core can build
+/// the matching [`SpecEmit`] *after* it has acquired the slot (the emitter needs
+/// `slot.eos_token()`). A closure can't do this — both `Qwen35Emit<'a>` and
+/// `Deepseek4Emit<'a>` borrow the tokenizer, which is derived from `m` *inside*
+/// `generate_spec`, so an externally-supplied closure can't capture it. The enum
+/// carries only owned, arch-side data; `generate_spec` matches it to construct
+/// the `Box<dyn SpecEmit>`. (T4c-2 adds a `Deepseek4` variant.)
+enum EmitSpec {
+    Qwen35 {
+        tool_schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema>,
+        im_end: Option<u32>,
+        stop: Vec<String>,
+        max_think: usize,
+        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    },
+}
+
+/// Summary returned by `generate_spec` to its arch wrapper, which writes the
+/// arch-specific `done` envelope and (qwen35) the asst-turn cache store from it.
+/// `None` is returned on the abort/error early-exits, which already wrote their
+/// own `done`/`error`; the wrapper then does nothing.
+struct SpecRun {
+    generated: usize,
+    spec_cycles: usize,
+    spec_accepted: usize,
+    /// Full committed stream (from the emitter) for the wrapper's cache store.
+    streamed_tokens: Vec<u32>,
+    /// Newly-prefilled token count (the suffix actually fed through the model).
+    prefill_tokens_len: usize,
+    prefill_s: f64,
+    total_s: f64,
+    decode_s: f64,
 }
 
 fn generate_dflash(
@@ -4440,12 +4474,55 @@ fn generate_dflash(
         None => (prompt_tokens.clone(), 0, false, 0),
     };
 
-    // The decode core (slot guard, prefill, accept-window loop, bake, done) is the
-    // arch-generic `generate_spec`. This wrapper owns only the qwen35/llama-specific
-    // prologue: the jinja/Plain prompt render and the LCP cache plan. A future ds4
-    // wrapper (Phase 4 T4c) prepares its DSML render + ds4 cache plan and calls the
-    // same `generate_spec`.
-    generate_spec(
+    // ── Grammar-guided decoding setup (dflash path) ─────────────
+    //
+    // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
+    // (see `Qwen35Emit::observe`), so the schema list is extracted here and
+    // handed to `generate_spec` via `EmitSpec`; the core's in-step grammar seam
+    // (`emit.grammar()`) stays `None` for qwen35. Disable with
+    // `HIPFIRE_QWEN35_GRAMMAR=0`.
+    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+    let tool_schemas_dflash: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
+        tools
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())?
+                            .to_string();
+                        // Required-field list from JSON schema's
+                        // `parameters.required`. Empty if the tool
+                        // declares no required args.
+                        let required: Vec<String> = func
+                            .get("parameters")
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(hipfire_arch_qwen35::grammar::ToolSchema { name, required })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
+    // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
+    // prologue (jinja/Plain render + LCP cache plan), the emitter recipe
+    // (`EmitSpec::Qwen35`), and the epilogue (asst-turn cache store + `done`
+    // envelope). A future ds4 wrapper (Phase 4 T4c-2) builds its DSML render +
+    // ds4 cache plan + `EmitSpec::Deepseek4` and writes its own ds4 `done`.
+    let prefill_tokens_full = prefill_tokens.len();
+    let run = match generate_spec(
         m,
         gpu,
         stdout,
@@ -4454,17 +4531,131 @@ fn generate_dflash(
         prefill_tokens,
         prefill_start,
         cache_hit,
-        cached_tokens_dflash,
         resume_from,
-        im_end_token,
         max_tokens,
-        max_think_tokens,
-        assistant_prefix,
-        pflash_bypass_reason,
-        pflash_alpha,
-        tools,
-        stop,
+        EmitSpec::Qwen35 {
+            tool_schemas: tool_schemas_dflash,
+            im_end: im_end_token,
+            stop: stop.to_vec(),
+            max_think: max_think_tokens,
+            assistant_prefix,
+        },
+    ) {
+        Some(r) => r,
+        // Abort / error early-exit already wrote its own done/error envelope.
+        None => return,
+    };
+    debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
+
+    // ── parse tool_calls + populate asst_turn_cache ──────────────
+    //
+    // The terminal `finish` flush (inside generate_spec) already rendered the
+    // `tool_calls` event. The asst-turn cache fingerprint below is daemon
+    // bookkeeping that needs its own parse + the decoded text, so it recomputes
+    // from the streamed tokens (mirrors the qwen35 non-dflash path so a
+    // dflash-emitted asst turn is reusable via verbatim token replay).
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let decoded_full = tokenizer.decode(&run.streamed_tokens);
+    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+
+    // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
+    // cached body slots cleanly between the assistant_prefix and the
+    // im_end+nl trailer that `build_cached_history` re-adds on replay
+    // (mirrors qwen35 cache writer).
+    let nl_token = tokenizer.encode("\n");
+    let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
+    let mut cached_seq: Vec<u32> = run.streamed_tokens.clone();
+    while let Some(&last) = cached_seq.last() {
+        if nl_set.contains(&last) {
+            cached_seq.pop();
+        } else {
+            break;
+        }
+    }
+    if let Some(&last) = cached_seq.last() {
+        if im_end_token == Some(last) {
+            cached_seq.pop();
+        }
+    }
+    if !cached_seq.is_empty() {
+        let stripped = strip_think_for_fingerprint(&decoded_full);
+        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+        let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+                fp, cached_seq.len(), emit_text.len(), emit_tool_calls.len(),
+                emit_text.chars().take(60).collect::<String>(),
+            );
+        }
+        m.asst_turn_cache.insert(fp, cached_seq);
+    }
+
+    // ── done envelope (qwen35-flavoured) ─────────────────────────
+    let tok_s = if run.total_s > 0.0 {
+        run.generated as f64 / run.total_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if run.decode_s > 0.0 {
+        run.generated as f64 / run.decode_s
+    } else {
+        0.0
+    };
+    // New-token count (not full rendered length) so the prefill rate reflects
+    // actual work on a cache HIT/resume — matches every other path's numerator.
+    let prefill_tok_s = if run.prefill_s > 0.0 {
+        run.prefill_tokens_len as f64 / run.prefill_s
+    } else {
+        0.0
+    };
+    let tau = if run.spec_cycles > 0 {
+        run.spec_accepted as f64 / run.spec_cycles as f64
+    } else {
+        0.0
+    };
+    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
+    // this branch) the `done` object must surface the bypass reason and
+    // alpha alongside the dflash perf metrics.
+    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
+        (Some(r), Some(a)) => format!(
+            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
+            r.replace('"', "'"),
+            a,
+        ),
+        _ => String::new(),
+    };
+    // Length-cap detection — see qwen35 path for rationale.
+    let hit_length_cap = run.generated >= max_tokens;
+    let finish_reason = if hit_length_cap {
+        "length"
+    } else if !emit_tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
+        // through the model), NOT the full rendered length — the CLI computes
+        // `prompt_tokens = cached + prefill`, so reporting the full length here
+        // double-counted the cached prefix on every HIT/resume.
+        id,
+        run.generated,
+        tok_s,
+        run.prefill_tokens_len,
+        run.prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        run.prefill_s * 1000.0,
+        tau,
+        run.spec_cycles,
+        cached_tokens_dflash,
+        finish_reason,
+        pflash_done_field,
     );
+    let _ = stdout.flush();
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -4472,10 +4663,11 @@ fn generate_dflash(
 /// + `SpecEmit` through one prefill → accept-window loop → bake → done. The caller
 /// (`generate_dflash` for qwen35/llama today) prepares the arch-specific inputs:
 /// the already-rendered `prompt_tokens`, the LCP cache decision
-/// (`prefill_tokens`/`prefill_start`/`cache_hit`/`cached_tokens_dflash`/`resume_from`),
-/// and the `im_end_token`. Behaviour is byte-identical to the pre-extraction
-/// `generate_dflash` — T4c generalizes the remaining arch-coupled seams (emit
-/// construction, in-step grammar, cache-miss teardown, bake/done tail) for ds4.
+/// (`prefill_tokens`/`prefill_start`/`cache_hit`/`resume_from`), and the emitter
+/// recipe (`EmitSpec`). It returns a [`SpecRun`] summary from which the wrapper
+/// writes its arch-specific `done` envelope + cache store; `None` on the
+/// abort/error early-exits (which already wrote their own done/error).
+/// T4c-2 adds the deepseek4 wrapper + `EmitSpec::Deepseek4` variant.
 #[allow(clippy::too_many_arguments)]
 fn generate_spec(
     m: &mut LoadedModel,
@@ -4486,17 +4678,10 @@ fn generate_spec(
     prefill_tokens: Vec<u32>,
     prefill_start: usize,
     cache_hit: bool,
-    cached_tokens_dflash: usize,
     resume_from: Option<usize>,
-    im_end_token: Option<u32>,
     max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_bypass_reason: Option<&str>,
-    pflash_alpha: Option<f32>,
-    tools: Option<&[serde_json::Value]>,
-    stop: &[String],
-) {
+    emit_spec: EmitSpec,
+) -> Option<SpecRun> {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Acquire the target via the RAII slot guard — it restores the bundle into
@@ -4514,7 +4699,7 @@ fn generate_spec(
                 id
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
     };
     // Arch-dispatched target borrow via the loader's `spec_target_guard()`
@@ -4531,7 +4716,7 @@ fn generate_spec(
                 id, e
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
     };
     let spec = m.speculator.as_mut().unwrap();
@@ -4551,7 +4736,7 @@ fn generate_spec(
                     id, e
                 );
                 let _ = stdout.flush();
-                return;
+                return None;
             }
         };
         let _ = spec.rewind_to(gpu, slot, ckpt);
@@ -4601,7 +4786,7 @@ fn generate_spec(
             if m.eviction.is_some() { "on" } else { "off" },
         );
         let _ = stdout.flush();
-        return;
+        return None;
     }
     if m.eviction.is_none()
         && prompt_tokens
@@ -4616,7 +4801,7 @@ fn generate_spec(
             id, ctx_capacity,
         );
         let _ = stdout.flush();
-        return;
+        return None;
     }
 
     // Prefill: the speculator seeds the target's hidden state (advancing its KV
@@ -4635,7 +4820,7 @@ fn generate_spec(
                 id, e
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
     };
     let prefill_outcome = spec.prefill(
@@ -4671,7 +4856,7 @@ fn generate_spec(
                 id
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
         Err(e) => {
             let _ = writeln!(
@@ -4680,82 +4865,37 @@ fn generate_spec(
                 id, e
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
     };
 
     let t_prefill = Instant::now();
 
-    // ── Grammar-guided decoding setup (dflash path) ─────────────
-    //
-    // Same matcher used by the qwen35 non-dflash path (see
-    // generate() in this file). Approach for dflash differs because
-    // spec_step writes KV for ALL committed tokens before we can
-    // mask anything — we can't easily reach into the verifier's
-    // logits. Strategy: POST-acceptance validation. After each
-    // spec_step commits a batch, walk committed tokens through the
-    // matcher; if any token violates the grammar (e.g. the Pi
-    // turn-12 attractor `<|im_start|>` after `<tool_call>`), stop
-    // accepting from that point, treat as EOS, and force a full
-    // KV/DN reset before next turn so the polluted slots don't
-    // contaminate subsequent generation.
-    //
-    // The trade-off vs the non-dflash CPU-mask-then-sample path is
-    // throughput: dflash with grammar OFF keeps full spec-decode
-    // speedup; the rare grammar-violation case terminates the turn
-    // early, requiring the client to retry. In production this
-    // should be rare — the matcher only constrains during
-    // tool_call header emission (~30-50 tokens).
-    //
-    // Disable with `HIPFIRE_QWEN35_GRAMMAR=0`.
-    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
-    let tool_schemas_dflash: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
-        tools
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        let func = t.get("function").unwrap_or(t);
-                        let name = func
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())?
-                            .to_string();
-                        // Required-field list from JSON schema's
-                        // `parameters.required`. Empty if the tool
-                        // declares no required args. See V4F's
-                        // identical extraction in spec_decode wiring.
-                        let required: Vec<String> = func
-                            .get("parameters")
-                            .and_then(|p| p.get("required"))
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Some(hipfire_arch_qwen35::grammar::ToolSchema { name, required })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    // Per-token emission (EosFilter byte stream + grammar + think force-close +
+    // stop-sequence match) lives behind the arch-generic `SpecEmit` seam. The
+    // emitter is built HERE (not by the caller) because it needs `slot.eos_token()`
+    // (only available after the slot guard) AND borrows the tokenizer (derived
+    // from `m` inside this fn) — so the wrapper supplies the arch recipe as an
+    // owned `EmitSpec` and this match constructs the matching `Box<dyn SpecEmit>`.
+    // qwen35 enforces tool-call grammar POST-acceptance inside `observe`
+    // (`emit.grammar()` is `None`); a future ds4 emitter wires in-step grammar.
+    let mut emit: Box<dyn SpecEmit> = match emit_spec {
+        EmitSpec::Qwen35 {
+            tool_schemas,
+            im_end,
+            stop,
+            max_think,
+            assistant_prefix,
+        } => Box::new(Qwen35Emit::new(
+            tokenizer,
+            tool_schemas,
+            slot.eos_token(),
+            im_end,
+            stop,
+            max_think,
+            assistant_prefix,
+        )),
     };
-    // Per-token emission (EosFilter byte stream + post-hoc grammar matcher +
-    // think force-close + stop-sequence match) now lives behind the arch-generic
-    // `SpecEmit` seam (`Qwen35Emit`). The decode loop keeps all loop/cache state
-    // and renders the `ClientEvent`s each step returns; `emit` owns the filter,
-    // grammar matcher, think counter, and the streamed-token history.
-    let mut emit = Qwen35Emit::new(
-        tokenizer,
-        tool_schemas_dflash,
-        slot.eos_token(),
-        im_end_token,
-        stop.to_vec(),
-        max_think_tokens,
-        assistant_prefix,
-    );
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -4850,7 +4990,7 @@ fn generate_spec(
                 id, generated
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }
         if position.saturating_add(block_size) >= ctx_capacity {
             break;
@@ -4858,9 +4998,12 @@ fn generate_spec(
 
         // One acceptance window. The speculator owns chain-vs-tree-vs-path_c
         // dispatch internally; the daemon just hands it the borrowed target and
-        // the prior committed tokens (drafter repeat / n-gram context). Grammar
-        // is enforced post-hoc below, so `None` is passed for the mask.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, None) {
+        // the prior committed tokens (drafter repeat / n-gram context). The
+        // in-step grammar mask comes from the emitter: qwen35 returns `None`
+        // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
+        // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
+        // borrow ends when `step` returns, before the per-token `emit.observe`.
+        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar()) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4977,128 +5120,29 @@ fn generate_spec(
     }
 
     // Restore the target bundle into m.state via the slot guard's Drop, before
-    // the end-of-turn cache bookkeeping below (which no longer needs the slot).
+    // the wrapper's end-of-turn cache bookkeeping (which no longer needs the slot).
     drop(guard);
 
-    // ── parse tool_calls + populate asst_turn_cache ──────────────
-    //
-    // The terminal `finish` flush parses tool calls from the decoded text and
-    // returns the `tool_calls` ClientEvent + the finish reason (stop/tool_calls;
-    // the length-cap override stays here). The asst-turn cache fingerprint below
-    // is daemon bookkeeping that needs its own parse + the decoded text, so it
-    // recomputes from the streamed tokens (mirrors the qwen35 non-dflash path so
-    // a dflash-emitted asst turn is reusable via verbatim token replay).
-    let finish = Box::new(emit).finish();
+    // Terminal `finish` flush — parses tool calls from the decoded text and
+    // renders the `tool_calls` ClientEvent. The arch-specific epilogue (the
+    // asst-turn cache store + the `done` envelope) is the WRAPPER's job: it
+    // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
+    // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
+    // returns a `SpecRun` summary instead of writing them itself.
+    let finish = emit.finish();
     render_client_events(stdout, id, &finish.events, 0);
 
-    let decoded_full = tokenizer.decode(&streamed_tokens);
-    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
-
-    // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
-    // cached body slots cleanly between the assistant_prefix and the
-    // im_end+nl trailer that `build_cached_history` re-adds on replay
-    // (mirrors qwen35 cache writer).
-    let nl_token = tokenizer.encode("\n");
-    let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
-    let mut cached_seq: Vec<u32> = streamed_tokens.clone();
-    while let Some(&last) = cached_seq.last() {
-        if nl_set.contains(&last) {
-            cached_seq.pop();
-        } else {
-            break;
-        }
-    }
-    if let Some(&last) = cached_seq.last() {
-        if im_end_token == Some(last) {
-            cached_seq.pop();
-        }
-    }
-    if !cached_seq.is_empty() {
-        let stripped = strip_think_for_fingerprint(&decoded_full);
-        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-        let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                fp, cached_seq.len(), emit_text.len(), emit_tool_calls.len(),
-                emit_text.chars().take(60).collect::<String>(),
-            );
-        }
-        m.asst_turn_cache.insert(fp, cached_seq);
-    }
-
     let t_end = Instant::now();
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    // New-token count (not full rendered length) so the prefill rate reflects
-    // actual work on a cache HIT/resume — matches every other path's numerator.
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens.len() as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let tau = if spec_cycles > 0 {
-        spec_accepted as f64 / spec_cycles as f64
-    } else {
-        0.0
-    };
-    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
-    // this branch) the `done` object must surface the bypass reason and
-    // alpha alongside the dflash perf metrics. Build a small fragment
-    // when both are available; otherwise empty for back-compat.
-    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
-        (Some(r), Some(a)) => format!(
-            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-            r.replace('"', "'"),
-            a,
-        ),
-        _ => String::new(),
-    };
-    // Length-cap detection — see qwen35 path for rationale.
-    let hit_length_cap = generated >= max_tokens;
-    let finish_reason = if hit_length_cap {
-        "length"
-    } else if !emit_tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
-        // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
-        // through the model), NOT the full rendered length — the CLI computes
-        // `prompt_tokens = cached + prefill`, so reporting the full length here
-        // double-counted the cached prefix on every HIT/resume. `prefill_tokens`
-        // (= p.new_tokens) is already the suffix; `cached_tokens_dflash` is the
-        // reused prefix, so cached + new == full rendered length. Matches the AR
-        // path (6754) which reports its `prefill_tokens` (new_tokens.len()).
-        id,
+    Some(SpecRun {
         generated,
-        tok_s,
-        prefill_tokens.len(),
-        prefill_s * 1000.0,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_s * 1000.0,
-        tau,
         spec_cycles,
-        cached_tokens_dflash,
-        finish_reason,
-        pflash_done_field,
-    );
-    let _ = stdout.flush();
+        spec_accepted,
+        streamed_tokens,
+        prefill_tokens_len: prefill_tokens.len(),
+        prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
+        total_s: t_end.duration_since(t0).as_secs_f64(),
+        decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
+    })
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
