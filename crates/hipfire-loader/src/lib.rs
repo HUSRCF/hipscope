@@ -27,7 +27,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::spec::Speculator;
+use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -49,6 +49,44 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+
+    /// Borrow this model's spec-decode target out of `state`, arch-erased as a
+    /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
+    /// spec-decode path — it then only ever sees `&mut dyn SpecTarget`, never an
+    /// arch type. Default (AR-only carriers): `Err` WITHOUT touching `state` —
+    /// only an override may `state.take()`.
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err(format!("{}: spec-decode target unsupported", self.name()))
+    }
+
+    /// Construct this model's per-token spec-decode emitter from the
+    /// model-independent [`SpecEmitCtx`]. The arch's emitter extracts its own
+    /// grammar schema from `ctx.tools` (raw JSON) internally. Default: `Err`
+    /// (arch has no spec emitter).
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err(format!("{}: spec emitter unsupported", self.name()))
+    }
+}
+
+/// The single registry lookup the daemon's spec path routes through: resolve the
+/// carrier that claims `arch_id`, so the daemon never arch-matches for the
+/// spec-decode guard / emitter. `is_dir` is `false` here because every
+/// spec-capable arch is disjoint on the bare HFQ `arch_id` (qwen35 5|6, llama
+/// 0|1, qwen2 7, deepseek4 9) and all carriers ignore the dir flag; if a future
+/// arch needs HFQ-vs-dir disambiguation in the spec path, thread a retained
+/// `is_dir` from load time rather than re-deriving it here.
+pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
+    REGISTRY
+        .iter()
+        .copied()
+        .find(|c| c.claims_arch_id(arch_id, false))
 }
 
 // ─── Registry ─────────────────────────────────────────────────────────

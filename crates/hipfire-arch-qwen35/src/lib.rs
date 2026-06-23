@@ -68,6 +68,10 @@ pub mod speculative;
 /// failure mode this prevents.
 pub mod grammar;
 
+/// Per-token spec-decode emission (`SpecEmit`). Pure CPU; named here because it
+/// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
+pub mod spec_emit;
+
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 

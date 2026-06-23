@@ -42,10 +42,9 @@ use std::path::Path;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hipfire_loader::spec_build::spec_target_guard;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
 use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
+    ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
 };
 
 /// Abort-target request ID. Set asynchronously by the background
@@ -3758,269 +3757,25 @@ fn render_client_events(stdout: &mut std::io::Stdout, id: &str, events: &[Client
     }
 }
 
-/// qwen35/llama per-token emission, extracted verbatim from `generate_dflash`'s
-/// inline loop behind the arch-generic [`SpecEmit`] seam. Owns the `EosFilter`
-/// byte stream, the post-hoc grammar `Matcher`, the `<think>` force-close
-/// counter, the user stop-sequence list, and the decoded-token history; the
-/// decode loop keeps all loop/cache state (position, seed, KV/recurrent resets,
-/// conversation-token bake, eviction) and renders the returned [`ClientEvent`]s.
-///
-/// The borrow of the tokenizer is the same disjoint-field share `generate_dflash`
-/// already takes (`m.tokenizer` vs `&mut m.state`/`&mut m.speculator`).
-struct Qwen35Emit<'a> {
-    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
-    filter: EosFilter,
-    /// Index into the freshly-decoded byte stream past which bytes have not yet
-    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
-    bytes_fed_to_filter: usize,
-    /// Every committed token in order, for byte decoding + the cache-store the
-    /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
-    streamed_tokens: Vec<u32>,
-    grammar_active: bool,
-    grammar_matcher: hipfire_arch_qwen35::grammar::Matcher,
-    /// Set when a committed token violated the grammar; the daemon reads it via
-    /// [`Self::grammar_violated`] to force the post-turn KV/recurrent reset.
-    grammar_violated: bool,
-    eos_token: u32,
-    im_end_token: Option<u32>,
+/// Model-independent emitter recipe a `generate_spec` wrapper supplies so the
+/// arch's carrier can build the matching [`SpecEmit`] *after* `generate_spec` has
+/// acquired the slot (the emitter needs `slot.eos_token()` and the tokenizer,
+/// both derived from `m` *inside* `generate_spec`). Every field is neutral —
+/// tool definitions are the request's raw JSON, which each arch's emitter parses
+/// into its own grammar schema; `generate_spec` builds a `SpecEmitCtx` from this
+/// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
+struct SpecEmitRequest {
+    im_end: Option<u32>,
+    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
+    tools: Option<Vec<serde_json::Value>>,
     stop: Vec<String>,
-    max_think_tokens: usize,
-    open_think_prefix: bool,
-    think_count: usize,
-    prev_in_think: bool,
-    /// `generated` counter at the point of the most recent `observe` — only used
-    /// for the attractor-detect log message (byte-for-byte stderr parity).
-    generated_hint: usize,
-}
-
-impl<'a> Qwen35Emit<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
-        tool_schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema>,
-        eos_token: u32,
-        im_end_token: Option<u32>,
-        stop: Vec<String>,
-        max_think_tokens: usize,
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    ) -> Self {
-        let grammar_active = !tool_schemas.is_empty();
-        Self {
-            tokenizer,
-            filter: EosFilter::new(EosFilterConfig::default()),
-            bytes_fed_to_filter: 0,
-            streamed_tokens: Vec::new(),
-            grammar_active,
-            grammar_matcher: hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas),
-            grammar_violated: false,
-            eos_token,
-            im_end_token,
-            stop,
-            max_think_tokens,
-            open_think_prefix: matches!(
-                assistant_prefix,
-                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-            ),
-            think_count: 0,
-            prev_in_think: false,
-            generated_hint: 0,
-        }
-    }
-
-    /// Push a committed token, run it through the byte filter, and return the
-    /// `Committed` + (optional) `Token` events — the shared tail of `begin`'s
-    /// first-token emit and `observe`'s per-token emit.
-    fn push_and_filter(&mut self, token: u32) -> Vec<ClientEvent> {
-        let mut events = Vec::new();
-        self.streamed_tokens.push(token);
-        events.push(ClientEvent::Committed {
-            id: token,
-            idx: self.streamed_tokens.len() - 1,
-        });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = self.filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            events.push(ClientEvent::Token(text.to_string()));
-        }
-        events
-    }
-}
-
-impl<'a> SpecEmit for Qwen35Emit<'a> {
-    fn begin(&mut self, first_token: u32) -> EmitOutcome {
-        // First-token emit (committed + filtered token), then seed the grammar
-        // matcher with the first token's text. Mirrors generate_dflash 4452-4489.
-        let events = self.push_and_filter(first_token);
-        if self.grammar_active {
-            let text = self.tokenizer.decode(&[first_token]);
-            self.grammar_matcher.advance(&text);
-        }
-        // First-token EOS guard: if the prefill's first token is itself a
-        // terminator we must NOT enter the spec loop (the inline `while
-        // !first_token_is_eos`). Surface as a stop so the caller skips the loop.
-        let first_token_is_eos = first_token == self.eos_token
-            || self.im_end_token == Some(first_token)
-            || self.tokenizer.is_terminator(first_token);
-        EmitOutcome {
-            events,
-            stop: if first_token_is_eos {
-                Some(StopReason::Eos)
-            } else {
-                None
-            },
-        }
-    }
-
-    fn observe(&mut self, token: u32) -> EmitOutcome {
-        // Grammar pre-check (POST-acceptance, before emit). A rejected token is
-        // NOT emitted; treat as a grammar violation → stop. Mirrors 4565-4584.
-        if self.grammar_active {
-            let text = self.tokenizer.decode(&[token]);
-            if !self.grammar_matcher.is_token_allowed(&text) {
-                eprintln!(
-                    "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS | {}",
-                    token, text, self.grammar_matcher.state(), self.grammar_matcher.debug_close_reject(),
-                );
-                self.grammar_violated = true;
-                return EmitOutcome {
-                    events: Vec::new(),
-                    stop: Some(StopReason::GrammarViolation),
-                };
-            }
-            let was_detected = self.grammar_matcher.attractor_detected();
-            self.grammar_matcher.advance(&text);
-            if !was_detected && self.grammar_matcher.attractor_detected() {
-                eprintln!(
-                    "[grammar-dflash-ngram] attractor detected in tool_call args at gen={} — forcing close",
-                    self.generated_hint,
-                );
-            }
-        }
-
-        // Emit the token (committed + filtered).
-        let mut events = self.push_and_filter(token);
-
-        // EOS check (token id). Mirrors 4608-4612.
-        if token == self.eos_token
-            || self.im_end_token == Some(token)
-            || self.tokenizer.is_terminator(token)
-        {
-            return EmitOutcome {
-                events,
-                stop: Some(StopReason::Eos),
-            };
-        }
-
-        // User stop-sequence match against the decoded suffix. Mirrors 4622-4628.
-        if !self.stop.is_empty() {
-            let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
-            if self
-                .stop
-                .iter()
-                .any(|s| decoded_suffix.ends_with(s.as_str()))
-            {
-                return EmitOutcome {
-                    events,
-                    stop: Some(StopReason::StopSequence),
-                };
-            }
-        }
-
-        // max_think_tokens enforcement. Mirrors 4632-4664.
-        if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(raw_str, self.open_think_prefix);
-            if in_think && !self.prev_in_think {
-                self.think_count = 0;
-            }
-            if in_think {
-                self.think_count += 1;
-            }
-            self.prev_in_think = in_think;
-
-            if in_think && self.think_count >= self.max_think_tokens {
-                // Force-close: stream `</think>\n` and stop. The inline path
-                // wrote this literal token frame directly (not through the
-                // filter, not into streamed_tokens) — preserve that exactly.
-                events.push(ClientEvent::Token("</think>\n".to_string()));
-                return EmitOutcome {
-                    events,
-                    stop: Some(StopReason::ThinkCap),
-                };
-            }
-        }
-
-        EmitOutcome { events, stop: None }
-    }
-
-    fn finish(self: Box<Self>) -> FinishSummary {
-        // Tool-call extraction + finish-flush. The conversation-token bake, KV
-        // resets, eviction, cache-store, and `done` envelope stay in
-        // generate_dflash. Mirrors 4733-4752 + the finish_reason branch 4827-4833
-        // (length cap is the caller's call; this returns stop/tool_calls).
-        let decoded_full = self.tokenizer.decode(&self.streamed_tokens);
-        let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
-        let mut events = Vec::new();
-        let tool_calls = emit_tool_calls.len();
-        let finish_reason = if !emit_tool_calls.is_empty() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        if !emit_tool_calls.is_empty() {
-            events.push(ClientEvent::ToolCalls(emit_tool_calls));
-        }
-        FinishSummary {
-            events,
-            finish_reason,
-            tool_calls,
-        }
-    }
-
-    /// The full committed-token stream (incl. the first token), for the daemon's
-    /// post-loop asst-turn cache store.
-    fn streamed_tokens(&self) -> &[u32] {
-        &self.streamed_tokens
-    }
-
-    /// Whether a committed token tripped the grammar matcher (daemon forces a
-    /// full KV/recurrent reset for the next turn when true).
-    fn grammar_violated(&self) -> bool {
-        self.grammar_violated
-    }
-
-    /// Hint the emitter of the daemon's current `generated` count so the
-    /// attractor-detect log message reports the same number it did inline.
-    fn set_generated_hint(&mut self, generated: usize) {
-        self.generated_hint = generated;
-    }
-}
-
-/// Arch-specific data a `generate_spec` wrapper supplies so the core can build
-/// the matching [`SpecEmit`] *after* it has acquired the slot (the emitter needs
-/// `slot.eos_token()`). A closure can't do this — both `Qwen35Emit<'a>` and
-/// `Deepseek4Emit<'a>` borrow the tokenizer, which is derived from `m` *inside*
-/// `generate_spec`, so an externally-supplied closure can't capture it. The enum
-/// carries only owned, arch-side data; `generate_spec` matches it to construct
-/// the `Box<dyn SpecEmit>`.
-enum EmitSpec {
-    Qwen35 {
-        tool_schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema>,
-        im_end: Option<u32>,
-        stop: Vec<String>,
-        max_think: usize,
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    },
-    /// deepseek4 DSML emitter. `grammar` is the in-step tool-call matcher
-    /// (`Some` when the request carries tools), threaded into the fused spec step
-    /// via `Deepseek4Emit::grammar()`.
-    Deepseek4 {
-        think_mode: ThinkMode,
-        grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
-    },
+    max_think: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
+    think_mode: ThinkMode,
+    /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
+    /// wrapper builds/caches the Arc so this struct carries no `LoadedModel` ref.
+    decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
 }
 
 /// Summary returned by `generate_spec` to its arch wrapper, which writes the
@@ -4230,42 +3985,15 @@ fn generate_dflash(
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
     // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
-    // (see `Qwen35Emit::observe`), so the schema list is extracted here and
-    // handed to `generate_spec` via `EmitSpec`; the core's in-step grammar seam
-    // (`emit.grammar()`) stays `None` for qwen35. Disable with
-    // `HIPFIRE_QWEN35_GRAMMAR=0`.
+    // (`Qwen35Emit::observe`); the emitter now extracts its own `ToolSchema`
+    // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
+    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
+    // (⇒ empty schema ⇒ grammar inactive).
     let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
-    let tool_schemas_dflash: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
-        tools
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        let func = t.get("function").unwrap_or(t);
-                        let name = func
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())?
-                            .to_string();
-                        // Required-field list from JSON schema's
-                        // `parameters.required`. Empty if the tool
-                        // declares no required args.
-                        let required: Vec<String> = func
-                            .get("parameters")
-                            .and_then(|p| p.get("required"))
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Some(hipfire_arch_qwen35::grammar::ToolSchema { name, required })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
+        tools.map(|t| t.to_vec())
     } else {
-        Vec::new()
+        None
     };
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
@@ -4286,12 +4014,14 @@ fn generate_dflash(
         cache_hit,
         resume_from,
         max_tokens,
-        EmitSpec::Qwen35 {
-            tool_schemas: tool_schemas_dflash,
+        SpecEmitRequest {
             im_end: im_end_token,
+            tools: emit_tools,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix,
+            think_mode: ThinkMode::NonThink,
+            decoded_vocab: None,
         },
     ) {
         Some(r) => r,
@@ -4433,7 +4163,7 @@ fn generate_spec(
     cache_hit: bool,
     resume_from: Option<usize>,
     max_tokens: usize,
-    emit_spec: EmitSpec,
+    emit_req: SpecEmitRequest,
 ) -> Option<SpecRun> {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
@@ -4455,12 +4185,29 @@ fn generate_spec(
             return None;
         }
     };
-    // Arch-dispatched target borrow via the loader's `spec_target_guard()`
-    // (`m.arch_id` is Copy + `m.model_path` is a disjoint field → no borrow
-    // conflict with the `&mut m.state` the guard takes). qwen35 moves the bundle
-    // out + reopens its HfqFile (restored on Drop); llama borrows its bundle in
-    // place. The boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
-    let mut guard = match spec_target_guard(&mut m.state, &m.model_path, m.arch_id) {
+    // Resolve the arch's carrier once — the single dispatch the spec path routes
+    // through for BOTH the target borrow and the emitter (the daemon never
+    // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
+    // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
+    let arch_id = m.arch_id;
+    let carrier = match hipfire_loader::carrier_for(arch_id) {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"no carrier for arch_id {}"}}"#,
+                id, arch_id
+            );
+            let _ = stdout.flush();
+            return None;
+        }
+    };
+    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
+    // (`m.model_path` is a disjoint field → no borrow conflict with the
+    // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
+    // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
+    // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
+    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
         Ok(g) => g,
         Err(e) => {
             let _ = writeln!(
@@ -4628,32 +4375,31 @@ fn generate_spec(
     // stop-sequence match) lives behind the arch-generic `SpecEmit` seam. The
     // emitter is built HERE (not by the caller) because it needs `slot.eos_token()`
     // (only available after the slot guard) AND borrows the tokenizer (derived
-    // from `m` inside this fn) — so the wrapper supplies the arch recipe as an
-    // owned `EmitSpec` and this match constructs the matching `Box<dyn SpecEmit>`.
-    // qwen35 enforces tool-call grammar POST-acceptance inside `observe`
-    // (`emit.grammar()` is `None`); a future ds4 emitter wires in-step grammar.
-    let mut emit: Box<dyn SpecEmit> = match emit_spec {
-        EmitSpec::Qwen35 {
-            tool_schemas,
-            im_end,
-            stop,
-            max_think,
-            assistant_prefix,
-        } => Box::new(Qwen35Emit::new(
-            tokenizer,
-            tool_schemas,
-            slot.eos_token(),
-            im_end,
-            stop,
-            max_think,
-            assistant_prefix,
-        )),
-        EmitSpec::Deepseek4 {
-            think_mode,
-            grammar,
-        } => Box::new(
-            Deepseek4Emit::new(tokenizer, think_mode, slot.eos_token()).with_grammar(grammar),
-        ),
+    // from `m`). The wrapper supplies the model-independent recipe as an owned
+    // `SpecEmitRequest`; the arch's carrier turns it into the concrete
+    // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
+    let emit_ctx = hipfire_runtime::spec::SpecEmitCtx {
+        tokenizer,
+        eos: slot.eos_token(),
+        im_end: emit_req.im_end,
+        tools: emit_req.tools.as_deref(),
+        stop: emit_req.stop,
+        max_think: emit_req.max_think,
+        assistant_prefix: emit_req.assistant_prefix,
+        think_mode: emit_req.think_mode,
+        decoded_vocab: emit_req.decoded_vocab,
+    };
+    let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"{}"}}"#,
+                id, e
+            );
+            let _ = stdout.flush();
+            return None;
+        }
     };
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
@@ -8926,193 +8672,6 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     prompt_ids
 }
 
-/// deepseek4 spec-decode per-token emission, extracted verbatim from
-/// `generate_deepseek4`'s `if spec_mode` loop behind the arch-generic
-/// [`SpecEmit`] seam. Owns the DSML [`StreamParser`](deepseek4::dsml::StreamParser)
-/// (bootstrapped `new_in_think()` for High/Max think modes, `new()` for NonThink),
-/// the tool-call accumulation buffer (the old `absorb_event` closure), and the
-/// tokenizer reference for `decode`. The decode loop keeps all loop/cache state
-/// (position/seed advance, `m.conversation_tokens` bake, `generated_count`,
-/// `max_tokens` guard) and renders the returned [`ClientEvent`]s.
-///
-/// Differs from `Qwen35Emit` in three behavior-preserving ways that mirror the
-/// inline ds4 spec branch exactly:
-/// - EOS is NOT emitted: a first token / accepted token equal to `eos_token`
-///   produces an empty `EmitOutcome` with `StopReason::Eos` (no parser feed, no
-///   committed event) — the inline loop dropped it.
-/// - Event ORDER is parser-events-first, then `Committed` (the inline loop ran
-///   `parser.feed` → `emit_stream_event` before `emit_committed_event`); this is
-///   the opposite of `Qwen35Emit`'s committed-first order, and `render_client_events`
-///   preserves whatever order the events Vec carries.
-/// - No stop-sequence / no max-think force-close (the ds4 spec branch had neither;
-///   think behavior is entirely in the parser's `new_in_think()` bootstrap).
-///
-/// The in-step grammar (`speculative_decode_step_with_pbs_grammar`'s matcher /
-/// mask, threaded INTO the spec step) is NOT this emitter's concern — it stays in
-/// the decode loop and `grammar()` returns `None` (Phase 4 wiring).
-struct Deepseek4Emit<'a> {
-    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
-    parser: deepseek4::dsml::StreamParser,
-    /// Parsed tool calls accumulated across the turn (the old `emit_tool_calls_buf`).
-    tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-    eos_token: u32,
-    /// Count of tokens actually emitted (committed) so far, kept in lockstep with
-    /// the daemon's `generated_count` so each `Committed { idx }` equals the
-    /// inline `emit_committed_event`'s `pos` argument.
-    emitted_count: usize,
-    /// In-step tool-call grammar, threaded into the fused spec step via
-    /// `grammar()`. `None` ⇒ no tools (or the bespoke loop, which owns its own
-    /// matcher and never calls `grammar()`). The matcher advances inside the spec
-    /// step ONLY — `observe` must NOT touch it (single-advance invariant).
-    grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
-}
-
-impl<'a> Deepseek4Emit<'a> {
-    fn new(
-        tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
-        think_mode: ThinkMode,
-        eos_token: u32,
-    ) -> Self {
-        let parser = match think_mode {
-            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
-            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
-        };
-        Self {
-            tokenizer,
-            parser,
-            tool_calls_buf: Vec::new(),
-            eos_token,
-            emitted_count: 0,
-            grammar: None,
-        }
-    }
-
-    /// Attach an in-step tool-call grammar (consumed by `generate_spec` via
-    /// `grammar()` and threaded into the fused spec step). Builder form so the
-    /// bespoke loop's `new(...)` stays grammar-free.
-    fn with_grammar(
-        mut self,
-        grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
-    ) -> Self {
-        self.grammar = grammar;
-        self
-    }
-
-    /// Feed one committed token's decoded text through the DSML parser, mapping
-    /// each `StreamEvent` to its `ClientEvent` (and absorbing tool calls), then
-    /// append the `Committed` event LAST — matching the inline `parser.feed` →
-    /// `emit_stream_event` → `emit_committed_event` ordering. Shared by `begin`'s
-    /// first-token emit and `observe`'s per-token emit.
-    fn feed_and_emit(&mut self, token: u32) -> Vec<ClientEvent> {
-        use deepseek4::dsml::StreamEvent;
-        let mut events = Vec::new();
-        let frag = self.tokenizer.decode(&[token]);
-        for ev in self.parser.feed(&frag) {
-            match ev {
-                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
-                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
-                StreamEvent::ToolCalls(calls) => {
-                    let converted: Vec<hipfire_runtime::prompt_frame::ToolCall> = calls
-                        .iter()
-                        .map(|c| hipfire_runtime::prompt_frame::ToolCall {
-                            name: c.name.clone(),
-                            arguments: c.arguments.clone(),
-                        })
-                        .collect();
-                    self.tool_calls_buf.extend(converted.iter().cloned());
-                    events.push(ClientEvent::ToolCalls(converted));
-                }
-            }
-        }
-        events.push(ClientEvent::Committed {
-            id: token,
-            idx: self.emitted_count,
-        });
-        self.emitted_count += 1;
-        events
-    }
-}
-
-impl<'a> SpecEmit for Deepseek4Emit<'a> {
-    /// In-step grammar: hand the fused spec step the erased ds4 grammar handle so
-    /// it masks draft+verify logits and advances the matcher. `None` ⇒ no tools.
-    /// Because the matcher advances HERE (in-step), `observe` must NOT re-advance
-    /// it — and ds4's `observe` only feeds the DSML parser, so the invariant holds.
-    fn grammar(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecGrammar> {
-        self.grammar
-            .as_mut()
-            .map(|g| g as &mut dyn hipfire_runtime::spec::SpecGrammar)
-    }
-
-    fn begin(&mut self, first_token: u32) -> EmitOutcome {
-        // First generated token (the prefill argmax). Mirrors generate_deepseek4
-        // 9537-9553: EOS-first yields an empty turn — the inline `if
-        // spec_last_token != eos_tok` guard dropped it (no feed, no committed).
-        if first_token == self.eos_token {
-            return EmitOutcome {
-                events: Vec::new(),
-                stop: Some(StopReason::Eos),
-            };
-        }
-        EmitOutcome {
-            events: self.feed_and_emit(first_token),
-            stop: None,
-        }
-    }
-
-    fn observe(&mut self, token: u32) -> EmitOutcome {
-        // Per-accepted-token. Mirrors generate_deepseek4 9597-9622: an accepted
-        // token equal to `eos_tok` breaks the loop BEFORE emit — no feed, no
-        // committed event. The `generated_count >= max_tokens` guard stays in the
-        // decode loop (loop state, not emit policy).
-        if token == self.eos_token {
-            return EmitOutcome {
-                events: Vec::new(),
-                stop: Some(StopReason::Eos),
-            };
-        }
-        EmitOutcome {
-            events: self.feed_and_emit(token),
-            stop: None,
-        }
-    }
-
-    fn finish(mut self: Box<Self>) -> FinishSummary {
-        // Post-loop flush. Mirrors generate_deepseek4 9632-9638: `parser.finish()`
-        // → absorb + emit, then `tool_calls_parsed_count = emit_tool_calls_buf.len()`.
-        // The ds4 `done` envelope drives `finish_reason` off `tool_calls_parsed_count`
-        // (length-cap override is the caller's call).
-        use deepseek4::dsml::StreamEvent;
-        let mut events = Vec::new();
-        // `finish` consumes the parser by value; move it out of `self`.
-        let parser = std::mem::replace(&mut self.parser, deepseek4::dsml::StreamParser::new());
-        for ev in parser.finish() {
-            match ev {
-                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
-                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
-                StreamEvent::ToolCalls(calls) => {
-                    let converted: Vec<hipfire_runtime::prompt_frame::ToolCall> = calls
-                        .iter()
-                        .map(|c| hipfire_runtime::prompt_frame::ToolCall {
-                            name: c.name.clone(),
-                            arguments: c.arguments.clone(),
-                        })
-                        .collect();
-                    self.tool_calls_buf.extend(converted.iter().cloned());
-                    events.push(ClientEvent::ToolCalls(converted));
-                }
-            }
-        }
-        let tool_calls = self.tool_calls_buf.len();
-        let finish_reason = if tool_calls > 0 { "tool_calls" } else { "stop" };
-        FinishSummary {
-            events,
-            finish_reason,
-            tool_calls,
-        }
-    }
-}
-
 /// Resolve whether deepseek4 spec-decode is requested for this model, mirroring
 /// the env/config chain inside `generate_deepseek4` (daemon.rs spec_requested).
 /// The dispatch uses this (plus `temp <= 1e-6` and `m.speculator.is_some()`) to
@@ -9127,67 +8686,6 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
             Some("off") => false,
             _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
         })
-}
-
-/// Build the deepseek4 in-step tool-call grammar from the request's `tools`,
-/// using (and lazily populating) the model's cached decoded-vocab. Returns `None`
-/// when no usable tool schema is present. Mirrors the bespoke spec loop's grammar
-/// setup (daemon.rs generate_deepseek4 spec branch) but packages the matcher +
-/// vocab + mask into the `Deepseek4SpecGrammar` the unified step consumes.
-fn build_deepseek4_spec_grammar(
-    m: &mut LoadedModel,
-    tools: Option<&[serde_json::Value]>,
-) -> Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar> {
-    let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
-        .map(|arr| {
-            arr.iter()
-                .map(|t| {
-                    let func = t.get("function").unwrap_or(t);
-                    let name = func
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let parameters = func.get("parameters");
-                    let params: Vec<String> = parameters
-                        .and_then(|p| p.get("properties"))
-                        .and_then(|p| p.as_object())
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default();
-                    let required: Vec<String> = parameters
-                        .and_then(|p| p.get("required"))
-                        .and_then(|r| r.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    deepseek4::grammar::ToolSchema {
-                        name,
-                        params,
-                        required,
-                    }
-                })
-                .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    if tool_schemas.is_empty() {
-        return None;
-    }
-    // Lazily build (and cache) the decoded-vocab Arc, mirroring the bespoke loop.
-    if m.decoded_vocab.is_none() {
-        let tok = m.tokenizer.as_ref().expect("tokenizer present");
-        let n = tok.vocab_size();
-        let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
-        m.decoded_vocab = Some(std::sync::Arc::new(v));
-    }
-    let decoded_vocab = m.decoded_vocab.clone().expect("just built");
-    Some(deepseek4::mtp_speculator::Deepseek4SpecGrammar::new(
-        tool_schemas,
-        decoded_vocab,
-    ))
 }
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
@@ -9302,7 +8800,24 @@ fn generate_deepseek4_spec(
         gpu.invalidate_graph_state();
     }
 
-    let grammar = build_deepseek4_spec_grammar(m, tools);
+    // The ds4 emitter builds its in-step tool-call grammar from the raw tool
+    // JSON inside `make_spec_emitter`, but that grammar masks per-token over the
+    // decoded vocab — which the neutral `SpecEmitCtx` can't lazily derive (it has
+    // no `&mut m`). Build/cache the vocab Arc here when tools are present and
+    // hand it down; mirrors the lazy cache the old `build_deepseek4_spec_grammar`
+    // did internally.
+    let decoded_vocab: Option<std::sync::Arc<Vec<String>>> =
+        if tools.map_or(false, |t| !t.is_empty()) {
+            if m.decoded_vocab.is_none() {
+                let tok = m.tokenizer.as_ref().expect("tokenizer present");
+                let n = tok.vocab_size();
+                let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
 
     let prompt_tokens_total = prompt_ids.len();
     let run = match generate_spec(
@@ -9316,9 +8831,14 @@ fn generate_deepseek4_spec(
         plan.cache_hit,
         None, // resume_from — ds4 has no DeltaNet checkpoints
         max_tokens,
-        EmitSpec::Deepseek4 {
+        SpecEmitRequest {
+            im_end: None,
+            tools: tools.map(|t| t.to_vec()),
+            stop: Vec::new(),
+            max_think: 0,
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
-            grammar,
+            decoded_vocab,
         },
     ) {
         Some(r) => r,

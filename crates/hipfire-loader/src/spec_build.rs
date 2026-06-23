@@ -17,7 +17,7 @@ use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_runtime::spec::{InPlaceGuard, SpecTarget, SpecTargetGuard, Speculator};
+use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;
 
@@ -127,40 +127,11 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
     }
 }
 
-// The pure-attention arms (LLaMA / plain Qwen3, Qwen2, DeepSeek V4) borrow their
-// bundle in place via the generic `hipfire_runtime::spec::InPlaceGuard<B>` — one
-// impl for all three, since they differed only by bundle type. Only qwen35 needs
-// the bespoke move-out + lazy-`HfqFile`-reopen `Qwen35SlotGuard` above.
-
-/// Arch-dispatched borrow of the spec-decode target as a boxed [`SpecTargetGuard`].
-///
-/// qwen35 (5/6) moves its bundle out of `m.state` into the RAII [`Qwen35SlotGuard`]
-/// (reopens the `HfqFile` lazily, restores the bundle on Drop); the dense LLaMA
-/// family (0/1) borrows its `LlamaBundle` in place. The returned box borrows
-/// `state` for `'m`, so the caller can still borrow `m`'s disjoint fields
-/// (`m.speculator`, `m.seq_pos`, …) alongside it. This is the single dispatch the
-/// daemon's `generate_dflash` routes through — it then only ever sees
-/// `&mut dyn SpecTarget`, never an arch type.
-pub fn spec_target_guard<'m>(
-    state: &'m mut Option<ModelState>,
-    model_path: &str,
-    arch_id: u32,
-) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-    if arch_id == 5 || arch_id == 6 {
-        Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
-    } else {
-        match state.as_mut() {
-            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
-            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
-            Some(ModelState::Deepseek4(bundle)) if arch_id == 9 => {
-                Ok(Box::new(InPlaceGuard { bundle }))
-            }
-            _ => Err(format!(
-                "spec path: unsupported arch state for arch_id {arch_id}"
-            )),
-        }
-    }
-}
+// The spec-decode target borrow is now dispatched per-arch by each carrier's
+// `Carrier::spec_target_guard` (qwen35 → the move-out + lazy-`HfqFile`-reopen
+// [`Qwen35SlotGuard`] above; the pure-attention arms → the generic
+// `hipfire_runtime::spec::InPlaceGuard<B>`). The daemon resolves the carrier via
+// `hipfire_loader::carrier_for(arch_id)` and never arch-matches itself.
 
 /// Pick the speculative-decode drafter for a freshly-loaded model. This is the
 /// single load-time registry the daemon's `generate_dflash` routes through —

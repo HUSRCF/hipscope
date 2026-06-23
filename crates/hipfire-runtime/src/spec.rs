@@ -724,6 +724,43 @@ pub struct FinishSummary {
     pub tool_calls: usize,
 }
 
+/// Model-independent context for constructing a turn's [`SpecEmit`].
+///
+/// Built by `generate_spec` *after* it has acquired the spec target (so `eos`
+/// is `slot.eos_token()`), then handed to the arch's carrier, whose
+/// `make_spec_emitter` constructs the concrete `Box<dyn SpecEmit>`. Every field
+/// is a model-independent request/render output — tool definitions are passed
+/// as **raw JSON** (`tools`) because the two arch emitters extract different
+/// schema shapes from them, and the only lossless rep both accept is the
+/// original JSON. The arch carrier owns the JSON→its-own-`ToolSchema`
+/// conversion, so no arch type appears here.
+pub struct SpecEmitCtx<'a> {
+    /// Tokenizer for decoding committed tokens to text (byte filter, grammar,
+    /// think-scan, tool-call extraction).
+    pub tokenizer: &'a crate::tokenizer::Tokenizer,
+    /// The target's EOS token (`slot.eos_token()`), known only after slot
+    /// acquisition — which is why the emitter is built here, not by the caller.
+    pub eos: u32,
+    /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
+    pub im_end: Option<u32>,
+    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
+    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
+    /// tool-call grammar.
+    pub tools: Option<&'a [serde_json::Value]>,
+    /// User stop sequences matched against the decoded suffix.
+    pub stop: Vec<String>,
+    /// `max_think_tokens` budget (0 ⇒ no think force-close).
+    pub max_think: usize,
+    /// Whether the prompt opened a `<think>` span via the assistant prefix.
+    pub assistant_prefix: crate::prompt_frame::AssistantPrefix,
+    /// Requested reasoning-effort level (arch interprets the frame mapping).
+    pub think_mode: crate::prompt_frame::ThinkMode,
+    /// Pre-decoded vocab for arches whose grammar masks per-token (DeepSeek V4).
+    /// The daemon builds/caches this Arc before the call so the neutral ctx
+    /// never has to mutate `LoadedModel`.
+    pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+}
+
 /// Per-token emission policy for a spec-decode turn. The decode loop calls
 /// [`begin`](Self::begin) once for the prefill's first token, then
 /// [`observe`](Self::observe) for each subsequently-committed token, rendering

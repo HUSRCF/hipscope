@@ -4,6 +4,7 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
+use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
@@ -12,6 +13,15 @@ use crate::{
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
+use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+
+// The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
+// ChatML-family spec arm — qwen35 DFlash AND the llama/qwen2 n-gram paths all
+// drive it (they already share qwen35's tool-call grammar). It physically lives
+// in the qwen35 crate; the llama/qwen2 carriers wiring it here is composition-
+// root glue, not an arch→arch dependency (those arch crates never name it). A
+// future cleanup could hoist the emitter + grammar into the runtime.
+use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
 
 // ─── Source-only metadata (tokenizer / chat_template / arch_id) ───────
 //
@@ -95,6 +105,22 @@ pub struct Qwen2Carrier;
 impl Carrier for Qwen2Carrier {
     fn name(&self) -> &'static str {
         "qwen2"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("qwen2: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // HFQ id 7 and qwen2 safetensors dirs (derive_arch_id → 7). Both route
@@ -276,6 +302,21 @@ impl Carrier for Qwen35Carrier {
     fn name(&self) -> &'static str {
         "qwen35"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
+        // (lazy HfqFile reopen, bundle restored on Drop — the #462 guard).
+        Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
@@ -452,6 +493,22 @@ impl Carrier for LlamaCarrier {
     fn name(&self) -> &'static str {
         "llama"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("llama: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2 (both namespaces).
         // Explicit allowlist (was an open `< 5` range that would silently
@@ -603,6 +660,24 @@ pub struct Deepseek4Carrier;
 impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
         "deepseek4"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("deepseek4: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(hipfire_arch_deepseek4::spec_emit::Deepseek4Emit::from_ctx(
+            ctx,
+        ))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9

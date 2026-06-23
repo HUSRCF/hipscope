@@ -59,6 +59,7 @@ pub mod grammar;
 pub mod mtp_speculator;
 pub mod sampling;
 pub mod spec_decode;
+pub mod spec_emit;
 pub mod spec_impl;
 
 pub use arch::DeepseekV4;
