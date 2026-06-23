@@ -277,10 +277,15 @@ pub fn build_speculator(
     // dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3), and Qwen2 (7 =
     // VibeThinker etc., its own `Qwen2State` KV).
     if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6 | 7) {
+        // Default K=12: the batched (weight-BW-bound) verify makes wider draft
+        // windows nearly free, and an n-gram K-sweep (vibethinker-3b, 2026-06-23)
+        // showed acceptance saturates at K≈12 (tau ~0.38) — K=12 peaks decode
+        // tok/s, K=16 ties, K≥24 regresses (wasted verify on drafts past the
+        // acceptance plateau). min_count stays 2 (a measured no-op knob).
         let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8usize)
+            .unwrap_or(12usize)
             .max(2);
         let min_count = std::env::var("HIPFIRE_NGRAM_MIN_COUNT")
             .ok()
