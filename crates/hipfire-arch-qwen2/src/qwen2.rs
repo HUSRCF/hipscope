@@ -1619,6 +1619,268 @@ pub fn forward_prefill_batch_embeds(
     Ok(())
 }
 
+/// Block-parallel spec-decode verify: run a whole `block` of candidate tokens
+/// through one batched forward at absolute positions `[position .. position+B)`
+/// and return the per-slot greedy argmax (the verifier's pick AFTER each block
+/// token). Slot `i` is `argmax(logits)` for query position `position+i`, which
+/// is exactly what the sequential `forward_step(block[i])` loop returns — but in
+/// one batched layer loop instead of B sequential decodes.
+///
+/// Correctness hinges on the attention seeing the FULL history: unlike
+/// `attention_causal_batched` (intra-block only, blind to prompt/accepted KV),
+/// this writes the block's post-RoPE K/V into the F32 cache at absolute
+/// positions first, then runs `attention_decode_batched_history`, so query row
+/// `i` attends to absolute positions `[0 .. position+i]` (prompt + accepted
+/// prefix + causal-within-block). That makes the result byte-equivalent to the
+/// sequential verify's per-step flash-decode attention.
+///
+/// Leaves `state.next_pos = position + B` and `state.k_cache`/`v_cache`
+/// populated for `[position .. position+B)` (the spec loop's `commit_prefix` is
+/// a no-op for pure attention; the rejected tail is overwritten by the next
+/// verify, exactly as in the sequential path).
+pub fn forward_verify_block_batched(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    block: &[u32],
+    position: usize,
+) -> HipResult<Vec<u32>> {
+    let dim = cfg.hidden_size;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv_heads = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let hidden_dim = cfg.intermediate_size;
+    let batch = block.len();
+
+    if position + batch > state.max_seq {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: verify block={batch} + position={position} > max_seq={}",
+                state.max_seq
+            ),
+        ));
+    }
+
+    fn proj(
+        gpu: &mut Gpu,
+        w: &WeightTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        batch: usize,
+    ) -> HipResult<()> {
+        match w.gpu_dtype {
+            DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch),
+            _ => weight_gemm(gpu, w, x, y, batch),
+        }
+    }
+
+    // Build the [batch × dim] F32 embedding matrix. Q8/HFQ4G256 tables get a
+    // single batched GPU lookup (no host round-trip); other formats fall back
+    // to the per-token host loop (block is small, so this is cheap and rare).
+    let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    match weights.embd_format {
+        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 => {
+            let tok_ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
+            let tok_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tok_ids.as_ptr() as *const u8, batch * 4) };
+            let tok_buf = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 payload
+            gpu.hip.memcpy_htod(&tok_buf.buf, tok_bytes)?;
+            match weights.embd_format {
+                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &x_batch,
+                    &tok_buf,
+                    batch,
+                    dim,
+                )?,
+                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                    &weights.token_embd,
+                    &x_batch,
+                    &tok_buf,
+                    batch,
+                    dim,
+                )?,
+                _ => unreachable!(),
+            }
+            gpu.free_tensor(tok_buf)?;
+        }
+        _ => {
+            let mut embeds = Vec::with_capacity(batch * dim);
+            for &tok in block {
+                let row = embed_token_row(gpu, weights, cfg, state, tok)?;
+                embeds.extend_from_slice(&row);
+            }
+            gpu.hip.memcpy_htod(&x_batch.buf, unsafe {
+                std::slice::from_raw_parts(embeds.as_ptr() as *const u8, embeds.len() * 4)
+            })?;
+        }
+    }
+    let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let v_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let gate_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let up_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    // Per-row logits + argmax (verifier's pick at each slot).
+    let logits_batch = gpu.alloc_tensor(&[batch, cfg.vocab_size], DType::F32)?;
+    // i32 payload in an F32 tensor (4-byte width; matches argmax_f32_batched
+    // output convention used across the spec-decode paths).
+    let argmax_batch = gpu.alloc_tensor(&[batch], DType::F32)?;
+
+    // Absolute positions [position .. position+batch) for batched RoPE and the
+    // F32 KV cache writes.
+    let pos_bytes: Vec<u8> = (0..batch as i32)
+        .flat_map(|i| (i + position as i32).to_ne_bytes())
+        .collect();
+    let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 payload, same width
+    gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let layer = &weights.layers[layer_idx];
+
+        gpu.rmsnorm_batched(
+            &x_batch,
+            &layer.attn_norm,
+            &tmp_batch,
+            batch,
+            dim,
+            cfg.rms_norm_eps,
+        )?;
+
+        proj(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
+        proj(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
+        proj(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
+
+        gpu.bias_add_f32(&q_batch, &layer.wq_bias, batch, q_dim)?;
+        gpu.bias_add_f32(&k_batch, &layer.wk_bias, batch, kv_dim)?;
+        gpu.bias_add_f32(&v_batch, &layer.wv_bias, batch, kv_dim)?;
+
+        gpu.rope_batched_f32(
+            &q_batch,
+            &k_batch,
+            &pos_array,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cfg.rope_theta,
+            batch,
+        )?;
+
+        // Persist the block's post-RoPE K/V into the F32 cache at absolute
+        // positions [position..position+batch). This makes the in-block causal
+        // prefix visible to the history-aware attention below AND overwrites any
+        // rejected-tail KV left by a prior verify window.
+        gpu.kv_cache_write_f32_batched(
+            &state.k_cache[layer_idx],
+            &k_batch,
+            &pos_array,
+            kv_dim,
+            batch,
+        )?;
+        gpu.kv_cache_write_f32_batched(
+            &state.v_cache[layer_idx],
+            &v_batch,
+            &pos_array,
+            kv_dim,
+            batch,
+        )?;
+
+        // Block-parallel decode-with-history: row i attends to [0..position+i].
+        gpu.attention_decode_batched_history(
+            &q_batch,
+            &state.k_cache[layer_idx],
+            &state.v_cache[layer_idx],
+            &attn_out_batch,
+            batch,
+            position,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )?;
+
+        proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
+        gpu.add_inplace_f32(&x_batch, &o_batch)?;
+
+        gpu.rmsnorm_batched(
+            &x_batch,
+            &layer.ffn_norm,
+            &tmp_batch,
+            batch,
+            dim,
+            cfg.rms_norm_eps,
+        )?;
+
+        proj(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
+        proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+        gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
+        proj(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
+        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+    }
+
+    // Final norm + lm_head for EVERY row (verify needs per-slot logits).
+    gpu.rmsnorm_batched(
+        &x_batch,
+        &weights.output_norm,
+        &tmp_batch,
+        batch,
+        dim,
+        cfg.rms_norm_eps,
+    )?;
+    // lm_head over the whole [batch × dim] block in one batched GEMM.
+    proj(gpu, &weights.output, &tmp_batch, &logits_batch, batch)?;
+
+    gpu.argmax_f32_batched(&logits_batch, &argmax_batch, cfg.vocab_size, batch)?;
+    let mut argmax_host: Vec<i32> = vec![0; batch];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, batch * 4)
+        };
+        gpu.hip.memcpy_dtoh(bytes, &argmax_batch.buf)?;
+    }
+    let out: Vec<u32> = argmax_host.iter().map(|&v| v as u32).collect();
+
+    // Leave the last row's logits in state.logits for callers that want the
+    // tail prediction (mirrors the sequential verify's final-step residue).
+    let last_off = (batch - 1) * cfg.vocab_size * 4;
+    gpu.hip.memcpy_dtod_at(
+        &state.logits.buf,
+        0,
+        &logits_batch.buf,
+        last_off,
+        cfg.vocab_size * 4,
+    )?;
+
+    state.next_pos = position + batch;
+
+    for t in [
+        x_batch,
+        tmp_batch,
+        q_batch,
+        k_batch,
+        v_batch,
+        attn_out_batch,
+        o_batch,
+        gate_batch,
+        up_batch,
+        ffn_hidden_batch,
+        ffn_out_batch,
+        logits_batch,
+        argmax_batch,
+        pos_array,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(out)
+}
+
 /// Lowered decode is DEFAULT ON (fleet-standard `!= Some("0")`, same
 /// convention as qwen35/minimax/deepseek4/lfm2moe); opt out with
 /// HIPFIRE_FORWARD_LOWERED=0. Byte-parity validated on gfx1100 (Kevin:

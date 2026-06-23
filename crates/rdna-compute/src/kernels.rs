@@ -2659,6 +2659,15 @@ pub const ATTENTION_INT8_KV_SRC: &str = include_str!("../../../kernels/src/atten
 pub const ATTENTION_CAUSAL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_causal_batched.hip");
 
+/// Batched decode-with-history attention over an F32 KV cache. One block per
+/// (query head, block row); each row at absolute position `base+row` attends to
+/// the full history [0..base+row] read from the persistent cache by absolute
+/// position. Drives block-parallel qwen2 spec-decode verify (arch_id=7).
+/// Grid: [n_heads, batch, 1]. Q/out: [batch × n_heads × head_dim].
+/// k_cache/v_cache: [max_seq × n_kv_heads × head_dim].
+pub const ATTENTION_DECODE_BATCHED_HISTORY_SRC: &str =
+    include_str!("../../../kernels/src/attention_decode_batched_history.hip");
+
 /// Batched Q8_0 KV cache write: quantize multiple positions at once.
 /// src: [batch_size × kv_dim] FP32. positions: [batch_size] int32.
 /// Grid: [total_blocks × batch_size]. Each block handles one Q8_0 group for one position.

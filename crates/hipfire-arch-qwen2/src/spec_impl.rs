@@ -13,26 +13,51 @@
 //! `Qwen2State` (not the shared `llama::KvCache`), so [`SpecTarget::kv_cache_mut`]
 //! stays at its `None` default — arch_id=7 has no FlashCASK eviction.
 //!
-//! VERIFY IS CURRENTLY SEQUENTIAL (one `forward_step` per block token), so it is
-//! CORRECT — each step's split-K flash-decode attention reads the FULL KV history
-//! — but it does NOT yet get the block-parallel speedup llama enjoys. The reason
-//! is a kernel gap: qwen2 keeps F32 KV, and the batched-with-history attention
-//! kernels in `rdna-compute` are all quantized-KV (q8/asym/fwht); qwen2's only
-//! batched attention (`attention_causal_batched`, used by
-//! `forward_prefill_batch_embeds`) is INTRA-batch and cannot see prior KV, so it
-//! is unusable for a mid-sequence verify. A real block-parallel verify needs an
-//! F32-KV batched-decode-with-history attention kernel (tracked follow-up). Until
-//! then n-gram on qwen2 is functional/coherent but not a throughput win — keep it
-//! opt-in (`HIPFIRE_NGRAM_DRAFT=1`).
+//! VERIFY IS BLOCK-PARALLEL: [`SpecTarget::verify_block`] runs the whole
+//! candidate block through one batched layer loop
+//! ([`qwen2::forward_verify_block_batched`]) instead of a `forward_step`-per-token
+//! sequential loop. The enabling piece is a new F32-KV batched-decode-with-history
+//! attention kernel (`attention_decode_batched_history`): the block's post-RoPE
+//! K/V are written into the F32 cache at absolute positions first, then each block
+//! query row attends to the FULL prior history `[0..position+i]` (prompt +
+//! accepted prefix + causal-within-block) in one launch. This sidesteps the kernel
+//! gap that blocked the naive batched verify — qwen2 keeps F32 KV, and the older
+//! batched attentions in `rdna-compute` were either quantized-KV (q8/asym/fwht) or
+//! intra-batch only (`attention_causal_batched`, blind to prior KV — the source of
+//! the token-264 attractor in commit 24a5804f's naive attempt).
+//!
+//! The batched verify is BYTE-IDENTICAL to the sequential one (same per-slot
+//! argmax vector; see `examples/verify_block_parity.rs`), so it carries the same
+//! coherence. The win scales with context: the block-parallel attention saves
+//! little at short prompts (GEMMs dominate) but is +~46% decode at ~900-token
+//! contexts where attention's share grows. n-gram remains opt-in
+//! (`HIPFIRE_NGRAM_DRAFT=1`); force the legacy sequential verify with
+//! `HIPFIRE_QWEN2_VERIFY_SEQ=1` (the byte-identical reference).
+//!
+//! NOTE: spec-decode on qwen2 does not yet beat plain AR on every workload — the
+//! remaining ceiling is the MQ4G256/HFQ4 projection GEMMs lacking a batched
+//! kernel, so each B-wide verify pays ~B× the GEMM cost via the per-row
+//! `weight_gemm` fallback. That batched-GEMM work is a separate follow-up; this
+//! change removes the *attention* serialization, which was the part a per-arch
+//! kernel could address.
 
 use crate::carrier::Qwen2Bundle;
 use crate::qwen2;
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
-/// Qwen2 verify scratch: nothing persistent. The sequential verify reuses the
-/// bundle's own `Qwen2State` scratch (dense attention → no recurrent snapshot to
-/// carry between windows).
+/// `HIPFIRE_QWEN2_VERIFY_SEQ=1` forces the legacy sequential verify (one
+/// `forward_step` per block token) instead of the block-parallel batched path.
+/// Used as the byte-identical reference in the correctness test.
+fn verify_sequential() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_QWEN2_VERIFY_SEQ").as_deref() == Ok("1"))
+}
+
+/// Qwen2 verify scratch: nothing persistent. The verify reuses the bundle's own
+/// `Qwen2State` scratch (dense attention → no recurrent snapshot to carry
+/// between windows).
 pub struct Qwen2SpecScratch;
 
 impl SpecScratch for Qwen2SpecScratch {
@@ -99,14 +124,32 @@ impl SpecTarget for Qwen2Bundle {
         position: usize,
         _scratch: &mut dyn SpecScratch,
     ) -> Result<Vec<u32>, String> {
+        // Block-parallel verify (default): one batched layer loop writes the
+        // block's K/V to the F32 cache at absolute positions [position..) then
+        // runs `attention_decode_batched_history` so each row attends to the FULL
+        // history [0..position+i] — byte-equivalent to the sequential per-token
+        // flash decode, but in one launch chain instead of B sequential decodes.
+        //
+        // `HIPFIRE_QWEN2_VERIFY_SEQ=1` forces the legacy sequential loop (the
+        // byte-identical reference the batched path is validated against).
+        if !verify_sequential() {
+            return qwen2::forward_verify_block_batched(
+                gpu,
+                &self.weights,
+                &self.config,
+                &mut self.state,
+                block,
+                position,
+            )
+            .map_err(|e| format!("{e:?}"));
+        }
+
         // Sequential verify: `forward_step(block[i])` predicts the token AFTER
         // block[i] (with block[0..i] already in the KV cache), which is exactly
         // `argmax[i]` — the verifier's pick at slot i. Each step's flash-decode
-        // attention reads the FULL KV history (prompt + accepted prefix), so this
-        // is correct where a naive intra-batch forward would be blind to the
-        // prompt. Position the cursor at `position` first so the writes land at
-        // the right absolute slots (overwriting any rejected-tail KV from a prior
-        // window). See the module header for why this isn't block-parallel yet.
+        // attention reads the FULL KV history (prompt + accepted prefix). Position
+        // the cursor at `position` first so the writes land at the right absolute
+        // slots (overwriting any rejected-tail KV from a prior window).
         self.state.next_pos = position;
         let mut out = Vec::with_capacity(block.len());
         for &tok in block {

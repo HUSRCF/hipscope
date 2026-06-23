@@ -1273,6 +1273,79 @@ impl Gpu {
         }
     }
 
+    /// Batched decode-with-history attention over an F32 KV cache.
+    ///
+    /// `q` is a `[batch × n_heads × head_dim]` block of query rows; row `i` lives
+    /// at absolute position `base + i`. K/V are read directly from the persistent
+    /// F32 cache (`[max_seq × n_kv_heads × head_dim]`, indexed by absolute
+    /// position), so each row attends to the FULL history `[0 .. base+i]`. The
+    /// caller MUST have written the block's own post-RoPE K/V into the cache at
+    /// positions `[base .. base+batch)` before calling, so the in-block causal
+    /// prefix is present.
+    ///
+    /// One block per `(head, row)` running a single-pass softmax over `ctx_len =
+    /// base + i + 1` — the same per-token flash-decode math `forward_step` runs
+    /// sequentially, but block-parallel. Writes `out` `[batch × n_heads × head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_batched_history(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        base: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_decode_batched_history",
+            kernels::ATTENTION_DECODE_BATCHED_HISTORY_SRC,
+            "attention_decode_batched_history",
+        )?;
+        let func = &self.functions["attention_decode_batched_history"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut b = batch as i32;
+        let mut base_i = base as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut base_i as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Max context any row attends to (the last block row sees the most).
+        let max_ctx = base + batch; // = base + (batch-1) + 1
+        let block_size = 128u32.min((max_ctx.max(head_dim) as u32).next_power_of_two());
+        // scores[max_ctx] + workspace[block_size]
+        let shared_mem = ((max_ctx + block_size as usize) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
     pub fn kv_cache_write_q8_0_batched(
         &mut self,
