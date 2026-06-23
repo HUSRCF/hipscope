@@ -42,7 +42,9 @@ use std::time::Instant;
 
 use hipfire_loader::spec_build::spec_target_guard;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
-use hipfire_runtime::spec::{EvictRetain, PrefillOutcome};
+use hipfire_runtime::spec::{
+    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
+};
 
 /// Abort-target request ID. Set asynchronously by the background
 /// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
@@ -3965,6 +3967,297 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// `SpecTargetGuard` trait — this fn only ever sees `&mut dyn SpecTarget` and
 /// never learns which arch (qwen35 moved-bundle vs llama borrow-in-place) it drives.
 #[allow(clippy::too_many_arguments)]
+/// Render the [`ClientEvent`]s a [`SpecEmit`] step produced to the daemon's
+/// JSONL wire format, byte-identical to `generate_dflash`'s old inline writes.
+/// `t_ms` is the per-step timestamp the inline path attached to committed +
+/// token frames (`t0.elapsed()`); tool_calls frames carry no timing.
+fn render_client_events(stdout: &mut std::io::Stdout, id: &str, events: &[ClientEvent], t_ms: u64) {
+    for ev in events {
+        match ev {
+            ClientEvent::Committed { id: tok_id, idx } => {
+                emit_committed_event(stdout, id, *tok_id, *idx, t_ms);
+            }
+            ClientEvent::Token(text) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(text).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+            }
+            ClientEvent::Reasoning(text) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"reasoning","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(text).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+            }
+            ClientEvent::ToolCalls(calls) => {
+                let calls_json: Vec<serde_json::Value> = calls
+                    .iter()
+                    .map(|tc| {
+                        serde_json::json!({
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        })
+                    })
+                    .collect();
+                let calls_str =
+                    serde_json::to_string(&calls_json).unwrap_or_else(|_| "[]".to_string());
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+                    id, calls_str,
+                );
+            }
+        }
+    }
+}
+
+/// qwen35/llama per-token emission, extracted verbatim from `generate_dflash`'s
+/// inline loop behind the arch-generic [`SpecEmit`] seam. Owns the `EosFilter`
+/// byte stream, the post-hoc grammar `Matcher`, the `<think>` force-close
+/// counter, the user stop-sequence list, and the decoded-token history; the
+/// decode loop keeps all loop/cache state (position, seed, KV/recurrent resets,
+/// conversation-token bake, eviction) and renders the returned [`ClientEvent`]s.
+///
+/// The borrow of the tokenizer is the same disjoint-field share `generate_dflash`
+/// already takes (`m.tokenizer` vs `&mut m.state`/`&mut m.speculator`).
+struct Qwen35Emit<'a> {
+    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+    filter: EosFilter,
+    /// Index into the freshly-decoded byte stream past which bytes have not yet
+    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
+    bytes_fed_to_filter: usize,
+    /// Every committed token in order, for byte decoding + the cache-store the
+    /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
+    streamed_tokens: Vec<u32>,
+    grammar_active: bool,
+    grammar_matcher: hipfire_arch_qwen35::grammar::Matcher,
+    /// Set when a committed token violated the grammar; the daemon reads it via
+    /// [`Self::grammar_violated`] to force the post-turn KV/recurrent reset.
+    grammar_violated: bool,
+    eos_token: u32,
+    im_end_token: Option<u32>,
+    stop: Vec<String>,
+    max_think_tokens: usize,
+    open_think_prefix: bool,
+    think_count: usize,
+    prev_in_think: bool,
+    /// `generated` counter at the point of the most recent `observe` — only used
+    /// for the attractor-detect log message (byte-for-byte stderr parity).
+    generated_hint: usize,
+}
+
+impl<'a> Qwen35Emit<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+        tool_schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema>,
+        eos_token: u32,
+        im_end_token: Option<u32>,
+        stop: Vec<String>,
+        max_think_tokens: usize,
+        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    ) -> Self {
+        let grammar_active = !tool_schemas.is_empty();
+        Self {
+            tokenizer,
+            filter: EosFilter::new(EosFilterConfig::default()),
+            bytes_fed_to_filter: 0,
+            streamed_tokens: Vec::new(),
+            grammar_active,
+            grammar_matcher: hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas),
+            grammar_violated: false,
+            eos_token,
+            im_end_token,
+            stop,
+            max_think_tokens,
+            open_think_prefix: matches!(
+                assistant_prefix,
+                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+            ),
+            think_count: 0,
+            prev_in_think: false,
+            generated_hint: 0,
+        }
+    }
+
+    /// The full committed-token stream (incl. the first token), for the daemon's
+    /// post-loop asst-turn cache store. Mirrors the old inline `streamed_tokens`.
+    fn streamed_tokens(&self) -> &[u32] {
+        &self.streamed_tokens
+    }
+
+    /// Whether a committed token tripped the grammar matcher (daemon forces a
+    /// full KV/recurrent reset for the next turn when true).
+    fn grammar_violated(&self) -> bool {
+        self.grammar_violated
+    }
+
+    /// Hint the emitter of the daemon's current `generated` count so the
+    /// attractor-detect log message reports the same number it did inline.
+    fn set_generated_hint(&mut self, generated: usize) {
+        self.generated_hint = generated;
+    }
+
+    /// Push a committed token, run it through the byte filter, and return the
+    /// `Committed` + (optional) `Token` events — the shared tail of `begin`'s
+    /// first-token emit and `observe`'s per-token emit.
+    fn push_and_filter(&mut self, token: u32) -> Vec<ClientEvent> {
+        let mut events = Vec::new();
+        self.streamed_tokens.push(token);
+        events.push(ClientEvent::Committed {
+            id: token,
+            idx: self.streamed_tokens.len() - 1,
+        });
+        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
+        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
+        self.bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = self.filter.observe(new_bytes) {
+            let text = std::str::from_utf8(&text_bytes).unwrap();
+            events.push(ClientEvent::Token(text.to_string()));
+        }
+        events
+    }
+}
+
+impl<'a> SpecEmit for Qwen35Emit<'a> {
+    fn begin(&mut self, first_token: u32) -> EmitOutcome {
+        // First-token emit (committed + filtered token), then seed the grammar
+        // matcher with the first token's text. Mirrors generate_dflash 4452-4489.
+        let events = self.push_and_filter(first_token);
+        if self.grammar_active {
+            let text = self.tokenizer.decode(&[first_token]);
+            self.grammar_matcher.advance(&text);
+        }
+        // First-token EOS guard: if the prefill's first token is itself a
+        // terminator we must NOT enter the spec loop (the inline `while
+        // !first_token_is_eos`). Surface as a stop so the caller skips the loop.
+        let first_token_is_eos = first_token == self.eos_token
+            || self.im_end_token == Some(first_token)
+            || self.tokenizer.is_terminator(first_token);
+        EmitOutcome {
+            events,
+            stop: if first_token_is_eos {
+                Some(StopReason::Eos)
+            } else {
+                None
+            },
+        }
+    }
+
+    fn observe(&mut self, token: u32) -> EmitOutcome {
+        // Grammar pre-check (POST-acceptance, before emit). A rejected token is
+        // NOT emitted; treat as a grammar violation → stop. Mirrors 4565-4584.
+        if self.grammar_active {
+            let text = self.tokenizer.decode(&[token]);
+            if !self.grammar_matcher.is_token_allowed(&text) {
+                eprintln!(
+                    "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS | {}",
+                    token, text, self.grammar_matcher.state(), self.grammar_matcher.debug_close_reject(),
+                );
+                self.grammar_violated = true;
+                return EmitOutcome {
+                    events: Vec::new(),
+                    stop: Some(StopReason::GrammarViolation),
+                };
+            }
+            let was_detected = self.grammar_matcher.attractor_detected();
+            self.grammar_matcher.advance(&text);
+            if !was_detected && self.grammar_matcher.attractor_detected() {
+                eprintln!(
+                    "[grammar-dflash-ngram] attractor detected in tool_call args at gen={} — forcing close",
+                    self.generated_hint,
+                );
+            }
+        }
+
+        // Emit the token (committed + filtered).
+        let mut events = self.push_and_filter(token);
+
+        // EOS check (token id). Mirrors 4608-4612.
+        if token == self.eos_token
+            || self.im_end_token == Some(token)
+            || self.tokenizer.is_terminator(token)
+        {
+            return EmitOutcome {
+                events,
+                stop: Some(StopReason::Eos),
+            };
+        }
+
+        // User stop-sequence match against the decoded suffix. Mirrors 4622-4628.
+        if !self.stop.is_empty() {
+            let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
+            if self
+                .stop
+                .iter()
+                .any(|s| decoded_suffix.ends_with(s.as_str()))
+            {
+                return EmitOutcome {
+                    events,
+                    stop: Some(StopReason::StopSequence),
+                };
+            }
+        }
+
+        // max_think_tokens enforcement. Mirrors 4632-4664.
+        if self.max_think_tokens > 0 {
+            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let in_think = currently_in_think(raw_str, self.open_think_prefix);
+            if in_think && !self.prev_in_think {
+                self.think_count = 0;
+            }
+            if in_think {
+                self.think_count += 1;
+            }
+            self.prev_in_think = in_think;
+
+            if in_think && self.think_count >= self.max_think_tokens {
+                // Force-close: stream `</think>\n` and stop. The inline path
+                // wrote this literal token frame directly (not through the
+                // filter, not into streamed_tokens) — preserve that exactly.
+                events.push(ClientEvent::Token("</think>\n".to_string()));
+                return EmitOutcome {
+                    events,
+                    stop: Some(StopReason::ThinkCap),
+                };
+            }
+        }
+
+        EmitOutcome { events, stop: None }
+    }
+
+    fn finish(self: Box<Self>) -> FinishSummary {
+        // Tool-call extraction + finish-flush. The conversation-token bake, KV
+        // resets, eviction, cache-store, and `done` envelope stay in
+        // generate_dflash. Mirrors 4733-4752 + the finish_reason branch 4827-4833
+        // (length cap is the caller's call; this returns stop/tool_calls).
+        let decoded_full = self.tokenizer.decode(&self.streamed_tokens);
+        let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+        let mut events = Vec::new();
+        let tool_calls = emit_tool_calls.len();
+        let finish_reason = if !emit_tool_calls.is_empty() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        if !emit_tool_calls.is_empty() {
+            events.push(ClientEvent::ToolCalls(emit_tool_calls));
+        }
+        FinishSummary {
+            events,
+            finish_reason,
+            tool_calls,
+        }
+    }
+}
+
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -4390,20 +4683,25 @@ fn generate_dflash(
     } else {
         Vec::new()
     };
-    let grammar_active = !tool_schemas_dflash.is_empty();
-    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_dflash);
-    let mut grammar_violated = false;
+    // Per-token emission (EosFilter byte stream + post-hoc grammar matcher +
+    // think force-close + stop-sequence match) now lives behind the arch-generic
+    // `SpecEmit` seam (`Qwen35Emit`). The decode loop keeps all loop/cache state
+    // and renders the `ClientEvent`s each step returns; `emit` owns the filter,
+    // grammar matcher, think counter, and the streamed-token history.
+    let mut emit = Qwen35Emit::new(
+        tokenizer,
+        tool_schemas_dflash,
+        slot.eos_token(),
+        im_end_token,
+        stop.to_vec(),
+        max_think_tokens,
+        assistant_prefix,
+    );
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
+    // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
+    // it stays in the loop and excludes any grammar-rejected token.
     let mut emitted: Vec<u32> = vec![first_token];
-    let mut streamed_tokens: Vec<u32> = Vec::new();
-    // `bytes_fed_to_filter` is the index into the freshly-decoded byte
-    // stream past which we have not yet handed bytes to the filter.
-    // The filter owns UTF-8 boundary buffering and any future arch
-    // quirks (Gemma 4 marker holdback, strip-think, byte-level stop_at);
-    // see crates/engine/src/eos_filter.rs.
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
@@ -4411,9 +4709,6 @@ fn generate_dflash(
     // sees): τ = accepted drafts / cycle.
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
-    // max_think_tokens enforcement state (mirrors the AR path).
-    let mut think_count: usize = 0;
-    let mut prev_in_think = false;
     let mut generated = 0usize;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
@@ -4448,45 +4743,19 @@ fn generate_dflash(
         }
     }
 
-    // Emit the first token immediately so TTFT is the prefill time.
-    streamed_tokens.push(first_token);
-    emit_committed_event(
+    // Emit the first token immediately so TTFT is the prefill time. `begin`
+    // pushes + filters it, seeds the grammar matcher, and reports whether the
+    // first token is itself a terminator (→ skip the spec loop entirely, so
+    // spec_step_dflash never drafts a whole block seeded on a terminal token).
+    let first_begin = emit.begin(first_token);
+    render_client_events(
         stdout,
         id,
-        first_token,
-        streamed_tokens.len() - 1,
+        &first_begin.events,
         t0.elapsed().as_millis() as u64,
     );
-    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-    bytes_fed_to_filter = all_bytes.len();
-    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-        let text = std::str::from_utf8(&text_bytes).unwrap();
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":{}}}"#,
-            id,
-            serde_json::to_string(&text).unwrap_or_default()
-        );
-        let _ = stdout.flush();
-    }
     generated += 1;
-    // Seed the grammar matcher with the first token's text so its rolling
-    // partial-buf catches an opening `<tool_call>` if the model emitted
-    // it as the very first decoded token.
-    if grammar_active {
-        let text = tokenizer.decode(&[first_token]);
-        grammar_matcher.advance(&text);
-    }
-
-    // First-token EOS guard (mirrors the AR path's post-emit EOS break). The
-    // first token was already emitted above; if it is itself a terminator we must
-    // NOT enter the spec loop, otherwise spec_step_dflash drafts + verifies a whole
-    // block seeded on an already-terminal token before stopping. The committed-tail
-    // check inside the loop applies this identical triple to every subsequent token.
-    let first_token_is_eos = first_token == slot.eos_token()
-        || im_end_token == Some(first_token)
-        || tokenizer.is_terminator(first_token);
+    let first_token_is_eos = first_begin.stop.is_some();
 
     // (The DFlash RNG cell and the `HIPFIRE_DDTREE_PATH_C` chain-vs-tree-vs-path_c
     // resolution that used to live here are now resolved once at build time and
@@ -4555,112 +4824,34 @@ fn generate_dflash(
             if generated >= max_tokens {
                 break;
             }
-            // Grammar pre-check (dflash path). Reject committed tokens
-            // that would put the matcher into an invalid state — e.g.
-            // `<|im_start|>` immediately after `<tool_call>` (Pi turn-12
-            // attractor). Treat rejection as EOS for this turn; the
-            // post-loop full-reset below clears the polluted KV slots
-            // that spec_step already wrote for the rejected tokens, so
-            // the next turn starts from a clean baseline.
-            if grammar_active {
-                let text = tokenizer.decode(&[tok]);
-                if !grammar_matcher.is_token_allowed(&text) {
-                    eprintln!(
-                        "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS | {}",
-                        tok, text, grammar_matcher.state(), grammar_matcher.debug_close_reject(),
-                    );
-                    grammar_violated = true;
-                    hit_eos = true;
-                    break;
-                }
-                let was_detected = grammar_matcher.attractor_detected();
-                grammar_matcher.advance(&text);
-                if !was_detected && grammar_matcher.attractor_detected() {
-                    eprintln!(
-                        "[grammar-dflash-ngram] attractor detected in tool_call args at gen={} — forcing close",
-                        generated,
-                    );
-                }
-            }
-            emitted.push(tok);
-            streamed_tokens.push(tok);
-            emit_committed_event(
-                stdout,
-                id,
-                tok,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-            }
-            generated += 1;
-            if tok == slot.eos_token() || im_end_token == Some(tok) || tokenizer.is_terminator(tok)
-            {
+            // `emit.observe` runs the per-token emission policy: grammar
+            // pre-check (reject → grammar violation, NO emit, post-loop forces a
+            // full KV/DN reset to clear the polluted slots spec_step wrote), then
+            // committed/token frames, EOS, user stop-sequence, and think
+            // force-close. Loop state (emitted/generated/position) stays here.
+            emit.set_generated_hint(generated);
+            let outcome = emit.observe(tok);
+            if outcome.stop == Some(StopReason::GrammarViolation) {
+                // Rejected before emit — not added to the repeat context, not
+                // streamed, not counted. Treat as EOS for this turn.
+                render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
                 hit_eos = true;
                 break;
             }
-
-            // hunt3 M-F: user stop-sequence match against the decoded output
-            // suffix (DFlash path). Mirrors the AR generate() loop — match on
-            // the full decoded text so a stop string spanning a token boundary
-            // is caught. On a hit we treat it like a natural stop: break out of
-            // both the committed-tail loop and the outer spec-cycle loop via
-            // `hit_eos`, so finish_reason resolves to "stop" below (hit_length_cap
-            // false, no tool_calls). Gated behind `!stop.is_empty()` so the
-            // common bench/serve path pays nothing.
-            if !stop.is_empty() {
-                let decoded_suffix = tokenizer.decode(&streamed_tokens);
-                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+            emitted.push(tok);
+            render_client_events(stdout, id, &outcome.events, t0.elapsed().as_millis() as u64);
+            generated += 1;
+            match outcome.stop {
+                Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
                     hit_eos = true;
                     break;
                 }
-            }
-
-            // max_think_tokens enforcement (mirrors the AR path). Track
-            // <think>/<⁄think> in decoded text and count tokens inside.
-            if max_think_tokens > 0 {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(
-                    raw_str,
-                    matches!(
-                        assistant_prefix,
-                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                    ),
-                );
-                if in_think && !prev_in_think {
-                    think_count = 0;
-                }
-                if in_think {
-                    think_count += 1;
-                }
-                prev_in_think = in_think;
-
-                if in_think && think_count >= max_think_tokens {
-                    // Force-close: emit </think>\n and break out of this batch.
-                    // Unlike the AR path we can't splice into the KV cache mid-
-                    // spec-cycle, so we just stream the close text and break.
-                    // The next request will start fresh.
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
+                Some(StopReason::ThinkCap) => {
                     think_cap_hit = true;
                     break;
                 }
+                Some(StopReason::GrammarViolation) => unreachable!("handled above"),
+                None => {}
             }
         }
         // Advance by the emitted-tail length (= accepted + 1), NOT by `accepted`
@@ -4694,6 +4885,12 @@ fn generate_dflash(
         }
     }
 
+    // Snapshot the emitter's state needed by the post-loop bookkeeping before
+    // the terminal `finish` consumes it: the full streamed-token stream (for the
+    // asst-turn cache) and whether a committed token tripped the grammar matcher.
+    let streamed_tokens = emit.streamed_tokens().to_vec();
+    let grammar_violated = emit.grammar_violated();
+
     m.seq_pos = position;
     // Bake the FULL conversation (prefill + decode) into conversation_tokens
     // so subsequent turns can compute LCP against it. Previously this stored
@@ -4726,30 +4923,17 @@ fn generate_dflash(
 
     // ── parse tool_calls + populate asst_turn_cache ──────────────
     //
-    // Mirror the qwen35 non-dflash path so a dflash-emitted asst turn
-    // is reusable on the next request via verbatim token replay.
-    // Without this, every turn after a dflash decode full-resets in
-    // the qwen35 cache machinery (fingerprint never stored).
+    // The terminal `finish` flush parses tool calls from the decoded text and
+    // returns the `tool_calls` ClientEvent + the finish reason (stop/tool_calls;
+    // the length-cap override stays here). The asst-turn cache fingerprint below
+    // is daemon bookkeeping that needs its own parse + the decoded text, so it
+    // recomputes from the streamed tokens (mirrors the qwen35 non-dflash path so
+    // a dflash-emitted asst turn is reusable via verbatim token replay).
+    let finish = Box::new(emit).finish();
+    render_client_events(stdout, id, &finish.events, 0);
+
     let decoded_full = tokenizer.decode(&streamed_tokens);
     let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
-
-    if !emit_tool_calls.is_empty() {
-        let calls_json: Vec<serde_json::Value> = emit_tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                })
-            })
-            .collect();
-        let calls_str = serde_json::to_string(&calls_json).unwrap_or_else(|_| "[]".to_string());
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
-            id, calls_str,
-        );
-    }
 
     // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
     // cached body slots cleanly between the assistant_prefix and the
