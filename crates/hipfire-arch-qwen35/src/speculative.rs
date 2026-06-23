@@ -16,6 +16,7 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
+use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -545,6 +546,57 @@ pub struct ModelSlot {
     pub dn_state: DeltaNetState,
     pub scratch: Qwen35Scratch,
     pub slot_config: ModelSlotConfig,
+}
+
+impl ModelSlot {
+    /// Assemble the spec-decode target slot from a live [`Qwen35Bundle`] that was
+    /// parked out of `ModelState`, opening the model's `HfqFile` (the mmap handle
+    /// `ModelSlot` carries but the spec kernels never read).
+    ///
+    /// **Fallible WITHOUT loss:** on a reopen failure the bundle is handed BACK in
+    /// the `Err` so the caller's RAII guard can re-park it and restore it into
+    /// `ModelState` on `Drop` — consuming the bundle on the error path would drop
+    /// it and leave `m.state == None`, reintroducing the #462 cross-request
+    /// state-bleed class this seam exists to prevent. This is the only piece of
+    /// `Qwen35Bundle` field knowledge the loader's guard previously inlined; it
+    /// lives here so the loader never names the bundle's fields.
+    pub fn from_bundle(bundle: Qwen35Bundle, path: &Path) -> Result<Self, (Qwen35Bundle, String)> {
+        let hfq = match HfqFile::open(path) {
+            Ok(h) => h,
+            Err(e) => return Err((bundle, format!("reopen model: {e}"))),
+        };
+        let Qwen35Bundle {
+            config,
+            weights,
+            scratch,
+            kv_cache,
+            dn_state,
+        } = bundle;
+        Ok(Self {
+            name: String::from("target"),
+            hfq,
+            config,
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            slot_config: ModelSlotConfig::default(),
+        })
+    }
+
+    /// Disassemble the slot back into a [`Qwen35Bundle`] — the `HfqFile` mmap,
+    /// `name`, and `slot_config` drop here; the five live pieces return to the
+    /// bundle. The inverse of [`from_bundle`](Self::from_bundle); the loader's
+    /// guard calls this on `Drop` to restore `ModelState`.
+    pub fn into_bundle(self) -> Qwen35Bundle {
+        Qwen35Bundle {
+            config: self.config,
+            weights: self.weights,
+            scratch: self.scratch,
+            kv_cache: self.kv_cache,
+            dn_state: self.dn_state,
+        }
+    }
 }
 
 impl ModelSlot {

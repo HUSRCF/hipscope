@@ -268,6 +268,23 @@ pub trait SpecTargetGuard {
     fn slot(&mut self) -> Result<&mut dyn SpecTarget, String>;
 }
 
+/// In-place spec-target borrow for arches whose bundle *is* a [`SpecTarget`]
+/// directly — the pure-attention family (LLaMA / plain Qwen3, Qwen2, DeepSeek V4).
+/// Unlike qwen35 there is no `HfqFile` to reopen and nothing to move out of
+/// `ModelState`: the `&mut` is held for the guard's life and released on `Drop`
+/// like any borrow, with no restore step. Generic over the bundle type so this
+/// single impl replaces the per-arch `LlamaSlotGuard` / `Qwen2SlotGuard` /
+/// `Deepseek4SlotGuard` (which differed only by bundle type).
+pub struct InPlaceGuard<'m, B: SpecTarget> {
+    pub bundle: &'m mut B,
+}
+
+impl<B: SpecTarget> SpecTargetGuard for InPlaceGuard<'_, B> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(&mut *self.bundle as &mut dyn SpecTarget)
+    }
+}
+
 /// Erased, arch-specific verify scratch owned by a model-free speculator.
 ///
 /// The concrete scratch (qwen35: `VerifyScratch` + `DeltaNetSnapshot` + s_ef

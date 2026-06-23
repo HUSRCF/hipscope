@@ -15,10 +15,9 @@
 use crate::ModelState;
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
-use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+use hipfire_arch_qwen35::speculative::ModelSlot;
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
+use hipfire_runtime::spec::{InPlaceGuard, SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;
 
@@ -90,31 +89,17 @@ impl<'m> Qwen35SlotGuard<'m> {
             let Some(Parked::Bundle(bundle)) = self.parked.take() else {
                 unreachable!("guarded by the if-let above")
             };
-            let hfq = match HfqFile::open(Path::new(&self.model_path)) {
-                Ok(h) => h,
-                Err(e) => {
-                    // Park the bundle back so `Drop` restores it — no leak.
+            // The bundle→slot field transform + `HfqFile` reopen is qwen35 field
+            // knowledge, owned by the arch crate. It is fallible-WITHOUT-loss: on
+            // reopen failure the bundle comes back in the `Err`, so we re-park it
+            // for `Drop` to restore — never leaving `m.state == None` (#462 guard).
+            match ModelSlot::from_bundle(bundle, Path::new(&self.model_path)) {
+                Ok(slot) => self.parked = Some(Parked::Slot(slot)),
+                Err((bundle, msg)) => {
                     self.parked = Some(Parked::Bundle(bundle));
-                    return Err(format!("reopen model: {e}"));
+                    return Err(msg);
                 }
-            };
-            let Qwen35Bundle {
-                config,
-                weights,
-                scratch,
-                kv_cache,
-                dn_state,
-            } = bundle;
-            self.parked = Some(Parked::Slot(ModelSlot {
-                name: String::from("target"),
-                hfq,
-                config,
-                weights,
-                kv_cache,
-                dn_state,
-                scratch,
-                slot_config: ModelSlotConfig::default(),
-            }));
+            }
         }
         match self.parked.as_mut() {
             Some(Parked::Slot(slot)) => Ok(slot),
@@ -127,17 +112,9 @@ impl Drop for Qwen35SlotGuard<'_> {
     fn drop(&mut self) {
         let bundle = match self.parked.take() {
             Some(Parked::Bundle(b)) => b,
-            Some(Parked::Slot(slot)) => {
-                // slot.hfq (mmap), slot.name, slot.slot_config drop here; the
-                // five live pieces go back into the bundle.
-                Qwen35Bundle {
-                    config: slot.config,
-                    weights: slot.weights,
-                    scratch: slot.scratch,
-                    kv_cache: slot.kv_cache,
-                    dn_state: slot.dn_state,
-                }
-            }
+            // slot.hfq (mmap), slot.name, slot.slot_config drop inside
+            // `into_bundle`; the five live pieces go back into the bundle.
+            Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
         *self.state_back = Some(ModelState::Qwen35(bundle));
@@ -150,46 +127,10 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
     }
 }
 
-/// Pure-attention (LLaMA / plain Qwen3 / Qwen2) spec-target borrow: the bundle is
-/// a `SpecTarget` in place, so — unlike qwen35 — there is no `HfqFile` to reopen
-/// and nothing to move out of `m.state`. The `&mut` is held for the guard's life
-/// and released on `Drop` like any borrow; there is no restore step.
-struct LlamaSlotGuard<'m> {
-    bundle: &'m mut hipfire_arch_llama::LlamaBundle,
-}
-
-impl SpecTargetGuard for LlamaSlotGuard<'_> {
-    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
-        Ok(&mut *self.bundle as &mut dyn SpecTarget)
-    }
-}
-
-/// Qwen2 (arch_id=7, e.g. VibeThinker) spec-target borrow. Like llama it is pure
-/// attention borrowed in place — but its KV lives in its own `Qwen2State`, so it
-/// implements `SpecTarget` with the default (`None`) `kv_cache_mut` (no eviction).
-struct Qwen2SlotGuard<'m> {
-    bundle: &'m mut hipfire_arch_qwen2::Qwen2Bundle,
-}
-
-impl SpecTargetGuard for Qwen2SlotGuard<'_> {
-    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
-        Ok(&mut *self.bundle as &mut dyn SpecTarget)
-    }
-}
-
-/// DeepSeek V4 (arch_id=9) spec-target borrow. Its `Deepseek4Bundle` implements
-/// `SpecTarget` in place (MLA KV + recurrent state live inside the bundle), so —
-/// like llama/qwen2 — there is no `HfqFile` to reopen and nothing to move out of
-/// `m.state`; the `&mut` is held for the guard's life and released on `Drop`.
-struct Deepseek4SlotGuard<'m> {
-    bundle: &'m mut hipfire_arch_deepseek4::Deepseek4Bundle,
-}
-
-impl SpecTargetGuard for Deepseek4SlotGuard<'_> {
-    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
-        Ok(&mut *self.bundle as &mut dyn SpecTarget)
-    }
-}
+// The pure-attention arms (LLaMA / plain Qwen3, Qwen2, DeepSeek V4) borrow their
+// bundle in place via the generic `hipfire_runtime::spec::InPlaceGuard<B>` — one
+// impl for all three, since they differed only by bundle type. Only qwen35 needs
+// the bespoke move-out + lazy-`HfqFile`-reopen `Qwen35SlotGuard` above.
 
 /// Arch-dispatched borrow of the spec-decode target as a boxed [`SpecTargetGuard`].
 ///
@@ -209,10 +150,10 @@ pub fn spec_target_guard<'m>(
         Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
     } else {
         match state.as_mut() {
-            Some(ModelState::Llama(bundle)) => Ok(Box::new(LlamaSlotGuard { bundle })),
-            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(Qwen2SlotGuard { bundle })),
+            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
             Some(ModelState::Deepseek4(bundle)) if arch_id == 9 => {
-                Ok(Box::new(Deepseek4SlotGuard { bundle }))
+                Ok(Box::new(InPlaceGuard { bundle }))
             }
             _ => Err(format!(
                 "spec path: unsupported arch state for arch_id {arch_id}"
