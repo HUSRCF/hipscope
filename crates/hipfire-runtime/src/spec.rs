@@ -306,7 +306,14 @@ pub enum SpecAdvance {
 /// mask-fill / accept method set will be defined when a grammar-consuming
 /// drafter (MTP / EAGLE) first needs it. `DflashSpeculator` ignores grammar —
 /// qwen35 enforces tool-call grammar post-hoc in the daemon.
-pub trait SpecGrammar {}
+///
+/// `as_any_mut` lets an in-step grammar consumer (the deepseek4 MTP drafter)
+/// downcast the erased handle back to its concrete arch grammar type
+/// (`hipfire_arch_deepseek4::mtp_speculator::Deepseek4SpecGrammar`) to reach the
+/// `Matcher` + decoded-vocab + mask the fused grammar step needs.
+pub trait SpecGrammar {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
 
 /// Outcome of [`Speculator::prefill`].
 #[derive(Debug, Clone)]

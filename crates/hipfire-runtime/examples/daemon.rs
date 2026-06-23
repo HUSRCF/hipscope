@@ -9155,6 +9155,11 @@ struct Deepseek4Emit<'a> {
     /// the daemon's `generated_count` so each `Committed { idx }` equals the
     /// inline `emit_committed_event`'s `pos` argument.
     emitted_count: usize,
+    /// In-step tool-call grammar, threaded into the fused spec step via
+    /// `grammar()`. `None` ⇒ no tools (or the bespoke loop, which owns its own
+    /// matcher and never calls `grammar()`). The matcher advances inside the spec
+    /// step ONLY — `observe` must NOT touch it (single-advance invariant).
+    grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
 }
 
 impl<'a> Deepseek4Emit<'a> {
@@ -9173,7 +9178,19 @@ impl<'a> Deepseek4Emit<'a> {
             tool_calls_buf: Vec::new(),
             eos_token,
             emitted_count: 0,
+            grammar: None,
         }
+    }
+
+    /// Attach an in-step tool-call grammar (consumed by `generate_spec` via
+    /// `grammar()` and threaded into the fused spec step). Builder form so the
+    /// bespoke loop's `new(...)` stays grammar-free.
+    fn with_grammar(
+        mut self,
+        grammar: Option<deepseek4::mtp_speculator::Deepseek4SpecGrammar>,
+    ) -> Self {
+        self.grammar = grammar;
+        self
     }
 
     /// Feed one committed token's decoded text through the DSML parser, mapping
@@ -9212,6 +9229,16 @@ impl<'a> Deepseek4Emit<'a> {
 }
 
 impl<'a> SpecEmit for Deepseek4Emit<'a> {
+    /// In-step grammar: hand the fused spec step the erased ds4 grammar handle so
+    /// it masks draft+verify logits and advances the matcher. `None` ⇒ no tools.
+    /// Because the matcher advances HERE (in-step), `observe` must NOT re-advance
+    /// it — and ds4's `observe` only feeds the DSML parser, so the invariant holds.
+    fn grammar(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecGrammar> {
+        self.grammar
+            .as_mut()
+            .map(|g| g as &mut dyn hipfire_runtime::spec::SpecGrammar)
+    }
+
     fn begin(&mut self, first_token: u32) -> EmitOutcome {
         // First generated token (the prefill argmax). Mirrors generate_deepseek4
         // 9537-9553: EOS-first yields an empty turn — the inline `if

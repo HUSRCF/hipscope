@@ -21,12 +21,48 @@
 //! `mtp_step` implementation for the safety argument.
 
 use crate::forward::PrefillBatchScratch;
-use crate::spec_decode::{logits_argmax, speculative_decode_step_with_pbs};
+use crate::grammar::{Matcher, ToolSchema};
+use crate::spec_decode::{
+    logits_argmax, speculative_decode_step_with_pbs, speculative_decode_step_with_pbs_grammar,
+};
 use crate::spec_impl::Deepseek4Bundle;
 use hipfire_runtime::spec::{
     MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
+use std::sync::Arc;
+
+/// Concrete in-step grammar handle for deepseek4 MTP spec-decode. Owns the
+/// tool-call [`Matcher`], a shared decoded-vocab table (Arc-cloned from the
+/// daemon's cache so it never borrows the model), and a reusable per-step token
+/// mask. The daemon's `Deepseek4Emit::grammar()` hands this in erased as
+/// `&mut dyn SpecGrammar`; [`Deepseek4MtpDrafter::mtp_step`] downcasts it back.
+/// The matcher advances INSIDE `speculative_decode_step_with_pbs_grammar` ONLY
+/// (single-advance invariant — the emitter must not re-advance it).
+pub struct Deepseek4SpecGrammar {
+    pub matcher: Matcher,
+    pub decoded_vocab: Arc<Vec<String>>,
+    pub grammar_mask: Vec<bool>,
+}
+
+impl Deepseek4SpecGrammar {
+    /// Build from tool schemas + the daemon's cached decoded-vocab. `grammar_mask`
+    /// is sized to the vocab; `Matcher::token_mask` refills it each fused step.
+    pub fn new(tools: Vec<ToolSchema>, decoded_vocab: Arc<Vec<String>>) -> Self {
+        let grammar_mask = vec![true; decoded_vocab.len()];
+        Self {
+            matcher: Matcher::new(tools),
+            decoded_vocab,
+            grammar_mask,
+        }
+    }
+}
+
+impl SpecGrammar for Deepseek4SpecGrammar {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
 
 /// DeepSeek V4 MTP drafter. `pbs` is allocated on the first `mtp_prefill`
 /// (it needs `&Gpu` + the concrete config, neither available at construction).
@@ -116,17 +152,23 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         _eos: u32,
         grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
-        // T4: in-step grammar needs a downcastable SpecGrammar concrete type
-        // on the deepseek4 side (SpecGrammar is currently a bare marker trait).
-        // Until that lands, error loudly rather than silently miscomputing.
-        if grammar.is_some() {
-            return Err("Deepseek4MtpDrafter: in-step grammar not yet wired (T4)".to_string());
-        }
-
         let pbs = self
             .pbs
             .as_ref()
             .ok_or("Deepseek4MtpDrafter: mtp_step called before mtp_prefill")?;
+
+        // In-step grammar: downcast the erased handle to the concrete ds4 grammar
+        // (matcher + decoded-vocab + reusable mask). `None` ⇒ the plain fused step.
+        // The matcher advances inside the grammar step ONLY; the daemon's
+        // Deepseek4Emit::observe must not re-advance it (single-advance invariant).
+        let grammar = match grammar {
+            Some(g) => Some(
+                g.as_any_mut()
+                    .downcast_mut::<Deepseek4SpecGrammar>()
+                    .ok_or("Deepseek4MtpDrafter: grammar handle is not a Deepseek4SpecGrammar")?,
+            ),
+            None => None,
+        };
 
         let bundle = Self::bundle(target)?;
         let Deepseek4Bundle {
@@ -150,17 +192,33 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         let lh: Option<&rdna_compute::GpuTensor> =
             unsafe { last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref()) };
 
-        let r = speculative_decode_step_with_pbs(
-            config,
-            weights,
-            state,
-            gpu,
-            pbs,
-            seed,
-            position as u32,
-            lh,
-            k,
-        )
+        let r = match grammar {
+            Some(g) => speculative_decode_step_with_pbs_grammar(
+                config,
+                weights,
+                state,
+                gpu,
+                pbs,
+                seed,
+                position as u32,
+                lh,
+                k,
+                &mut g.matcher,
+                &g.decoded_vocab[..],
+                &mut g.grammar_mask,
+            ),
+            None => speculative_decode_step_with_pbs(
+                config,
+                weights,
+                state,
+                gpu,
+                pbs,
+                seed,
+                position as u32,
+                lh,
+                k,
+            ),
+        }
         .map_err(|e| format!("mtp step: {e}"))?;
 
         Ok(MtpWindow {
