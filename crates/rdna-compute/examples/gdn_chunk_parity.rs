@@ -148,7 +148,20 @@ fn bench(gpu: &mut rdna_compute::Gpu) {
     const HD: usize = 128;
     const N_HEADS: usize = 16;
     const ITERS: usize = 13;
-    let shapes: &[(usize, usize)] = &[(128, 16), (256, 16), (256, 32), (512, 16), (512, 32)];
+    // Small-n = the spec-decode VERIFY shape (DFlash block ~8-16, DDTree
+    // candidates, MTP K~4-5) — single/few chunks, latency-critical. Large-n =
+    // prefill. Both matter; verify is the better-justified target.
+    let shapes: &[(usize, usize)] = &[
+        (4, 4),
+        (8, 8),
+        (16, 16),
+        (24, 16),
+        (32, 16),
+        (32, 32),
+        (128, 16),
+        (256, 16),
+        (512, 16),
+    ];
 
     println!("\n=== BENCH  HD={HD} n_heads={N_HEADS}  (warm median-of-{ITERS}, ms) ===");
     println!(
