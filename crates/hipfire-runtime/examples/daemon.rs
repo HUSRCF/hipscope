@@ -9062,6 +9062,166 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     prompt_ids
 }
 
+/// deepseek4 spec-decode per-token emission, extracted verbatim from
+/// `generate_deepseek4`'s `if spec_mode` loop behind the arch-generic
+/// [`SpecEmit`] seam. Owns the DSML [`StreamParser`](deepseek4::dsml::StreamParser)
+/// (bootstrapped `new_in_think()` for High/Max think modes, `new()` for NonThink),
+/// the tool-call accumulation buffer (the old `absorb_event` closure), and the
+/// tokenizer reference for `decode`. The decode loop keeps all loop/cache state
+/// (position/seed advance, `m.conversation_tokens` bake, `generated_count`,
+/// `max_tokens` guard) and renders the returned [`ClientEvent`]s.
+///
+/// Differs from `Qwen35Emit` in three behavior-preserving ways that mirror the
+/// inline ds4 spec branch exactly:
+/// - EOS is NOT emitted: a first token / accepted token equal to `eos_token`
+///   produces an empty `EmitOutcome` with `StopReason::Eos` (no parser feed, no
+///   committed event) — the inline loop dropped it.
+/// - Event ORDER is parser-events-first, then `Committed` (the inline loop ran
+///   `parser.feed` → `emit_stream_event` before `emit_committed_event`); this is
+///   the opposite of `Qwen35Emit`'s committed-first order, and `render_client_events`
+///   preserves whatever order the events Vec carries.
+/// - No stop-sequence / no max-think force-close (the ds4 spec branch had neither;
+///   think behavior is entirely in the parser's `new_in_think()` bootstrap).
+///
+/// The in-step grammar (`speculative_decode_step_with_pbs_grammar`'s matcher /
+/// mask, threaded INTO the spec step) is NOT this emitter's concern — it stays in
+/// the decode loop and `grammar()` returns `None` (Phase 4 wiring).
+struct Deepseek4Emit<'a> {
+    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+    parser: deepseek4::dsml::StreamParser,
+    /// Parsed tool calls accumulated across the turn (the old `emit_tool_calls_buf`).
+    tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall>,
+    eos_token: u32,
+    /// Count of tokens actually emitted (committed) so far, kept in lockstep with
+    /// the daemon's `generated_count` so each `Committed { idx }` equals the
+    /// inline `emit_committed_event`'s `pos` argument.
+    emitted_count: usize,
+}
+
+impl<'a> Deepseek4Emit<'a> {
+    fn new(
+        tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+        think_mode: ThinkMode,
+        eos_token: u32,
+    ) -> Self {
+        let parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+        Self {
+            tokenizer,
+            parser,
+            tool_calls_buf: Vec::new(),
+            eos_token,
+            emitted_count: 0,
+        }
+    }
+
+    /// Feed one committed token's decoded text through the DSML parser, mapping
+    /// each `StreamEvent` to its `ClientEvent` (and absorbing tool calls), then
+    /// append the `Committed` event LAST — matching the inline `parser.feed` →
+    /// `emit_stream_event` → `emit_committed_event` ordering. Shared by `begin`'s
+    /// first-token emit and `observe`'s per-token emit.
+    fn feed_and_emit(&mut self, token: u32) -> Vec<ClientEvent> {
+        use deepseek4::dsml::StreamEvent;
+        let mut events = Vec::new();
+        let frag = self.tokenizer.decode(&[token]);
+        for ev in self.parser.feed(&frag) {
+            match ev {
+                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
+                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
+                StreamEvent::ToolCalls(calls) => {
+                    let converted: Vec<hipfire_runtime::prompt_frame::ToolCall> = calls
+                        .iter()
+                        .map(|c| hipfire_runtime::prompt_frame::ToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect();
+                    self.tool_calls_buf.extend(converted.iter().cloned());
+                    events.push(ClientEvent::ToolCalls(converted));
+                }
+            }
+        }
+        events.push(ClientEvent::Committed {
+            id: token,
+            idx: self.emitted_count,
+        });
+        self.emitted_count += 1;
+        events
+    }
+}
+
+impl<'a> SpecEmit for Deepseek4Emit<'a> {
+    fn begin(&mut self, first_token: u32) -> EmitOutcome {
+        // First generated token (the prefill argmax). Mirrors generate_deepseek4
+        // 9537-9553: EOS-first yields an empty turn — the inline `if
+        // spec_last_token != eos_tok` guard dropped it (no feed, no committed).
+        if first_token == self.eos_token {
+            return EmitOutcome {
+                events: Vec::new(),
+                stop: Some(StopReason::Eos),
+            };
+        }
+        EmitOutcome {
+            events: self.feed_and_emit(first_token),
+            stop: None,
+        }
+    }
+
+    fn observe(&mut self, token: u32) -> EmitOutcome {
+        // Per-accepted-token. Mirrors generate_deepseek4 9597-9622: an accepted
+        // token equal to `eos_tok` breaks the loop BEFORE emit — no feed, no
+        // committed event. The `generated_count >= max_tokens` guard stays in the
+        // decode loop (loop state, not emit policy).
+        if token == self.eos_token {
+            return EmitOutcome {
+                events: Vec::new(),
+                stop: Some(StopReason::Eos),
+            };
+        }
+        EmitOutcome {
+            events: self.feed_and_emit(token),
+            stop: None,
+        }
+    }
+
+    fn finish(mut self: Box<Self>) -> FinishSummary {
+        // Post-loop flush. Mirrors generate_deepseek4 9632-9638: `parser.finish()`
+        // → absorb + emit, then `tool_calls_parsed_count = emit_tool_calls_buf.len()`.
+        // The ds4 `done` envelope drives `finish_reason` off `tool_calls_parsed_count`
+        // (length-cap override is the caller's call).
+        use deepseek4::dsml::StreamEvent;
+        let mut events = Vec::new();
+        // `finish` consumes the parser by value; move it out of `self`.
+        let parser = std::mem::replace(&mut self.parser, deepseek4::dsml::StreamParser::new());
+        for ev in parser.finish() {
+            match ev {
+                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
+                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
+                StreamEvent::ToolCalls(calls) => {
+                    let converted: Vec<hipfire_runtime::prompt_frame::ToolCall> = calls
+                        .iter()
+                        .map(|c| hipfire_runtime::prompt_frame::ToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect();
+                    self.tool_calls_buf.extend(converted.iter().cloned());
+                    events.push(ClientEvent::ToolCalls(converted));
+                }
+            }
+        }
+        let tool_calls = self.tool_calls_buf.len();
+        let finish_reason = if tool_calls > 0 { "tool_calls" } else { "stop" };
+        FinishSummary {
+            events,
+            finish_reason,
+            tool_calls,
+        }
+    }
+}
+
 fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -9491,10 +9651,6 @@ fn generate_deepseek4(
             })
             .unwrap_or_default();
         let grammar_active = !tool_schemas.is_empty();
-        let mut parser = match think_mode {
-            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
-            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
-        };
         let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
         let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
             if m.decoded_vocab.is_none() {
@@ -9512,18 +9668,15 @@ fn generate_deepseek4(
             .map(|v| v.as_slice())
             .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-        use hipfire_arch_deepseek4::dsml::StreamEvent;
-        let mut absorb_event = |ev: &StreamEvent| {
-            if let StreamEvent::ToolCalls(calls) = ev {
-                for c in calls {
-                    emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
-                        name: c.name.clone(),
-                        arguments: c.arguments.clone(),
-                    });
-                }
-            }
-        };
+
+        // DSML emission behind the arch-generic `SpecEmit` seam (`Deepseek4Emit`):
+        // owns the `StreamParser` + tool-call accumulation buffer. The decode loop
+        // keeps all loop/cache state (position/seed advance, conversation-token
+        // bake, `generated_count`, `max_tokens` guard) and the in-step grammar
+        // (matcher/mask threaded INTO the spec step), and renders the returned
+        // `ClientEvent`s via `render_client_events` — byte-identical to the old
+        // inline `parser.feed` → `emit_stream_event` → `emit_committed_event`.
+        let mut emit = Deepseek4Emit::new(tokenizer, think_mode, eos_tok);
 
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
@@ -9534,22 +9687,22 @@ fn generate_deepseek4(
         // first token is dropped from every spec-decode response — a regression
         // vs the non-spec path (e.g. "Here's…" → "'s…"). Mirrors the in-loop
         // emission; EOS-first yields an empty turn (loop then no-ops).
-        if spec_last_token != eos_tok && generated_count < max_tokens {
-            let frag = tokenizer.decode(&[spec_last_token]);
-            for ev in parser.feed(&frag) {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
-            }
-            emit_committed_event(
+        if generated_count < max_tokens {
+            let outcome = emit.begin(spec_last_token);
+            render_client_events(
                 stdout,
                 id,
-                spec_last_token,
-                generated_count,
+                &outcome.events,
                 decode_t0.elapsed().as_millis() as u64,
             );
             let _ = stdout.flush();
-            m.conversation_tokens.push(spec_last_token);
-            generated_count += 1;
+            // The first-token EOS guard is now `begin`'s `StopReason::Eos` (empty
+            // events): only bake the token + advance `generated_count` when it was
+            // actually emitted (no stop).
+            if outcome.stop.is_none() {
+                m.conversation_tokens.push(spec_last_token);
+                generated_count += 1;
+            }
         }
         'outer: while generated_count < max_tokens {
             let lh: Option<&rdna_compute::GpuTensor> = unsafe {
@@ -9595,28 +9748,31 @@ fn generate_deepseek4(
             spec_drafts_accepted += r.n_accepted as u64;
 
             for &t in &r.accepted_tokens {
-                if generated_count >= max_tokens || t == eos_tok {
+                // `generated_count >= max_tokens` is loop state; the `t == eos_tok`
+                // early-stop is now `observe`'s `StopReason::Eos` (empty events —
+                // the inline path emitted nothing for an accepted EOS, then broke).
+                if generated_count >= max_tokens {
                     break 'outer;
                 }
-                let frag = tokenizer.decode(&[t]);
                 // Always route through the DSML StreamParser (new_in_think in
                 // thinking modes) so `<think>…</think>` is split into reasoning
                 // vs content server-side and emitted as structured events. The
                 // old non-grammar branch emitted raw tokens, leaving the CLI to
                 // client-side-parse a stream that (for V4 thinking mode) starts
                 // INSIDE the think block with no `<think>` opener in the output.
-                for ev in parser.feed(&frag) {
-                    absorb_event(&ev);
-                    emit_stream_event(stdout, id, ev);
-                }
-                emit_committed_event(
+                let outcome = emit.observe(t);
+                render_client_events(
                     stdout,
                     id,
-                    t,
-                    generated_count,
+                    &outcome.events,
                     decode_t0.elapsed().as_millis() as u64,
                 );
                 let _ = stdout.flush();
+                if outcome.stop.is_some() {
+                    // Accepted EOS: emitted nothing, broke out — the position/seed
+                    // update below is intentionally skipped (mirrors `break 'outer`).
+                    break 'outer;
+                }
                 m.conversation_tokens.push(t);
                 generated_count += 1;
             }
@@ -9629,13 +9785,10 @@ fn generate_deepseek4(
         // Flush buffered partial markers / unclosed think — always, not only
         // when tools are present. A thinking turn that fills max_tokens without
         // closing </think> must still surface its buffered reasoning.
-        for ev in parser.finish() {
-            absorb_event(&ev);
-            emit_stream_event(stdout, id, ev);
-        }
+        let finish = Box::new(emit).finish();
+        render_client_events(stdout, id, &finish.events, 0);
         let _ = stdout.flush();
-        drop(absorb_event);
-        tool_calls_parsed_count = emit_tool_calls_buf.len();
+        tool_calls_parsed_count = finish.tool_calls;
     } else {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
