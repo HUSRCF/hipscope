@@ -17,6 +17,7 @@ pub mod arch;
 pub mod arch_spec;
 pub mod augmentor;
 pub mod bf16_loader;
+pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod config;
