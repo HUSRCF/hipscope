@@ -113,10 +113,13 @@ of that.
 
 ## 6. Open items / recommendations
 
-1. **Deploy MTP** (wire into the daemon — currently `mtp_only_demo`-only). Spec: `LoadedModel.
-   qwen35_mtp_head`, `mtp_weights_present` bundle-probe for qwen, `generate_qwen35_mtp` (analog of
-   `generate_deepseek4`), `HIPFIRE_MTP_VERIFY_DECOUPLE` default-on for gfx11, `MtpSpecState`
-   lifecycle in reset/checkpoint/abort. Perf is proven; this makes it servable.
+1. **Deploy MTP — DONE** (commit `fd717e5d`). Wired into the daemon: `LoadedModel.qwen35_mtp_head`
+   (bundled `.mq4-mtp` trailer or `<trunk>.mtp` sidecar), `generate_qwen35_mtp`, gated
+   `HIPFIRE_QWEN_MTP=1` + greedy + arch 5/6 + single-GPU (default path unchanged), generation-local
+   `MtpSpecState` freed at every exit (state-bleed guard), defaults K=3/p_min=0.4. **Validated
+   gfx11 27B-3.6:** routes through MTP (`"mtp":true`), **lossless** (byte-identical to AR at
+   temp=0), **no state-bleed** (same prompt at positions b & d in a 4-request session →
+   byte-identical output + τ), perf over floor (prose 65 / code 78 / capital 93 tok/s decode).
 2. **Genre-aware mode selection** (DFlash for structured, MTP for prose) — or simply run MTP
    everywhere (it clears all genres; DFlash is faster on structured but MTP is durable everywhere).
 3. **DFlash prose retrain** (lossless, to lift DFlash prose τ→2+): a dedicated effort — build the
