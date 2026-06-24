@@ -3168,21 +3168,21 @@ pub fn spec_step_dflash(
             std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
-    // HIPFIRE_DFLASH_FAST_SAMPLE=1 (default OFF): in the temp>0 sampled path,
-    // compute the per-row softmax on the GPU (`softmax_temp_batched_into_f32`)
-    // instead of the host `exp` loop over the full vocab. The host RNG, accept
-    // test, residual sampler, and CACTUS math are UNCHANGED — they just read
-    // the GPU-produced probabilities instead of host-recomputed ones. The
+    // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
+    // sampled path, compute the per-row softmax (and the top_p nucleus cutoff) on
+    // the GPU instead of the host `exp` loop over the full vocab. The host RNG,
+    // accept test, residual sampler, and CACTUS math are UNCHANGED — they just
+    // read the GPU-produced probabilities instead of host-recomputed ones. The
     // D2H transfer size is identical (full-vocab probs vs full-vocab logits);
     // what moves to the GPU is the ~31×vocab `exp`/max/normalize work per
     // cycle. PARITY: distribution-only, NOT byte-identical (GPU tree-reduction
     // vs host sequential sum can differ at the last ULP and rarely flip a
-    // borderline `u*p_d <= p_t` accept) — hence opt-in + coherence-gate before
-    // any default flip. Greedy path (temp==0) is never affected.
+    // borderline `u*p_d <= p_t` accept) — validated coherent across genres
+    // (no attractors), so default-on. Greedy path (temp==0) is never affected.
     static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let fast_sample_active = use_temp_sampling
         && *FAST_SAMPLE_ENV.get_or_init(|| {
-            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() == Some("1")
+            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0")
         });
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(

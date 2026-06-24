@@ -7170,22 +7170,22 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
-    // Sampled (temp>0) spec-decode is only worthwhile with the GPU-softmax fast
-    // path (HIPFIRE_DFLASH_FAST_SAMPLE=1): without it, the host full-vocab softmax
-    // (~31 passes over the vocab per cycle) costs ~+19ms/cycle and makes sampled
-    // DFlash slower than AR. So a temp>0 request only routes to DFlash when
-    // fast-sample is enabled; otherwise it falls through to the AR path
-    // (byte-faithful at the requested temp/top_p). Greedy (temp<=1e-6) always
-    // routes to DFlash, unchanged. Note: fast-sample is distribution-parity
-    // (GPU softmax differs from host softmax at the last ULP, which can rarely
-    // flip a borderline accept), NOT byte-parity — validated coherent across
-    // genres but intentionally opt-in.
-    let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() == Some("1");
+    // Sampled (temp>0) spec-decode is DEFAULT-ON via the GPU-softmax fast path:
+    // it honors temp + top_p (lossless distribution-parity == AR-at-top_p) and
+    // runs ~1.4-1.5x AR. Opt out with HIPFIRE_DFLASH_FAST_SAMPLE=0 (→ AR,
+    // byte-faithful). The spec path does NOT honor top_k/min_p, so a request that
+    // sets either routes to AR for faithfulness. Greedy (temp<=1e-6) always
+    // routes to DFlash, unchanged. (Fast-sample is distribution-parity, not
+    // byte-parity — the GPU softmax differs from the host at the last ULP, which
+    // can rarely flip a borderline accept; validated coherent across genres.)
+    let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
+    let topk_or_minp =
+        top_k.map(|k| k > 0).unwrap_or(false) || min_p.map(|p| p > 0.0).unwrap_or(false);
     if m.dflash.is_some()
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
-        && (temp <= 1e-6 || fast_sample_on)
+        && (temp <= 1e-6 || (fast_sample_on && !topk_or_minp))
     {
         // One-time visibility: top_p IS now honored on the DFlash spec sampled
         // path (identical nucleus truncation on draft + target → lossless ==
