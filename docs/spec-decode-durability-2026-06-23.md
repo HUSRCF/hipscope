@@ -86,6 +86,37 @@ knob (greedy MTP is distribution-preserving at any threshold). MTP perf is prove
 `mtp_only_demo`; it is **not yet daemon-wired** (only ds4 MTP is) — deployment is the remaining
 implement step (§6).
 
+## 2.5 Sampled (temp>0) serving — DFlash + GPU-softmax fast path
+
+The matrices above are greedy (temp=0). For **sampled** serving, DFlash runs via
+lossless rejection sampling; the per-cycle full-vocab softmax was the bottleneck
+(~31 CPU passes/cycle ≈ +19ms), so a GPU-softmax fast path
+(`HIPFIRE_DFLASH_FAST_SAMPLE=1`) moves it on-device, cutting the overhead **~89%**
+(59.3 → 42.7 ms/cycle) so sampled per-cycle ≈ greedy.
+
+| Genre | sampled tok/s | AR× | τ | floor |
+|---|---|---|---|---|
+| code | 66.2 | 1.54× | 2.91 | ≥1.3× ✓ |
+| reason | 69.1 | 1.61× | 3.05 | ✓ |
+| instruct | 72.0 | 1.67× | 3.32 | ✓ |
+| prose | 54.5 | 1.27× | 2.16 | 1.15× ✓ / 1.3× ✗ |
+| creative fiction | 52.8–52.9 | 1.23× | 2.05–2.06 | 1.15× ✓ / 1.3× ✗ |
+
+Structured genres clear the 1.3× DFlash floor; prose/fiction clear the 1.15× MTP
+floor but land ~5% under the strict 1.3× — the **structural lower sampled τ**
+(rejection sampling accepts fewer than greedy argmax: prose τ2.16 sampled vs 3.10
+greedy), NOT overhead (per-cycle is already ≈greedy).
+
+**Parity:** distribution-parity, not byte-parity. The GPU softmax (tree reduction)
+differs from the host softmax (sequential) at the last ULP, rarely flipping a
+borderline accept; the committed distribution is the same temp-T distribution up
+to rounding. Validated: long common prefix then benign divergence into equally
+valid continuations; coherence-clean across all 6 genres (unique-word ratio
+0.61–0.80, 3gram-rep <0.02, no attractors). **Safe default:** opt-in — without the
+flag, temp>0 → AR (byte-faithful). `top_p`/`top_k` are not honored on the sampled
+DFlash path (full-vocab temp-only; one-time warning). MTP sampled stays off (its
+arch-layer sampled path is lossy).
+
 ## 3. The prose dividing line
 
 Prose is the entire story. High-entropy narrative text means the target distribution is flat, so a
