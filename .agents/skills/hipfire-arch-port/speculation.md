@@ -56,7 +56,7 @@ daemon decode loop  ──drives──▶  &mut dyn Speculator        (policy: d
 - **Build (your own `Speculator` impl):** a *learned* drafter — DFlash (small
   same-family draft model), MTP (multi-token-prediction head), or EAGLE. These
   need trained weights and per-arch kernels. If your arch is an MTP family,
-  implement the smaller `MtpDrafter` (`spec.rs:461`) and let `MtpSpeculator`
+  implement the smaller `MtpDrafter` (`spec.rs:492`) and let `MtpSpeculator`
   adapt it to `Speculator` for you — you never write a whole `Speculator`.
 
 For a brand-new arch, **start with n-gram**: it's the cheap correctness-preserving
@@ -131,9 +131,9 @@ verify scratch lazily via `SpecTarget::new_spec_scratch` on first `prefill`.
 `SpecTarget`, use the generic in-place guard — one line:
 
 ```rust
-fn spec_target_guard<'m>(&self, state: &'m mut Option<ModelState>, _path: &str)
+fn spec_target_guard<'m>(&self, state: &'m mut Option<ModelState>, _model_path: &str)
     -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-    match state {
+    match state.as_mut() {
         Some(ModelState::YourArch(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
         _ => Err("not a loaded <yourarch> bundle".into()),
     }
@@ -196,5 +196,5 @@ machine. This does **not** affect generated tokens, only their rendering.
 | Canonical `SpecTarget` template (pure attention) | `crates/hipfire-arch-qwen2/src/spec_impl.rs` |
 | Recurrent-state template (snapshot/rewind) | `crates/hipfire-arch-qwen35/src/spec_impl.rs`, `crates/hipfire-arch-lfm2moe/src/spec_impl.rs` |
 | VL bespoke-decode routing example | `decode_vl_dots_ocr_ngram` in `crates/hipfire-runtime/examples/daemon.rs` |
-| MTP drafter core (learned, multi-token) | `MtpDrafter` / `MtpSpeculator` in `spec.rs:461` |
+| MTP drafter core (learned, multi-token) | `MtpDrafter` (`spec.rs:492`) / `MtpSpeculator` (`spec.rs:543`) |
 | Per-arch support status + measured τ | `docs/speculation-support-inventory.md` |

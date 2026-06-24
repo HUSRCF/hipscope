@@ -137,8 +137,14 @@ impl Carrier for Qwen2Carrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
         // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
         // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
             speculator,
@@ -576,8 +582,14 @@ impl Carrier for LlamaCarrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
         // no DFlash draft and no eviction by default; the arm builds its verify
         // scratch lazily on first prefill, so only ctx_capacity is needed here.
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
             speculator,
@@ -644,8 +656,14 @@ impl Carrier for DotsOcrCarrier {
         // output is densely self-repeating. The daemon's `generate_vl_dots_ocr`
         // routes to the spec decode loop when this is `Some` (vision prefill is
         // unchanged; only the decode phase becomes speculative).
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             qwen2_state: Some(state),
             dots_ocr_config: Some(config),
@@ -858,8 +876,14 @@ impl Carrier for MinimaxCarrier {
         // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
         // can be driven by the arch-generic spec loop with no draft model.
         // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -943,8 +967,14 @@ impl Carrier for Lfm2MoeCarrier {
         // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
         // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
         // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
                 config,
@@ -1020,6 +1050,7 @@ impl Carrier for Cohere2MoeCarrier {
                     None,
                     true,
                     ctx.max_seq,
+                    ctx.spec,
                 );
                 Ok(lm)
             }
@@ -1047,6 +1078,7 @@ impl Carrier for Cohere2MoeCarrier {
                     None,
                     true,
                     ctx.max_seq,
+                    ctx.spec,
                 );
                 Ok(LoadedModel {
                     state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {

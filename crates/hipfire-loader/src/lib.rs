@@ -25,7 +25,7 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
+use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -785,8 +785,14 @@ fn finish_qwen35_load(
     // it is still available for the struct literal below; `config`/`dn_state` are
     // borrowed only for the n-gram arm's scratch construction (snapshot copied to
     // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
-    let speculator =
-        crate::spec_build::build_speculator(arch_id, dflash, mtp, eviction.is_none(), physical_cap);
+    let speculator = crate::spec_build::build_speculator(
+        arch_id,
+        dflash,
+        mtp,
+        eviction.is_none(),
+        physical_cap,
+        ctx.spec,
+    );
 
     let state = Some(ModelState::Qwen35(bundle));
     Ok(LoadedModel {
@@ -811,6 +817,7 @@ fn finish_qwen35_load(
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
+#[allow(clippy::too_many_arguments)]
 pub fn load_model(
     path: &str,
     max_seq: usize,
@@ -820,6 +827,7 @@ pub fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
+    spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
@@ -904,6 +912,7 @@ pub fn load_model(
         state_quant_override,
         cask,
         pp,
+        spec,
         gpu,
     };
 

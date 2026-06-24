@@ -155,6 +155,7 @@ pub fn build_speculator(
     mtp: Option<Qwen35MtpHead>,
     eviction_is_none: bool,
     ctx_capacity: usize,
+    ngram: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
         return Some(build_dflash_speculator(df, eviction_is_none));
@@ -184,24 +185,38 @@ pub fn build_speculator(
         eprintln!("  qwen35 MTP head present but arm declined (eviction/arch) — ignored");
         let _ = head;
     }
-    let ngram_enabled = std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() == Some("1");
-    // Spec-capable arches with a `SpecTarget` impl: qwen35 DeltaNet (5/6), the
-    // dense LLaMA family (0 = LLaMA/Mistral, 1 = plain Qwen3), and Qwen2 (7 =
-    // VibeThinker etc., its own `Qwen2State` KV).
+    // n-gram enable resolves env-wins-else-param: an explicit `HIPFIRE_NGRAM_DRAFT`
+    // (the top of the config ladder) overrides; otherwise the CLI-resolved
+    // `ngram.ngram_draft` (per-model > global, already folded by the CLI) decides;
+    // absent both, off. This keeps a directly-driven daemon (no hipfire CLI,
+    // `HIPFIRE_NGRAM_DRAFT=1`) working while letting the config ladder drive it.
+    let ngram_enabled = match std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() {
+        Some("1") => true,
+        Some(_) => false, // env set to anything else explicitly disables
+        None => ngram.ngram_draft.unwrap_or(false),
+    };
+    // Spec-capable arches with a `SpecTarget` impl: dense LLaMA family
+    // (0 = LLaMA/Mistral, 1 = plain Qwen3), qwen35 DeltaNet (5/6), Qwen2
+    // (7 = VibeThinker, own `Qwen2State` KV), dots-ocr (8, VL decode-phase),
+    // minimax (10), lfm2moe (11, conv-state rollback), cohere2moe (12).
     if ngram_enabled && matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8 | 10 | 11 | 12) {
         // Default K=12: the batched (weight-BW-bound) verify makes wider draft
         // windows nearly free, and an n-gram K-sweep (vibethinker-3b, 2026-06-23)
         // showed acceptance saturates at K≈12 (tau ~0.38) — K=12 peaks decode
         // tok/s, K=16 ties, K≥24 regresses (wasted verify on drafts past the
-        // acceptance plateau). min_count stays 2 (a measured no-op knob).
+        // acceptance plateau). Resolution mirrors the enable flag: env wins, else
+        // the CLI-resolved param (per-model > global, from `ngram_k`/
+        // `ngram_min_count`), else the default. K keeps its `.max(2)` floor.
         let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or(ngram.ngram_k)
             .unwrap_or(12usize)
             .max(2);
         let min_count = std::env::var("HIPFIRE_NGRAM_MIN_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or(ngram.ngram_min_count)
             .unwrap_or(2u32);
         eprintln!(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",

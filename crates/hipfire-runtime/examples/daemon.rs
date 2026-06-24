@@ -985,6 +985,30 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3) as usize;
 
+                // Model-free n-gram speculator config, forwarded by the CLI after
+                // resolving the `speculation` selector + legacy knobs through the
+                // config ladder (env > flag > per-model > global). `ngram_draft`
+                // is the per-load enable; `ngram_k`/`ngram_min_count` tune the
+                // drafter. The loader applies env-wins over these (so a directly
+                // driven daemon with `HIPFIRE_NGRAM_DRAFT=1` still works). Absent
+                // params leave the fields `None` → loader defaults / env.
+                let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+                    ngram_draft: msg
+                        .get("params")
+                        .and_then(|p| p.get("ngram_draft"))
+                        .and_then(|v| v.as_bool()),
+                    ngram_k: msg
+                        .get("params")
+                        .and_then(|p| p.get("ngram_k"))
+                        .and_then(|v| v.as_u64())
+                        .map(|k| k as usize),
+                    ngram_min_count: msg
+                        .get("params")
+                        .and_then(|p| p.get("ngram_min_count"))
+                        .and_then(|v| v.as_u64())
+                        .map(|c| c as u32),
+                };
+
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
                 // Accepted here; the generate loop will honor it in the
@@ -1250,6 +1274,7 @@ fn main() {
                         state_quant_override.as_deref(),
                         &cask,
                         pp,
+                        spec_cfg,
                         &mut gpu,
                     )
                 };
