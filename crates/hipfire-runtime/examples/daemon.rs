@@ -12284,6 +12284,10 @@ fn run_dots_ocr_ngram_loop(
     let mut emitted: Vec<u32> = Vec::new();
     let mut position = prompt_ids.len();
     let mut seed_token = first_token;
+    // τ accounting (accepted drafts / windows) — mirrors the text spec path so
+    // the done envelope reports acceptance for diagnosing spec-vs-AR perf.
+    let mut spec_cycles = 0usize;
+    let mut spec_accepted = 0usize;
     // Tokens to stream this iteration. First window = the prefill seed alone
     // (mirrors the AR loop emitting the first argmax), then the accepted
     // committed tail from each `spec.step` (seed re-echo already stripped).
@@ -12342,6 +12346,8 @@ fn run_dots_ocr_ngram_loop(
                 break;
             }
         };
+        spec_cycles += 1;
+        spec_accepted += step.accepted;
         // Advance by the emitted-tail length (= accepted + 1), per the spec.rs
         // `emit_len_drives_advance` contract; the target already wrote KV for the
         // whole tail in `verify_block`.
@@ -12367,9 +12373,14 @@ fn run_dots_ocr_ngram_loop(
     } else {
         0.0
     };
+    let tau = if spec_cycles > 0 {
+        spec_accepted as f64 / spec_cycles as f64
+    } else {
+        0.0
+    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}}}"#,
         id,
         generated,
         tok_s,
@@ -12377,7 +12388,9 @@ fn run_dots_ocr_ngram_loop(
         prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
-        prefill_s * 1000.0
+        prefill_s * 1000.0,
+        tau,
+        spec_cycles
     );
     let _ = stdout.flush();
 }

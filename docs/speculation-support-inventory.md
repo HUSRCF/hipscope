@@ -198,6 +198,38 @@ small 1.5B Qwen2 GEMMs costs more than the ~1–2 tokens it commits per window
 (same MQ4 GEMM-batching ceiling noted for qwen2). **Perf is the deferred
 follow-up**; correctness/wiring is complete.
 
+### Perf follow-up — batched verify FALSIFIED as the fix (2026-06-24 τ measurement)
+
+The deferred "batched verify" perf follow-up was **measured and falsified**
+before building. n-gram acceptance (τ = accepted drafts / window) on the wired
+no-drafter arches, greedy, on gfx1151:
+
+| Arch | Workload | Verify path | τ | decode tok/s vs AR |
+|---|---|---|---|---|
+| cohere2moe (12) | free-form code (LRUCache) | sequential | **0.16** | slower (AR done has no tok/s; cycles=172 → 1.16 tok/cycle ≈ AR) |
+| cohere2moe (12) | verbatim copy | sequential | **0.42** | slower |
+| dots-ocr (8) | structured OCR (table page) | **batched** (qwen2 kernel) | **0.48** | **0.55×** (28.7 vs 52.6) |
+
+**Conclusion:** the binding constraint is **draft acceptance, not verify speed.**
+A batched verify amortizes the per-window weight read across a *wide accepted*
+draft — worthless when only ~0.2–0.5 tokens are accepted per window (τ≪1). The
+dots-ocr row is decisive: it *already* runs the block-parallel qwen2 batched
+verify, on the highest-repetition workload of the set, and is still 0.55×.
+n-gram beats AR only when τ≳3 (literal copy / long-context retrieval — the
+qwen2 +46% long-ctx and llama +73% copy cases); these reasoning/extraction
+models on these workloads do not repeat literally enough. Building a minimax
+(79 GB MoE) batched verify is near-certainly wasted: minimax is a free-form
+reasoning model, so its τ will track cohere2moe's ~0.16. **Do NOT build the
+batched verify on this evidence** — the real path to a spec win on these arches
+is a *learned* drafter (EAGLE-3 / MTP, see upstream survey above), not a verify
+kernel. n-gram stays correct + opt-in (`HIPFIRE_NGRAM_DRAFT=1`); it is a niche
+win gated on high-literal-repetition traffic.
+
+Diagnostic added: `run_dots_ocr_ngram_loop`'s done envelope now reports
+`tau`/`cycles` (parity with the text spec path), so spec-vs-AR acceptance is
+visible per request. Probes: `/home/bjoern/hipfire-ngram-validate/tau_probe.py`,
+`tau_copy_probe.py`.
+
 ### Key integration finding (all 4 arches)
 The orphan rule forced each agent to define a NEW bundle struct *in the arch crate*
 (parallel to the existing `hipfire_loader::*Bundle`), because `SpecTarget` is a
