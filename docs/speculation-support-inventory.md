@@ -209,21 +209,37 @@ no-drafter arches, greedy, on gfx1151:
 | cohere2moe (12) | free-form code (LRUCache) | sequential | **0.16** | slower (AR done has no tok/s; cycles=172 → 1.16 tok/cycle ≈ AR) |
 | cohere2moe (12) | verbatim copy | sequential | **0.42** | slower |
 | dots-ocr (8) | structured OCR (table page) | **batched** (qwen2 kernel) | **0.48** | **0.55×** (28.7 vs 52.6) |
+| minimax (10) | free-form code (LRUCache) | **sequential** | **0.30** | slower (17.9 tok/s n-gram; cycles=153 → 1.3 tok/cycle) |
 
-**Conclusion:** the binding constraint is **draft acceptance, not verify speed.**
-A batched verify amortizes the per-window weight read across a *wide accepted*
-draft — worthless when only ~0.2–0.5 tokens are accepted per window (τ≪1). The
-dots-ocr row is decisive: it *already* runs the block-parallel qwen2 batched
-verify, on the highest-repetition workload of the set, and is still 0.55×.
-n-gram beats AR only when τ≳3 (literal copy / long-context retrieval — the
-qwen2 +46% long-ctx and llama +73% copy cases); these reasoning/extraction
-models on these workloads do not repeat literally enough. Building a minimax
-(79 GB MoE) batched verify is near-certainly wasted: minimax is a free-form
-reasoning model, so its τ will track cohere2moe's ~0.16. **Do NOT build the
-batched verify on this evidence** — the real path to a spec win on these arches
-is a *learned* drafter (EAGLE-3 / MTP, see upstream survey above), not a verify
-kernel. n-gram stays correct + opt-in (`HIPFIRE_NGRAM_DRAFT=1`); it is a niche
-win gated on high-literal-repetition traffic.
+**Conclusion (nuanced — splits by whether the model is weight-BW-bound):**
+
+For **small / compute-bound** decoders (dots-ocr 1.5B), batched verify does NOT
+help: a B-token verify costs ~B× the compute (GEMM FLOPs scale with B; the model
+is launch/compute-bound, not BW-bound), so there is no amortization. dots-ocr is
+decisive: it *already* runs the block-parallel qwen2 batched verify, on the
+highest-repetition workload of the set, and is still 0.55×. Here acceptance
+(τ≪1) AND the lack of BW-amortization both sink it. cohere2moe (mid, sequential
+verify) is the same story.
+
+For **large / weight-BW-bound** decoders (minimax 79 GB MoE), the calculus
+differs: `forward_batch` reads each weight ~once for all B tokens, so a batched
+verify costs ~1 weight-read/cycle while committing (τ+1) tokens/cycle. At the
+measured **τ=0.30** that is ~1.3 tokens per weight-read vs AR's 1.0 → a *plausible*
+~1.3× decode win, where the current **sequential** verify (≈B forwards/cycle) is
+a loss. **Two caveats keep this modest + uncertain:** (1) ceiling is only ~1.3×
+at τ=0.30 (not the 2–5× the `forward_batch` docstring cites for high-τ DFlash);
+(2) **MoE erodes the amortization** — B tokens route to up to B×k *different*
+experts, so the batch reads more expert weight than one token does (partial, not
+full, amortization). Realistic outcome: break-even to ~1.3×.
+
+**Decision:** minimax is the ONE arch where a batched verify *could* pay off
+(BW-bound), but the upside is modest and MoE-uncertain; the effort is porting
+`forward_batch` to return per-row logits/argmax (a verify variant). The other
+three arches are falsified (compute-bound and/or τ≪1) — do NOT build batched
+verify for them. The general path to a real spec win remains a *learned* drafter
+(EAGLE-3 / MTP, see upstream survey), not a verify kernel. n-gram stays correct
++ opt-in (`HIPFIRE_NGRAM_DRAFT=1`); a niche win gated on high-literal-repetition
+traffic or (minimax only) a BW-bound batched-verify port.
 
 Diagnostic added: `run_dots_ocr_ngram_loop`'s done envelope now reports
 `tau`/`cycles` (parity with the text spec path), so spec-vs-AR acceptance is
