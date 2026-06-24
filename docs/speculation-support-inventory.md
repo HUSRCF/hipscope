@@ -116,12 +116,16 @@ Per-arch wrinkles:
 
 ## n-gram seam — work log
 
+Dispatch snapshot from the one-agent-per-arch-crate phase (compile-check only).
+The `Status` column records that phase; all four are now **fully wired + GPU-validated**
+— see the completion table in the next section for the authoritative state.
+
 | Arch | Agent | spec_impl.rs | Bundle type | Status |
 |---|---|---|---|---|
-| minimax (10) | sonnet | ✅ compiles `-p hipfire-arch-minimax` | `hipfire_arch_minimax::MiniMaxBundle` (new) | impl done; wiring pending |
-| cohere2moe (12) | sonnet | ✅ compiles `-p hipfire-arch-cohere2moe` | `hipfire_arch_cohere2moe::Cohere2MoeBundle` (new) | impl done; wiring pending |
-| dots-ocr (8) | sonnet | ✅ compiles `-p hipfire-arch-dots-ocr` | `hipfire_arch_dots_ocr::DotsOcrBundle` (new) | impl done; wiring + VL-routing pending |
-| lfm2moe (11) | opus | ✅ compiles `-p hipfire-arch-lfm2moe` | `hipfire_arch_lfm2moe::Lfm2MoeBundle` (new) | impl done (conv-state snapshot/restore); wiring pending |
+| minimax (10) | sonnet | ✅ compiles `-p hipfire-arch-minimax` | `hipfire_arch_minimax::MiniMaxBundle` (new) | ✅ wired + GPU-validated (see below) |
+| cohere2moe (12) | sonnet | ✅ compiles `-p hipfire-arch-cohere2moe` | `hipfire_arch_cohere2moe::Cohere2MoeBundle` (new) | ✅ wired + GPU-validated (see below) |
+| dots-ocr (8) | sonnet | ✅ compiles `-p hipfire-arch-dots-ocr` | `hipfire_arch_dots_ocr::DotsOcrBundle` (new) | ✅ wired (VL decode-phase) + GPU-validated (see below) |
+| lfm2moe (11) | opus | ✅ compiles `-p hipfire-arch-lfm2moe` | `hipfire_arch_lfm2moe::Lfm2MoeBundle` (new) | ✅ wired (conv-state rollback) + GPU-validated (see below) |
 
 Agents were scoped to their own arch crate (`spec_impl.rs` + `lib.rs` mod) and
 compile-check only; the shared wiring is integrated afterward.
