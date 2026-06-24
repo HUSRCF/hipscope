@@ -2241,27 +2241,53 @@ pub fn spec_step_mtp_compressed_serial(
     // implementation — a low-confidence draft still gets to face trunk
     // verify, but we stop spending compute speculating further.
     let p_min = state.p_min;
-    let use_p_min = p_min > 0.0;
-    let log_p_min = if use_p_min {
-        p_min.ln()
-    } else {
-        f32::NEG_INFINITY
+    let sampling = state.sampling;
+    // The K-step draft pick and the trunk-verify accept rule run in exactly ONE
+    // of three modes per step. Modeling it as `DraftMode` makes the illegal
+    // `p_min + sampling` combination unrepresentable downstream — it was
+    // previously a runtime `panic!` deep inside the step. The legacy
+    // `use_p_min` / `use_sampling` / `log_p_min` bindings are derived from this
+    // single source of truth below so they can never disagree.
+    //
+    // Sampling vs greedy: when sampling.temp > 0, the K-chain SAMPLES from each
+    // draft distribution (instead of argmax) and trunk verify applies a residual
+    // acceptance rule (instead of strict argmax-match). Matches Unsloth/llama.cpp
+    // #22673 canonical MTP recipe (temp=1.0, top_p=0.95, top_k=20). p_min stops
+    // speculating further once a draft's confidence drops below the cutoff.
+    #[derive(Debug, Clone, Copy)]
+    enum DraftMode {
+        /// temp == 0, p_min == 0: argmax draft + strict argmax-match accept.
+        Greedy,
+        /// temp == 0, p_min > 0: top-2 logsumexp draft with a confidence cutoff.
+        PMin { log_p_min: f32 },
+        /// temp > 0: sampled draft + residual acceptance (temp/top_p in state.sampling).
+        Sampled,
+    }
+    let draft_mode = match (sampling.is_greedy(), p_min > 0.0) {
+        (false, true) => {
+            // p_min uses topk_logsumexp_batched, which doesn't compose with
+            // arbitrary top_k/top_p sampling — caller must pick one. (Was a panic!.)
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "spec_step_mtp_compressed_serial: --mtp-p-min and --temp > 0 are mutually exclusive (got p_min={p_min}, temp={})",
+                    sampling.temp
+                ),
+            ));
+        }
+        (false, false) => DraftMode::Sampled,
+        (true, true) => DraftMode::PMin {
+            log_p_min: p_min.ln(),
+        },
+        (true, false) => DraftMode::Greedy,
+    };
+    let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
+    let use_sampling = matches!(draft_mode, DraftMode::Sampled);
+    let log_p_min = match draft_mode {
+        DraftMode::PMin { log_p_min } => log_p_min,
+        _ => f32::NEG_INFINITY,
     };
     let mut chain_truncated = false;
-
-    // Sampling vs greedy: when sampling.temp > 0, K-chain SAMPLES from each
-    // draft distribution (instead of argmax) and trunk verify applies a
-    // residual acceptance rule (instead of strict argmax-match). Matches
-    // Unsloth/llama.cpp #22673 canonical MTP recipe (temp=1.0, top_p=0.95,
-    // top_k=20). Greedy path (temp=0) unchanged.
-    let sampling = state.sampling;
-    let use_sampling = !sampling.is_greedy();
-    if use_sampling && use_p_min {
-        // p_min logic uses the topk_logsumexp_batched output, which doesn't
-        // straightforwardly compose with arbitrary top_k/top_p sampling.
-        // Disallow the combination for now — caller picks one or the other.
-        panic!("spec_step_mtp_compressed_serial: --mtp-p-min and --temp > 0 are mutually exclusive (got p_min={p_min}, temp={})", sampling.temp);
-    }
     let mut draft_probs: Vec<f32> = if use_sampling {
         Vec::with_capacity(max_n)
     } else {
