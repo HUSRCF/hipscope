@@ -3075,6 +3075,22 @@ pub fn spec_step_dflash(
             std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
+    // HIPFIRE_DFLASH_FAST_SAMPLE=1 (default OFF): in the temp>0 sampled path,
+    // compute the per-row softmax on the GPU (`softmax_temp_batched_into_f32`)
+    // instead of the host `exp` loop over the full vocab. The host RNG, accept
+    // test, residual sampler, and CACTUS math are UNCHANGED — they just read
+    // the GPU-produced probabilities instead of host-recomputed ones. The
+    // D2H transfer size is identical (full-vocab probs vs full-vocab logits);
+    // what moves to the GPU is the ~31×vocab `exp`/max/normalize work per
+    // cycle. PARITY: distribution-only, NOT byte-identical (GPU tree-reduction
+    // vs host sequential sum can differ at the last ULP and rarely flip a
+    // borderline `u*p_d <= p_t` accept) — hence opt-in + coherence-gate before
+    // any default flip. Greedy path (temp==0) is never affected.
+    static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast_sample_active = use_temp_sampling
+        && *FAST_SAMPLE_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() == Some("1")
+        });
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -3340,7 +3356,26 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if use_temp_sampling {
+            if use_temp_sampling && fast_sample_active {
+                // FAST_SAMPLE: GPU softmax → download probs (same D2H size as
+                // logits). Host RNG/sample math is byte-for-byte the same calls
+                // as the default arm below — only the softmax `exp` work moved
+                // off-host. Distribution-parity, not byte-parity (see flag doc).
+                let probs_gpu = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, batch, temp)?;
+                let host_probs = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                debug_assert_eq!(host_probs.len(), batch * vocab);
+                draft_softmaxes.reserve(batch);
+                for i in 0..batch {
+                    let probs = host_probs[i * vocab..(i + 1) * vocab].to_vec();
+                    let u = xorshift_next_unit(rng_state);
+                    let t = sample_categorical(&probs, u);
+                    draft_probs_at_drafted.push(probs[t as usize]);
+                    drafted.push(t);
+                    draft_softmaxes.push(probs);
+                }
+            } else if use_temp_sampling {
                 // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
                 let host_logits = gpu.download_f32(&logits_batch)?;
                 debug_assert_eq!(host_logits.len(), batch * vocab);
@@ -3513,7 +3548,12 @@ pub fn spec_step_dflash(
         position,
         hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active, // full target logits needed for rejection sampling, RP, or n-gram block
+        // Full target logits are D2H'd to the host for rejection sampling, RP,
+        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
+        // GPU-softmaxed target probs directly from the resident
+        // `verify_scratch.logits` buffer, so the host full-logit download +
+        // host argmax are skipped — that's the target-side half of the cost cut.
+        (use_temp_sampling && !fast_sample_active) || host_path_active,
         verify_scratch,
     )?;
 
@@ -3539,9 +3579,30 @@ pub fn spec_step_dflash(
     let mut accept_len = 0usize;
     let bonus_token;
     if use_temp_sampling {
-        let tgt_logits = &verify_out.logits_per_pos;
-        debug_assert_eq!(tgt_logits.len(), b * vocab);
         debug_assert_eq!(draft_softmaxes.len(), b - 1);
+        // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
+        // all B rows and download the probs. The accept loop below then reads
+        // `target_probs` from this buffer instead of calling the host
+        // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+        // distribution-parity probs. The verify logits are still resident in
+        // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
+        // and only ran GPU-argmax afterwards, which does not overwrite it).
+        let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+            gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
+            let host = gpu.download_f32(&probs_gpu)?;
+            let _ = gpu.free_tensor(probs_gpu);
+            debug_assert_eq!(host.len(), b * vocab);
+            Some(host)
+        } else {
+            // Non-fast path: the host full-vocab logits from verify are the
+            // softmax input. Bound here so the fast path never touches the
+            // (now-empty) `logits_per_pos`.
+            debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
+            None
+        };
+        let tgt_logits = &verify_out.logits_per_pos;
         let mut target_probs = Vec::with_capacity(vocab);
         let mut rejected_bonus: Option<u32> = None;
         // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
@@ -3550,11 +3611,16 @@ pub fn spec_step_dflash(
         // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
         let use_cactus = cactus_delta > 0.0;
         for i in 0..b - 1 {
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+            }
             let t = block[i + 1] as usize;
             let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
             let p_t = target_probs[t];
@@ -3601,11 +3667,16 @@ pub fn spec_step_dflash(
         } else {
             // All accepted: sample from target_softmax at position B-1.
             let i = b - 1;
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+            }
             let u = xorshift_next_unit(rng_state);
             sample_categorical(&target_probs, u)
         };

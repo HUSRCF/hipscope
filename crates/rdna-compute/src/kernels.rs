@@ -3267,6 +3267,13 @@ pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
 pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/softmax_prob_gather_batched.hip");
 
+/// Batched temperature-scaled softmax, out-of-place. One block per row;
+/// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
+/// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
+/// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+pub const SOFTMAX_TEMP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/softmax_temp_batched.hip");
+
 /// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
 /// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[32] (32B) = 36 bytes per 64 elements.
 /// Dequant: weight = (_Float16)(nibble) * scale + min — single FP16 FMA on RDNA.

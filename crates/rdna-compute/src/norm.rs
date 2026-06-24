@@ -431,6 +431,62 @@ impl Gpu {
         )
     }
 
+    /// Batched temperature-scaled softmax, out-of-place. For each of `rows`
+    /// rows of width `vocab`, writes `probs[r] = softmax(logits[r] / temp)`
+    /// into `probs` and leaves `logits` untouched.
+    ///
+    /// Mirrors the host `softmax_temp_into` (apply temp to each logit, max over
+    /// scaled logits, exp(scaled - max), normalize). The GPU reduction order
+    /// (tree) differs from the host sequential sum, so the result is
+    /// DISTRIBUTION-parity, NOT byte-identical — used only behind the
+    /// HIPFIRE_DFLASH_FAST_SAMPLE opt-in in the DFlash sampled path.
+    pub fn softmax_temp_batched_into_f32(
+        &mut self,
+        logits: &GpuTensor,
+        probs: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+        temp: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_temp_batched",
+            kernels::SOFTMAX_TEMP_BATCHED_SRC,
+            "softmax_temp_batched_f32",
+        )?;
+
+        let logits_ptr = logits.buf.as_ptr();
+        let probs_ptr = probs.buf.as_ptr();
+        let n_val = vocab as i32;
+        let inv_t = 1.0f32 / temp;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &logits_ptr as *const _ as *mut c_void,
+            &probs_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_t as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32.min(vocab as u32).max(1);
+        let shared_mem = block * 4;
+
+        self.launch_maybe_blob(
+            "softmax_temp_batched_f32",
+            [rows as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(logits_ptr);
+                b.push_ptr(probs_ptr);
+                b.push_i32(n_val);
+                b.push_f32(inv_t);
+                b
+            },
+        )
+    }
+
     /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.
     /// pos_buf: GPU buffer containing a single i32 position value.
     pub fn rope_f32(

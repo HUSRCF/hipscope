@@ -3964,6 +3964,21 @@ fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
+    // historical DFlash posture). >0 → lossless rejection-sampling inside
+    // spec_step_dflash (full-vocab softmax on BOTH draft + target, so the
+    // committed-token distribution exactly equals the target's own temp-T
+    // sampling). NOTE: top_p/top_k/min_p are intentionally NOT plumbed here —
+    // spec_step_dflash has no nucleus parameter, and truncating only one of the
+    // two softmaxes would break the rejection-sampling invariant. A temp>0
+    // request carrying a non-default top_p gets temp-only sampling (a one-time
+    // warn is emitted at the routing site).
+    temp: f32,
+    // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
+    // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
+    // daemon hardcodes 0.0; the param exists only so a future opt-in request
+    // field can reach it without re-touching this signature.
+    cactus_delta: f32,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -4782,15 +4797,18 @@ fn generate_dflash(
                 seed_token,
                 None, // ctx_slice = full history
                 Some(&mut df.gdn_tape),
-                0.0_f32, // temperature
+                temp, // request-resolved temperature (0.0 = greedy/argmax-accept;
+                // >0 = lossless rejection-sampling, equals target temp-T sampling
+                // when cactus_delta==0). top_p/top_k are NOT honored on this path
+                // (spec_step_dflash is full-vocab softmax both sides — see caller).
                 &mut rng_state,
                 None, // block_size override
                 None, // ngram_cache
                 &emitted,
-                0.0_f32, // cactus_delta
-                None,    // pld_spine
-                1.0_f32, // repeat_penalty (off)
-                0,       // repeat_window
+                cactus_delta, // 0.0 from the daemon (lossless); >0 is deliberately lossy
+                None,         // pld_spine
+                1.0_f32,      // repeat_penalty (off)
+                0,            // repeat_window
             )
         };
         let step = match step_result {
@@ -7051,9 +7069,16 @@ fn generate(
         );
         return;
     }
-    // DFlash fast path -- only when a draft model is loaded AND temperature is
-    // effectively 0 (DFlash is greedy-only in this integration). Skip the
-    // normal AR sampling setup entirely.
+    // DFlash fast path -- only when a draft model is loaded. DFlash now serves
+    // BOTH greedy (temp≈0 → argmax-accept) AND temp>0 (lossless rejection-
+    // sampling: full-vocab softmax on draft + target, accept `u*p_draft <=
+    // p_target`, rejection/all-accept bonus from the renormalized residual /
+    // target softmax — so the committed distribution exactly equals the target's
+    // own temp-T sampling at cactus_delta==0). Skip the normal AR sampling setup
+    // entirely. CAVEAT: top_p/top_k/min_p are NOT honored on the spec path
+    // (spec_step_dflash is full-vocab; truncating one side would break the
+    // rejection invariant) — a temp>0 request carrying a non-default top_p gets
+    // temp-only sampling and a one-time warn below.
     //
     // Exception: thinking-on + max_think_tokens currently needs the AR path.
     // DFlash's budget cap can close/strip the think span but does not yet
@@ -7076,6 +7101,19 @@ fn generate(
     // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
     // budgeted-thinking (which needs the AR </think> splice). Anything not
     // satisfying ALL of these falls through to the existing DFlash/AR routing.
+    //
+    // SAMPLED MTP IS DELIBERATELY GREEDY-ONLY HERE (the `temp <= 1e-6` clause
+    // stays). The arch layer (spec_step_mtp_compressed_serial, mtp_spec.rs:
+    // 2257-2936) DOES implement a temp>0 rejection-sampling branch, but it is
+    // NOT distribution-preserving: the accept ratio uses un-truncated
+    // p_target/p_draft while drafts are sampled from a top_k=20 / top_p nucleus,
+    // and the bonus is sample_top_p(trunk) rather than a draw from the
+    // renormalized residual (documented at mtp_spec.rs:2859-2864). That is the
+    // same practical-but-lossy posture as llama.cpp/vLLM. To avoid riding the
+    // lossless sampled-spec default, a temp>0 MTP-opted-in request falls through
+    // to DFlash (which IS lossless) or AR. Productizing sampled MTP requires a
+    // truncated-accept-ratio + residual-bonus fix first; until then DFlash
+    // carries the lossless sampled-spec story.
     let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
     if qwen_mtp_opt_in
         && m.qwen35_mtp_head.is_some()
@@ -7127,12 +7165,40 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
+    // Sampled (temp>0) spec-decode is only worthwhile with the GPU-softmax fast
+    // path (HIPFIRE_DFLASH_FAST_SAMPLE=1): without it, the host full-vocab softmax
+    // (~31 passes over the vocab per cycle) costs ~+19ms/cycle and makes sampled
+    // DFlash slower than AR. So a temp>0 request only routes to DFlash when
+    // fast-sample is enabled; otherwise it falls through to the AR path
+    // (byte-faithful at the requested temp/top_p). Greedy (temp<=1e-6) always
+    // routes to DFlash, unchanged. Note: fast-sample is distribution-parity
+    // (GPU softmax differs from host softmax at the last ULP, which can rarely
+    // flip a borderline accept), NOT byte-parity — validated coherent across
+    // genres but intentionally opt-in.
+    let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() == Some("1");
     if m.dflash.is_some()
-        && temp <= 1e-6
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
+        && (temp <= 1e-6 || fast_sample_on)
     {
+        // One-time visibility: top_p/top_k/min_p cannot be honored on the
+        // DFlash spec path. A temp>0 request that also requested a non-default
+        // top_p (< 1.0) will get temp-only full-vocab sampling, which differs
+        // from what the AR path would produce at the same top_p. Emit a single
+        // event so the behavior mismatch is visible rather than silent.
+        if temp > 1e-6 && top_p < 0.999 {
+            static SPEC_TOPP_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SPEC_TOPP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode ignores top_p/top_k/min_p (full-vocab temp sampling only); set HIPFIRE_DFLASH_CHAT=0 to route temp+top_p requests through AR"}}"#,
+                    id,
+                );
+                let _ = stdout.flush();
+            }
+        }
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -7171,11 +7237,15 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
-            stop, // hunt3 M-F: thread user stop sequences into the default DFlash path
+            stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp,    // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
+            0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );
         // Silence unused-variable warnings for the params DFlash doesn't
-        // consume (top_p / repeat penalties are AR-only sampling knobs;
-        // pflash_state is bypassed on the DFlash decode path).
+        // consume. top_p was read above only for the one-time spec-warn; it is
+        // NOT applied to the spec sampling (full-vocab). repeat penalties are
+        // AR-only sampling knobs; pflash_state is bypassed on the DFlash decode
+        // path.
         let _ = (
             top_p,
             repeat_penalty,

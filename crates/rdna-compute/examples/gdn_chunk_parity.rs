@@ -119,7 +119,9 @@ fn main() {
             if ok { "OK" } else { "FAIL" }
         );
 
-        for tns in [q_gpu, k_gpu, v_gpu, g_gpu, b_gpu, s_seq, s_chunk, out_seq, out_chunk] {
+        for tns in [
+            q_gpu, k_gpu, v_gpu, g_gpu, b_gpu, s_seq, s_chunk, out_seq, out_chunk,
+        ] {
             gpu.free_tensor(tns).unwrap();
         }
     }
