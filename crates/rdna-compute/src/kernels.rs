@@ -3271,6 +3271,11 @@ pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
 /// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
 /// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
 /// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+///
+/// This file holds TWO entry points: `softmax_temp_batched_f32` (above) and
+/// `softmax_temp_topp_batched_f32`, which additionally emits per-row nucleus
+/// (top_p) `tau_cut`/`Z` outputs for AR-equivalent nucleus truncation on the
+/// host (see `Gpu::softmax_temp_topp_batched_into_f32`).
 pub const SOFTMAX_TEMP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/softmax_temp_batched.hip");
 

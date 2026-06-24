@@ -487,6 +487,81 @@ impl Gpu {
         )
     }
 
+    /// Batched temperature-scaled softmax that ALSO emits, per row, the nucleus
+    /// (top_p) threshold `tau_cut[r]` and kept mass `Z[r]` so the host can apply
+    /// `p_i = (p_i >= tau_cut[r]) ? p_i / Z[r] : 0` (AR-equivalent nucleus
+    /// truncation). `tau_cut` and `Z` must each be `[rows]`-shaped F32 tensors.
+    ///
+    /// `probs` is left as the FULL normalized softmax (the kernel does NOT
+    /// truncate on-device; the host helper does, so the kernel stays a pure read
+    /// plus two scalars). When `top_p >= 1.0` the nucleus phase is skipped and
+    /// `tau_cut=0, Z=1` so host truncation is identity → byte-equivalent to
+    /// `softmax_temp_batched_into_f32`.
+    ///
+    /// `tau_cut` is found by bisection over the mass predicate (no sort); see the
+    /// kernel doc in `softmax_temp_batched.hip`. Distribution-parity (tree
+    /// reduction), not byte-parity, to the host softmax — used behind
+    /// HIPFIRE_DFLASH_FAST_SAMPLE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn softmax_temp_topp_batched_into_f32(
+        &mut self,
+        logits: &GpuTensor,
+        probs: &GpuTensor,
+        tau_cut: &GpuTensor,
+        z: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+        temp: f32,
+        top_p: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_temp_topp_batched",
+            kernels::SOFTMAX_TEMP_BATCHED_SRC,
+            "softmax_temp_topp_batched_f32",
+        )?;
+
+        let logits_ptr = logits.buf.as_ptr();
+        let probs_ptr = probs.buf.as_ptr();
+        let tau_ptr = tau_cut.buf.as_ptr();
+        let z_ptr = z.buf.as_ptr();
+        let n_val = vocab as i32;
+        let inv_t = 1.0f32 / temp;
+        let top_p_val = top_p;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &logits_ptr as *const _ as *mut c_void,
+            &probs_ptr as *const _ as *mut c_void,
+            &tau_ptr as *const _ as *mut c_void,
+            &z_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_t as *const _ as *mut c_void,
+            &top_p_val as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32.min(vocab as u32).max(1);
+        let shared_mem = block * 4;
+
+        self.launch_maybe_blob(
+            "softmax_temp_topp_batched_f32",
+            [rows as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(logits_ptr);
+                b.push_ptr(probs_ptr);
+                b.push_ptr(tau_ptr);
+                b.push_ptr(z_ptr);
+                b.push_i32(n_val);
+                b.push_f32(inv_t);
+                b.push_f32(top_p_val);
+                b
+            },
+        )
+    }
+
     /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.
     /// pos_buf: GPU buffer containing a single i32 position value.
     pub fn rope_f32(

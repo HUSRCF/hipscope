@@ -3974,6 +3974,10 @@ fn generate_dflash(
     // request carrying a non-default top_p gets temp-only sampling (a one-time
     // warn is emitted at the routing site).
     temp: f32,
+    // Nucleus (top_p) cutoff, threaded into spec_step_dflash's sampled path and
+    // applied IDENTICALLY to both draft + target softmaxes (lossless == AR at
+    // this top_p via the target truncation). 1.0 (>= 0.999) disables it.
+    top_p: f32,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
@@ -4799,8 +4803,9 @@ fn generate_dflash(
                 Some(&mut df.gdn_tape),
                 temp, // request-resolved temperature (0.0 = greedy/argmax-accept;
                 // >0 = lossless rejection-sampling, equals target temp-T sampling
-                // when cactus_delta==0). top_p/top_k are NOT honored on this path
-                // (spec_step_dflash is full-vocab softmax both sides — see caller).
+                // when cactus_delta==0).
+                top_p, // nucleus cutoff (honored on the sampled path, identical
+                // truncation on draft + target → lossless == AR-at-top_p).
                 &mut rng_state,
                 None, // block_size override
                 None, // ngram_cache
@@ -7182,18 +7187,20 @@ fn generate(
         && !force_ar_chat
         && (temp <= 1e-6 || fast_sample_on)
     {
-        // One-time visibility: top_p/top_k/min_p cannot be honored on the
-        // DFlash spec path. A temp>0 request that also requested a non-default
-        // top_p (< 1.0) will get temp-only full-vocab sampling, which differs
-        // from what the AR path would produce at the same top_p. Emit a single
-        // event so the behavior mismatch is visible rather than silent.
-        if temp > 1e-6 && top_p < 0.999 {
-            static SPEC_TOPP_WARNED: std::sync::atomic::AtomicBool =
+        // One-time visibility: top_p IS now honored on the DFlash spec sampled
+        // path (identical nucleus truncation on draft + target → lossless ==
+        // AR-at-top_p). top_k and min_p are still NOT honored. Emit a single
+        // narrowed event only when a non-default top_k/min_p was requested, so a
+        // residual behavior mismatch is visible rather than silent.
+        let topk_requested = top_k.map(|k| k > 0).unwrap_or(false);
+        let minp_requested = min_p.map(|p| p > 0.0).unwrap_or(false);
+        if temp > 1e-6 && (topk_requested || minp_requested) {
+            static SPEC_TOPK_WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !SPEC_TOPP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !SPEC_TOPK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let _ = writeln!(
                     stdout,
-                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode ignores top_p/top_k/min_p (full-vocab temp sampling only); set HIPFIRE_DFLASH_CHAT=0 to route temp+top_p requests through AR"}}"#,
+                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode honors temp+top_p but ignores top_k/min_p; set HIPFIRE_DFLASH_CHAT=0 to route through AR for full top_k/min_p support"}}"#,
                     id,
                 );
                 let _ = stdout.flush();
@@ -7239,15 +7246,14 @@ fn generate(
             messages_history,
             stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
             temp,    // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
+            top_p,   // nucleus cutoff: honored on the sampled DFlash path
             0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );
         // Silence unused-variable warnings for the params DFlash doesn't
-        // consume. top_p was read above only for the one-time spec-warn; it is
-        // NOT applied to the spec sampling (full-vocab). repeat penalties are
-        // AR-only sampling knobs; pflash_state is bypassed on the DFlash decode
-        // path.
+        // consume. top_p IS now applied to the spec sampling (nucleus on both
+        // draft + target). repeat penalties are AR-only sampling knobs;
+        // pflash_state is bypassed on the DFlash decode path.
         let _ = (
-            top_p,
             repeat_penalty,
             repeat_window,
             budget_alert_at_tok,
