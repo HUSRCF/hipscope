@@ -185,6 +185,16 @@ matches. Index of currently-available skills:
   guaranteed-fresh daemon. Kills bun CLI + spawned daemon, fuser-frees
   the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
 
+- **`agent-memory`** — git-tracked cross-session project memory as in-repo markdown
+  notes (`.agent-memory/notes/*.md`, YAML frontmatter) with **lexical (ripgrep)
+  recall** via `scripts/mem.sh` — no DB, no embeddings, no MCP process. **Reach for
+  this when:** answering a project/architecture question, starting a task like past
+  work, or you've learned something durable (finding / falsification / decision /
+  gotcha). Recall before answering (`scripts/mem.sh recall <terms>`), remember after
+  learning (`scripts/mem.sh remember <slug> "<title>" tags`). Project findings go
+  here (shared, diffable, travel with the code); personal/fleet notes stay in global
+  memory. See `docs/skills/agent-memory.md`.
+
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
 
