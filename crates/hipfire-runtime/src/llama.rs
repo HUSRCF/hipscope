@@ -8635,7 +8635,11 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     for i in 0..TOP_K {
         let p = if topk_val[i].is_finite() {
             let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
-            if pp.is_finite() { pp } else { 0.0 }
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -8727,7 +8731,13 @@ pub fn sample_full_dist(
     // smuggle in min_p > 1.0 (which would `retain` an empty candidate set and
     // panic on `cand[0]` below) or a negative min_p. Clamp at fn entry to the
     // valid [0,1] probability-ratio range; min_p == 0 is the happy path (no cut).
-    let min_p = min_p.map(|mp| if mp.is_finite() { mp.clamp(0.0, 1.0) } else { 0.0 });
+    let min_p = min_p.map(|mp| {
+        if mp.is_finite() {
+            mp.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
     let inv_temp = 1.0 / temperature;
 
     // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
@@ -8764,9 +8774,7 @@ pub fn sample_full_dist(
 
     // Sort descending by probability (top_k / top_p / min_p all operate on the
     // ranked distribution). Unstable sort with a NaN-last comparator.
-    cand.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
     // FINDING #2 (intentional, do NOT "fix" by adding a default cap):
@@ -9119,14 +9127,7 @@ mod tests {
     #[test]
     fn argmax_mixed_finite_and_nonfinite_picks_finite() {
         // +Inf, NaN, and a finite peak interleaved → the finite peak (idx 4).
-        let logits = [
-            f32::INFINITY,
-            f32::NAN,
-            -2.0,
-            f32::NAN,
-            9.0,
-            f32::INFINITY,
-        ];
+        let logits = [f32::INFINITY, f32::NAN, -2.0, f32::NAN, 9.0, f32::INFINITY];
         assert_eq!(argmax(&logits), 4);
     }
 
