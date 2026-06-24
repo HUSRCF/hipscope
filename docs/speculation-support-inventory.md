@@ -8,6 +8,11 @@ hipfire today, plus — for arches with no native drafter — what (if anything)
 exists upstream. Compiled from a per-architecture audit (one agent per arch crate
 + web search), 2026-06-23.
 
+> This doc is the **status** register. For the **interface contract + how to add
+> speculative decode to a new arch** (the `SpecTarget` trait, the registry
+> wiring, pitfalls), see `.agents/skills/hipfire-arch-port/speculation.md`
+> (step 7 of the arch-port skill).
+
 ## Vocabulary
 
 - **n-gram drafter** — model-free, arch-generic (`crates/hipfire-runtime/src/spec_ngram.rs`),
