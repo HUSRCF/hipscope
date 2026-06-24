@@ -5203,6 +5203,15 @@ fn generate_qwen35_mtp(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    // Request-resolved temp. 0.0 → greedy/argmax-match (p_min confidence cutoff
+    // applies). >0 → lossless residual-acceptance sampling (set_sampling below;
+    // mutually exclusive with p_min). Reached with temp>0 only when the dispatch
+    // gate saw HIPFIRE_MTP_SAMPLED=1 and a temp+top_p-only request.
+    temp: f32,
+    // Nucleus (top_p) cutoff for the sampled MTP path. Applied to BOTH draft +
+    // target nuclei (independent per-side truncation → lossless == AR-at-top_p).
+    // Ignored on the greedy path. <= 0.0 is treated as disabled (1.0).
+    top_p: f32,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -5436,7 +5445,27 @@ fn generate_qwen35_mtp(
                 return;
             }
         };
-    state.set_p_min(p_min);
+    if temp > 1e-6 {
+        // Sampled MTP: nucleus sampling — NOT p_min (mutually exclusive; the arch
+        // step returns Err if both are set). top_k/min_p are routed to AR upstream.
+        // MtpSpecState::new seeds an arch-derived DEFAULT p_min (e.g. 0.6); clear it
+        // so the (sampling XOR p_min) invariant holds — otherwise spec_step Errs out.
+        state.set_p_min(0.0);
+        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
+        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
+        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+        state.set_sampling(
+            mtp_spec::MtpSamplingConfig {
+                temp,
+                top_k: 0,
+                top_p: top_p_eff,
+                min_p: 0.0,
+            },
+            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
+        );
+    } else {
+        state.set_p_min(p_min); // greedy MTP confidence cutoff
+    }
 
     let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
 
@@ -7107,22 +7136,28 @@ fn generate(
     // budgeted-thinking (which needs the AR </think> splice). Anything not
     // satisfying ALL of these falls through to the existing DFlash/AR routing.
     //
-    // SAMPLED MTP IS DELIBERATELY GREEDY-ONLY HERE (the `temp <= 1e-6` clause
-    // stays). The arch layer (spec_step_mtp_compressed_serial, mtp_spec.rs:
-    // 2257-2936) DOES implement a temp>0 rejection-sampling branch, but it is
-    // NOT distribution-preserving: the accept ratio uses un-truncated
-    // p_target/p_draft while drafts are sampled from a top_k=20 / top_p nucleus,
-    // and the bonus is sample_top_p(trunk) rather than a draw from the
-    // renormalized residual (documented at mtp_spec.rs:2859-2864). That is the
-    // same practical-but-lossy posture as llama.cpp/vLLM. To avoid riding the
-    // lossless sampled-spec default, a temp>0 MTP-opted-in request falls through
-    // to DFlash (which IS lossless) or AR. Productizing sampled MTP requires a
-    // truncated-accept-ratio + residual-bonus fix first; until then DFlash
-    // carries the lossless sampled-spec story.
+    // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
+    // but gated behind an opt-in env flag until the temp>0 coherence battery
+    // validates it. The arch layer's F5 DFlash-convention fix (mtp_spec.rs:
+    // independent per-side nuclei + sample_residual) makes the temp>0 branch
+    // lossless: draft + target each truncate to their own top_p nucleus, the
+    // accept ratio is computed against the truncated distributions, and the
+    // bonus is drawn from the renormalized residual (no longer the lossy
+    // un-truncated / sample_top_p(trunk) posture). Gating:
+    //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
+    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`
+    //     AND the request honors temp+top_p only. A top_k/min_p request falls
+    //     through to DFlash/AR (the MTP sampled path is nucleus-only, mirroring
+    //     the DFlash sampled gate's top_k/min_p carve-out).
+    // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
+    // through to DFlash (lossless sampled-spec) or AR exactly as before.
     let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
+    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
+    let topk_or_minp =
+        top_k.map(|k| k > 0).unwrap_or(false) || min_p.map(|p| p > 0.0).unwrap_or(false);
     if qwen_mtp_opt_in
         && m.qwen35_mtp_head.is_some()
-        && temp <= 1e-6
+        && (temp <= 1e-6 || (mtp_sampled_on && !topk_or_minp))
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
     {
@@ -7139,11 +7174,12 @@ fn generate(
             tools,
             messages_history,
             stop,
+            temp,  // request-resolved temp (0.0 greedy / >0 lossless residual-accept sampling)
+            top_p, // nucleus cutoff: honored on the sampled MTP path
         );
         // Silence unused-variable warnings for AR-only / DFlash-only knobs the
         // MTP serve path does not consume.
         let _ = (
-            top_p,
             top_k,
             min_p,
             repeat_penalty,
