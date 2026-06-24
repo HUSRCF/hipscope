@@ -12038,7 +12038,36 @@ fn generate_vl_dots_ocr(
     let prefill_tokens = prompt_ids.len();
     let prefill_s = t_prefill.elapsed().as_secs_f64();
 
-    // 6. Greedy decode, streaming in the daemon JSONL protocol.
+    // 6. Decode. Opt-in n-gram speculative decode when a speculator was built at
+    // load (HIPFIRE_NGRAM_DRAFT=1, arch_id=8 gate in `spec_build`); else the
+    // bespoke greedy AR loop below. The vision prefill above already advanced the
+    // shared Qwen2 KV (`m.qwen2_state`), so both paths decode from the same warm
+    // state — only the drafting differs. The n-gram verify always falls back to
+    // the target's greedy argmax, so spec output is byte-identical to AR; only τ
+    // (speed) changes. The prefill bindings above (`tokenizer`/`config`/`state`/…)
+    // are released here so the speculative branch can take `&mut m`; the AR path
+    // re-borrows them below.
+    if m.speculator.is_some() {
+        decode_vl_dots_ocr_ngram(
+            m,
+            gpu,
+            stdout,
+            id,
+            &prompt_ids,
+            max_tokens,
+            t0,
+            prefill_tokens,
+            prefill_s,
+        );
+        return;
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let config = m.dots_ocr_config.as_ref().unwrap();
+    let text_cfg = &config.text;
+    let weights = m.dots_ocr_weights.as_ref().unwrap();
+    let state = m.qwen2_state.as_mut().unwrap();
+
+    // Greedy decode, streaming in the daemon JSONL protocol.
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
         vec![text_cfg.eos_token_id]
     } else {
@@ -12095,6 +12124,230 @@ fn generate_vl_dots_ocr(
                 return;
             }
         }
+    }
+
+    let decode_s = t_gen.elapsed().as_secs_f64();
+    let total_s = t0.elapsed().as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0
+    );
+    let _ = stdout.flush();
+}
+
+/// dots.ocr (arch_id=8) n-gram speculative decode, post-vision-prefill.
+///
+/// `generate_vl_dots_ocr` runs the image-conditioned prefill and routes here
+/// when a model-free n-gram speculator was built at load (HIPFIRE_NGRAM_DRAFT=1).
+/// dots.ocr's text decoder IS Qwen2, so the speculator drives it through the
+/// `DotsOcrBundle: SpecTarget` impl. The vision prefill already advanced the
+/// shared `m.qwen2_state` KV, so this only replaces the *decode* phase.
+///
+/// The flat decoder fields (`dots_ocr_config`/`dots_ocr_weights`/`qwen2_state`)
+/// are moved into a `DotsOcrBundle` for the `&mut dyn SpecTarget` borrow and
+/// restored on return — dots.ocr stores its state as flat `LoadedModel` fields,
+/// not a `ModelState` bundle, so the `Carrier::spec_target_guard` path (used by
+/// the text arches) does not apply here.
+#[allow(clippy::too_many_arguments)]
+fn decode_vl_dots_ocr_ngram(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    t0: Instant,
+    prefill_tokens: usize,
+    prefill_s: f64,
+) {
+    use hipfire_arch_dots_ocr::DotsOcrBundle;
+    // Move the live decoder state into a SpecTarget bundle; restored on return.
+    let mut bundle = DotsOcrBundle {
+        config: m.dots_ocr_config.take().unwrap(),
+        weights: m.dots_ocr_weights.take().unwrap(),
+        state: m.qwen2_state.take().unwrap(),
+    };
+    let mut spec = m.speculator.take().unwrap();
+    // `m.tokenizer` is a disjoint field → coexists with the takes above and the
+    // restore below; the loop never touches `m`.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    run_dots_ocr_ngram_loop(
+        &mut bundle,
+        spec.as_mut(),
+        tokenizer,
+        gpu,
+        stdout,
+        id,
+        prompt_ids,
+        max_tokens,
+        t0,
+        prefill_tokens,
+        prefill_s,
+    );
+    m.dots_ocr_config = Some(bundle.config);
+    m.dots_ocr_weights = Some(bundle.weights);
+    m.qwen2_state = Some(bundle.state);
+    m.speculator = Some(spec);
+}
+
+/// The dots.ocr n-gram decode loop proper, factored out of
+/// [`decode_vl_dots_ocr_ngram`] so the `&DotsOcrBundle` borrow it drives is
+/// disjoint from the `&mut m` field-restore. Mirrors the `generate_spec`
+/// prefill→step contract but with plain UTF-8 text streaming (no `SpecEmit`:
+/// dots.ocr output is unframed layout-JSON, no reasoning/marker/tool channels).
+#[allow(clippy::too_many_arguments)]
+fn run_dots_ocr_ngram_loop(
+    bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
+    spec: &mut dyn hipfire_runtime::spec::Speculator,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    t0: Instant,
+    prefill_tokens: usize,
+    prefill_s: f64,
+) {
+    let eos_set: Vec<u32> = if bundle.config.text.eos_token_ids.is_empty() {
+        vec![bundle.config.text.eos_token_id]
+    } else {
+        bundle.config.text.eos_token_ids.clone()
+    };
+    let block_size = spec.block_size();
+    let ctx_capacity = spec.ctx_capacity();
+
+    // Prime the n-gram drafter + fetch the first token WITHOUT re-running the
+    // (vision-conditioned) target prefill. `cache_hit=true` + an empty suffix
+    // makes `ChainSpeculator::prefill` skip the target advance —
+    // `spec_advance(&[], prompt_len, reset=false)` just argmaxes the live
+    // post-vision-prefill logits — and only `drafter.prefill_seed(prompt_ids)`.
+    // It also lazily builds the verify scratch (required before the first `step`).
+    let first_token = match spec.prefill(
+        gpu,
+        bundle,
+        prompt_ids,
+        &[],
+        prompt_ids.len(),
+        true,
+        None,
+        &|| check_abort(id),
+    ) {
+        Ok(PrefillOutcome::Ready { first_token }) => first_token,
+        Ok(PrefillOutcome::Aborted) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","tokens":0,"tok_s":0.0,"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":0.0,"decode_tok_s":0.0,"ttft_ms":{:.1}}}"#,
+                id,
+                prefill_tokens,
+                prefill_s * 1000.0,
+                prefill_s * 1000.0
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        Err(e) => {
+            write_error(stdout, id, &format!("dots.ocr spec prefill: {e}"));
+            return;
+        }
+    };
+
+    let t_gen = Instant::now();
+    let mut streamed: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut generated = 0usize;
+    // n-gram context (committed generated tail; the drafter holds the prompt
+    // internally via prefill_seed).
+    let mut emitted: Vec<u32> = Vec::new();
+    let mut position = prompt_ids.len();
+    let mut seed_token = first_token;
+    // Tokens to stream this iteration. First window = the prefill seed alone
+    // (mirrors the AR loop emitting the first argmax), then the accepted
+    // committed tail from each `spec.step` (seed re-echo already stripped).
+    let mut window: Vec<u32> = vec![first_token];
+
+    'outer: loop {
+        for &tok in &window {
+            if generated >= max_tokens {
+                break 'outer;
+            }
+            // EOS is never streamed (matches the AR loop's pre-emit break).
+            if eos_set.contains(&tok) {
+                break 'outer;
+            }
+            emit_committed_event(stdout, id, tok, generated, t0.elapsed().as_millis() as u64);
+            generated += 1;
+            streamed.push(tok);
+            emitted.push(tok);
+            // Incremental UTF-8 streaming — only emit complete code points
+            // (byte-identical to the AR path).
+            let all_bytes = tokenizer.decode_bytes(&streamed);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let valid_len = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid_len > 0 {
+                let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+                emitted_bytes += valid_len;
+            }
+        }
+        if generated >= max_tokens {
+            break;
+        }
+        // Decode-side cancel: stop early. The next request resets state at
+        // prefill, so no cross-request bleed; the caller restores bundle/spec.
+        if check_abort(id) {
+            break;
+        }
+        // Context-overflow guard (matches generate_spec): one window writes up
+        // to `block_size` KV slots.
+        if position.saturating_add(block_size) >= ctx_capacity {
+            break;
+        }
+        let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None) {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));
+                break;
+            }
+        };
+        // Advance by the emitted-tail length (= accepted + 1), per the spec.rs
+        // `emit_len_drives_advance` contract; the target already wrote KV for the
+        // whole tail in `verify_block`.
+        position += step.emit.len();
+        seed_token = step.next_seed;
+        window = step.emit.to_vec();
     }
 
     let decode_s = t_gen.elapsed().as_secs_f64();

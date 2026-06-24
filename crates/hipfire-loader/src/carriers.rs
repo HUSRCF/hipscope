@@ -638,10 +638,19 @@ impl Carrier for DotsOcrCarrier {
             ctx.max_seq,
         )
         .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). dots.ocr's
+        // text decoder IS Qwen2, so the n-gram arm drives it via the
+        // `DotsOcrBundle: SpecTarget` impl — a strong fit because layout-JSON
+        // output is densely self-repeating. The daemon's `generate_vl_dots_ocr`
+        // routes to the spec decode loop when this is `Some` (vision prefill is
+        // unchanged; only the decode phase becomes speculative).
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, true, ctx.max_seq);
         Ok(LoadedModel {
             qwen2_state: Some(state),
             dots_ocr_config: Some(config),
             dots_ocr_weights: Some(weights),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

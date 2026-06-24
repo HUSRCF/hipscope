@@ -32,10 +32,10 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 | llama | 0/1 | Llama/Mistral/Qwen3 dense | n-gram + SpecTarget verify | ❌ (model-free n-gram only) | ✅ n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
 | qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget verify (block-parallel) | ❌ (model-free n-gram only) | ✅ n-gram opt-in |
 | qwen35-vl | 5 | Qwen3.5/3.6-VL | none (VL path is AR, CPU-sampled) | ❌ | ❌ (text backbone *is* qwen35 — reusable) |
-| minimax | 10 | MiniMax-M2 (MoE) | none; per-token AR | ❌ | ❌ (carrier stubs return "unsupported") |
-| lfm2moe | 11 | LFM2.5-MoE (Liquid) | none; per-token AR | ❌ | ❌ (recurrent conv-state ⇒ needs rollback seam) |
-| cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | none; per-token AR | ❌ | ❌ (sliding-window ⇒ verify must replicate mask) |
-| dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | none; per-token AR VL path | ❌ | ❌ |
+| minimax | 10 | MiniMax-M2 (MoE) | n-gram + SpecTarget verify | ❌ (model-free n-gram only) | ✅ n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
+| lfm2moe | 11 | LFM2.5-MoE (Liquid) | n-gram + SpecTarget verify (conv-state rollback) | ❌ (model-free n-gram only) | ✅ n-gram opt-in |
+| cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | n-gram + SpecTarget verify (sliding-window seq) | ❌ (model-free n-gram only) | ✅ n-gram opt-in (+ `Cohere2MoeEmit`) |
+| dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | n-gram + SpecTarget verify (VL decode-phase) | ❌ (model-free n-gram only) | ✅ n-gram opt-in (image-conditioned prefill unchanged) |
 
 **Has real speculation today:** qwen35 (DFlash + MTP), deepseek4 (MTP),
 llama/qwen2 (model-free n-gram only). Everything else is plain autoregressive.
@@ -133,7 +133,7 @@ compile-check only; the shared wiring is integrated afterward.
 | **minimax (10)** | ✅ (re-export bundle, carrier guard+emitter, build_speculator, spec_build gate +10, daemon arm) | `Qwen35Emit` (ChatML-clean) | ✅ **token-identical** generation (AR vs n-gram, greedy, `MiniMax-M2.7.mq2` 74GB on gfx1151/96GB): `AR[8:] == n-gram` exactly. Sole delta = the leading `<think>\n` delimiter (8 chars) that the bespoke AR path emits raw and `Qwen35Emit` consumes — cosmetic emitter rendering, NOT a generation divergence |
 | **lfm2moe (11)** | ✅ (same pattern; conv-state rollback) | `Qwen35Emit` (ChatML-clean) | ✅ **AR == n-gram byte-identical** (575 chars greedy, `lfm2.5-8b-a1b.mq4`); detectors all clean → conv-state snapshot/rollback correct |
 | **cohere2moe (12)** | ✅ (bundle re-export, carrier guard+emitter, build_speculator, spec_build gate +12, daemon arm) | `Cohere2MoeEmit` (ported marker state machine + guards) | ✅ **AR == n-gram byte-identical** (669 chars greedy, `North-Mini-Code-1.0.mq4.hfq`); zero marker leaks |
-| **dots-ocr (8)** | ❌ DEFERRED | — (VL path) | — |
+| **dots-ocr (8)** | ✅ (carrier `build_speculator`, spec_build gate +8, VL decode-phase routing in `generate_vl_dots_ocr`) | — (plain UTF-8 text stream; no `SpecEmit` — unframed layout-JSON) | ✅ **AR == n-gram byte-identical** (562 chars greedy, `dots-ocr.q8.hfq` + `dots_ocr_smoke_001.jpg`, table-heavy page, max_seq 8192). Currently *slower* (45.5 vs 60.5 decode tok/s) — sequential-acceptance vs batched-verify overhead on the 1.5B Qwen2 GEMMs; perf is the deferred follow-up |
 
 **minimax + lfm2moe** loader + daemon both build clean (`-p hipfire-loader`,
 `--example daemon`). The integration mirrors the qwen2 template exactly:
@@ -174,9 +174,29 @@ emitter is correct and arguably cleaner (reasoning-channel handling).
    to `forward_batch` (mirroring AR) so the KV is bit-identical to the batched AR
    path (per-token vs batched GEMM accumulation otherwise drifts greedy decode).
 
-**dots-ocr DEFERRED — VL routing:** arch_id 8 decodes via `generate_vl_dots_ocr`
-(image-conditioned, CPU-sampled), not the text spec loop. Engaging n-gram needs a
-VL-aware routing decision. `SpecTarget` impl compiles; not wired.
+**dots-ocr DONE — VL decode-phase routing:** arch_id 8 decodes via
+`generate_vl_dots_ocr` (image-conditioned), NOT the generic text `generate_spec`
+loop, and its decoder state lives in **flat `LoadedModel` fields**
+(`dots_ocr_config`/`dots_ocr_weights`/`qwen2_state`), not a `ModelState` bundle —
+so the `Carrier::spec_target_guard` path the text arches use does not apply. The
+resolution keeps the bespoke vision prefill untouched and routes only the
+**decode phase**: after `forward_prefill_batch_embeds` leaves the Qwen2 KV warm,
+when a speculator was built at load the daemon branches to a new
+`decode_vl_dots_ocr_ngram`/`run_dots_ocr_ngram_loop` pair that (a) moves the flat
+fields into a `DotsOcrBundle` for the `&mut dyn SpecTarget` borrow (restored on
+return), (b) primes the n-gram drafter + fetches the first token WITHOUT
+re-running the vision-conditioned prefill — `ChainSpeculator::prefill` with
+`cache_hit=true` + empty suffix makes `spec_advance(&[], prompt_len, reset=false)`
+just argmax the live logits and only `drafter.prefill_seed(prompt_ids)` — and (c)
+runs the `prefill→step` contract with **plain UTF-8 text streaming** (no
+`SpecEmit`: OCR output is unframed layout-JSON, no reasoning/marker/tool
+channels). Because the n-gram verify always falls back to the same Qwen2 target
+greedy argmax, the spec output is byte-identical to AR by construction — only τ
+differs. Validated: **562-char OCR == AR exactly**. NOTE: currently *slower*
+(45.5 vs 60.5 decode tok/s) — the batched verify of a wide K=12 draft against the
+small 1.5B Qwen2 GEMMs costs more than the ~1–2 tokens it commits per window
+(same MQ4 GEMM-batching ceiling noted for qwen2). **Perf is the deferred
+follow-up**; correctness/wiring is complete.
 
 ### Key integration finding (all 4 arches)
 The orphan rule forced each agent to define a NEW bundle struct *in the arch crate*
