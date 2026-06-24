@@ -183,8 +183,11 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     // which may or may not satisfy — handled by the predicate directly).
     float lo = 0.0f;
     float hi = pmax;
-    // ~30 iterations on the f32 range drives the interval below 1e-7 relative.
-    for (int it = 0; it < 30; ++it) {
+    // 20 iterations drive the interval below ~1e-6 relative — ample for a
+    // nucleus cutoff (boundary tokens carry negligible mass; the host's
+    // exact-Z recompute in Phase 6 uses the converged threshold). Was 30;
+    // trimmed for perf (each iteration re-reads the full row).
+    for (int it = 0; it < 20; ++it) {
         float mid = 0.5f * (lo + hi);
         float m = 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {

@@ -539,7 +539,11 @@ impl Gpu {
             &top_p_val as *const _ as *mut c_void,
         ];
 
-        let block = 256u32.min(vocab as u32).max(1);
+        // Wider block than the plain softmax (256): the nucleus bisection
+        // re-reads the row ~20×, and the grid is only `rows` blocks (~31), so
+        // a wider block puts more threads on each active CU to hide memory
+        // latency. shared_mem auto-scales (one float per thread for the reduce).
+        let block = 1024u32.min(vocab as u32).max(1);
         let shared_mem = block * 4;
 
         self.launch_maybe_blob(
