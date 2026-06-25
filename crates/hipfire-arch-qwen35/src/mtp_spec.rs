@@ -2683,21 +2683,21 @@ pub fn spec_step_mtp_compressed_serial(
                 //   apply_topp_trunc (host, same cut the target side uses) →
                 //   host-RNG sample_categorical → store the TRUNCATED row.
                 //
-                // Compressed-vocab sampled is out of scope and unreachable in
-                // production (served qwen3.6-27b MTP is full-vocab tied); reject
-                // explicitly so a future compressed-sampled config can never
-                // silently take this full-vocab nucleus path on a mismatched
-                // (vocab_map-remapped, compressed-softmax) distribution.
-                if !use_full_vocab {
-                    return Err(hip_bridge::HipError::new(
-                        0,
-                        "sampled MTP requires full-vocab draft (compressed-vocab sampled unsupported)",
-                    ));
-                }
+                // Compressed-vocab sampled IS supported (cvs-sampled): softmax
+                // over the COMPRESSED draft row (argmax_vocab wide, ~15× cheaper
+                // than full vocab — the cvs win), sample a compressed token,
+                // remap to the full trunk id via vocab_map, and EMBED the
+                // compressed nucleus into a full-vocab vector so the residual
+                // bonus draw (sample_residual, on reject) subtracts it from the
+                // full-vocab target correctly. In full-vocab mode argmax_vocab ==
+                // vocab and the embed is a no-op (row already full-width). The
+                // accept ratio uses only the SCALAR draft prob, so it is
+                // mode-agnostic; losslessness holds because the residual covers
+                // the full vocab (unmapped slots keep the full target mass).
 
-                // GPU softmax(+nucleus) over the single full-vocab draft row.
-                // alloc/download/free idiom copied from speculative.rs:3457-3492.
-                let probs_gpu = gpu.alloc_tensor(&[vocab], DType::F32)?;
+                // GPU softmax(+nucleus) over the single draft row (full OR
+                // compressed width). idiom copied from speculative.rs:3457-3492.
+                let probs_gpu = gpu.alloc_tensor(&[argmax_vocab], DType::F32)?;
                 let tau_gpu = gpu.alloc_tensor(&[1], DType::F32)?;
                 let z_gpu = gpu.alloc_tensor(&[1], DType::F32)?;
                 gpu.softmax_temp_topp_batched_into_f32(
@@ -2705,7 +2705,7 @@ pub fn spec_step_mtp_compressed_serial(
                     &probs_gpu,
                     &tau_gpu,
                     &z_gpu,
-                    vocab,
+                    argmax_vocab,
                     /* rows */ 1,
                     sampling.temp,
                     sampling.top_p,
@@ -2716,35 +2716,49 @@ pub fn spec_step_mtp_compressed_serial(
                 let _ = gpu.free_tensor(probs_gpu);
                 let _ = gpu.free_tensor(tau_gpu);
                 let _ = gpu.free_tensor(z_gpu);
-                debug_assert_eq!(probs.len(), vocab);
+                debug_assert_eq!(probs.len(), argmax_vocab);
 
                 // Host nucleus cut (identity when top_p disabled → tau==0).
                 apply_topp_trunc(&mut probs, tau[0], z[0]);
 
                 // Host-RNG categorical sample from the SAME truncated nucleus we
                 // store — draft token and stored distribution agree (load-bearing
-                // for the residual). Dropping top_k=20 is correct: sampled MTP is
-                // top_p-only under the DFlash convention.
+                // for the residual). top_p-only under the DFlash convention.
                 let u = state.rng.next_uniform_f32();
                 draft_idx = sample_categorical(&probs, u) as usize;
                 assert!(
-                    draft_idx < vocab,
-                    "draft sample {draft_idx} out of vocab {vocab}"
+                    draft_idx < argmax_vocab,
+                    "draft sample {draft_idx} out of draft vocab {argmax_vocab}"
                 );
 
                 draft_probs.push(probs[draft_idx]);
-                draft_softmaxes.push(probs);
 
-                // Full-vocab: the sampled index IS the trunk token id (vocab_map
-                // is None in full-vocab mode). It feeds the next MTP head forward
-                // exactly as the greedy/p_min paths do (via candidates[k-1]).
+                // Remap compressed → full trunk id (no-op in full-vocab mode);
+                // feeds the next MTP head forward via candidates[k-1].
                 let token_id = match vocab_map_opt {
                     Some(vm) => vm[draft_idx],
                     None => draft_idx as u32,
                 };
                 candidates.push(token_id);
-                // draft_logits_host is unused on this GPU-softmax path; left
-                // allocated for symmetry with the (removed) host-sample fallback.
+
+                // Store the draft nucleus at FULL-vocab width for the residual.
+                // Full-vocab: the row already is full-width. Compressed: scatter
+                // each kept compressed prob to its full-vocab slot (vocab_map[j]);
+                // the unmapped slots stay 0, so residual = (target − draft)₊
+                // returns the full target mass there (lossless over full vocab).
+                if use_full_vocab {
+                    draft_softmaxes.push(probs);
+                } else {
+                    let vm = vocab_map_opt.expect("compressed mode carries a vocab_map");
+                    let mut full = vec![0.0f32; vocab];
+                    for (j, &pj) in probs.iter().enumerate() {
+                        if pj > 0.0 {
+                            full[vm[j] as usize] = pj;
+                        }
+                    }
+                    draft_softmaxes.push(full);
+                }
+                // draft_logits_host is unused on this GPU-softmax path.
                 let _ = &draft_logits_host;
             } else if use_p_min {
                 // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
@@ -3035,13 +3049,10 @@ pub fn spec_step_mtp_compressed_serial(
         // p_draft over the UN-truncated softmax while the draft was sampled from
         // a nucleus — a mismatch that can silently ship a token attractor.
         //
-        // Full-vocab only (served qwen3.6-27b MTP is full-vocab tied). The
-        // draft side already rejected compressed-vocab sampled, so reaching here
-        // implies use_full_vocab; candidates[k] is the trunk token id directly.
-        debug_assert!(
-            use_full_vocab,
-            "sampled MTP accept reached without full-vocab draft"
-        );
+        // Mode-agnostic: candidates[k] is the full trunk token id in BOTH full
+        // and compressed modes (compressed drafts remapped via vocab_map at
+        // proposal time), and draft_softmaxes are full-vocab width (compressed
+        // nuclei embedded above), so the accept rule needs no use_full_vocab gate.
         hit_eos = mtp_sampled_accept(
             gpu,
             state,
