@@ -5429,6 +5429,10 @@ fn generate_qwen35_mtp(
         .qwen35_mtp_head
         .as_ref()
         .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
+    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
+    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
+    // alloc below needs &mut state + &mut gpu.
+    let cvs_opt = head.weights.compressed_vocab_size;
     let kv_mode = MtpKvMode::Q8;
     let mut state =
         match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
@@ -5445,6 +5449,20 @@ fn generate_qwen35_mtp(
                 return;
             }
         };
+    // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
+    // up front (mtp_only_demo does this; the daemon previously only set up the
+    // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
+    // heads (cvs == None) skip this entirely.
+    if let Some(cvs) = cvs_opt {
+        if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
+            emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
+            return;
+        }
+        if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
+            emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
+            return;
+        }
+    }
     if temp > 1e-6 {
         // Sampled MTP: nucleus sampling — NOT p_min (mutually exclusive; the arch
         // step returns Err if both are set). top_k/min_p are routed to AR upstream.
