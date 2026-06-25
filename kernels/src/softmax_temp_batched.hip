@@ -175,44 +175,47 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     pmax = sdata[0];
     __syncthreads();
 
-    // ── Phase 5: bisect tau in [lo, hi] = [0, pmax] for the crossing value ──
-    // Predicate: mass(tau) = sum_{p_i >= tau} p_i. mass decreases as tau rises.
-    // We want the largest tau with mass(tau) >= top_p (the crossing token's
-    // probability). Invariant: mass(lo) >= top_p, mass(hi) < top_p (when
-    // top_p<1, mass(0)==1>=top_p and mass(pmax) is just the top token(s) mass
-    // which may or may not satisfy — handled by the predicate directly).
-    float lo = 0.0f;
-    float hi = pmax;
-    // 20 iterations drive the interval below ~1e-6 relative — ample for a
-    // nucleus cutoff (boundary tokens carry negligible mass; the host's
-    // exact-Z recompute in Phase 6 uses the converged threshold). Was 30;
-    // trimmed for perf (each iteration re-reads the full row).
-    for (int it = 0; it < 20; ++it) {
-        float mid = 0.5f * (lo + hi);
-        float m = 0.0f;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            float p = row_out[i];
-            if (p >= mid) m += p;
-        }
-        sdata[threadIdx.x] = m;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-            __syncthreads();
-        }
-        float mass = sdata[0];
-        __syncthreads();
-        // mass(mid) >= top_p → the nucleus reaches at least mid; we can raise
-        // the bar (keep fewer tokens). Else lower it (keep more).
-        if (mass >= top_p) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+    // ── Phase 5': histogram nucleus (replaces the 20-iteration bisection) ───
+    // The bisection re-read all `n` probs ~20× — the dominant cost when the
+    // trunk forward is cheap (MoE A3B: 665µs/call, 13% of GPU time). Instead,
+    // ONE pass bins each SIGNIFICANT prob's MASS into NBINS linear buckets over
+    // [0, pmax]; thread 0 then scans buckets top-down (highest prob first) for
+    // the crossing where cumulative kept-mass >= top_p. tau = the lower edge of
+    // that bucket — the largest bucket-resolution threshold whose kept mass
+    // still covers top_p, matching the bisection's intent at bucket precision.
+    // Probs below pmax*1e-5 carry negligible mass AND sit far below any
+    // realistic nucleus threshold, so they're skipped — which also kills the
+    // atomic contention the 248K-long tail would otherwise put on the low bins.
+    // Phase 6 recomputes the exact kept mass Z from this tau, so only the
+    // threshold (not Z) is bucket-approximate.
+    const int NBINS = 512;
+    __shared__ float shist[512];
+    for (int b = threadIdx.x; b < NBINS; b += blockDim.x) shist[b] = 0.0f;
+    __syncthreads();
+    float floor_p = pmax * 1e-5f;
+    float inv_pmax_bins = (pmax > 0.0f) ? ((float)NBINS / pmax) : 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float p = row_out[i];
+        if (p < floor_p) continue;
+        int bin = (int)(p * inv_pmax_bins);
+        if (bin >= NBINS) bin = NBINS - 1;
+        atomicAdd(&shist[bin], p);
     }
-    // lo is the largest tau with mass(lo) >= top_p → the inclusive crossing
-    // threshold. Host keeps p_i >= lo.
-    float tau = lo;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float cum = 0.0f;
+        int cross = 0;
+        for (int b = NBINS - 1; b >= 0; --b) {
+            cum += shist[b];
+            if (cum >= top_p) {
+                cross = b;
+                break;
+            }
+        }
+        sdata[0] = ((float)cross / (float)NBINS) * pmax;
+    }
+    __syncthreads();
+    float tau = sdata[0];
 
     // ── Phase 6: exact Z = mass(tau) from the converged threshold ──────────
     float kept = 0.0f;
