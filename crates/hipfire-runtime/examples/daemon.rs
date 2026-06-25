@@ -7171,6 +7171,34 @@ fn generate(
     // through to DFlash (lossless sampled-spec) or AR exactly as before.
     let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
     let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
+    // Sampled MTP is top_p-only: the residual-accept sampler honors top_p
+    // losslessly but does not implement top_k/min_p. A model whose generation
+    // config carries top_k (qwen3.6 A3B mq4p ships top_k=20) would otherwise
+    // route every sampled request to AR/DFlash and silently lose the MTP
+    // speedup. When MTP is opted-in, a head is loaded, and this is a sampled
+    // request that ONLY top_k is blocking (min_p not also set), drop top_k so
+    // MTP engages — top_p still applies, so the nucleus is preserved. Models
+    // without an MTP head, or requests also constrained by min_p, are untouched
+    // (top_k preserved for their AR/DFlash sampling). This affects only the MTP
+    // path; if MTP still cannot run, top_k was left intact for the fallback.
+    let mtp_head_sampled = qwen_mtp_opt_in
+        && m.qwen35_mtp_head.is_some()
+        && mtp_sampled_on
+        && temp > 1e-6
+        && (m.arch_id == 5 || m.arch_id == 6)
+        && !budgeted_thinking_needs_ar;
+    let top_k = if mtp_head_sampled
+        && top_k.map(|k| k > 0).unwrap_or(false)
+        && !min_p.map(|p| p > 0.0).unwrap_or(false)
+    {
+        eprintln!(
+            "[hipfire-daemon] MTP head present: dropping top_k={top_k:?} for the \
+             top_p-only sampled-MTP path (top_p preserved)"
+        );
+        None
+    } else {
+        top_k
+    };
     let topk_or_minp =
         top_k.map(|k| k > 0).unwrap_or(false) || min_p.map(|p| p > 0.0).unwrap_or(false);
     if qwen_mtp_opt_in
