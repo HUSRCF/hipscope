@@ -2152,62 +2152,6 @@ pub fn spec_step_mtp_compressed(
 /// Full-vocab only: `candidates[k]` is already the trunk token id (vocab_map is
 /// None in full-vocab mode), so it indexes the target softmax row directly.
 #[allow(clippy::too_many_arguments)]
-/// Combined top_k + top_p nucleus truncation on a NORMALIZED probability row
-/// (sums to 1 over its vocab). Keeps the tokens that are BOTH in the top-`top_k`
-/// by probability AND within the cumulative top_p mass (top_k applied first,
-/// the nucleus over those), renormalized by the kept mass — i.e. exactly the
-/// AR-at-(top_k,top_p) distribution. Used on the sampled-MTP path when the
-/// request/card carries top_k>0; the top_p-only path keeps using the GPU's
-/// apply_topp_trunc(tau,z). O(vocab): one partial-select + one zeroing pass.
-/// Applied identically to draft and target nuclei, so the residual-accept stays
-/// lossless relative to the (top_k,top_p)-truncated target.
-fn apply_topk_topp_trunc(row: &mut [f32], top_k: usize, top_p: f32) {
-    let n = row.len();
-    let k = top_k.min(n);
-    if k == 0 {
-        return;
-    }
-    let mut idx: Vec<usize> = (0..n).collect();
-    if k < n {
-        idx.select_nth_unstable_by(k - 1, |&a, &b| {
-            row[b]
-                .partial_cmp(&row[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        idx.truncate(k);
-    }
-    idx.sort_unstable_by(|&a, &b| {
-        row[b]
-            .partial_cmp(&row[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    // Nucleus within the top-k: accumulate (descending) until cumulative mass
-    // >= top_p (inclusive crossing). top_p<=0 or >=1 keeps all of the top-k.
-    let mut kept = idx.len();
-    if top_p > 0.0 && top_p < 1.0 {
-        let mut cum = 0.0f32;
-        for (rank, &i) in idx.iter().enumerate() {
-            cum += row[i];
-            if cum >= top_p {
-                kept = rank + 1;
-                break;
-            }
-        }
-    }
-    let z: f32 = idx[..kept].iter().map(|&i| row[i]).sum();
-    let inv_z = if z > f32::MIN_POSITIVE { 1.0 / z } else { 0.0 };
-    // Capture kept (renormalized) values, zero the row, scatter them back —
-    // avoids a per-element membership test over the full vocab.
-    let kept_vals: Vec<(usize, f32)> =
-        idx[..kept].iter().map(|&i| (i, row[i] * inv_z)).collect();
-    for p in row.iter_mut() {
-        *p = 0.0;
-    }
-    for (i, v) in kept_vals {
-        row[i] = v;
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn mtp_sampled_accept(
     gpu: &mut Gpu,
@@ -2247,6 +2191,7 @@ fn mtp_sampled_accept(
         n_verify,
         temp,
         top_p,
+        top_k,
     )?;
     let host_probs = gpu.download_f32(&probs_gpu)?;
     let tau = gpu.download_f32(&tau_gpu)?;
@@ -2256,17 +2201,12 @@ fn mtp_sampled_accept(
     let _ = gpu.free_tensor(z_gpu);
     debug_assert_eq!(host_probs.len(), n_verify * vocab);
 
-    // Build a single position's TRUNCATED target nucleus row on demand. With a
-    // top_k cutoff (request/card recipe, e.g. qwen3.6 A3B top_k=20) we recompute
-    // the combined top_k+top_p nucleus on the host from the full softmax row;
-    // otherwise the GPU-computed top_p threshold (tau/z) is applied as before.
+    // Build a single position's TRUNCATED target nucleus row on demand. The
+    // softmax kernel already folded any top_k cutoff into tau (tau = max(tau_p,
+    // tau_k)), so apply_topp_trunc applies the combined top_k+top_p nucleus.
     let target_row_at = |pos: usize| -> Vec<f32> {
         let mut row = host_probs[pos * vocab..(pos + 1) * vocab].to_vec();
-        if top_k > 0 {
-            apply_topk_topp_trunc(&mut row, top_k, top_p);
-        } else {
-            apply_topp_trunc(&mut row, tau[pos], z[pos]);
-        }
+        apply_topp_trunc(&mut row, tau[pos], z[pos]);
         row
     };
 
@@ -2774,6 +2714,7 @@ pub fn spec_step_mtp_compressed_serial(
                     /* rows */ 1,
                     sampling.temp,
                     sampling.top_p,
+                    sampling.top_k,
                 )?;
                 let mut probs = gpu.download_f32(&probs_gpu)?;
                 let tau = gpu.download_f32(&tau_gpu)?;
@@ -2783,16 +2724,11 @@ pub fn spec_step_mtp_compressed_serial(
                 let _ = gpu.free_tensor(z_gpu);
                 debug_assert_eq!(probs.len(), argmax_vocab);
 
-                // Host nucleus cut. With a top_k cutoff (request/card recipe,
-                // e.g. qwen3.6 A3B top_k=20) recompute the combined top_k+top_p
-                // nucleus on the host from the full draft softmax row — the SAME
-                // truncation the target side applies, so the residual-accept
-                // stays lossless. Otherwise use the GPU top_p threshold (tau/z).
-                if sampling.top_k > 0 {
-                    apply_topk_topp_trunc(&mut probs, sampling.top_k, sampling.top_p);
-                } else {
-                    apply_topp_trunc(&mut probs, tau[0], z[0]);
-                }
+                // Host nucleus cut. The softmax kernel already folded
+                // sampling.top_k into tau (tau = max(tau_p, tau_k)), so
+                // apply_topp_trunc applies the combined top_k+top_p nucleus —
+                // the SAME cut the target side gets (keeps the accept lossless).
+                apply_topp_trunc(&mut probs, tau[0], z[0]);
 
                 // Host-RNG categorical sample from the SAME truncated nucleus we
                 // store — draft token and stored distribution agree (load-bearing

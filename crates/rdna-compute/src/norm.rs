@@ -513,6 +513,7 @@ impl Gpu {
         rows: usize,
         temp: f32,
         top_p: f32,
+        top_k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -528,6 +529,7 @@ impl Gpu {
         let n_val = vocab as i32;
         let inv_t = 1.0f32 / temp;
         let top_p_val = top_p;
+        let top_k_val = top_k as i32;
 
         let mut params: Vec<*mut c_void> = vec![
             &logits_ptr as *const _ as *mut c_void,
@@ -537,6 +539,7 @@ impl Gpu {
             &n_val as *const _ as *mut c_void,
             &inv_t as *const _ as *mut c_void,
             &top_p_val as *const _ as *mut c_void,
+            &top_k_val as *const _ as *mut c_void,
         ];
 
         // Wider block than the plain softmax (256): the nucleus bisection
@@ -561,6 +564,7 @@ impl Gpu {
                 b.push_i32(n_val);
                 b.push_f32(inv_t);
                 b.push_f32(top_p_val);
+                b.push_i32(top_k_val);
                 b
             },
         )

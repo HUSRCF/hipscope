@@ -3978,6 +3978,9 @@ fn generate_dflash(
     // applied IDENTICALLY to both draft + target softmaxes (lossless == AR at
     // this top_p via the target truncation). 1.0 (>= 0.999) disables it.
     top_p: f32,
+    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20), applied to both
+    // draft + target softmax rows on the sampled path. 0 = disabled (top_p-only).
+    top_k: usize,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
@@ -4806,6 +4809,7 @@ fn generate_dflash(
                 // when cactus_delta==0).
                 top_p, // nucleus cutoff (honored on the sampled path, identical
                 // truncation on draft + target → lossless == AR-at-top_p).
+                top_k, // top-k cutoff, folded into tau by the kernel alongside top_p
                 &mut rng_state,
                 None, // block_size override
                 None, // ngram_cache
@@ -7246,28 +7250,30 @@ fn generate(
     // byte-parity — the GPU softmax differs from the host at the last ULP, which
     // can rarely flip a borderline accept; validated coherent across genres.)
     let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
-    let topk_or_minp =
-        top_k.map(|k| k > 0).unwrap_or(false) || min_p.map(|p| p > 0.0).unwrap_or(false);
+    // DFlash now honors top_k too (folded into tau by the spec-sampling kernel
+    // alongside top_p, applied identically to draft + target → lossless ==
+    // AR-at-(top_k,top_p)). min_p remains unimplemented on this path, so only a
+    // min_p-constrained request still routes to AR.
+    let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
     if m.dflash.is_some()
         && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
-        && (temp <= 1e-6 || (fast_sample_on && !topk_or_minp))
+        && (temp <= 1e-6 || (fast_sample_on && !dflash_min_p_present))
     {
-        // One-time visibility: top_p IS now honored on the DFlash spec sampled
-        // path (identical nucleus truncation on draft + target → lossless ==
-        // AR-at-top_p). top_k and min_p are still NOT honored. Emit a single
-        // narrowed event only when a non-default top_k/min_p was requested, so a
-        // residual behavior mismatch is visible rather than silent.
-        let topk_requested = top_k.map(|k| k > 0).unwrap_or(false);
+        // One-time visibility: temp + top_p + top_k ARE now honored on the
+        // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
+        // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains
+        // unimplemented; warn once if a non-default min_p was requested so the
+        // residual mismatch is visible rather than silent.
         let minp_requested = min_p.map(|p| p > 0.0).unwrap_or(false);
-        if temp > 1e-6 && (topk_requested || minp_requested) {
-            static SPEC_TOPK_WARNED: std::sync::atomic::AtomicBool =
+        if temp > 1e-6 && minp_requested {
+            static SPEC_MINP_WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !SPEC_TOPK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !SPEC_MINP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let _ = writeln!(
                     stdout,
-                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode honors temp+top_p but ignores top_k/min_p; set HIPFIRE_DFLASH_CHAT=0 to route through AR for full top_k/min_p support"}}"#,
+                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode honors temp+top_p+top_k but ignores min_p; set HIPFIRE_DFLASH_CHAT=0 to route through AR for full min_p support"}}"#,
                     id,
                 );
                 let _ = stdout.flush();
@@ -7314,6 +7320,7 @@ fn generate(
             stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
             temp,    // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
             top_p,   // nucleus cutoff: honored on the sampled DFlash path
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (recipe → folded into tau)
             0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );
         // Silence unused-variable warnings for the params DFlash doesn't

@@ -3064,6 +3064,11 @@ pub fn spec_step_dflash(
     // preservation); the draft is truncated too for parity + acceptance
     // efficiency. See apply_topp_trunc / apply_host_nucleus.
     top_p: f32,
+    // Top-k cutoff, applied identically to draft + target softmax rows on the
+    // sampled path (folded into tau by the GPU kernel: tau = max(tau_p, tau_k)).
+    // 0 = disabled (top_p-only). Lossless == AR-at-(top_k,top_p), same cut both
+    // sides.
+    top_k: usize,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
     ngram_cache: Option<&NgramCache>,
@@ -3472,6 +3477,7 @@ pub fn spec_step_dflash(
                         batch,
                         temp,
                         top_p,
+                        top_k,
                     )?;
                     let tau = gpu.download_f32(&tau_gpu)?;
                     let z = gpu.download_f32(&z_gpu)?;
@@ -3742,6 +3748,7 @@ pub fn spec_step_dflash(
                     b,
                     temp,
                     top_p,
+                    top_k,
                 )?;
                 fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
                 fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);

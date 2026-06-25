@@ -105,7 +105,8 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     float* __restrict__ Z,         // [rows] out
     int n,
     float inv_t,
-    float top_p
+    float top_p,
+    int top_k
 ) {
     extern __shared__ float sdata[];
     int row = blockIdx.x;
@@ -151,8 +152,10 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     }
     __syncthreads();
 
-    // ── top_p >= 1.0 guard: nucleus disabled → identity truncation ─────────
-    if (top_p >= 1.0f) {
+    // ── top_p >= 1.0 guard: nucleus disabled → identity truncation. With a
+    // top_k cutoff the truncation is NOT identity (top_k still limits the
+    // candidate set), so only short-circuit when top_k is ALSO disabled.
+    if (top_p >= 1.0f && top_k <= 0) {
         if (threadIdx.x == 0) {
             tau_cut[row] = 0.0f;
             Z[row] = 1.0f;
@@ -189,8 +192,12 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     // Phase 6 recomputes the exact kept mass Z from this tau, so only the
     // threshold (not Z) is bucket-approximate.
     const int NBINS = 512;
-    __shared__ float shist[512];
-    for (int b = threadIdx.x; b < NBINS; b += blockDim.x) shist[b] = 0.0f;
+    __shared__ float shist[512];     // per-bin prob MASS  (→ top_p threshold)
+    __shared__ float shist_cnt[512]; // per-bin prob COUNT (→ top_k threshold)
+    for (int b = threadIdx.x; b < NBINS; b += blockDim.x) {
+        shist[b] = 0.0f;
+        shist_cnt[b] = 0.0f;
+    }
     __syncthreads();
     float floor_p = pmax * 1e-5f;
     float inv_pmax_bins = (pmax > 0.0f) ? ((float)NBINS / pmax) : 0.0f;
@@ -200,19 +207,36 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
         int bin = (int)(p * inv_pmax_bins);
         if (bin >= NBINS) bin = NBINS - 1;
         atomicAdd(&shist[bin], p);
+        atomicAdd(&shist_cnt[bin], 1.0f);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float cum = 0.0f;
-        int cross = 0;
-        for (int b = NBINS - 1; b >= 0; --b) {
-            cum += shist[b];
-            if (cum >= top_p) {
-                cross = b;
-                break;
+        // Scan buckets top-down (highest prob first). tau_p = lower edge of the
+        // bucket where cumulative MASS first reaches top_p (the nucleus cut).
+        // tau_k = lower edge of the bucket where cumulative COUNT first reaches
+        // top_k (the k-th largest prob, at bucket precision). top_k AND top_p
+        // keep tokens above BOTH thresholds, so the effective cutoff is the
+        // tighter (higher) of the two. The pmax*1e-5 floor skipped the long tail,
+        // which sits below the top-k for any realistic k, so the count is exact.
+        float cum_mass = 0.0f;
+        float cum_cnt = 0.0f;
+        float tau_p = 0.0f;
+        float tau_k = 0.0f;
+        bool found_p = (top_p >= 1.0f); // top_p disabled → no mass cut (tau_p=0)
+        bool found_k = (top_k <= 0);    // top_k disabled → no count cut (tau_k=0)
+        for (int b = NBINS - 1; b >= 0 && !(found_p && found_k); --b) {
+            cum_mass += shist[b];
+            cum_cnt += shist_cnt[b];
+            if (!found_p && cum_mass >= top_p) {
+                tau_p = ((float)b / (float)NBINS) * pmax;
+                found_p = true;
+            }
+            if (!found_k && cum_cnt >= (float)top_k) {
+                tau_k = ((float)b / (float)NBINS) * pmax;
+                found_k = true;
             }
         }
-        sdata[0] = ((float)cross / (float)NBINS) * pmax;
+        sdata[0] = fmaxf(tau_p, tau_k);
     }
     __syncthreads();
     float tau = sdata[0];

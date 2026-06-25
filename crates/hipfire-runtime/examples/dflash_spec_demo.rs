@@ -1720,6 +1720,7 @@ fn main() {
                     if no_tape { None } else { Some(&mut gdn_tape) },
                     runtime_temp,
                     1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
+                    0, // top_k: demo has no top-k CLI; 0 = disabled
                     &mut rng_state,
                     block_override,
                     ngram_cache.as_ref(),
