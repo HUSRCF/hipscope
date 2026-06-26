@@ -1033,34 +1033,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.mtp_mode = resolved.mtp_mode;
   params.mtp_k = resolved.mtp_k;
 
-  // DFlash + Q8 KV capture cap. Two compounding limits make a large allocated
-  // KV physical_cap return 0 tokens when DFlash engages through the serve, so we
-  // cap the allocated max_seq when a DFlash draft is wired and the KV mode is
-  // Q8/auto:
-  //   1. The captured spec-decode prefill
-  //      (forward_prefill_batch_single_chunk_captured) falls back to a per-
-  //      position path that does hip.malloc INSIDE the hipGraph capture region
-  //      once physical_cap exceeds ~15000 with Q8 KV — illegal during capture
-  //      (gfx1100's 56 KB LDS overflows the captured flash path at ctx > 15000),
-  //      so the request errors and the client gets 0 tokens.
-  //   2. Empirically, even below that hardware limit the DFlash serve path
-  //      returns 0 tokens at physical_cap≈14336 while the *direct* daemon serves
-  //      it fine — a serve-engine interactive-load issue at large KV that is
-  //      validated reliable at 8192 (1274 tokens, coherent). Until that's
-  //      root-caused, 8192 is the conservative capture-safe ceiling.
-  // The serve's default max_seq (32768) trips this the moment DFlash engages —
-  // exactly what the uncapped-serve fix newly exercises. Longer context:
-  // dflash_mode=off (AR) or a non-Q8 kv_mode (asym/fwht). Skipped when the cap
-  // would fall below the max_tokens viability floor (huge single-response
-  // requests stay uncapped and route through AR if they exceed the limit).
-  const DFLASH_Q8_CAPTURE_MAX_SEQ = 8192;
-  if (params.draft && params.dflash_mode !== "off"
-      && (params.kv_mode === "q8" || params.kv_mode === "auto")
-      && params.max_seq > DFLASH_Q8_CAPTURE_MAX_SEQ
-      && DFLASH_Q8_CAPTURE_MAX_SEQ >= minViable) {
-    console.error(`[hipfire] DFlash + Q8 KV: capping max_seq ${params.max_seq} → ${DFLASH_Q8_CAPTURE_MAX_SEQ} (captured-flash LDS limit at KV physical_cap>15000 on gfx1100-class). For longer context set dflash_mode=off (AR) or a non-Q8 kv_mode.`);
-    params.max_seq = DFLASH_Q8_CAPTURE_MAX_SEQ;
-  }
+  // (Former DFlash+Q8 max_seq cap removed.) The captured-flash LDS cliff that
+  // 0-token'd Q8 KV at physical_cap>15000 is fixed in the engine: the captured
+  // verify forward now dispatches the tiled attention_flash_q8_0_batched_masked
+  // at any context (O(1) LDS, no per-position malloc). DFlash serves at the full
+  // resolved max_seq, VRAM-bound by the drafter context rather than a fixed cap.
 
   return { type: "load", model: path, params };
 }
@@ -3258,19 +3235,9 @@ async function serve(port: number, host: string) {
         // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
         // independent max_seq <= 524288 clamp, hunt3 H-D contract).
         let requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
-        // DFlash+Q8 capture cap: the prewarm load (buildLoadMessage) may cap the
-        // KV below the resolved config — the captured-flash spec-decode prefill
-        // errors at KV physical_cap>15000 and is unreliable above ~8192 through
-        // the serve. `currentMaxSeq` reflects that actually-loaded cap (nothing
-        // else lowers it below the config). Sizing this requirement against the
-        // UNCAPPED effective.max_seq re-inflates the load on the reload below
-        // (the bump), bringing back the captured-flash 0-token error on every
-        // DFlash request. Hold the requirement at the loaded cap; a request that
-        // genuinely needs more is truncated by the daemon to the KV rather than
-        // erroring the whole turn.
-        if (currentMaxSeq !== null && currentMaxSeq < effective.max_seq) {
-          requiredMaxSeq = Math.min(requiredMaxSeq, currentMaxSeq);
-        }
+        // (Former DFlash+Q8 reload-bump guard removed alongside the load cap:
+        // buildLoadMessage no longer caps max_seq, so requiredMaxSeq need not be
+        // held down to the loaded cap — the engine serves the full context.)
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
