@@ -432,6 +432,18 @@ fn ddtree_logw_cutoff() -> f32 {
     }
 }
 
+/// Parse HIPFIRE_DDTREE_MINNODES — the node-count floor for the banded DDTree
+/// build (`build_ddtree_tree_bounded`). Places at least this many
+/// highest-probability nodes before the logw cutoff is allowed to prune,
+/// capped at `budget`. 0 / unset reproduces the historical pure-cutoff build
+/// byte-for-byte (the wrapper delegates with min_nodes=0).
+fn ddtree_min_nodes() -> usize {
+    std::env::var("HIPFIRE_DDTREE_MINNODES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// DDTree meta-verifier pruner telemetry: per-cycle tree-size histogram.
 /// `cycle_count` = cycles observed; `total_nodes` = sum of tree.num_nodes()
 /// across cycles; `max_nodes` / `min_nodes` = range observed.
@@ -4370,11 +4382,12 @@ pub fn spec_step_ddtree(
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
+        ddtree_min_nodes(),
         tree_budget,
         ddtree_logw_cutoff(),
     );
@@ -4691,11 +4704,12 @@ pub fn spec_step_ddtree_batched(
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
+        ddtree_min_nodes(),
         tree_budget,
         ddtree_logw_cutoff(),
     );
@@ -5317,11 +5331,12 @@ pub fn spec_step_ddtree_path_c(
     )?;
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
+        ddtree_min_nodes(),
         tree_budget,
         ddtree_logw_cutoff(),
     );
