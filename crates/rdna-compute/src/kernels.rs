@@ -3371,6 +3371,9 @@ pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_ac
 pub const DDTREE_SWOR_WALK_SRC: &str =
     include_str!("../../../kernels/src/ddtree_swor_walk.hip");
 
+pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_gumbel_topk_batched.hip");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════

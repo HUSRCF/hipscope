@@ -4338,51 +4338,29 @@ fn run_dflash_draft_for_topk_gpu(
     // per-position log-prob `log_softmax(logits/temp)[token]`. The candidates are
     // then genuine draft samples — the precondition the SWOR verify needs.
     if let Some((temp, rng)) = sample {
-        // Download once for host-side Gumbel sampling + the CPU tree build; KEEP
-        // `logits_batch` on device for the fused GPU SWOR walk (returned below).
-        let host = gpu.download_f32(&logits_batch)?;
-        let inv_t = 1.0 / temp.max(1e-4);
-        let mut top_tokens = vec![0u32; batch * k];
-        let mut top_log_probs = vec![0f32; batch * k];
-        for r in 0..batch {
-            let row = &host[r * vocab..(r + 1) * vocab];
-            // log-sum-exp at temp for the true log-prob.
-            let mut m = f32::NEG_INFINITY;
-            for &v in row {
-                let s = v * inv_t;
-                if s > m {
-                    m = s;
-                }
-            }
-            let mut sum = 0.0f32;
-            for &v in row {
-                sum += (v * inv_t - m).exp();
-            }
-            let lse = m + sum.ln();
-            // Top-k by perturbed score `logit/temp + Gumbel`. Maintain a small
-            // ascending-by-score buffer of size ≤ k.
-            let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
-            for (t, &v) in row.iter().enumerate() {
-                let mut u = xorshift_next_unit(rng);
-                if u <= 1e-7 {
-                    u = 1e-7;
-                }
-                let g = -(-(u.ln())).ln(); // Gumbel(0,1)
-                let score = v * inv_t + g;
-                if best.len() < k {
-                    best.push((score, t as u32));
-                    best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                } else if score > best[0].0 {
-                    best[0] = (score, t as u32);
-                    best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                }
-            }
-            // Emit highest-score first (rank 0). True log-prob = logit/temp − lse.
-            for (rank, &(_score, tok)) in best.iter().rev().enumerate() {
-                top_tokens[r * k + rank] = tok;
-                top_log_probs[r * k + rank] = row[tok as usize] * inv_t - lse;
-            }
-        }
+        // Device-side Gumbel-top-k SWOR sampling: NO [B×vocab] D2H. Draw the k
+        // draw-ordered candidates per position + their true log-q on the GPU; only
+        // B×k come back for the CPU tree build. `logits_batch` stays resident for
+        // the fused SWOR walk (returned below).
+        let seed = *rng;
+        xorshift_next_unit(rng);
+        let idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+        let logp_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+        gpu.ddtree_gumbel_topk_batched_f32(
+            &logits_batch,
+            &idx_gpu,
+            &logp_gpu,
+            vocab,
+            k,
+            batch,
+            temp,
+            seed,
+        )?;
+        let idx_host = gpu.download_f32(&idx_gpu)?;
+        let top_log_probs = gpu.download_f32(&logp_gpu)?;
+        let _ = gpu.free_tensor(idx_gpu);
+        let _ = gpu.free_tensor(logp_gpu);
+        let top_tokens: Vec<u32> = idx_host.iter().map(|f| f.to_bits()).collect();
         return Ok((top_tokens, top_log_probs, Some(logits_batch)));
     }
 
@@ -4834,18 +4812,18 @@ pub fn spec_step_ddtree_batched(
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
-    // Verify-scheme selector (A/B). HIPFIRE_DDTREE_VERIFY: naive (default,
-    // distribution-preserving) | swor (q-exploiting Sequoia/SpecTr). SWOR is
-    // distribution-exact ONLY with genuine draft samples, so it drives the
-    // Gumbel-SWOR draft sampler below. HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the
-    // greedy walk (old behaviour) for the τ A/B.
+    // Verify-scheme selector. HIPFIRE_DDTREE_VERIFY: swor (DEFAULT — q-exploiting
+    // Sequoia/SpecTr, distribution-exact, the broad-sweep perf winner) | naive
+    // (simpler distribution-preserving fallback). SWOR drives the device Gumbel-
+    // SWOR draft sampler below. HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the greedy
+    // argmax walk (NOT temperature-correct — diagnostic/A-B only).
     let force_greedy_verify = std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
         .ok()
         .as_deref()
         == Some("1");
     let use_swor = temp > 0.0
         && !force_greedy_verify
-        && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() == Some("swor");
+        && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() != Some("naive");
 
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs

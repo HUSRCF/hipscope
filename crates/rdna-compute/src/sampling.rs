@@ -714,6 +714,62 @@ impl Gpu {
         )
     }
 
+    /// Per-row Gumbel-top-k SWOR sampler: draws `k` tokens WITHOUT replacement
+    /// from `softmax(logits/temp)` per row of `[batch × vocab]`, returning the
+    /// draw-ordered token ids (`top_idx`) and their true log-probs (`top_logp`),
+    /// both `[batch × k]`. Keeps the draft logits device-resident — only B×k come
+    /// back, vs the prior [B × vocab] D2H for host Gumbel sampling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ddtree_gumbel_topk_batched_f32(
+        &mut self,
+        logits: &GpuTensor,   // [batch × vocab]
+        top_idx: &GpuTensor,  // [batch × k] i32
+        top_logp: &GpuTensor, // [batch × k] f32
+        vocab: usize,
+        k: usize,
+        batch: usize,
+        temp: f32,
+        seed: u64,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!((1..=8).contains(&k), "gumbel_topk: k={k} must be in [1,8]");
+        self.ensure_kernel(
+            "ddtree_gumbel_topk_batched",
+            kernels::DDTREE_GUMBEL_TOPK_BATCHED_SRC,
+            "ddtree_gumbel_topk_batched_f32",
+        )?;
+        let func = &self.functions["ddtree_gumbel_topk_batched_f32"];
+        let mut lp = logits.buf.as_ptr();
+        let mut ti = top_idx.buf.as_ptr();
+        let mut tl = top_logp.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut kk = k as i32;
+        let mut tp = temp;
+        let mut sd = (seed | 1) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut ti as *mut _ as *mut c_void,
+            &mut tl as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut sd as *mut _ as *mut c_void,
+        ];
+        const MAX_K: u32 = 8;
+        let nth: u32 = 256;
+        let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch as u32, 1, 1],
+                [nth, 1, 1],
+                lds,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Fused on-device SWOR tree-verify walk. One workgroup runs the whole
     /// sequential descent; each per-slot vocab sweep (target softmax, draft
     /// softmax, recursive `relu(p−q)` residual, renorm, categorical draw) is
