@@ -4056,6 +4056,90 @@ fn run_dflash_draft_for_logits(
 /// Returns `(top_tokens, top_log_probs)` each of size `(b-1) * k` in
 /// row-major order (same convention as `ddtree::topk_from_logits`).
 #[allow(clippy::too_many_arguments)]
+/// Upload an `i32` slice as a device buffer (no I32 DType — raw bytes; kernels
+/// read it as `int*`).
+fn upload_i32(gpu: &Gpu, data: &[i32]) -> HipResult<GpuTensor> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    gpu.upload_raw(bytes, &[data.len()])
+}
+
+/// Run the fused on-device SWOR tree-verify walk and return the CPU-shaped
+/// `(accepted_node_indices, bonus_token)`. Builds the device metadata
+/// (slot→depth, draw-ordered candidates, child-of-candidate adjacency), launches
+/// `ddtree_swor_walk_f32` against the device-resident target + draft logits, and
+/// reads back only the tiny result. No full-vocab work on the host.
+#[allow(clippy::too_many_arguments)]
+fn swor_walk_gpu(
+    gpu: &mut Gpu,
+    tree: &hipfire_runtime::ddtree::DdTree,
+    target_logits: &GpuTensor,
+    draft_logits: &GpuTensor,
+    pos_cands: &[u32],
+    num_pos: usize,
+    k: usize,
+    vocab: usize,
+    temp: f32,
+    seed: u64,
+) -> HipResult<(Vec<usize>, u32)> {
+    let n_slots = 1 + tree.nodes.len();
+    let mut slot_depth = vec![0i32; n_slots];
+    for s in 1..n_slots {
+        slot_depth[s] = tree.nodes[s - 1].depth as i32;
+    }
+    let mut child_of_cand = vec![-1i32; n_slots * k];
+    for s in 0..n_slots {
+        let depth = slot_depth[s] as usize;
+        if depth >= num_pos {
+            continue;
+        }
+        for r in 0..k {
+            let token = pos_cands[depth * k + r];
+            if let Some(&ci) = tree.child_maps[s].get(&token) {
+                child_of_cand[s * k + r] = ci as i32;
+            }
+        }
+    }
+    let pos_cands_i32: Vec<i32> = pos_cands.iter().map(|&t| t as i32).collect();
+    let t_pcand = upload_i32(gpu, &pos_cands_i32)?;
+    let t_depth = upload_i32(gpu, &slot_depth)?;
+    let t_child = upload_i32(gpu, &child_of_cand)?;
+    let t_pres = gpu.alloc_tensor(&[vocab], rdna_compute::DType::F32)?;
+    let t_qpos = gpu.alloc_tensor(&[vocab], rdna_compute::DType::F32)?;
+    let t_out = gpu.alloc_tensor(&[2 + num_pos], rdna_compute::DType::F32)?;
+    gpu.ddtree_swor_walk_f32(
+        target_logits,
+        draft_logits,
+        &t_pcand,
+        &t_depth,
+        &t_child,
+        &t_pres,
+        &t_qpos,
+        &t_out,
+        temp,
+        k,
+        vocab,
+        n_slots,
+        num_pos,
+        seed,
+    )?;
+    let raw = gpu.download_f32(&t_out)?;
+    let _ = gpu.free_tensor(t_pcand);
+    let _ = gpu.free_tensor(t_depth);
+    let _ = gpu.free_tensor(t_child);
+    let _ = gpu.free_tensor(t_pres);
+    let _ = gpu.free_tensor(t_qpos);
+    let _ = gpu.free_tensor(t_out);
+    let accept_len = (raw[0].to_bits() as i32).max(0) as usize;
+    let bonus = raw[1].to_bits() as u32;
+    let mut accepted = Vec::with_capacity(accept_len);
+    for i in 0..accept_len {
+        accepted.push((raw[2 + i].to_bits() as i32) as usize);
+    }
+    Ok((accepted, bonus))
+}
+
 fn run_dflash_draft_for_topk_gpu(
     gpu: &mut Gpu,
     target: &ModelSlot,
@@ -4074,10 +4158,11 @@ fn run_dflash_draft_for_topk_gpu(
     // genuine draft samples, which is what the q-exploiting SWOR verify needs to
     // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
     sample: Option<(f32, &mut u64)>,
-) -> HipResult<(Vec<u32>, Vec<f32>, Option<Vec<f32>>)> {
-    // The 3rd return is the FULL per-position draft softmax `[batch·vocab]`,
-    // populated only in `sample` mode — the verbatim SWOR verify needs it for the
-    // residual `relu(p − q)`. `None` on the default top-k path.
+) -> HipResult<(Vec<u32>, Vec<f32>, Option<GpuTensor>)> {
+    // The 3rd return is the draft logits kept ON DEVICE (`[batch·vocab]`),
+    // populated only in `sample` mode — the fused GPU SWOR walk softmaxes them
+    // for its residual, so they must NOT be freed here. `None` on the top-k path;
+    // the SWOR caller frees the tensor after the walk.
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
@@ -4253,13 +4338,12 @@ fn run_dflash_draft_for_topk_gpu(
     // per-position log-prob `log_softmax(logits/temp)[token]`. The candidates are
     // then genuine draft samples — the precondition the SWOR verify needs.
     if let Some((temp, rng)) = sample {
+        // Download once for host-side Gumbel sampling + the CPU tree build; KEEP
+        // `logits_batch` on device for the fused GPU SWOR walk (returned below).
         let host = gpu.download_f32(&logits_batch)?;
-        let _ = gpu.free_tensor(logits_batch);
         let inv_t = 1.0 / temp.max(1e-4);
         let mut top_tokens = vec![0u32; batch * k];
         let mut top_log_probs = vec![0f32; batch * k];
-        // Full per-position draft softmax for the SWOR residual.
-        let mut q_full = vec![0f32; batch * vocab];
         for r in 0..batch {
             let row = &host[r * vocab..(r + 1) * vocab];
             // log-sum-exp at temp for the true log-prob.
@@ -4275,13 +4359,6 @@ fn run_dflash_draft_for_topk_gpu(
                 sum += (v * inv_t - m).exp();
             }
             let lse = m + sum.ln();
-            // Materialize the full softmax q for this position.
-            {
-                let qrow = &mut q_full[r * vocab..(r + 1) * vocab];
-                for (t, &v) in row.iter().enumerate() {
-                    qrow[t] = (v * inv_t - lse).exp();
-                }
-            }
             // Top-k by perturbed score `logit/temp + Gumbel`. Maintain a small
             // ascending-by-score buffer of size ≤ k.
             let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
@@ -4306,7 +4383,7 @@ fn run_dflash_draft_for_topk_gpu(
                 top_log_probs[r * k + rank] = row[tok as usize] * inv_t - lse;
             }
         }
-        return Ok((top_tokens, top_log_probs, Some(q_full)));
+        return Ok((top_tokens, top_log_probs, Some(logits_batch)));
     }
 
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
@@ -4775,7 +4852,7 @@ pub fn spec_step_ddtree_batched(
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
     // with an on-device top-K (~µs) plus a ~480 byte D2H. SWOR mode instead
     // Gumbel-top-k samples the children (download + CPU sample).
-    let (top_tokens, top_log_probs, draft_q_full) = run_dflash_draft_for_topk_gpu(
+    let (top_tokens, top_log_probs, draft_logits_dev) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,
@@ -4951,9 +5028,10 @@ pub fn spec_step_ddtree_batched(
     // temp > 0 needs the full per-slot target logits for naive tree sampling;
     // greedy keeps the cheap GPU-argmax + 4·B D2H.
     // `force_greedy_verify` / `use_swor` were resolved before the draft (the
-    // draft sampler keys off `use_swor`). temp>0 needs the full per-slot target
-    // logits for either sampling walk.
-    let want_full_logits = temp > 0.0 && !force_greedy_verify;
+    // draft sampler keys off `use_swor`). Only NAIVE needs the host download of
+    // the full logits; SWOR reads them on-device (verify_scratch.logits) in the
+    // fused kernel, so it skips the B×vocab D2H.
+    let want_full_logits = temp > 0.0 && !force_greedy_verify && !use_swor;
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -4973,21 +5051,28 @@ pub fn spec_step_ddtree_batched(
     // OR — when use_swor — the q-exploiting Sequoia/SpecTr SWOR walk over the
     // Gumbel-sampled tree. All return the same (accepted, bonus) shape; step 10's
     // divergent-path commit handles non-linear accepted paths identically.
-    let (accepted_node_indices, bonus_token) = if !want_full_logits {
-        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
-    } else if use_swor {
-        hipfire_runtime::ddtree::sample_verified_tree_swor(
+    let (accepted_node_indices, bonus_token) = if use_swor {
+        // Fully on-device fused SWOR walk: target logits from verify scratch,
+        // draft logits kept on device — no full-vocab host work, no q D2H.
+        let target_dev = verify_scratch.logits.sub_offset(0, big_n * vocab);
+        let draft_dev = draft_logits_dev
+            .as_ref()
+            .expect("use_swor ⇒ draft kept its device logits");
+        let seed = *rng_state;
+        xorshift_next_unit(rng_state);
+        swor_walk_gpu(
+            gpu,
             &tree,
-            &verify_out.logits_per_pos,
-            draft_q_full.as_deref().unwrap_or(&[]),
+            &target_dev,
+            draft_dev,
             &swor_pos_cands,
             b - 1,
             tree_topk,
             vocab,
             temp,
-            rng_state,
-        )
-    } else {
+            seed,
+        )?
+    } else if want_full_logits {
         hipfire_runtime::ddtree::sample_verified_tree(
             &tree,
             &verify_out.logits_per_pos,
@@ -4995,7 +5080,13 @@ pub fn spec_step_ddtree_batched(
             temp,
             rng_state,
         )
+    } else {
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
     };
+    // The kept draft logits are no longer needed once the walk has run.
+    if let Some(t) = draft_logits_dev {
+        let _ = gpu.free_tensor(t);
+    }
     let accept_len = accepted_node_indices.len();
 
     // Phase-0 (p,q) dump for the q-exploiting-verify decision gate. Only on the

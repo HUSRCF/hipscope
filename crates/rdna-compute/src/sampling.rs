@@ -159,8 +159,19 @@ impl Gpu {
         // Back-compat shim: no presence/frequency penalties (byte-identical
         // to the pre-PF kernel, which had `if (repeat_penalty > 1.0f)`).
         self.sample_top_p_pf(
-            logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
-            rng_state, repeat_window, repeat_penalty, 0.0, 0.0, None, None,
+            logits,
+            result_buf,
+            repeat_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+            0.0,
+            0.0,
+            None,
+            None,
         )
     }
 
@@ -198,9 +209,19 @@ impl Gpu {
         // identical token for distinct logits. Opt out: HIPFIRE_SAMPLE_PARALLEL=0.
         if sample_parallel_enabled() {
             return self.sample_top_p_parallel_impl(
-                logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
-                rng_state, repeat_window, repeat_penalty, presence_penalty, frequency_penalty,
-                top_k_req, min_p_val,
+                logits,
+                result_buf,
+                repeat_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                repeat_window,
+                repeat_penalty,
+                presence_penalty,
+                frequency_penalty,
+                top_k_req,
+                min_p_val,
             );
         }
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
@@ -688,6 +709,94 @@ impl Gpu {
                 b.push_ptr(rp);
                 b.push_i32(dg);
                 b.push_i32(eos);
+                b
+            },
+        )
+    }
+
+    /// Fused on-device SWOR tree-verify walk. One workgroup runs the whole
+    /// sequential descent; each per-slot vocab sweep (target softmax, draft
+    /// softmax, recursive `relu(p−q)` residual, renorm, categorical draw) is
+    /// block-parallel. Replaces the host O(vocab·k)/slot loop and the q D2H.
+    /// `out` (i32 `[2 + num_pos]`): `out[0]`=accept_len, `out[1]`=bonus token,
+    /// `out[2+i]`=accepted child node index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ddtree_swor_walk_f32(
+        &mut self,
+        target_logits: &GpuTensor, // [n_slots * vocab]
+        draft_logits: &GpuTensor,  // [num_pos * vocab]
+        pos_cands: &GpuTensor,     // [num_pos * k] i32
+        slot_depth: &GpuTensor,    // [n_slots] i32
+        child_of_cand: &GpuTensor, // [n_slots * k] i32
+        p_res: &GpuTensor,         // scratch [vocab]
+        q_pos: &GpuTensor,         // scratch [vocab]
+        out: &GpuTensor,           // [2 + num_pos] i32
+        temp: f32,
+        k: usize,
+        vocab: usize,
+        n_slots: usize,
+        num_pos: usize,
+        seed: u64,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!((1..=8).contains(&k), "swor_walk: k={k} must be in [1,8]");
+        self.ensure_kernel(
+            "ddtree_swor_walk",
+            kernels::DDTREE_SWOR_WALK_SRC,
+            "ddtree_swor_walk_f32",
+        )?;
+        let mut tl = target_logits.buf.as_ptr();
+        let mut dl = draft_logits.buf.as_ptr();
+        let mut pc = pos_cands.buf.as_ptr();
+        let mut sd = slot_depth.buf.as_ptr();
+        let mut cc = child_of_cand.buf.as_ptr();
+        let mut pr = p_res.buf.as_ptr();
+        let mut qp = q_pos.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut tp = temp;
+        let mut kk = k as i32;
+        let mut vs = vocab as i32;
+        let mut ns = n_slots as i32;
+        let mut np = num_pos as i32;
+        let mut sd_seed = (seed | 1) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tl as *mut _ as *mut c_void,
+            &mut dl as *mut _ as *mut c_void,
+            &mut pc as *mut _ as *mut c_void,
+            &mut sd as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut pr as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut sd_seed as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "ddtree_swor_walk_f32",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tl);
+                b.push_ptr(dl);
+                b.push_ptr(pc);
+                b.push_ptr(sd);
+                b.push_ptr(cc);
+                b.push_ptr(pr);
+                b.push_ptr(qp);
+                b.push_ptr(op);
+                b.push_f32(tp);
+                b.push_i32(kk);
+                b.push_i32(vs);
+                b.push_i32(ns);
+                b.push_i32(np);
+                b.push_u32(sd_seed);
                 b
             },
         )

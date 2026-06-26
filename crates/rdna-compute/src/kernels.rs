@@ -3368,6 +3368,9 @@ pub const ARGMAX_TOKEN_CHAIN_SRC: &str =
 /// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
 pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
 
+pub const DDTREE_SWOR_WALK_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_swor_walk.hip");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════
