@@ -4074,7 +4074,10 @@ fn run_dflash_draft_for_topk_gpu(
     // genuine draft samples, which is what the q-exploiting SWOR verify needs to
     // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
     sample: Option<(f32, &mut u64)>,
-) -> HipResult<(Vec<u32>, Vec<f32>)> {
+) -> HipResult<(Vec<u32>, Vec<f32>, Option<Vec<f32>>)> {
+    // The 3rd return is the FULL per-position draft softmax `[batch·vocab]`,
+    // populated only in `sample` mode — the verbatim SWOR verify needs it for the
+    // residual `relu(p − q)`. `None` on the default top-k path.
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
@@ -4255,6 +4258,8 @@ fn run_dflash_draft_for_topk_gpu(
         let inv_t = 1.0 / temp.max(1e-4);
         let mut top_tokens = vec![0u32; batch * k];
         let mut top_log_probs = vec![0f32; batch * k];
+        // Full per-position draft softmax for the SWOR residual.
+        let mut q_full = vec![0f32; batch * vocab];
         for r in 0..batch {
             let row = &host[r * vocab..(r + 1) * vocab];
             // log-sum-exp at temp for the true log-prob.
@@ -4270,6 +4275,13 @@ fn run_dflash_draft_for_topk_gpu(
                 sum += (v * inv_t - m).exp();
             }
             let lse = m + sum.ln();
+            // Materialize the full softmax q for this position.
+            {
+                let qrow = &mut q_full[r * vocab..(r + 1) * vocab];
+                for (t, &v) in row.iter().enumerate() {
+                    qrow[t] = (v * inv_t - lse).exp();
+                }
+            }
             // Top-k by perturbed score `logit/temp + Gumbel`. Maintain a small
             // ascending-by-score buffer of size ≤ k.
             let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
@@ -4294,7 +4306,7 @@ fn run_dflash_draft_for_topk_gpu(
                 top_log_probs[r * k + rank] = row[tok as usize] * inv_t - lse;
             }
         }
-        return Ok((top_tokens, top_log_probs));
+        return Ok((top_tokens, top_log_probs, Some(q_full)));
     }
 
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
@@ -4328,7 +4340,7 @@ fn run_dflash_draft_for_topk_gpu(
     let _ = gpu.free_tensor(topk_val_gpu);
 
     let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
-    Ok((top_tokens, val_host))
+    Ok((top_tokens, val_host, None))
 }
 
 /// Enumerate all root-to-leaf paths in a DdTree. Returns paths as Vec<Vec<usize>>
@@ -4763,7 +4775,7 @@ pub fn spec_step_ddtree_batched(
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
     // with an on-device top-K (~µs) plus a ~480 byte D2H. SWOR mode instead
     // Gumbel-top-k samples the children (download + CPU sample).
-    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+    let (top_tokens, top_log_probs, draft_q_full) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,
@@ -4781,6 +4793,9 @@ pub fn spec_step_ddtree_batched(
             None
         },
     )?;
+    // SWOR verify needs the draw-ordered candidates per position; `top_tokens` is
+    // already in Gumbel-draw order (rank 0 = first drawn) in sample mode.
+    let swor_pos_cands = top_tokens.clone();
 
     let t_draft = t_all.elapsed();
     let t_topk = t_draft; // fused with draft now
@@ -4964,6 +4979,10 @@ pub fn spec_step_ddtree_batched(
         hipfire_runtime::ddtree::sample_verified_tree_swor(
             &tree,
             &verify_out.logits_per_pos,
+            draft_q_full.as_deref().unwrap_or(&[]),
+            &swor_pos_cands,
+            b - 1,
+            tree_topk,
             vocab,
             temp,
             rng_state,
@@ -5447,7 +5466,7 @@ pub fn spec_step_ddtree_path_c(
     );
 
     // ── 1+2. GPU-resident draft + per-row top-K (identical to batched path) ──
-    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+    let (top_tokens, top_log_probs, _q_full) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,

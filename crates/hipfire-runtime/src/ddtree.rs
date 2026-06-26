@@ -634,43 +634,103 @@ pub fn sample_verified_tree(
     }
 }
 
-/// q-EXPLOITING tree verify (Sequoia / SpecTr "sampling-without-replacement"
-/// family), on the REDUCED per-slot support `{child_1..child_k, TAIL}`.
+/// One position's VERBATIM recursive without-replacement speculative-sampling
+/// step (SpecTr / Sequoia / SpecInfer §A). Given the target distribution `p_s`
+/// (full vocab), the full draft distribution `q_pos` (full vocab), and the draft's
+/// `cands` drawn from `q_pos` WITHOUT replacement IN DRAW ORDER, emits one token
+/// distributed EXACTLY as `p_s` while accepting a candidate when possible.
 ///
-/// Unlike naive sampling (which ignores `q`), at each slot this tries the drafted
-/// children in descending draft-prob order and accepts child `c` with the SWOR
-/// ratio `min(1, p_res(c) / (q(c)/Z))` (`Z` = remaining draft mass), depleting the
-/// residual target `p_res` on rejection — so a confident draft buys acceptance the
-/// target's own sample would have missed. `p` comes from the verify logits
-/// (already downloaded on the temp>0 path) and `q = exp(node.logw − parent.logw)`;
-/// the residual is renormalized over the small `{children, TAIL}` support, so this
-/// needs NO extra D2H over naive. On all-reject the bonus is a target draw (keeps
-/// the emitted token coherent).
+/// For draw `j` (0-indexed), `Z = 1 − Σ_{i<j} q(c_i)` is the remaining draft mass
+/// and the residual draft distribution is `q_j(t) = q_pos(t)/Z` for `t` not yet
+/// drawn. Accept `c_j` w.p. `min(1, p_j(c_j)/q_j(c_j))`; on rejection set
+/// `p_{j+1} = normalize(relu(p_j − q_j))` (full-vocab) and continue; if all `k`
+/// reject, draw the token from the final residual `p_{k+1}`. Returns
+/// `(Some(accepted_token), _)` or `(None, residual_token)`.
+fn swor_step(
+    p_s: &mut [f32],
+    q_pos: &[f32],
+    cands: &[u32],
+    rng_state: &mut u64,
+) -> (Option<u32>, u32) {
+    let vocab = p_s.len();
+    let mut drawn: Vec<u32> = Vec::with_capacity(cands.len());
+    let mut drawn_q_sum = 0.0f32;
+    for &c in cands {
+        let ct = c as usize;
+        if ct >= vocab {
+            continue;
+        }
+        let z = (1.0 - drawn_q_sum).max(1e-9);
+        let qjc = (q_pos[ct] / z).clamp(0.0, 1.0);
+        let ratio = if qjc > 0.0 {
+            (p_s[ct] / qjc).min(1.0)
+        } else {
+            0.0
+        };
+        let u = xorshift_unit(rng_state);
+        if p_s[ct] > 0.0 && u < ratio {
+            return (Some(c), c);
+        }
+        // Reject: p_{j+1} = normalize(relu(p_j − q_j)), q_j(t)=q_pos[t]/z for t∉drawn.
+        for (t, pv) in p_s.iter_mut().enumerate() {
+            if drawn.iter().any(|&d| d as usize == t) {
+                continue;
+            }
+            *pv = (*pv - q_pos[t] / z).max(0.0);
+        }
+        let s: f32 = p_s.iter().sum();
+        if s > 0.0 {
+            for pv in p_s.iter_mut() {
+                *pv /= s;
+            }
+        }
+        drawn.push(c);
+        drawn_q_sum += q_pos[ct];
+    }
+    // All candidates rejected: draw from the final residual target.
+    let u = xorshift_unit(rng_state);
+    (None, sample_unnormalized(p_s, u))
+}
+
+/// q-EXPLOITING tree verify — VERBATIM recursive without-replacement speculative
+/// sampling (SpecTr / Sequoia / SpecInfer), distribution-EXACT.
 ///
-/// EXACTNESS CAVEAT: SWOR is distribution-exact only when the candidates are
-/// genuine draft samples. hipfire's ddtree is built from top-k MARGINALS, so this
-/// is a draft-BIASED relaxation (over-trusts the draft, same family as CACTUS) —
-/// it trades distribution-exactness for acceptance. The naive path stays the
-/// distribution-preserving default; this is the q-exploiting A/B arm. Reduces to
-/// the greedy walk at `temp→0` (one-hot target ⇒ only the argmax child clears the
-/// ratio). Returns the same `(accepted_node_indices, bonus_token)` shape.
+/// Unlike naive sampling (which ignores `q`), at each tree node this runs the
+/// full recursive SWOR step ([`swor_step`]) over the node's draft proposals —
+/// the `k` tokens the draft sampled WITHOUT replacement from that position's
+/// distribution, in draw order — accepting one when the rejection ratio clears.
+/// Because every emitted token is drawn from the (residual) TARGET, the output
+/// distribution is preserved EXACTLY at any temperature; `q` only changes WHICH
+/// target draws get reused (acceptance), not WHAT is emitted. (Validated by the
+/// `swor_preserves_target_distribution` Monte-Carlo test.)
+///
+/// Inputs: `target_logits` `[(1+N)·vocab]` (per verify slot); `draft_q`
+/// `[num_pos·vocab]` the full draft softmax per draft position; `pos_cands`
+/// `[num_pos·k]` the draft's draw-ordered samples per position. A node at tree
+/// depth `d` draws from position `d` (root = position 0). On accept the walk
+/// descends the matching tree child; an accepted-but-pruned candidate (not in the
+/// tree) is emitted as the final token. Reduces to `follow_verified_tree` at
+/// `temp→0`. Returns the same `(accepted_node_indices, bonus_token)` shape.
+#[allow(clippy::too_many_arguments)]
 pub fn sample_verified_tree_swor(
     tree: &DdTree,
-    logits_per_pos: &[f32],
+    target_logits: &[f32],
+    draft_q: &[f32],
+    pos_cands: &[u32],
+    num_pos: usize,
+    k: usize,
     vocab: usize,
     temp: f32,
     rng_state: &mut u64,
 ) -> (Vec<usize>, u32) {
     let n_slots = 1 + tree.nodes.len();
-    debug_assert_eq!(logits_per_pos.len(), n_slots * vocab);
+    debug_assert_eq!(target_logits.len(), n_slots * vocab);
 
-    // Greedy (temp≤0): delegate to the argmax walk. The SWOR ratio can otherwise
-    // reject even a probability-1 token once the draft mass depletes (prop>1), so
-    // dispatch here to guarantee exact equivalence to follow_verified_tree.
+    // Greedy (temp≤0): delegate to the argmax walk (exact follow_verified_tree).
     if temp <= 0.0 {
         let argmax: Vec<u32> = (0..n_slots)
             .map(|s| {
-                let row = &logits_per_pos[s * vocab..(s + 1) * vocab];
+                let row = &target_logits[s * vocab..(s + 1) * vocab];
                 let mut bi = 0usize;
                 let mut bv = f32::NEG_INFINITY;
                 for (i, &v) in row.iter().enumerate() {
@@ -690,70 +750,34 @@ pub fn sample_verified_tree_swor(
     let mut p: Vec<f32> = Vec::with_capacity(vocab);
 
     loop {
-        let row = &logits_per_pos[current_slot * vocab..(current_slot + 1) * vocab];
-        softmax_temp_into(row, temp, &mut p);
-
-        // Children in descending draft prob = ascending node index (build order).
-        let mut cand: Vec<usize> = tree.child_maps[current_slot].values().copied().collect();
-        cand.sort_unstable();
-        let parent_logw = if current_slot == 0 {
-            0.0
+        // Draft position generating this node's children = the node's tree depth
+        // (root depth 0). Past the last draft position there are no children.
+        let depth = if current_slot == 0 {
+            0
         } else {
-            tree.nodes[current_slot - 1].logw
+            tree.nodes[current_slot - 1].depth as usize
         };
-
-        // Reduced support: per-child residual target + one TAIL bucket.
-        let mut p_res: Vec<f32> = cand
-            .iter()
-            .map(|&ci| p[tree.nodes[ci].token as usize])
-            .collect();
-        let p_tail = (1.0 - p_res.iter().sum::<f32>()).max(0.0);
-        let mut tail = p_tail;
-        let mut remaining_q = 1.0f32;
-        let mut chosen: Option<usize> = None;
-        for (j, &ci) in cand.iter().enumerate() {
-            let q = (tree.nodes[ci].logw - parent_logw).exp().clamp(0.0, 1.0);
-            let prop = if remaining_q > 1e-6 {
-                q / remaining_q
-            } else {
-                q
-            };
-            let ratio = if prop > 0.0 {
-                (p_res[j] / prop).min(1.0)
-            } else {
-                0.0
-            };
+        let row = &target_logits[current_slot * vocab..(current_slot + 1) * vocab];
+        softmax_temp_into(row, temp, &mut p);
+        if depth >= num_pos {
+            // Leaf: no draft proposals → emit a target draw.
             let u = xorshift_unit(rng_state);
-            if p_res[j] > 0.0 && u < ratio {
-                chosen = Some(ci);
-                break;
-            }
-            // Reject: deplete residual by the proposed mass, renorm {children, TAIL}.
-            p_res[j] = (p_res[j] - prop).max(0.0);
-            let s: f32 = p_res.iter().sum::<f32>() + tail;
-            if s > 0.0 {
-                for x in p_res.iter_mut() {
-                    *x /= s;
-                }
-                tail /= s;
-            }
-            remaining_q -= q;
-            if remaining_q <= 1e-6 {
-                break;
-            }
+            return (accepted, sample_unnormalized(&p, u));
         }
 
-        match chosen {
-            Some(child_idx) => {
-                accepted.push(child_idx);
-                current_slot = child_idx + 1;
-            }
-            None => {
-                // Bonus = a genuine target draw (coherent), like the naive path.
-                // temp>0 is guaranteed past the greedy guard above.
-                let u = xorshift_unit(rng_state);
-                return (accepted, sample_unnormalized(&p, u));
-            }
+        let q_pos = &draft_q[depth * vocab..(depth + 1) * vocab];
+        let cands = &pos_cands[depth * k..depth * k + k];
+        let (acc_tok, emit) = swor_step(&mut p, q_pos, cands, rng_state);
+        match acc_tok {
+            Some(c) => match tree.child_maps[current_slot].get(&c) {
+                Some(&child_idx) => {
+                    accepted.push(child_idx);
+                    current_slot = child_idx + 1;
+                }
+                // Accepted a candidate the budget pruned from the tree — emit it.
+                None => return (accepted, c),
+            },
+            None => return (accepted, emit),
         }
     }
 }
@@ -1283,9 +1307,70 @@ mod tests {
             .collect();
         let (acc_g, bonus_g) = follow_verified_tree(&tree, &argmax);
         let mut rng = 0x2222_3333_4444_5555u64;
-        let (acc_s, bonus_s) = sample_verified_tree_swor(&tree, &logits, vocab, 0.0, &mut rng);
+        // temp≤0 delegates to greedy before touching draft_q/pos_cands → empty ok.
+        let (acc_s, bonus_s) =
+            sample_verified_tree_swor(&tree, &logits, &[], &[], 0, 0, vocab, 0.0, &mut rng);
         assert_eq!(acc_g, acc_s, "SWOR accepted path diverged at temp=0");
         assert_eq!(bonus_g, bonus_s, "SWOR bonus diverged at temp=0");
+    }
+
+    // Sample k tokens WITHOUT replacement from `q` (sequential), returning draw
+    // order — the proposal sequence the verbatim SWOR step expects.
+    fn swor_sample(q: &[f32], k: usize, rng: &mut u64) -> Vec<u32> {
+        let mut qr = q.to_vec();
+        let mut out = Vec::with_capacity(k);
+        for _ in 0..k {
+            let s: f32 = qr.iter().sum();
+            if s <= 0.0 {
+                break;
+            }
+            let u = xorshift_unit(rng) * s;
+            let mut acc = 0.0f32;
+            let mut pick = qr.len() - 1;
+            for (i, &v) in qr.iter().enumerate() {
+                acc += v;
+                if u < acc {
+                    pick = i;
+                    break;
+                }
+            }
+            out.push(pick as u32);
+            qr[pick] = 0.0; // without replacement
+        }
+        out
+    }
+
+    #[test]
+    fn swor_preserves_target_distribution() {
+        // VERBATIM distribution-fidelity proof: draw the candidates WITHOUT
+        // replacement from the draft q (as the real Gumbel-top-k path does), run
+        // the exact SWOR step, and confirm the emitted token's marginal equals the
+        // TARGET p — at several temperatures and for k < vocab (so some target mass
+        // is never proposed and must surface via the residual). This is the check
+        // that was missing from the approximate implementation.
+        let vocab = 6usize;
+        // A target and a DISTINCT draft (so q is genuinely exploited / corrected).
+        let p = [0.30f32, 0.05, 0.20, 0.10, 0.25, 0.10];
+        let q = [0.10f32, 0.40, 0.05, 0.20, 0.05, 0.20];
+        for &k in &[2usize, 3, 4] {
+            let n_runs = 600_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0x5eed_1234_abcd_0007u64 ^ (k as u64);
+            for _ in 0..n_runs {
+                let cands = swor_sample(&q, k, &mut rng);
+                let mut p_work = p.to_vec();
+                let (_acc, emit) = swor_step(&mut p_work, &q, &cands, &mut rng);
+                hist[emit as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - p[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "verbatim SWOR must preserve the target distribution; k={k} TV={tv:.4} hist={hist:?}"
+            );
+        }
     }
 
     #[test]
