@@ -6305,6 +6305,27 @@ fn generate(
         && m.speculator
             .as_ref()
             .is_some_and(|s| s.supports_temp_verify());
+    // Operator visibility: a temp>0 request on a DFlash-capable arch that did NOT
+    // qualify for SWOR spec silently runs AR (correct, but slower). Name the
+    // specific config reason so an operator can see why the spec speedup is off.
+    if temp > 1e-6
+        && m.speculator.is_some()
+        && (m.arch_id == 5 || m.arch_id == 6)
+        && !temp_spec_ok
+        && !budgeted_thinking_needs_ar
+        && !force_ar_chat
+    {
+        let reason = if std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0") {
+            "HIPFIRE_DFLASH_TEMP_SPEC=0"
+        } else if user_explicit_sampling {
+            "request set an explicit top_p/top_k/min_p/penalty (SWOR spec honors temperature only); AR applies them"
+        } else {
+            "ddtree SWOR verify not active (needs ddtree_budget>0, no path_c, no HIPFIRE_DDTREE_GREEDY_VERIFY=1)"
+        };
+        eprintln!(
+            "[hipfire] id={id}: temp>0 DFlash ddtree spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
+        );
+    }
     if m.speculator.is_some()
         && (temp <= 1e-6 || temp_spec_ok)
         && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
