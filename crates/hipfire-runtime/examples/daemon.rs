@@ -3840,6 +3840,10 @@ fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    // Request sampling temperature. The caller only routes temp>0 here when the
+    // speculator reports `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR);
+    // forwarded into the spec loop's verify.
+    temp: f32,
 ) {
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
@@ -4048,6 +4052,7 @@ fn generate_dflash(
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
         },
+        temp,
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -4189,6 +4194,10 @@ fn generate_spec(
     resume_from: Option<usize>,
     max_tokens: usize,
     emit_req: SpecEmitRequest,
+    // Request sampling temperature. >0 only reaches here for speculators that
+    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR); greedy
+    // drafters ignore it. The daemon's routing gate enforces that invariant.
+    temp: f32,
 ) -> Option<SpecRun> {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
@@ -4539,7 +4548,7 @@ fn generate_spec(
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar()) {
+        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar(), temp) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -5926,6 +5935,7 @@ fn generate(
             tools,
             messages_history,
             stop,
+            temp as f32,
         );
         return;
     }
@@ -6039,6 +6049,7 @@ fn generate(
             tools,
             messages_history,
             stop,
+            temp as f32,
         );
         return;
     }
@@ -6100,6 +6111,7 @@ fn generate(
             tools,
             messages_history,
             stop,
+            temp as f32,
         );
         return;
     }
@@ -6159,6 +6171,7 @@ fn generate(
             tools,
             messages_history,
             stop,
+            temp as f32,
         );
         return;
     }
@@ -6254,8 +6267,18 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
+    // temp>0 routes to DFlash spec ONLY when the speculator's verify is
+    // distribution-correct at temp>0 (qwen35 DFlash ddtree → SWOR); greedy-only
+    // drafters (chain DFlash, llama) keep temp>0 on the AR sampler. Greedy
+    // (temp<=1e-6) routes to spec as before regardless. Opt out:
+    // HIPFIRE_DFLASH_TEMP_SPEC=0 forces temp>0 back to AR even where supported.
+    let temp_spec_ok = temp > 1e-6
+        && std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() != Some("0")
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_temp_verify());
     if m.speculator.is_some()
-        && temp <= 1e-6
+        && (temp <= 1e-6 || temp_spec_ok)
         && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
@@ -6299,6 +6322,7 @@ fn generate(
             tools,
             messages_history,
             stop, // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp as f32,
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
@@ -8999,6 +9023,7 @@ fn generate_deepseek4_spec(
             think_mode,
             decoded_vocab,
         },
+        0.0, // ds4 MTP spec is greedy-only (routed at temp<=1e-6); temp ignored
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -12364,7 +12389,7 @@ fn run_dots_ocr_ngram_loop(
         if position.saturating_add(block_size) >= ctx_capacity {
             break;
         }
-        let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None) {
+        let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None, 0.0) {
             Ok(s) => s,
             Err(e) => {
                 write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));

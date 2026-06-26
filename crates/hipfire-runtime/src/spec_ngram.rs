@@ -204,6 +204,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         seed: u32,
         emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
+        _temp: f32, // n-gram verify is greedy-only
     ) -> Result<SpecStep, String> {
         // Propose the draft (pure CPU) BEFORE borrowing scratch.
         let draft = self.drafter.propose(emitted, seed, self.block_size - 1);

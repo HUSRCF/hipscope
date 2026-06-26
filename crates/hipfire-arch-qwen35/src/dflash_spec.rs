@@ -71,7 +71,15 @@ pub fn load_dflash_state(
     let draft_weights =
         DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
-    let max_n = block_size + 1;
+    // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
+    // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
+    // staging for the larger of the two so ddtree-mode serve doesn't overflow
+    // ("verify_scratch max_n < b" panic). budget=0 ⇒ chain-only, unchanged.
+    let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let max_n = (block_size + 1).max(ddtree_budget + 1);
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
     // refactor regressed this to the `with_mq=false` `::new` constructor →
@@ -118,11 +126,7 @@ pub fn load_dflash_state(
     let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
         .map_err(|e| format!("GdnTape::new_for_config: {e}"))?;
     let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
-    // DDTree
-    let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // DDTree (budget read once above, used for scratch sizing).
     let ddtree = if ddtree_budget > 0 {
         let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
             .ok()
@@ -353,6 +357,12 @@ impl Speculator for DflashSpeculator {
         Ok(PrefillOutcome::Ready { first_token })
     }
 
+    /// Temp>0 verify is distribution-correct only on the ddtree-batched arm (SWOR).
+    /// path_c and chain mode are greedy, so they must NOT receive temp>0 routing.
+    fn supports_temp_verify(&self) -> bool {
+        self.df.ddtree.is_some() && self.path_c_mode.is_none()
+    }
+
     fn step(
         &mut self,
         gpu: &mut Gpu,
@@ -361,6 +371,7 @@ impl Speculator for DflashSpeculator {
         seed: u32,
         emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
+        temp: f32,
     ) -> Result<SpecStep, String> {
         let slot = target
             .as_any_mut()
@@ -417,10 +428,12 @@ impl Speculator for DflashSpeculator {
                     None, // ctx_slice = full history
                     dd.budget,
                     dd.topk,
-                    // Greedy verify on the production path until temperature is
-                    // plumbed through SpecTarget::step (see Task 2/3 in
-                    // docs/plans/2026-06-26-ddtree-rejection-sampling-verify.md).
-                    0.0,
+                    // Request temperature → distribution-preserving SWOR verify at
+                    // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is
+                    // the only DFlash mode with sampled verify; path_c/chain below
+                    // stay greedy, so `supports_temp_verify` gates serve routing to
+                    // ddtree only.
+                    temp,
                     &mut self.rng_state,
                 )
             }

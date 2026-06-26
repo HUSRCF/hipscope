@@ -380,10 +380,22 @@ pub trait Speculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String>;
 
+    /// Whether this speculator's verify is distribution-correct at temp>0 (so the
+    /// daemon may route temp>0 requests through it for the spec speedup). Default
+    /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on
+    /// the AR sampler. The qwen35 DFlash ddtree path overrides this to `true`
+    /// (its SWOR verify samples the target distribution exactly).
+    fn supports_temp_verify(&self) -> bool {
+        false
+    }
+
     /// Run one acceptance window starting from `seed` at absolute `position`.
     /// `target` is the borrowed verifier; `emitted` is the prior committed
     /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
-    /// draft and verify logits (`None` = unconstrained).
+    /// draft and verify logits (`None` = unconstrained). `temp` is the request
+    /// sampling temperature — ignored by greedy-only drafters; the ddtree path
+    /// uses it to switch the verify into distribution-preserving SWOR at temp>0.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         gpu: &mut Gpu,
@@ -392,6 +404,7 @@ pub trait Speculator {
         seed: u32,
         emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
+        temp: f32,
     ) -> Result<SpecStep, String>;
 
     /// Compact drafter-local cached state after a target KV eviction the daemon
@@ -602,6 +615,7 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         seed: u32,
         _emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
+        _temp: f32, // MTP/chain verify is greedy-only
     ) -> Result<SpecStep, String> {
         let k = self.arch.k();
         let eos = target.eos_token();
