@@ -1279,10 +1279,16 @@ fn main() {
         let mut pld_accepted: usize = 0;
 
         if ddtree_enabled {
-            if temp > 0.0 {
+            if temp > 0.0 && !ddtree_batched {
                 eprintln!(
-                    "WARNING: --ddtree with temp>0 falls back to greedy on the verify side for \
-                this spike (rejection-sampling integration is deferred)."
+                    "WARNING: --ddtree (non-batched / path-c) with temp>0 falls back to greedy on \
+                the verify side. Use --ddtree-batched for distribution-preserving naive tree sampling."
+                );
+            }
+            if temp > 0.0 && ddtree_batched {
+                eprintln!(
+                    "temp>0 + --ddtree-batched: distribution-preserving naive tree sampling \
+                (sample target, accept drafted child it lands on)."
                 );
             }
             if pld_enabled {
@@ -1680,6 +1686,8 @@ fn main() {
                         ctx_slice,
                         ddtree_budget,
                         ddtree_topk,
+                        runtime_temp,
+                        &mut rng_state,
                     )
                     .expect("ddtree-batched spec step")
                 } else {

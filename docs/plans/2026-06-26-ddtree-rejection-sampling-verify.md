@@ -2,13 +2,67 @@
 
 - **Branch:** `feature/speculator-ddtree` (off `fivetide/feature/speculator-abstraction`)
 - **Depends on / relates to:** `feat/ddtree-banded-build` @ `e0767840` — the banded-build
-  knob (`HIPFIRE_DDTREE_MINNODES`). That port is a **no-op under the current greedy
-  verify** (proven: τ/accept byte-identical across MINNODES 0/4/8 at temp 0 *and* 0.7).
-  It is *parked* for this work: tree breadth (banding, topk>1) can only pay off once
-  acceptance is sampled rather than argmax. Merge/rebase `feat/ddtree-banded-build` in
-  when implementing so the re-A/B (Phase 4) can measure breadth against a sampled verify.
+  knob (`HIPFIRE_DDTREE_MINNODES`), merged into this branch. The floor stays a
+  near-no-op at both temps (it rarely binds under an active cutoff; see the A/B
+  below). NOTE: the original "breadth only pays under sampling" premise was
+  *falsified* by the A/B — tree breadth via budget/topk raises acceptance under
+  greedy too. The floor specifically, not breadth in general, is the no-op.
 - **Date:** 2026-06-26
-- **Status:** scoped, not started
+- **Status:** IMPLEMENTED (Tasks 1–3, demo path) + A/B verified. Production
+  `SpecTarget::step` temp plumbing (Task 2 daemon arm) deferred — see Remaining.
+
+## Implementation note — the correct algorithm is *naive sampling*, not rejection
+
+While scoping, a counterexample showed the obvious "rejection sampling over the
+top-k siblings" scheme is NOT distribution-preserving: a deterministically-first
+candidate is proposed with probability 1 (not `q`), so `min(1,p/q)` over-accepts
+it (e.g. target wants token0 at 0.20 but the scheme emits it at 0.40). Leviathan's
+guarantee needs the candidate to be a genuine *draft sample*; hipfire's ddtree is
+built from top-k *marginals*, so there is no draft sample to anchor to.
+
+The correct scheme for a top-k tree is SpecInfer's **naive sampling**: at each
+slot draw a token `x` from the **target** distribution; if `x` matches a drafted
+child, accept and descend; else `x` is the bonus. Every emitted token is a target
+draw ⇒ distribution-preserving EXACTLY, at any temperature, with no dependence on
+the draft probabilities. `DdNode.logw` is therefore unused by the sampler (kept as
+metadata). Implemented as `ddtree::sample_verified_tree`; reduces to
+`follow_verified_tree` at temp→0. Unit tests: temp→0 byte-equivalence + a 400k-run
+Monte-Carlo confirming TV(emitted, target) < 0.01 incl. an uncovered target mode.
+
+## A/B verification (27B-3.6 DFlash, q8 KV, --no-chatml, PEP-8 LRU md5 df5dedc8, warm)
+
+Greedy (temp 0) vs sampled (temp 0.7), narrow (b8-k2) vs wide (b22-k4), no cutoff:
+
+| cell                | accept | tau  | tok/s | mean_nodes |
+|---------------------|--------|------|-------|-----------|
+| temp0  narrow b8-k2 | 0.290  | 4.35 | 25.6  | 8         |
+| temp0  wide  b22-k4 | 0.392  | 5.88 | 24.1  | 22        |
+| temp0.7 narrow b8-k2| 0.284  | 4.26 | 32.7  | 8         |
+| temp0.7 wide  b22-k4| 0.359  | 5.39 | 22.6  | 22        |
+
+Findings:
+1. **The sampled tree verify works and is coherent** — temp0.7 outputs pass the
+   attractor detector (last-128 unique-ratio 0.34/0.48, max-freq 0.09), τ≈5.4.
+   temp=0 path unregressed (coherence-gate-dflash 4/4 OK).
+2. **Breadth raises acceptance at BOTH temperatures** (wide ≫ narrow: +0.10 accept
+   at temp0, +0.075 at temp0.7). This *corrects* the earlier framing that "greedy
+   ignores breadth" — greedy tree verify also benefits, because a wider tree has
+   more chances to contain the argmax-matching child deeper. Breadth's real lever
+   is **budget/topk**, and it is NOT temperature-gated.
+3. **temp0.7 sampled accept is slightly below temp0 greedy** (0.359 vs 0.392 wide)
+   — expected: sampling draws higher-entropy targets the draft tree covers less
+   often. The payoff of temp>0 is **distribution-correctness**, not speed.
+
+**Verdict:** the deliverable's value is correctness — temp>0 ddtree DFlash now
+samples the target distribution properly instead of silently falling back to
+greedy. It does NOT vindicate the banded `MINNODES` floor (still a near-no-op at
+both temps; the floor rarely binds under an active cutoff). Breadth via
+budget/topk was already helping greedy and continues to.
+
+## Remaining
+- Plumb request temperature through `SpecTarget::step` so the daemon/serve path
+  uses sampled verify at temp>0 (today production passes `temp=0.0`, greedy).
+- Add a temp>0 arm to `coherence-gate-dflash.sh` (seeded RNG) as a standing guard.
 
 ## Problem
 

@@ -417,6 +417,11 @@ impl Speculator for DflashSpeculator {
                     None, // ctx_slice = full history
                     dd.budget,
                     dd.topk,
+                    // Greedy verify on the production path until temperature is
+                    // plumbed through SpecTarget::step (see Task 2/3 in
+                    // docs/plans/2026-06-26-ddtree-rejection-sampling-verify.md).
+                    0.0,
+                    &mut self.rng_state,
                 )
             }
         } else {

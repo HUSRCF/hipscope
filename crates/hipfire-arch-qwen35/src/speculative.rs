@@ -4650,6 +4650,13 @@ pub fn spec_step_ddtree_batched(
     ctx_slice: Option<usize>,
     tree_budget: usize,
     tree_topk: usize,
+    // Temperature for the verify-side acceptance. temp == 0 → greedy argmax
+    // walk (follow_verified_tree); temp > 0 → distribution-preserving naive
+    // tree sampling (sample_verified_tree), which needs the full per-slot
+    // target logits and consumes `rng_state` (xorshift, shared with the linear
+    // DFlash sampler convention).
+    temp: f32,
+    rng_state: &mut u64,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let vocab = target.config.vocab_size;
@@ -4847,6 +4854,9 @@ pub fn spec_step_ddtree_batched(
         pre_rope_k_capture: pre_rope_capture,
     };
     let t_pre_verify = t_all.elapsed();
+    // temp > 0 needs the full per-slot target logits for naive tree sampling;
+    // greedy keeps the cheap GPU-argmax + 4·B D2H.
+    let want_full_logits = temp > 0.0;
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -4854,16 +4864,29 @@ pub fn spec_step_ddtree_batched(
         position,
         hidden_rb,
         Some(gdn_tape),
-        false,
+        want_full_logits,
         ctx,
         verify_scratch,
     )?;
-    let posterior = verify_out.argmax_per_pos;
     let t_post_verify = t_all.elapsed();
 
-    // ── 8. Greedy walk: longest accepted path + bonus ─────────────────────
-    let (accepted_node_indices, bonus_token) =
-        hipfire_runtime::ddtree::follow_verified_tree(&tree, &posterior);
+    // ── 8. Accept walk: longest accepted path + bonus ─────────────────────
+    // Greedy (temp 0) → argmax walk; temp > 0 → distribution-preserving naive
+    // tree sampling over the full target logits (SpecInfer "naive sampling":
+    // draw from target, accept the drafted child it lands on). Both return the
+    // same (accepted_node_indices, bonus) shape; step 10's divergent-path
+    // commit handles non-linear accepted paths identically.
+    let (accepted_node_indices, bonus_token) = if want_full_logits {
+        hipfire_runtime::ddtree::sample_verified_tree(
+            &tree,
+            &verify_out.logits_per_pos,
+            vocab,
+            temp,
+            rng_state,
+        )
+    } else {
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
+    };
     let accept_len = accepted_node_indices.len();
 
     // ── 9. Build committed + drafted sequences ────────────────────────────
