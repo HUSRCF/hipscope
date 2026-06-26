@@ -181,6 +181,40 @@ pub fn build_ddtree_tree_with_cutoff(
     budget: usize,
     logw_cutoff: f32,
 ) -> DdTree {
+    // Thin wrapper: no floor (min_nodes=0), budget is the ceiling.
+    build_ddtree_tree_bounded(
+        top_tokens,
+        top_log_probs,
+        depth,
+        topk,
+        0,
+        budget,
+        logw_cutoff,
+    )
+}
+
+/// Best-first DDTree build with a node-count band `[min_nodes, max_nodes]`.
+///
+/// The `logw_cutoff` (meta-verifier pruner) is the *shape* control — it shrinks
+/// the tree on confident steps — but its raw node count swings with the step's
+/// distribution (a near-chain when peaked, near-full when flat). This bands it:
+/// expand the most-likely nodes *ignoring* the cutoff until `min_nodes` are
+/// placed (a floor, so the verify is never wastefully tiny), then let the cutoff
+/// prune, and stop at `max_nodes` (the ceiling, so verify cost is capped). The
+/// result is always in `[min(min_nodes, reachable), max_nodes]`, with the cutoff
+/// steering depth-vs-breadth within the band. `min_nodes=0` ⇒ pure cutoff
+/// (the historical `build_ddtree_tree_with_cutoff`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ddtree_tree_bounded(
+    top_tokens: &[u32],
+    top_log_probs: &[f32],
+    depth: usize,
+    topk: usize,
+    min_nodes: usize,
+    max_nodes: usize,
+    logw_cutoff: f32,
+) -> DdTree {
+    let budget = max_nodes;
     // Early out: no draft positions or no budget → root-only tree.
     if budget == 0 || depth == 0 {
         return DdTree {
@@ -232,7 +266,9 @@ pub fn build_ddtree_tree_with_cutoff(
         // also below. Bail early to shrink the tree for high-confidence
         // cycles — verify cost saved ∝ nodes-pruned, acceptance loss ≈ 0
         // (those nodes' target-accept probability is bounded by exp(logw)).
-        if entry.logw < logw_cutoff {
+        // The `min_nodes` floor delays the cutoff: always place at least that
+        // many highest-probability nodes first, so the band's lower bound holds.
+        if nodes.len() >= min_nodes && entry.logw < logw_cutoff {
             break;
         }
         let HeapEntry {
@@ -752,6 +788,31 @@ mod tests {
         let t = build_ddtree_tree(&[], &[], 0, 0, 0);
         assert_eq!(t.nodes.len(), 0);
         assert_eq!(t.visibility, vec![vec![true]]);
+    }
+
+    #[test]
+    fn bounded_keeps_node_count_in_band() {
+        let (depth, topk) = (4usize, 3usize);
+        // Peaked and flat distributions — raw cutoff would swing the count, but
+        // the band must clamp both to [4, 16] at every cutoff.
+        for probs in [[0.90f32, 0.06, 0.04], [0.40, 0.32, 0.28]] {
+            let mut toks = Vec::new();
+            let mut lp = Vec::new();
+            for d in 0..depth {
+                for r in 0..topk {
+                    toks.push((d * 10 + r) as u32);
+                    lp.push(probs[r].ln());
+                }
+            }
+            for cut in [f32::NEG_INFINITY, -4.0, -3.0, -2.0] {
+                let t = build_ddtree_tree_bounded(&toks, &lp, depth, topk, 4, 16, cut);
+                let n = t.num_nodes();
+                assert!(
+                    (4..=16).contains(&n),
+                    "node count {n} out of [4,16] (cut={cut})"
+                );
+            }
+        }
     }
 
     #[test]
