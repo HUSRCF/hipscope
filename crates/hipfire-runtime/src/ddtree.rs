@@ -634,6 +634,130 @@ pub fn sample_verified_tree(
     }
 }
 
+/// q-EXPLOITING tree verify (Sequoia / SpecTr "sampling-without-replacement"
+/// family), on the REDUCED per-slot support `{child_1..child_k, TAIL}`.
+///
+/// Unlike naive sampling (which ignores `q`), at each slot this tries the drafted
+/// children in descending draft-prob order and accepts child `c` with the SWOR
+/// ratio `min(1, p_res(c) / (q(c)/Z))` (`Z` = remaining draft mass), depleting the
+/// residual target `p_res` on rejection — so a confident draft buys acceptance the
+/// target's own sample would have missed. `p` comes from the verify logits
+/// (already downloaded on the temp>0 path) and `q = exp(node.logw − parent.logw)`;
+/// the residual is renormalized over the small `{children, TAIL}` support, so this
+/// needs NO extra D2H over naive. On all-reject the bonus is a target draw (keeps
+/// the emitted token coherent).
+///
+/// EXACTNESS CAVEAT: SWOR is distribution-exact only when the candidates are
+/// genuine draft samples. hipfire's ddtree is built from top-k MARGINALS, so this
+/// is a draft-BIASED relaxation (over-trusts the draft, same family as CACTUS) —
+/// it trades distribution-exactness for acceptance. The naive path stays the
+/// distribution-preserving default; this is the q-exploiting A/B arm. Reduces to
+/// the greedy walk at `temp→0` (one-hot target ⇒ only the argmax child clears the
+/// ratio). Returns the same `(accepted_node_indices, bonus_token)` shape.
+pub fn sample_verified_tree_swor(
+    tree: &DdTree,
+    logits_per_pos: &[f32],
+    vocab: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (Vec<usize>, u32) {
+    let n_slots = 1 + tree.nodes.len();
+    debug_assert_eq!(logits_per_pos.len(), n_slots * vocab);
+
+    // Greedy (temp≤0): delegate to the argmax walk. The SWOR ratio can otherwise
+    // reject even a probability-1 token once the draft mass depletes (prop>1), so
+    // dispatch here to guarantee exact equivalence to follow_verified_tree.
+    if temp <= 0.0 {
+        let argmax: Vec<u32> = (0..n_slots)
+            .map(|s| {
+                let row = &logits_per_pos[s * vocab..(s + 1) * vocab];
+                let mut bi = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in row.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        bi = i;
+                    }
+                }
+                bi as u32
+            })
+            .collect();
+        return follow_verified_tree(tree, &argmax);
+    }
+
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut current_slot: usize = 0;
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+
+    loop {
+        let row = &logits_per_pos[current_slot * vocab..(current_slot + 1) * vocab];
+        softmax_temp_into(row, temp, &mut p);
+
+        // Children in descending draft prob = ascending node index (build order).
+        let mut cand: Vec<usize> = tree.child_maps[current_slot].values().copied().collect();
+        cand.sort_unstable();
+        let parent_logw = if current_slot == 0 {
+            0.0
+        } else {
+            tree.nodes[current_slot - 1].logw
+        };
+
+        // Reduced support: per-child residual target + one TAIL bucket.
+        let mut p_res: Vec<f32> = cand
+            .iter()
+            .map(|&ci| p[tree.nodes[ci].token as usize])
+            .collect();
+        let p_tail = (1.0 - p_res.iter().sum::<f32>()).max(0.0);
+        let mut tail = p_tail;
+        let mut remaining_q = 1.0f32;
+        let mut chosen: Option<usize> = None;
+        for (j, &ci) in cand.iter().enumerate() {
+            let q = (tree.nodes[ci].logw - parent_logw).exp().clamp(0.0, 1.0);
+            let prop = if remaining_q > 1e-6 {
+                q / remaining_q
+            } else {
+                q
+            };
+            let ratio = if prop > 0.0 {
+                (p_res[j] / prop).min(1.0)
+            } else {
+                0.0
+            };
+            let u = xorshift_unit(rng_state);
+            if p_res[j] > 0.0 && u < ratio {
+                chosen = Some(ci);
+                break;
+            }
+            // Reject: deplete residual by the proposed mass, renorm {children, TAIL}.
+            p_res[j] = (p_res[j] - prop).max(0.0);
+            let s: f32 = p_res.iter().sum::<f32>() + tail;
+            if s > 0.0 {
+                for x in p_res.iter_mut() {
+                    *x /= s;
+                }
+                tail /= s;
+            }
+            remaining_q -= q;
+            if remaining_q <= 1e-6 {
+                break;
+            }
+        }
+
+        match chosen {
+            Some(child_idx) => {
+                accepted.push(child_idx);
+                current_slot = child_idx + 1;
+            }
+            None => {
+                // Bonus = a genuine target draw (coherent), like the naive path.
+                // temp>0 is guaranteed past the greedy guard above.
+                let u = xorshift_unit(rng_state);
+                return (accepted, sample_unnormalized(&p, u));
+            }
+        }
+    }
+}
+
 /// Return the **greedy main path** through the tree as a list of node
 /// indices: the chain that starts at the root and at each step descends
 /// to its highest-cumulative-log-prob child.
@@ -1135,6 +1259,33 @@ mod tests {
             *x /= s;
         }
         e
+    }
+
+    #[test]
+    fn swor_temp0_matches_follow_verified_tree() {
+        // The q-exploiting SWOR walk must reduce to the greedy argmax walk at
+        // temp→0 (same safety guarantee as naive sampling).
+        let tree = small_tree();
+        let vocab = 8usize;
+        let n = 1 + tree.nodes.len();
+        let mut logits = vec![0.0f32; n * vocab];
+        for s in 0..n {
+            let pref = tree.child_maps[s]
+                .values()
+                .copied()
+                .min()
+                .map(|ci| tree.nodes[ci].token)
+                .unwrap_or(0);
+            logits[s * vocab + pref as usize] = 10.0;
+        }
+        let argmax: Vec<u32> = (0..n)
+            .map(|s| row_argmax(&logits[s * vocab..(s + 1) * vocab]))
+            .collect();
+        let (acc_g, bonus_g) = follow_verified_tree(&tree, &argmax);
+        let mut rng = 0x2222_3333_4444_5555u64;
+        let (acc_s, bonus_s) = sample_verified_tree_swor(&tree, &logits, vocab, 0.0, &mut rng);
+        assert_eq!(acc_g, acc_s, "SWOR accepted path diverged at temp=0");
+        assert_eq!(bonus_g, bonus_s, "SWOR bonus diverged at temp=0");
     }
 
     #[test]

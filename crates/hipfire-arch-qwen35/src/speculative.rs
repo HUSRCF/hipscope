@@ -4068,6 +4068,12 @@ fn run_dflash_draft_for_topk_gpu(
     ctx_slice: Option<usize>,
     b: usize,
     k: usize,
+    // `Some((temp, rng))` ⇒ draw the `k` children per position WITHOUT replacement
+    // from the draft softmax at `temp` (Gumbel-top-k = exact SWOR sampling), and
+    // return their TRUE per-position log-probs. This makes the tree's candidates
+    // genuine draft samples, which is what the q-exploiting SWOR verify needs to
+    // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
+    sample: Option<(f32, &mut u64)>,
 ) -> HipResult<(Vec<u32>, Vec<f32>)> {
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
@@ -4235,6 +4241,60 @@ fn run_dflash_draft_for_topk_gpu(
     if let Err(e) = gemm_result {
         let _ = gpu.free_tensor(logits_batch);
         return Err(e);
+    }
+
+    // Step 5a: Gumbel-top-k SWOR sampling (q-exploiting verify). Download the
+    // draft logits and, per position, draw k tokens WITHOUT replacement from
+    // softmax(logits/temp) via the Gumbel-top-k trick (top-k by `logit/temp +
+    // Gumbel(0,1)` is an exact size-k SWOR sample), returning each token's TRUE
+    // per-position log-prob `log_softmax(logits/temp)[token]`. The candidates are
+    // then genuine draft samples — the precondition the SWOR verify needs.
+    if let Some((temp, rng)) = sample {
+        let host = gpu.download_f32(&logits_batch)?;
+        let _ = gpu.free_tensor(logits_batch);
+        let inv_t = 1.0 / temp.max(1e-4);
+        let mut top_tokens = vec![0u32; batch * k];
+        let mut top_log_probs = vec![0f32; batch * k];
+        for r in 0..batch {
+            let row = &host[r * vocab..(r + 1) * vocab];
+            // log-sum-exp at temp for the true log-prob.
+            let mut m = f32::NEG_INFINITY;
+            for &v in row {
+                let s = v * inv_t;
+                if s > m {
+                    m = s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for &v in row {
+                sum += (v * inv_t - m).exp();
+            }
+            let lse = m + sum.ln();
+            // Top-k by perturbed score `logit/temp + Gumbel`. Maintain a small
+            // ascending-by-score buffer of size ≤ k.
+            let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+            for (t, &v) in row.iter().enumerate() {
+                let mut u = xorshift_next_unit(rng);
+                if u <= 1e-7 {
+                    u = 1e-7;
+                }
+                let g = -(-(u.ln())).ln(); // Gumbel(0,1)
+                let score = v * inv_t + g;
+                if best.len() < k {
+                    best.push((score, t as u32));
+                    best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                } else if score > best[0].0 {
+                    best[0] = (score, t as u32);
+                    best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                }
+            }
+            // Emit highest-score first (rank 0). True log-prob = logit/temp − lse.
+            for (rank, &(_score, tok)) in best.iter().rev().enumerate() {
+                top_tokens[r * k + rank] = tok;
+                top_log_probs[r * k + rank] = row[tok as usize] * inv_t - lse;
+            }
+        }
+        return Ok((top_tokens, top_log_probs));
     }
 
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
@@ -4685,10 +4745,24 @@ pub fn spec_step_ddtree_batched(
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
+    // Verify-scheme selector (A/B). HIPFIRE_DDTREE_VERIFY: naive (default,
+    // distribution-preserving) | swor (q-exploiting Sequoia/SpecTr). SWOR is
+    // distribution-exact ONLY with genuine draft samples, so it drives the
+    // Gumbel-SWOR draft sampler below. HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the
+    // greedy walk (old behaviour) for the τ A/B.
+    let force_greedy_verify = std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let use_swor = temp > 0.0
+        && !force_greedy_verify
+        && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() == Some("swor");
+
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
-    // with an on-device top-K (~µs) plus a ~480 byte D2H.
+    // with an on-device top-K (~µs) plus a ~480 byte D2H. SWOR mode instead
+    // Gumbel-top-k samples the children (download + CPU sample).
     let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
@@ -4701,6 +4775,11 @@ pub fn spec_step_ddtree_batched(
         ctx_slice,
         b,
         tree_topk,
+        if use_swor {
+            Some((temp, &mut *rng_state))
+        } else {
+            None
+        },
     )?;
 
     let t_draft = t_all.elapsed();
@@ -4856,13 +4935,9 @@ pub fn spec_step_ddtree_batched(
     let t_pre_verify = t_all.elapsed();
     // temp > 0 needs the full per-slot target logits for naive tree sampling;
     // greedy keeps the cheap GPU-argmax + 4·B D2H.
-    // HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the pre-sampling greedy accept walk
-    // even at temp>0 — reproduces the old "falls back to greedy" behaviour for
-    // an apples-to-apples τ A/B against the distribution-preserving sampler.
-    let force_greedy_verify = std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
-        .ok()
-        .as_deref()
-        == Some("1");
+    // `force_greedy_verify` / `use_swor` were resolved before the draft (the
+    // draft sampler keys off `use_swor`). temp>0 needs the full per-slot target
+    // logits for either sampling walk.
     let want_full_logits = temp > 0.0 && !force_greedy_verify;
     let verify_out = verify_dflash_block_tree(
         gpu,
@@ -4878,13 +4953,15 @@ pub fn spec_step_ddtree_batched(
     let t_post_verify = t_all.elapsed();
 
     // ── 8. Accept walk: longest accepted path + bonus ─────────────────────
-    // Greedy (temp 0) → argmax walk; temp > 0 → distribution-preserving naive
-    // tree sampling over the full target logits (SpecInfer "naive sampling":
-    // draw from target, accept the drafted child it lands on). Both return the
-    // same (accepted_node_indices, bonus) shape; step 10's divergent-path
-    // commit handles non-linear accepted paths identically.
-    let (accepted_node_indices, bonus_token) = if want_full_logits {
-        hipfire_runtime::ddtree::sample_verified_tree(
+    // Greedy (temp 0 / forced) → argmax walk. temp>0: naive sampling
+    // (distribution-preserving; draw target, accept drafted child it lands on)
+    // OR — when use_swor — the q-exploiting Sequoia/SpecTr SWOR walk over the
+    // Gumbel-sampled tree. All return the same (accepted, bonus) shape; step 10's
+    // divergent-path commit handles non-linear accepted paths identically.
+    let (accepted_node_indices, bonus_token) = if !want_full_logits {
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
+    } else if use_swor {
+        hipfire_runtime::ddtree::sample_verified_tree_swor(
             &tree,
             &verify_out.logits_per_pos,
             vocab,
@@ -4892,7 +4969,13 @@ pub fn spec_step_ddtree_batched(
             rng_state,
         )
     } else {
-        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
+        hipfire_runtime::ddtree::sample_verified_tree(
+            &tree,
+            &verify_out.logits_per_pos,
+            vocab,
+            temp,
+            rng_state,
+        )
     };
     let accept_len = accepted_node_indices.len();
 
@@ -5376,6 +5459,7 @@ pub fn spec_step_ddtree_path_c(
         ctx_slice,
         b,
         tree_topk,
+        None, // path_c is main-path/greedy — no SWOR draft sampling
     )?;
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
