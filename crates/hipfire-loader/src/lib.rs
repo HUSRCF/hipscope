@@ -716,6 +716,8 @@ fn finish_qwen35_load(
             config,
             dn_state,
             ctx.gpu,
+            ctx.spec.ddtree_budget,
+            ctx.spec.ddtree_topk,
         ) {
             Ok(s) => {
                 eprintln!(

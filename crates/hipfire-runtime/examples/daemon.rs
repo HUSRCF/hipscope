@@ -1007,6 +1007,19 @@ fn main() {
                         .and_then(|p| p.get("ngram_min_count"))
                         .and_then(|v| v.as_u64())
                         .map(|c| c as u32),
+                    // DDTree draft tuning — same load-param mechanism as ngram_k:
+                    // CLI `--ddtree-budget` / `--ddtree-topk` → these load params,
+                    // env-wins-else-param in the loader.
+                    ddtree_budget: msg
+                        .get("params")
+                        .and_then(|p| p.get("ddtree_budget"))
+                        .and_then(|v| v.as_u64())
+                        .map(|b| b as usize),
+                    ddtree_topk: msg
+                        .get("params")
+                        .and_then(|p| p.get("ddtree_topk"))
+                        .and_then(|v| v.as_u64())
+                        .map(|k| k as usize),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
@@ -2074,6 +2087,11 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
+                    // Did the request explicitly set a non-temperature sampling
+                    // control? (gates temp>0 spec routing — see generate()).
+                    let user_explicit_sampling = ["top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"]
+                        .iter()
+                        .any(|k| msg.get(*k).is_some());
                     generate(
                         m,
                         &mut gpu,
@@ -2082,6 +2100,7 @@ fn main() {
                         id,
                         prompt,
                         system,
+                        user_explicit_sampling,
                         temp,
                         top_p,
                         top_k,
@@ -5840,6 +5859,10 @@ fn generate(
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
+    // Whether the request EXPLICITLY set a non-temperature sampling control
+    // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
+    // force the AR sampler (the SWOR spec verify can only honor temperature).
+    user_explicit_sampling: bool,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
@@ -5913,7 +5936,7 @@ fn generate(
     // `SpecTarget`) routes to the arch-generic spec loop, exactly like llama
     // (0/1). Without a speculator it falls through to the plain qwen2 decode
     // short-circuit below.
-    if m.arch_id == 7 && m.speculator.is_some() {
+    if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6027,7 +6050,7 @@ fn generate(
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
-    if m.arch_id == 11 && m.speculator.is_some() {
+    if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6089,7 +6112,7 @@ fn generate(
     // state machine + empty-turn / think-budget generation guards) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
-    if m.arch_id == 12 && m.speculator.is_some() {
+    if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6149,7 +6172,7 @@ fn generate(
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
-    if m.arch_id == 10 && m.speculator.is_some() {
+    if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6267,12 +6290,17 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
-    // temp>0 routes to DFlash spec ONLY when the speculator's verify is
-    // distribution-correct at temp>0 (qwen35 DFlash ddtree → SWOR); greedy-only
-    // drafters (chain DFlash, llama) keep temp>0 on the AR sampler. Greedy
-    // (temp<=1e-6) routes to spec as before regardless. Opt out:
-    // HIPFIRE_DFLASH_TEMP_SPEC=0 forces temp>0 back to AR even where supported.
+    // temp>0 routes to DFlash spec ONLY when (a) the speculator's verify is
+    // distribution-correct at temp>0 (qwen35 DFlash ddtree → SWOR), AND (b) the
+    // request did NOT explicitly set a non-temperature sampling control — the SWOR
+    // verify samples softmax(logits/temp) only, so it can't honor top_p / top_k /
+    // min_p / repeat / presence / frequency. Routing an EXPLICIT such request to
+    // spec would silently drop the user's controls, so fall back to AR (which
+    // applies them). A *defaulted* top_p (model recommendation) is advisory — a
+    // bare-temperature request still gets the spec speedup. Greedy (temp<=1e-6)
+    // routes to spec as before. Opt out: HIPFIRE_DFLASH_TEMP_SPEC=0 → temp>0 to AR.
     let temp_spec_ok = temp > 1e-6
+        && !user_explicit_sampling
         && std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() != Some("0")
         && m.speculator
             .as_ref()

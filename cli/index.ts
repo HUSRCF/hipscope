@@ -284,6 +284,10 @@ export interface HipfireConfig {
   ngram_mode: "off" | "on" | "auto";
   ngram_k: number;         // draft window K (2–32). Higher = more parallelism.
   ngram_min_count: number; // min n-gram match count to propose (1–10).
+  // DFlash/DDTree draft tree (used when speculation runs dflash). Mirrors the
+  // ngram knobs as CLI-forwarded draft settings, env-wins-else-param in the loader.
+  ddtree_budget: number;   // max verify-tree nodes (0–64). 0 = chain DFlash (no tree).
+  ddtree_topk: number;     // per-position branching width (1–8).
 
   // ── Chat-template overrides ───────────────────────────────────────────
   // Lift the two env-only chat-template knobs (HIPFIRE_CHAT_TEMPLATE_FILE,
@@ -406,6 +410,8 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   ngram_mode: "off",
   ngram_k: 12,
   ngram_min_count: 2,
+  ddtree_budget: 0,
+  ddtree_topk: 4,
   // Chat-template overrides. Empty/true = engine defaults (no env projected).
   chat_template: "",
   default_chatml: true,
@@ -486,6 +492,8 @@ function validateConfigValue(key: string, value: any): boolean {
     case "ngram_mode": return ["off", "on", "auto"].includes(value);
     case "ngram_k": return typeof value === "number" && Number.isInteger(value) && value >= 2 && value <= 32;
     case "ngram_min_count": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    case "ddtree_budget": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 64;
+    case "ddtree_topk": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 8;
     // chat_template: empty (unset) OR a path that exists + is readable. Tilde
     // is expanded for the existence check so `~/templates/x.j2` validates.
     case "chat_template": {
@@ -564,6 +572,7 @@ const PER_MODEL_KEYS = [
   "prefill_sparse_threshold",
   "mtp_mode", "mtp_k",
   "speculation", "ngram_mode", "ngram_k", "ngram_min_count",
+  "ddtree_budget", "ddtree_topk",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -995,6 +1004,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.ngram_draft = ngramOn;
   params.ngram_k = (draftMaxEnv && ngramOn) ? draftMaxEnv : resolved.ngram_k;
   params.ngram_min_count = resolved.ngram_min_count;
+
+  // DFlash ddtree tree shape (the dflash mechanism's draft window). Mirrors
+  // mtp_k/ngram_k: --draft-max overrides the budget when dflash runs, else the
+  // resolved config. budget=0 → chain-mode DFlash (no tree); >0 → SWOR ddtree.
+  if (effDflashMode !== "off") {
+    params.ddtree_budget = draftMaxEnv ? draftMaxEnv : resolved.ddtree_budget;
+    params.ddtree_topk = resolved.ddtree_topk;
+  }
 
   // Forced-mechanism prerequisite check: `--spec dflash` (or speculation=dflash)
   // with no draft model resolvable is a no-op that would silently fall through

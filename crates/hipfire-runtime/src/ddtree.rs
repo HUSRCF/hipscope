@@ -1373,6 +1373,103 @@ mod tests {
         }
     }
 
+    // Exact CPU mirror of the device Gumbel-top-k sampler's per-element RNG
+    // (`kernels/src/ddtree_gumbel_topk_batched.hip`): murmur3 fmix32 of (seed,b,i).
+    // Keep in sync with the kernel — this is the regression net for that RNG.
+    fn murmur3_unit(seed: u32, b: u32, i: u32) -> f32 {
+        let mut h = i.wrapping_mul(0x9E3779B1) ^ b.wrapping_mul(0x85EBCA77) ^ seed;
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846CA68B);
+        h ^= h >> 16;
+        (h >> 8) as f32 * (1.0 / 16_777_216.0)
+    }
+
+    // Mirror of the device Gumbel-top-k SWOR sampler: draw k tokens WITHOUT
+    // replacement from softmax(logits/temp) by top-k of `logit/temp + Gumbel`.
+    fn gumbel_topk_murmur3(logits: &[f32], k: usize, temp: f32, seed: u32, b: u32) -> Vec<u32> {
+        let inv_t = 1.0 / temp.max(1e-4);
+        let mut scored: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut u = murmur3_unit(seed, b, i as u32);
+                if u <= 1e-7 {
+                    u = 1e-7;
+                }
+                if u >= 1.0 {
+                    u = 0.9999999;
+                }
+                let g = -(-(u.ln())).ln();
+                (v * inv_t + g, i as u32)
+            })
+            .collect();
+        scored.sort_by(|a, c| c.0.partial_cmp(&a.0).unwrap());
+        scored.iter().take(k).map(|&(_, t)| t).collect()
+    }
+
+    #[test]
+    fn gumbel_swor_composition_preserves_target_distribution() {
+        // THE end-to-end gate the prior tests missed: candidates come from the
+        // ACTUAL murmur3 Gumbel sampler (not an exact host SWOR draw), fed into the
+        // exact swor_step. The emitted marginal must STILL equal the target — this
+        // is the only test that would catch a weak/biased draft sampler (which
+        // keeps rank-0 correct but biases the without-replacement joint, the
+        // recurring over-acceptance trap). Several temps × k, distinct p≠q.
+        let vocab = 6usize;
+        let plog = [0.4f32, -1.2, 1.1, 0.0, 0.7, -0.3]; // target logits (≠ draft)
+        let qlog = [-0.5f32, 1.3, -0.2, 0.6, -1.0, 0.2]; // draft logits
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            let inv_t = 1.0 / temp;
+            // target p at this temp.
+            let mut p = vec![0f32; vocab];
+            {
+                let m = plog.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut s = 0.0;
+                for (t, &v) in plog.iter().enumerate() {
+                    p[t] = ((v - m) * inv_t).exp();
+                    s += p[t];
+                }
+                for x in p.iter_mut() {
+                    *x /= s;
+                }
+            }
+            // full draft q at this temp (what swor_step's residual uses).
+            let mut q = vec![0f32; vocab];
+            {
+                let m = qlog.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut s = 0.0;
+                for (t, &v) in qlog.iter().enumerate() {
+                    q[t] = ((v - m) * inv_t).exp();
+                    s += q[t];
+                }
+                for x in q.iter_mut() {
+                    *x /= s;
+                }
+            }
+            for &k in &[2usize, 3, 4] {
+                let n_runs = 400_000u32;
+                let mut hist = vec![0u64; vocab];
+                let mut vrng = 0x1357_9bdf_2468_ace0u64 ^ ((k as u64) << 8);
+                for run in 0..n_runs {
+                    let cands = gumbel_topk_murmur3(&qlog, k, temp, run.wrapping_add(1), 0);
+                    let mut p_work = p.clone();
+                    let (_acc, emit) = swor_step(&mut p_work, &q, &cands, &mut vrng);
+                    hist[emit as usize] += 1;
+                }
+                let tv: f64 = (0..vocab)
+                    .map(|t| (hist[t] as f64 / n_runs as f64 - p[t] as f64).abs())
+                    .sum::<f64>()
+                    * 0.5;
+                assert!(
+                    tv < 0.01,
+                    "Gumbel→SWOR composition must preserve the target; temp={temp} k={k} TV={tv:.4} hist={hist:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sample_first_token_marginal_exact_across_temperatures() {
         // The first emitted token is always a draw from the ROOT target (whether

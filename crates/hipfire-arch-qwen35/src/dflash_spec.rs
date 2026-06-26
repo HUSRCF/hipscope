@@ -58,12 +58,17 @@ pub struct DflashState {
 
 // ─── DFlash state load ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
     target_config: &Qwen35Config,
     target_dn: &DeltaNetState,
     gpu: &mut Gpu,
+    // DDTree draft tuning forwarded by the loader from the unified spec config
+    // (CLI `--ddtree-budget` / `--ddtree-topk`). Env wins, else these, else default.
+    ddtree_budget_param: Option<usize>,
+    ddtree_topk_param: Option<usize>,
 ) -> Result<DflashState, String> {
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
@@ -78,6 +83,7 @@ pub fn load_dflash_state(
     let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or(ddtree_budget_param)
         .unwrap_or(0);
     let max_n = (block_size + 1).max(ddtree_budget + 1);
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
@@ -131,6 +137,7 @@ pub fn load_dflash_state(
         let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or(ddtree_topk_param)
             .unwrap_or(4);
         let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
             + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
@@ -359,8 +366,16 @@ impl Speculator for DflashSpeculator {
 
     /// Temp>0 verify is distribution-correct only on the ddtree-batched arm (SWOR).
     /// path_c and chain mode are greedy, so they must NOT receive temp>0 routing.
+    /// `HIPFIRE_DDTREE_GREEDY_VERIFY=1` forces the argmax walk even on the ddtree
+    /// arm (ignores temperature) — so it also disqualifies temp>0 routing, else a
+    /// temp>0 request would silently get greedy output.
     fn supports_temp_verify(&self) -> bool {
-        self.df.ddtree.is_some() && self.path_c_mode.is_none()
+        self.df.ddtree.is_some()
+            && self.path_c_mode.is_none()
+            && std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
+                .ok()
+                .as_deref()
+                != Some("1")
     }
 
     fn step(
