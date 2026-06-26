@@ -4896,6 +4896,24 @@ pub fn spec_step_ddtree_batched(
     };
     let accept_len = accepted_node_indices.len();
 
+    // Phase-0 (p,q) dump for the q-exploiting-verify decision gate. Only on the
+    // temp>0 full-logits path; appends one JSONL record per cycle.
+    if want_full_logits {
+        if let Ok(path) = std::env::var("HIPFIRE_DDTREE_DUMP_PQ") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DUMP_CYCLE: AtomicU64 = AtomicU64::new(0);
+            let c = DUMP_CYCLE.fetch_add(1, Ordering::Relaxed);
+            hipfire_runtime::ddtree::dump_pq_jsonl(
+                &path,
+                &tree,
+                &verify_out.logits_per_pos,
+                vocab,
+                temp,
+                c,
+            );
+        }
+    }
+
     // ── 9. Build committed + drafted sequences ────────────────────────────
     let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
     committed.push(seed_token);

@@ -479,6 +479,95 @@ fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
     (w.len() - 1) as u32
 }
 
+/// Phase-0 instrumentation: append one JSON-lines record describing this cycle's
+/// tree as a per-slot REDUCED categorical `{child_1..child_k, TAIL}` over both the
+/// target `p` (softmax of the verify logits at `temp`) and the draft conditional
+/// `q` (`exp(node.logw − parent.logw)`). Children are the only reusable tokens, so
+/// accept decisions only ever involve this small support — collapsing all non-child
+/// tokens into one TAIL bucket is exact for accept-length simulation and needs no
+/// full-vocab draft logits. Consumed by the `ddtree_pq_sim` example to A/B
+/// greedy/naive/WR/SWOR acceptance offline (see the q-exploiting-verify plan).
+///
+/// Record shape (one line):
+/// `{"cycle":C,"slots":[{"s":S,"argmax_child":CS,"p_tail":PT,"q_tail":QT,
+///    "children":[[child_slot,q,p],...]},...]}`
+/// where `child_slot = child_node_index + 1`, `argmax_child` = the child slot whose
+/// token is the global argmax of `p` at that slot (or `-1` if the argmax is a
+/// non-child / tail token).
+pub fn dump_pq_jsonl(
+    path: &str,
+    tree: &DdTree,
+    logits_per_pos: &[f32],
+    vocab: usize,
+    temp: f32,
+    cycle: u64,
+) {
+    use std::io::Write;
+    let n_slots = 1 + tree.nodes.len();
+    if logits_per_pos.len() != n_slots * vocab {
+        return; // only valid on the temp>0 full-logits path
+    }
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+    let mut out = String::new();
+    out.push_str(&format!("{{\"cycle\":{cycle},\"slots\":["));
+    for s in 0..n_slots {
+        let row = &logits_per_pos[s * vocab..(s + 1) * vocab];
+        softmax_temp_into(row, if temp > 0.0 { temp } else { 1.0 }, &mut p);
+        let argmax_tok = {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+        let parent_logw = if s == 0 { 0.0 } else { tree.nodes[s - 1].logw };
+        let mut children: Vec<(usize, f32, f32)> = Vec::new();
+        let mut p_children = 0.0f32;
+        let mut q_children = 0.0f32;
+        let mut argmax_child: i64 = -1;
+        for (&token, &child_idx) in tree.child_maps[s].iter() {
+            let q = (tree.nodes[child_idx].logw - parent_logw)
+                .exp()
+                .clamp(0.0, 1.0);
+            let pt = p[token as usize];
+            p_children += pt;
+            q_children += q;
+            if token == argmax_tok {
+                argmax_child = (child_idx + 1) as i64;
+            }
+            children.push((child_idx + 1, q, pt));
+        }
+        children.sort_unstable_by_key(|&(cs, _, _)| cs);
+        let p_tail = (1.0 - p_children).max(0.0);
+        let q_tail = (1.0 - q_children).max(0.0);
+        if s > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"s\":{s},\"argmax_child\":{argmax_child},\"p_tail\":{p_tail:.6},\"q_tail\":{q_tail:.6},\"children\":["
+        ));
+        for (i, (cs, q, pt)) in children.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{cs},{q:.6},{pt:.6}]"));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
 /// Distribution-preserving tree verify — the temp>0 acceptance rule, replacing
 /// `follow_verified_tree`'s greedy argmax walk.
 ///
