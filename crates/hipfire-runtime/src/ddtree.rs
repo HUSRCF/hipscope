@@ -1036,6 +1036,112 @@ mod tests {
         );
     }
 
+    // softmax(logits / temp) — the per-slot target the walk must reproduce.
+    fn softmax_temp(logits: &[f32], temp: f32) -> Vec<f32> {
+        let inv = 1.0 / temp;
+        let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut e: Vec<f32> = logits.iter().map(|&v| ((v - m) * inv).exp()).collect();
+        let s: f32 = e.iter().sum();
+        for x in e.iter_mut() {
+            *x /= s;
+        }
+        e
+    }
+
+    #[test]
+    fn sample_first_token_marginal_exact_across_temperatures() {
+        // The first emitted token is always a draw from the ROOT target (whether
+        // it lands on a drafted child or becomes the bonus), so its marginal must
+        // equal softmax(root_logits / temp) EXACTLY at every temperature, for any
+        // tree shape. This is the core "distribution-exact at any temperature"
+        // invariant.
+        let vocab = 5usize;
+        // Tree covers tokens {1,3} at the root; tokens {0,2,4} reach only via bonus.
+        let top_tokens = [1u32, 3];
+        let q = [0.55f32, 0.30];
+        let lp: Vec<f32> = q.iter().map(|x| x.ln()).collect();
+        let tree = build_ddtree_tree_bounded(&top_tokens, &lp, 1, 2, 0, 2, f32::NEG_INFINITY);
+        let n = 1 + tree.nodes.len();
+
+        // Arbitrary (non-uniform) root logits; leaf rows unused for first token.
+        let root_logits = [0.4f32, -1.2, 2.1, 0.0, -0.5];
+        let mut logits = vec![0.0f32; n * vocab];
+        logits[..vocab].copy_from_slice(&root_logits);
+
+        let mut rng = 0x0123_4567_89ab_cdefu64;
+        for &temp in &[0.3f32, 0.7, 1.0, 1.5] {
+            let want = softmax_temp(&root_logits, temp);
+            let n_runs = 600_000u32;
+            let mut hist = vec![0u64; vocab];
+            for _ in 0..n_runs {
+                let (accepted, bonus) = sample_verified_tree(&tree, &logits, vocab, temp, &mut rng);
+                let first = accepted
+                    .first()
+                    .map(|&ni| tree.nodes[ni].token)
+                    .unwrap_or(bonus);
+                hist[first as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - want[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "first-token marginal must equal softmax(root/temp); temp={temp} TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_second_token_conditional_exact() {
+        // After the walk descends an accepted child, the NEXT emitted token is a
+        // draw from that child slot's target. Depth-1 tree → each child is a leaf,
+        // so conditioned on accepting child token 0 (slot 1), the second token is
+        // the bonus drawn from softmax(slot1_logits / temp). This proves the
+        // descended-slot conditional draw is exact (i.e. the full sequence is
+        // autoregressive sampling from the target).
+        let vocab = 4usize;
+        let top_tokens = [0u32, 1];
+        let q = [0.6f32, 0.3];
+        let lp: Vec<f32> = q.iter().map(|x| x.ln()).collect();
+        let tree = build_ddtree_tree_bounded(&top_tokens, &lp, 1, 2, 0, 2, f32::NEG_INFINITY);
+        // child token 0 is node 0 → slot 1.
+        let slot_of_child0 = tree.child_maps[0][&0] + 1;
+        let n = 1 + tree.nodes.len();
+
+        let root_logits = [1.5f32, 0.2, -0.3, -2.0]; // token 0 likely → frequent descent
+        let slot1_logits = [-0.5f32, 0.8, 1.2, 0.1]; // the conditional target after token 0
+        let mut logits = vec![0.0f32; n * vocab];
+        logits[..vocab].copy_from_slice(&root_logits);
+        logits[slot_of_child0 * vocab..(slot_of_child0 + 1) * vocab].copy_from_slice(&slot1_logits);
+
+        let temp = 0.7f32;
+        let want = softmax_temp(&slot1_logits, temp);
+        let mut rng = 0xfeed_face_0000_1111u64;
+        let mut hist = vec![0u64; vocab];
+        let mut conditioned = 0u64;
+        for _ in 0..2_000_000u32 {
+            let (accepted, bonus) = sample_verified_tree(&tree, &logits, vocab, temp, &mut rng);
+            // Condition on x0 == token 0 (accepted child 0); then x1 = bonus.
+            if accepted.first().map(|&ni| tree.nodes[ni].token) == Some(0) {
+                conditioned += 1;
+                hist[bonus as usize] += 1;
+            }
+        }
+        assert!(
+            conditioned > 100_000,
+            "too few descents to estimate ({conditioned})"
+        );
+        let tv: f64 = (0..vocab)
+            .map(|t| (hist[t] as f64 / conditioned as f64 - want[t] as f64).abs())
+            .sum::<f64>()
+            * 0.5;
+        assert!(
+            tv < 0.01,
+            "second-token | x0=0 must equal softmax(slot1/temp); TV={tv:.4} hist={hist:?} n={conditioned}"
+        );
+    }
+
     #[test]
     fn empty_tree_has_root_only_visibility() {
         let t = build_ddtree_tree(&[], &[], 0, 0, 0);
