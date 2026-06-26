@@ -4856,7 +4856,14 @@ pub fn spec_step_ddtree_batched(
     let t_pre_verify = t_all.elapsed();
     // temp > 0 needs the full per-slot target logits for naive tree sampling;
     // greedy keeps the cheap GPU-argmax + 4·B D2H.
-    let want_full_logits = temp > 0.0;
+    // HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the pre-sampling greedy accept walk
+    // even at temp>0 — reproduces the old "falls back to greedy" behaviour for
+    // an apples-to-apples τ A/B against the distribution-preserving sampler.
+    let force_greedy_verify = std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let want_full_logits = temp > 0.0 && !force_greedy_verify;
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,

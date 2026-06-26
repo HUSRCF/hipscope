@@ -59,6 +59,23 @@ greedy. It does NOT vindicate the banded `MINNODES` floor (still a near-no-op at
 both temps; the floor rarely binds under an active cutoff). Breadth via
 budget/topk was already helping greedy and continues to.
 
+### τ impact — sampled vs old greedy-fallback, isolated (temp 0.7)
+
+Apples-to-apples at the SAME temp/seed/tree, only the accept rule differs
+(`HIPFIRE_DDTREE_GREEDY_VERIFY=1` forces the old greedy walk):
+
+| tree        | greedy τ (old) | sampled τ (new) | Δτ     | tok/s          |
+|-------------|----------------|-----------------|--------|----------------|
+| narrow b8-k2| 4.353          | 4.256           | −2.2%  | 34.5 → 32.7    |
+| wide  b22-k4| 5.885          | 5.390           | −8.4%  | 24.1 → 22.6    |
+
+The greedy column reproduces the temp=0 baseline exactly (greedy accept is
+temperature-invariant), confirming the isolation. So distribution-preserving
+sampling costs **~2–8% τ** (more on wider trees) — the price of correctness:
+sampling draws higher-entropy targets the draft tree covers slightly less often.
+Modest and bounded; it buys correct temp>0 output where the engine previously
+emitted argmax-biased (greedy) tokens regardless of the requested temperature.
+
 ## Remaining
 - Plumb request temperature through `SpecTarget::step` so the daemon/serve path
   uses sampled verify at temp>0 (today production passes `temp=0.0`, greedy).
