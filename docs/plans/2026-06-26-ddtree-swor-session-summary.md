@@ -109,6 +109,15 @@ logic transfer unchanged.
 
 ## Review findings (2026-06-26, 3-agent review: correctness / missed-ops / boundaries)
 
+**RESOLVED in `60c73395`:** #1 (explicit sampling controls → AR), #2 (GREEDY_VERIFY
+disqualifies temp>0 spec), #3 (n-gram temp>0 → AR), #4 (Gumbel→swor_step composition
+distribution gate test), AND the ddtree draft settings now ride the unified CLI
+(`ddtree_budget`/`ddtree_topk` config keys + load params, `--draft-max`→budget;
+env-wins-else-param in the loader). Serve smoke confirms: bare-temp→SPEC,
+explicit-top_p→AR, GREEDY_VERIFY→AR. **STILL OPEN:** #5 (drop arch_id allowlist),
+#6 (hoist swor_walk_gpu out of qwen35 crate), #7 (parallelize kernel bonus scan) —
+the reuse-prereq + cheap-perf items below.
+
 Ranked. Two are behavior regressions introduced by the serve wiring (`5884a894`)
 and should be fixed before calling this done. The seam fixes also de-risk reuse.
 
