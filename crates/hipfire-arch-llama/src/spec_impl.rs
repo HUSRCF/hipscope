@@ -18,7 +18,7 @@
 use crate::LlamaBundle;
 use hipfire_runtime::llama::{self, KvCache, PrefillBatchScratch};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// LLaMA target-verify scratch: just the per-block batched-forward scratch
 /// (`PrefillBatchScratch`). No recurrent snapshot — pure attention.
@@ -163,6 +163,33 @@ impl SpecTarget for LlamaBundle {
         // Pure attention: verify's accepted-prefix KV is already correct, and the
         // rejected tail is overwritten by the next verify. Nothing to rewind.
         Ok(())
+    }
+
+    /// Apply the target's lm_head to `n` rows of pre-norm residual hidden states
+    /// (`hidden_rows`: F32 GpuTensor, shape `[n × dim]`, row-major).
+    ///
+    /// Returns `n × vocab_size` host f32 logits (not argmax) so callers can do
+    /// SWOR or any other sampling over the full distribution. Argmax is the
+    /// cheapest derive; the speculator computes it from these logits.
+    ///
+    /// Implemented by calling `hipfire_runtime::llama_spec::lm_head_logits_n_rows`
+    /// which mirrors the per-row `rmsnorm + weight_gemv(output)` loop already
+    /// used in `verify_block_argmax`, sharing the same scratch buffers.
+    fn lm_head_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        hidden_rows: &GpuTensor,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        hipfire_runtime::llama_spec::lm_head_logits_n_rows(
+            gpu,
+            &self.weights,
+            &self.config,
+            hidden_rows,
+            n,
+            &self.scratch,
+        )
+        .map_err(|e| format!("LlamaBundle::lm_head_logits: {e:?}"))
     }
 
     fn eos_token(&self) -> u32 {

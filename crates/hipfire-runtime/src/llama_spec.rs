@@ -14,7 +14,7 @@ use crate::llama::{
     LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Per-position greedy verify: run the target over `block` (length `n`) at
 /// positions `[start_pos, start_pos + n)`, advancing `kv_cache` by `n`, and
@@ -112,6 +112,54 @@ pub fn verify_block_argmax(
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
             out.push(argmax(&gpu.download_f32(&scratch.logits)?));
         }
+    }
+    Ok(out)
+}
+
+/// Apply the target lm_head (final-norm + output projection) to `n` rows of
+/// pre-norm residual hidden states, returning `n × vocab_size` host-side f32
+/// logits in row-major order.
+///
+/// `hidden_rows` must be an `F32` `GpuTensor` of length `n × dim` laid out
+/// row-major (row `i` starts at byte offset `i * dim * 4`). `scratch` is used
+/// as a single-row staging buffer — `scratch.x`, `scratch.tmp`, and
+/// `scratch.logits` are overwritten on every iteration. Callers that need the
+/// raw logits for SWOR sampling should call this instead of running argmax
+/// inside the loop.
+///
+/// Concretely for each row `i`:
+///   1. DtoD-copy row `i` of `hidden_rows` into `scratch.x` (single F32 vector).
+///   2. `rmsnorm_f32(scratch.x, weights.output_norm, scratch.tmp, eps)`.
+///   3. `weight_gemv(weights.output, scratch.tmp, scratch.logits)`.
+///   4. Download `scratch.logits` and append to the output buffer.
+///
+/// This mirrors the per-row lm_head loop in `verify_block_argmax` exactly —
+/// reusing the same scratch buffers and the same kernel dispatch path — so the
+/// returned logits are bit-identical to what `verify_block_argmax` would compute
+/// before taking `argmax`.
+pub fn lm_head_logits_n_rows(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    hidden_rows: &GpuTensor,
+    n: usize,
+    scratch: &ForwardScratch,
+) -> HipResult<Vec<f32>> {
+    let dim = config.dim;
+    let vocab = config.vocab_size;
+    let mut out = Vec::with_capacity(n * vocab);
+    for i in 0..n {
+        let off_bytes = i * dim * 4;
+        gpu.hip
+            .memcpy_dtod_at(&scratch.x.buf, 0, &hidden_rows.buf, off_bytes, dim * 4)?;
+        gpu.rmsnorm_f32(
+            &scratch.x,
+            &weights.output_norm,
+            &scratch.tmp,
+            config.norm_eps,
+        )?;
+        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        out.extend_from_slice(&gpu.download_f32(&scratch.logits)?);
     }
     Ok(out)
 }
