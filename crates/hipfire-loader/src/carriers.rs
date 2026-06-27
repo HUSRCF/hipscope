@@ -533,7 +533,7 @@ impl Carrier for LlamaCarrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         // ── source-varying seam: yields a LlamaBundle ──
-        let bundle = match src {
+        let mut bundle = match src {
             ModelSource::Hfq(hfq) => {
                 hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
             }
@@ -580,17 +580,75 @@ impl Carrier for LlamaCarrier {
         };
 
         // ── single shared tail ──
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
-        // no DFlash draft and no eviction by default; the arm builds its verify
-        // scratch lazily on first prefill, so only ctx_capacity is needed here.
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        // If a DFlash draft (arch_id=20 HFQ) is configured for this dense llama/qwen3
+        // target, build the target-generic chain DFlash speculator. This wins over n-gram
+        // (mirrors qwen35's dflash-over-ngram precedence) and is set directly — not through
+        // build_speculator — because build_speculator's `dflash` param is qwen35-typed
+        // (DflashState) and cannot carry the generic Box<dyn Speculator>.
+        //
+        // If no DFlash draft is present (or it isn't arch_id=20), fall through to
+        // build_speculator for the opt-in n-gram arm (HIPFIRE_NGRAM_DRAFT=1).
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if let Some(dp) =
+            ctx.draft_path
+        {
+            // Peek at the draft's arch_id without consuming the path; the builder
+            // opens it again internally.
+            match hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(dp)) {
+                Ok(draft_hfq) if draft_hfq.arch_id == 20 => {
+                    // Parse DflashConfig to validate the cross-attention concat invariant
+                    // (review finding L4): the drafter's hidden must equal the target dim.
+                    let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
+                        .ok_or_else(|| {
+                            format!(
+                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
+                                 'dflash' metadata block",
+                                dp
+                            )
+                        })?;
+                    if bundle.config.dim != draft_cfg.hidden {
+                        return Err(format!(
+                            "DFlash draft '{}' hidden={} != target dim={} \
+                                 (cross-attention concat invariant L4: drafter hidden \
+                                 must equal target residual dim)",
+                            dp, draft_cfg.hidden, bundle.config.dim
+                        ));
+                    }
+                    // Drop the peek handle before the builder reopens it.
+                    drop(draft_hfq);
+                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                        ctx.gpu,
+                        dp,
+                        &mut bundle,
+                        ctx.max_seq,
+                    )
+                    .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
+                    eprintln!(
+                        "  DFlash generic speculator loaded for arch {} target: {}",
+                        meta.arch_id, dp
+                    );
+                    Some(spec)
+                }
+                // Not a DFlash draft or unreadable — fall through to n-gram.
+                _ => crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                ),
+            }
+        } else {
+            // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.
+            crate::spec_build::build_speculator(
+                meta.arch_id,
+                None,
+                None,
+                true,
+                ctx.max_seq,
+                ctx.spec,
+            )
+        };
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
             speculator,
