@@ -628,15 +628,35 @@ impl Carrier for LlamaCarrier {
                     );
                     Some(spec)
                 }
-                // Not a DFlash draft or unreadable — fall through to n-gram.
-                _ => crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                ),
+                // Not a DFlash draft or unreadable — log why and fall through to n-gram.
+                Err(e) => {
+                    eprintln!(
+                        "  [hipfire] draft '{}' unreadable ({e}); DFlash speculator not built, falling back to n-gram",
+                        dp
+                    );
+                    crate::spec_build::build_speculator(
+                        meta.arch_id,
+                        None,
+                        None,
+                        true,
+                        ctx.max_seq,
+                        ctx.spec,
+                    )
+                }
+                Ok(draft_hfq) => {
+                    eprintln!(
+                        "  [hipfire] draft '{}' is arch_id={} (not 20 / DFlash); DFlash speculator not built, falling back to n-gram",
+                        dp, draft_hfq.arch_id
+                    );
+                    crate::spec_build::build_speculator(
+                        meta.arch_id,
+                        None,
+                        None,
+                        true,
+                        ctx.max_seq,
+                        ctx.spec,
+                    )
+                }
             }
         } else {
             // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.

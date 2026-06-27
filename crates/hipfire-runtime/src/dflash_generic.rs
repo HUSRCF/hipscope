@@ -27,6 +27,11 @@
 //!   5. greedy-accept the longest matching prefix + bonus, append ONLY the
 //!      committed-prefix hidden to `target_hidden_host`, and advance.
 //!
+//! **The GREEDY CHAIN path is the SHIPPED DEFAULT.** At temp 0 it is lossless
+//! (token-identical to AR). The DDTree tree-SWOR arm is OPT-IN via
+//! `HIPFIRE_DFLASH_TREE=1`; without that flag the tree code is entirely inactive
+//! and the chain path is the only execution path.
+//!
 //! The chain (linear) verify supports BOTH greedy (temp≈0) and a
 //! distribution-EXACT temp>0 path: SpecInfer NAIVE sampling (draw `x ~
 //! softmax(target_logits/temp)` per position, accept the drafted token it lands
@@ -301,6 +306,53 @@ impl GenericDflashSpeculator {
             .chain(std::iter::once(bonus));
         Ok(SpecStep::new(emit, bonus, depth, accept_len))
     }
+
+    /// Shared chain-verify tail: H2 hidden truncation + SpecStep construction.
+    ///
+    /// Called after both the greedy and temp>0 chain arms have computed `accepted`
+    /// and `bonus` and committed the prefix via `commit_prefix`. Appends the first
+    /// `accepted + 1` rows of `block_hidden` to `target_hidden_host` (H2: seed +
+    /// accepted drafts; the bonus row is NOT appended — it materialises next cycle
+    /// as the block seed) and constructs the `SpecStep` for the daemon.
+    ///
+    /// MUST be called with identical arguments from both arms: the call order
+    /// (extend_from_slice → debug_assert_eq → SpecStep::new) is the same in both.
+    fn finish_chain(
+        &mut self,
+        block_hidden: &[f32],
+        drafts: &[u32],
+        accepted: usize,
+        bonus: u32,
+        position: usize,
+        ne: usize,
+        h: usize,
+    ) -> Result<SpecStep, String> {
+        // Append ONLY the committed-prefix hidden — the first accepted+1 rows of
+        // block_hidden (seed + accepted drafts). The bonus's hidden is NOT appended:
+        // its proper hidden materialises on the NEXT cycle's verify when it is
+        // forwarded as block[0]. This grows the prefix by accept+1, matching
+        // draft_forward's contract.
+        // draft_forward owns the uploaded_target_hidden_rows cursor (it delta-uploads
+        // the appended host rows next step); the generic path never scatters to GPU
+        // itself, so we must NOT set it here.
+        let keep_elems = committed_block_hidden_elems(accepted, ne, h);
+        self.target_hidden_host
+            .extend_from_slice(&block_hidden[..keep_elems]);
+        debug_assert_eq!(
+            self.target_hidden_host.len(),
+            committed_host_len(position, accepted, ne, h),
+            "host buffer length mismatch after chain commit"
+        );
+
+        // ── Lower to SpecStep: emit = committed[1..] (accepted drafts + bonus,
+        // seed dropped), next_seed = bonus. emit.len() == accepted + 1 drives the
+        // daemon's position += emit.len().
+        let emit = drafts[..accepted]
+            .iter()
+            .copied()
+            .chain(std::iter::once(bonus));
+        Ok(SpecStep::new(emit, bonus, drafts.len(), accepted))
+    }
 }
 
 /// Pure (testable) truncation math for the partial-accept host-buffer update.
@@ -519,23 +571,7 @@ impl Speculator for GenericDflashSpeculator {
                 naive_sample_chain(&logits_per_pos, &drafts, vocab, temp, &mut self.rng_state);
 
             target.commit_prefix(gpu, &block, accepted, position, vs.as_mut())?;
-
-            // Same H2 truncation as the greedy path: append the first accepted+1
-            // hidden rows (seed + accepted drafts); draft_forward owns the cursor.
-            let keep_elems = committed_block_hidden_elems(accepted, ne, h);
-            self.target_hidden_host
-                .extend_from_slice(&block_hidden[..keep_elems]);
-            debug_assert_eq!(
-                self.target_hidden_host.len(),
-                committed_host_len(position, accepted, ne, h),
-                "host buffer length mismatch after temp>0 commit"
-            );
-
-            let emit = drafts[..accepted]
-                .iter()
-                .copied()
-                .chain(std::iter::once(bonus));
-            return Ok(SpecStep::new(emit, bonus, drafts.len(), accepted));
+            return self.finish_chain(&block_hidden, &drafts, accepted, bonus, position, ne, h);
         }
 
         // ── 4. Verify + accept + truncation (review finding H2) ─────────────
@@ -570,30 +606,7 @@ impl Speculator for GenericDflashSpeculator {
         // the snapshot verify_block stashed in `vs`. accept_len passed is the
         // number of accepted DRAFTS (block[1..=accept_len] accepted).
         target.commit_prefix(gpu, &block, accepted, position, vs.as_mut())?;
-
-        // Append ONLY the committed-prefix hidden — the first accepted+1 rows of
-        // block_hidden (positions [position .. position+accepted], i.e. seed +
-        // accepted drafts). The bonus's hidden is NOT appended: its proper hidden
-        // materializes on the NEXT cycle's verify when it is forwarded as block[0].
-        // This grows the prefix by accept+1, matching draft_forward's contract.
-        let keep_elems = committed_block_hidden_elems(accepted, ne, h);
-        self.target_hidden_host
-            .extend_from_slice(&block_hidden[..keep_elems]);
-        // draft_forward owns the uploaded_target_hidden_rows cursor (it delta-uploads the appended host rows next step); the generic path never scatters to GPU itself, so we must NOT set it here.
-        debug_assert_eq!(
-            self.target_hidden_host.len(),
-            committed_host_len(position, accepted, ne, h),
-            "host buffer length mismatch after commit"
-        );
-
-        // ── 5. Lower to SpecStep: emit = committed[1..] (accepted drafts + bonus,
-        // seed dropped), next_seed = bonus. emit.len() == accepted + 1 drives the
-        // daemon's position += emit.len().
-        let emit = drafts[..accepted]
-            .iter()
-            .copied()
-            .chain(std::iter::once(bonus));
-        Ok(SpecStep::new(emit, bonus, drafts.len(), accepted))
+        self.finish_chain(&block_hidden, &drafts, accepted, bonus, position, ne, h)
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) {

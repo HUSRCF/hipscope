@@ -276,17 +276,15 @@ pub trait SpecTarget {
     /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
     /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
     ///
-    /// `None` (default) means this target cannot feed a hidden-conditioned
-    /// drafter; `build_speculator`'s DFlash arm declines gracefully.
+    /// `None` (default) means this target cannot feed a hidden-conditioned drafter.
     fn dflash_extract_layers(&self) -> Option<&[usize]> {
         None
     }
 
     /// Apply the target's lm_head to `n` rows of residual hidden states
     /// (shape `[n, dim]`, stored row-major) on `gpu`, returning `n × vocab`
-    /// host-side logits. Returns `Err` by default; implemented in Task 2b for
-    /// the llama/qwen3 family. Returns logits (not argmax) so SWOR/M5 sampling
-    /// has access to the full distribution.
+    /// host-side logits (not argmax), so the caller has access to the full
+    /// distribution for sampling. Returns `Err` by default.
     fn lm_head_logits(
         &mut self,
         _gpu: &mut Gpu,
@@ -298,9 +296,8 @@ pub trait SpecTarget {
 
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
     /// target logits (`block.len() × vocab`, row-major) instead of the per-position
-    /// argmax. Used by the temp>0 chain DFlash path, which draws `x ~
-    /// softmax(logits_i / temp)` per position (distribution-exact SpecInfer naive
-    /// sampling) rather than taking the argmax.
+    /// argmax. The caller uses the full logits to draw from the target distribution
+    /// (e.g. distribution-exact sampling at temp>0).
     ///
     /// Same contract as `verify_block` otherwise: snapshots whatever
     /// [`commit_prefix`](Self::commit_prefix) needs *before* advancing, leaves
@@ -308,8 +305,7 @@ pub trait SpecTarget {
     /// residual hidden into `hidden_out` when `Some` and
     /// [`dflash_extract_layers`](Self::dflash_extract_layers) is `Some`.
     ///
-    /// Returns `Err` by default; implemented for the llama/qwen3 family (which
-    /// already computes these logits internally before argmax-ing them).
+    /// Returns `Err` by default.
     fn verify_block_logits(
         &mut self,
         _gpu: &mut Gpu,
@@ -321,34 +317,23 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
-    /// Single-pass TREE-masked verify: run the target over a LINEARIZED DDTree in
-    /// ONE batched forward and return the FULL per-NODE target logits
-    /// (`tokens.len() × vocab`, row-major). `tokens`/`mask_block` come from
-    /// [`crate::ddtree::linearize_tree_with_parents`] (slot 0 = seed; `mask_block`
-    /// is the `[n × n]` additive `0.0`/`-inf` ancestor-visibility bias). The
-    /// forward runs at contiguous positions `[position .. position + n)`; the mask
-    /// alone encodes the tree, so a node's logits equal a causal verify of that
-    /// node's root-to-node chain.
+    /// Single-pass TREE-masked verify: run the target over a linearized draft tree
+    /// in ONE batched forward and return the FULL per-node target logits
+    /// (`tokens.len() × vocab`, row-major).
     ///
-    /// `tokens`/`mask_block`/`depth_positions` all come from
-    /// [`crate::ddtree::linearize_tree_with_parents`]: `mask_block` is the
-    /// `[n × n]` additive ancestor mask; `depth_positions` are the per-slot DEPTH
-    /// RoPE positions (`position + node.depth`). The forward rotates Q/K at the
-    /// depth positions (parent→child distance 1) so the bushy-tree verify is
-    /// greedy-lossless, while KV write + mask stay on contiguous slots.
+    /// `tokens` is the slot-ordered token sequence (slot 0 = seed). `mask_block`
+    /// is the `[n × n]` additive `0.0`/`-inf` ancestor-visibility bias that encodes
+    /// the tree topology: a node's logits equal a causal verify of that node's
+    /// root-to-node chain. `depth_positions` are the per-slot RoPE positions
+    /// (`position + node.depth`); the target rotates Q/K at these positions so
+    /// parent→child distance is 1, while KV writes and the mask stay on contiguous
+    /// slots. The forward runs at contiguous positions `[position .. position + n)`.
     ///
-    /// This is the single-forward heart of the q-exploiting SWOR tree verify
-    /// (`dflash_generic::step_tree`): `n_slots × vocab` logits feed
-    /// [`crate::ddtree::sample_verified_tree_swor`] (temp>0) /
-    /// [`crate::ddtree::sample_verified_tree`] (temp 0). `hidden_out` captures the
-    /// per-extract-layer residual rows for DFlash conditioning (same contract as
-    /// [`verify_block`](Self::verify_block)).
+    /// `hidden_out` captures per-extract-layer residual rows (same contract as
+    /// [`verify_block`](Self::verify_block) / [`dflash_extract_layers`](Self::dflash_extract_layers)).
     ///
-    /// Leaves target state advanced by `n` (stateless arches: the accepted-prefix
-    /// KV is correct, the rejected tail is overwritten next cycle —
-    /// [`commit_prefix`](Self::commit_prefix) is a no-op). Returns `Err` by
-    /// default; implemented for the llama/qwen3 family (which has the masked
-    /// batched attention kernels).
+    /// Leaves target state advanced by `n`; for stateless targets
+    /// [`commit_prefix`](Self::commit_prefix) is a no-op. Returns `Err` by default.
     #[allow(clippy::too_many_arguments)]
     fn verify_tree_logits(
         &mut self,
@@ -364,22 +349,18 @@ pub trait SpecTarget {
     }
 
     /// Look up the target's embedding row for `token_id`, dequantized to F32
-    /// (length `dim`). The generic DFlash drafter needs this to build the
-    /// mask-token "noise" embedding it broadcasts across the masked block
-    /// positions ([`crate::dflash_generic`]). Returns `Err` by default;
-    /// implemented for the llama/qwen3 family (which exposes `token_embd`).
+    /// (length `dim`). Used by hidden-conditioned drafters to obtain the noise
+    /// embedding broadcast across masked block positions. Returns `Err` by default.
     fn embed_row(&mut self, _gpu: &mut Gpu, _token_id: u32) -> Result<Vec<f32>, String> {
         Err("target does not expose embed_row".into())
     }
 
     /// Configure which residual-hidden layer indices the target captures into
     /// the `hidden_out` sink of [`spec_advance`](Self::spec_advance) /
-    /// [`verify_block`](Self::verify_block). The generic DFlash drafter calls
-    /// this at build time with its own `target_layer_ids` so capture matches
-    /// the drafter's `fc` expectation. Default no-op for targets that cannot
-    /// feed a hidden-conditioned drafter (their `dflash_extract_layers` stays
-    /// `None`). This is the arch-free route that lets [`crate::dflash_generic`]
-    /// set extract layers without naming a concrete bundle type.
+    /// [`verify_block`](Self::verify_block). Called by a hidden-conditioned drafter
+    /// at build time so capture indices match its `fc` expectation. Default no-op
+    /// for targets that do not expose hidden states (their [`dflash_extract_layers`](Self::dflash_extract_layers)
+    /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 }
 
