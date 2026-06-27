@@ -110,8 +110,10 @@ pub struct FeatureFlags {
     pub force_unfused: bool,
 
     // ── Speculative decode (DFlash/DDTree) ────────────────────────
-    /// Enable DDTree tree-SWOR verify arm (`HIPFIRE_DFLASH_TREE=1`). Default
-    /// false. When false the chain path is the only active execution path.
+    /// DDTree tree-SWOR verify arm. **Default ON** — it works out of the box;
+    /// opt out with `HIPFIRE_DFLASH_TREE=0` to fall back to the chain path
+    /// (the only other execution path). Tree-SWOR is distribution-exact at any
+    /// temperature and lossless (== AR) at temp 0, so default-on is safe.
     pub dflash_tree: bool,
     /// Override DDTree node budget (`HIPFIRE_DDTREE_BUDGET`). `None` → use the
     /// per-call-site default (`DEFAULT_TREE_BUDGET = 8`).
@@ -119,9 +121,6 @@ pub struct FeatureFlags {
     /// Override DDTree per-position top-K breadth (`HIPFIRE_DDTREE_TOPK`).
     /// `None` → use the per-call-site default (`DEFAULT_TREE_TOPK = 2`).
     pub ddtree_topk: Option<usize>,
-    /// Force argmax even at temp>0 (`HIPFIRE_DDTREE_GREEDY_VERIFY=1`). Default
-    /// false. When true the speculator reports `supports_temp_verify = false`.
-    pub ddtree_greedy_verify: bool,
 }
 
 impl FeatureFlags {
@@ -286,11 +285,9 @@ impl FeatureFlags {
                 .unwrap_or(false),
 
             // Speculative decode (DFlash/DDTree)
-            dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1"),
+            dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() != Ok("0"),
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
-            ddtree_greedy_verify: std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY").as_deref()
-                == Ok("1"),
         }
     }
 
@@ -426,10 +423,9 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
-            dflash_tree: false,
+            dflash_tree: true,
             ddtree_budget: None,
             ddtree_topk: None,
-            ddtree_greedy_verify: false,
         }
     }
 }

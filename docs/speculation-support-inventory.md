@@ -76,13 +76,13 @@ Everything else is plain autoregressive.
   safetensors checkpoint. Supplied via the daemon `load` message `params.draft`
   field (path to the `.hfq` file). Auto-wired in `LlamaCarrier::load` when
   `draft_path` is set to a valid arch_id=20 HFQ.
-  - **Greedy chain** (shipped default): lossless / token-identical to AR.
-    `HIPFIRE_DFLASH_TREE=0` (or unset).
-  - **DDTree tree-SWOR** (opt-in `HIPFIRE_DFLASH_TREE=1`): one tree-masked
-    target forward per cycle; distribution-exact at temp>0. Knobs:
-    `HIPFIRE_DDTREE_BUDGET` (default 8), `HIPFIRE_DDTREE_TOPK` (default 2).
-  - **temp>0**: chain arm uses SpecInfer NAIVE sampling (distribution-exact);
-    force greedy with `HIPFIRE_DDTREE_GREEDY_VERIFY=1`.
+  - **DDTree tree-SWOR** (shipped default): one tree-masked target forward per
+    cycle; lossless / token-identical to AR at temp 0, distribution-exact at
+    temp>0. Knobs: `HIPFIRE_DDTREE_BUDGET` (default 8), `HIPFIRE_DDTREE_TOPK`
+    (default 2).
+  - **Greedy chain** (`HIPFIRE_DFLASH_TREE=0` to opt out of the tree arm):
+    lossless / token-identical to AR; temp>0 uses SpecInfer NAIVE sampling
+    (distribution-exact).
   - **Empirical note (gfx1151):** break-even acceptance τ ≈ 2.5–3; the win is
     drafter-acceptance-bound. Batched GEMMs at B=1 limit verify-side gains.
 - **n-gram**: opt-in `HIPFIRE_NGRAM_DRAFT=1`. **Ceiling:** unbatched MQ4G256/HFQ4

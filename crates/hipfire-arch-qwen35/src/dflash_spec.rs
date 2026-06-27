@@ -366,16 +366,8 @@ impl Speculator for DflashSpeculator {
 
     /// Temp>0 verify is distribution-correct only on the ddtree-batched arm (SWOR).
     /// path_c and chain mode are greedy, so they must NOT receive temp>0 routing.
-    /// `HIPFIRE_DDTREE_GREEDY_VERIFY=1` forces the argmax walk even on the ddtree
-    /// arm (ignores temperature) — so it also disqualifies temp>0 routing, else a
-    /// temp>0 request would silently get greedy output.
     fn supports_temp_verify(&self) -> bool {
-        self.df.ddtree.is_some()
-            && self.path_c_mode.is_none()
-            && std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
-                .ok()
-                .as_deref()
-                != Some("1")
+        self.df.ddtree.is_some() && self.path_c_mode.is_none()
     }
 
     fn step(

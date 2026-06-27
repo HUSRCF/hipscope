@@ -27,24 +27,25 @@
 //!   5. greedy-accept the longest matching prefix + bonus, append ONLY the
 //!      committed-prefix hidden to `target_hidden_host`, and advance.
 //!
-//! **The GREEDY CHAIN path is the SHIPPED DEFAULT.** At temp 0 it is lossless
-//! (token-identical to AR). The DDTree tree-SWOR arm is OPT-IN via
-//! `HIPFIRE_DFLASH_TREE=1`; without that flag the tree code is entirely inactive
-//! and the chain path is the only execution path.
+//! **The DDTree tree-SWOR arm is the SHIPPED DEFAULT** — it works out of the
+//! box and is the strictly-more-capable verify (higher τ, distribution-exact at
+//! any temperature, lossless == AR at temp 0). Opt out with
+//! `HIPFIRE_DFLASH_TREE=0` to fall back to the greedy chain path, which is also
+//! lossless at temp 0 and distribution-exact at temp>0 (naive sampling).
 //!
 //! The chain (linear) verify supports BOTH greedy (temp≈0) and a
 //! distribution-EXACT temp>0 path: SpecInfer NAIVE sampling (draw `x ~
 //! softmax(target_logits/temp)` per position, accept the drafted token it lands
 //! on, else emit the draw as the bonus — see [`crate::ddtree::naive_sample_chain`]).
 //! So [`supports_temp_verify`](Speculator::supports_temp_verify) is `true` for the
-//! chain unless `HIPFIRE_DDTREE_GREEDY_VERIFY=1` forces argmax.
+//! chain.
 //!
-//! The opt-in tree arm (`HIPFIRE_DFLASH_TREE=1`) verifies the WHOLE bounded
+//! The tree arm (default; `HIPFIRE_DFLASH_TREE=0` to disable) verifies the WHOLE bounded
 //! DDTree in ONE tree-masked target forward ([`SpecTarget::verify_tree_logits`])
 //! and walks the per-node logits with the q-exploiting without-replacement
 //! speculative sampler ([`crate::ddtree::sample_verified_tree_swor`]). This is
 //! ALSO distribution-exact at temp>0, so a tree-enabled speculator reports
-//! `supports_temp_verify = true` (unless greedy is forced) and temp>0 routes
+//! `supports_temp_verify = true` and temp>0 routes
 //! through the single-pass tree-SWOR rather than the chain naive sampler. At
 //! temp 0 the greedy argmax walk through the tree is lossless == AR.
 
@@ -110,14 +111,9 @@ pub struct GenericDflashSpeculator {
     verify_scratch: Option<Box<dyn SpecScratch>>,
     block_size: usize,
     ctx_capacity: usize,
-    /// Opt-in tree-verify policy (`HIPFIRE_DFLASH_TREE=1`). When `enabled` is
-    /// false the `step` takes the original single-path chain verify.
+    /// Tree-verify policy (default on; `HIPFIRE_DFLASH_TREE=0` to disable). When
+    /// `enabled` is false the `step` takes the original single-path chain verify.
     tree: TreeMode,
-    /// When `true` (`HIPFIRE_DDTREE_GREEDY_VERIFY=1`) the verify ALWAYS takes the
-    /// argmax even at temp>0, so this speculator reports `supports_temp_verify() =
-    /// false` (it would silently ignore the temperature). Mirrors the qwen35
-    /// ddtree path's `force_greedy_verify`.
-    force_greedy_verify: bool,
     /// Xorshift64* RNG state for the temp>0 chain naive sampler. Bit-compatible
     /// with the qwen35 spec sampler's seed so the chain draws are deterministic.
     rng_state: u64,
@@ -504,30 +500,19 @@ impl Speculator for GenericDflashSpeculator {
             block[i + 1] = d;
         }
 
-        // ── Tree-verify arm (opt-in, HIPFIRE_DFLASH_TREE=1) ─────────────────
+        // ── Tree-verify arm (default; HIPFIRE_DFLASH_TREE=0 to disable) ─────
         // Build a bounded DDTree from the per-position draft marginals and verify
         // the WHOLE tree in ONE tree-masked forward (`verify_tree_logits`), then
         // walk it with the distribution-exact SWOR sampler. temp 0 → greedy
         // (lossless == AR); temp>0 → q-exploiting SWOR (distribution-exact). This
         // arm CARRIES temp>0 — the chain naive-sampling path below is skipped when
-        // the tree is enabled (unless greedy is forced, in which case step_tree's
-        // temp is clamped to 0 by the caller-side `requires_greedy`).
+        // the tree is enabled.
         if self.tree.enabled {
-            let verify_temp = if self.force_greedy_verify { 0.0 } else { temp };
-            return self.step_tree(
-                gpu,
-                target,
-                position,
-                seed,
-                &draft_logits,
-                vocab,
-                b,
-                verify_temp,
-            );
+            return self.step_tree(gpu, target, position, seed, &draft_logits, vocab, b, temp);
         }
 
         // ── 4t. temp>0 chain naive-sampling verify (distribution-exact) ─────
-        // When the request temperature is >0 (and greedy is not force-flagged),
+        // When the request temperature is >0,
         // verify the chain by drawing x ~ softmax(target_logits/temp) per position
         // and accepting the longest prefix where draft[i] == x_i (SpecInfer NAIVE
         // sampling — distribution-EXACT at any temperature; see
@@ -535,7 +520,7 @@ impl Speculator for GenericDflashSpeculator {
         // logits, so this arm uses `verify_block_logits` instead of `verify_block`
         // (which only returns the argmax). The same H2 truncation applies: append
         // only the first accepted+1 rows of the captured hidden.
-        if temp > 1e-6 && !self.force_greedy_verify {
+        if temp > 1e-6 {
             let vs = self
                 .verify_scratch
                 .as_mut()
@@ -617,16 +602,13 @@ impl Speculator for GenericDflashSpeculator {
     fn supports_temp_verify(&self) -> bool {
         // BOTH the chain path (SpecInfer naive sampling) and the tree arm
         // (q-exploiting SWOR — `step_tree` + `sample_verified_tree_swor`) are
-        // distribution-EXACT at temp>0. The only exclusion is
-        // `HIPFIRE_DDTREE_GREEDY_VERIFY=1`, which forces argmax and would silently
-        // ignore the temperature.
-        !self.force_greedy_verify
+        // distribution-EXACT at temp>0, so temp>0 always routes through spec.
+        true
     }
 
     fn requires_greedy(&self) -> bool {
-        // Greedy required only when forced (`HIPFIRE_DDTREE_GREEDY_VERIFY=1`); both
-        // chain and tree-SWOR honor temp>0 distribution-correctly otherwise.
-        self.force_greedy_verify
+        // Chain and tree-SWOR both honor temp>0 distribution-correctly.
+        false
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
@@ -690,7 +672,6 @@ pub fn build_generic_dflash_speculator(
         block_size,
         ctx_capacity,
         tree: TreeMode::from_flags(&gpu.flags),
-        force_greedy_verify: gpu.flags.ddtree_greedy_verify,
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
     }))

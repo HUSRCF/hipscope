@@ -6360,7 +6360,7 @@ fn generate(
         } else if user_explicit_sampling {
             "request set an explicit top_p/top_k/min_p/penalty (SWOR spec honors temperature only); AR applies them"
         } else {
-            "ddtree SWOR verify not active (needs ddtree_budget>0, no path_c, no HIPFIRE_DDTREE_GREEDY_VERIFY=1)"
+            "ddtree SWOR verify not active (needs ddtree_budget>0, no path_c)"
         };
         eprintln!(
             "[hipfire] id={id}: temp>0 DFlash ddtree spec disabled -> AR ({reason}). Temperature honored; spec speedup off."

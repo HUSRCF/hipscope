@@ -432,18 +432,6 @@ fn ddtree_logw_cutoff() -> f32 {
     }
 }
 
-/// Parse HIPFIRE_DDTREE_MINNODES — the node-count floor for the banded DDTree
-/// build (`build_ddtree_tree_bounded`). Places at least this many
-/// highest-probability nodes before the logw cutoff is allowed to prune,
-/// capped at `budget`. 0 / unset reproduces the historical pure-cutoff build
-/// byte-for-byte (the wrapper delegates with min_nodes=0).
-fn ddtree_min_nodes() -> usize {
-    std::env::var("HIPFIRE_DDTREE_MINNODES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
 /// DDTree meta-verifier pruner telemetry: per-cycle tree-size histogram.
 /// `cycle_count` = cycles observed; `total_nodes` = sum of tree.num_nodes()
 /// across cycles; `max_nodes` / `min_nodes` = range observed.
@@ -4514,7 +4502,7 @@ pub fn spec_step_ddtree(
         &top_log_probs,
         b - 1,
         tree_topk,
-        ddtree_min_nodes(),
+        0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
         ddtree_logw_cutoff(),
     );
@@ -4815,15 +4803,9 @@ pub fn spec_step_ddtree_batched(
     // Verify-scheme selector. HIPFIRE_DDTREE_VERIFY: swor (DEFAULT — q-exploiting
     // Sequoia/SpecTr, distribution-exact, the broad-sweep perf winner) | naive
     // (simpler distribution-preserving fallback). SWOR drives the device Gumbel-
-    // SWOR draft sampler below. HIPFIRE_DDTREE_GREEDY_VERIFY=1 forces the greedy
-    // argmax walk (NOT temperature-correct — diagnostic/A-B only).
-    let force_greedy_verify = std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let use_swor = temp > 0.0
-        && !force_greedy_verify
-        && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() != Some("naive");
+    // SWOR draft sampler below.
+    let use_swor =
+        temp > 0.0 && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() != Some("naive");
 
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
@@ -4865,7 +4847,7 @@ pub fn spec_step_ddtree_batched(
         &top_log_probs,
         b - 1,
         tree_topk,
-        ddtree_min_nodes(),
+        0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
         ddtree_logw_cutoff(),
     );
@@ -5005,11 +4987,11 @@ pub fn spec_step_ddtree_batched(
     let t_pre_verify = t_all.elapsed();
     // temp > 0 needs the full per-slot target logits for naive tree sampling;
     // greedy keeps the cheap GPU-argmax + 4·B D2H.
-    // `force_greedy_verify` / `use_swor` were resolved before the draft (the
-    // draft sampler keys off `use_swor`). Only NAIVE needs the host download of
-    // the full logits; SWOR reads them on-device (verify_scratch.logits) in the
-    // fused kernel, so it skips the B×vocab D2H.
-    let want_full_logits = temp > 0.0 && !force_greedy_verify && !use_swor;
+    // `use_swor` was resolved before the draft (the draft sampler keys off it).
+    // Only NAIVE needs the host download of the full logits; SWOR reads them
+    // on-device (verify_scratch.logits) in the fused kernel, so it skips the
+    // B×vocab D2H.
+    let want_full_logits = temp > 0.0 && !use_swor;
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -5556,7 +5538,7 @@ pub fn spec_step_ddtree_path_c(
         &top_log_probs,
         b - 1,
         tree_topk,
-        ddtree_min_nodes(),
+        0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
         ddtree_logw_cutoff(),
     );
