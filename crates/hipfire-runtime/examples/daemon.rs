@@ -6350,7 +6350,7 @@ fn generate(
     // specific config reason so an operator can see why the spec speedup is off.
     if temp > 1e-6
         && m.speculator.is_some()
-        && (m.arch_id == 5 || m.arch_id == 6)
+        && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
         && !temp_spec_ok
         && !budgeted_thinking_needs_ar
         && !force_ar_chat

@@ -408,6 +408,68 @@ pub fn follow_verified_tree(tree: &DdTree, posterior: &[u32]) -> (Vec<usize>, u3
     (accepted, next_token)
 }
 
+/// SpecInfer NAIVE-sampling acceptance for a LINEAR (chain) DFlash block —
+/// distribution-EXACT at any temperature.
+///
+/// `logits_per_pos` is the target's full per-position logits, row-major
+/// `[(depth + 1) × vocab]`, where `depth = drafts.len()`: row `i` is the
+/// target distribution at block position `i` (the prediction after the prefix
+/// `[seed, drafts[0..i]]`). `drafts[i]` is the draft's token at position `i`.
+///
+/// At each position `i` draw `x_i ~ softmax(logits_i / temp)` (the argmax when
+/// `temp <= 0`). Accept the longest prefix where `drafts[i] == x_i`; the first
+/// mismatch's `x_i` is the bonus. If every draft is accepted, the bonus is the
+/// target draw at the final row `depth`. Because every emitted token (the
+/// accepted drafts AND the bonus) is a genuine draw from the target
+/// distribution, the output marginal equals `softmax(logits/temp)` EXACTLY — no
+/// rejection ratio, no dependence on the draft probabilities (the draft only
+/// affects HOW MANY target draws get reused, i.e. acceptance length, not WHAT is
+/// emitted). The biased `min(1, p/q)` rejection rule is NOT used (and is only
+/// justified for top-k trees, not this chain).
+///
+/// At `temp <= 0` this reduces EXACTLY to greedy accept (`accept_greedy_prefix`
+/// against the per-position argmax): each draw is the row argmax, so the
+/// accepted prefix and bonus are the target's own greedy continuation.
+///
+/// Returns `(accepted, bonus)`: `accepted` is the number of accepted drafts
+/// (`0..=depth`) and `bonus` is the target draw at the divergence position.
+/// Threads the SAME `rng_state` (xorshift, bit-compatible with the qwen35 spec
+/// sampler) so the sampler is deterministic given a seed.
+pub fn naive_sample_chain(
+    logits_per_pos: &[f32],
+    drafts: &[u32],
+    vocab: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (usize, u32) {
+    let depth = drafts.len();
+    debug_assert_eq!(logits_per_pos.len(), (depth + 1) * vocab);
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+    for i in 0..=depth {
+        let row = &logits_per_pos[i * vocab..(i + 1) * vocab];
+        let x: u32 = if temp > 0.0 {
+            softmax_temp_into(row, temp, &mut p);
+            let u = xorshift_unit(rng_state);
+            sample_unnormalized(&p, u)
+        } else {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (t, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = t;
+                }
+            }
+            bi as u32
+        };
+        // At the final row there is no draft to match — `x` is always the bonus.
+        if i == depth || drafts[i] != x {
+            return (i, x);
+        }
+    }
+    unreachable!("naive_sample_chain loop always returns at i == depth");
+}
+
 /// Xorshift64* → uniform [0, 1). Bit-compatible with the qwen35 spec sampler's
 /// RNG (`speculative::xorshift_next_unit`) so the tree accept walk is
 /// deterministic given a seed and consistent with the linear DFlash path.
@@ -1223,6 +1285,80 @@ mod tests {
         let (acc_s, bonus_s) = sample_verified_tree(&tree, &logits, vocab, 0.0, &mut rng);
         assert_eq!(acc_g, acc_s, "accepted path diverged at temp=0");
         assert_eq!(bonus_g, bonus_s, "bonus diverged at temp=0");
+    }
+
+    // ── Chain naive-sampling (linear DFlash temp>0) ─────────────────────────
+
+    #[test]
+    fn naive_sample_chain_temp0_is_argmax() {
+        // temp <= 0 ⇒ each position's draw is the row argmax, so the accept walk
+        // is identical to greedy accept_greedy_prefix against the argmax. Here the
+        // draft matches the argmax at position 0 (token 2) but not position 1
+        // (argmax 4 ≠ draft 1) ⇒ accept 1, bonus = argmax at pos 1 = 4.
+        let vocab = 6usize;
+        let drafts = [2u32, 1];
+        let mut logits = vec![0.0f32; (drafts.len() + 1) * vocab];
+        logits[0 * vocab + 2] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
+        logits[1 * vocab + 4] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
+        logits[2 * vocab + 5] = 10.0; // pos 2 argmax = 5 (unused)
+        let mut rng = 0x1u64;
+        let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, &mut rng);
+        assert_eq!(accepted, 1);
+        assert_eq!(bonus, 4);
+
+        // Full accept: both drafts equal the argmax ⇒ accept 2, bonus = argmax at
+        // the final row (pos 2) = 5.
+        let drafts_full = [2u32, 4];
+        let (acc_f, bonus_f) = naive_sample_chain(&logits, &drafts_full, vocab, 0.0, &mut rng);
+        assert_eq!(acc_f, 2);
+        assert_eq!(bonus_f, 5);
+    }
+
+    #[test]
+    fn naive_sample_chain_preserves_target_distribution() {
+        // Monte-Carlo distribution fidelity exercising the ACTUAL shipped RNG path
+        // (xorshift_unit + softmax_temp_into + sample_unnormalized) — per memory,
+        // the RNG is the thing that silently reintroduces bias, so the test must
+        // run the real sampler, not an injected host sampler.
+        //
+        // Setup: a depth-1 chain (one draft) whose draft token is NOT the target
+        // mode, so the position-0 emitted token (accept ? draft : bonus) is purely
+        // a target draw. Its marginal must equal softmax(logits_0 / temp) EXACTLY
+        // within MC noise, at every temperature.
+        let vocab = 6usize;
+        // Distinct, non-degenerate target logits per temperature scaling.
+        let logits0 = [2.0f32, 0.5, -1.0, 1.2, 0.0, 0.8];
+        // Draft token 4 (a middling-prob token), deliberately != most argmaxes.
+        let draft = 4u32;
+        let mut full = vec![0.0f32; 2 * vocab];
+        full[..vocab].copy_from_slice(&logits0);
+        // Row 1 (bonus-on-full-accept) — arbitrary; only reached when draft accepted.
+        full[vocab..].copy_from_slice(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            // Reference marginal: softmax(logits0 / temp).
+            let target = softmax_temp(&logits0, temp);
+
+            let n_runs = 200_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0xC0FFEE_1234_5678_u64 ^ ((temp.to_bits() as u64) << 8);
+            for _ in 0..n_runs {
+                let (accepted, bonus) = naive_sample_chain(&full, &[draft], vocab, temp, &mut rng);
+                // Position-0 emitted token = accepted draft (if accept) else bonus.
+                let emitted = if accepted >= 1 { draft } else { bonus };
+                hist[emitted as usize] += 1;
+            }
+            let mut tv = 0.0f64;
+            for t in 0..vocab {
+                let emp = hist[t] as f64 / n_runs as f64;
+                tv += (emp - target[t] as f64).abs();
+            }
+            tv *= 0.5;
+            assert!(
+                tv < 0.01,
+                "naive chain sampling must preserve the target distribution at temp={temp}; TV={tv:.4} hist={hist:?}"
+            );
+        }
     }
 
     #[test]

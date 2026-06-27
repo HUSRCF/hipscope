@@ -156,6 +156,40 @@ impl SpecTarget for LlamaBundle {
         .map_err(|e| format!("{e:?}"))
     }
 
+    fn verify_block_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<LlamaSpecScratch>()
+            .ok_or("verify_block_logits: scratch is not LlamaSpecScratch")?;
+        let extract = &self.dflash_extract_layers;
+        let mut sink = match hidden_out {
+            Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
+                extract_layers: extract,
+                hidden: h,
+            }),
+            _ => None,
+        };
+        hipfire_runtime::llama_spec::verify_block_logits(
+            gpu,
+            &self.weights,
+            &self.config,
+            block,
+            position,
+            &mut self.kv,
+            &self.scratch,
+            &s.pbs,
+            sink.as_mut(),
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
+
     fn commit_prefix(
         &mut self,
         _gpu: &mut Gpu,

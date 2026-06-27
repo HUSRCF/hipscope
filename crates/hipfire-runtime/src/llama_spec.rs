@@ -46,9 +46,68 @@ pub fn verify_block_argmax(
     pbs: &PrefillBatchScratch,
     capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<u32>> {
+    verify_block_logits_or_argmax(
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, false,
+    )
+    .map(|VerifyOut { argmax, .. }| argmax)
+}
+
+/// Like [`verify_block_argmax`] but returns the FULL per-position target logits
+/// (`block.len() × vocab_size`, row-major) instead of just the argmax. Used by
+/// the temp>0 chain DFlash path (SpecInfer naive sampling draws from the per-
+/// position target distribution rather than taking the argmax). The logits are
+/// bit-identical to those `verify_block_argmax` argmaxes internally — both go
+/// through the same single batched forward + per-row `rmsnorm + lm_head`.
+pub fn verify_block_logits(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    block: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<Vec<f32>> {
+    verify_block_logits_or_argmax(
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true,
+    )
+    .map(|VerifyOut { logits, .. }| logits)
+}
+
+/// Output of the shared verify forward: per-position argmax always; full logits
+/// only when `want_logits` was set (else empty).
+struct VerifyOut {
+    argmax: Vec<u32>,
+    logits: Vec<f32>,
+}
+
+/// Shared body for [`verify_block_argmax`] / [`verify_block_logits`]: one batched
+/// forward over `block`, then per-row `rmsnorm + lm_head`. When `want_logits` the
+/// full per-row logits are collected; the argmax is always returned (cheap CPU
+/// scan over the already-downloaded row).
+#[allow(clippy::too_many_arguments)]
+fn verify_block_logits_or_argmax(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    block: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    capture: Option<&mut HiddenCaptureSink>,
+    want_logits: bool,
+) -> HipResult<VerifyOut> {
     let n = block.len();
     let dim = config.dim;
+    let vocab = config.vocab_size;
     let mut out = Vec::with_capacity(n);
+    let mut logits_out: Vec<f32> = if want_logits {
+        Vec::with_capacity(n * vocab)
+    } else {
+        Vec::new()
+    };
 
     const MIN_BATCH: usize = 4;
     let arch = gpu.arch.as_str();
@@ -73,7 +132,7 @@ pub fn verify_block_argmax(
     // fallback below does not run the capturing per-layer loop.
     assert!(
         eligible || capture.is_none(),
-        "verify_block_argmax: hidden capture requested but block is ineligible \
+        "verify_block: hidden capture requested but block is ineligible \
          for the batched path (n={n}, kv_ok={kv_ok}, weights_ok={weights_ok})"
     );
 
@@ -104,16 +163,27 @@ pub fn verify_block_argmax(
                 config.norm_eps,
             )?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-            out.push(argmax(&gpu.download_f32(&scratch.logits)?));
+            let row = gpu.download_f32(&scratch.logits)?;
+            out.push(argmax(&row));
+            if want_logits {
+                logits_out.extend_from_slice(&row);
+            }
         }
     } else {
         for (i, &tok) in block.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
-            out.push(argmax(&gpu.download_f32(&scratch.logits)?));
+            let row = gpu.download_f32(&scratch.logits)?;
+            out.push(argmax(&row));
+            if want_logits {
+                logits_out.extend_from_slice(&row);
+            }
         }
     }
-    Ok(out)
+    Ok(VerifyOut {
+        argmax: out,
+        logits: logits_out,
+    })
 }
 
 /// Apply the target lm_head (final-norm + output projection) to `n` rows of

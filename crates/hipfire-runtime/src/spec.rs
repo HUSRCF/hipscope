@@ -296,6 +296,31 @@ pub trait SpecTarget {
         Err("target does not expose lm_head over hidden".into())
     }
 
+    /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
+    /// target logits (`block.len() × vocab`, row-major) instead of the per-position
+    /// argmax. Used by the temp>0 chain DFlash path, which draws `x ~
+    /// softmax(logits_i / temp)` per position (distribution-exact SpecInfer naive
+    /// sampling) rather than taking the argmax.
+    ///
+    /// Same contract as `verify_block` otherwise: snapshots whatever
+    /// [`commit_prefix`](Self::commit_prefix) needs *before* advancing, leaves
+    /// target state advanced by `block.len()`, and captures per-extract-layer
+    /// residual hidden into `hidden_out` when `Some` and
+    /// [`dflash_extract_layers`](Self::dflash_extract_layers) is `Some`.
+    ///
+    /// Returns `Err` by default; implemented for the llama/qwen3 family (which
+    /// already computes these logits internally before argmax-ing them).
+    fn verify_block_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose verify_block_logits".into())
+    }
+
     /// Look up the target's embedding row for `token_id`, dequantized to F32
     /// (length `dim`). The generic DFlash drafter needs this to build the
     /// mask-token "noise" embedding it broadcasts across the masked block
