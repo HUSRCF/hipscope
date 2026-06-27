@@ -80,22 +80,11 @@ struct TreeMode {
 }
 
 impl TreeMode {
-    fn from_env() -> Self {
-        let enabled = std::env::var("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1");
-        let budget = std::env::var("HIPFIRE_DDTREE_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&b| b > 0)
-            .unwrap_or(DEFAULT_TREE_BUDGET);
-        let topk = std::env::var("HIPFIRE_DDTREE_TOPK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&k| k >= 1)
-            .unwrap_or(DEFAULT_TREE_TOPK);
+    fn from_flags(flags: &rdna_compute::FeatureFlags) -> Self {
         TreeMode {
-            enabled,
-            budget,
-            topk,
+            enabled: flags.dflash_tree,
+            budget: flags.ddtree_budget.unwrap_or(DEFAULT_TREE_BUDGET),
+            topk: flags.ddtree_topk.unwrap_or(DEFAULT_TREE_TOPK),
         }
     }
 }
@@ -700,8 +689,8 @@ pub fn build_generic_dflash_speculator(
         verify_scratch: Some(verify_scratch),
         block_size,
         ctx_capacity,
-        tree: TreeMode::from_env(),
-        force_greedy_verify: std::env::var("HIPFIRE_DDTREE_GREEDY_VERIFY").as_deref() == Ok("1"),
+        tree: TreeMode::from_flags(&gpu.flags),
+        force_greedy_verify: gpu.flags.ddtree_greedy_verify,
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
     }))
