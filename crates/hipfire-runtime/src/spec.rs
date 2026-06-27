@@ -295,6 +295,25 @@ pub trait SpecTarget {
     ) -> Result<Vec<f32>, String> {
         Err("target does not expose lm_head over hidden".into())
     }
+
+    /// Look up the target's embedding row for `token_id`, dequantized to F32
+    /// (length `dim`). The generic DFlash drafter needs this to build the
+    /// mask-token "noise" embedding it broadcasts across the masked block
+    /// positions ([`crate::dflash_generic`]). Returns `Err` by default;
+    /// implemented for the llama/qwen3 family (which exposes `token_embd`).
+    fn embed_row(&mut self, _gpu: &mut Gpu, _token_id: u32) -> Result<Vec<f32>, String> {
+        Err("target does not expose embed_row".into())
+    }
+
+    /// Configure which residual-hidden layer indices the target captures into
+    /// the `hidden_out` sink of [`spec_advance`](Self::spec_advance) /
+    /// [`verify_block`](Self::verify_block). The generic DFlash drafter calls
+    /// this at build time with its own `target_layer_ids` so capture matches
+    /// the drafter's `fc` expectation. Default no-op for targets that cannot
+    /// feed a hidden-conditioned drafter (their `dflash_extract_layers` stays
+    /// `None`). This is the arch-free route that lets [`crate::dflash_generic`]
+    /// set extract layers without naming a concrete bundle type.
+    fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 }
 
 /// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched

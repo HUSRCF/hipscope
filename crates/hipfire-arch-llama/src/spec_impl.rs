@@ -211,4 +211,30 @@ impl SpecTarget for LlamaBundle {
             Some(&self.dflash_extract_layers)
         }
     }
+
+    fn set_dflash_extract_layers(&mut self, layers: Vec<usize>) {
+        // Delegate to the inherent setter (sorts + dedups ascending) so the
+        // generic DFlash drafter can configure capture layers without naming
+        // the concrete `LlamaBundle` type.
+        LlamaBundle::set_dflash_extract_layers(self, layers);
+    }
+
+    fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
+        // Look up one embedding row into the per-token scratch `x` (`[dim]` F32),
+        // dispatching on the table's storage format, then download to host. Used
+        // by the generic DFlash drafter to build its mask-token noise embedding.
+        let dim = self.config.dim;
+        let dst = self.scratch.x.sub_offset(0, dim);
+        llama::embedding_lookup_dispatch(
+            gpu,
+            self.weights.embd_format,
+            &self.weights.token_embd,
+            &dst,
+            token_id,
+            dim,
+        )
+        .map_err(|e| format!("LlamaBundle::embed_row: {e:?}"))?;
+        gpu.download_f32(&dst)
+            .map_err(|e| format!("LlamaBundle::embed_row download: {e:?}"))
+    }
 }
