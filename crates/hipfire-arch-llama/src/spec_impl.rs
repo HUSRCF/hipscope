@@ -77,15 +77,20 @@ impl SpecTarget for LlamaBundle {
         // missing → no capture (the `_hidden_out` ignored default of Task 1).
         let extract = self.dflash_extract_layers.clone();
         let want_capture = !extract.is_empty() && hidden_out.is_some();
-        let chunk_max = llama::PREFILL_MAX_BATCH;
-        let mut off = 0usize;
-        let mut pos = start_pos;
-        while off < tokens.len() {
+        // GREEDY-EQUIVALENCE: prefill the prompt token-by-token through the SAME
+        // decode kernel AR uses (`forward_scratch_compute`), not the batched
+        // prefill kernel. The batched and per-token forwards are not bitwise
+        // equal; on a near-tie logit the batched path's KV flips the verifier's
+        // argmax off AR's greedy pick (bielik/code diverged at token 2: pos 261
+        // logit gap 15.93 vs 15.88). Matching AR's per-token prefill restores
+        // token-identical greedy spec decode. Per-token capture appends one
+        // position's `num_extract × dim` residual per call (extract order).
+        for (i, &tok) in tokens.iter().enumerate() {
             if abort() {
                 self.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
-            let end = (off + chunk_max).min(tokens.len());
+            let pos = start_pos + i;
             let mut sink = if want_capture {
                 Some(llama::HiddenCaptureSink {
                     extract_layers: &extract,
@@ -94,22 +99,21 @@ impl SpecTarget for LlamaBundle {
             } else {
                 None
             };
-            llama::forward_prefill_batch_capture(
+            llama::forward_scratch_embed(gpu, &self.weights, &self.config, tok, pos, &self.scratch)
+                .map_err(|e| format!("{e:?}"))?;
+            llama::forward_scratch_compute_capture(
                 gpu,
                 &self.weights,
                 &self.config,
-                &tokens[off..end],
                 pos,
                 &mut self.kv,
                 &self.scratch,
-                None,
                 sink.as_mut(),
             )
             .map_err(|e| format!("{e:?}"))?;
-            pos += end - off;
-            off = end;
         }
-        // forward_prefill_batch leaves last-row logits in scratch.logits.
+        // The last per-token forward_scratch_compute leaves the final token's
+        // logits in scratch.logits.
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| format!("{e:?}"))?;

@@ -4325,10 +4325,37 @@ pub fn forward_scratch_compute(
     kv_cache: &mut KvCache,
     scratch: &ForwardScratch,
 ) -> HipResult<()> {
+    forward_scratch_compute_capture(gpu, weights, config, pos, kv_cache, scratch, None)
+}
+
+/// `forward_scratch_compute` plus an optional per-extract-layer residual-hidden
+/// capture sink. Processes ONE token (decode kernel — bit-identical to AR's
+/// `forward_scratch`), and for each decoder layer whose index appears in
+/// `capture.extract_layers` downloads the post-FFN residual (`scratch.x[..dim]`)
+/// and appends, in `extract_layers` ascending order, `num_extract × dim` f32 to
+/// the sink. This is the per-token twin of `forward_prefill_batch_capture`'s
+/// capture; used by the DFlash spec prefill so the speculator conditions on the
+/// EXACT residual stream AR's per-token prefill produces (greedy-equivalence —
+/// the batched prefill kernel is not bitwise-equal to the decode kernel and
+/// flips argmax at near-tie logits).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_compute_capture(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    mut capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;
     let kv_dim = n_kv_heads * head_dim;
+    let dim = config.dim;
+    // Per-token capture appends rows in extract-layer ASCENDING order, matching
+    // forward_prefill_batch_capture's layout for n=1 (one position per call).
+    let mut cap_rows: Vec<Vec<f32>> = Vec::new();
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -4625,6 +4652,29 @@ pub fn forward_scratch_compute(
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
         weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+
+        // DFlash per-token capture: download this layer's post-FFN residual
+        // (`scratch.x[..dim]`) if it is an extract layer. Same point as the
+        // batched capture (post-FFN residual, before next attn_norm).
+        if let Some(cap) = capture.as_deref() {
+            if cap.extract_layers.contains(&layer_idx) {
+                let row = scratch.x.sub_offset(0, dim);
+                cap_rows.push(gpu.download_f32(&row)?);
+            }
+        }
+    }
+
+    if let Some(cap) = capture.as_deref_mut() {
+        debug_assert_eq!(
+            cap_rows.len(),
+            cap.extract_layers.len(),
+            "captured {} layers but extract_layers has {}",
+            cap_rows.len(),
+            cap.extract_layers.len()
+        );
+        for layer_rows in cap_rows.iter() {
+            cap.hidden.extend_from_slice(&layer_rows[..dim]);
+        }
     }
 
     gpu.rmsnorm_f32(
