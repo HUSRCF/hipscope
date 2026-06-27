@@ -6564,7 +6564,21 @@ fn generate(
     // `SpecTarget`) routes to the arch-generic spec loop, exactly like llama
     // (0/1). Without a speculator it falls through to the plain qwen2 decode
     // short-circuit below.
-    if m.arch_id == 7 && m.speculator.is_some() {
+    // The n-gram ChainSpeculator on arch 7/10/11/12 is greedy-only: `build_speculator`
+    // sets `samples=true` only for arch 5/6 (spec_build.rs), so `requires_greedy()` is
+    // true and `verify_block()` decodes argmax regardless of the requested temp. Gate
+    // each spec short-circuit the same way the qwen35/llama DFlash route is gated
+    // (~7042): route into the spec loop only when greedy (temp<=1e-6) OR the loaded
+    // drafter genuinely samples; a temp>0 request on a greedy-only drafter falls
+    // through to the arch's AR path below (faithful sampling) instead of being
+    // silently decoded greedy. Future-proof: a sampling-capable drafter on these
+    // arches auto-enables the temp>0 route with no further change.
+    let ngram_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
+    if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6586,8 +6600,8 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // request temp (spec greedy-only today; #477-merge note)
-            top_p, // nucleus cutoff (pinned-disabled in spec until re-wire)
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
         );
@@ -6681,7 +6695,7 @@ fn generate(
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
-    if m.arch_id == 11 && m.speculator.is_some() {
+    if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6703,8 +6717,8 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // request temp (spec greedy-only today; #477-merge note)
-            top_p, // nucleus cutoff (pinned-disabled in spec until re-wire)
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
         );
@@ -6746,7 +6760,7 @@ fn generate(
     // state machine + empty-turn / think-budget generation guards) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
-    if m.arch_id == 12 && m.speculator.is_some() {
+    if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6768,8 +6782,8 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // request temp (spec greedy-only today; #477-merge note)
-            top_p, // nucleus cutoff (pinned-disabled in spec until re-wire)
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
         );
@@ -6809,7 +6823,7 @@ fn generate(
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
-    if m.arch_id == 10 && m.speculator.is_some() {
+    if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6831,8 +6845,8 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // request temp (spec greedy-only today; #477-merge note)
-            top_p, // nucleus cutoff (pinned-disabled in spec until re-wire)
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
         );
@@ -6946,10 +6960,10 @@ fn generate(
     // bonus is drawn from the renormalized residual (no longer the lossy
     // un-truncated / sample_top_p(trunk) posture). Gating:
     //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
-    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`
-    //     AND the request honors temp+top_p only. A top_k/min_p request falls
-    //     through to DFlash/AR (the MTP sampled path is nucleus-only, mirroring
-    //     the DFlash sampled gate's top_k/min_p carve-out).
+    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
+    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
+    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
+    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
     // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
     // through to DFlash (lossless sampled-spec) or AR exactly as before.
     let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
@@ -6957,12 +6971,12 @@ fn generate(
     // Sampled MTP honors temp + top_p + top_k: the residual-accept sampler
     // applies the SAME top_k+top_p nucleus to BOTH the draft and target sides
     // (see mtp_sampled_accept / the draft truncation), so it stays lossless ==
-    // AR-at-(top_k,top_p). min_p is the only sampling knob still unimplemented
-    // on this path, so a min_p-constrained request routes to AR/DFlash. top_k
-    // flows through to generate_qwen35_mtp below and on into the nuclei — this
-    // is what lets a model whose card recommends top_k (qwen3.6 A3B ships
-    // top_k=20) keep its recipe AND get the MTP speedup, instead of either
-    // silently dropping top_k or losing MTP.
+    // AR-at-(top_k,top_p). min_p is ALSO plumbed through (min_p.unwrap_or(0.0)
+    // below → generate_qwen35_mtp → the mtp_spec min_p cutoff) and honored, not
+    // carved out. top_k + min_p flow through to generate_qwen35_mtp below and on
+    // into the nuclei — this is what lets a model whose card recommends top_k
+    // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
+    // instead of silently dropping top_k/min_p or losing MTP.
     if qwen_mtp_opt_in
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)

@@ -1291,6 +1291,18 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
+    // Host-side metadata work (chat template + author-recommended sampling) BEFORE
+    // any GPU allocation / EP hipGraph capture. `recommended_sampling()` reparses
+    // the .hfq metadata_json (serde_json::from_str); doing that post-allocation but
+    // pre-capture churns the host heap and — on gfx12 / ROCm 7.2, which snapshots
+    // buffer addresses at graph-instantiate — slows the captured EP-decode graph
+    // replay. Same regression as load_model (gfx12 A3B 99→50), mirrored here for the
+    // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
+    // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
+    // captures + engages; this only settles the heap before it instantiates.
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+
     let gpus =
         Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
@@ -1359,8 +1371,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             1
         }
     };
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
+    // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
@@ -1396,6 +1407,18 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
     let arch_id = hfq.arch_id;
     let n_exp = config.num_local_experts;
+
+    // Host-side metadata work (chat template + author-recommended sampling) BEFORE
+    // any GPU allocation / EP hipGraph capture. `recommended_sampling()` reparses
+    // the .hfq metadata_json (serde_json::from_str); doing that post-allocation but
+    // pre-capture churns the host heap and — on gfx12 / ROCm 7.2, which snapshots
+    // buffer addresses at graph-instantiate — slows the captured EP-decode graph
+    // replay. Same regression as load_model (gfx12 A3B 99→50), mirrored here for the
+    // minimax EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP
+    // graph itself (minimax forward.rs begin_graph_capture) is untouched — it still
+    // captures + engages; this only settles the heap before it instantiates.
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
 
     let gpus =
         Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
@@ -1470,8 +1493,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             .or_else(|| try_one("<|endoftext|>"))
             .unwrap_or(1)
     };
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
+    // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
