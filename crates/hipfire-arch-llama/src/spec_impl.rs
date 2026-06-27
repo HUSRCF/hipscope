@@ -65,13 +65,18 @@ impl SpecTarget for LlamaBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
-        _hidden_out: Option<&mut Vec<f32>>,
+        mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Pure attention: "reset" just rewinds the eviction offset; the prefill
         // forward overwrites KV at the absolute positions it writes.
         if reset {
             self.kv.compact_offset = 0;
         }
+        // DFlash hidden capture: only when the drafter configured extract layers
+        // AND the caller passed a sink. The two together form the gate; either
+        // missing → no capture (the `_hidden_out` ignored default of Task 1).
+        let extract = self.dflash_extract_layers.clone();
+        let want_capture = !extract.is_empty() && hidden_out.is_some();
         let chunk_max = llama::PREFILL_MAX_BATCH;
         let mut off = 0usize;
         let mut pos = start_pos;
@@ -81,7 +86,15 @@ impl SpecTarget for LlamaBundle {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (off + chunk_max).min(tokens.len());
-            llama::forward_prefill_batch(
+            let mut sink = if want_capture {
+                Some(llama::HiddenCaptureSink {
+                    extract_layers: &extract,
+                    hidden: hidden_out.as_deref_mut().unwrap(),
+                })
+            } else {
+                None
+            };
+            llama::forward_prefill_batch_capture(
                 gpu,
                 &self.weights,
                 &self.config,
@@ -90,6 +103,7 @@ impl SpecTarget for LlamaBundle {
                 &mut self.kv,
                 &self.scratch,
                 None,
+                sink.as_mut(),
             )
             .map_err(|e| format!("{e:?}"))?;
             pos += end - off;
@@ -110,12 +124,20 @@ impl SpecTarget for LlamaBundle {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
-        _hidden_out: Option<&mut Vec<f32>>,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let s = scratch
             .as_any_mut()
             .downcast_mut::<LlamaSpecScratch>()
             .ok_or("verify_block: scratch is not LlamaSpecScratch")?;
+        let extract = &self.dflash_extract_layers;
+        let mut sink = match hidden_out {
+            Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
+                extract_layers: extract,
+                hidden: h,
+            }),
+            _ => None,
+        };
         hipfire_runtime::llama_spec::verify_block_argmax(
             gpu,
             &self.weights,
@@ -125,6 +147,7 @@ impl SpecTarget for LlamaBundle {
             &mut self.kv,
             &self.scratch,
             &s.pbs,
+            sink.as_mut(),
         )
         .map_err(|e| format!("{e:?}"))
     }
@@ -152,5 +175,13 @@ impl SpecTarget for LlamaBundle {
 
     fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
         Some(&mut self.kv)
+    }
+
+    fn dflash_extract_layers(&self) -> Option<&[usize]> {
+        if self.dflash_extract_layers.is_empty() {
+            None
+        } else {
+            Some(&self.dflash_extract_layers)
+        }
     }
 }

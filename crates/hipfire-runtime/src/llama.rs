@@ -1902,6 +1902,29 @@ pub fn upload_prefill_batch_inputs(
     Ok(())
 }
 
+/// Per-extract-layer residual-hidden capture sink for the batched llama
+/// forward (DFlash drafter conditioning, review finding M3).
+///
+/// When threaded through [`forward_prefill_batch`] / [`forward_prefill_chunk`]
+/// (and the verify path), the forward downloads the residual stream `x`
+/// (`[n × dim]`) AFTER each decoder layer whose index appears in
+/// `extract_layers`, and appends — per processed position, across the
+/// extract layers in `extract_layers` order — `extract_layers.len() × dim`
+/// f32 to `hidden`. The final `hidden` buffer is therefore
+/// `[n_pos × num_extract × dim]` row-major, matching the
+/// `dflash::draft_forward` `target_hidden` row layout.
+///
+/// `extract_layers` MUST be in ascending order (the caller's
+/// `dflash::DflashConfig::target_layer_ids` convention). Capture is at the
+/// post-layer residual, independent of qk-norm (qk-norm acts on Q/K, not the
+/// residual).
+pub struct HiddenCaptureSink<'a> {
+    /// Decoder-layer indices to capture, ascending order.
+    pub extract_layers: &'a [usize],
+    /// Output sink: appended `[n_pos × num_extract × dim]` row-major.
+    pub hidden: &'a mut Vec<f32>,
+}
+
 /// Process `tokens` through the model with one batched forward, advancing
 /// `kv_cache` by `tokens.len()` positions and writing the *last* token's
 /// logits into `scratch.logits`.
@@ -1925,6 +1948,27 @@ pub fn forward_prefill_batch(
     scratch: &ForwardScratch,
     pbs_in: Option<&PrefillBatchScratch>,
 ) -> HipResult<()> {
+    forward_prefill_batch_capture(
+        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs_in, None,
+    )
+}
+
+/// `forward_prefill_batch` plus an optional per-extract-layer residual-hidden
+/// capture sink (DFlash drafter conditioning). The capture sink is only
+/// honored on the eligible batched path (the per-token fallback does not feed
+/// it — DFlash always uses the batched path for the prompts it conditions on).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capture(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mut capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
     let n = tokens.len();
     if n == 0 {
         return Ok(());
@@ -1947,6 +1991,16 @@ pub fn forward_prefill_batch(
     let eligible = !force_fallback && n >= MIN_BATCH && kv_ok && weights_ok;
 
     if !eligible {
+        // The per-token fallback does not run the batched per-layer loop that
+        // feeds the capture sink. DFlash always conditions on the batched path,
+        // so a capture request on an ineligible model is a usage error, not a
+        // silent no-op.
+        assert!(
+            capture.is_none(),
+            "forward_prefill_batch_capture: hidden capture requested but model \
+             is ineligible for the batched path (n={n}, kv_ok={kv_ok}, \
+             weights_ok={weights_ok}); DFlash requires the batched forward"
+        );
         for (i, &tok) in tokens.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
@@ -1981,6 +2035,7 @@ pub fn forward_prefill_batch(
             kv_cache,
             scratch,
             pbs,
+            capture.as_deref_mut(),
             false,
         )?;
         offset += chunk_n;
@@ -2076,7 +2131,7 @@ pub fn forward_prefill_batch_chunk_captured(
     );
 
     forward_prefill_chunk(
-        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true,
+        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, None, true,
     )
 }
 
@@ -2090,11 +2145,21 @@ fn forward_prefill_chunk(
     kv_cache: &mut KvCache,
     s: &ForwardScratch,
     pbs: &PrefillBatchScratch,
+    mut capture: Option<&mut HiddenCaptureSink>,
     pre_uploaded: bool,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+
+    // DFlash hidden capture: collect this chunk's per-extract-layer residual
+    // rows (`[n × dim]` each, in `extract_layers` order) into host buffers as
+    // the per-layer loop produces them, then interleave into the sink in
+    // position-major order at the end of the chunk (`[pos][layer][dim]`).
+    let mut cap_rows: Vec<Vec<f32>> = Vec::new();
+    if capture.is_some() {
+        cap_rows.reserve(capture.as_ref().unwrap().extract_layers.len());
+    }
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -2805,7 +2870,38 @@ fn forward_prefill_chunk(
             )?;
         }
 
+        // DFlash capture: if this layer is an extract layer, download its
+        // post-FFN residual rows (`pbs.x_batch[..n]`) to host. The residual
+        // stream here is the layer output BEFORE the next layer's attn_norm —
+        // exactly the conditioning the draft model's cross-attention consumes.
+        if let Some(cap) = capture.as_deref() {
+            if cap.extract_layers.contains(&layer_idx) {
+                let rows = pbs.x_batch.sub_offset(0, n * dim);
+                cap_rows.push(gpu.download_f32(&rows)?);
+            }
+        }
+
         let _ = kv_dim;
+    }
+
+    // Interleave the captured per-extract-layer rows into the sink in
+    // position-major order: for each position p, concat layer 0..L at p.
+    if let Some(cap) = capture.as_deref_mut() {
+        debug_assert_eq!(
+            cap_rows.len(),
+            cap.extract_layers.len(),
+            "captured {} layers but extract_layers has {}",
+            cap_rows.len(),
+            cap.extract_layers.len()
+        );
+        let num_extract = cap_rows.len();
+        cap.hidden.reserve(n * num_extract * dim);
+        for p in 0..n {
+            for layer_rows in cap_rows.iter() {
+                cap.hidden
+                    .extend_from_slice(&layer_rows[p * dim..(p + 1) * dim]);
+            }
+        }
     }
 
     Ok(())

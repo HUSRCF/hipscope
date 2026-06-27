@@ -10,6 +10,12 @@ pub struct LlamaBundle {
     pub weights: LlamaWeights,
     pub scratch: ForwardScratch,
     pub kv: KvCache,
+    /// Decoder-layer indices whose residual hidden states a hidden-conditioned
+    /// drafter (DFlash / EAGLE) wants captured, ascending order. Empty = no
+    /// capture (the `SpecTarget::dflash_extract_layers` default of `None`). The
+    /// speculator sets the real `target_layer_ids` via
+    /// [`LlamaBundle::set_dflash_extract_layers`].
+    pub dflash_extract_layers: Vec<usize>,
 }
 
 /// Build the LLaMA GPU bundle from an HFQ source.
@@ -47,5 +53,19 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         weights,
         scratch,
         kv,
+        dflash_extract_layers: Vec::new(),
     })
+}
+
+impl LlamaBundle {
+    /// Set the decoder-layer indices whose residual hidden states the
+    /// hidden-conditioned drafter wants captured (ascending order). The
+    /// speculator calls this with `dflash::DflashConfig::target_layer_ids`.
+    pub fn set_dflash_extract_layers(&mut self, layers: Vec<usize>) {
+        debug_assert!(
+            layers.windows(2).all(|w| w[0] < w[1]),
+            "dflash extract layers must be strictly ascending: {layers:?}"
+        );
+        self.dflash_extract_layers = layers;
+    }
 }

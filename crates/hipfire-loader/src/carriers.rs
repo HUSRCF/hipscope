@@ -574,6 +574,7 @@ impl Carrier for LlamaCarrier {
                     weights,
                     scratch,
                     kv,
+                    dflash_extract_layers: Vec::new(),
                 }
             }
         };

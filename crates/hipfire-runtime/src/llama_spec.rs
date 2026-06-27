@@ -9,8 +9,9 @@
 //! through `impl SpecTarget for LlamaBundle` (in `hipfire-arch-llama`).
 
 use crate::llama::{
-    argmax, forward_prefill_batch, forward_scratch_compute, forward_scratch_embed, is_batchable_la,
-    weight_gemv, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
+    argmax, forward_prefill_batch_capture, forward_scratch_compute, forward_scratch_embed,
+    is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig,
+    LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
 use rdna_compute::Gpu;
@@ -43,6 +44,7 @@ pub fn verify_block_argmax(
     kv_cache: &mut KvCache,
     scratch: &ForwardScratch,
     pbs: &PrefillBatchScratch,
+    capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<u32>> {
     let n = block.len();
     let dim = config.dim;
@@ -67,11 +69,20 @@ pub fn verify_block_argmax(
         && kv_ok
         && weights_ok;
 
+    // DFlash hidden capture only flows through the batched path; the per-token
+    // fallback below does not run the capturing per-layer loop.
+    assert!(
+        eligible || capture.is_none(),
+        "verify_block_argmax: hidden capture requested but block is ineligible \
+         for the batched path (n={n}, kv_ok={kv_ok}, weights_ok={weights_ok})"
+    );
+
     if eligible {
         // Single batched forward (n <= pbs.max_batch ⇒ one chunk) populates
         // pbs.x_batch with all n rows of post-final-layer hidden. Its own
-        // last-row lm_head is redundant here but cheap.
-        forward_prefill_batch(
+        // last-row lm_head is redundant here but cheap. `capture` (if Some)
+        // collects the per-extract-layer residual rows for DFlash conditioning.
+        forward_prefill_batch_capture(
             gpu,
             weights,
             config,
@@ -80,6 +91,7 @@ pub fn verify_block_argmax(
             kv_cache,
             scratch,
             Some(pbs),
+            capture,
         )?;
         for i in 0..n {
             let off_bytes = i * dim * 4;
