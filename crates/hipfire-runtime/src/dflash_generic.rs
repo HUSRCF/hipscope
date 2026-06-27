@@ -271,9 +271,7 @@ impl Speculator for GenericDflashSpeculator {
         let keep_elems = committed_block_hidden_elems(accepted, ne, h);
         self.target_hidden_host
             .extend_from_slice(&block_hidden[..keep_elems]);
-        // Keep the draft's incremental-upload cursor in sync with the new prefix
-        // length so the next draft_forward delta-uploads only the appended rows.
-        self.scratch.uploaded_target_hidden_rows = position + accepted + 1;
+        // draft_forward owns the uploaded_target_hidden_rows cursor (it delta-uploads the appended host rows next step); the generic path never scatters to GPU itself, so we must NOT set it here.
         debug_assert_eq!(
             self.target_hidden_host.len(),
             committed_host_len(position, accepted, ne, h),
