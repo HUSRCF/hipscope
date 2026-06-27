@@ -31,6 +31,7 @@
 //! milestone (M5), so [`requires_greedy`](Speculator::requires_greedy) is `true`
 //! and [`supports_temp_verify`](Speculator::supports_temp_verify) is `false`.
 
+use crate::ddtree::{build_ddtree_tree_bounded, topk_from_logits, DdTree};
 use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
@@ -40,6 +41,70 @@ use crate::spec::{
 };
 use rdna_compute::Gpu;
 use std::path::Path;
+
+/// Tree-verify defaults (overridable via `HIPFIRE_DDTREE_BUDGET` / `_TOPK`).
+const DEFAULT_TREE_BUDGET: usize = 8;
+const DEFAULT_TREE_TOPK: usize = 2;
+
+/// Resolved tree-mode policy, read once at build time from the environment.
+///
+/// `enabled` gates the whole arm (`HIPFIRE_DFLASH_TREE=1`). When off the
+/// speculator is byte-for-byte the original chain path. `budget` caps the tree
+/// node count (passed as `max_nodes` to [`build_ddtree_tree_bounded`]); `topk`
+/// is the per-position breadth (the second dim of the top-K marginal arrays).
+#[derive(Debug, Clone, Copy)]
+struct TreeMode {
+    enabled: bool,
+    budget: usize,
+    topk: usize,
+}
+
+impl TreeMode {
+    fn from_env() -> Self {
+        let enabled = std::env::var("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1");
+        let budget = std::env::var("HIPFIRE_DDTREE_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(DEFAULT_TREE_BUDGET);
+        let topk = std::env::var("HIPFIRE_DDTREE_TOPK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(DEFAULT_TREE_TOPK);
+        TreeMode {
+            enabled,
+            budget,
+            topk,
+        }
+    }
+}
+
+/// Enumerate every root-to-leaf path of a DDTree as a list of node-index chains
+/// (root-exclusive, root→leaf order). One chain per leaf. Mirrors the qwen35
+/// `speculative::enumerate_paths` reference; duplicated here because it is
+/// crate-private there and the logic (leaf detection + parent walk) is trivial.
+/// An empty tree yields one empty path (the seed-only window).
+fn enumerate_tree_paths(tree: &DdTree) -> Vec<Vec<usize>> {
+    if tree.nodes.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut paths: Vec<Vec<usize>> = Vec::new();
+    for leaf in 0..tree.nodes.len() {
+        // A node is a leaf iff no other node lists it as parent.
+        if tree.child_maps[leaf + 1].is_empty() {
+            let mut path: Vec<usize> = Vec::new();
+            let mut cur: i32 = leaf as i32;
+            while cur >= 0 {
+                path.push(cur as usize);
+                cur = tree.nodes[cur as usize].parent_index;
+            }
+            path.reverse();
+            paths.push(path);
+        }
+    }
+    paths
+}
 
 /// Target-generic chain-mode DFlash speculator.
 ///
@@ -62,11 +127,155 @@ pub struct GenericDflashSpeculator {
     verify_scratch: Option<Box<dyn SpecScratch>>,
     block_size: usize,
     ctx_capacity: usize,
+    /// Opt-in tree-verify policy (`HIPFIRE_DFLASH_TREE=1`). When `enabled` is
+    /// false the `step` takes the original single-path chain verify.
+    tree: TreeMode,
 }
 
 impl GenericDflashSpeculator {
     fn num_extract(&self) -> usize {
         self.config.num_extract()
+    }
+
+    /// Tree-verify step (Option B: linear n-best). Builds a bounded DDTree from
+    /// the per-position draft marginals, then verifies every enumerated
+    /// root-to-leaf path with an independent `verify_block` and commits the path
+    /// that accepts the most drafts.
+    ///
+    /// LOSSLESS at temp 0 by construction: each path's `verify_block` returns the
+    /// EXACT target greedy argmax per position, so `accept_greedy_prefix` only
+    /// keeps drafts that match the target's argmax and the bonus IS the target's
+    /// argmax after the accepted prefix. The committed prefix is therefore the
+    /// target's own greedy continuation regardless of which path wins — identical
+    /// to AR. Widening the tree can only change HOW MANY of those argmax tokens a
+    /// single cycle commits, never WHICH tokens.
+    ///
+    /// Cost: one `verify_block` per enumerated path (N forwards/cycle) — the cost
+    /// the A/B is measuring. The winner is re-verified once more with hidden
+    /// capture so the committed-prefix residual hidden can be appended to
+    /// `target_hidden_host` (same H2 truncation rule as the chain path: keep only
+    /// the first `accepted + 1` rows; `draft_forward` owns the upload cursor).
+    #[allow(clippy::too_many_arguments)]
+    fn step_tree(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        draft_logits: &[f32],
+        vocab: usize,
+        b: usize,
+    ) -> Result<SpecStep, String> {
+        let ne = self.num_extract();
+        let h = self.config.hidden;
+        let depth = b - 1; // drafted positions = block_size - 1
+
+        // Per-position top-K marginals from the draft logits, then the bounded
+        // best-first DDTree (Algorithm 1). topk is capped to vocab defensively.
+        let topk = self.tree.topk.min(vocab).max(1);
+        let (top_tokens, top_log_probs) = topk_from_logits(draft_logits, depth, vocab, topk);
+        let tree = build_ddtree_tree_bounded(
+            &top_tokens,
+            &top_log_probs,
+            depth,
+            topk,
+            0,
+            self.tree.budget,
+            f32::NEG_INFINITY,
+        );
+
+        let vs = self
+            .verify_scratch
+            .as_mut()
+            .ok_or("GenericDflashSpeculator: verify scratch already freed")?;
+
+        // Verify each root-to-leaf path independently; track the longest accept.
+        // The path tokens sit at consecutive absolute positions [position..],
+        // because a path is a chain through tree DEPTH — so `verify_block` (a
+        // linear forward) verifies it exactly. For a stateless target this is
+        // self-contained: verify writes the path's KV, commit_prefix is a no-op,
+        // and the next path's verify overwrites the rejected tail.
+        let paths = enumerate_tree_paths(&tree);
+        let mut best_block: Vec<u32> = vec![seed]; // fallback: seed-only (0 accept)
+        let mut best_accepted: usize = 0;
+        let mut best_bonus: u32 = seed;
+        let mut best_proposed: usize = 0;
+        let mut found = false;
+
+        for path in &paths {
+            // path-token block: [seed, nodes[p0].token, nodes[p1].token, …]
+            let mut block: Vec<u32> = Vec::with_capacity(1 + path.len());
+            block.push(seed);
+            for &node_idx in path {
+                block.push(tree.nodes[node_idx].token);
+            }
+            let path_drafts = &block[1..];
+
+            let target_pick = target.verify_block(gpu, &block, position, vs.as_mut(), None)?;
+            debug_assert_eq!(target_pick.len(), block.len());
+
+            let acc = accept_greedy_prefix(path_drafts, &target_pick, None);
+            let accepted = acc.accepted;
+            // Strictly-greater keeps the FIRST path (enumeration/leaf order) on a
+            // tie — deterministic winner selection.
+            if !found || accepted > best_accepted {
+                found = true;
+                best_accepted = accepted;
+                best_bonus = *acc.committed.last().expect("eos=None yields a bonus");
+                best_proposed = path_drafts.len();
+                best_block = block;
+            }
+        }
+
+        // Re-verify the WINNER once with hidden capture so we can append exactly
+        // the committed-prefix residual hidden. (We verified with None above to
+        // avoid N hidden downloads.) commit_prefix then fixes target state to the
+        // committed prefix [seed, accepted…] (no-op for a stateless target).
+        //
+        // Pad the capture block to the full block_size `b`: hidden capture only
+        // flows through the target's BATCHED verify path, which requires the
+        // block be batch-eligible (n >= MIN_BATCH). Enumerated paths can be
+        // shorter than that (a depth-1 leaf → len 2), so we pad the tail past the
+        // committed prefix with the mask token. We only keep the first
+        // `accepted + 1` hidden rows, so the padding rows are discarded, and the
+        // padding KV (positions beyond the committed prefix) is overwritten by the
+        // next cycle's verify — same as the chain path's rejected-tail KV.
+        let mut cap_block: Vec<u32> = best_block.clone();
+        cap_block.resize(b, self.config.mask_token_id);
+        let mut block_hidden: Vec<f32> = Vec::with_capacity(b * ne * h);
+        let _ = target.verify_block(
+            gpu,
+            &cap_block,
+            position,
+            vs.as_mut(),
+            Some(&mut block_hidden),
+        )?;
+        debug_assert_eq!(block_hidden.len(), b * ne * h);
+        target.commit_prefix(gpu, &cap_block, best_accepted, position, vs.as_mut())?;
+
+        // Append the first accepted+1 rows of the winner's hidden (seed + accepted
+        // drafts); discard the rejected tail and the bonus row. Grows the prefix
+        // by accept+1, matching draft_forward's incremental contract.
+        let keep_elems = committed_block_hidden_elems(best_accepted, ne, h);
+        self.target_hidden_host
+            .extend_from_slice(&block_hidden[..keep_elems]);
+        debug_assert_eq!(
+            self.target_hidden_host.len(),
+            committed_host_len(position, best_accepted, ne, h),
+            "host buffer length mismatch after tree commit"
+        );
+
+        // Lower: emit = accepted drafts (block[1..=accepted]) + bonus; seed dropped.
+        let emit = best_block[1..=best_accepted]
+            .iter()
+            .copied()
+            .chain(std::iter::once(best_bonus));
+        Ok(SpecStep::new(
+            emit,
+            best_bonus,
+            best_proposed,
+            best_accepted,
+        ))
     }
 }
 
@@ -230,6 +439,15 @@ impl Speculator for GenericDflashSpeculator {
             block[i + 1] = d;
         }
 
+        // ── Tree-verify arm (opt-in, HIPFIRE_DFLASH_TREE=1) ─────────────────
+        // Build a bounded DDTree from the per-position draft marginals, verify
+        // ≤N enumerated root-to-leaf paths each via `verify_block`, and commit
+        // the longest-accepted one. Still greedy/lossless: every committed token
+        // is a target argmax (see step_tree). Off by default → chain path below.
+        if self.tree.enabled {
+            return self.step_tree(gpu, target, position, seed, &draft_logits, vocab, b);
+        }
+
         // ── 4. Verify + accept + truncation (review finding H2) ─────────────
         // Verify [seed, drafts…] through the target. Returns the per-position
         // greedy argmax (length b) AND fills block_hidden with the per-position
@@ -372,6 +590,7 @@ pub fn build_generic_dflash_speculator(
         verify_scratch: Some(verify_scratch),
         block_size,
         ctx_capacity,
+        tree: TreeMode::from_env(),
     }))
 }
 
