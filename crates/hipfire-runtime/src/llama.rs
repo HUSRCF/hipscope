@@ -1935,11 +1935,13 @@ pub struct HiddenCaptureSink<'a> {
 /// visible. `block_start` is the absolute decode position the block begins at;
 /// `block_cols` equals the linearized tree length (`1 + tree.num_nodes()`).
 ///
-/// RoPE positions stay CONTIGUOUS (`[block_start .. block_start + n)`) — exactly
-/// as the qwen35 tree verify does (`qwen35.rs:8286`): the mask alone encodes
-/// ancestor visibility, and the tree-depth positions from
-/// `linearize_tree_with_parents` are only used to BUILD `bias`, not for RoPE.
-/// This sidesteps the duplicate-KV-slot hazard of depth-based positions.
+/// The KV WRITE slot and the FA mask alignment stay CONTIGUOUS
+/// (`[block_start .. block_start + n)`), so siblings never collide on the same
+/// cache slot; but Q/K RoPE uses the tree-DEPTH positions
+/// (`block_start + node.depth`, see `rope_positions` below), so a parent→child
+/// RoPE distance is exactly 1 regardless of linearized slot. Decoupling the two
+/// is what kills the "linearization-slot RoPE phase skew" on bushy trees while
+/// avoiding the duplicate-KV-slot hazard of depth-based write slots.
 pub struct TreeMaskRef<'a> {
     /// `[block_cols × block_cols]` row-major additive bias (0/-inf), on device.
     pub bias: &'a GpuTensor,
