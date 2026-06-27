@@ -321,6 +321,48 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
+    /// Single-pass TREE-masked verify: run the target over a LINEARIZED DDTree in
+    /// ONE batched forward and return the FULL per-NODE target logits
+    /// (`tokens.len() × vocab`, row-major). `tokens`/`mask_block` come from
+    /// [`crate::ddtree::linearize_tree_with_parents`] (slot 0 = seed; `mask_block`
+    /// is the `[n × n]` additive `0.0`/`-inf` ancestor-visibility bias). The
+    /// forward runs at contiguous positions `[position .. position + n)`; the mask
+    /// alone encodes the tree, so a node's logits equal a causal verify of that
+    /// node's root-to-node chain.
+    ///
+    /// `tokens`/`mask_block`/`depth_positions` all come from
+    /// [`crate::ddtree::linearize_tree_with_parents`]: `mask_block` is the
+    /// `[n × n]` additive ancestor mask; `depth_positions` are the per-slot DEPTH
+    /// RoPE positions (`position + node.depth`). The forward rotates Q/K at the
+    /// depth positions (parent→child distance 1) so the bushy-tree verify is
+    /// greedy-lossless, while KV write + mask stay on contiguous slots.
+    ///
+    /// This is the single-forward heart of the q-exploiting SWOR tree verify
+    /// (`dflash_generic::step_tree`): `n_slots × vocab` logits feed
+    /// [`crate::ddtree::sample_verified_tree_swor`] (temp>0) /
+    /// [`crate::ddtree::sample_verified_tree`] (temp 0). `hidden_out` captures the
+    /// per-extract-layer residual rows for DFlash conditioning (same contract as
+    /// [`verify_block`](Self::verify_block)).
+    ///
+    /// Leaves target state advanced by `n` (stateless arches: the accepted-prefix
+    /// KV is correct, the rejected tail is overwritten next cycle —
+    /// [`commit_prefix`](Self::commit_prefix) is a no-op). Returns `Err` by
+    /// default; implemented for the llama/qwen3 family (which has the masked
+    /// batched attention kernels).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_tree_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _tokens: &[u32],
+        _mask_block: &[f32],
+        _depth_positions: &[i32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose verify_tree_logits".into())
+    }
+
     /// Look up the target's embedding row for `token_id`, dequantized to F32
     /// (length `dim`). The generic DFlash drafter needs this to build the
     /// mask-token "noise" embedding it broadcasts across the masked block

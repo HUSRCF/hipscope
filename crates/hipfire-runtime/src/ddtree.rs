@@ -470,6 +470,71 @@ pub fn naive_sample_chain(
     unreachable!("naive_sample_chain loop always returns at i == depth");
 }
 
+/// Per-position draft distributions + draw-ordered SWOR candidates for the
+/// q-exploiting tree-SWOR verify ([`sample_verified_tree_swor`]).
+///
+/// Given `draft_logits` (`num_pos × vocab`, row-major — the per-draft-position
+/// logits the drafter produced), this returns:
+/// - `draft_q` (`num_pos × vocab`): the full `softmax(logits_pos / temp)` per
+///   position (the residual distribution `swor_step` corrects against);
+/// - `pos_cands` (`num_pos × k`): `k` tokens drawn WITHOUT replacement from each
+///   position's `draft_q`, IN DRAW ORDER (the proposal sequence the verbatim
+///   SWOR step expects).
+///
+/// The candidates are drawn by the same sequential SWOR scheme the
+/// `swor_preserves_target_distribution` test validates — a host mirror of the
+/// device Gumbel-top-k sampler's distribution (top-k of `logit/temp + Gumbel`
+/// over a category equals a SWOR draw from `softmax(logit/temp)`). Because every
+/// emitted token in `sample_verified_tree_swor` is drawn from the (residual)
+/// TARGET, `pos_cands`/`draft_q` only change WHICH target draws get reused
+/// (acceptance), never WHAT is emitted — so the output marginal stays
+/// distribution-exact regardless of how candidates were sampled.
+///
+/// Uses the same `xorshift_unit` RNG stream as the accept walk, advancing
+/// `rng_state` in place.
+pub fn swor_draft_candidates(
+    draft_logits: &[f32],
+    num_pos: usize,
+    vocab: usize,
+    k: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (Vec<f32>, Vec<u32>) {
+    debug_assert_eq!(draft_logits.len(), num_pos * vocab);
+    let mut draft_q: Vec<f32> = Vec::with_capacity(num_pos * vocab);
+    let mut pos_cands: Vec<u32> = Vec::with_capacity(num_pos * k);
+    let mut q: Vec<f32> = Vec::with_capacity(vocab);
+    for pos in 0..num_pos {
+        let row = &draft_logits[pos * vocab..(pos + 1) * vocab];
+        softmax_temp_into(row, temp.max(1e-4), &mut q);
+        draft_q.extend_from_slice(&q);
+        // Sequential SWOR draw of k tokens from q (residual renormalize each step).
+        let mut qr = q.clone();
+        for _ in 0..k {
+            let s: f32 = qr.iter().sum();
+            if s <= 0.0 {
+                // Degenerate residual: pad with token 0 (never matches a real
+                // child once q is exhausted; SWOR residual still corrects).
+                pos_cands.push(0);
+                continue;
+            }
+            let u = xorshift_unit(rng_state) * s;
+            let mut acc = 0.0f32;
+            let mut pick = qr.len() - 1;
+            for (i, &v) in qr.iter().enumerate() {
+                acc += v;
+                if u < acc {
+                    pick = i;
+                    break;
+                }
+            }
+            pos_cands.push(pick as u32);
+            qr[pick] = 0.0; // without replacement
+        }
+    }
+    (draft_q, pos_cands)
+}
+
 /// Xorshift64* → uniform [0, 1). Bit-compatible with the qwen35 spec sampler's
 /// RNG (`speculative::xorshift_next_unit`) so the tree accept walk is
 /// deterministic given a seed and consistent with the linear DFlash path.
@@ -1505,6 +1570,86 @@ mod tests {
             assert!(
                 tv < 0.01,
                 "verbatim SWOR must preserve the target distribution; k={k} TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tree_swor_emit_marginal_is_target() {
+        // END-TO-END dense tree-SWOR distribution gate: the EXACT CPU pipeline
+        // `GenericDflashSpeculator::step_tree` runs at temp>0 —
+        //   topk_from_logits → build_ddtree_tree_bounded → swor_draft_candidates
+        //   → sample_verified_tree_swor
+        // — through the REAL xorshift RNG stream. The first emitted token (the
+        // first accepted child's token, or the bonus when nothing is accepted at
+        // slot 0) must be marginally distributed as softmax(target_logits_0/temp),
+        // proving the dense tree-SWOR verify is distribution-exact independent of
+        // the draft q. This is the mandatory guard the task requires: the win must
+        // be on the tok/s axis WITHOUT moving the output distribution.
+        let vocab = 8usize;
+        let depth = 2usize; // 2 draft positions (block_size 3)
+        let topk = 2usize;
+
+        // Draft logits per position (DISTINCT from target so q is genuinely
+        // exploited). Row 0 builds the seed's children; row 1 the depth-2 layer.
+        let draft_logits: Vec<f32> = vec![
+            // pos 0
+            0.4, -1.2, 1.1, 0.0, 0.7, -0.3, 0.2, -0.6, // pos 1
+            -0.5, 1.3, -0.2, 0.6, -1.0, 0.2, 0.9, -0.4,
+        ];
+        // Target logits per linearized slot. Slot 0 (the seed) is the one whose
+        // emit marginal we measure; give it a mode (token 6) the tree's top-2
+        // children at position 0 do NOT cover, so the mode can only surface via
+        // the residual/bonus — the strongest distribution-fidelity stress.
+        let target_logits0 = [0.3f32, -1.0, 0.5, 0.1, -0.4, 0.2, 1.4, -0.7];
+
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            // Reference marginal: softmax(target_logits0 / temp).
+            let target = softmax_temp(&target_logits0, temp);
+
+            let n_runs = 400_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0x7ec0_dded_1234_0001u64 ^ ((temp.to_bits() as u64) << 9);
+            for _ in 0..n_runs {
+                // Build the tree exactly as step_tree does (deterministic; no RNG).
+                let (top_tokens, top_log_probs) =
+                    topk_from_logits(&draft_logits, depth, vocab, topk);
+                let tree = build_ddtree_tree_bounded(
+                    &top_tokens,
+                    &top_log_probs,
+                    depth,
+                    topk,
+                    0,
+                    8,
+                    f32::NEG_INFINITY,
+                );
+                let big_n = 1 + tree.nodes.len();
+                // Per-slot target logits: slot 0 is the measured row; the rest are
+                // arbitrary (only reached after acceptance, which doesn't change
+                // slot 0's emit marginal). Fill them uniform.
+                let mut logits = vec![0.0f32; big_n * vocab];
+                logits[..vocab].copy_from_slice(&target_logits0);
+
+                let (draft_q, pos_cands) =
+                    swor_draft_candidates(&draft_logits, depth, vocab, topk, temp, &mut rng);
+                let (accepted, bonus) = sample_verified_tree_swor(
+                    &tree, &logits, &draft_q, &pos_cands, depth, topk, vocab, temp, &mut rng,
+                );
+                // Slot-0 emitted token = first accepted child's token, else bonus.
+                let emitted = match accepted.first() {
+                    Some(&ni) => tree.nodes[ni].token,
+                    None => bonus,
+                };
+                hist[emitted as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - target[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "dense tree-SWOR emit marginal must equal the target at temp={temp}; \
+                 TV={tv:.4} hist={hist:?}"
             );
         }
     }
