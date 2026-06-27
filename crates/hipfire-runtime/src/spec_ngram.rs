@@ -186,7 +186,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // new suffix (hit → no reset, from prefill_start). The target owns the
         // chunked/abortable forward; we only need its KV + recurrent state moved.
         let start = if cache_hit { prefill_start } else { 0 };
-        let adv = target.spec_advance(gpu, prefill_tokens, start, !cache_hit, abort)?;
+        let adv = target.spec_advance(gpu, prefill_tokens, start, !cache_hit, abort, None)?;
         let first_token = match adv {
             SpecAdvance::Aborted => return Ok(PrefillOutcome::Aborted),
             SpecAdvance::Ready { last_argmax } => last_argmax,
@@ -221,7 +221,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
 
         // Verify: target snapshots its pre-state into `scratch`, runs the block,
         // returns per-position greedy argmax, leaves state advanced by b.
-        let argmax = target.verify_block(gpu, &block, position, scratch)?;
+        let argmax = target.verify_block(gpu, &block, position, scratch, None)?;
 
         // Shared greedy accept-prefix (eos=None: EOS handled downstream by the
         // daemon decode loop). `committed` = accepted drafts ++ bonus.

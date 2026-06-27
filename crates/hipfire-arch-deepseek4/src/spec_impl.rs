@@ -68,6 +68,7 @@ impl SpecTarget for Deepseek4Bundle {
         _start_pos: usize,
         _reset: bool,
         _abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         Err(DS4_NO_NGRAM.into())
     }
@@ -78,6 +79,7 @@ impl SpecTarget for Deepseek4Bundle {
         _block: &[u32],
         _position: usize,
         _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         Err(DS4_NO_NGRAM.into())
     }

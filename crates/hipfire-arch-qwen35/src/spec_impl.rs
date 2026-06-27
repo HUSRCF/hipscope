@@ -161,6 +161,7 @@ impl SpecTarget for ModelSlot {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Plain target advance, chunked at PREFILL_MAX_BATCH with abort checks
         // between chunks. No hidden extraction — only KV + recurrent state move.
@@ -210,6 +211,7 @@ impl SpecTarget for ModelSlot {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let s = scratch
             .as_any_mut()

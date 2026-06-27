@@ -24,7 +24,7 @@
 //! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through
 //! `generate()`, not this trait.
 
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 use smallvec::SmallVec;
 
 /// Outcome of one speculative-decode acceptance window, drafter-agnostic.
@@ -185,6 +185,11 @@ pub trait SpecTarget {
     /// abortable), returning the greedy argmax at the LAST position. `reset`
     /// zeroes recurrent + KV state first (cache-miss prefill); `false` continues
     /// from the current state (cache-hit suffix, or the partial-accept replay).
+    ///
+    /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
+    /// the target appends, per processed position, the concat of residual hidden
+    /// at `layers` (`layers.len() × dim` f32/row) to the provided `Vec`. Ignored
+    /// (no-op) when `None` or when `dflash_extract_layers()` returns `None`.
     fn spec_advance(
         &mut self,
         gpu: &mut Gpu,
@@ -192,6 +197,7 @@ pub trait SpecTarget {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String>;
 
     /// Run the target over `block` at absolute `position`, returning the greedy
@@ -204,12 +210,18 @@ pub trait SpecTarget {
     /// S/conv state AND the Q8 error-feedback residual) INTO `scratch`, *before*
     /// running the forward that advances it. Stateless (pure-attention) arches
     /// snapshot nothing.
+    ///
+    /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
+    /// the target appends, per processed position, the concat of residual hidden
+    /// at `layers` (`layers.len() × dim` f32/row). Ignored when `None` or when
+    /// `dflash_extract_layers()` returns `None`.
     fn verify_block(
         &mut self,
         gpu: &mut Gpu,
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String>;
 
     /// Fix target state to reflect exactly the committed prefix
@@ -247,6 +259,41 @@ pub trait SpecTarget {
     /// (it has no `llama::KvCache` to hand back).
     fn kv_cache_mut(&mut self) -> Option<&mut crate::llama::KvCache> {
         None
+    }
+
+    // ── DFlash drafter primitives (default no-op) ───────────────────────────
+    //
+    // These let a hidden-conditioned drafter (DFlash / EAGLE) be built on top of
+    // ANY dense-attention target without arch-specific coupling. The default
+    // implementations return `None` / `Err` so that `build_speculator`'s DFlash
+    // arm declines gracefully on targets that don't expose hidden states (e.g.
+    // minimax, cohere2moe). A target that DOES expose them (llama, qwen3) overrides
+    // both `dflash_extract_layers` (returning the layer ids) and captures hidden
+    // rows into `hidden_out` inside `spec_advance` / `verify_block` (Task 2b).
+
+    /// The layer indices whose residual hidden states the drafter wants captured,
+    /// in order. When `Some(layers)`, the target should, on each processed
+    /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
+    /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
+    ///
+    /// `None` (default) means this target cannot feed a hidden-conditioned
+    /// drafter; `build_speculator`'s DFlash arm declines gracefully.
+    fn dflash_extract_layers(&self) -> Option<&[usize]> {
+        None
+    }
+
+    /// Apply the target's lm_head to `n` rows of residual hidden states
+    /// (shape `[n, dim]`, stored row-major) on `gpu`, returning `n × vocab`
+    /// host-side logits. Returns `Err` by default; implemented in Task 2b for
+    /// the llama/qwen3 family. Returns logits (not argmax) so SWOR/M5 sampling
+    /// has access to the full distribution.
+    fn lm_head_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose lm_head over hidden".into())
     }
 }
 
@@ -1151,6 +1198,66 @@ mod tests {
         let o = EmitOutcome::held();
         assert!(o.events.is_empty());
         assert!(o.stop.is_none());
+    }
+
+    #[test]
+    fn spectarget_hidden_default_is_unsupported() {
+        // A SpecTarget that doesn't override the DFlash hooks reports no extract
+        // layers and refuses capture — so build_speculator's DFlash arm declines
+        // gracefully on arches without hidden capture (e.g. minimax).
+        struct Bare;
+        impl SpecTarget for Bare {
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn reset_recurrent(&mut self, _gpu: &mut rdna_compute::Gpu) {}
+            fn new_spec_scratch(
+                &mut self,
+                _gpu: &mut rdna_compute::Gpu,
+                _block_size: usize,
+            ) -> Result<Box<dyn SpecScratch>, String> {
+                unimplemented!()
+            }
+            fn spec_advance(
+                &mut self,
+                _gpu: &mut rdna_compute::Gpu,
+                _tokens: &[u32],
+                _start_pos: usize,
+                _reset: bool,
+                _abort: &dyn Fn() -> bool,
+                _hidden_out: Option<&mut Vec<f32>>,
+            ) -> Result<SpecAdvance, String> {
+                unimplemented!()
+            }
+            fn verify_block(
+                &mut self,
+                _gpu: &mut rdna_compute::Gpu,
+                _block: &[u32],
+                _position: usize,
+                _scratch: &mut dyn SpecScratch,
+                _hidden_out: Option<&mut Vec<f32>>,
+            ) -> Result<Vec<u32>, String> {
+                unimplemented!()
+            }
+            fn commit_prefix(
+                &mut self,
+                _gpu: &mut rdna_compute::Gpu,
+                _block: &[u32],
+                _accept_len: usize,
+                _position: usize,
+                _scratch: &mut dyn SpecScratch,
+            ) -> Result<(), String> {
+                unimplemented!()
+            }
+            fn eos_token(&self) -> u32 {
+                0
+            }
+            fn ctx_capacity(&self) -> usize {
+                0
+            }
+        }
+        let b = Bare;
+        assert!(b.dflash_extract_layers().is_none());
     }
 
     #[test]

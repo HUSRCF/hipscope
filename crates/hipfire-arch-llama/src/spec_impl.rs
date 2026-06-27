@@ -65,6 +65,7 @@ impl SpecTarget for LlamaBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Pure attention: "reset" just rewinds the eviction offset; the prefill
         // forward overwrites KV at the absolute positions it writes.
@@ -109,6 +110,7 @@ impl SpecTarget for LlamaBundle {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let s = scratch
             .as_any_mut()

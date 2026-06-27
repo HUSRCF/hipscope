@@ -2089,9 +2089,16 @@ fn main() {
                     }
                     // Did the request explicitly set a non-temperature sampling
                     // control? (gates temp>0 spec routing — see generate()).
-                    let user_explicit_sampling = ["top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"]
-                        .iter()
-                        .any(|k| msg.get(*k).is_some());
+                    let user_explicit_sampling = [
+                        "top_p",
+                        "top_k",
+                        "min_p",
+                        "repeat_penalty",
+                        "presence_penalty",
+                        "frequency_penalty",
+                    ]
+                    .iter()
+                    .any(|k| msg.get(*k).is_some());
                     generate(
                         m,
                         &mut gpu,
@@ -4567,7 +4574,15 @@ fn generate_spec(
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar(), temp) {
+        let step = match spec.step(
+            gpu,
+            slot,
+            position,
+            seed_token,
+            &emitted,
+            emit.grammar(),
+            temp,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4656,7 +4671,8 @@ fn generate_spec(
         // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
         if !forced_after.is_empty() {
             for ft in std::mem::take(&mut forced_after) {
-                if let Err(e) = slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id))
+                if let Err(e) =
+                    slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
                 {
                     let _ = writeln!(
                         stdout,
@@ -5936,7 +5952,13 @@ fn generate(
     // `SpecTarget`) routes to the arch-generic spec loop, exactly like llama
     // (0/1). Without a speculator it falls through to the plain qwen2 decode
     // short-circuit below.
-    if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
+    if m.arch_id == 7
+        && m.speculator.is_some()
+        && (temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .is_some_and(|sp| sp.supports_temp_verify()))
+    {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6050,7 +6072,13 @@ fn generate(
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
-    if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
+    if m.arch_id == 11
+        && m.speculator.is_some()
+        && (temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .is_some_and(|sp| sp.supports_temp_verify()))
+    {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6112,7 +6140,13 @@ fn generate(
     // state machine + empty-turn / think-budget generation guards) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
-    if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
+    if m.arch_id == 12
+        && m.speculator.is_some()
+        && (temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .is_some_and(|sp| sp.supports_temp_verify()))
+    {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6172,7 +6206,13 @@ fn generate(
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
-    if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || m.speculator.as_ref().is_some_and(|sp| sp.supports_temp_verify())) {
+    if m.arch_id == 10
+        && m.speculator.is_some()
+        && (temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .is_some_and(|sp| sp.supports_temp_verify()))
+    {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
