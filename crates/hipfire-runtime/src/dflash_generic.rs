@@ -67,6 +67,31 @@ use std::path::Path;
 const DEFAULT_TREE_BUDGET: usize = 8;
 const DEFAULT_TREE_TOPK: usize = 2;
 
+/// Effective tree node budget for this config, clamped so the linearized tree
+/// (`budget` nodes + 1 seed) can never exceed the dense verify kernel's batch
+/// ceiling. Single source of truth shared by the tree builder ([`TreeMode`])
+/// and the verify-scratch sizer ([`dense_tree_verify_nodes`]) so the two can't
+/// disagree.
+fn clamped_tree_budget(flags: &rdna_compute::FeatureFlags) -> usize {
+    flags
+        .ddtree_budget
+        .unwrap_or(DEFAULT_TREE_BUDGET)
+        .clamp(1, crate::llama::PREFILL_MAX_BATCH - 1)
+}
+
+/// Linearized node count (clamped `budget` + seed) the dense DFlash tree-verify
+/// scratch must hold, or `0` when the tree arm is disabled. `SpecTarget::
+/// new_spec_scratch` sizes `PrefillBatchScratch` to at least this, so a large
+/// `HIPFIRE_DDTREE_BUDGET` (or `--draft-max`) can't overflow the verify batch —
+/// the `forward_prefill_batch_tree: tree size N exceeds max_batch` panic.
+pub fn dense_tree_verify_nodes(flags: &rdna_compute::FeatureFlags) -> usize {
+    if flags.dflash_tree {
+        clamped_tree_budget(flags) + 1
+    } else {
+        0
+    }
+}
+
 /// Resolved tree-mode policy, read once at build time from the environment.
 ///
 /// `enabled` gates the whole arm (`HIPFIRE_DFLASH_TREE=1`). When off the
@@ -84,7 +109,7 @@ impl TreeMode {
     fn from_flags(flags: &rdna_compute::FeatureFlags) -> Self {
         TreeMode {
             enabled: flags.dflash_tree,
-            budget: flags.ddtree_budget.unwrap_or(DEFAULT_TREE_BUDGET),
+            budget: clamped_tree_budget(flags),
             topk: flags.ddtree_topk.unwrap_or(DEFAULT_TREE_TOPK),
         }
     }

@@ -53,7 +53,14 @@ impl SpecTarget for LlamaBundle {
         block_size: usize,
     ) -> Result<Box<dyn SpecScratch>, String> {
         let block_size = block_size.max(2);
-        let pbs = PrefillBatchScratch::new(gpu, &self.config, block_size, self.kv.physical_cap)
+        // The tree-verify arm linearizes a DDTree of up to `dense_tree_verify_nodes`
+        // slots into ONE batched forward, so the verify scratch must hold the larger
+        // of the chain block and the (clamped) tree size — else a big
+        // `HIPFIRE_DDTREE_BUDGET` overflows `pbs.max_batch` and panics.
+        let max_batch = block_size.max(hipfire_runtime::dflash_generic::dense_tree_verify_nodes(
+            &gpu.flags,
+        ));
+        let pbs = PrefillBatchScratch::new(gpu, &self.config, max_batch, self.kv.physical_cap)
             .map_err(|e| format!("LlamaSpecScratch PrefillBatchScratch: {e:?}"))?;
         Ok(Box::new(LlamaSpecScratch { pbs }))
     }
