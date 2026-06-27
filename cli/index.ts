@@ -6752,6 +6752,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Minimum n-gram match count before the drafter proposes a continuation (1-10).",
       range: [1, 10], step: 1,
     },
+    ddtree_budget: {
+      label: "ddtree_budget",
+      desc: "DFlash verify-tree node budget (0-64). 0 = chain DFlash (no tree); >0 = SWOR ddtree. More breadth raises acceptance but costs more verify per cycle.",
+      range: [0, 64], step: 1,
+    },
+    ddtree_topk: {
+      label: "ddtree_topk",
+      desc: "DFlash ddtree per-position branching width (1-8). Wider catches the target token at deeper draft ranks; pairs with ddtree_budget.",
+      range: [1, 8], step: 1,
+    },
     chat_template: {
       label: "chat_template",
       desc: "Path to a .j2/.jinja chat template → HIPFIRE_CHAT_TEMPLATE_FILE. Empty = engine default (model/bundled/embedded). For qwen3* a set path overrides the froggeric pillar (daemon warns, intentionally).",
