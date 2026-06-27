@@ -302,6 +302,13 @@ pub struct LoadedModel {
     pub mtp_mode: String,
     pub mtp_k: usize,
     pub mtp_weights_present: bool,
+    // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
+    // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
+    // present alongside the trunk. Persistent for the life of the model;
+    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
+    // against it (so the recurrent MTP-KV never bleeds across requests). None
+    // for every other arch and for qwen35 trunks without an MTP head.
+    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
     // dots.ocr state
     pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
     pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
@@ -371,6 +378,7 @@ impl LoadedModel {
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
+            qwen35_mtp_head: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             vision_config: None,
@@ -794,8 +802,67 @@ fn finish_qwen35_load(
         ctx.spec,
     );
 
+    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
+    //
+    // Load the arch_id=21 MTP head when it is present either bundled in the
+    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
+    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
+    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
+    // the model serves via the unchanged DFlash/AR path. Failures here are
+    // non-fatal — log and continue with `qwen35_mtp_head = None`.
+    //
+    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
+    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
+    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
+        use hipfire_arch_qwen35::mtp_head;
+        let trunk_path = Path::new(ctx.path);
+        // 1. Bundled trailer inside the trunk file?
+        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
+                None
+            }
+        };
+        match bundled {
+            Some(h) => {
+                eprintln!(
+                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
+                    h.config.n_embd, h.config.vocab_size
+                );
+                Some(h)
+            }
+            None => {
+                // 2. Sidecar `<trunk>.mtp` next to the model path?
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            Some(h)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
+                                sidecar.display()
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
     let state = Some(ModelState::Qwen35(bundle));
-    Ok(LoadedModel {
+    let mut model = LoadedModel {
         state,
         eviction,
         speculator,
@@ -810,7 +877,13 @@ fn finish_qwen35_load(
             ctx.path.to_string(),
             chat_template,
         )
-    })
+    };
+    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
+    // ds4 probe set in the daemon's load handler). For qwen35 the presence of a
+    // loaded MTP head IS the signal.
+    model.mtp_weights_present = qwen35_mtp_head.is_some();
+    model.qwen35_mtp_head = qwen35_mtp_head;
+    Ok(model)
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
@@ -831,6 +904,20 @@ pub fn load_model(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
+
+    // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
+    // `generation_config`). Extract HERE, from the already-open source, BEFORE the
+    // carrier allocates any GPU buffers. The `metadata_json` parse churns the host
+    // heap; doing it AFTER allocation but BEFORE the first-warmup AR hipGraph
+    // capture perturbs buffer placement and — on gfx12 / ROCm 7.2, which snapshots
+    // kernarg/buffer addresses at graph-instantiate — makes the captured graph
+    // replay ~2× slower (gfx12 MoE A3B 99→50; bisected to config-inheritance commit
+    // 2a7a1c8b). Parsing pre-allocation lets the heap settle. HFQ sources only;
+    // raw-safetensors PP carries no generation_config.
+    let rec_sampling = match &src {
+        ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
+        _ => None,
+    };
 
     // DFlash lm_head quant check — only for HFQ sources
     if draft_path.is_some() {
@@ -935,21 +1022,13 @@ pub fn load_model(
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
-    // Author-recommended sampling defaults: pull temperature / top_p / top_k from
-    // the .hfq's baked `generation_config` so the generate handler can fall back
-    // to them when the request omits a knob. HFQ sources only — the raw
-    // safetensors PP path carries no generation_config, so rec_* stay `None`
-    // there. min_p / presence_penalty are not in generation_config (request-only),
-    // so they remain `None`. Re-open the source by path (cheap: header parse only,
-    // no weight upload) since the carrier consumed `src`.
-    if matches!(ModelSource::from_path(path), Ok(ModelSource::Hfq(_))) {
-        if let Ok(hfq) = HfqFile::open(Path::new(path)) {
-            if let Some(rec) = hfq.recommended_sampling() {
-                result.rec_temperature = rec.temperature;
-                result.rec_top_p = rec.top_p;
-                result.rec_top_k = rec.top_k.map(|k| k as f32);
-            }
-        }
+    // Apply the author-recommended sampling extracted pre-allocation (see above).
+    // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
+    // is the gfx12 hipGraph-replay regression root-caused above.
+    if let Some(rec) = rec_sampling {
+        result.rec_temperature = rec.temperature;
+        result.rec_top_p = rec.top_p;
+        result.rec_top_k = rec.top_k.map(|k| k as f32);
     }
     Ok(result)
 }
@@ -1531,6 +1610,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
+    }
+    if let Some(head) = m.qwen35_mtp_head {
+        head.free_gpu(gpu);
     }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);

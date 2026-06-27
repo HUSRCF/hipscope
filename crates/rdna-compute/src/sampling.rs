@@ -285,30 +285,51 @@ impl Gpu {
         min_p_val: f32,
     ) -> HipResult<(u32, u32)> {
         const N_BLOCKS: u32 = 128;
-        // W7 P2b: gather TOP_K widened 20→64 so request top_k>20 (minimax
-        // top_k=40) is honored. BLOCK dropped 256→128 to keep LDS within the
-        // 64 KiB RDNA wave32 group-segment limit: smem = BLOCK*TOP_K*8 =
-        // 128*64*8 = 64 KiB (256*64*8 = 128 KiB would fail to launch).
-        const TOP_K: usize = 64;
-        const BLOCK: u32 = 128;
-        // smem: topk_val[BLOCK*TOP_K] + topk_idx[BLOCK*TOP_K], 4 bytes each.
-        let shared_mem = BLOCK * TOP_K as u32 * 4 * 2;
+        // ARCHBLEED FIX (was d3472d9e): the gather budget is REQUEST-SELECTED,
+        // not a global hardcode. W7 P2b widened TOP_K 20→64 (so minimax top_k=40
+        // is honored) and dropped the block 256→128 to fit LDS — but did so
+        // UNCONDITIONALLY, costing ~6.5% AR decode on every non-minimax model
+        // (gfx1100 qwen3.6-27b). Here the common case (top_k<=20, incl. None)
+        // uses a 20-wide / 256-block variant that is byte-identical to 43c3129c;
+        // only top_k>20 compiles+uses the 64-wide / 128-block variant. LDS =
+        // block*TOP_K*8 must stay <= 64 KiB: 256*20*8=40K and 128*64*8=64K both
+        // fit; 256*64*8=128K would fail to launch — so width and block move
+        // together. minimax keeps its full top_k=40 support via the wide path.
+        let wide = top_k_req > 20;
+        let top_k: usize = if wide { 64 } else { 20 };
+        let block: u32 = if wide { 128 } else { 256 };
+        // smem: topk_val[block*TOP_K] + topk_idx[block*TOP_K], 4 bytes each.
+        let shared_mem = block * top_k as u32 * 4 * 2;
 
-        let m = "sample_top_p_parallel";
-        self.ensure_kernel(
-            m,
-            kernels::SAMPLE_TOP_P_PARALLEL_SRC,
-            "sample_apply_repeat_penalty",
-        )?;
-        self.ensure_kernel(m, kernels::SAMPLE_TOP_P_PARALLEL_SRC, "sample_topk_partial")?;
-        self.ensure_kernel(
-            m,
-            kernels::SAMPLE_TOP_P_PARALLEL_SRC,
-            "sample_topk_finalize",
-        )?;
+        // One templated source → two compiled variants. `self.functions` is
+        // keyed by function name and skips reload once a name is present (see
+        // compile_and_load_kernel), so the wide variant SUFFIXES its entry
+        // points to coexist with the default without clobbering it.
+        let (m, suffix): (&str, &str) = if wide {
+            ("sample_top_p_parallel_w64", "_w64")
+        } else {
+            ("sample_top_p_parallel", "")
+        };
+        let src: String = if wide {
+            kernels::SAMPLE_TOP_P_PARALLEL_SRC
+                .replace(
+                    "sample_apply_repeat_penalty",
+                    "sample_apply_repeat_penalty_w64",
+                )
+                .replace("sample_topk_partial", "sample_topk_partial_w64")
+                .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+        } else {
+            kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+        };
+        let fn_penalty = format!("sample_apply_repeat_penalty{suffix}");
+        let fn_partial = format!("sample_topk_partial{suffix}");
+        let fn_finalize = format!("sample_topk_finalize{suffix}");
+        self.ensure_kernel(m, &src, &fn_penalty)?;
+        self.ensure_kernel(m, &src, &fn_partial)?;
+        self.ensure_kernel(m, &src, &fn_finalize)?;
 
         // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
-        let n_cand = N_BLOCKS as usize * TOP_K;
+        let n_cand = N_BLOCKS as usize * top_k;
         let val_bytes = n_cand * 4;
         let partial_base = self
             .scratch
@@ -348,12 +369,12 @@ impl Gpu {
                 &mut pp as *mut _ as *mut c_void,
                 &mut fp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions["sample_apply_repeat_penalty"];
+            let func = &self.functions[fn_penalty.as_str()];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [1, 1, 1],
-                    [BLOCK, 1, 1],
+                    [block, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -370,12 +391,12 @@ impl Gpu {
                 &mut pval as *mut _ as *mut c_void,
                 &mut pidx as *mut _ as *mut c_void,
             ];
-            let func = &self.functions["sample_topk_partial"];
+            let func = &self.functions[fn_partial.as_str()];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [N_BLOCKS, 1, 1],
-                    [BLOCK, 1, 1],
+                    [block, 1, 1],
                     shared_mem,
                     self.stream_ref(),
                     &mut params,
@@ -396,12 +417,12 @@ impl Gpu {
                 &mut tk as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions["sample_topk_finalize"];
+            let func = &self.functions[fn_finalize.as_str()];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [1, 1, 1],
-                    [BLOCK, 1, 1],
+                    [block, 1, 1],
                     shared_mem,
                     self.stream_ref(),
                     &mut params,

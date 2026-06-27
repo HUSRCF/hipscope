@@ -212,6 +212,35 @@ pub trait SpecTarget {
         scratch: &mut dyn SpecScratch,
     ) -> Result<Vec<u32>, String>;
 
+    /// Like [`verify_block`](Self::verify_block) but returns per-position SAMPLED
+    /// tokens (sample `s_i ~ p_T(top_k,top_p)` from the target logits) instead of
+    /// argmax. For a point-mass n-gram draft this makes the shared
+    /// `accept_greedy_prefix(draft, picks)` flow faithful temp-T speculation:
+    /// "accept the guess iff it equals the target sample" is exactly
+    /// distribution-preserving (the committed token is always the target sample).
+    /// Same snapshot CONTRACT as `verify_block`.
+    ///
+    /// Default: `Err` — a target that has NOT implemented sampled verify must
+    /// never silently fall back to greedy (that would decode temp>0 at argmax).
+    /// The drafter's `requires_greedy()`/`build_speculator` gate is what keeps a
+    /// temp>0 request off this path for such a target; the `Err` is the
+    /// belt-and-suspenders guard if one ever slips through.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+    ) -> Result<Vec<u32>, String> {
+        let _ = (gpu, block, position, scratch, temp, top_p, top_k, rng_state);
+        Err("verify_block_sampled: this target does not support sampled verify".into())
+    }
+
     /// Fix target state to reflect exactly the committed prefix
     /// `block[..accept_len + 1]` (after [`verify_block`](Self::verify_block)
     /// over-advanced it by `block.len()`). Cases:
@@ -450,12 +479,24 @@ pub trait Speculator {
     fn free(self: Box<Self>, gpu: &mut Gpu);
 
     /// Whether this drafter requires greedy verification (temperature 0).
-    /// DFlash / DDTree return `true`; a sampling-capable MTP / EAGLE could
-    /// return `false`. `build_speculator` returns `None` for a non-greedy
-    /// request against a greedy-only drafter, routing it to the AR path.
+    /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
+    /// returns `true`; a sampling-capable drafter (DFlash with lossless rejection
+    /// sampling) returns `false`. The daemon dispatch consults this per request:
+    /// a temp>0 request may take the spec path only against a drafter that returns
+    /// `false`; against a `true` drafter it falls through to AR rather than being
+    /// silently decoded greedy.
     fn requires_greedy(&self) -> bool {
         true
     }
+
+    /// Configure per-request sampling for the next acceptance window(s). Called
+    /// by the daemon's spec wrapper (`generate_dflash`) once before the step
+    /// loop, threading the request's resolved temp/top_p/top_k/cactus down to
+    /// the drafter. Default no-op: a greedy-only drafter ignores it and keeps
+    /// decoding at argmax. A sampling-capable drafter (DFlash) stores these and
+    /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
+    /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────

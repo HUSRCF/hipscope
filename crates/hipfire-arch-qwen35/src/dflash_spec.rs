@@ -204,6 +204,17 @@ pub struct DflashSpeculator {
     df: DflashState,
     path_c_mode: Option<&'static str>,
     rng_state: u64,
+    /// Per-request sampling, set via `set_sampling` before each step loop and
+    /// applied in the chain-mode `spec_step_dflash` branch of `step`. Default
+    /// greedy (temp 0 / top_p 1 / top_k 0 / cactus 0) → argmax-accept, the
+    /// historical DFlash posture, so an unconfigured speculator (or the
+    /// greedy-only DDTree branches) decode greedily. Mirrors spec-graph's old
+    /// inline `generate_dflash` call, which threaded the request temp/top_p/top_k
+    /// into the same four `spec_step_dflash` args.
+    sample_temp: f32,
+    sample_top_p: f32,
+    sample_top_k: usize,
+    sample_cactus: f32,
     /// Divergent-render checkpoint ring. Populated by `prefill`'s seed when
     /// `resume_enabled`; freed on `reset`/`free`.
     checkpoints: Vec<(usize, DeltaNetSnapshot)>,
@@ -228,9 +239,17 @@ impl DflashSpeculator {
         Self {
             df,
             path_c_mode,
-            // Same fixed seed the daemon's DFlash loop used (greedy decode does
-            // not consume it, but the signature requires an RNG state cell).
+            // Same fixed seed the daemon's DFlash loop used. `set_sampling`
+            // re-seeds it to this value per request (matching spec-graph's local
+            // `let mut rng_state = 0x13579BDF` per `generate_dflash` call) so a
+            // sampled request is deterministic given its seed; greedy decode does
+            // not consume it.
             rng_state: 0x13579BDF,
+            // Greedy by default until a request calls `set_sampling`.
+            sample_temp: 0.0,
+            sample_top_p: 1.0,
+            sample_top_k: 0,
+            sample_cactus: 0.0,
             checkpoints: Vec::new(),
             resume_enabled,
             ck_interval,
@@ -434,13 +453,22 @@ impl Speculator for DflashSpeculator {
                 seed,
                 None, // ctx_slice = full history
                 Some(&mut self.df.gdn_tape),
-                0.0_f32, // temperature (greedy)
+                // Sampling threaded from the request via `set_sampling` (#477
+                // merge re-wire). These four positions reproduce spec-graph's old
+                // inline `generate_dflash` call verbatim: temp 0 ⇒ greedy/argmax;
+                // temp>0 ⇒ lossless rejection sampling with the IDENTICAL
+                // (top_k,top_p) nucleus truncation on draft + target. The DDTree
+                // branches above stay greedy (tree-verify is greedy by
+                // construction) and ignore these.
+                self.sample_temp,
+                self.sample_top_p, // top_p (1.0 = no truncation)
+                self.sample_top_k, // top_k (0 = top_p-only)
                 &mut self.rng_state,
                 None, // block_size override
                 None, // ngram_cache
                 emitted,
-                0.0_f32, // cactus_delta
-                None,    // pld_spine
+                self.sample_cactus, // 0.0 = lossless; >0 = deliberately lossy
+                None,               // pld_spine
                 1.0_f32, // repeat_penalty (off)
                 0,       // repeat_window
             )
@@ -508,6 +536,30 @@ impl Speculator for DflashSpeculator {
             }
         }
         Ok(position)
+    }
+
+    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
+        // Store the request's sampling config for the chain-mode branch of
+        // `step`. Re-seed the RNG to the same fixed value spec-graph used per
+        // `generate_dflash` call (a fresh `let mut rng_state = 0x13579BDF`), so a
+        // sampled request is deterministic given its seed and two identical
+        // requests in one session produce identical output — preserving
+        // spec-graph's behavior rather than letting the seed drift across turns.
+        self.sample_temp = temp;
+        self.sample_top_p = top_p;
+        self.sample_top_k = top_k;
+        self.sample_cactus = cactus_delta;
+        self.rng_state = 0x13579BDF;
+    }
+
+    fn requires_greedy(&self) -> bool {
+        // DFlash supports faithful temp>0 decode via lossless rejection sampling
+        // (set_sampling + the sampled `spec_step_dflash` path), so it does NOT
+        // require greedy verification. The daemon dispatch consults this (via
+        // `spec_can_sample`) to decide whether a temp>0 request may take the spec
+        // path or must fall to AR — returning `false` here is what lets sampled
+        // DFlash engage while greedy-only drafters (MTP/n-gram) stay on AR.
+        false
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {

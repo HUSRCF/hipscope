@@ -1929,7 +1929,7 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 /// Temperature-scaled softmax. Writes into `out` (reused across calls to
 /// avoid per-position allocation in the rejection-sampling hot loop).
 #[inline]
-fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+pub(crate) fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
     out.clear();
     out.reserve(logits.len());
     let inv_t = 1.0 / temp;
@@ -1952,9 +1952,90 @@ fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
     }
 }
 
+/// Apply a nucleus (top_p) truncation to a normalized probability row IN PLACE,
+/// given the per-row threshold `tau_cut` and kept mass `Z` produced by the GPU
+/// `softmax_temp_topp_batched_f32` kernel:
+///
+///   p'(x) = if p(x) >= tau_cut { p(x) / Z } else { 0 }
+///
+/// After this the row sums to 1 (it was divided by the kept mass Z), so
+/// `sample_categorical` / `sample_residual` operate on a proper distribution.
+///
+/// When `tau_cut == 0.0` (the kernel's top_p>=1.0 guard) this is the IDENTITY
+/// (every p >= 0 is kept, Z == 1) → byte-equivalent to no truncation.
+///
+/// This reproduces the AR nucleus cut in `mtp_spec.rs` (sort desc, accumulate,
+/// cut at the FIRST prefix whose cumulative >= top_p INCLUSIVE, renorm by kept
+/// mass) in threshold form. Exact float ties at the boundary are kept together
+/// here (`>=`), whereas AR cuts by sort position — a measure-zero divergence for
+/// real logits.
+#[inline]
+pub(crate) fn apply_topp_trunc(row: &mut [f32], tau_cut: f32, z: f32) {
+    if tau_cut <= 0.0 {
+        // top_p disabled (or single-token row already at full mass): identity.
+        return;
+    }
+    let inv_z = 1.0f32 / z.max(f32::MIN_POSITIVE);
+    for p in row.iter_mut() {
+        if *p >= tau_cut {
+            *p *= inv_z;
+        } else {
+            *p = 0.0;
+        }
+    }
+}
+
+/// Host-side nucleus (top_p) truncation of an ALREADY-normalized softmax row,
+/// IN PLACE, matching the AR rule in `mtp_spec.rs:307-325`: sort descending,
+/// accumulate, cut at the FIRST token whose cumulative prob >= top_p (inclusive
+/// crossing token), renormalize the kept set by its mass. Used on the non-fast
+/// DFlash temp arms (which compute the softmax on host, not GPU) so top_p is
+/// honored on the WHOLE temp path, not only under HIPFIRE_DFLASH_FAST_SAMPLE.
+///
+/// `top_p >= 1.0` is a no-op (identity). Produces the same kept-set and the same
+/// renormalized values as `apply_topp_trunc` would given the GPU `tau_cut/Z`,
+/// modulo the boundary-tie convention (this version keeps AR's sort-position
+/// tie-break exactly; `apply_topp_trunc` keeps all boundary-equal tokens).
+pub(crate) fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
+    if top_p >= 1.0 {
+        return;
+    }
+    // Indices sorted by probability descending (stable for tie reproducibility).
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        row[b]
+            .partial_cmp(&row[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut cum = 0.0f64;
+    let mut kept_mass = 0.0f64;
+    let mut cutoff = order.len();
+    for (rank, &idx) in order.iter().enumerate() {
+        cum += row[idx] as f64;
+        kept_mass += row[idx] as f64;
+        if cum >= top_p as f64 {
+            cutoff = rank + 1;
+            break;
+        }
+    }
+    let inv = if kept_mass > 0.0 {
+        1.0f64 / kept_mass
+    } else {
+        0.0
+    };
+    // Zero out the dropped tail, renorm the kept head.
+    for (rank, &idx) in order.iter().enumerate() {
+        if rank < cutoff {
+            row[idx] = (row[idx] as f64 * inv) as f32;
+        } else {
+            row[idx] = 0.0;
+        }
+    }
+}
+
 /// Draw a categorical sample from `probs` given uniform u ∈ [0, 1).
 #[inline]
-fn sample_categorical(probs: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     let mut acc = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         acc += p;
@@ -1969,7 +2050,7 @@ fn sample_categorical(probs: &[f32], u: f32) -> u32 {
 /// sample the "corrective" bonus token in speculative rejection sampling
 /// (Chen & Leviathan 2023, algorithm 1).
 #[inline]
-fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
     let mut sum = 0.0f32;
     for i in 0..p_target.len() {
         let d = p_target[i] - p_draft[i];
@@ -2006,7 +2087,7 @@ pub use hipfire_runtime::spec::{NgramCache, PldMatch, PldMatcher};
 /// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
 /// given the seed, cheap enough to inline into the B-rejection loop.
 #[inline]
-fn xorshift_next_unit(state: &mut u64) -> f32 {
+pub(crate) fn xorshift_next_unit(state: &mut u64) -> f32 {
     let mut s = *state;
     s ^= s << 13;
     s ^= s >> 7;
@@ -2874,6 +2955,18 @@ pub fn spec_step_dflash(
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
     temp: f32,
+    // Nucleus (top_p) cutoff applied IDENTICALLY to both the draft and target
+    // softmax rows on the temp sampling path. 1.0 (or >= 0.999) disables it →
+    // the path is byte-equivalent to plain temp-T full-vocab sampling. Lossless
+    // == AR-at-this-top_p holds via the TARGET truncation (Leviathan marginal
+    // preservation); the draft is truncated too for parity + acceptance
+    // efficiency. See apply_topp_trunc / apply_host_nucleus.
+    top_p: f32,
+    // Top-k cutoff, applied identically to draft + target softmax rows on the
+    // sampled path (folded into tau by the GPU kernel: tau = max(tau_p, tau_k)).
+    // 0 = disabled (top_p-only). Lossless == AR-at-(top_k,top_p), same cut both
+    // sides.
+    top_k: usize,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
     ngram_cache: Option<&NgramCache>,
@@ -2950,6 +3043,11 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
+    // Nucleus active only when a non-default top_p was requested. Mirrors the
+    // AR/MTP convention (top_p >= 0.999 ≈ disabled). When inactive the GPU
+    // kernel writes tau_cut=0/Z=1 and the host helpers are identity, so the
+    // sampled path is byte-equivalent to the prior pure-temp behavior.
+    let topp_active = use_temp_sampling && top_p < 0.999;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -2973,6 +3071,22 @@ pub fn spec_step_dflash(
             std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
+    // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
+    // sampled path, compute the per-row softmax (and the top_p nucleus cutoff) on
+    // the GPU instead of the host `exp` loop over the full vocab. The host RNG,
+    // accept test, residual sampler, and CACTUS math are UNCHANGED — they just
+    // read the GPU-produced probabilities instead of host-recomputed ones. The
+    // D2H transfer size is identical (full-vocab probs vs full-vocab logits);
+    // what moves to the GPU is the ~31×vocab `exp`/max/normalize work per
+    // cycle. PARITY: distribution-only, NOT byte-identical (GPU tree-reduction
+    // vs host sequential sum can differ at the last ULP and rarely flip a
+    // borderline `u*p_d <= p_t` accept) — validated coherent across genres
+    // (no attractors), so default-on. Greedy path (temp==0) is never affected.
+    static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast_sample_active = use_temp_sampling
+        && *FAST_SAMPLE_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0")
+        });
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -3238,7 +3352,63 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if use_temp_sampling {
+            if use_temp_sampling && fast_sample_active {
+                // FAST_SAMPLE: GPU softmax → download probs (same D2H size as
+                // logits). Host RNG/sample math is byte-for-byte the same calls
+                // as the default arm below — only the softmax `exp` work moved
+                // off-host. Distribution-parity, not byte-parity (see flag doc).
+                let probs_gpu = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+                // top_p nucleus: when active, the GPU kernel additionally emits
+                // per-row tau_cut/Z so the host can apply the SAME nucleus cut as
+                // the target side (parity + acceptance efficiency). When
+                // inactive, fall back to the plain softmax (tau_cut/Z absent →
+                // truncation identity).
+                let (host_tau, host_z) = if topp_active {
+                    let tau_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    let z_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        vocab,
+                        batch,
+                        temp,
+                        top_p,
+                        top_k,
+                        0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                    )?;
+                    let tau = gpu.download_f32(&tau_gpu)?;
+                    let z = gpu.download_f32(&z_gpu)?;
+                    let _ = gpu.free_tensor(tau_gpu);
+                    let _ = gpu.free_tensor(z_gpu);
+                    (Some(tau), Some(z))
+                } else {
+                    gpu.softmax_temp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        vocab,
+                        batch,
+                        temp,
+                    )?;
+                    (None, None)
+                };
+                let host_probs = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                debug_assert_eq!(host_probs.len(), batch * vocab);
+                draft_softmaxes.reserve(batch);
+                for i in 0..batch {
+                    let mut probs = host_probs[i * vocab..(i + 1) * vocab].to_vec();
+                    if let (Some(tau), Some(z)) = (&host_tau, &host_z) {
+                        apply_topp_trunc(&mut probs, tau[i], z[i]);
+                    }
+                    let u = xorshift_next_unit(rng_state);
+                    let t = sample_categorical(&probs, u);
+                    draft_probs_at_drafted.push(probs[t as usize]);
+                    drafted.push(t);
+                    draft_softmaxes.push(probs);
+                }
+            } else if use_temp_sampling {
                 // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
                 let host_logits = gpu.download_f32(&logits_batch)?;
                 debug_assert_eq!(host_logits.len(), batch * vocab);
@@ -3247,6 +3417,11 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
+                    // Host nucleus on the non-fast temp arm so top_p is honored
+                    // on the whole DFlash temp path (not only under FAST_SAMPLE).
+                    if topp_active {
+                        apply_host_nucleus(&mut probs, top_p);
+                    }
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -3301,6 +3476,9 @@ pub fn spec_step_dflash(
                 if use_temp_sampling {
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(&logits, temp, &mut probs);
+                    if topp_active {
+                        apply_host_nucleus(&mut probs, top_p);
+                    }
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -3411,7 +3589,12 @@ pub fn spec_step_dflash(
         position,
         hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active, // full target logits needed for rejection sampling, RP, or n-gram block
+        // Full target logits are D2H'd to the host for rejection sampling, RP,
+        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
+        // GPU-softmaxed target probs directly from the resident
+        // `verify_scratch.logits` buffer, so the host full-logit download +
+        // host argmax are skipped — that's the target-side half of the cost cut.
+        (use_temp_sampling && !fast_sample_active) || host_path_active,
         verify_scratch,
     )?;
 
@@ -3437,9 +3620,55 @@ pub fn spec_step_dflash(
     let mut accept_len = 0usize;
     let bonus_token;
     if use_temp_sampling {
-        let tgt_logits = &verify_out.logits_per_pos;
-        debug_assert_eq!(tgt_logits.len(), b * vocab);
         debug_assert_eq!(draft_softmaxes.len(), b - 1);
+        // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
+        // all B rows and download the probs. The accept loop below then reads
+        // `target_probs` from this buffer instead of calling the host
+        // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+        // distribution-parity probs. The verify logits are still resident in
+        // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
+        // and only ran GPU-argmax afterwards, which does not overwrite it).
+        // On the fast path, GPU per-row target softmax (+ optional nucleus
+        // tau_cut/Z when topp_active) for all b rows.
+        let mut fast_tgt_tau: Option<Vec<f32>> = None;
+        let mut fast_tgt_z: Option<Vec<f32>> = None;
+        let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+            if topp_active {
+                let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
+                    &logits_batch,
+                    &probs_gpu,
+                    &tau_gpu,
+                    &z_gpu,
+                    vocab,
+                    b,
+                    temp,
+                    top_p,
+                    top_k,
+                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                )?;
+                fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
+                fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
+                let _ = gpu.free_tensor(tau_gpu);
+                let _ = gpu.free_tensor(z_gpu);
+            } else {
+                gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
+            }
+            let host = gpu.download_f32(&probs_gpu)?;
+            let _ = gpu.free_tensor(probs_gpu);
+            debug_assert_eq!(host.len(), b * vocab);
+            Some(host)
+        } else {
+            // Non-fast path: the host full-vocab logits from verify are the
+            // softmax input. Bound here so the fast path never touches the
+            // (now-empty) `logits_per_pos`.
+            debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
+            None
+        };
+        let tgt_logits = &verify_out.logits_per_pos;
         let mut target_probs = Vec::with_capacity(vocab);
         let mut rejected_bonus: Option<u32> = None;
         // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
@@ -3448,11 +3677,24 @@ pub fn spec_step_dflash(
         // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
         let use_cactus = cactus_delta > 0.0;
         for i in 0..b - 1 {
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                // top_p nucleus, IDENTICAL cut to the draft side (GPU tau/Z).
+                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                }
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+                // Non-fast temp arm: host nucleus so top_p holds here too.
+                if topp_active {
+                    apply_host_nucleus(&mut target_probs, top_p);
+                }
+            }
             let t = block[i + 1] as usize;
             let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
             let p_t = target_probs[t];
@@ -3499,11 +3741,22 @@ pub fn spec_step_dflash(
         } else {
             // All accepted: sample from target_softmax at position B-1.
             let i = b - 1;
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                }
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+                if topp_active {
+                    apply_host_nucleus(&mut target_probs, top_p);
+                }
+            }
             let u = xorshift_next_unit(rng_state);
             sample_categorical(&target_probs, u)
         };
@@ -5978,6 +6231,93 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:
+    /// bisect tau over [0, p_max] for the inclusive crossing threshold and
+    /// recompute Z = mass(tau) exactly. Used only by the parity test below.
+    fn cpu_tau_cut_z(probs: &[f32], top_p: f32) -> (f32, f32) {
+        if top_p >= 1.0 {
+            return (0.0, 1.0);
+        }
+        let pmax = probs.iter().cloned().fold(0.0f32, f32::max);
+        let mass = |tau: f32| -> f32 { probs.iter().filter(|&&p| p >= tau).sum() };
+        let (mut lo, mut hi) = (0.0f32, pmax);
+        for _ in 0..30 {
+            let mid = 0.5 * (lo + hi);
+            if mass(mid) >= top_p {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let tau = lo;
+        (tau, mass(tau))
+    }
+
+    #[test]
+    fn apply_topp_trunc_matches_ar_nucleus_cut() {
+        // A row with a clear nucleus boundary (no exact ties): the GPU-style
+        // threshold cut must reproduce the AR sort-and-cut nucleus exactly
+        // (same kept set, same renormalized values).
+        let base = [0.40f32, 0.25, 0.20, 0.10, 0.05];
+        for &top_p in &[0.5f32, 0.6, 0.85, 0.95, 0.99] {
+            // AR reference (sort desc, cumulative >= top_p inclusive, renorm).
+            let mut ar = base.to_vec();
+            apply_host_nucleus(&mut ar, top_p);
+
+            // GPU-style: compute tau_cut/Z by bisection, then host truncate.
+            let (tau, z) = cpu_tau_cut_z(&base, top_p);
+            let mut gpu_style = base.to_vec();
+            apply_topp_trunc(&mut gpu_style, tau, z);
+
+            // Same kept set.
+            for i in 0..base.len() {
+                assert_eq!(
+                    ar[i] == 0.0,
+                    gpu_style[i] == 0.0,
+                    "kept-set mismatch at idx {i}, top_p {top_p}: ar={:?} gpu={:?}",
+                    ar,
+                    gpu_style
+                );
+            }
+            // Same renormalized values for kept tokens.
+            for i in 0..base.len() {
+                assert!(
+                    (ar[i] - gpu_style[i]).abs() < 1e-5,
+                    "value mismatch at idx {i}, top_p {top_p}: ar={} gpu={}",
+                    ar[i],
+                    gpu_style[i]
+                );
+            }
+            // Renormalized row sums to 1.
+            let s: f32 = gpu_style.iter().sum();
+            assert!((s - 1.0).abs() < 1e-4, "row should renorm to 1, got {s}");
+        }
+    }
+
+    #[test]
+    fn apply_topp_trunc_identity_when_disabled() {
+        let base = [0.4f32, 0.3, 0.2, 0.1];
+        let mut row = base.to_vec();
+        // tau_cut == 0.0 (the kernel's top_p>=1.0 guard) → identity.
+        apply_topp_trunc(&mut row, 0.0, 1.0);
+        assert_eq!(row, base.to_vec());
+        // apply_host_nucleus with top_p>=1.0 → identity too.
+        let mut row2 = base.to_vec();
+        apply_host_nucleus(&mut row2, 1.0);
+        assert_eq!(row2, base.to_vec());
+    }
+
+    #[test]
+    fn apply_topp_trunc_single_token_nucleus() {
+        // Very tight top_p keeps only the top token; Z == p_max.
+        let base = [0.7f32, 0.2, 0.07, 0.03];
+        let (tau, z) = cpu_tau_cut_z(&base, 0.5);
+        let mut row = base.to_vec();
+        apply_topp_trunc(&mut row, tau, z);
+        assert!((row[0] - 1.0).abs() < 1e-5, "single-token nucleus → 1.0");
+        assert_eq!(&row[1..], &[0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {

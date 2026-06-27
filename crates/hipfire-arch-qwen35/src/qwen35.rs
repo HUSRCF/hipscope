@@ -3176,7 +3176,8 @@ fn warn_rdna2_unvalidated_dtypes(hfq: &HfqFile, gpu: &Gpu) {
     }
     eprintln!(
         "  ⚠️  RDNA2 ({}): this model contains RDNA3+-only quant formats: {}.",
-        gpu.arch, present.join(", ")
+        gpu.arch,
+        present.join(", ")
     );
     eprintln!(
         "      RDNA2 (gfx1030): uniform .mq4 is the validated SKU; this model's \
@@ -5972,34 +5973,11 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         ));
     }
 
-    // Capture-mode contract: under hipStreamBeginCapture, the FA branch
-    // bakes max_ctx_len = kv_cache.physical_cap (kernels read seq_len
-    // per-row from a device buffer, but LDS is sized from this scalar).
-    // For Q8 KV at physical_cap > 15000, the FA path enters the per-
-    // position long-context fallback, which issues hip.malloc + per-row
-    // memcpy_htod inside the layer loop. Both are capture-illegal — they
-    // would either error at capture time or bake stale host bytes into
-    // the kernarg blob. Asym2/3/4 KV use pure-batched flash kernels and
-    // stay capture-safe at any context length, so reject only this exact
-    // combination here.
-    const LDS_CTX_LIMIT: usize = 15000;
-    if kv_cache.quant_q8
-        && !(kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4)
-        && kv_cache.physical_cap > LDS_CTX_LIMIT
-    {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "forward_prefill_batch_single_chunk_captured: Q8 KV with \
-             physical_cap {} > {} hits the per-position long-context \
-             fallback, which issues hip.malloc + memcpy_htod inside the \
-             captured region. Use asym3 KV for capture at long context, \
-             or shrink physical_cap.",
-                kv_cache.physical_cap, LDS_CTX_LIMIT,
-            ),
-        ));
-    }
-
+    // Q8 KV at any physical_cap is capture-safe: forward_prefill_chunk
+    // dispatches through the unified DispatchCtx → AttnQ8_0KvBatchedMasked,
+    // which routes max_ctx_len > 8192 to the tiled attention_flash_q8_0_tile_batched
+    // (O(1) LDS, no per-position malloc). The former physical_cap > 15000 guard
+    // predated that crossover (landed 2026-06-09) and is now obsolete.
     forward_prefill_chunk(
         gpu,
         weights,
@@ -8801,18 +8779,36 @@ fn forward_prefill_chunk(
                     // so the captured/eager batched prefill honours FP32/Q4 state
                     // instead of forcing the Q8 kernel onto non-Q8 buffers.
                     match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
+                        StateQuant::FP32 => {
+                            if rdna_compute::norm::gdn_chunked() && n > 1 {
+                                gpu.gated_delta_net_f32_chunked(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    rdna_compute::norm::gdn_chunk_size(),
+                                )?
+                            } else {
+                                gpu.gated_delta_net_f32_batch_seq(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                )?
+                            }
+                        }
                         StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
                             &pbs.dn_q_batch,
                             &pbs.dn_k_batch,
@@ -10625,18 +10621,36 @@ fn forward_prefill_chunk(
                     }
                 } else {
                     match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
+                        StateQuant::FP32 => {
+                            if rdna_compute::norm::gdn_chunked() && n > 1 {
+                                gpu.gated_delta_net_f32_chunked(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    rdna_compute::norm::gdn_chunk_size(),
+                                )?
+                            } else {
+                                gpu.gated_delta_net_f32_batch_seq(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                )?
+                            }
+                        }
                         StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
                             &pbs.dn_q_batch,
                             &pbs.dn_k_batch,

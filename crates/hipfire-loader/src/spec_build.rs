@@ -222,10 +222,16 @@ pub fn build_speculator(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",
             block_size, min_count
         );
+        // `samples` = the target arch implements `SpecTarget::verify_block_sampled`
+        // (qwen35 5/6 today). It drives the n-gram speculator's `requires_greedy()`
+        // so a temp>0 request only takes the sampled n-gram path where the target
+        // can actually sample; elsewhere it routes to AR.
+        let samples = matches!(arch_id, 5 | 6);
         return Some(Box::new(ChainSpeculator::new(
             NgramDrafter::new(min_count, block_size),
             block_size,
             ctx_capacity,
+            samples,
         )));
     }
     None
