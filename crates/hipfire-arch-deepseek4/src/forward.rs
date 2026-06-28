@@ -8675,6 +8675,10 @@ pub fn prefill_with_mtp_fill(
 ///                  confidence head.
 pub struct DraftResult {
     pub tokens: Vec<u32>,
+    /// Per-slot draft logits `[block * vocab]`. Currently always EMPTY: the
+    /// markov bias-add + argmax run on-GPU and no caller consumes the draft
+    /// logits (the verify forward recomputes the trunk head). Populate this
+    /// only if a future consumer needs them — it costs a `[block, vocab]` d2h.
     pub logits: Vec<f32>,
     pub confidence: Vec<f32>,
 }
@@ -8865,6 +8869,19 @@ pub fn dspark_forward(
     let kv_dim = n_kv * head_dim;
 
     // committed main_kv history visible to this step (ring fill level).
+    //
+    // NOTE: this counts as if the rings were warmed from position 0, but DSpark
+    // writes only ONE seed main_kv per window (at `position % win`), so the
+    // staged committed window holds real keys only at written columns and ZEROS
+    // elsewhere — the bidirectional attention dilutes over those zeros. We TRIED
+    // compacting the writes (slot = fill % win) + `n_committed = fill+1` so the
+    // attention sees only real keys (no zero dilution). It is strictly more
+    // faithful to the reference's full-history scheme, but A/B-measured a τ LOSS
+    // on MQ2-Lloyd — code τ 3.64→3.14, prose τ 2.96→2.62 (both still coherent),
+    // ~6-8% tok/s. Same lesson as priming the rings over the prompt (a618510a):
+    // under 2-bit quant the drafter's attention is mis-calibrated such that the
+    // zero-key denominator inflation is a NET BENEFIT to acceptance, not noise.
+    // So we keep the zeros. Revisit on a higher-precision DSpark sidecar.
     let n_committed = (position as usize + 1).min(win);
     // custom-stager width: committed window + the block KVs.
     let stage_w = win + block;
@@ -9506,16 +9523,17 @@ fn dspark_forward_head(
         block,
         Some(&x_f16),
     )?;
-    let mut logits_host = gpu
-        .download_f32(&logits_dev)
-        .map_err(|e| format!("dspark d2h logits: {e:?}"))?;
     if let Some(r) = normed_rot {
         let _ = gpu.free_tensor(r);
     }
     let _ = gpu.free_tensor(x_f16);
-    let _ = gpu.free_tensor(logits_dev);
     let _ = gpu.free_tensor(normed);
     let _ = gpu.free_tensor(x_head);
+    // `logits_dev` stays resident: the markov loop adds each slot's bias and
+    // argmaxes ON-GPU (no per-slot 517 KB / upfront 2.5 MB full-vocab d2h).
+    // Freed after the loop. The draft logits themselves are never consumed
+    // downstream (verify re-runs the trunk head), so we never materialize them
+    // on the host.
 
     // ── Sequential markov in-block sampling (greedy) ────────────────────
     // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
@@ -9541,6 +9559,9 @@ fn dspark_forward_head(
     for i in 0..block {
         // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank].
         dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
+        // emb is [markov_rank]=256 floats — tiny; download it for the host
+        // confidence dot (the only host-side consumer). The big d2h (the
+        // [vocab] bias and the full [block,vocab] logits) stay on-GPU below.
         let emb_host = gpu
             .download_f32(&emb_dev)
             .map_err(|e| format!("dspark d2h markov emb {i}: {e:?}"))?;
@@ -9562,24 +9583,20 @@ fn dspark_forward_head(
             vocab,
             markov_rank,
         )?;
-        let bias_host = gpu
-            .download_f32(&bias_dev)
-            .map_err(|e| format!("dspark d2h markov bias {i}: {e:?}"))?;
-        // logits[i] += bias; argmax.
-        let row = &mut logits_host[i * vocab..(i + 1) * vocab];
-        let mut best = 0usize;
-        let mut best_v = f32::NEG_INFINITY;
-        for (t, l) in row.iter_mut().enumerate() {
-            *l += bias_host[t];
-            if *l > best_v {
-                best_v = *l;
-                best = t;
-            }
-        }
-        out_ids[i + 1] = best as u32;
+        // logits[i] += bias, then argmax — both ON-GPU. The sequential
+        // dependency (out_ids[i] → emb → bias → argmax → out_ids[i+1]) forces
+        // per-slot argmax, but only the 4-byte token id crosses to the host
+        // (argmax_f32 reduces on-GPU), not a 517 KB bias vector.
+        let row = logits_dev.sub_offset(i * vocab, vocab);
+        gpu.add_inplace_f32(&row, &bias_dev)
+            .map_err(|e| format!("dspark markov bias add {i}: {e:?}"))?;
+        out_ids[i + 1] = gpu
+            .argmax_f32(&row, vocab)
+            .map_err(|e| format!("dspark markov argmax {i}: {e:?}"))?;
     }
     let _ = gpu.free_tensor(emb_dev);
     let _ = gpu.free_tensor(bias_dev);
+    let _ = gpu.free_tensor(logits_dev);
     if let Some(r) = emb_rot {
         let _ = gpu.free_tensor(r);
     }
@@ -9604,8 +9621,10 @@ fn dspark_forward_head(
     }
 
     Ok(DraftResult {
+        // Draft logits are not materialized on the host: argmax happens on-GPU
+        // and nothing downstream consumes them (verify re-runs the trunk head).
         tokens: out_ids[1..=block].to_vec(),
-        logits: logits_host,
+        logits: Vec::new(),
         confidence,
     })
 }
@@ -9656,6 +9675,237 @@ fn dspark_download_weight_f32(
             "dspark confidence_proj: unsupported dtype {other:?} (expected F16/F32/Q8_0)"
         )),
     }
+}
+
+/// One GPU-vs-CPU numeric parity check for a DSpark novel-head kernel.
+#[derive(Debug, Clone)]
+pub struct DsparkParityCheck {
+    pub name: &'static str,
+    pub n: usize,
+    pub max_abs_diff: f32,
+    /// `max_abs_diff` relative to the largest CPU-reference magnitude.
+    pub rel_max_abs: f32,
+    pub cosine: f32,
+    pub pass: bool,
+}
+
+/// Result of [`dspark_head_parity`] — one entry per novel-head kernel checked.
+#[derive(Debug, Clone)]
+pub struct DsparkParityReport {
+    pub checks: Vec<DsparkParityCheck>,
+}
+
+impl DsparkParityReport {
+    pub fn all_pass(&self) -> bool {
+        self.checks.iter().all(|c| c.pass)
+    }
+}
+
+/// Cosine + relative-max-abs between a GPU output and its CPU reference. A
+/// transpose/layout bug collapses cosine toward 0; Q8 dequant + FMA-order
+/// differences leave cosine ≈ 1 with a small relative error — so the pass gate
+/// (cosine ≥ 0.9999 AND rel_max_abs ≤ 0.02) separates the two cleanly.
+fn dspark_parity_stats(name: &'static str, gpu_v: &[f32], cpu_v: &[f32]) -> DsparkParityCheck {
+    let n = gpu_v.len().min(cpu_v.len());
+    let mut max_abs = 0.0f32;
+    let mut max_cpu = 0.0f32;
+    let (mut dot, mut ng, mut nc) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (g, c) = (gpu_v[i], cpu_v[i]);
+        max_abs = max_abs.max((g - c).abs());
+        max_cpu = max_cpu.max(c.abs());
+        dot += g as f64 * c as f64;
+        ng += g as f64 * g as f64;
+        nc += c as f64 * c as f64;
+    }
+    let cosine = if ng > 0.0 && nc > 0.0 {
+        (dot / (ng.sqrt() * nc.sqrt())) as f32
+    } else {
+        0.0
+    };
+    let rel_max_abs = if max_cpu > 0.0 {
+        max_abs / max_cpu
+    } else {
+        max_abs
+    };
+    let pass = cosine >= 0.9999 && rel_max_abs <= 0.02;
+    DsparkParityCheck {
+        name,
+        n,
+        max_abs_diff: max_abs,
+        rel_max_abs,
+        cosine,
+        pass,
+    }
+}
+
+/// GPU-vs-CPU numeric parity for the DSpark **novel** head kernels — the code
+/// with NO trunk reuse: `main_proj`+`main_norm` (the target-hidden ingestion)
+/// and the Markov head (`markov_w1` embed + `markov_w2` bias). Each check runs
+/// the EXACT production GPU primitive `dspark_forward` uses on a fixed synthetic
+/// input, against an independent CPU reference derived from `inference/model.py`
+/// using the real quantized weights, and compares cosine + relative max-abs.
+///
+/// This is the runnable slice of the plan's mandated "numeric-parity spike".
+/// The full fp8 `model.py` reference cannot run on an RDNA box (fp8 kernels +
+/// the 167 GB trunk), so we validate the novel LINEAR heads — where a layout /
+/// transpose / dequant bug would silently sink draft acceptance and masquerade
+/// as "DSpark is just slow" rather than "the port is wrong". Coverage boundary:
+///   - main_proj gemv, main_norm RMS, markov embed, markov bias gemv → HERE.
+///   - MLA / MoE / HC kernels → reused from the trunk, covered by its gates.
+///   - bidirectional KV staging → `HIPFIRE_DSPARK_VERIFY_STAGE=1` bit-check.
+///   - hc_head sigmoid gate, confidence dot → host/coherence-covered (the
+///     confidence dot already IS a CPU computation; no GPU kernel to diff).
+pub fn dspark_head_parity(
+    cfg: &DeepseekV4Config,
+    dspark: &crate::deepseek4::DsparkWeights,
+    gpu: &mut Gpu,
+) -> Result<DsparkParityReport, String> {
+    let hidden = cfg.hidden_size;
+    let three_h = 3 * hidden;
+    let rank = dspark.cfg.markov_rank;
+    let vocab = cfg.vocab_size;
+    let mut checks = Vec::new();
+
+    let main_proj = dspark
+        .main_proj
+        .as_ref()
+        .ok_or("parity: main_proj missing")?;
+    let main_norm = dspark
+        .main_norm
+        .as_ref()
+        .ok_or("parity: main_norm missing")?;
+    let markov_w1 = dspark
+        .markov_w1
+        .as_ref()
+        .ok_or("parity: markov_w1 missing")?;
+    let markov_w2 = dspark
+        .markov_w2
+        .as_ref()
+        .ok_or("parity: markov_w2 missing")?;
+
+    let upload = |gpu: &mut Gpu, v: &[f32]| -> Result<GpuTensor, String> {
+        let t = gpu
+            .alloc_tensor(&[v.len()], DType::F32)
+            .map_err(|e| format!("parity alloc: {e:?}"))?;
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
+        };
+        gpu.memcpy_htod_auto(&t.buf, bytes)
+            .map_err(|e| format!("parity htod: {e:?}"))?;
+        Ok(t)
+    };
+
+    // ── 1+2. main_proj gemv (pre-norm) + main_norm → main_x ─────────────────
+    // Deterministic synthetic main_hidden[3*hidden]; no RNG (reproducible).
+    let mh: Vec<f32> = (0..three_h)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let mh_dev = upload(gpu, &mh)?;
+    let pre_dev = gpu
+        .alloc_tensor(&[hidden], DType::F32)
+        .map_err(|e| format!("parity alloc pre: {e:?}"))?;
+    if weight_needs_fwht(main_proj) {
+        let rot = gpu
+            .alloc_tensor(&[three_h], DType::F32)
+            .map_err(|e| format!("parity alloc rot: {e:?}"))?;
+        gpu.rotate_x_mq(&mh_dev, &rot, three_h)
+            .map_err(|e| format!("parity rotate mh: {e:?}"))?;
+        gemv_auto(gpu, main_proj, &rot, &mh_dev, &pre_dev, hidden, three_h)?;
+        let _ = gpu.free_tensor(rot);
+    } else {
+        gemv_auto(gpu, main_proj, &mh_dev, &mh_dev, &pre_dev, hidden, three_h)?;
+    }
+    let pre_gpu = gpu
+        .download_f32(&pre_dev)
+        .map_err(|e| format!("parity d2h pre: {e:?}"))?;
+    // CPU reference: dequant main_proj [hidden, 3h] row-major, matmul.
+    let wproj = dspark_download_weight_f32(gpu, main_proj, hidden, three_h)?;
+    let pre_cpu: Vec<f32> = (0..hidden)
+        .map(|o| {
+            let base = o * three_h;
+            (0..three_h).map(|i| wproj[base + i] * mh[i]).sum()
+        })
+        .collect();
+    checks.push(dspark_parity_stats(
+        "main_proj gemv (pre-norm)",
+        &pre_gpu,
+        &pre_cpu,
+    ));
+
+    // main_norm: RMS in place on the GPU pre-norm vector (out = x*w*rsqrt(mean(x²)+eps)).
+    let x_dev = upload(gpu, &pre_gpu)?;
+    gpu.rmsnorm_f32(&x_dev, main_norm, &x_dev, cfg.rms_norm_eps)
+        .map_err(|e| format!("parity rmsnorm: {e:?}"))?;
+    let x_gpu = gpu
+        .download_f32(&x_dev)
+        .map_err(|e| format!("parity d2h main_x: {e:?}"))?;
+    let g = dspark_download_weight_f32(gpu, main_norm, 1, hidden)?;
+    let ms = pre_cpu.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+    let inv = 1.0 / (ms + cfg.rms_norm_eps).sqrt();
+    let x_cpu: Vec<f32> = (0..hidden).map(|o| pre_cpu[o] * inv * g[o]).collect();
+    checks.push(dspark_parity_stats(
+        "main_norm(main_proj) = main_x",
+        &x_gpu,
+        &x_cpu,
+    ));
+
+    // ── 3. markov_w1 embedding lookup (row tok) ─────────────────────────────
+    let tok = (vocab / 3) as u32;
+    let emb_dev = gpu
+        .alloc_tensor(&[rank], DType::F32)
+        .map_err(|e| format!("parity alloc emb: {e:?}"))?;
+    dspark_embed_one(gpu, markov_w1, &emb_dev, tok, rank)?;
+    let emb_gpu = gpu
+        .download_f32(&emb_dev)
+        .map_err(|e| format!("parity d2h emb: {e:?}"))?;
+    let w1 = dspark_download_weight_f32(gpu, markov_w1, vocab, rank)?;
+    let emb_cpu = w1[(tok as usize) * rank..(tok as usize + 1) * rank].to_vec();
+    checks.push(dspark_parity_stats(
+        "markov_w1 embed lookup",
+        &emb_gpu,
+        &emb_cpu,
+    ));
+
+    // ── 4. markov_w2 bias = markov_w2 @ emb ─────────────────────────────────
+    let bias_dev = gpu
+        .alloc_tensor(&[vocab], DType::F32)
+        .map_err(|e| format!("parity alloc bias: {e:?}"))?;
+    if weight_needs_fwht(markov_w2) {
+        let rot = gpu
+            .alloc_tensor(&[rank], DType::F32)
+            .map_err(|e| format!("parity alloc emb rot: {e:?}"))?;
+        gpu.rotate_x_mq(&emb_dev, &rot, rank)
+            .map_err(|e| format!("parity rotate emb: {e:?}"))?;
+        gemv_auto(gpu, markov_w2, &rot, &emb_dev, &bias_dev, vocab, rank)?;
+        let _ = gpu.free_tensor(rot);
+    } else {
+        gemv_auto(gpu, markov_w2, &emb_dev, &emb_dev, &bias_dev, vocab, rank)?;
+    }
+    let bias_gpu = gpu
+        .download_f32(&bias_dev)
+        .map_err(|e| format!("parity d2h bias: {e:?}"))?;
+    let w2 = dspark_download_weight_f32(gpu, markov_w2, vocab, rank)?;
+    // Feed the GPU emb to the CPU reference so this isolates the w2 layout.
+    let bias_cpu: Vec<f32> = (0..vocab)
+        .map(|v| {
+            let base = v * rank;
+            (0..rank).map(|r| w2[base + r] * emb_gpu[r]).sum()
+        })
+        .collect();
+    checks.push(dspark_parity_stats(
+        "markov_w2 bias gemv",
+        &bias_gpu,
+        &bias_cpu,
+    ));
+
+    let _ = gpu.free_tensor(mh_dev);
+    let _ = gpu.free_tensor(pre_dev);
+    let _ = gpu.free_tensor(x_dev);
+    let _ = gpu.free_tensor(emb_dev);
+    let _ = gpu.free_tensor(bias_dev);
+
+    Ok(DsparkParityReport { checks })
 }
 
 /// CPU reference implementation of bias-aware top-k: picks the `k` highest
