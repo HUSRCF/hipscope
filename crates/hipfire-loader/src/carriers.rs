@@ -4,6 +4,7 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
+use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
@@ -12,6 +13,15 @@ use crate::{
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
+use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+
+// The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
+// ChatML-family spec arm — qwen35 DFlash AND the llama/qwen2 n-gram paths all
+// drive it (they already share qwen35's tool-call grammar). It physically lives
+// in the qwen35 crate; the llama/qwen2 carriers wiring it here is composition-
+// root glue, not an arch→arch dependency (those arch crates never name it). A
+// future cleanup could hoist the emitter + grammar into the runtime.
+use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
 
 // ─── Source-only metadata (tokenizer / chat_template / arch_id) ───────
 //
@@ -96,6 +106,22 @@ impl Carrier for Qwen2Carrier {
     fn name(&self) -> &'static str {
         "qwen2"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("qwen2: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // HFQ id 7 and qwen2 safetensors dirs (derive_arch_id → 7). Both route
         // here so the qwen2 Q/K/V `attention_bias=true` biases load (the
@@ -108,8 +134,20 @@ impl Carrier for Qwen2Carrier {
         }
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
+        // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
+        // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Qwen2(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -269,6 +307,21 @@ pub struct Qwen35Carrier;
 impl Carrier for Qwen35Carrier {
     fn name(&self) -> &'static str {
         "qwen35"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
+        // (lazy HfqFile reopen, bundle restored on Drop — the #462 guard).
+        Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
@@ -446,6 +499,22 @@ impl Carrier for LlamaCarrier {
     fn name(&self) -> &'static str {
         "llama"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("llama: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2 (both namespaces).
         // Explicit allowlist (was an open `< 5` range that would silently
@@ -510,8 +579,20 @@ impl Carrier for LlamaCarrier {
         };
 
         // ── single shared tail ──
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
+        // no DFlash draft and no eviction by default; the arm builds its verify
+        // scratch lazily on first prefill, so only ctx_capacity is needed here.
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -569,10 +650,25 @@ impl Carrier for DotsOcrCarrier {
             ctx.max_seq,
         )
         .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). dots.ocr's
+        // text decoder IS Qwen2, so the n-gram arm drives it via the
+        // `DotsOcrBundle: SpecTarget` impl — a strong fit because layout-JSON
+        // output is densely self-repeating. The daemon's `generate_vl_dots_ocr`
+        // routes to the spec decode loop when this is `Some` (vision prefill is
+        // unchanged; only the decode phase becomes speculative).
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             qwen2_state: Some(state),
             dots_ocr_config: Some(config),
             dots_ocr_weights: Some(weights),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -591,6 +687,24 @@ pub struct Deepseek4Carrier;
 impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
         "deepseek4"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("deepseek4: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(hipfire_arch_deepseek4::spec_emit::Deepseek4Emit::from_ctx(
+            ctx,
+        ))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
@@ -636,12 +750,44 @@ impl Carrier for Deepseek4Carrier {
             .unwrap_or(1024);
         let pbs = deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
+        // deepseek4 MTP spec-decode capability: present iff the MTP addon weights loaded
+        // (HIPFIRE_DEEPSEEK4_MTP_ADDON / .mtp-addon.hfq / HIPFIRE_DEEPSEEK4_LOAD_MTP). The
+        // per-request spec gate (mtp_mode / HIPFIRE_DEEPSEEK4_SPEC_DECODE / temp<=eps) stays in
+        // the generate path (T4 routing) — here we only build the capability. Undriven until T4:
+        // the daemon's arch_id==9 branch still uses the bespoke generate_deepseek4 loop.
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> =
+            if weights.mtp_layer.is_some() {
+                // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
+                // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
+                let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| {
+                        std::env::var("HIPFIRE_MTP_K")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(2);
+                let ctx_capacity = config.max_position_embeddings;
+                eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
+                Some(
+                    hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator(
+                        max_n,
+                        ctx_capacity,
+                    ),
+                )
+            } else {
+                None
+            };
         Ok(LoadedModel {
-            deepseek4_config: Some(config),
-            deepseek4_weights: Some(weights),
-            deepseek4_state: Some(state),
+            state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
+            speculator,
             deepseek4_pbs: Some(pbs),
-            deepseek4_eos_tok: eos_tok,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -660,6 +806,24 @@ pub struct MinimaxCarrier;
 impl Carrier for MinimaxCarrier {
     fn name(&self) -> &'static str {
         "minimax"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Minimax(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("minimax: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Shared ChatML emitter (same one qwen2 reuses): MiniMax-M2 is ChatML
+        // (`<|im_end|>`), so the generic think/tool-call/EOS scanning applies.
+        Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
@@ -708,6 +872,18 @@ impl Carrier for MinimaxCarrier {
             &meta.tokenizer,
             &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
         );
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). MiniMax-M2
+        // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
+        // can be driven by the arch-generic spec loop with no draft model.
+        // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Minimax(crate::MiniMaxBundle {
                 config,
@@ -715,6 +891,7 @@ impl Carrier for MinimaxCarrier {
                 state,
                 eos_tok,
             })),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -733,6 +910,24 @@ pub struct Lfm2MoeCarrier;
 impl Carrier for Lfm2MoeCarrier {
     fn name(&self) -> &'static str {
         "lfm2moe"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Lfm2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("lfm2moe: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Shared ChatML emitter (same one qwen2/minimax reuse): LFM2.5 is ChatML
+        // (`<|im_end|>`), no bespoke marker state machine.
+        Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
@@ -768,6 +963,18 @@ impl Carrier for Lfm2MoeCarrier {
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);
+        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). LFM2.5-MoE
+        // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
+        // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
+        // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
         Ok(LoadedModel {
             state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
                 config,
@@ -775,6 +982,7 @@ impl Carrier for Lfm2MoeCarrier {
                 state,
                 eos_tok,
             })),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -799,6 +1007,25 @@ impl Carrier for Cohere2MoeCarrier {
     fn name(&self) -> &'static str {
         "cohere2moe"
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut() {
+            Some(ModelState::Cohere2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("cohere2moe: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // Arch-specific emitter: North's agentic-marker state machine (markers
+        // never surfaced, reasoning channel, ACTION→tool_calls) + the empty-turn
+        // and think-budget generation guards via `take_forced`.
+        Ok(hipfire_arch_cohere2moe::spec_emit::Cohere2MoeEmit::from_ctx(ctx))
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
@@ -814,7 +1041,18 @@ impl Carrier for Cohere2MoeCarrier {
                 let tokenizer =
                     hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                         .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-                crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)
+                let mut lm =
+                    crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)?;
+                // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
+                lm.speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                Ok(lm)
             }
             ModelSource::Dir(source) => {
                 // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
@@ -834,6 +1072,14 @@ impl Carrier for Cohere2MoeCarrier {
                     &meta.tokenizer,
                     &["<|END_OF_TURN_TOKEN|>", "</s>", "<|endoftext|>"],
                 );
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
                 Ok(LoadedModel {
                     state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {
                         config,
@@ -841,6 +1087,7 @@ impl Carrier for Cohere2MoeCarrier {
                         state,
                         eos_tok,
                     })),
+                    speculator,
                     ..LoadedModel::skeleton(
                         meta.arch_id,
                         meta.tokenizer,

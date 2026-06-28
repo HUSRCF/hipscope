@@ -21,11 +21,13 @@ pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod lfm2moe;
+pub mod spec_impl;
 
 pub use arch::Lfm2Moe;
 pub use config::{config_from_source, Lfm2MoeConfig, MixerKind};
 pub use forward::{decode_step, decode_step_capture};
 pub use lfm2moe::{load_weights_from_source, Lfm2MoeState, Lfm2MoeWeights};
+pub use spec_impl::Lfm2MoeBundle;
 
 /// Architecture id for LFM2.5-MoE.
 pub const ARCH_ID: u32 = 11;

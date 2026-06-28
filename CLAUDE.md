@@ -185,6 +185,16 @@ matches. Index of currently-available skills:
   guaranteed-fresh daemon. Kills bun CLI + spawned daemon, fuser-frees
   the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
 
+- **`agent-memory`** — git-tracked cross-session project memory as in-repo markdown
+  notes (`.agent-memory/notes/*.md`, YAML frontmatter) with **lexical (ripgrep)
+  recall** via `scripts/mem.sh` — no DB, no embeddings, no MCP process. **Reach for
+  this when:** answering a project/architecture question, starting a task like past
+  work, or you've learned something durable (finding / falsification / decision /
+  gotcha). Recall before answering (`scripts/mem.sh recall <terms>`), remember after
+  learning (`scripts/mem.sh remember <slug> "<title>" tags`). Project findings go
+  here (shared, diffable, travel with the code); personal/fleet notes stay in global
+  memory. See `docs/skills/agent-memory.md`.
+
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
 
@@ -362,6 +372,31 @@ for DFlash perf/gate claims; older pre-q8 DFlash perf numbers are historical
 only. Drift >5% from the current q8/max256 baseline is a regression
 — start with `git bisect` against this rule, not against session-recalled
 "peak" numbers.
+
+## Hard-won measurement & debugging rules
+
+Cross-cutting rules distilled from the memory log — promoted here so they are not
+re-learned per session.
+
+- **Measure spec-decode durability on the DAEMON, not the demo harness.**
+  `dflash_spec_demo` / `mtp_only_demo` run raw continuation and under-report by
+  ~40% — they never trigger the chatml + structured-thinking serving behavior
+  that makes even novel content predictable (τ jumps 1.05 → 2.2+). A
+  "fails on prose/fiction" verdict from a demo is a harness artifact, not a
+  product verdict; confirm τ/tok-s through the daemon (`serve`, the path users
+  hit) before calling a genre drafter-bound.
+- **Offline spec-decode proxies mis-rank drafters — always confirm online.** An
+  offline argmax / CE-vs-KL ranking reversed on-device (the proxy rewards the
+  training objective, not real acceptance τ). Never ship a drafter decision on
+  an offline proxy alone — budget one online sweep first.
+- **Garbage output → swap to a KNOWN-GOOD model FIRST, before debugging the
+  engine.** A wrong-recipe model (e.g. dense-AWQ on an MoE) lobotomizes output
+  and burns engine-debugging cycles. Coherence gates must include a bare factual
+  prompt — strong/code prompts mask a lobotomy.
+- **Byte-parity validation is meaningless under stochastic state — pin FP32 +
+  `HIPFIRE_DETERMINISTIC=1`.** Q8 DeltaNet-state stochastic rounding makes an
+  exact TP/seam path look non-bit-exact ("ULP cascade") and mis-attributes the
+  bug. Use FP32 DeltaNet state for any byte-parity claim.
 
 ## GPU Lock Protocol (Multi-Agent)
 

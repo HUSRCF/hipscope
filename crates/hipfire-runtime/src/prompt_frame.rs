@@ -68,6 +68,41 @@ pub enum AssistantPrefix {
     ClosedThink,
 }
 
+/// Reasoning-effort level requested for a turn (OpenAI-compatible
+/// `reasoning_effort` / project-custom `thinking_mode`).
+///
+/// This is a model-independent *request* parameter (like temperature or
+/// top-p), carried through the serving path and the neutral `SpecEmitCtx` so
+/// per-arch emitters can interpret it. The arch-specific *frame* mapping — e.g.
+/// DeepSeek V4's `<｜Assistant｜></think>` vs `<think>` open-token, or its `Max`
+/// extended-reasoning preamble — lives in the arch crate that consumes this.
+#[derive(Copy, Clone, Debug)]
+pub enum ThinkMode {
+    /// Non-thinking: model skips reasoning and replies directly.
+    NonThink,
+    /// Thinking: model produces a `<think>` block before responding.
+    High,
+    /// Thinking-max: same as `High` plus an extended-reasoning preamble (the
+    /// consuming arch decides what that means). Some models recommend a large
+    /// context window for this mode.
+    Max,
+}
+
+impl ThinkMode {
+    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
+    /// project-custom `thinking_mode`) to a mode.
+    /// Accepted: "none|off|chat|minimal" → NonThink;
+    ///           "low|medium|high|thinking" → High;
+    ///           "max" → Max. Anything else → NonThink (safe default).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "max" => Self::Max,
+            "high" | "thinking" | "low" | "medium" => Self::High,
+            _ => Self::NonThink,
+        }
+    }
+}
+
 /// Role of a multi-turn history entry. `User` / `Assistant` are
 /// canonical for `ChatFrame::Plain` (the hand-rolled ChatML path).
 /// `System` / `Tool` are accepted by `JinjaChatFrame::render_messages`
@@ -804,9 +839,8 @@ impl<'a> JinjaChatFrame<'a> {
                 if is_system {
                     // Populated date → the template's "Current date:" line
                     // renders (its intended behaviour for a system turn).
-                    map.entry("current_date".to_string()).or_insert_with(|| {
-                        serde_json::Value::String(render_time_date())
-                    });
+                    map.entry("current_date".to_string())
+                        .or_insert_with(|| serde_json::Value::String(render_time_date()));
                     // Sibling optional attributes the same templates probe
                     // (also gated `{% if system_message and system_message.X %}`)
                     // would equally raise under strict-undefined on a system

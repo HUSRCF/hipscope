@@ -1451,6 +1451,29 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        // MQ4G256 = HFQ4G256 weight layout + an offline FWHT rotation, so the
+        // batched GEMM is: FWHT-rotate all `batch_size` activation columns once
+        // (`mq_rotate_x`, AWQ-aware), then feed the same INT4-G256 WMMA kernel
+        // HFQ4G256 uses. This is the batched twin of `weight_gemv`'s single-row
+        // `ensure_mq_signs + rotate_x_mq_for + gemv(Prerotated)` path, and mirrors
+        // DFlash's proven `gemm_dispatch` MQ4 arm (dflash.rs). Replaces the per-row
+        // GEMV fallback that re-read the weight `batch_size`× (the spec-verify
+        // bottleneck). NOTE: the WMMA path quantizes x to F16, so it is NOT
+        // bit-identical to the F32 GEMV — fine for any batched-prefill / spec-verify
+        // use (validated by coherence), same as HFQ4G256 already is.
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            // `_batched_lmhead` routes batch>1 to the WMMA residual kernel on
+            // gfx11/gfx12 (zero-inits Y, so residual `+=` collapses to `=`), which
+            // the scalar `gemm_hfq4g256` path falls 8-10× short of at small batch
+            // (its own dispatch comment). It also invalidates the FP16-x cache for
+            // the freshly-pooled x_rot pointer, so no manual reset is needed here.
+            let r = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
@@ -2036,21 +2059,9 @@ pub fn forward_prefill_batch_chunk_captured(
         "forward_prefill_batch_chunk_captured requires batched-eligible weights + KV"
     );
 
-    // The Q8 long-context fallback in `forward_prefill_chunk` issues
-    // `hip.malloc` + per-row `memcpy_htod` inside the layer loop, which
-    // would error or bake stale data under capture. The threshold is
-    // baked from `physical_cap` in capture mode, not the live seq_len, so
-    // we have to gate on the cap regardless of how many tokens this chunk
-    // carries. Asym KV paths run pure-batched kernels and stay safe.
-    const LDS_CTX_LIMIT: usize = 15000;
-    assert!(
-        !(kv_cache.quant_q8 && kv_cache.physical_cap > LDS_CTX_LIMIT),
-        "Q8 KV with physical_cap {} > {} hits the per-position long-context fallback, \
-         which issues hip.malloc + memcpy_htod inside the captured region. \
-         Use asym3 KV for capture at long context, or shrink physical_cap.",
-        kv_cache.physical_cap,
-        LDS_CTX_LIMIT,
-    );
+    // Q8 long-context is now capture-safe: `forward_prefill_chunk`'s Q8 branch
+    // uses the tiled `attention_flash_q8_0_batched_masked` (O(1) LDS, no
+    // per-position malloc/memcpy), so no cap-based gate is needed.
 
     forward_prefill_chunk(
         gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true,
@@ -2462,38 +2473,27 @@ fn forward_prefill_chunk(
                 &pbs.flash_partials,
             )?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
-            // Long-context Q8 fallback: per-position flash.
-            //
-            // `pbs.positions` was uploaded as raw i32 bits but the dtype is
-            // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`
-            // would reinterpret those bytes as floats, so positions like 15000
-            // would surface as ~1e-3 subnormals that cast to 0. Reconstruct
-            // from `start_pos + b` directly — the buffer layout is exactly
-            // [start_pos .. start_pos + n] in linear order.
-            let q_dim = config.n_heads * config.head_dim;
-            let pos_buf_tmp = gpu.hip.malloc(4)?;
-            for b in 0..n {
-                let pos_b = start_pos + b;
-                let seq_len_b = pos_b + 1;
-                let pos_i32 = pos_b as i32;
-                gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                gpu.attention_flash_q8_0(
-                    &q_b,
-                    &kv_cache.k_gpu[layer_idx],
-                    &kv_cache.v_gpu[layer_idx],
-                    &out_b,
-                    &pos_buf_tmp,
-                    seq_len_b,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    kv_cache.physical_cap,
-                    &pbs.flash_partials,
-                )?;
-            }
-            let _ = gpu.hip.free(pos_buf_tmp);
+            // Long-context Q8: tiled batched flash (O(1) LDS, capture-safe).
+            // Replaces the former per-position malloc+memcpy loop now that
+            // `attention_flash_q8_0_batched_masked` (the >8192 crossover kernel)
+            // exists — numerically equivalent, no per-row host uploads.
+            gpu.attention_flash_q8_0_batched_masked(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                max_ctx_len,
+                n,
+                &pbs.flash_partials,
+                None,
+                0,
+                0,
+            )?;
         } else {
             gpu.attention_q8_0_kv_batched_masked(
                 &pbs.fa_q_batch,
@@ -8612,7 +8612,11 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     for i in 0..TOP_K {
         let p = if topk_val[i].is_finite() {
             let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
-            if pp.is_finite() { pp } else { 0.0 }
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -8704,7 +8708,13 @@ pub fn sample_full_dist(
     // smuggle in min_p > 1.0 (which would `retain` an empty candidate set and
     // panic on `cand[0]` below) or a negative min_p. Clamp at fn entry to the
     // valid [0,1] probability-ratio range; min_p == 0 is the happy path (no cut).
-    let min_p = min_p.map(|mp| if mp.is_finite() { mp.clamp(0.0, 1.0) } else { 0.0 });
+    let min_p = min_p.map(|mp| {
+        if mp.is_finite() {
+            mp.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
     let inv_temp = 1.0 / temperature;
 
     // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
@@ -8741,9 +8751,7 @@ pub fn sample_full_dist(
 
     // Sort descending by probability (top_k / top_p / min_p all operate on the
     // ranked distribution). Unstable sort with a NaN-last comparator.
-    cand.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
     // FINDING #2 (intentional, do NOT "fix" by adding a default cap):
@@ -9096,14 +9104,7 @@ mod tests {
     #[test]
     fn argmax_mixed_finite_and_nonfinite_picks_finite() {
         // +Inf, NaN, and a finite peak interleaved → the finite peak (idx 4).
-        let logits = [
-            f32::INFINITY,
-            f32::NAN,
-            -2.0,
-            f32::NAN,
-            9.0,
-            f32::INFINITY,
-        ];
+        let logits = [f32::INFINITY, f32::NAN, -2.0, f32::NAN, 9.0, f32::INFINITY];
         assert_eq!(argmax(&logits), 4);
     }
 

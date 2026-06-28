@@ -37,6 +37,36 @@ fn dn_requant_per_token() -> bool {
     })
 }
 
+/// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
+/// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
+/// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
+/// Numerically EQUAL to batch_seq (oracle gdn_chunked_f32, 1.3e-15).
+pub fn gdn_chunked() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_GDN_CHUNKED")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Chunk size CS for the chunked FP32 GDN kernel. Default 16 (fits 64 KB LDS
+/// with occupancy headroom). Clamped to [1, 32] (CS_MAX). CS=32 is opt-in and
+/// occupancy-1; CS>32 is refused (LDS overflow).
+pub fn gdn_chunk_size() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let cs = std::env::var("HIPFIRE_GDN_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16);
+        cs.clamp(1, 32)
+    })
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -396,6 +426,149 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(x_ptr);
                 b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// Batched temperature-scaled softmax, out-of-place. For each of `rows`
+    /// rows of width `vocab`, writes `probs[r] = softmax(logits[r] / temp)`
+    /// into `probs` and leaves `logits` untouched.
+    ///
+    /// Mirrors the host `softmax_temp_into` (apply temp to each logit, max over
+    /// scaled logits, exp(scaled - max), normalize). The GPU reduction order
+    /// (tree) differs from the host sequential sum, so the result is
+    /// DISTRIBUTION-parity, NOT byte-identical — used only behind the
+    /// HIPFIRE_DFLASH_FAST_SAMPLE opt-in in the DFlash sampled path.
+    pub fn softmax_temp_batched_into_f32(
+        &mut self,
+        logits: &GpuTensor,
+        probs: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+        temp: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_temp_batched",
+            kernels::SOFTMAX_TEMP_BATCHED_SRC,
+            "softmax_temp_batched_f32",
+        )?;
+
+        let logits_ptr = logits.buf.as_ptr();
+        let probs_ptr = probs.buf.as_ptr();
+        let n_val = vocab as i32;
+        let inv_t = 1.0f32 / temp;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &logits_ptr as *const _ as *mut c_void,
+            &probs_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_t as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32.min(vocab as u32).max(1);
+        let shared_mem = block * 4;
+
+        self.launch_maybe_blob(
+            "softmax_temp_batched_f32",
+            [rows as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(logits_ptr);
+                b.push_ptr(probs_ptr);
+                b.push_i32(n_val);
+                b.push_f32(inv_t);
+                b
+            },
+        )
+    }
+
+    /// Batched temperature-scaled softmax that ALSO emits, per row, the nucleus
+    /// (top_p) threshold `tau_cut[r]` and kept mass `Z[r]` so the host can apply
+    /// `p_i = (p_i >= tau_cut[r]) ? p_i / Z[r] : 0` (AR-equivalent nucleus
+    /// truncation). `tau_cut` and `Z` must each be `[rows]`-shaped F32 tensors.
+    ///
+    /// `probs` is left as the FULL normalized softmax (the kernel does NOT
+    /// truncate on-device; the host helper does, so the kernel stays a pure read
+    /// plus two scalars). When `top_p >= 1.0` the nucleus phase is skipped and
+    /// `tau_cut=0, Z=1` so host truncation is identity → byte-equivalent to
+    /// `softmax_temp_batched_into_f32`.
+    ///
+    /// `tau_cut` is found by bisection over the mass predicate (no sort); see the
+    /// kernel doc in `softmax_temp_batched.hip`. Distribution-parity (tree
+    /// reduction), not byte-parity, to the host softmax — used behind
+    /// HIPFIRE_DFLASH_FAST_SAMPLE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn softmax_temp_topp_batched_into_f32(
+        &mut self,
+        logits: &GpuTensor,
+        probs: &GpuTensor,
+        tau_cut: &GpuTensor,
+        z: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        min_p: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_temp_topp_batched",
+            kernels::SOFTMAX_TEMP_BATCHED_SRC,
+            "softmax_temp_topp_batched_f32",
+        )?;
+
+        let logits_ptr = logits.buf.as_ptr();
+        let probs_ptr = probs.buf.as_ptr();
+        let tau_ptr = tau_cut.buf.as_ptr();
+        let z_ptr = z.buf.as_ptr();
+        let n_val = vocab as i32;
+        let inv_t = 1.0f32 / temp;
+        let top_p_val = top_p;
+        let top_k_val = top_k as i32;
+        let min_p_val = min_p;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &logits_ptr as *const _ as *mut c_void,
+            &probs_ptr as *const _ as *mut c_void,
+            &tau_ptr as *const _ as *mut c_void,
+            &z_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_t as *const _ as *mut c_void,
+            &top_p_val as *const _ as *mut c_void,
+            &top_k_val as *const _ as *mut c_void,
+            &min_p_val as *const _ as *mut c_void,
+        ];
+
+        // Wider block than the plain softmax (256): the nucleus bisection
+        // re-reads the row ~20×, and the grid is only `rows` blocks (~31), so
+        // a wider block puts more threads on each active CU to hide memory
+        // latency. shared_mem auto-scales (one float per thread for the reduce).
+        let block = 1024u32.min(vocab as u32).max(1);
+        let shared_mem = block * 4;
+
+        self.launch_maybe_blob(
+            "softmax_temp_topp_batched_f32",
+            [rows as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(logits_ptr);
+                b.push_ptr(probs_ptr);
+                b.push_ptr(tau_ptr);
+                b.push_ptr(z_ptr);
+                b.push_i32(n_val);
+                b.push_f32(inv_t);
+                b.push_f32(top_p_val);
+                b.push_i32(top_k_val);
+                b.push_f32(min_p_val);
                 b
             },
         )
@@ -2553,6 +2726,124 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Chunked (parallel) FP32 GDN — numerically EQUAL to
+    /// `gated_delta_net_f32_batch_seq` (oracle gdn_chunked_f32). Same buffer
+    /// args plus a `chunk_size` scalar. The cross-chunk dependency (chunk ci's
+    /// S_in = chunk ci-1's S_out) is serialized HERE by a host loop over
+    /// chunks: one launch per chunk, grid `[n_heads, 1, 1]`, `chunk_index`
+    /// passed as a scalar. S advances in place in `s_f32` (same as batch_seq).
+    /// `chunk_size` is clamped to [1, 32]; the kernel's static LDS is sized for
+    /// CS_MAX=32.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_chunked(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_f32: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        chunk_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_chunked",
+            kernels::GATED_DELTA_NET_F32_CHUNKED_SRC,
+            "gated_delta_net_f32_chunked",
+        )?;
+
+        let cs = chunk_size.clamp(1, 32);
+        let n_chunks = n_tokens.div_ceil(cs);
+        // Threads per workgroup (BLK). The chunked kernel is parameterized over
+        // blockDim.x: 32 = 1 wave/4-rows-per-lane, 128 = 4 waves (latency
+        // hiding + 1 HD row/lane), 256 = 8 waves. Default 128; override for
+        // perf sweeps via HIPFIRE_GDN_BLK.
+        let blk: u32 = std::env::var("HIPFIRE_GDN_BLK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|b| (b.clamp(32, 256) / 32) * 32)
+            .unwrap_or(128);
+
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sp = s_f32.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f32_chunked",
+            bytes,
+        );
+
+        // Host loop over chunks — cross-chunk is serial (S_in = prev S_out).
+        for ci in 0..n_chunks {
+            let mut qp = qp;
+            let mut kp = kp;
+            let mut vp = vp;
+            let mut gp = gp;
+            let mut bp = bp;
+            let mut sp = sp;
+            let mut op = op;
+            let mut nt = n_tokens as i32;
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut cs_i = cs as i32;
+            let mut ci_i = ci as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut cs_i as *mut _ as *mut c_void,
+                &mut ci_i as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_f32_chunked",
+                [n_heads as u32, 1, 1],
+                [blk, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(cs_i);
+                    b.push_i32(ci_i);
+                    b
+                },
+            )?;
+        }
+
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        Ok(())
     }
 
     /// GDN recurrence with Q4-quantized S state.

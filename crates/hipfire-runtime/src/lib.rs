@@ -17,6 +17,7 @@ pub mod arch;
 pub mod arch_spec;
 pub mod augmentor;
 pub mod bf16_loader;
+pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod config;
@@ -33,6 +34,7 @@ pub mod hfq;
 pub mod kv_adaptive;
 pub mod kv_mode;
 pub mod llama;
+pub mod llama_spec;
 pub mod loader_api;
 pub mod loop_guard;
 pub mod model_load;
@@ -41,12 +43,15 @@ pub mod multi_gpu;
 pub mod paro;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod spec;
+pub mod spec_ngram;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 
+pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod tokenizer;

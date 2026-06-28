@@ -66,7 +66,29 @@ pub struct LoadCtx<'a> {
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
+    pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
+}
+
+/// Per-load model-free n-gram speculator settings, resolved by the CLI through
+/// the config ladder (env > flag > per-model > global) and forwarded in the
+/// `load` message params. `None` fields mean "the CLI said nothing" — the loader
+/// then falls back to the legacy env vars (`HIPFIRE_NGRAM_DRAFT*`) so a daemon
+/// driven directly (no hipfire CLI) keeps working. Env always *wins* over these
+/// when set, matching the top of the ladder.
+///
+/// The master `speculation` selector lives entirely CLI-side: it is lowered into
+/// the per-mechanism signals (`dflash_mode`/`draft`, `mtp_mode`, and this), so
+/// `build_speculator`'s first-match cascade (dflash > mtp > n-gram) naturally
+/// yields the chosen mechanism without the loader needing a selector of its own.
+#[derive(Clone, Copy, Default)]
+pub struct SpecLoadCfg {
+    /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
+    pub ngram_draft: Option<bool>,
+    /// n-gram draft window K (`HIPFIRE_NGRAM_DRAFT_K`). `None` = loader default.
+    pub ngram_k: Option<usize>,
+    /// n-gram min match count (`HIPFIRE_NGRAM_MIN_COUNT`). `None` = loader default.
+    pub ngram_min_count: Option<u32>,
 }
 
 /// One arch's load contract. Object-safe — usable as `&dyn Carrier`.

@@ -2659,6 +2659,15 @@ pub const ATTENTION_INT8_KV_SRC: &str = include_str!("../../../kernels/src/atten
 pub const ATTENTION_CAUSAL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_causal_batched.hip");
 
+/// Batched decode-with-history attention over an F32 KV cache. One block per
+/// (query head, block row); each row at absolute position `base+row` attends to
+/// the full history [0..base+row] read from the persistent cache by absolute
+/// position. Drives block-parallel qwen2 spec-decode verify (arch_id=7).
+/// Grid: [n_heads, batch, 1]. Q/out: [batch × n_heads × head_dim].
+/// k_cache/v_cache: [max_seq × n_kv_heads × head_dim].
+pub const ATTENTION_DECODE_BATCHED_HISTORY_SRC: &str =
+    include_str!("../../../kernels/src/attention_decode_batched_history.hip");
+
 /// Batched Q8_0 KV cache write: quantize multiple positions at once.
 /// src: [batch_size × kv_dim] FP32. positions: [batch_size] int32.
 /// Grid: [total_blocks × batch_size]. Each block handles one Q8_0 group for one position.
@@ -3183,6 +3192,16 @@ pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
 pub const GATED_DELTA_NET_F32_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_batch_seq.hip");
 
+/// Chunked (parallel) FP32 GDN recurrence — chunked sibling of
+/// GATED_DELTA_NET_F32_BATCH_SEQ_SRC. One wave32 workgroup per (head, chunk);
+/// intra-chunk parallelism replaces the per-token serial inner loop.
+/// Numerically EQUAL to the sequential recurrence (oracle gdn_chunked_f32).
+/// Cross-chunk dependency is serialized host-side (one launch per chunk).
+/// Grid: [n_heads, n_chunks]. Block: [32]. Default OFF (HIPFIRE_GDN_CHUNKED).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_CHUNKED_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_chunked.hip");
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
@@ -3256,6 +3275,18 @@ pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
 /// D2H + ~4 ms host softmax per spec-decode cycle.
 pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/softmax_prob_gather_batched.hip");
+
+/// Batched temperature-scaled softmax, out-of-place. One block per row;
+/// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
+/// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
+/// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+///
+/// This file holds TWO entry points: `softmax_temp_batched_f32` (above) and
+/// `softmax_temp_topp_batched_f32`, which additionally emits per-row nucleus
+/// (top_p) `tau_cut`/`Z` outputs for AR-equivalent nucleus truncation on the
+/// host (see `Gpu::softmax_temp_topp_batched_into_f32`).
+pub const SOFTMAX_TEMP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/softmax_temp_batched.hip");
 
 /// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
 /// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[32] (32B) = 36 bytes per 64 elements.

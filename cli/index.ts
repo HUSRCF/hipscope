@@ -255,6 +255,36 @@ export interface HipfireConfig {
   mtp_mode: string;      // "off" | "on" | "auto"
   mtp_k: number;         // draft tokens per spec-decode window
 
+  // ── Unified speculation selector ──────────────────────────
+  // `speculation` is the CANONICAL knob: it picks the mechanism, so "all three
+  // legacy modes on" can't be ambiguous. Only ONE speculator ever runs (the
+  // daemon holds a single drafter), selected by the first-match cascade
+  // dflash > mtp > ngram.
+  //   "off"   → plain autoregressive decode.
+  //   "auto"  → cascade by availability; the legacy knobs (dflash_mode /
+  //             mtp_mode / ngram_mode) act as per-mechanism eligibility filters
+  //             and keep their own heuristics (e.g. dflash's A3B gate). DEFAULT.
+  //   "dflash"/"mtp"/"ngram" → force exactly that mechanism (bypass the
+  //             heuristics; warn if its prerequisite — a draft model / MTP
+  //             weights — is missing, then fall back to AR).
+  // The selector is lowered CLI-side into the per-mechanism load params, so the
+  // daemon needs no selector of its own. Default "auto" + the legacy defaults
+  // (dflash_mode=off, mtp_mode=auto, ngram_mode=off) reproduces prior behavior.
+  speculation: "off" | "auto" | "ngram" | "dflash" | "mtp";
+
+  // ── Model-free n-gram speculative decode ──────────────────
+  // n-gram is model-free (no draft weights): it proposes tokens from the
+  // prompt+output suffix and verifies against the target's own greedy argmax,
+  // so output is byte-identical to AR — only tok/s differs. It wins on
+  // high-repetition workloads (verbatim copy, long-context retrieval,
+  // structured output) and loses on free-form prose, so it stays opt-in.
+  //   "off"  → never (default).
+  //   "on"   → eligible in the `auto` cascade (lowest priority) and selectable.
+  //   "auto" → last-resort: enable only when neither dflash nor mtp can run.
+  ngram_mode: "off" | "on" | "auto";
+  ngram_k: number;         // draft window K (2–32). Higher = more parallelism.
+  ngram_min_count: number; // min n-gram match count to propose (1–10).
+
   // ── Chat-template overrides ───────────────────────────────────────────
   // Lift the two env-only chat-template knobs (HIPFIRE_CHAT_TEMPLATE_FILE,
   // HIPFIRE_DEFAULT_CHATML) onto the config surface so they can be set/edited
@@ -370,6 +400,12 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_sparse_threshold: 32768,
   mtp_mode: "auto",
   mtp_k: 3,
+  // Unified speculation selector. "auto" + the legacy mode defaults reproduces
+  // prior behavior (dflash off, mtp auto, n-gram off).
+  speculation: "auto",
+  ngram_mode: "off",
+  ngram_k: 12,
+  ngram_min_count: 2,
   // Chat-template overrides. Empty/true = engine defaults (no env projected).
   chat_template: "",
   default_chatml: true,
@@ -446,6 +482,10 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     case "mtp_mode": return ["off", "on", "auto"].includes(value);
     case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    case "speculation": return ["off", "auto", "ngram", "dflash", "mtp"].includes(value);
+    case "ngram_mode": return ["off", "on", "auto"].includes(value);
+    case "ngram_k": return typeof value === "number" && Number.isInteger(value) && value >= 2 && value <= 32;
+    case "ngram_min_count": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
     // chat_template: empty (unset) OR a path that exists + is readable. Tilde
     // is expanded for the existence check so `~/templates/x.j2` validates.
     case "chat_template": {
@@ -523,6 +563,7 @@ const PER_MODEL_KEYS = [
   "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
   "mtp_mode", "mtp_k",
+  "speculation", "ngram_mode", "ngram_k", "ngram_min_count",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -585,7 +626,7 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // resolveThinkingBudget), so its return type narrows the optional field to
 // required — downstream readers can use `cfg.max_think_tokens > 0` without a
 // possibly-undefined check.
-type ResolvedConfig = HipfireConfig & { max_think_tokens: number };
+type ResolvedConfig = HipfireConfig & { max_think_tokens: number; max_think_explicit: boolean };
 
 function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
@@ -633,6 +674,15 @@ function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
 // a present value can ONLY have come from an explicit global save or a per-model
 // override. Absence is the signal that the preset should drive.
 function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfig {
+  // Did the operator set a think-budget EXPLICITLY, or is it the bare preset
+  // default? A raw `max_think_tokens` (absent from CONFIG_DEFAULTS) present here
+  // can only be an explicit save/override; a `thinking_budget` other than the
+  // "med" default is likewise an explicit choice. The serve path uses this to
+  // stay uncapped by default (so DFlash/MTP engage) while still honoring an
+  // explicit budget — see the serve handler's max_think_tokens block.
+  (cfg as ResolvedConfig).max_think_explicit =
+    (cfg.max_think_tokens !== undefined && cfg.max_think_tokens !== null) ||
+    (cfg.thinking_budget !== undefined && cfg.thinking_budget !== "med");
   if (cfg.max_think_tokens === undefined || cfg.max_think_tokens === null) {
     const tb = cfg.thinking_budget ?? "med";
     cfg.max_think_tokens = THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
@@ -651,17 +701,17 @@ function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfi
 /// the daemon NEVER sees its own card/arch defaults: the CLI always sent the
 /// global default.)
 ///
-/// NOTE: top_k and min_p are CARRIED through here (so a future P2 daemon that
-/// honors them inherits the card value) but the daemon sampler IGNORES them
-/// today — top-K is compile-time-fixed and min_p is unimplemented. presence_penalty,
-/// temperature, top_p, repeat_penalty DO take effect.
+/// NOTE: top_k is now HONORED by the daemon sampler (the spec-sampling kernel
+/// folds it into the nucleus on AR + DFlash + MTP). min_p is still carried-but-
+/// inert (unimplemented). presence_penalty, temperature, top_p, repeat_penalty
+/// also take effect.
 interface SamplingForSend {
   temperature?: number;
   top_p?: number;
   repeat_penalty?: number;
   presence_penalty?: number;
-  top_k?: number; // carried-but-inert until P2
-  min_p?: number; // carried-but-inert until P2
+  top_k?: number; // honored by the daemon (spec-sampling kernel folds into nucleus)
+  min_p?: number; // carried-but-inert (daemon unimplemented)
   system_prompt?: string;
 }
 export function resolveSamplingForSend(
@@ -827,7 +877,37 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const targetBn = basename(path);
   const isA3B = /a3b/i.test(targetBn);
   const hasSidecar = !!(resolved.cask_sidecar && resolved.cask_sidecar.length > 0 && existsSync(resolved.cask_sidecar));
-  const mode = resolved.dflash_mode;
+
+  // ── Unified speculation selector ───────────────────────────────────────
+  // Resolve `speculation` (env > per-model > global; CLI `--spec` lowers into
+  // HIPFIRE_SPECULATION) and lower it into the three per-mechanism enables.
+  // Only ONE speculator runs (daemon cascade dflash > mtp > ngram), so this
+  // decides which by gating the others off. `auto` keeps every mechanism's
+  // legacy knob as its eligibility filter; an explicit mechanism forces one.
+  const speculation = (process.env.HIPFIRE_SPECULATION || resolved.speculation || "auto").toLowerCase();
+  let effDflashMode: "on" | "off" | "auto" = resolved.dflash_mode;
+  let effMtpMode = resolved.mtp_mode; // "off" | "on" | "auto"
+  // n-gram enable: env (HIPFIRE_NGRAM_DRAFT) wins; else the selector + ngram_mode.
+  let ngramOn: boolean;
+  switch (speculation) {
+    case "off":    effDflashMode = "off"; effMtpMode = "off"; ngramOn = false; break;
+    case "dflash": effDflashMode = "on";  effMtpMode = "off"; ngramOn = false; break;
+    case "mtp":    effDflashMode = "off"; effMtpMode = "on";  ngramOn = false; break;
+    case "ngram":  effDflashMode = "off"; effMtpMode = "off"; ngramOn = true;  break;
+    case "auto":
+    default:
+      // n-gram joins the auto cascade only when explicitly enabled (it loses on
+      // prose). `ngram_mode=auto` is last-resort: the daemon's cascade reaches
+      // n-gram only after dflash+mtp are unavailable, so "on" and "auto" both
+      // emit ngram_draft=true here and the cascade order does the gating.
+      ngramOn = resolved.ngram_mode === "on" || resolved.ngram_mode === "auto";
+      break;
+  }
+  // env top-of-ladder override for the n-gram enable specifically.
+  if (process.env.HIPFIRE_NGRAM_DRAFT === "1") ngramOn = true;
+  else if (process.env.HIPFIRE_NGRAM_DRAFT !== undefined) ngramOn = false;
+
+  const mode = effDflashMode;
   params.dflash_mode = mode;
   const autoOn = !isA3B || hasSidecar;
   const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
@@ -905,6 +985,34 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // treats absent keys as "use engine defaults" so older daemons stay
   // compatible even when the CLI passes new keys.
   params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+
+  // ── MTP + n-gram speculation params (unified selector lowering) ─────────
+  // `--draft-max` lowers into HIPFIRE_DRAFT_MAX and routes to the ACTIVE
+  // mechanism's window (mtp_k when mtp runs, ngram_k when n-gram runs).
+  const draftMaxEnv = process.env.HIPFIRE_DRAFT_MAX
+    ? parseInt(process.env.HIPFIRE_DRAFT_MAX, 10)
+    : undefined;
+  // MTP: emit the effective mode (the selector may have forced it off). Window
+  // = --draft-max override else resolved mtp_k. This is the SOLE mtp_mode/mtp_k
+  // emission — it supersedes the old unconditional `params.mtp_* = resolved.*`
+  // that used to sit before the return (removed: it ran last and clobbered the
+  // selector, leaving MTP un-gated when speculation forced another mechanism).
+  params.mtp_mode = effMtpMode;
+  params.mtp_k = (draftMaxEnv && effMtpMode !== "off") ? draftMaxEnv : resolved.mtp_k;
+  // n-gram: byte-identical-to-AR model-free drafter. ngram_draft is the
+  // per-load enable the loader reads (env HIPFIRE_NGRAM_DRAFT still wins there).
+  params.ngram_draft = ngramOn;
+  params.ngram_k = (draftMaxEnv && ngramOn) ? draftMaxEnv : resolved.ngram_k;
+  params.ngram_min_count = resolved.ngram_min_count;
+
+  // Forced-mechanism prerequisite check: `--spec dflash` (or speculation=dflash)
+  // with no draft model resolvable is a no-op that would silently fall through
+  // the cascade — warn instead. (mtp/ngram prerequisites are discovered
+  // daemon-side, so only dflash is checkable here.)
+  // (skip the hint when the draft was explicitly opted out via HIPFIRE_DFLASH_DRAFT="").
+  if (speculation === "dflash" && !params.draft && process.env.HIPFIRE_DFLASH_DRAFT !== "") {
+    console.error(`[hipfire] speculation=dflash but no draft model found (set HIPFIRE_DFLASH_DRAFT or --model-draft <path>) — falling back to AR.`);
+  }
 
   // Auto-attach a TriAttention sidecar when:
   //   (1) user hasn't manually set cask_sidecar (resolved value is empty)
@@ -1024,6 +1132,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.mtp_mode = resolved.mtp_mode;
   params.mtp_k = resolved.mtp_k;
 
+  // (Former DFlash+Q8 max_seq cap removed.) The captured-flash LDS cliff that
+  // 0-token'd Q8 KV at physical_cap>15000 is fixed in the engine: the captured
+  // verify forward now dispatches the tiled attention_flash_q8_0_batched_masked
+  // at any context (O(1) LDS, no per-position malloc). DFlash serves at the full
+  // resolved max_seq, VRAM-bound by the drafter context rather than a fixed cap.
   return { type: "load", model: path, params };
 }
 
@@ -1782,7 +1895,8 @@ async function runViaHttp(
     if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
     if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
     if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
-    // top_k / min_p: carried-but-inert (daemon ignores until P2).
+    // top_k is now HONORED by the daemon (folded into the nucleus on AR + DFlash
+    // + MTP by the spec-sampling kernel); min_p remains carried-but-inert.
     if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
     if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
   } else {
@@ -2346,8 +2460,8 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     if (typeof sv.top_p === "number") genMsg.top_p = sv.top_p;
     if (typeof sv.repeat_penalty === "number") genMsg.repeat_penalty = sv.repeat_penalty;
     if (typeof sv.presence_penalty === "number") genMsg.presence_penalty = sv.presence_penalty;
-    // top_k / min_p: carried-but-inert (daemon ignores until P2). Sent so a
-    // future daemon inherits the card value; harmless no-op today.
+    // top_k is now HONORED by the daemon (spec-sampling kernel); min_p stays
+    // carried-but-inert (sent so a future daemon inherits the card value).
     if (typeof sv.top_k === "number") genMsg.top_k = sv.top_k;
     if (typeof sv.min_p === "number") genMsg.min_p = sv.min_p;
   } else {
@@ -3218,7 +3332,10 @@ async function serve(port: number, host: string) {
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
         // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
         // independent max_seq <= 524288 clamp, hunt3 H-D contract).
-        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        let requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        // (Former DFlash+Q8 reload-bump guard removed alongside the load cap:
+        // buildLoadMessage no longer caps max_seq, so requiredMaxSeq need not be
+        // held down to the loaded cap — the engine serves the full context.)
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -3492,22 +3609,28 @@ async function serve(port: number, host: string) {
             ? Math.max(0, Number(body.presence_penalty) || 0)
             : sendView.presence_penalty;
           if (typeof pp === "number") genParams.presence_penalty = pp;
-          // top_k / min_p: carried-but-inert (daemon ignores until P2).
+          // top_k is now HONORED by the daemon (folded into the nucleus on AR +
+          // DFlash + MTP); min_p remains carried-but-inert.
           if (typeof sendView.top_k === "number") genParams.top_k = sendView.top_k;
           if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
         }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
-        // Mirror the `hipfire run` path's per-model max_think_tokens
-        // propagation. Without this, models with thinking=on can consume
-        // the entire max_tokens budget inside a single <think>...</think>
-        // block, leaving message.content empty after the downstream strip.
-        // Reported in #74 with qwen3.6:27b returning empty content + full
-        // 8192 completion_tokens despite max_think_tokens=2048 in config.
-        // thinking=off: hard-suppress by capping to 1 token, same as
-        // enable_thinking=false. Overrides any per-model max_think_tokens.
+        // Serve API is UNCAPPED by default (OpenAI/o1 convention — the client
+        // bounds length via max_tokens). The CLI-chat think-budget preset is a
+        // chat convenience, NOT an API default: forwarding the bare "med" preset
+        // here made the daemon route EVERY thinking request to AR (its
+        // `budgeted_thinking_needs_ar` gate), which DISABLED DFlash/MTP through
+        // the serve — they can't continue past a *forced* </think> so a budget
+        // sends them to AR. So forward a budget only when the operator set one
+        // EXPLICITLY (raw max_think_tokens or a non-default thinking_budget);
+        // `reasoning_effort` still caps per-request below and thinking=off
+        // hard-suppresses. (#74 trade-off accepted per design: an uncapped
+        // thinking model on a SMALL max_tokens can return empty content, so
+        // clients should size max_tokens for the reasoning they ask for, or pass
+        // reasoning_effort. The `hipfire run`/chat paths keep the preset budget.)
         if (effective.thinking === "off") {
           genParams.max_think_tokens = 1;
-        } else if (effective.max_think_tokens > 0) {
+        } else if (effective.max_think_tokens > 0 && effective.max_think_explicit) {
           genParams.max_think_tokens = effective.max_think_tokens;
         }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
@@ -6619,6 +6742,26 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
       range: [1, 10], step: 1,
     },
+    speculation: {
+      label: "speculation",
+      desc: "Speculative decode selector (canonical). off = AR; auto = cascade dflash>mtp>ngram gated by the legacy mode knobs; dflash/mtp/ngram = force one.",
+      options: ["off", "auto", "ngram", "dflash", "mtp"],
+    },
+    ngram_mode: {
+      label: "ngram_mode",
+      desc: "Model-free n-gram drafter (byte-identical to AR). off = never; on = eligible in auto cascade + selectable; auto = last-resort when no dflash/mtp.",
+      options: ["off", "on", "auto"],
+    },
+    ngram_k: {
+      label: "ngram_k",
+      desc: "n-gram draft window K (2-32). Higher = more parallelism, diminishing acceptance past ~12.",
+      range: [2, 32], step: 1,
+    },
+    ngram_min_count: {
+      label: "ngram_min_count",
+      desc: "Minimum n-gram match count before the drafter proposes a continuation (1-10).",
+      range: [1, 10], step: 1,
+    },
     chat_template: {
       label: "chat_template",
       desc: "Path to a .j2/.jinja chat template → HIPFIRE_CHAT_TEMPLATE_FILE. Empty = engine default (model/bundled/embedded). For qwen3* a set path overrides the froggeric pillar (daemon warns, intentionally).",
@@ -7509,9 +7652,15 @@ switch (cmd) {
     const topPVal = takeFlagValue(rest, "--top-p");
     const repeatPenaltyVal = takeFlagValue(rest, "--repeat-penalty");
     const maxTokensVal = takeFlagValue(rest, "--max-tokens") ?? takeFlagValue(rest, "-n");
+    // Speculative-decode flags (llama.cpp-style). They lower into env so the
+    // per-model resolver in buildLoadMessage (env > flag > per-model > global)
+    // picks them up. `-md` implies the dflash mechanism unless --spec overrides.
+    const modelDraftVal = takeFlagValue(rest, "--model-draft", { allowDashValue: true }) ?? takeFlagValue(rest, "-md", { allowDashValue: true });
+    const draftMaxVal = takeFlagValue(rest, "--draft-max") ?? takeFlagValue(rest, "--draft");
+    const specVal = takeFlagValue(rest, "--spec") ?? takeFlagValue(rest, "--speculation");
     const model = rest[0];
     if (wantHelp || !model) {
-      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\"");
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
       process.exit(wantHelp ? 0 : EXIT.USAGE);
     }
     // Validate --kv-mode against the same allowlist config validation uses.
@@ -7521,9 +7670,29 @@ switch (cmd) {
     }
     // Validate numeric value-flags (takeFlagValue already rejected dangling /
     // dash-looking values; here we enforce numeric-ness).
-    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal]] as const) {
+    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal], ["--draft-max", draftMaxVal]] as const) {
       if (val !== null && isNaN(Number(val))) { console.error(`Error: ${name} requires a number, got '${val}'`); process.exit(1); }
     }
+    // Speculation flags lower into env. Ladder is env > flag, so a flag only
+    // fills a var the shell did NOT already export (an exported env wins).
+    if (specVal !== null) {
+      if (!["off", "auto", "ngram", "dflash", "mtp"].includes(specVal)) {
+        console.error(`Error: invalid --spec '${specVal}'. Valid: off, auto, ngram, dflash, mtp`);
+        process.exit(1);
+      }
+      if (process.env.HIPFIRE_SPECULATION === undefined) process.env.HIPFIRE_SPECULATION = specVal;
+    }
+    if (modelDraftVal !== null) {
+      if (process.env.HIPFIRE_DFLASH_DRAFT === undefined) process.env.HIPFIRE_DFLASH_DRAFT = modelDraftVal;
+      // -md implies dflash unless the user (or env) already picked a mechanism.
+      if (specVal === null && process.env.HIPFIRE_SPECULATION === undefined) process.env.HIPFIRE_SPECULATION = "dflash";
+      // A draft model is only used by the dflash mechanism; warn if another was selected.
+      const effSpec = process.env.HIPFIRE_SPECULATION;
+      if (effSpec && effSpec !== "dflash" && effSpec !== "auto") {
+        console.error(`[hipfire] --model-draft is ignored under speculation=${effSpec} (draft models only feed DFlash).`);
+      }
+    }
+    if (draftMaxVal !== null && process.env.HIPFIRE_DRAFT_MAX === undefined) process.env.HIPFIRE_DRAFT_MAX = String(Math.floor(Number(draftMaxVal)));
     const image = imageVal ?? undefined;
     const system = systemVal ?? undefined;
     const runCfg = resolveModelConfig(model);

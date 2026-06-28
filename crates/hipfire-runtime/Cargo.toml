@@ -73,6 +73,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
+# Inline-small token buffer for `spec::SpecStep::emit` — keeps the
+# autoregressive one-token-per-step path heap-alloc-free; only large
+# speculative windows spill to the heap.
+smallvec = "1"
 # GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
 # (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
 # then BPE each chunk independently; without that step the merge PQ runs

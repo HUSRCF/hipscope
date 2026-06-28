@@ -7,25 +7,27 @@
 mod carriers;
 pub use carriers::*;
 
+/// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
+/// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
+/// both `LoadedModel`/`ModelState` and the arch crates are in scope.
+pub mod spec_build;
+
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
-use hipfire_arch_qwen35::speculative::{
-    DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
-};
+use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
-use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource};
+use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -47,6 +49,44 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+
+    /// Borrow this model's spec-decode target out of `state`, arch-erased as a
+    /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
+    /// spec-decode path — it then only ever sees `&mut dyn SpecTarget`, never an
+    /// arch type. Default (AR-only carriers): `Err` WITHOUT touching `state` —
+    /// only an override may `state.take()`.
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err(format!("{}: spec-decode target unsupported", self.name()))
+    }
+
+    /// Construct this model's per-token spec-decode emitter from the
+    /// model-independent [`SpecEmitCtx`]. The arch's emitter extracts its own
+    /// grammar schema from `ctx.tools` (raw JSON) internally. Default: `Err`
+    /// (arch has no spec emitter).
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err(format!("{}: spec emitter unsupported", self.name()))
+    }
+}
+
+/// The single registry lookup the daemon's spec path routes through: resolve the
+/// carrier that claims `arch_id`, so the daemon never arch-matches for the
+/// spec-decode guard / emitter. `is_dir` is `false` here because every
+/// spec-capable arch is disjoint on the bare HFQ `arch_id` (qwen35 5|6, llama
+/// 0|1, qwen2 7, deepseek4 9) and all carriers ignore the dir flag; if a future
+/// arch needs HFQ-vs-dir disambiguation in the spec path, thread a retained
+/// `is_dir` from load time rather than re-deriving it here.
+pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
+    REGISTRY
+        .iter()
+        .copied()
+        .find(|c| c.claims_arch_id(arch_id, false))
 }
 
 // ─── Registry ─────────────────────────────────────────────────────────
@@ -113,34 +153,10 @@ impl Eviction {
     }
 }
 
-// ─── DDTree side state ────────────────────────────────────────────────
-
-/// Side state for DDTree-mode speculative decoding.
-pub struct DdtreeState {
-    pub post_seed_snap: DeltaNetSnapshot,
-    pub scratch: DdtreeScratch,
-    pub budget: usize,
-    pub topk: usize,
-    pub path_c_parent_pre_snap: DeltaNetSnapshot,
-    pub path_c_main_end_snap: DeltaNetSnapshot,
-}
-
-// ─── DFlash state ─────────────────────────────────────────────────────
-
-/// Optional DFlash speculative-decoding state.
-pub struct DflashState {
-    pub draft_config: DflashConfig,
-    pub draft_weights: DflashWeights,
-    pub draft_scratch: DflashScratch,
-    pub hidden_rb: HiddenStateRingBuffer,
-    pub verify_scratch: VerifyScratch,
-    pub target_snap: DeltaNetSnapshot,
-    pub gdn_tape: GdnTape,
-    pub target_hidden_host: Vec<f32>,
-    pub ctx_capacity: usize,
-    pub block_size: usize,
-    pub ddtree: Option<DdtreeState>,
-}
+// `DdtreeState`, `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
+// impl now live in `hipfire_arch_qwen35::dflash_spec` — all qwen35 + runtime
+// types, so the loader only constructs and routes them, never owns the DFlash
+// mechanics.
 
 // ─── AsstTurnCache ────────────────────────────────────────────────────
 
@@ -230,32 +246,27 @@ pub enum ModelState {
     Lfm2Moe(Lfm2MoeBundle),
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
+    Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
 }
 
-/// LFM2.5-MoE (arch_id=11) GPU bundle. `eos_tok` is resolved at load time and
-/// rides along so the generate path doesn't re-tokenize.
-pub struct Lfm2MoeBundle {
-    pub config: lfm2moe::config::Lfm2MoeConfig,
-    pub weights: lfm2moe::lfm2moe::Lfm2MoeWeights,
-    pub state: lfm2moe::lfm2moe::Lfm2MoeState,
-    pub eos_tok: u32,
-}
+/// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
+/// owns it so `impl SpecTarget for Lfm2MoeBundle` (the n-gram verify seam, incl.
+/// the conv-state snapshot/rollback) can live next to the forward it drives
+/// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
+/// resolved at load time and rides along so the generate path doesn't re-tokenize.
+pub use lfm2moe::Lfm2MoeBundle;
 
-/// MiniMax-M2 (arch_id=10) GPU bundle.
-pub struct MiniMaxBundle {
-    pub config: minimax::MiniMaxConfig,
-    pub weights: minimax::MiniMaxWeights,
-    pub state: minimax::MiniMaxState,
-    pub eos_tok: u32,
-}
+/// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
+/// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
+/// live next to the forward it drives (orphan rule). Field-identical to the
+/// prior loader-local struct (`config`/`weights`/`state`/`eos_tok`).
+pub use minimax::MiniMaxBundle;
 
-/// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle.
-pub struct Cohere2MoeBundle {
-    pub config: cohere2moe::Cohere2MoeConfig,
-    pub weights: cohere2moe::Cohere2MoeWeights,
-    pub state: cohere2moe::Cohere2MoeState,
-    pub eos_tok: u32,
-}
+/// Cohere2-MoE / North-Mini-Code (arch_id=12) GPU bundle. Re-exported from the
+/// arch crate, which owns it so `impl SpecTarget for Cohere2MoeBundle` (the
+/// n-gram verify seam) lives next to the forward it drives (orphan rule).
+/// Field-identical to the prior loader-local struct.
+pub use cohere2moe::Cohere2MoeBundle;
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
@@ -272,11 +283,13 @@ pub struct LoadedModel {
     pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 Flash state
-    pub deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
-    pub deepseek4_weights: Option<hipfire_arch_deepseek4::DeepseekV4Weights>,
-    pub deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
+    // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
+    // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
+    // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
+    // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
+    // models — the eos must be carried here (mirrors `minimax_eos_tok`).
     pub deepseek4_eos_tok: u32,
     // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
@@ -289,6 +302,13 @@ pub struct LoadedModel {
     pub mtp_mode: String,
     pub mtp_k: usize,
     pub mtp_weights_present: bool,
+    // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
+    // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
+    // present alongside the trunk. Persistent for the life of the model;
+    // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
+    // against it (so the recurrent MTP-KV never bleeds across requests). None
+    // for every other arch and for qwen35 trunks without an MTP head.
+    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
     // dots.ocr state
     pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
     pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
@@ -308,7 +328,12 @@ pub struct LoadedModel {
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
-    pub dflash: Option<DflashState>,
+    /// The model's speculative-decode drafter+verifier, when a draft model is
+    /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
+    /// DFlash chain / DDTree tree / future MTP). Replaces the old
+    /// `dflash: Option<DflashState>` field — the `DflashState` now lives inside
+    /// the `DflashSpeculator` impl behind this trait object.
+    pub speculator: Option<Box<dyn Speculator>>,
     pub chat_template: Option<String>,
     // Author-recommended sampling defaults, baked into the .hfq's
     // `generation_config` metadata and read at load time on the HFQ source
@@ -347,15 +372,13 @@ impl LoadedModel {
             kv_cache: None,
             dn_state: None,
             qwen2_state: None,
-            deepseek4_config: None,
-            deepseek4_weights: None,
-            deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
+            qwen35_mtp_head: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             vision_config: None,
@@ -372,7 +395,7 @@ impl LoadedModel {
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,
-            dflash: None,
+            speculator: None,
             chat_template,
             rec_temperature: None,
             rec_top_p: None,
@@ -412,6 +435,18 @@ impl LoadedModel {
         }
     }
 
+    /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
+    /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
+    /// `qwen2_state` direct field — that is None for plain qwen2 and is only
+    /// populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
+    /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
+    pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
+        match &mut self.state {
+            Some(ModelState::Qwen2(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Cohere2-MoE bundle if this model is arch_id=12, else None.
     pub fn cohere2moe(&self) -> Option<&Cohere2MoeBundle> {
         match &self.state {
@@ -423,6 +458,22 @@ impl LoadedModel {
     pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
         match &mut self.state {
             Some(ModelState::Cohere2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
+    /// (EP/pp ds4 keeps its state in `ep` (EpArch::Ds4), so this is None there.)
+    pub fn deepseek4(&self) -> Option<&hipfire_arch_deepseek4::Deepseek4Bundle> {
+        match &self.state {
+            Some(ModelState::Deepseek4(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
+        match &mut self.state {
+            Some(ModelState::Deepseek4(b)) => Some(b),
             _ => None,
         }
     }
@@ -667,7 +718,13 @@ fn finish_qwen35_load(
 
     // ── DFlash ─────────────────────────────────────────────────────
     let dflash = if let Some(dp) = ctx.draft_path {
-        match load_dflash_state(dp, physical_cap, config, dn_state, ctx.gpu) {
+        match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
+            dp,
+            physical_cap,
+            config,
+            dn_state,
+            ctx.gpu,
+        ) {
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
@@ -686,12 +743,129 @@ fn finish_qwen35_load(
     } else {
         None
     };
+    // ── qwen35 MTP head (opt-in, bundled .mq4-mtp only) ────────────
+    // Loaded ONLY when HIPFIRE_QWEN35_MTP=1, the trunk is a bundled `.mq4-mtp`
+    // file, no DFlash draft was requested (DFlash wins), eviction is None (the
+    // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
+    // here — not in build_speculator — because this is the only site with a
+    // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
+    let mtp = if dflash.is_none()
+        && eviction.is_none()
+        && matches!(arch_id, 5 | 6)
+        && std::env::var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
+        && ctx.path.ends_with(".mq4-mtp")
+    {
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
+            std::path::Path::new(ctx.path),
+            ctx.gpu,
+            ctx.max_seq,
+        ) {
+            Ok(Some(head)) => {
+                eprintln!(
+                    "  MTP head loaded from bundle: n_embd={} vocab={} (compressed_lm_head_draft={})",
+                    head.config.n_embd,
+                    head.config.vocab_size,
+                    head.weights.lm_head_draft.is_some(),
+                );
+                Some(head)
+            }
+            Ok(None) => {
+                eprintln!(
+                    "  HIPFIRE_QWEN35_MTP=1 but {} has no bundled MTP trailer — AR/n-gram only",
+                    ctx.path
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "  MTP head load failed ({}): {e} — AR/n-gram only",
+                    ctx.path
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
+    // else a bundled MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in)
+    // the model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
+    // it is still available for the struct literal below; `config`/`dn_state` are
+    // borrowed only for the n-gram arm's scratch construction (snapshot copied to
+    // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
+    let speculator = crate::spec_build::build_speculator(
+        arch_id,
+        dflash,
+        mtp,
+        eviction.is_none(),
+        physical_cap,
+        ctx.spec,
+    );
+
+    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
+    //
+    // Load the arch_id=21 MTP head when it is present either bundled in the
+    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
+    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
+    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
+    // the model serves via the unchanged DFlash/AR path. Failures here are
+    // non-fatal — log and continue with `qwen35_mtp_head = None`.
+    //
+    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
+    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
+    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
+        use hipfire_arch_qwen35::mtp_head;
+        let trunk_path = Path::new(ctx.path);
+        // 1. Bundled trailer inside the trunk file?
+        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
+                None
+            }
+        };
+        match bundled {
+            Some(h) => {
+                eprintln!(
+                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
+                    h.config.n_embd, h.config.vocab_size
+                );
+                Some(h)
+            }
+            None => {
+                // 2. Sidecar `<trunk>.mtp` next to the model path?
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            Some(h)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
+                                sidecar.display()
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    };
 
     let state = Some(ModelState::Qwen35(bundle));
-    Ok(LoadedModel {
+    let mut model = LoadedModel {
         state,
         eviction,
-        dflash,
+        speculator,
         vision_config,
         vision_weights,
         max_seq: ctx.max_seq,
@@ -703,13 +877,20 @@ fn finish_qwen35_load(
             ctx.path.to_string(),
             chat_template,
         )
-    })
+    };
+    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
+    // ds4 probe set in the daemon's load handler). For qwen35 the presence of a
+    // loaded MTP head IS the signal.
+    model.mtp_weights_present = qwen35_mtp_head.is_some();
+    model.qwen35_mtp_head = qwen35_mtp_head;
+    Ok(model)
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
+#[allow(clippy::too_many_arguments)]
 pub fn load_model(
     path: &str,
     max_seq: usize,
@@ -719,9 +900,24 @@ pub fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
+    spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
+
+    // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
+    // `generation_config`). Extract HERE, from the already-open source, BEFORE the
+    // carrier allocates any GPU buffers. The `metadata_json` parse churns the host
+    // heap; doing it AFTER allocation but BEFORE the first-warmup AR hipGraph
+    // capture perturbs buffer placement and — on gfx12 / ROCm 7.2, which snapshots
+    // kernarg/buffer addresses at graph-instantiate — makes the captured graph
+    // replay ~2× slower (gfx12 MoE A3B 99→50; bisected to config-inheritance commit
+    // 2a7a1c8b). Parsing pre-allocation lets the heap settle. HFQ sources only;
+    // raw-safetensors PP carries no generation_config.
+    let rec_sampling = match &src {
+        ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
+        _ => None,
+    };
 
     // DFlash lm_head quant check — only for HFQ sources
     if draft_path.is_some() {
@@ -803,6 +999,7 @@ pub fn load_model(
         state_quant_override,
         cask,
         pp,
+        spec,
         gpu,
     };
 
@@ -825,21 +1022,13 @@ pub fn load_model(
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
-    // Author-recommended sampling defaults: pull temperature / top_p / top_k from
-    // the .hfq's baked `generation_config` so the generate handler can fall back
-    // to them when the request omits a knob. HFQ sources only — the raw
-    // safetensors PP path carries no generation_config, so rec_* stay `None`
-    // there. min_p / presence_penalty are not in generation_config (request-only),
-    // so they remain `None`. Re-open the source by path (cheap: header parse only,
-    // no weight upload) since the carrier consumed `src`.
-    if matches!(ModelSource::from_path(path), Ok(ModelSource::Hfq(_))) {
-        if let Ok(hfq) = HfqFile::open(Path::new(path)) {
-            if let Some(rec) = hfq.recommended_sampling() {
-                result.rec_temperature = rec.temperature;
-                result.rec_top_p = rec.top_p;
-                result.rec_top_k = rec.top_k.map(|k| k as f32);
-            }
-        }
+    // Apply the author-recommended sampling extracted pre-allocation (see above).
+    // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
+    // is the gfx12 hipGraph-replay regression root-caused above.
+    if let Some(rec) = rec_sampling {
+        result.rec_temperature = rec.temperature;
+        result.rec_top_p = rec.top_p;
+        result.rec_top_k = rec.top_k.map(|k| k as f32);
     }
     Ok(result)
 }
@@ -890,130 +1079,6 @@ fn load_cohere2moe(
 }
 
 // ─── MMQ screening ────────────────────────────────────────────────────
-
-// ─── DFlash state load ────────────────────────────────────────────────
-
-fn load_dflash_state(
-    draft_path: &str,
-    ctx_capacity: usize,
-    target_config: &qwen35::Qwen35Config,
-    target_dn: &DeltaNetState,
-    gpu: &mut Gpu,
-) -> Result<DflashState, String> {
-    use hipfire_arch_qwen35::qwen35::LayerType;
-    use hipfire_arch_qwen35::speculative::{
-        DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
-    };
-    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
-    let draft_config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let draft_weights =
-        DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
-    let block_size = draft_config.block_size;
-    let max_n = block_size + 1;
-    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
-    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
-    // refactor regressed this to the `with_mq=false` `::new` constructor →
-    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = DflashScratch::new_with_mq(
-        gpu,
-        &draft_config,
-        block_size,
-        ctx_capacity,
-        draft_weights.has_mq,
-    )
-    .map_err(|e| format!("{e}"))?;
-    let _ = draft_hfq;
-    // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
-    // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
-    // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
-    // chunks of up to `PREFILL_MAX_BATCH` and captures each into staging via
-    // `write_rows_to_staging` (whose `n <= max_batch` guard is a debug_assert,
-    // silent in release). Sizing staging to only `max_n` overflowed the d2d
-    // copy on any prompt longer than block_size+1 tokens. Size it to the
-    // larger of the two so both paths fit.
-    let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    let hidden_rb = HiddenStateRingBuffer::new(
-        gpu,
-        target_config.n_layers,
-        draft_config.num_extract(),
-        target_config.dim,
-        ctx_capacity,
-        staging_max_batch,
-    )
-    .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
-    let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = VerifyScratch::with_prefill(
-        gpu,
-        max_n,
-        target_config.dim,
-        target_config.vocab_size,
-        hidden_k,
-        target_config,
-    )
-    .map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
-    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-        .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?;
-    let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
-        .map_err(|e| format!("GdnTape::new_for_config: {e}"))?;
-    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
-    // DDTree
-    let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let ddtree = if ddtree_budget > 0 {
-        let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
-        let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
-            + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
-        let n_fa_layers = target_config
-            .layer_types
-            .iter()
-            .filter(|t| **t == LayerType::FullAttention)
-            .count();
-        let post_seed_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let scratch = DdtreeScratch::new(
-            gpu,
-            ddtree_budget,
-            target_config.n_kv_heads,
-            target_config.head_dim,
-            qkv_dim,
-            n_fa_layers,
-        )
-        .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
-        let path_c_parent_pre_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let path_c_main_end_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        Some(DdtreeState {
-            post_seed_snap,
-            scratch,
-            budget: ddtree_budget,
-            topk,
-            path_c_parent_pre_snap,
-            path_c_main_end_snap,
-        })
-    } else {
-        None
-    };
-    Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
-        verify_scratch,
-        target_snap,
-        gdn_tape,
-        target_hidden_host,
-        ctx_capacity,
-        block_size,
-        ddtree,
-    })
-}
 
 // ─── EP load functions ────────────────────────────────────────────────
 
@@ -1226,7 +1291,20 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    // Host-side metadata work (chat template + author-recommended sampling) BEFORE
+    // any GPU allocation / EP hipGraph capture. `recommended_sampling()` reparses
+    // the .hfq metadata_json (serde_json::from_str); doing that post-allocation but
+    // pre-capture churns the host heap and — on gfx12 / ROCm 7.2, which snapshots
+    // buffer addresses at graph-instantiate — slows the captured EP-decode graph
+    // replay. Same regression as load_model (gfx12 A3B 99→50), mirrored here for the
+    // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
+    // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
+    // captures + engages; this only settles the heap before it instantiates.
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1234,8 +1312,13 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     // Transactional partial-load: build per-rank weights/state/partials INTO the
     // staging guard. Every `?` below early-returns while `staging` is alive, so
     // its `Drop` frees the ranks already loaded.
@@ -1288,8 +1371,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             1
         }
     };
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
+    // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
@@ -1326,7 +1408,20 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let arch_id = hfq.arch_id;
     let n_exp = config.num_local_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    // Host-side metadata work (chat template + author-recommended sampling) BEFORE
+    // any GPU allocation / EP hipGraph capture. `recommended_sampling()` reparses
+    // the .hfq metadata_json (serde_json::from_str); doing that post-allocation but
+    // pre-capture churns the host heap and — on gfx12 / ROCm 7.2, which snapshots
+    // buffer addresses at graph-instantiate — slows the captured EP-decode graph
+    // replay. Same regression as load_model (gfx12 A3B 99→50), mirrored here for the
+    // minimax EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP
+    // graph itself (minimax forward.rs begin_graph_capture) is untouched — it still
+    // captures + engages; this only settles the heap before it instantiates.
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1334,8 +1429,13 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = MinimaxEpStaging::new(gpus);
@@ -1393,8 +1493,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             .or_else(|| try_one("<|endoftext|>"))
             .unwrap_or(1)
     };
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
+    // chat_template + rec extracted pre-allocation above (gfx12 hipGraph hazard).
     Ok(LoadedModel {
         ep: Some(EpState {
             gpus,
@@ -1516,6 +1615,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             | Some(ModelState::Lfm2Moe(_))
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Deepseek4(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1526,9 +1626,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
-    if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+    if let Some(spec) = m.speculator {
+        // Frees the drafter's GPU buffers (draft weights + scratch) AND its
+        // checkpoint ring — a drafter that forgets is a compile error, not a
+        // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
+        // empty) is still drained below for defense-in-depth.
+        spec.free(gpu);
+    }
+    if let Some(head) = m.qwen35_mtp_head {
+        head.free_gpu(gpu);
     }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
@@ -1575,22 +1681,22 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::Deepseek4(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
         }
     }
     // Non-core arch weights
     if let Some(s) = m.qwen2_state {
         s.free_gpu(gpu);
     }
-    if let Some(s) = m.deepseek4_state {
-        s.free_gpu(gpu);
-    }
+    // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
+    // its config/weights/state freed via ModelState::Deepseek4 above.
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
-    }
-    if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
     }
     // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
