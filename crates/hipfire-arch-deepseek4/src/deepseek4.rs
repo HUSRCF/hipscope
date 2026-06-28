@@ -243,6 +243,56 @@ impl DeepseekV4Config {
     }
 }
 
+/// DSpark draft-module config, parsed from the DSpark sidecar HFQ's metadata
+/// (the released DeepSeek-V4-Flash-DSpark `config.json` carries these `dspark_*`
+/// keys). Absent on the trunk and on plain MTP sidecars — `from_metadata_json`
+/// returns `None` when `dspark_block_size` is missing, so non-DSpark files are
+/// unaffected. The number of MTP stages is NOT taken from config (the released
+/// config reports `num_nextn_predict_layers=1` even though the shipped DSpark
+/// checkpoint has 3 `mtp.{0,1,2}` stages) — the loader probes the tensor index
+/// instead. See docs/design/2026-06-28-dspark-deepseek4-forward-spec.md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsparkConfig {
+    /// Draft block width (slots predicted per step). V4-Flash: 5.
+    pub block_size: usize,
+    /// Target residual-stream layers whose HC-mean-pooled hidden states are
+    /// concatenated and fed through `main_proj`. V4-Flash: [40, 41, 42].
+    pub target_layer_ids: Vec<usize>,
+    /// Low-rank dim of the vanilla Markov bias head. V4-Flash: 256.
+    pub markov_rank: usize,
+    /// Token id used to fill draft block slots 1.. (slot 0 = real token).
+    pub noise_token_id: u32,
+}
+
+impl DsparkConfig {
+    /// Parse from an HFQ `metadata_json` (the outer
+    /// `{"architecture":.., "config":{..}}` envelope). Returns `None` when the
+    /// `config` wrapper or `dspark_block_size` is absent (i.e. not a DSpark
+    /// sidecar), so callers can treat `None` as "plain MTP / no DSpark".
+    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
+        let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+        let cfg = wrapper.get("config")?;
+        let block_size = cfg.get("dspark_block_size")?.as_u64()? as usize;
+        if block_size == 0 {
+            return None;
+        }
+        let target_layer_ids = cfg
+            .get("dspark_target_layer_ids")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect::<Vec<_>>();
+        let markov_rank = cfg.get("dspark_markov_rank")?.as_u64()? as usize;
+        let noise_token_id = cfg.get("dspark_noise_token_id")?.as_u64()? as u32;
+        Some(Self {
+            block_size,
+            target_layer_ids,
+            markov_rank,
+            noise_token_id,
+        })
+    }
+}
+
 /// Parse `DeepseekV4Config` from a `ModelSource` (safetensors or HFQ).
 /// The `ModelSource`'s metadata JSON should contain the same outer
 /// `{"architecture":..., "config":{...}}` wrapper as the HFQ format.
@@ -1364,6 +1414,28 @@ mod tests {
         assert_eq!(raw.index_topk, 512);
         assert_eq!(raw.sliding_window, 128);
         assert_eq!(raw.compress_ratios.len(), 8);
+    }
+
+    #[test]
+    fn parses_dspark_config_and_skips_non_dspark() {
+        // DSpark sidecar metadata envelope (subset of the real config keys).
+        let dspark_meta = r#"{"architecture":"deepseek_v4","config":{
+            "dspark_block_size":5,
+            "dspark_target_layer_ids":[40,41,42],
+            "dspark_markov_rank":256,
+            "dspark_noise_token_id":128799}}"#;
+        let c = DsparkConfig::from_metadata_json(dspark_meta)
+            .expect("DSpark sidecar metadata must parse");
+        assert_eq!(c.block_size, 5);
+        assert_eq!(c.target_layer_ids, vec![40, 41, 42]);
+        assert_eq!(c.markov_rank, 256);
+        assert_eq!(c.noise_token_id, 128799);
+
+        // A trunk / plain-MTP metadata envelope (no dspark_* keys) → None.
+        let plain_meta = r#"{"architecture":"deepseek_v4","config":{"hidden_size":4096}}"#;
+        assert!(DsparkConfig::from_metadata_json(plain_meta).is_none());
+        // Missing config wrapper → None (not a panic).
+        assert!(DsparkConfig::from_metadata_json("{}").is_none());
     }
 
     /// Verify the parser handles the actual released DeepSeek V4 config.json
