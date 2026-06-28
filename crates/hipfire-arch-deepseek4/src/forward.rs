@@ -9500,8 +9500,21 @@ fn dspark_download_weight_f32(
                 })
                 .collect())
         }
+        DType::Q8_0 => {
+            // Q8_0: 34-byte blocks (f16 scale + 32 int8) over rows*cols values.
+            // The deepseek4-q8-mtp quant routes confidence_proj/markov to Q8F16
+            // (= DType::Q8_0 on device), so handle it here rather than forcing a
+            // re-quant. proj is tiny ([1, 4352]) → CPU dequant is cheap.
+            let n = rows * cols;
+            let nblocks = n.div_ceil(32);
+            let mut bytes = vec![0u8; nblocks * 34];
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &w.buf)
+                .map_err(|e| format!("dspark d2h weight q8_0: {e:?}"))?;
+            Ok(hipfire_runtime::llama::dequantize_q8_0(&bytes, n))
+        }
         other => Err(format!(
-            "dspark confidence_proj: unsupported dtype {other:?} (expected F16/F32)"
+            "dspark confidence_proj: unsupported dtype {other:?} (expected F16/F32/Q8_0)"
         )),
     }
 }
