@@ -1117,6 +1117,20 @@ pub struct DeepseekV4State {
     pub head_x_f16: Option<rdna_compute::GpuTensor>,
     pub head_logits_batch: Option<rdna_compute::GpuTensor>,
 
+    // ── DSpark draft-module state (lazy; only allocated when the DSpark
+    //    drafter is loaded and `dspark_forward` runs). ────────────────
+    /// Per-stage committed main_kv SWA ring `[n_kv, head_dim, window]`.
+    /// One ring per DSpark stage (each stage attends over its own
+    /// running main_kv history). Lazily allocated on first
+    /// `dspark_forward` call; `dspark_swa_k[s] == None` until then.
+    pub dspark_swa_k: Vec<Option<rdna_compute::GpuTensor>>,
+    /// Dedicated block-scratch (`max_batch >= block_size`) for the DSpark
+    /// 3-stage chain. Allocated once and reused across decode steps.
+    pub dspark_pbs: Option<crate::forward::PrefillBatchScratch>,
+    /// `main_x = main_norm(main_proj(main_hidden))` `[hidden]` — computed
+    /// once per `dspark_forward` (forward_embed) and shared by all stages.
+    pub dspark_main_x: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -1212,6 +1226,9 @@ impl DeepseekV4State {
             head_norm_batch: None,
             head_x_f16: None,
             head_logits_batch: None,
+            dspark_swa_k: Vec::new(),
+            dspark_pbs: None,
+            dspark_main_x: None,
             n_tokens: 0,
             _scaffold: (),
         })
@@ -1417,6 +1434,16 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.wo_a_out_rot);
         free_opt(gpu, &mut self.head_hc_pre);
         free_opt(gpu, &mut self.head_hc_out);
+        // DSpark draft-module state.
+        for ring in self.dspark_swa_k.drain(..) {
+            if let Some(t) = ring {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.dspark_main_x);
+        if let Some(pbs) = self.dspark_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
     }
 }
 

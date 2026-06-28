@@ -3299,23 +3299,33 @@ pub fn mtp_forward_batched(
     // The MTP layer has compress_ratio = 0 so attention_block_batched_swa_only
     // is the right path. Hash routing is N/A (mtp_layer_idx >= num_hash_layers).
     let n = batch_size;
+    let mtp_layer = weights.resolve_layer(mtp_layer_idx);
     mhc_pre_batched(
         cfg,
-        weights,
+        mtp_layer,
         pbs,
         gpu,
         mtp_layer_idx,
         /*is_attn=*/ true,
         n,
     )?;
-    q_lora_batched(cfg, weights, pbs, &pbs.hc_x_in_batch, gpu, mtp_layer_idx, n)?;
-    kv_joint_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n)?;
-    apply_tail_rope_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n)?;
+    q_lora_batched(
+        cfg,
+        mtp_layer,
+        pbs,
+        &pbs.hc_x_in_batch,
+        gpu,
+        mtp_layer_idx,
+        n,
+    )?;
+    kv_joint_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
+    apply_tail_rope_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
     attention_block_batched_swa_only(cfg, weights, state, pbs, gpu, mtp_layer_idx, start_pos, n)?;
     hc_attn_mix_batched(cfg, pbs, gpu, n)?;
+    let mtp_layer = weights.resolve_layer(mtp_layer_idx);
     mhc_pre_batched(
         cfg,
-        weights,
+        mtp_layer,
         pbs,
         gpu,
         mtp_layer_idx,
@@ -3326,7 +3336,16 @@ pub fn mtp_forward_batched(
     // not hash-routed (mtp_layer_idx >= num_hash_layers), so the value
     // is ignored. Pass an empty slice.
     let tokens_dummy: &[u32] = &[];
-    ffn_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n, tokens_dummy)?;
+    ffn_batched(
+        cfg,
+        mtp_layer,
+        pbs,
+        gpu,
+        mtp_layer_idx,
+        /*hash_routing=*/ false,
+        n,
+        tokens_dummy,
+    )?;
     hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
 
     // ── 9. Capture the LAST batch position's residual stream → mtp_last_hidden.
@@ -7311,14 +7330,14 @@ fn attention_block_batched_mixed(
 #[allow(dead_code)]
 fn ffn_batched(
     cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
+    hash_routing: bool,
     batch_size: usize,
     tokens: &[u32],
 ) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
     let ffn_norm = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
@@ -7429,7 +7448,7 @@ fn ffn_batched(
         return Ok(());
     }
     // Layers 0..num_hash_layers use STATIC tid2eid routing per upstream DeepSeek V4.
-    let hash_routing = layer_idx < cfg.num_hash_layers;
+    // For DSpark drafter stages the caller passes hash_routing=false (score-routed).
     if hash_routing && layer.tid2eid_host.is_empty() {
         return Ok(());
     }
@@ -7795,14 +7814,13 @@ fn hc_ffn_mix_batched(
 #[allow(dead_code)]
 fn mhc_pre_batched(
     cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
     is_attn: bool,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
     let (hc_fn, hc_base, hc_scale) = if is_attn {
         (
             layer.hc_attn_fn.as_ref().unwrap(),
@@ -7886,13 +7904,12 @@ fn mhc_pre_batched(
 #[allow(dead_code)]
 fn apply_tail_rope_batched(
     cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
 
@@ -7929,13 +7946,12 @@ fn apply_tail_rope_batched(
 #[allow(dead_code)]
 fn kv_joint_batched(
     cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
     let wkv = layer
         .wkv
         .as_ref()
@@ -7991,14 +8007,13 @@ fn kv_joint_batched(
 #[allow(dead_code, clippy::too_many_arguments)]
 fn q_lora_batched(
     cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     hc_x_in_batch: &GpuTensor, // [B, hidden]
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
     let attn_norm = layer
         .attn_norm
         .as_ref()
@@ -8284,25 +8299,26 @@ pub fn forward_prefill_batch_chunk(
     // staging + indexer top-K gather + wo_a/wo_b O-LoRA projection.
     for layer_idx in 0..cfg.num_hidden_layers {
         // Attention-side HC pre + per-stream input mapping.
-        mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/ true, n)?;
+        let layer = weights.resolve_layer(layer_idx);
+        mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, /*is_attn=*/ true, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "03_l0_mhc_pre_attn_hc_x_in", &pbs.hc_x_in_batch);
         }
 
         // Q-LoRA: pbs.hc_x_in_batch → tmp/tmp_plain → q_lat → q_batch.
-        q_lora_batched(cfg, weights, pbs, &pbs.hc_x_in_batch, gpu, layer_idx, n)?;
+        q_lora_batched(cfg, layer, pbs, &pbs.hc_x_in_batch, gpu, layer_idx, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "04_l0_q_lora_q_batch", &pbs.q_batch);
         }
 
         // Joint KV projection: tmp/tmp_plain → kv_batch.
-        kv_joint_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+        kv_joint_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "05_l0_kv_joint_kv_batch", &pbs.kv_batch);
         }
 
         // Tail-only RoPE on q_batch and kv_batch in-place.
-        apply_tail_rope_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+        apply_tail_rope_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "06_l0_tail_rope_q_batch", &pbs.q_batch);
             dump_buf(gpu, "06_l0_tail_rope_kv_batch", &pbs.kv_batch);
@@ -8310,7 +8326,6 @@ pub fn forward_prefill_batch_chunk(
 
         // ── Attention block: pure-SWA for compress_ratio==0, mixed
         //    (SWA + indexer/identity topk) for compress_ratio>0.
-        let layer = weights.resolve_layer(layer_idx);
         if layer.compress_ratio == 0 {
             attention_block_batched_swa_only(
                 cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
@@ -8330,13 +8345,12 @@ pub fn forward_prefill_batch_chunk(
 
         // FFN side: mhc_pre(is_attn=false) → ffn_batched (shared + routed)
         // → hc_ffn_mix_batched.
-        mhc_pre_batched(
-            cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/ false, n,
-        )?;
+        mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, /*is_attn=*/ false, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "09_l0_mhc_pre_ffn_hc_x_in", &pbs.hc_x_in_batch);
         }
-        ffn_batched(cfg, weights, pbs, gpu, layer_idx, n, tokens)?;
+        let hash_routing = layer_idx < cfg.num_hash_layers;
+        ffn_batched(cfg, layer, pbs, gpu, layer_idx, hash_routing, n, tokens)?;
         if layer_idx == 0 {
             dump_buf(gpu, "10_l0_ffn_out", &pbs.ffn_out_batch);
         }
@@ -8517,6 +8531,853 @@ pub fn prefill_with_mtp_fill(
         }
     }
     Ok(last_logits)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  DSpark draft-module forward
+//  (additive — see docs/design/2026-06-28-dspark-deepseek4-forward-spec.md)
+// ════════════════════════════════════════════════════════════════════════
+
+/// One block of DSpark draft output. Filled by [`dspark_forward`].
+///
+/// - `tokens`   — `block_size` drafted token ids (the markov sequential
+///                sampling output, slots `1..=block_size`).
+/// - `logits`   — flattened `[block_size, vocab]` per-slot logits (post
+///                markov bias). Useful for a downstream verifier; may be
+///                left empty by callers that only need `tokens`.
+/// - `confidence` — `[block_size]` per-slot confidence scalars from the
+///                  confidence head.
+pub struct DraftResult {
+    pub tokens: Vec<u32>,
+    pub logits: Vec<f32>,
+    pub confidence: Vec<f32>,
+}
+
+/// Single-token embedding lookup into row 0 of `out` (`[dim]` F32),
+/// dispatching on the embedding-table dtype. Mirrors the dtype handling
+/// the head / MTP paths use. Supports the formats DSpark sidecars ship
+/// the trunk `token_embd` in (Q8_0 / HFQ4G256 / F16 / F32).
+fn dspark_embed_one(
+    gpu: &mut Gpu,
+    table: &GpuTensor,
+    out: &GpuTensor,
+    token_id: u32,
+    dim: usize,
+) -> Result<(), String> {
+    match table.dtype {
+        DType::Q8_0 => gpu
+            .embedding_lookup_q8(table, out, token_id, dim)
+            .map_err(|e| format!("dspark embed q8: {e:?}")),
+        DType::F32 => gpu
+            .embedding_lookup(table, out, token_id, dim)
+            .map_err(|e| format!("dspark embed f32: {e:?}")),
+        DType::Raw => gpu
+            .embedding_lookup_hfq4g256(table, out, token_id, dim)
+            .map_err(|e| format!("dspark embed hfq4g256: {e:?}")),
+        DType::F16 => {
+            // No single-row F16 lookup kernel — extract the row to host,
+            // convert F16→F32, upload into `out`. Cheap (dim ≤ 4096).
+            let mut row_bytes = vec![0u8; dim * 2];
+            let off = (token_id as usize) * dim * 2;
+            gpu.hip
+                .memcpy_dtoh_at(&mut row_bytes, &table.buf, off)
+                .map_err(|e| format!("dspark embed f16 dtoh: {e:?}"))?;
+            let row_f32: Vec<f32> = (0..dim)
+                .map(|i| {
+                    let h = u16::from_le_bytes([row_bytes[i * 2], row_bytes[i * 2 + 1]]);
+                    hipfire_runtime::llama::f16_to_f32(h)
+                })
+                .collect();
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(row_f32.as_ptr() as *const u8, dim * 4) };
+            gpu.hip
+                .memcpy_htod(&out.buf, bytes)
+                .map_err(|e| format!("dspark embed f16 htod: {e:?}"))
+        }
+        other => Err(format!("dspark embed: unsupported table dtype {other:?}")),
+    }
+}
+
+/// DSpark draft forward: a 3-stage MTP chain over a `block_size`-slot noise
+/// block, producing `block_size` draft tokens.
+///
+/// The crux is the bidirectional draft attention: all `block_size` block
+/// slots attend over the SAME key window — the committed main_kv ring plus
+/// the `block_size` block KVs. We reuse the existing
+/// [`Gpu::deepseek4_attn_swa_batched`] kernel with a CUSTOM bidirectional
+/// stager: for every query row `b` we stage `[committed main_kv (n_committed)
+/// ++ block_size block kv]` and set `n_valid_arr[b] = n_committed + block_size`.
+/// The kernel then does dense attention of each query over those keys.
+///
+/// Inputs:
+///   - `main_hidden` `[3 * hidden]` — the 3 target layers' HC-mean-pooled
+///     hidden states concatenated (captured in the trunk forward).
+///   - `token_embd`  — the TRUNK token-embedding table (DSpark sidecars
+///     don't carry their own embedding).
+///   - `head` / `output_norm` — the TRUNK lm_head + its output norm.
+///   - `prev_token` / `position` — the committed token and its absolute
+///     KV position (the block predicts positions `position+1 ..= +block_size`).
+///
+/// Additive: touches no existing `mtp_forward` / `forward_prefill_*` path.
+/// Per-stage main_kv rings live in `state.dspark_swa_k`; the block scratch
+/// in `state.dspark_pbs`; `main_x` in `state.dspark_main_x`.
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_forward(
+    cfg: &DeepseekV4Config,
+    dspark: &crate::deepseek4::DsparkWeights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    main_hidden: &GpuTensor, // [3 * hidden]
+    token_embd: &GpuTensor,
+    head: &GpuTensor,
+    output_norm: &GpuTensor,
+    prev_token: u32,
+    position: u32,
+) -> Result<DraftResult, String> {
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_kv = cfg.num_key_value_heads;
+    let n_groups = cfg.o_groups;
+    let win = cfg.sliding_window;
+    let vocab = cfg.vocab_size;
+    let block = dspark.cfg.block_size;
+    let n_stages = dspark.stages.len();
+    if n_stages == 0 {
+        return Err("dspark_forward: no stages loaded".to_string());
+    }
+    let kv_dim = n_kv * head_dim;
+
+    // committed main_kv history visible to this step (ring fill level).
+    let n_committed = (position as usize + 1).min(win);
+    // custom-stager width: committed window + the block KVs.
+    let stage_w = win + block;
+    if n_committed + block > 1024 {
+        // deepseek4_attn_swa_batched LDS scores buffer caps at MAX_WINDOW=1024.
+        return Err(format!(
+            "dspark_forward: n_valid {} exceeds kernel MAX_WINDOW 1024",
+            n_committed + block
+        ));
+    }
+
+    // ── Ensure async stream + per-call scratch ──────────────────────────
+    if gpu.active_stream.is_none() {
+        let s = gpu
+            .hip
+            .stream_create()
+            .map_err(|e| format!("dspark stream_create: {e:?}"))?;
+        gpu.active_stream = Some(s);
+    }
+
+    // Block scratch — allocate once, reuse across decode steps.
+    if state.dspark_pbs.is_none() {
+        state.dspark_pbs = Some(PrefillBatchScratch::new(gpu, cfg, block.max(8))?);
+    }
+    // Per-stage main_kv rings — lazy.
+    if state.dspark_swa_k.len() != n_stages {
+        state.dspark_swa_k = (0..n_stages).map(|_| None).collect();
+    }
+    for s in 0..n_stages {
+        if state.dspark_swa_k[s].is_none() {
+            state.dspark_swa_k[s] = Some(
+                gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                    .map_err(|e| format!("dspark alloc ring[{s}]: {e:?}"))?,
+            );
+        }
+    }
+
+    // ── A. forward_embed (once) ─────────────────────────────────────────
+    // main_x = main_norm(main_proj(main_hidden)). main_proj: [hidden, 3*hidden].
+    let main_proj = dspark
+        .main_proj
+        .as_ref()
+        .ok_or("dspark_forward: main_proj missing")?;
+    let main_norm = dspark
+        .main_norm
+        .as_ref()
+        .ok_or("dspark_forward: main_norm missing")?;
+    if state.dspark_main_x.is_none() {
+        state.dspark_main_x = Some(
+            gpu.alloc_tensor(&[hidden], DType::F32)
+                .map_err(|e| format!("dspark alloc main_x: {e:?}"))?,
+        );
+    }
+    {
+        // main_proj GEMV: main_hidden[3*hidden] → tmp[hidden].
+        // main_proj/main_hidden may need FWHT for MQ4 weights — for F32/Q8/F16
+        // gemv_auto reads the plain input. We pre-rotate when needed.
+        let main_x = state.dspark_main_x.as_ref().unwrap().shallow_clone();
+        let three_h = 3 * hidden;
+        if weight_needs_fwht(main_proj) {
+            // Rotate main_hidden into a scratch, then GEMV. Reuse a per-call buffer.
+            let rot = gpu
+                .alloc_tensor(&[three_h], DType::F32)
+                .map_err(|e| format!("dspark alloc main_proj rot: {e:?}"))?;
+            gpu.rotate_x_mq(main_hidden, &rot, three_h)
+                .map_err(|e| format!("dspark rotate main_hidden: {e:?}"))?;
+            gemv_auto(gpu, main_proj, &rot, main_hidden, &main_x, hidden, three_h)?;
+            let _ = gpu.free_tensor(rot);
+        } else {
+            gemv_auto(
+                gpu,
+                main_proj,
+                main_hidden,
+                main_hidden,
+                &main_x,
+                hidden,
+                three_h,
+            )?;
+        }
+        // main_norm RMSNorm in place.
+        gpu.rmsnorm_f32(&main_x, main_norm, &main_x, cfg.rms_norm_eps)
+            .map_err(|e| format!("dspark main_norm: {e:?}"))?;
+    }
+
+    // noise block ids: [prev_token, noise, noise, ...] (block_size slots).
+    let mut block_ids = vec![dspark.cfg.noise_token_id; block];
+    block_ids[0] = prev_token;
+
+    // Embed each block id into pbs.embed_batch rows, then broadcast → streams.
+    {
+        let pbs = state.dspark_pbs.as_ref().unwrap();
+        for (b, &tid) in block_ids.iter().enumerate() {
+            let row = pbs.embed_batch.sub_offset(b * hidden, hidden);
+            dspark_embed_one(gpu, token_embd, &row, tid, hidden)?;
+        }
+        gpu.hc_streams_init_from_embed_batched(
+            &pbs.embed_batch,
+            &pbs.streams_batch,
+            hidden as i32,
+            hc_mult as i32,
+            block as i32,
+        )
+        .map_err(|e| format!("dspark hc_streams_init: {e:?}"))?;
+
+        // Block-slot positions: position+1 ..= position+block (shared by q +
+        // block-kv RoPE). Uploaded once; reused by every stage.
+        let pos_host: Vec<i32> = (0..block).map(|i| position as i32 + 1 + i as i32).collect();
+        let pos_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.positions.buf, pos_bytes)
+            .map_err(|e| format!("dspark htod block positions: {e:?}"))?;
+
+        // n_valid_arr[b] = n_committed + block for all b (dense / bidirectional).
+        let nv_host: Vec<i32> = vec![(n_committed + block) as i32; block];
+        let nv_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(nv_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, nv_bytes)
+            .map_err(|e| format!("dspark htod n_valid: {e:?}"))?;
+    }
+
+    // Per-call custom staging buffer [block, head_dim, stage_w].
+    let staged = gpu
+        .alloc_tensor(&[block, head_dim, stage_w], DType::F32)
+        .map_err(|e| format!("dspark alloc staged: {e:?}"))?;
+
+    // ── B. 3-stage chain ────────────────────────────────────────────────
+    for s in 0..n_stages {
+        let layer = &dspark.stages[s];
+
+        // 1. attn-side HC pre + per-stream input map → hc_x_in_batch.
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            mhc_pre_batched(
+                cfg, layer, pbs, gpu, /*layer_idx=*/ s, /*is_attn=*/ true, block,
+            )?;
+        }
+        // 2. block q from attn_norm(hc_x_in): writes pbs.tmp/tmp_plain + q_batch.
+        {
+            let hc_x_in = state
+                .dspark_pbs
+                .as_ref()
+                .unwrap()
+                .hc_x_in_batch
+                .shallow_clone();
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            q_lora_batched(cfg, layer, pbs, &hc_x_in, gpu, s, block)?;
+        }
+        // 3. block kv from the same attn_norm'd input (reads pbs.tmp*).
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            kv_joint_batched(cfg, layer, pbs, gpu, s, block)?;
+        }
+        // 4. tail RoPE on q_batch + block kv_batch at positions position+1..+block.
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            apply_tail_rope_batched(cfg, layer, pbs, gpu, s, block)?;
+        }
+
+        // 5. main_kv from main_x (n=1): kv_norm(wkv @ main_x); RoPE at `position`;
+        //    commit into this stage's ring at slot position % win.
+        {
+            let wkv = layer
+                .wkv
+                .as_ref()
+                .ok_or_else(|| format!("dspark stage {s} wkv missing"))?;
+            let kv_norm = layer
+                .kv_norm
+                .as_ref()
+                .ok_or_else(|| format!("dspark stage {s} kv_norm missing"))?;
+            let main_x = state.dspark_main_x.as_ref().unwrap().shallow_clone();
+            // main_kv scratch [kv_dim].
+            let main_kv = gpu
+                .alloc_tensor(&[kv_dim], DType::F32)
+                .map_err(|e| format!("dspark alloc main_kv: {e:?}"))?;
+            if weight_needs_fwht(wkv) {
+                let rot = gpu
+                    .alloc_tensor(&[hidden], DType::F32)
+                    .map_err(|e| format!("dspark alloc main_x rot: {e:?}"))?;
+                gpu.rotate_x_mq(&main_x, &rot, hidden)
+                    .map_err(|e| format!("dspark rotate main_x: {e:?}"))?;
+                gemv_auto(gpu, wkv, &rot, &main_x, &main_kv, kv_dim, hidden)?;
+                let _ = gpu.free_tensor(rot);
+            } else {
+                gemv_auto(gpu, wkv, &main_x, &main_x, &main_kv, kv_dim, hidden)?;
+            }
+            gpu.rmsnorm_f32(&main_kv, kv_norm, &main_kv, cfg.rms_norm_eps)
+                .map_err(|e| format!("dspark main_kv norm: {e:?}"))?;
+            // RoPE main_kv at absolute `position`. n_heads=0 → kv-only rotation.
+            let (fb, fs, ef, af, cl, ch) = layer_rope_params(cfg, layer.compress_ratio);
+            let pos1 = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("dspark alloc pos1: {e:?}"))?;
+            let pos_bytes = (position as i32).to_le_bytes();
+            gpu.memcpy_htod_auto(&pos1.buf, &pos_bytes)
+                .map_err(|e| format!("dspark htod pos1: {e:?}"))?;
+            gpu.rope_tail_yarn_interleaved_batched(
+                &main_kv,
+                &main_kv,
+                &pos1,
+                /*n_heads=*/ 0,
+                n_kv as i32,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                fb,
+                fs,
+                ef,
+                af,
+                cl,
+                ch,
+                /*inverse=*/ 0,
+                1,
+            )
+            .map_err(|e| format!("dspark main_kv rope: {e:?}"))?;
+            // Commit into the stage ring at slot position % win.
+            {
+                let ring = state.dspark_swa_k[s].as_ref().unwrap();
+                gpu.swa_ring_write_batched_f32(
+                    &main_kv,
+                    ring,
+                    n_kv as i32,
+                    head_dim as i32,
+                    win as i32,
+                    position as i32,
+                    1,
+                )
+                .map_err(|e| format!("dspark ring write[{s}]: {e:?}"))?;
+            }
+            let _ = gpu.free_tensor(pos1);
+            let _ = gpu.free_tensor(main_kv);
+        }
+
+        // 6. Custom bidirectional staging: for each of the block rows, copy
+        //    [ring committed window (n_committed cols) | block kv (block cols)]
+        //    into staged[b]. Assembled on host for correctness (the ring + block
+        //    KVs are F32). TODO(perf): replace with a GPU strided-copy kernel.
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            // Download the committed ring [n_kv*head_dim*win] (n_kv==1).
+            let ring = state.dspark_swa_k[s].as_ref().unwrap();
+            let ring_host = gpu
+                .download_f32(ring)
+                .map_err(|e| format!("dspark d2h ring[{s}]: {e:?}"))?;
+            // Download block kv [block, head_dim].
+            let block_kv_host = gpu
+                .download_f32(&pbs.kv_batch.sub_offset(0, block * kv_dim))
+                .map_err(|e| format!("dspark d2h block kv: {e:?}"))?;
+            // Assemble staged_host [block, head_dim, stage_w].
+            let mut staged_host = vec![0.0f32; block * head_dim * stage_w];
+            for b in 0..block {
+                for d in 0..head_dim {
+                    let dst_base = (b * head_dim + d) * stage_w;
+                    // committed cols 0..n_committed from ring[d, col].
+                    for c in 0..n_committed {
+                        staged_host[dst_base + c] = ring_host[d * win + c];
+                    }
+                    // block kv col n_committed..n_committed+block.
+                    for j in 0..block {
+                        staged_host[dst_base + n_committed + j] = block_kv_host[j * kv_dim + d];
+                    }
+                }
+            }
+            let staged_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(staged_host.as_ptr() as *const u8, staged_host.len() * 4)
+            };
+            gpu.memcpy_htod_auto(&staged.buf, staged_bytes)
+                .map_err(|e| format!("dspark htod staged: {e:?}"))?;
+        }
+
+        // 7. Dense (bidirectional) attention over staged keys + attn_sink.
+        {
+            let attn_sink = layer
+                .attn_sink
+                .as_ref()
+                .ok_or_else(|| format!("dspark stage {s} attn_sink missing"))?;
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            gpu.deepseek4_attn_swa_batched(
+                &pbs.q_batch,
+                &staged,
+                &staged,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                n_groups as i32,
+                /*window=*/ stage_w as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark attn[{s}]: {e:?}"))?;
+        }
+
+        // 8. inverse RoPE on attn_out, then wo_a + wo_b → attn_out_batch.
+        dspark_wo_project(cfg, layer, state, gpu, s, block)?;
+
+        // 9. hc_attn_mix.
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            hc_attn_mix_batched(cfg, pbs, gpu, block)?;
+        }
+
+        // 10. FFN side: mhc_pre(ffn) + ffn(score-routed) + hc_ffn_mix.
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            mhc_pre_batched(cfg, layer, pbs, gpu, s, /*is_attn=*/ false, block)?;
+            ffn_batched(
+                cfg,
+                layer,
+                pbs,
+                gpu,
+                s,
+                /*hash_routing=*/ false,
+                block,
+                &[],
+            )?;
+            hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
+        }
+    }
+    let _ = gpu.free_tensor(staged);
+
+    // ── C. forward_head (last stage) ────────────────────────────────────
+    let last = &dspark.stages[n_stages - 1];
+    dspark_forward_head(
+        cfg,
+        dspark,
+        last,
+        state,
+        gpu,
+        head,
+        output_norm,
+        prev_token,
+        block,
+        vocab,
+        hidden,
+        hc_mult,
+    )
+}
+
+/// Steps 6d–6e of the per-stage attention block (inverse RoPE + O-LoRA
+/// projection), adapted for DSpark: reads `pbs.attn_out_raw_batch`, writes
+/// `pbs.attn_out_batch`. Mirrors [`attention_block_batched_swa_only`] steps
+/// 5–9 with the DSpark stage's `wo_a`/`wo_b`.
+fn dspark_wo_project(
+    cfg: &DeepseekV4Config,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    stage: usize,
+    block: usize,
+) -> Result<(), String> {
+    let pbs = state.dspark_pbs.as_ref().unwrap();
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_groups = cfg.o_groups;
+    let o_lora_rank = cfg.o_lora_rank;
+    let groups_o_lora = n_groups * o_lora_rank;
+    let per_group_in = (n_heads / n_groups) * head_dim;
+
+    let wo_a = layer
+        .wo_a
+        .as_ref()
+        .ok_or_else(|| format!("dspark stage {stage} wo_a missing"))?;
+    let wo_b = layer
+        .wo_b
+        .as_ref()
+        .ok_or_else(|| format!("dspark stage {stage} wo_b missing"))?;
+
+    // 5. inverse tail RoPE on attn_out_raw (q-tail un-rotation).
+    let (fb, fs, ef, af, cl, ch) = layer_rope_params(cfg, layer.compress_ratio);
+    gpu.rope_tail_yarn_interleaved_batched(
+        &pbs.attn_out_raw_batch,
+        &pbs.attn_out_raw_batch,
+        &pbs.positions,
+        n_heads as i32,
+        0,
+        head_dim as i32,
+        cfg.qk_rope_head_dim as i32,
+        fb,
+        fs,
+        ef,
+        af,
+        cl,
+        ch,
+        /*inverse=*/ 1,
+        block as i32,
+    )
+    .map_err(|e| format!("dspark inv rope[{stage}]: {e:?}"))?;
+
+    // 6. FWHT rotate attn_out_raw → attn_out_raw_rot (MQ4 wo_a only).
+    if weight_needs_fwht(wo_a) {
+        gpu.rotate_x_mq_batched(
+            &pbs.attn_out_raw_batch,
+            &pbs.attn_out_raw_rot_batch,
+            n_heads * head_dim,
+            block,
+        )
+        .map_err(|e| format!("dspark rotate attn_out_raw[{stage}]: {e:?}"))?;
+    }
+
+    // 7. wo_a per-group batched (F32 / Q8_0 / MQ4).
+    match wo_a.dtype {
+        DType::F32 => gpu
+            .wo_per_group_batched_f32(
+                wo_a,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark wo_a f32[{stage}]: {e:?}"))?,
+        DType::Q8_0 => gpu
+            .wo_per_group_batched_q8_0(
+                wo_a,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark wo_a q8[{stage}]: {e:?}"))?,
+        DType::Raw => gpu
+            .wo_per_group_batched_hfq4g256(
+                wo_a,
+                &pbs.attn_out_raw_rot_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark wo_a hfq4g256[{stage}]: {e:?}"))?,
+        other => return Err(format!("dspark wo_a[{stage}]: unsupported dtype {other:?}")),
+    }
+
+    // 8. FWHT rotate wo_a_out → wo_a_out_rot (MQ4 wo_b only).
+    if weight_needs_fwht(wo_b) {
+        gpu.rotate_x_mq_batched(
+            &pbs.wo_a_out_batch,
+            &pbs.wo_a_out_rot_batch,
+            groups_o_lora,
+            block,
+        )
+        .map_err(|e| format!("dspark rotate wo_a_out[{stage}]: {e:?}"))?;
+    }
+
+    // 9. wo_b GEMV → attn_out_batch.
+    gemv_auto_batched_wmma(
+        gpu,
+        wo_b,
+        &pbs.wo_a_out_rot_batch,
+        &pbs.wo_a_out_batch,
+        &pbs.attn_out_batch,
+        cfg.hidden_size,
+        groups_o_lora,
+        block,
+        Some(&pbs.wmma_x_scratch_f16),
+    )?;
+    Ok(())
+}
+
+/// forward_head: head-HC (SIGMOID gate) → x_head[block, hidden]; lm_head
+/// over rmsnorm(x_head, mtp_final_norm) → logits[block, vocab]; sequential
+/// markov in-block sampling → block_size draft tokens; confidence head.
+#[allow(clippy::too_many_arguments)]
+fn dspark_forward_head(
+    cfg: &DeepseekV4Config,
+    dspark: &crate::deepseek4::DsparkWeights,
+    last: &crate::deepseek4::DeepseekV4LayerWeights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    head: &GpuTensor,
+    output_norm: &GpuTensor,
+    prev_token: u32,
+    block: usize,
+    vocab: usize,
+    hidden: usize,
+    hc_mult: usize,
+) -> Result<DraftResult, String> {
+    let markov_rank = dspark.cfg.markov_rank;
+
+    let hc_head_fn = last
+        .mtp_hc_head_fn
+        .as_ref()
+        .ok_or("dspark_forward_head: mtp_hc_head_fn missing")?;
+    let hc_head_base = last
+        .mtp_hc_head_base
+        .as_ref()
+        .ok_or("dspark_forward_head: mtp_hc_head_base missing")?;
+    let mtp_final_norm = last
+        .mtp_final_norm
+        .as_ref()
+        .ok_or("dspark_forward_head: mtp_final_norm missing")?;
+    let markov_w1 = dspark
+        .markov_w1
+        .as_ref()
+        .ok_or("dspark_forward_head: markov_w1 missing")?;
+    let markov_w2 = dspark
+        .markov_w2
+        .as_ref()
+        .ok_or("dspark_forward_head: markov_w2 missing")?;
+    let confidence_proj = dspark
+        .confidence_proj
+        .as_ref()
+        .ok_or("dspark_forward_head: confidence_proj missing")?;
+
+    // x_head[block, hidden] — head-HC sigmoid-gate reduction per slot.
+    let x_head = gpu
+        .alloc_tensor(&[block, hidden], DType::F32)
+        .map_err(|e| format!("dspark alloc x_head: {e:?}"))?;
+    // Per-slot head-HC pre [hc_mult] scratch.
+    let hc_pre = gpu
+        .alloc_tensor(&[hc_mult], DType::F32)
+        .map_err(|e| format!("dspark alloc head hc_pre: {e:?}"))?;
+    let x_dim = hidden * hc_mult;
+    {
+        let pbs = state.dspark_pbs.as_ref().unwrap();
+        let stream_len = hc_mult * hidden;
+        for b in 0..block {
+            let streams_b = pbs.streams_batch.sub_offset(b * stream_len, stream_len);
+            // pre = sigmoid(mixes * scale + base) + eps  (NOT sinkhorn).
+            gpu.hc_head_compute_pre(
+                &streams_b,
+                hc_head_fn,
+                hc_head_base,
+                &hc_pre,
+                hc_mult as i32,
+                x_dim as i32,
+                last.mtp_hc_head_scale,
+                cfg.rms_norm_eps,
+                cfg.hc_eps,
+            )
+            .map_err(|e| format!("dspark hc_head_compute_pre b{b}: {e:?}"))?;
+            // x_head[b] = sum_h pre[h] * streams[b, h, :].
+            let x_head_b = x_head.sub_offset(b * hidden, hidden);
+            gpu.hc_input_map_4stream(&hc_pre, &streams_b, &x_head_b, hidden as i32)
+                .map_err(|e| format!("dspark hc_input_map head b{b}: {e:?}"))?;
+        }
+    }
+    let _ = gpu.free_tensor(hc_pre);
+
+    // Download x_head once (needed for confidence concat) and keep on host.
+    let x_head_host = gpu
+        .download_f32(&x_head)
+        .map_err(|e| format!("dspark d2h x_head: {e:?}"))?;
+
+    // logits[block, vocab] = lm_head(rmsnorm(x_head, mtp_final_norm)).
+    let normed = gpu
+        .alloc_tensor(&[block, hidden], DType::F32)
+        .map_err(|e| format!("dspark alloc head normed: {e:?}"))?;
+    gpu.rmsnorm_batched(
+        &x_head,
+        mtp_final_norm,
+        &normed,
+        block,
+        hidden,
+        cfg.rms_norm_eps,
+    )
+    .map_err(|e| format!("dspark final rmsnorm: {e:?}"))?;
+    // output_norm is the trunk lm_head norm — applied after the per-stage
+    // mtp_final_norm? Spec uses head(norm(x)) with the stage's mtp_final_norm.
+    // We feed the stage-normed activation directly to the trunk lm_head.
+    let _ = output_norm;
+    let normed_rot = if weight_needs_fwht(head) {
+        let r = gpu
+            .alloc_tensor(&[block, hidden], DType::F32)
+            .map_err(|e| format!("dspark alloc normed_rot: {e:?}"))?;
+        gpu.rotate_x_mq_batched(&normed, &r, hidden, block)
+            .map_err(|e| format!("dspark rotate head input: {e:?}"))?;
+        Some(r)
+    } else {
+        None
+    };
+    let logits_dev = gpu
+        .alloc_tensor(&[block, vocab], DType::F32)
+        .map_err(|e| format!("dspark alloc logits: {e:?}"))?;
+    let x_f16 = gpu
+        .alloc_tensor(&[block * hidden], DType::F16)
+        .map_err(|e| format!("dspark alloc head x_f16: {e:?}"))?;
+    gemv_auto_batched_wmma(
+        gpu,
+        head,
+        normed_rot.as_ref().unwrap_or(&normed),
+        &normed,
+        &logits_dev,
+        vocab,
+        hidden,
+        block,
+        Some(&x_f16),
+    )?;
+    let mut logits_host = gpu
+        .download_f32(&logits_dev)
+        .map_err(|e| format!("dspark d2h logits: {e:?}"))?;
+    if let Some(r) = normed_rot {
+        let _ = gpu.free_tensor(r);
+    }
+    let _ = gpu.free_tensor(x_f16);
+    let _ = gpu.free_tensor(logits_dev);
+    let _ = gpu.free_tensor(normed);
+    let _ = gpu.free_tensor(x_head);
+
+    // ── Sequential markov in-block sampling (greedy) ────────────────────
+    // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
+    // markov_bias = markov_w2 @ markov_w1_lookup(out_ids[i]). markov_embed[i]
+    // (the [markov_rank] lookup) is also collected for the confidence head.
+    let mut out_ids = vec![prev_token; block + 1];
+    let mut markov_embeds: Vec<Vec<f32>> = Vec::with_capacity(block);
+    // Reusable device scratch for the markov head.
+    let emb_dev = gpu
+        .alloc_tensor(&[markov_rank], DType::F32)
+        .map_err(|e| format!("dspark alloc markov emb: {e:?}"))?;
+    let bias_dev = gpu
+        .alloc_tensor(&[vocab], DType::F32)
+        .map_err(|e| format!("dspark alloc markov bias: {e:?}"))?;
+    let emb_rot = if weight_needs_fwht(markov_w2) {
+        Some(
+            gpu.alloc_tensor(&[markov_rank], DType::F32)
+                .map_err(|e| format!("dspark alloc markov emb rot: {e:?}"))?,
+        )
+    } else {
+        None
+    };
+    for i in 0..block {
+        // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank].
+        dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
+        let emb_host = gpu
+            .download_f32(&emb_dev)
+            .map_err(|e| format!("dspark d2h markov emb {i}: {e:?}"))?;
+        markov_embeds.push(emb_host);
+        // bias = markov_w2 @ emb  ([vocab, markov_rank] · [markov_rank]).
+        let x_for_w2 = if let Some(r) = emb_rot.as_ref() {
+            gpu.rotate_x_mq(&emb_dev, r, markov_rank)
+                .map_err(|e| format!("dspark rotate markov emb {i}: {e:?}"))?;
+            r
+        } else {
+            &emb_dev
+        };
+        gemv_auto(
+            gpu,
+            markov_w2,
+            x_for_w2,
+            &emb_dev,
+            &bias_dev,
+            vocab,
+            markov_rank,
+        )?;
+        let bias_host = gpu
+            .download_f32(&bias_dev)
+            .map_err(|e| format!("dspark d2h markov bias {i}: {e:?}"))?;
+        // logits[i] += bias; argmax.
+        let row = &mut logits_host[i * vocab..(i + 1) * vocab];
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (t, l) in row.iter_mut().enumerate() {
+            *l += bias_host[t];
+            if *l > best_v {
+                best_v = *l;
+                best = t;
+            }
+        }
+        out_ids[i + 1] = best as u32;
+    }
+    let _ = gpu.free_tensor(emb_dev);
+    let _ = gpu.free_tensor(bias_dev);
+    if let Some(r) = emb_rot {
+        let _ = gpu.free_tensor(r);
+    }
+
+    // ── Confidence head: proj([x_head[i] ++ markov_embed[i]]) per slot ──
+    // confidence_proj: [1, hidden + markov_rank]. Compute on host (single
+    // dot-product per slot) — proj is tiny and downloading it once is cheap.
+    // TODO(perf): keep the GEMV on GPU once a [block, 1] confidence kernel
+    // is wired; CPU dot is fine for correctness.
+    let proj_in = hidden + markov_rank;
+    let proj_host = dspark_download_weight_f32(gpu, confidence_proj, 1, proj_in)?;
+    let mut confidence = vec![0.0f32; block];
+    for i in 0..block {
+        let mut acc = 0.0f32;
+        for d in 0..hidden {
+            acc += proj_host[d] * x_head_host[i * hidden + d];
+        }
+        for d in 0..markov_rank {
+            acc += proj_host[hidden + d] * markov_embeds[i][d];
+        }
+        confidence[i] = acc;
+    }
+
+    Ok(DraftResult {
+        tokens: out_ids[1..=block].to_vec(),
+        logits: logits_host,
+        confidence,
+    })
+}
+
+/// Download a `[rows, cols]` weight as F32, dispatching on dtype. Used for
+/// the tiny confidence-head projection where a CPU dot-product is simplest.
+/// Supports F32 / F16 (Q8_0 / MQ4 confidence projections are not expected —
+/// the head ships F16/F32 — and error out clearly if encountered).
+fn dspark_download_weight_f32(
+    gpu: &Gpu,
+    w: &GpuTensor,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, String> {
+    match w.dtype {
+        DType::F32 => gpu
+            .download_f32(w)
+            .map_err(|e| format!("dspark d2h weight f32: {e:?}")),
+        DType::F16 => {
+            let n = rows * cols;
+            let mut bytes = vec![0u8; n * 2];
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &w.buf)
+                .map_err(|e| format!("dspark d2h weight f16: {e:?}"))?;
+            Ok((0..n)
+                .map(|i| {
+                    hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                        bytes[i * 2],
+                        bytes[i * 2 + 1],
+                    ]))
+                })
+                .collect())
+        }
+        other => Err(format!(
+            "dspark confidence_proj: unsupported dtype {other:?} (expected F16/F32)"
+        )),
+    }
 }
 
 /// CPU reference implementation of bias-aware top-k: picks the `k` highest
