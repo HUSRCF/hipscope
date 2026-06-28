@@ -327,9 +327,21 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
         // The verify forward wrote ring slots position..position+n_proposed using
         // (possibly rejected) drafts; only the first committed.len() are real.
         // The next window's bootstrap forward overwrites the next-seed slot.
+        //
+        // NOTE: the next seed (committed.last() = the verifier's bonus) is the one
+        // token never run through the trunk, so its [40,41,42] main_hidden is NOT
+        // in the capture buffer — we force a fresh 1-token bootstrap forward next
+        // window. We tried folding this away (Lever 2): emit only the accepted
+        // prefix and seed the next window from the last accepted token, whose
+        // main_hidden IS captured (dspark_caps[a]), re-proposing the bonus as the
+        // next window's first draft. It is correct and coherent but a measured
+        // LOSS (short prompt 10.6→8.8, code 13.8→12.9 tok/s): DSpark's verify is a
+        // full 43-layer MoE trunk pass that dominates the cheap 1-token bootstrap,
+        // so dropping the free bonus (≈ −1 token/window ⇒ ~1.4× more expensive
+        // verify forwards) costs more than the bootstrap saves. The free bonus is
+        // worth more than the bootstrap is expensive — so we keep the 2-forward
+        // shape. See the branch bench notes.
         bundle.state.n_tokens = (position + committed.len()) as u64;
-        // The next seed (committed.last()) is a fresh token — its main_hidden is
-        // NOT in the capture buffer, so force a bootstrap next window.
         self.main_hidden_pos = None;
 
         Ok(MtpWindow {
