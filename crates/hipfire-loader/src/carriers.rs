@@ -834,30 +834,44 @@ impl Carrier for Deepseek4Carrier {
         // per-request spec gate (mtp_mode / HIPFIRE_DEEPSEEK4_SPEC_DECODE / temp<=eps) stays in
         // the generate path (T4 routing) — here we only build the capability. Undriven until T4:
         // the daemon's arch_id==9 branch still uses the bespoke generate_deepseek4 loop.
-        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> =
-            if weights.mtp_layer.is_some() {
-                // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
-                // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-                let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| {
-                        std::env::var("HIPFIRE_MTP_K")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                    })
-                    .unwrap_or(2);
-                let ctx_capacity = config.max_position_embeddings;
-                eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
-                Some(
-                    hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator(
-                        max_n,
-                        ctx_capacity,
-                    ),
-                )
-            } else {
-                None
-            };
+        // DSpark draft module (the `-dspark` sidecar) wins over the in-trunk MTP
+        // layer when present. Default-ON when the sidecar loaded; opt out with
+        // HIPFIRE_DEEPSEEK4_DSPARK=0 to force the plain MTP path for A/B.
+        let dspark_enabled = weights.dspark.is_some()
+            && std::env::var("HIPFIRE_DEEPSEEK4_DSPARK").ok().as_deref() != Some("0");
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if dspark_enabled {
+            let block = weights.dspark.as_ref().unwrap().cfg.block_size;
+            let ctx_capacity = config.max_position_embeddings;
+            eprintln!("  deepseek4 DSpark speculator enabled (sidecar, block={block})");
+            Some(
+                hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator(
+                    block,
+                    ctx_capacity,
+                ),
+            )
+        } else if weights.mtp_layer.is_some() {
+            // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
+            // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
+            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    std::env::var("HIPFIRE_MTP_K")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(2);
+            let ctx_capacity = config.max_position_embeddings;
+            eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
+            Some(
+                hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator(
+                    max_n,
+                    ctx_capacity,
+                ),
+            )
+        } else {
+            None
+        };
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
                 config,
