@@ -293,6 +293,50 @@ impl DsparkConfig {
     }
 }
 
+/// GPU-resident weights for the DSpark 3-stage draft module. Loaded from
+/// the separate `<stem>-dspark.<ext>` sidecar (arch_id=9), additive to the
+/// trunk's single-stage `DeepseekV4Weights::mtp_layer` — they coexist.
+///
+/// Each `stages[s]` is a full `DeepseekV4LayerWeights` carrying that stage's
+/// dense attention + FFN + HC + routed experts under the `mtp.{s}` prefix.
+/// DSpark stages have NO enorm/hnorm/e_proj/h_proj (those are MTP-only); the
+/// last stage additionally stores the head-HC mix (`mtp_hc_head_*`) and the
+/// final norm (`mtp_final_norm`) in its layer fields.
+///
+/// The DSpark-specific globals (`main_proj`/`main_norm` from stage 0,
+/// `markov_w1`/`markov_w2`/`confidence_proj` from the last stage) live
+/// directly on this struct.
+pub struct DsparkWeights {
+    pub cfg: DsparkConfig,
+    pub stages: Vec<DeepseekV4LayerWeights>,
+    pub main_proj: Option<rdna_compute::GpuTensor>,
+    pub main_norm: Option<rdna_compute::GpuTensor>,
+    pub markov_w1: Option<rdna_compute::GpuTensor>,
+    pub markov_w2: Option<rdna_compute::GpuTensor>,
+    pub confidence_proj: Option<rdna_compute::GpuTensor>,
+}
+
+impl DsparkWeights {
+    /// Release every GPU buffer the DSpark module owns. Frees the DSpark
+    /// globals then drains each stage via `DeepseekV4LayerWeights::free_gpu`
+    /// (which reclaims the per-stage hc_head + final-norm fields too).
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.main_proj);
+        free_opt(gpu, &mut self.main_norm);
+        free_opt(gpu, &mut self.markov_w1);
+        free_opt(gpu, &mut self.markov_w2);
+        free_opt(gpu, &mut self.confidence_proj);
+        for stage in self.stages.drain(..) {
+            stage.free_gpu(gpu);
+        }
+    }
+}
+
 /// Parse `DeepseekV4Config` from a `ModelSource` (safetensors or HFQ).
 /// The `ModelSource`'s metadata JSON should contain the same outer
 /// `{"architecture":..., "config":{...}}` wrapper as the HFQ format.
@@ -666,6 +710,10 @@ pub struct DeepseekV4Weights {
     /// `input_proj` conditioning on the base model's hidden state.
     /// `None` at scaffold stage; populated when Phase 5 ships.
     pub mtp_layer: Option<DeepseekV4LayerWeights>,
+    /// Optional DSpark 3-stage draft module, loaded from the
+    /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
+    /// present. `None` when no DSpark sidecar exists (silent no-op).
+    pub dspark: Option<DsparkWeights>,
     pub _scaffold: (),
 }
 
@@ -699,6 +747,9 @@ impl DeepseekV4Weights {
         }
         if let Some(mtp) = self.mtp_layer.take() {
             mtp.free_gpu(gpu);
+        }
+        if let Some(d) = self.dspark.take() {
+            d.free_gpu(gpu);
         }
     }
 
