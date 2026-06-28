@@ -8859,6 +8859,10 @@ pub fn dspark_forward(
         gpu.rmsnorm_f32(&main_x, main_norm, &main_x, cfg.rms_norm_eps)
             .map_err(|e| format!("dspark main_norm: {e:?}"))?;
     }
+    dspark_nan_dbg(gpu, "main_hidden", main_hidden, 6);
+    if let Some(mx) = state.dspark_main_x.as_ref() {
+        dspark_nan_dbg(gpu, "main_x", &mx.shallow_clone(), 6);
+    }
 
     // noise block ids: [prev_token, noise, noise, ...] (block_size slots).
     let mut block_ids = vec![dspark.cfg.noise_token_id; block];
@@ -8867,10 +8871,18 @@ pub fn dspark_forward(
     // Embed each block id into pbs.embed_batch rows, then broadcast → streams.
     {
         let pbs = state.dspark_pbs.as_ref().unwrap();
-        for (b, &tid) in block_ids.iter().enumerate() {
-            let row = pbs.embed_batch.sub_offset(b * hidden, hidden);
-            dspark_embed_one(gpu, token_embd, &row, tid, hidden)?;
-        }
+        // Embed the block ids via the SAME proven batched kernel the AR/prefill
+        // path uses (the per-token embedding_lookup_q8 produced garbage). Upload
+        // ids → pbs.tokens (i32-in-F32 slots), then batched lookup → embed_batch.
+        // Called unconditionally — matches forward_prefill_batch_chunk, which
+        // runs this on weights.token_embd regardless of its dtype enum.
+        let tok_host: Vec<i32> = block_ids.iter().map(|&t| t as i32).collect();
+        let tok_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tok_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.tokens.buf, tok_bytes)
+            .map_err(|e| format!("dspark htod block tokens: {e:?}"))?;
+        gpu.embedding_lookup_q8_batched(token_embd, &pbs.embed_batch, &pbs.tokens, block, hidden)
+            .map_err(|e| format!("dspark embedding_lookup_q8_batched: {e:?}"))?;
         gpu.hc_streams_init_from_embed_batched(
             &pbs.embed_batch,
             &pbs.streams_batch,
@@ -8908,9 +8920,25 @@ pub fn dspark_forward(
         // 1. attn-side HC pre + per-stream input map → hc_x_in_batch.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
+            if s == 0 {
+                dspark_nan_dbg(
+                    gpu,
+                    "s0 streams ENTRY",
+                    &pbs.streams_batch.shallow_clone(),
+                    6,
+                );
+            }
             mhc_pre_batched(
                 cfg, layer, pbs, gpu, /*layer_idx=*/ s, /*is_attn=*/ true, block,
             )?;
+            if s == 0 {
+                dspark_nan_dbg(
+                    gpu,
+                    "s0 hc_x_in (post-mhc_pre)",
+                    &pbs.hc_x_in_batch.shallow_clone(),
+                    6,
+                );
+            }
         }
         // 2. block q from attn_norm(hc_x_in): writes pbs.tmp/tmp_plain + q_batch.
         {
@@ -9066,6 +9094,17 @@ pub fn dspark_forward(
             )
             .map_err(|e| format!("dspark attn[{s}]: {e:?}"))?;
         }
+        if s == 0 {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            dspark_nan_dbg(gpu, "s0 q_batch", &pbs.q_batch.shallow_clone(), 6);
+            dspark_nan_dbg(gpu, "s0 kv_batch", &pbs.kv_batch.shallow_clone(), 6);
+            dspark_nan_dbg(
+                gpu,
+                "s0 attn_out_raw",
+                &pbs.attn_out_raw_batch.shallow_clone(),
+                6,
+            );
+        }
 
         // 8. inverse RoPE on attn_out, then wo_a + wo_b → attn_out_batch.
         dspark_wo_project(cfg, layer, state, gpu, s, block)?;
@@ -9073,7 +9112,23 @@ pub fn dspark_forward(
         // 9. hc_attn_mix.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
+            if s == 0 {
+                dspark_nan_dbg(
+                    gpu,
+                    "s0 attn_out (post-wo)",
+                    &pbs.attn_out_batch.shallow_clone(),
+                    6,
+                );
+            }
             hc_attn_mix_batched(cfg, pbs, gpu, block)?;
+            if s == 0 {
+                dspark_nan_dbg(
+                    gpu,
+                    "s0 streams post-attn-mix",
+                    &pbs.streams_batch.shallow_clone(),
+                    6,
+                );
+            }
         }
 
         // 10. FFN side: mhc_pre(ffn) + ffn(score-routed) + hc_ffn_mix.
@@ -9091,6 +9146,15 @@ pub fn dspark_forward(
                 &[],
             )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
+        }
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            dspark_nan_dbg(
+                gpu,
+                &format!("streams after stage {s}"),
+                &pbs.streams_batch,
+                6,
+            );
         }
     }
     let _ = gpu.free_tensor(staged);
@@ -9111,6 +9175,29 @@ pub fn dspark_forward(
         hidden,
         hc_mult,
     )
+}
+
+/// Gated NaN/range diagnostic for DSpark forward bring-up. Downloads an F32
+/// tensor and prints len/nan/inf/head; no-op unless HIPFIRE_DSPARK_DEBUG=1.
+fn dspark_nan_dbg(gpu: &Gpu, label: &str, t: &GpuTensor, n: usize) {
+    if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() != Ok("1") {
+        return;
+    }
+    match gpu.download_f32(t) {
+        Ok(v) => {
+            let nan = v.iter().filter(|x| x.is_nan()).count();
+            let inf = v.iter().filter(|x| x.is_infinite()).count();
+            let h = n.min(v.len());
+            eprintln!(
+                "[dspark-dbg] {label}: len={} nan={} inf={} head={:?}",
+                v.len(),
+                nan,
+                inf,
+                &v[..h]
+            );
+        }
+        Err(e) => eprintln!("[dspark-dbg] {label}: download failed {e:?}"),
+    }
 }
 
 /// Steps 6d–6e of the per-stage attention block (inverse RoPE + O-LoRA
