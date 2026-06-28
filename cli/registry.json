@@ -82,6 +82,9 @@
     },
     "qwen3.6:35b-a3b": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
@@ -97,6 +100,9 @@
     },
     "qwen3.6:35b-a3b-mq2": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq2",
       "size_gb": 11.6,
       "min_vram_gb": 14,
@@ -104,6 +110,9 @@
     },
     "qwen3.6:35b-a3b-mq3p": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq3p",
       "size_gb": 17.2,
       "min_vram_gb": 20,
@@ -111,6 +120,9 @@
     },
     "qwen3.6:35b-a3b-mq4p": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
@@ -118,6 +130,9 @@
     },
     "qwen3.6:35b-a3b-mfp4": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mfp4",
       "size_gb": 20.2,
       "min_vram_gb": 22,
@@ -125,6 +140,9 @@
     },
     "qwen3.6:35b-a3b-mq5": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq5",
       "size_gb": 23.7,
       "min_vram_gb": 26,
@@ -132,6 +150,9 @@
     },
     "qwen3.6:35b-a3b-mq6": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq6",
       "size_gb": 27.7,
       "min_vram_gb": 30,
@@ -139,6 +160,9 @@
     },
     "qwen3.6:35b-a3b-mq4": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq4",
       "size_gb": 19.4,
       "min_vram_gb": 22,
@@ -146,6 +170,9 @@
     },
     "qwen3.6:35b-a3b-mq4r": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
