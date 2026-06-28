@@ -9059,41 +9059,69 @@ pub fn dspark_forward(
             dspark_stage_main_kv_to_ring(cfg, layer, gpu, &main_x, &ring, s, position)?;
         }
 
-        // 6. Custom bidirectional staging: for each of the block rows, copy
-        //    [ring committed window (n_committed cols) | block kv (block cols)]
-        //    into staged[b]. Assembled on host for correctness (the ring + block
-        //    KVs are F32). TODO(perf): replace with a GPU strided-copy kernel.
+        // 6. Custom bidirectional staging, assembled ON-GPU:
+        //    staged[b] = [ring committed window (n_committed cols) | block kv
+        //    (block cols) | zero tail]. All block rows identical (bidirectional).
+        //    The prior host path (d2h ring + d2h block_kv + host assemble + h2d)
+        //    forced ~2 stream syncs per stage; the kernel keeps everything on
+        //    the active stream so the 3 stages pipeline. `HIPFIRE_DSPARK_VERIFY_STAGE=1`
+        //    cross-checks the GPU buffer against the host assembly bit-for-bit.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            // Download the committed ring [n_kv*head_dim*win] (n_kv==1).
-            let ring = state.dspark_swa_k[s].as_ref().unwrap();
-            let ring_host = gpu
-                .download_f32(ring)
-                .map_err(|e| format!("dspark d2h ring[{s}]: {e:?}"))?;
-            // Download block kv [block, head_dim].
-            let block_kv_host = gpu
-                .download_f32(&pbs.kv_batch.sub_offset(0, block * kv_dim))
-                .map_err(|e| format!("dspark d2h block kv: {e:?}"))?;
-            // Assemble staged_host [block, head_dim, stage_w].
-            let mut staged_host = vec![0.0f32; block * head_dim * stage_w];
-            for b in 0..block {
-                for d in 0..head_dim {
-                    let dst_base = (b * head_dim + d) * stage_w;
-                    // committed cols 0..n_committed from ring[d, col].
-                    for c in 0..n_committed {
-                        staged_host[dst_base + c] = ring_host[d * win + c];
-                    }
-                    // block kv col n_committed..n_committed+block.
-                    for j in 0..block {
-                        staged_host[dst_base + n_committed + j] = block_kv_host[j * kv_dim + d];
+            let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
+            let block_kv = pbs.kv_batch.sub_offset(0, block * kv_dim);
+            gpu.dspark_stage_kv(
+                &ring,
+                &block_kv,
+                &staged,
+                win,
+                kv_dim,
+                head_dim,
+                n_committed,
+                block,
+                stage_w,
+            )
+            .map_err(|e| format!("dspark stage_kv[{s}]: {e:?}"))?;
+
+            if std::env::var("HIPFIRE_DSPARK_VERIFY_STAGE").as_deref() == Ok("1") {
+                let ring_host = gpu
+                    .download_f32(&ring)
+                    .map_err(|e| format!("dspark verify d2h ring[{s}]: {e:?}"))?;
+                let block_kv_host = gpu
+                    .download_f32(&block_kv)
+                    .map_err(|e| format!("dspark verify d2h block kv: {e:?}"))?;
+                let mut staged_ref = vec![0.0f32; block * head_dim * stage_w];
+                for b in 0..block {
+                    for d in 0..head_dim {
+                        let dst_base = (b * head_dim + d) * stage_w;
+                        for c in 0..n_committed {
+                            staged_ref[dst_base + c] = ring_host[d * win + c];
+                        }
+                        for j in 0..block {
+                            staged_ref[dst_base + n_committed + j] = block_kv_host[j * kv_dim + d];
+                        }
                     }
                 }
+                let staged_gpu = gpu
+                    .download_f32(&staged)
+                    .map_err(|e| format!("dspark verify d2h staged[{s}]: {e:?}"))?;
+                let mut max_abs = 0.0f32;
+                let mut n_mismatch = 0usize;
+                for (g, r) in staged_gpu.iter().zip(staged_ref.iter()) {
+                    let diff = (g - r).abs();
+                    if diff > max_abs {
+                        max_abs = diff;
+                    }
+                    if diff != 0.0 {
+                        n_mismatch += 1;
+                    }
+                }
+                eprintln!(
+                    "[dspark verify_stage] stage={s} n_committed={n_committed} max_abs_diff={max_abs:.3e} n_mismatch={n_mismatch}/{}",
+                    staged_gpu.len()
+                );
+                assert_eq!(n_mismatch, 0, "dspark stage_kv GPU != host (stage {s})");
             }
-            let staged_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(staged_host.as_ptr() as *const u8, staged_host.len() * 4)
-            };
-            gpu.memcpy_htod_auto(&staged.buf, staged_bytes)
-                .map_err(|e| format!("dspark htod staged: {e:?}"))?;
         }
 
         // 7. Dense (bidirectional) attention over staged keys + attn_sink.

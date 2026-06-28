@@ -3331,6 +3331,12 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
 
+/// DSpark bidirectional staging assembly. Builds the per-stage attention
+/// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the
+/// committed main_kv ring + the block KV, replacing a host d2h+assemble+h2d
+/// that forced 2 stream syncs per stage (3 stages → ~6 syncs/window).
+pub const DSPARK_STAGE_KV_SRC: &str = include_str!("../../../kernels/src/dspark_stage_kv.hip");
+
 /// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.
 pub const EMBEDDING_HFQ4G128_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g128.hip");
@@ -3405,8 +3411,7 @@ pub const ARGMAX_TOKEN_CHAIN_SRC: &str =
 /// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
 pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
 
-pub const DDTREE_SWOR_WALK_SRC: &str =
-    include_str!("../../../kernels/src/ddtree_swor_walk.hip");
+pub const DDTREE_SWOR_WALK_SRC: &str = include_str!("../../../kernels/src/ddtree_swor_walk.hip");
 
 pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/ddtree_gumbel_topk_batched.hip");
