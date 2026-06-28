@@ -1131,6 +1131,27 @@ pub struct DeepseekV4State {
     /// once per `dspark_forward` (forward_embed) and shared by all stages.
     pub dspark_main_x: Option<rdna_compute::GpuTensor>,
 
+    // ── DSpark target-hidden capture (gated; populated by the batched
+    //    trunk forward when `dspark_capture_active` is set). ───────────
+    /// When false (default) the capture block in `forward_prefill_batch_chunk`
+    /// is a byte-for-byte no-op. Set true only by the DSpark drafter path
+    /// before a prefill whose target-layer hidden states it needs.
+    pub dspark_capture_active: bool,
+    /// Trunk layer indices whose post-FFN HC-mean-pooled hidden state is
+    /// captured (e.g. `[40, 41, 42]`). The capture slot for a layer is its
+    /// index within this Vec.
+    pub dspark_target_layers: Vec<usize>,
+    /// Capture buffer `[max_batch, n_target_layers, hidden]` F32. Lazily
+    /// allocated inside the capture block (needs `pbs.max_batch`).
+    pub dspark_caps: Option<rdna_compute::GpuTensor>,
+    /// `[max_batch, hc_mult=4]` F32 filled with `0.25` — the mean-pool
+    /// weight vector fed to `hc_input_map_4stream_batched`. Lazy.
+    pub dspark_cap_ones: Option<rdna_compute::GpuTensor>,
+    /// Assembled `[n_target_layers * hidden]` main-hidden vector, the
+    /// concatenation of the captured per-target-layer slots for one batch
+    /// position. Reused across `dspark_assemble_main_hidden` calls.
+    pub dspark_main_hidden: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -1229,6 +1250,11 @@ impl DeepseekV4State {
             dspark_swa_k: Vec::new(),
             dspark_pbs: None,
             dspark_main_x: None,
+            dspark_capture_active: false,
+            dspark_target_layers: Vec::new(),
+            dspark_caps: None,
+            dspark_cap_ones: None,
+            dspark_main_hidden: None,
             n_tokens: 0,
             _scaffold: (),
         })
@@ -1441,6 +1467,9 @@ impl DeepseekV4State {
             }
         }
         free_opt(gpu, &mut self.dspark_main_x);
+        free_opt(gpu, &mut self.dspark_caps);
+        free_opt(gpu, &mut self.dspark_cap_ones);
+        free_opt(gpu, &mut self.dspark_main_hidden);
         if let Some(pbs) = self.dspark_pbs.take() {
             pbs.free_gpu(gpu);
         }

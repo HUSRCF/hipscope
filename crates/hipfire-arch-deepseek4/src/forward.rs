@@ -8362,9 +8362,135 @@ pub fn forward_prefill_batch_chunk(
                 &pbs.streams_batch,
             );
         }
+
+        // ── DSpark target-hidden capture (gated; no-op when inactive) ───
+        // When the DSpark drafter primes a prefill it sets
+        // `state.dspark_capture_active = true` and lists the trunk layers
+        // it needs in `state.dspark_target_layers`. For each such layer we
+        // mean-pool this layer's 4 HC residual streams over the hc_mult
+        // axis (→ [n, hidden]) and stash it into the per-layer capture slot.
+        // The whole block is skipped byte-for-byte when the flag is false.
+        if state.dspark_capture_active {
+            if let Some(slot) = state
+                .dspark_target_layers
+                .iter()
+                .position(|&l| l == layer_idx)
+            {
+                dspark_capture_layer(cfg, state, gpu, pbs, layer_idx, slot, n)?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Mean-pool layer `layer_idx`'s 4 HC residual streams over the hc_mult
+/// axis and stash the per-batch-position results into capture slot `slot`
+/// of `state.dspark_caps` (`[max_batch, n_target_layers, hidden]`).
+///
+/// Lazily allocates `dspark_caps` (sized to `pbs.max_batch`) and the
+/// constant mean-weight vector `dspark_cap_ones` (`[max_batch, 4]` filled
+/// `0.25`) on first call. The mean-pool reuses the
+/// `hc_input_map_4stream_batched` kernel (`x_out[b,d] = Σ_h a[b,h]·s[b,h,d]`)
+/// with `a = 0.25` everywhere → arithmetic mean over the 4 streams.
+fn dspark_capture_layer(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    layer_idx: usize,
+    slot: usize,
+    n: usize,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    let n_targets = state.dspark_target_layers.len();
+    let max_batch = pbs.max_batch;
+
+    if n >= max_batch + 1 {
+        return Err(format!(
+            "dspark_capture_layer: n {n} > capture max_batch {max_batch}"
+        ));
+    }
+
+    // Lazy alloc: [max_batch, 4] filled 0.25 (mean weights).
+    if state.dspark_cap_ones.is_none() {
+        let ones = vec![0.25f32; max_batch * hc_mult];
+        state.dspark_cap_ones = Some(
+            gpu.upload_f32(&ones, &[max_batch, hc_mult])
+                .map_err(|e| format!("dspark_capture alloc cap_ones: {e:?}"))?,
+        );
+    }
+    // Lazy alloc: [max_batch, n_target_layers, hidden] capture buffer.
+    if state.dspark_caps.is_none() {
+        state.dspark_caps = Some(
+            gpu.zeros(&[max_batch, n_targets, hidden], DType::F32)
+                .map_err(|e| format!("dspark_capture alloc caps: {e:?}"))?,
+        );
+    }
+
+    // 1. Mean-pool streams [n, 4, hidden] → pbs.tmp_batch [n, hidden].
+    //    tmp_batch is reused as a contiguous landing zone; it is clobbered
+    //    by the next layer's q_lora regardless, so this is safe.
+    let cap_ones = state.dspark_cap_ones.as_ref().unwrap().shallow_clone();
+    gpu.hc_input_map_4stream_batched(
+        &cap_ones,
+        &pbs.streams_batch,
+        &pbs.tmp_batch,
+        hidden as i32,
+        n as i32,
+    )
+    .map_err(|e| format!("dspark_capture mean-pool l{layer_idx}: {e:?}"))?;
+
+    // 2. Scatter each batch row into its strided capture slot
+    //    dspark_caps[b, slot, :] (offset (b*n_targets + slot)*hidden).
+    let caps = state.dspark_caps.as_ref().unwrap();
+    let row_bytes = hidden * 4;
+    for b in 0..n {
+        let dst_off = (b * n_targets + slot) * row_bytes;
+        let src_off = b * row_bytes;
+        gpu.memcpy_dtod_at_auto(&caps.buf, dst_off, &pbs.tmp_batch.buf, src_off, row_bytes)
+            .map_err(|e| format!("dspark_capture scatter l{layer_idx} b{b}: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Assemble the captured per-target-layer hidden states for batch position
+/// `batch_pos` into a contiguous `[n_target_layers * hidden]` tensor — the
+/// `main_hidden` input to [`dspark_forward`]. Target layers appear in
+/// ascending capture-slot order (slot 0, 1, … = `dspark_target_layers[0..]`).
+///
+/// In the `[max_batch, n_target_layers, hidden]` layout the slice
+/// `dspark_caps[batch_pos, 0..n_targets, :]` is already contiguous, so this
+/// is a single d2d copy into the reused `state.dspark_main_hidden` buffer.
+pub fn dspark_assemble_main_hidden<'a>(
+    state: &'a mut DeepseekV4State,
+    gpu: &mut Gpu,
+    cfg: &DeepseekV4Config,
+    batch_pos: usize,
+) -> Result<&'a GpuTensor, String> {
+    let hidden = cfg.hidden_size;
+    let n_targets = state.dspark_target_layers.len();
+    if n_targets == 0 {
+        return Err("dspark_assemble_main_hidden: no target layers set".to_string());
+    }
+    let caps = state
+        .dspark_caps
+        .as_ref()
+        .ok_or("dspark_assemble_main_hidden: no captures (capture inactive?)")?;
+    let total = n_targets * hidden;
+
+    if state.dspark_main_hidden.is_none() {
+        state.dspark_main_hidden = Some(
+            gpu.alloc_tensor(&[total], DType::F32)
+                .map_err(|e| format!("dspark_assemble alloc main_hidden: {e:?}"))?,
+        );
+    }
+    let dst = state.dspark_main_hidden.as_ref().unwrap();
+    let src_off = batch_pos * n_targets * hidden * 4;
+    gpu.memcpy_dtod_at_auto(&dst.buf, 0, &caps.buf, src_off, total * 4)
+        .map_err(|e| format!("dspark_assemble d2d: {e:?}"))?;
+    Ok(state.dspark_main_hidden.as_ref().unwrap())
 }
 
 /// Top-level batched-prefill driver — chunks the prompt by max_batch
