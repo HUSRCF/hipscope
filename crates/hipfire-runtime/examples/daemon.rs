@@ -1368,8 +1368,10 @@ fn main() {
                         m.mtp_k = mtp_k;
                         // Detect whether MTP weights are present in the loaded
                         // model. Used by mtp_mode=auto to decide whether to
-                        // enable spec-decode at generate time. Two sources:
+                        // enable spec-decode at generate time. Three sources:
                         //   - DeepSeek V4: the trunk's bundled `mtp_layer`.
+                        //   - DeepSeek V4: a DSpark sidecar (either counts for auto
+                        //     mode; the loader picks whichever applies).
                         //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by
                         //     the loader (`qwen35_mtp_head`, set from a bundled
                         //     `.mq4-mtp` trailer or a `.mtp` sidecar). The loader
@@ -1378,8 +1380,8 @@ fn main() {
                         //     it back to false for a qwen35 model.
                         let ds4_mtp = m
                             .deepseek4()
-                            .and_then(|b| b.weights.mtp_layer.as_ref())
-                            .is_some();
+                            .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
+                            .unwrap_or(false);
                         m.mtp_weights_present =
                             ds4_mtp || m.qwen35_mtp_head.is_some() || m.mtp_weights_present;
 
