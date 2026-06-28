@@ -8679,6 +8679,95 @@ pub struct DraftResult {
     pub confidence: Vec<f32>,
 }
 
+/// Compute one DSpark stage's `main_kv` from a committed `main_x` and commit it
+/// into that stage's sliding-window ring at slot `position % win`. This is the
+/// reference `DSparkAttention` KV-side write: `kv_norm(wkv(main_x))` then RoPE
+/// the rope-tail dims at the absolute `position` (kv-only, `n_heads=0`).
+///
+/// Shared by [`dspark_forward`]'s per-step write (step 5) and
+/// [`dspark_warm_rings`]'s prefill priming, so both paths produce byte-identical
+/// ring contents for the same `main_x`/`position`.
+#[allow(clippy::too_many_arguments)]
+fn dspark_stage_main_kv_to_ring(
+    cfg: &DeepseekV4Config,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    gpu: &mut Gpu,
+    main_x: &GpuTensor,
+    ring: &GpuTensor,
+    stage: usize,
+    position: u32,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let head_dim = cfg.head_dim;
+    let n_kv = cfg.num_key_value_heads;
+    let win = cfg.sliding_window;
+    let kv_dim = n_kv * head_dim;
+
+    let wkv = layer
+        .wkv
+        .as_ref()
+        .ok_or_else(|| format!("dspark stage {stage} wkv missing"))?;
+    let kv_norm = layer
+        .kv_norm
+        .as_ref()
+        .ok_or_else(|| format!("dspark stage {stage} kv_norm missing"))?;
+    let main_kv = gpu
+        .alloc_tensor(&[kv_dim], DType::F32)
+        .map_err(|e| format!("dspark alloc main_kv: {e:?}"))?;
+    if weight_needs_fwht(wkv) {
+        let rot = gpu
+            .alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("dspark alloc main_x rot: {e:?}"))?;
+        gpu.rotate_x_mq(main_x, &rot, hidden)
+            .map_err(|e| format!("dspark rotate main_x: {e:?}"))?;
+        gemv_auto(gpu, wkv, &rot, main_x, &main_kv, kv_dim, hidden)?;
+        let _ = gpu.free_tensor(rot);
+    } else {
+        gemv_auto(gpu, wkv, main_x, main_x, &main_kv, kv_dim, hidden)?;
+    }
+    gpu.rmsnorm_f32(&main_kv, kv_norm, &main_kv, cfg.rms_norm_eps)
+        .map_err(|e| format!("dspark main_kv norm: {e:?}"))?;
+    // RoPE main_kv at absolute `position`. n_heads=0 → kv-only rotation.
+    let (fb, fs, ef, af, cl, ch) = layer_rope_params(cfg, layer.compress_ratio);
+    let pos1 = gpu
+        .alloc_tensor(&[1], DType::F32)
+        .map_err(|e| format!("dspark alloc pos1: {e:?}"))?;
+    let pos_bytes = (position as i32).to_le_bytes();
+    gpu.memcpy_htod_auto(&pos1.buf, &pos_bytes)
+        .map_err(|e| format!("dspark htod pos1: {e:?}"))?;
+    gpu.rope_tail_yarn_interleaved_batched(
+        &main_kv,
+        &main_kv,
+        &pos1,
+        /*n_heads=*/ 0,
+        n_kv as i32,
+        head_dim as i32,
+        cfg.qk_rope_head_dim as i32,
+        fb,
+        fs,
+        ef,
+        af,
+        cl,
+        ch,
+        /*inverse=*/ 0,
+        1,
+    )
+    .map_err(|e| format!("dspark main_kv rope: {e:?}"))?;
+    gpu.swa_ring_write_batched_f32(
+        &main_kv,
+        ring,
+        n_kv as i32,
+        head_dim as i32,
+        win as i32,
+        position as i32,
+        1,
+    )
+    .map_err(|e| format!("dspark ring write[{stage}]: {e:?}"))?;
+    let _ = gpu.free_tensor(pos1);
+    let _ = gpu.free_tensor(main_kv);
+    Ok(())
+}
+
 /// Single-token embedding lookup into row 0 of `out` (`[dim]` F32),
 /// dispatching on the embedding-table dtype. Mirrors the dtype handling
 /// the head / MTP paths use. Supports the formats DSpark sidecars ship
@@ -8965,74 +9054,9 @@ pub fn dspark_forward(
         // 5. main_kv from main_x (n=1): kv_norm(wkv @ main_x); RoPE at `position`;
         //    commit into this stage's ring at slot position % win.
         {
-            let wkv = layer
-                .wkv
-                .as_ref()
-                .ok_or_else(|| format!("dspark stage {s} wkv missing"))?;
-            let kv_norm = layer
-                .kv_norm
-                .as_ref()
-                .ok_or_else(|| format!("dspark stage {s} kv_norm missing"))?;
             let main_x = state.dspark_main_x.as_ref().unwrap().shallow_clone();
-            // main_kv scratch [kv_dim].
-            let main_kv = gpu
-                .alloc_tensor(&[kv_dim], DType::F32)
-                .map_err(|e| format!("dspark alloc main_kv: {e:?}"))?;
-            if weight_needs_fwht(wkv) {
-                let rot = gpu
-                    .alloc_tensor(&[hidden], DType::F32)
-                    .map_err(|e| format!("dspark alloc main_x rot: {e:?}"))?;
-                gpu.rotate_x_mq(&main_x, &rot, hidden)
-                    .map_err(|e| format!("dspark rotate main_x: {e:?}"))?;
-                gemv_auto(gpu, wkv, &rot, &main_x, &main_kv, kv_dim, hidden)?;
-                let _ = gpu.free_tensor(rot);
-            } else {
-                gemv_auto(gpu, wkv, &main_x, &main_x, &main_kv, kv_dim, hidden)?;
-            }
-            gpu.rmsnorm_f32(&main_kv, kv_norm, &main_kv, cfg.rms_norm_eps)
-                .map_err(|e| format!("dspark main_kv norm: {e:?}"))?;
-            // RoPE main_kv at absolute `position`. n_heads=0 → kv-only rotation.
-            let (fb, fs, ef, af, cl, ch) = layer_rope_params(cfg, layer.compress_ratio);
-            let pos1 = gpu
-                .alloc_tensor(&[1], DType::F32)
-                .map_err(|e| format!("dspark alloc pos1: {e:?}"))?;
-            let pos_bytes = (position as i32).to_le_bytes();
-            gpu.memcpy_htod_auto(&pos1.buf, &pos_bytes)
-                .map_err(|e| format!("dspark htod pos1: {e:?}"))?;
-            gpu.rope_tail_yarn_interleaved_batched(
-                &main_kv,
-                &main_kv,
-                &pos1,
-                /*n_heads=*/ 0,
-                n_kv as i32,
-                head_dim as i32,
-                cfg.qk_rope_head_dim as i32,
-                fb,
-                fs,
-                ef,
-                af,
-                cl,
-                ch,
-                /*inverse=*/ 0,
-                1,
-            )
-            .map_err(|e| format!("dspark main_kv rope: {e:?}"))?;
-            // Commit into the stage ring at slot position % win.
-            {
-                let ring = state.dspark_swa_k[s].as_ref().unwrap();
-                gpu.swa_ring_write_batched_f32(
-                    &main_kv,
-                    ring,
-                    n_kv as i32,
-                    head_dim as i32,
-                    win as i32,
-                    position as i32,
-                    1,
-                )
-                .map_err(|e| format!("dspark ring write[{s}]: {e:?}"))?;
-            }
-            let _ = gpu.free_tensor(pos1);
-            let _ = gpu.free_tensor(main_kv);
+            let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
+            dspark_stage_main_kv_to_ring(cfg, layer, gpu, &main_x, &ring, s, position)?;
         }
 
         // 6. Custom bidirectional staging: for each of the block rows, copy

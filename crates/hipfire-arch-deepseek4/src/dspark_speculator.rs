@@ -134,15 +134,22 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
         )
         .map_err(|e| format!("dspark prefill: {e}"))?;
 
-        // Assemble main_hidden for the LAST prefilled position (the seed's
-        // PREDECESSOR — the trunk position whose logits produced the seed). The
-        // seed itself sits one position later and is materialised on the first
-        // mtp_step via the bootstrap forward, so we leave main_hidden_pos = None.
+        // NOTE: we deliberately do NOT warm the DSpark stage main_kv rings over
+        // the prompt here. The reference forward_spec(start_pos==0) does prime
+        // them, and an experimental `forward::dspark_warm_rings` reproduces that
+        // (phase-correct, sharing `dspark_stage_main_kv_to_ring` with decode).
+        // But measured on this MQ2-Lloyd build it is a consistent LOSS: on a
+        // 96-token code prompt, priming dropped τ 3.24→2.55 and decode 13.8→10.8
+        // tok/s (deterministic, interleaved A/B). The trained draft attends
+        // BETTER to a sparse recent-decode window than to the full committed
+        // prompt history — injecting the prompt's main_kv misaligns the draft
+        // from the target under this quant. Left unwired pending a full-precision
+        // model where the reference's priming actually pays. See the branch's
+        // bench notes / dspark-v4-deepseek4-port memory entry.
         //
-        // TODO(perf): warm each DSpark stage's main_kv SWA ring over the prompt
-        // here (the reference primes the stage caches during prefill). Skipped
-        // for now — single-step drafting is correct without it; multi-step τ may
-        // be lower than the warmed ceiling until this lands.
+        // The seed sits one position past the last prefilled position; its
+        // main_hidden is materialised on the first mtp_step's bootstrap forward,
+        // so we leave main_hidden_pos = None.
         self.main_hidden_pos = None;
 
         Ok(logits_argmax(&last_logits) as u32)
