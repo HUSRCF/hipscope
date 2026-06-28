@@ -274,7 +274,43 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
             position as u32,
         )
         .map_err(|e| format!("dspark draft: {e}"))?;
-        let drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+        let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+
+        // ── 2a. Confidence-threshold draft truncation (DSpark's own adaptive
+        // draft-length mechanism — reference deepspec `_confident_prefix_length`).
+        //
+        // `dspark_forward`'s confidence head emits a per-slot confidence LOGIT
+        // (pre-sigmoid). Survival of slot i is `sigmoid(confidence[i])`; the
+        // reference truncates the proposal at the FIRST slot whose survival drops
+        // below a threshold. Truncating BEFORE the verify forward means the heavy
+        // 43-layer/256-expert trunk runs over fewer positions on uncertain (prose)
+        // drafts — cheaper windows — while the full block survives where the model
+        // is confident (code). This does NOT change which tokens get committed
+        // when the model is confident: a slot below threshold is one the draft is
+        // unsure of and likely-to-be-rejected anyway, so cutting it trades a sliver
+        // of potential acceptance for a strictly cheaper verify. The committed
+        // stream remains target-verified greedy ⇒ coherence is preserved.
+        //
+        // Threshold default 0.5: survival 0.5 ⇔ confidence logit 0.0, i.e. keep a
+        // slot iff the head's confidence logit is non-negative. This is the natural
+        // decision boundary of a sigmoid gate and matches the reference default.
+        let conf_threshold: f32 = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5);
+        let confident_len = {
+            // First slot below threshold cuts the proposal there; always keep ≥1.
+            let mut l = drafts.len();
+            for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
+                let survival = 1.0f32 / (1.0 + (-c).exp());
+                if survival < conf_threshold {
+                    l = i;
+                    break;
+                }
+            }
+            l.max(1)
+        };
+        drafts.truncate(confident_len);
         let n_proposed = drafts.len();
 
         // ── 3. Verify: trunk forward [seed, draft0..draft_{n-1}] ────────────
