@@ -58,7 +58,7 @@ fn main() -> Result<(), String> {
 
     let dspark = weights.dspark.as_ref().ok_or_else(|| {
         "weights.dspark is None — DSpark sidecar not found next to the trunk \
-         (expected <stem>-dspark.<ext>) or HIPFIRE_DEEPSEEK4_LOAD_DSPARK=0"
+         (expected <stem>-dspark.<ext>)"
             .to_string()
     })?;
     eprintln!(

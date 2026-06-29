@@ -108,6 +108,14 @@ pub struct DeepseekV4Config {
     /// populated at load time from the sidecar.
     #[serde(skip)]
     pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
+
+    /// Whether to load the DSpark 3-stage drafter sidecar (`<stem>-dspark.<ext>`)
+    /// during `load_weights`. Set by the loader from the `speculation` selector
+    /// (`dspark`/`auto` → true, any other mechanism → false) so a 3×MoE sidecar
+    /// is not paged into VRAM when DSpark won't run. Defaults to `true` for a
+    /// directly-driven daemon (no CLI selector). Not (de)serialized.
+    #[serde(skip)]
+    pub load_dspark: bool,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -223,6 +231,7 @@ impl DeepseekV4Config {
             num_nextn_predict_layers: raw.num_nextn_predict_layers,
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
+            load_dspark: true,
         };
         // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
@@ -385,6 +394,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_nextn_predict_layers: raw.num_nextn_predict_layers,
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
+        load_dspark: true,
     })
 }
 

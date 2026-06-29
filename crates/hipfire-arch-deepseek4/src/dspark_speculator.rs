@@ -48,15 +48,19 @@ pub struct Deepseek4DsparkDrafter {
     main_hidden_pos: Option<usize>,
     block: usize,
     ctx_capacity: usize,
+    /// Confidence-truncation threshold (survival sigmoid cutoff). Resolved once
+    /// at build time as env > CLI param > 0.5 — see `build_deepseek4_dspark_speculator`.
+    conf_threshold: f32,
 }
 
 impl Deepseek4DsparkDrafter {
-    pub fn new(block: usize, ctx_capacity: usize) -> Self {
+    pub fn new(block: usize, ctx_capacity: usize, conf_threshold: f32) -> Self {
         Self {
             pbs: None,
             main_hidden_pos: None,
             block: block.clamp(1, 8),
             ctx_capacity,
+            conf_threshold,
         }
     }
 
@@ -294,10 +298,8 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
         // Threshold default 0.5: survival 0.5 ⇔ confidence logit 0.0, i.e. keep a
         // slot iff the head's confidence logit is non-negative. This is the natural
         // decision boundary of a sigmoid gate and matches the reference default.
-        let conf_threshold: f32 = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.5);
+        // Resolved once at build (env > `--dspark-conf-threshold` > 0.5).
+        let conf_threshold = self.conf_threshold;
         let confident_len = {
             // First slot below threshold cuts the proposal there; always keep ≥1.
             let mut l = drafts.len();
@@ -416,9 +418,23 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
 /// Build the deepseek4 DSpark speculator (the boxed `dyn Speculator` the loader
 /// returns when a `-dspark` sidecar is present). The trunk-sized
 /// `PrefillBatchScratch` is allocated lazily on the first `mtp_prefill`.
-pub fn build_deepseek4_dspark_speculator(block: usize, ctx_capacity: usize) -> Box<dyn Speculator> {
+///
+/// `conf_threshold` is the CLI-forwarded confidence-truncation cutoff (`None` =
+/// loader default 0.5). Ladder: env `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD`
+/// wins, else the CLI param, else 0.5.
+pub fn build_deepseek4_dspark_speculator(
+    block: usize,
+    ctx_capacity: usize,
+    conf_threshold: Option<f32>,
+) -> Box<dyn Speculator> {
+    let conf_threshold = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or(conf_threshold)
+        .unwrap_or(0.5);
     Box::new(MtpSpeculator::new(Deepseek4DsparkDrafter::new(
         block,
         ctx_capacity,
+        conf_threshold,
     )))
 }

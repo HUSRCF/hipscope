@@ -804,18 +804,24 @@ impl Carrier for Deepseek4Carrier {
         // ── source-varying seam: (config, weights) only ──
         // NOTE: the Dir/safetensors arm is UNVALIDATED — no deepseek_v4
         // checkpoint was available locally to verify load fidelity. Reviewer-ask.
+        // DSpark sidecar load gate: `speculation=dspark`/`auto` load the 3×MoE
+        // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
+        // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
+        let load_dspark = ctx.spec.dspark != Some(false);
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
-                let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                config.load_dspark = load_dspark;
                 let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
                     &mut hfq, &config, ctx.gpu,
                 )?;
                 (config, weights)
             }
             ModelSource::Dir(source) => {
-                let config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
+                let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
                     "deepseek4: failed to parse config from safetensors".to_string()
                 })?;
+                config.load_dspark = load_dspark;
                 let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
                     &source, &config, ctx.gpu,
                 )?;
@@ -835,10 +841,11 @@ impl Carrier for Deepseek4Carrier {
         // the generate path (T4 routing) — here we only build the capability. Undriven until T4:
         // the daemon's arch_id==9 branch still uses the bespoke generate_deepseek4 loop.
         // DSpark draft module (the `-dspark` sidecar) wins over the in-trunk MTP
-        // layer when present. Default-ON when the sidecar loaded; opt out with
-        // HIPFIRE_DEEPSEEK4_DSPARK=0 to force the plain MTP path for A/B.
-        let dspark_enabled = weights.dspark.is_some()
-            && std::env::var("HIPFIRE_DEEPSEEK4_DSPARK").ok().as_deref() != Some("0");
+        // layer when present. Built when the sidecar loaded AND the `speculation`
+        // selector did not pick another mechanism (`ctx.spec.dspark != Some(false)`;
+        // `None` = auto keeps the default-on behaviour). The threshold is the
+        // CLI-forwarded `--dspark-conf-threshold` (env still wins in the builder).
+        let dspark_enabled = weights.dspark.is_some() && ctx.spec.dspark != Some(false);
         let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if dspark_enabled {
             let block = weights.dspark.as_ref().unwrap().cfg.block_size;
             let ctx_capacity = config.max_position_embeddings;
@@ -847,6 +854,7 @@ impl Carrier for Deepseek4Carrier {
                 hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator(
                     block,
                     ctx_capacity,
+                    ctx.spec.dspark_conf_threshold,
                 ),
             )
         } else if weights.mtp_layer.is_some() {

@@ -1024,6 +1024,23 @@ fn main() {
                         .and_then(|p| p.get("ddtree_topk"))
                         .and_then(|v| v.as_u64())
                         .map(|k| k as usize),
+                    // DSpark draft module: the CLI lowers `speculation` into a
+                    // `dspark_mode` string. off→Some(false) (skip load+build),
+                    // on→Some(true) (force), auto/absent→None (load-if-sidecar).
+                    dspark: msg
+                        .get("params")
+                        .and_then(|p| p.get("dspark_mode"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| match s {
+                            "on" => Some(true),
+                            "off" => Some(false),
+                            _ => None, // "auto" → loader default
+                        }),
+                    dspark_conf_threshold: msg
+                        .get("params")
+                        .and_then(|p| p.get("dspark_conf_threshold"))
+                        .and_then(|v| v.as_f64())
+                        .map(|t| t as f32),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.

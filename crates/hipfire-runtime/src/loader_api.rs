@@ -95,6 +95,16 @@ pub struct SpecLoadCfg {
     pub ddtree_budget: Option<usize>,
     /// DDTree per-position top-K width (`HIPFIRE_DDTREE_TOPK`). `None` = default.
     pub ddtree_topk: Option<usize>,
+    /// DSpark draft module (deepseek4 `-dspark` sidecar) enable, lowered from the
+    /// `speculation` selector: `Some(true)` = `dspark` mode (load + force),
+    /// `Some(false)` = another mechanism selected (skip load + build),
+    /// `None` = `auto` (load if the sidecar exists, prefer over in-trunk MTP).
+    /// Replaces the old `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_LOAD_DSPARK`
+    /// env gates — both fold into this one mode.
+    pub dspark: Option<bool>,
+    /// DSpark confidence-truncation threshold (`--dspark-conf-threshold`). `None`
+    /// = loader default (0.5). Env `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` wins.
+    pub dspark_conf_threshold: Option<f32>,
 }
 
 /// One arch's load contract. Object-safe — usable as `&dyn Carrier`.

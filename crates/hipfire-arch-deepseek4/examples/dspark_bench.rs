@@ -14,7 +14,8 @@
 //!   - draft accept fraction = accepted / proposed
 //!   - the decoded text (for human coherence eyeball)
 //!
-//! Drafter selection (matches the loader's `HIPFIRE_DEEPSEEK4_DSPARK` gate):
+//! Drafter selection (bench-local A/B switch — this harness builds the
+//! speculator directly, bypassing the loader's `speculation`-mode gate):
 //!   HIPFIRE_DEEPSEEK4_DSPARK=0  → MTP drafter; otherwise DSpark (if sidecar).
 //!
 //! ENV:
@@ -158,7 +159,7 @@ fn main() -> Result<(), String> {
 
     let ctx_cap = cfg.max_position_embeddings;
     let mut spec: Box<dyn Speculator> = if dspark_enabled {
-        build_deepseek4_dspark_speculator(block, ctx_cap)
+        build_deepseek4_dspark_speculator(block, ctx_cap, None)
     } else {
         let k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
             .ok()

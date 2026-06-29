@@ -1398,13 +1398,12 @@ impl DeepseekV4 {
         // ── DSpark 3-stage drafter sidecar discovery ─────────────────────
         // Additive to the single-stage MTP load above. Mirrors the `-mtp`
         // addon resolution but for a `<stem>-dspark.<ext>` sidecar holding the
-        // `mtp.{0,1,2}.*` DSpark stages (arch_id=9). Default ON when the
-        // sidecar exists; `HIPFIRE_DEEPSEEK4_LOAD_DSPARK=0` opts out. A missing
-        // sidecar is a silent no-op (`weights.dspark` stays None).
-        let load_dspark = std::env::var("HIPFIRE_DEEPSEEK4_LOAD_DSPARK")
-            .map(|s| s != "0")
-            .unwrap_or(true);
-        if load_dspark {
+        // `mtp.{0,1,2}.*` DSpark stages (arch_id=9). Gated by `config.load_dspark`,
+        // which the loader sets from the `speculation` selector (`dspark`/`auto`
+        // → true, any other mechanism → false) so the 3×MoE sidecar is not paged
+        // into VRAM when DSpark won't run. A missing sidecar is a silent no-op
+        // (`weights.dspark` stays None).
+        if cfg.load_dspark {
             let base = hfq.path();
             let dspark_path: Option<std::path::PathBuf> =
                 match (base.parent(), base.file_stem(), base.extension()) {
