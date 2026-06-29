@@ -9565,10 +9565,11 @@ fn dspark_forward_head(
     }
     let _ = gpu.free_tensor(hc_pre);
 
-    // Download x_head once (needed for confidence concat) and keep on host.
-    let x_head_host = gpu
-        .download_f32(&x_head)
-        .map_err(|e| format!("dspark d2h x_head: {e:?}"))?;
+    // x_head stays resident: the confidence head reads it ON GPU (per-slot
+    // `proj · [x_head[i] ++ markov_embed[i]]` 1-row gemv in the markov loop),
+    // so we never pay the [block, hidden] d2h. Neutral on UMA (gfx1151
+    // VRAM==RAM) but removes a per-window PCIe d2h on discrete cards
+    // (gfx1100/gfx1201) where it stalls the decode pipeline. Freed after loop.
 
     // logits[block, vocab] = lm_head(rmsnorm(x_head, mtp_final_norm)).
     let normed = gpu
@@ -9619,7 +9620,8 @@ fn dspark_forward_head(
     }
     let _ = gpu.free_tensor(x_f16);
     let _ = gpu.free_tensor(normed);
-    let _ = gpu.free_tensor(x_head);
+    // x_head freed after the confidence head (below) — the markov loop's
+    // per-slot confidence gemv reads x_head[i] on GPU.
     // `logits_dev` stays resident: the markov loop adds each slot's bias and
     // argmaxes ON-GPU (no per-slot 517 KB / upfront 2.5 MB full-vocab d2h).
     // Freed after the loop. The draft logits themselves are never consumed
@@ -9631,7 +9633,18 @@ fn dspark_forward_head(
     // markov_bias = markov_w2 @ markov_w1_lookup(out_ids[i]). markov_embed[i]
     // (the [markov_rank] lookup) is also collected for the confidence head.
     let mut out_ids = vec![prev_token; block + 1];
-    let mut markov_embeds: Vec<Vec<f32>> = Vec::with_capacity(block);
+    // Confidence head buffers (computed ON GPU per slot inside the loop):
+    // `conf_batch[block]` holds the per-slot confidence logit; `concat_dev`
+    // stages `[x_head[i] ++ markov_embed[i]]` for the 1-row `confidence_proj`
+    // gemv. Downloaded once after the loop (block floats), so neither x_head
+    // nor the per-slot markov embed crosses to the host.
+    let proj_in = hidden + markov_rank;
+    let conf_batch = gpu
+        .alloc_tensor(&[block], DType::F32)
+        .map_err(|e| format!("dspark alloc conf_batch: {e:?}"))?;
+    let concat_dev = gpu
+        .alloc_tensor(&[proj_in], DType::F32)
+        .map_err(|e| format!("dspark alloc conf concat: {e:?}"))?;
     // Reusable device scratch for the markov head.
     let emb_dev = gpu
         .alloc_tensor(&[markov_rank], DType::F32)
@@ -9648,15 +9661,30 @@ fn dspark_forward_head(
         None
     };
     for i in 0..block {
-        // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank].
+        // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank] (unrotated).
         dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
-        // emb is [markov_rank]=256 floats — tiny; download it for the host
-        // confidence dot (the only host-side consumer). The big d2h (the
-        // [vocab] bias and the full [block,vocab] logits) stay on-GPU below.
-        let emb_host = gpu
-            .download_f32(&emb_dev)
-            .map_err(|e| format!("dspark d2h markov emb {i}: {e:?}"))?;
-        markov_embeds.push(emb_host);
+        // Confidence slot i ON GPU: stage [x_head[i] ++ markov_embed[i]] then a
+        // 1-row `confidence_proj` gemv → conf_batch[i]. Uses the UNROTATED
+        // emb_dev (matches the reference, which dotted the raw markov embed).
+        {
+            let xh_i = x_head.sub_offset(i * hidden, hidden);
+            let c_hidden = concat_dev.sub_offset(0, hidden);
+            let c_markov = concat_dev.sub_offset(hidden, markov_rank);
+            gpu.memcpy_dtod_auto(&c_hidden.buf, &xh_i.buf, hidden * 4)
+                .map_err(|e| format!("dspark conf stage x_head {i}: {e:?}"))?;
+            gpu.memcpy_dtod_auto(&c_markov.buf, &emb_dev.buf, markov_rank * 4)
+                .map_err(|e| format!("dspark conf stage emb {i}: {e:?}"))?;
+            let conf_i = conf_batch.sub_offset(i, 1);
+            gemv_auto(
+                gpu,
+                confidence_proj,
+                &concat_dev,
+                &concat_dev,
+                &conf_i,
+                1,
+                proj_in,
+            )?;
+        }
         // bias = markov_w2 @ emb  ([vocab, markov_rank] · [markov_rank]).
         let x_for_w2 = if let Some(r) = emb_rot.as_ref() {
             gpu.rotate_x_mq(&emb_dev, r, markov_rank)
@@ -9692,24 +9720,22 @@ fn dspark_forward_head(
         let _ = gpu.free_tensor(r);
     }
 
-    // ── Confidence head: proj([x_head[i] ++ markov_embed[i]]) per slot ──
-    // confidence_proj: [1, hidden + markov_rank]. Compute on host (single
-    // dot-product per slot) — proj is tiny and downloading it once is cheap.
-    // TODO(perf): keep the GEMV on GPU once a [block, 1] confidence kernel
-    // is wired; CPU dot is fine for correctness.
-    let proj_in = hidden + markov_rank;
-    let proj_host = dspark_download_weight_f32(gpu, confidence_proj, 1, proj_in)?;
+    // ── Confidence head: computed ON GPU per slot in the markov loop above
+    //    (`confidence_proj · [x_head[i] ++ markov_embed[i]]`). Download only the
+    //    `block` confidence logits — no x_head / per-slot-embed / proj-weight
+    //    d2h. ───────────────────────────────────────────────────────────────
     let mut confidence = vec![0.0f32; block];
-    for i in 0..block {
-        let mut acc = 0.0f32;
-        for d in 0..hidden {
-            acc += proj_host[d] * x_head_host[i * hidden + d];
-        }
-        for d in 0..markov_rank {
-            acc += proj_host[hidden + d] * markov_embeds[i][d];
-        }
-        confidence[i] = acc;
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(confidence.as_mut_ptr() as *mut u8, block * 4)
+        };
+        gpu.hip
+            .memcpy_dtoh(bytes, &conf_batch.buf)
+            .map_err(|e| format!("dspark d2h confidence: {e:?}"))?;
     }
+    let _ = gpu.free_tensor(conf_batch);
+    let _ = gpu.free_tensor(concat_dev);
+    let _ = gpu.free_tensor(x_head);
 
     Ok(DraftResult {
         // Draft logits are not materialized on the host: argmax happens on-GPU
