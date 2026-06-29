@@ -27,7 +27,8 @@
 
 use hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator;
 use hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator;
-use hipfire_arch_deepseek4::{Deepseek4Bundle, DeepseekV4, DeepseekV4State};
+use hipfire_arch_deepseek4::spec_decode::logits_argmax;
+use hipfire_arch_deepseek4::{forward, Deepseek4Bundle, DeepseekV4, DeepseekV4State};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{PrefillOutcome, Speculator};
@@ -187,6 +188,80 @@ fn main() -> Result<(), String> {
         "prompt: {prompt:?} -> {} tokens (token-md5 {prompt_md5})",
         prompt_tokens.len()
     );
+
+    // ── AR baseline (no speculation): plain greedy trunk decode. ──
+    // HIPFIRE_DEEPSEEK4_AR=1 bypasses the speculator entirely and drives the
+    // trunk one token at a time (1 forward/token), the apples-to-apples
+    // denominator for the MTP / DSpark tok/s wins. Same prompt, same warmup.
+    if std::env::var("HIPFIRE_DEEPSEEK4_AR").ok().as_deref() == Some("1") {
+        let pbs = forward::PrefillBatchScratch::new(&mut gpu, &bundle.config, 256)?;
+        // Greedy AR decode from a fresh prefill; returns the generated tokens.
+        let run = |bundle: &mut Deepseek4Bundle,
+                   gpu: &mut Gpu,
+                   n_max: usize|
+         -> Result<Vec<u32>, String> {
+            bundle.state.reset();
+            let last = forward::forward_prefill_batch_chunked(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                &prompt_tokens,
+                0,
+                &pbs,
+            )?;
+            let mut tok = logits_argmax(&last) as u32;
+            let mut pos = prompt_tokens.len();
+            let mut gen = Vec::with_capacity(n_max);
+            if raw || tok != eos_tok {
+                gen.push(tok);
+            }
+            while gen.len() < n_max {
+                let lg = forward::forward_prefill_batch_chunked(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    &[tok],
+                    pos as u32,
+                    &pbs,
+                )?;
+                tok = logits_argmax(&lg) as u32;
+                pos += 1;
+                if !raw && tok == eos_tok {
+                    break;
+                }
+                gen.push(tok);
+            }
+            Ok(gen)
+        };
+        let _ = run(&mut bundle, &mut gpu, warmup)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("ar warmup sync: {e:?}"))?;
+        let t0 = Instant::now();
+        let generated = run(&mut bundle, &mut gpu, max)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("ar post sync: {e:?}"))?;
+        let dt = t0.elapsed().as_secs_f64();
+        let n = generated.len();
+        let tok_s = if dt > 0.0 { n as f64 / dt } else { 0.0 };
+        let text = tokenizer.decode(&generated);
+        println!("=== dspark_bench ===");
+        println!(
+            "drafter=AR block=1 prompt_md5={prompt_md5} prompt_tokens={}",
+            prompt_tokens.len()
+        );
+        println!(
+            "tokens={n} time={dt:.3}s tok/s={tok_s:.2} | windows={n} tau=1.000 accept=0.000 (proposed=0 accepted=0)"
+        );
+        println!("--- decoded ({n} tokens) ---");
+        println!("{text}");
+        println!("--- token ids ---");
+        println!("{generated:?}");
+        return Ok(());
+    }
 
     // ── WARMUP: full prefill + short throwaway decode (JIT + DPM ramp). ──
     {
