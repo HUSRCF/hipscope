@@ -80,11 +80,11 @@ pub fn load_dflash_state(
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
     // staging for the larger of the two so ddtree-mode serve doesn't overflow
     // ("verify_scratch max_n < b" panic). budget=0 ⇒ chain-only, unchanged.
-    let ddtree_budget: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or(ddtree_budget_param)
-        .unwrap_or(0);
+    // Resolved through FeatureFlags (env override) so the ddtree budget has a
+    // single parser shared with the dense path — env wins, else the CLI param,
+    // else 0 (chain-only). An explicit `HIPFIRE_DDTREE_BUDGET=0` reads as None
+    // (unset) here and falls through to the param, matching the dense semantics.
+    let ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
     let max_n = (block_size + 1).max(ddtree_budget + 1);
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
@@ -134,11 +134,7 @@ pub fn load_dflash_state(
     let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
     // DDTree (budget read once above, used for scratch sizing).
     let ddtree = if ddtree_budget > 0 {
-        let topk: usize = std::env::var("HIPFIRE_DDTREE_TOPK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or(ddtree_topk_param)
-            .unwrap_or(4);
+        let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
         let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
             + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
         let n_fa_layers = target_config

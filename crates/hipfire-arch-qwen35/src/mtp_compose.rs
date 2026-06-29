@@ -1119,7 +1119,7 @@ pub fn spec_step_dflash_mtp_tree(
         gpu.hip
             .memcpy_htod(&ddtree_scratch.attn_bias.buf, mask_bytes)?;
     }
-    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
+    let use_tree_la = gpu.flags.ddtree_tree_la;
     if use_tree_la {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(

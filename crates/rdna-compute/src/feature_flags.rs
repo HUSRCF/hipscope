@@ -121,6 +121,23 @@ pub struct FeatureFlags {
     /// Override DDTree per-position top-K breadth (`HIPFIRE_DDTREE_TOPK`).
     /// `None` → use the per-call-site default (`DEFAULT_TREE_TOPK = 2`).
     pub ddtree_topk: Option<usize>,
+    /// qwen35 ddtree temp>0 verify scheme. `false` (default) → q-exploiting SWOR;
+    /// `true` → the simpler naive-sampling fallback (`HIPFIRE_DDTREE_VERIFY=naive`).
+    pub ddtree_verify_naive: bool,
+    /// qwen35 ddtree tree-LA (linearized-ancestor) fast-tape path. **Default ON**;
+    /// opt out with `HIPFIRE_DDTREE_TREE_LA=0`.
+    pub ddtree_tree_la: bool,
+    /// qwen35 DFlash GPU softmax/nucleus fast path on the temp>0 sampled verify.
+    /// **Default ON**; opt out with `HIPFIRE_DFLASH_FAST_SAMPLE=0`.
+    pub dflash_fast_sample: bool,
+    /// qwen35 ddtree meta-verifier expansion cutoff (`HIPFIRE_DDTREE_LOGW_CUTOFF`).
+    /// Stores the positive X the user set (stop tree expansion when the next
+    /// candidate's cumulative logw < −X); `None`/0/unparseable → no cutoff.
+    /// Use [`FeatureFlags::ddtree_logw_cutoff_value`] for the resolved threshold.
+    pub ddtree_logw_cutoff: Option<f32>,
+    /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
+    /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
+    pub dflash_q8_lmhead_wmma: bool,
 }
 
 impl FeatureFlags {
@@ -288,6 +305,20 @@ impl FeatureFlags {
             dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() != Ok("0"),
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
+            ddtree_verify_naive: std::env::var("HIPFIRE_DDTREE_VERIFY").as_deref() == Ok("naive"),
+            ddtree_tree_la: std::env::var("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
+            dflash_fast_sample: std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
+            ddtree_logw_cutoff: std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|&x| x > 0.0),
+            dflash_q8_lmhead_wmma: match std::env::var("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
+                Ok(v) => {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v == "0" || v == "false" || v == "off" || v == "no")
+                }
+                Err(_) => true,
+            },
         }
     }
 
@@ -295,6 +326,16 @@ impl FeatureFlags {
 
     pub fn gemv_dp4a_enabled(&self) -> bool {
         self.gemv_dp4a.unwrap_or(self.gemv_dp4a_default_on)
+    }
+
+    /// Resolved ddtree meta-verifier expansion threshold: `−X` for a user-set
+    /// positive `X` (stop expanding when cumulative logw drops below it), else
+    /// `f32::NEG_INFINITY` (expand to the full budget).
+    pub fn ddtree_logw_cutoff_value(&self) -> f32 {
+        match self.ddtree_logw_cutoff {
+            Some(x) => -x,
+            None => f32::NEG_INFINITY,
+        }
     }
 
     pub fn gemv_prefetch_enabled(&self) -> bool {
@@ -426,6 +467,11 @@ impl FeatureFlags {
             dflash_tree: true,
             ddtree_budget: None,
             ddtree_topk: None,
+            ddtree_verify_naive: false,
+            ddtree_tree_la: true,
+            dflash_fast_sample: true,
+            ddtree_logw_cutoff: None,
+            dflash_q8_lmhead_wmma: true,
         }
     }
 }

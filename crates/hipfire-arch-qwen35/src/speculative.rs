@@ -108,17 +108,6 @@ fn run_spec_gemm_key(
     })
 }
 
-fn dflash_q8_lmhead_wmma_enabled_from_env() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    })
-}
-
 fn dflash_gemm_q8_lmhead(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
@@ -126,7 +115,7 @@ fn dflash_gemm_q8_lmhead(
     y: &GpuTensor,
     n: usize,
 ) -> HipResult<()> {
-    if dflash_q8_lmhead_wmma_enabled_from_env() {
+    if gpu.flags.dflash_q8_lmhead_wmma {
         // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to the identical
         // gpu.gemm_q8_0_batched_chunked the prior direct call used.
         return run_spec_gemm_key(
@@ -417,19 +406,6 @@ pub fn reset_seed_oracle_stats() {
     SEED_ORACLE_ANYPOS_MATCH.store(0, Ordering::Relaxed);
     SEED_ORACLE_FULLACCEPT.store(0, Ordering::Relaxed);
     SEED_ORACLE_ACCEPT_LEN_SUM.store(0, Ordering::Relaxed);
-}
-
-/// Parse HIPFIRE_DDTREE_LOGW_CUTOFF. Positive value X means "stop tree
-/// expansion when next candidate's cumulative logw < -X". 0.0 / unset /
-/// unparseable disables (= expand all the way to `budget`).
-fn ddtree_logw_cutoff() -> f32 {
-    match std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-    {
-        Some(x) if x > 0.0 => -x,
-        _ => f32::NEG_INFINITY,
-    }
 }
 
 /// DDTree meta-verifier pruner telemetry: per-cycle tree-size histogram.
@@ -3074,11 +3050,7 @@ pub fn spec_step_dflash(
     // vs host sequential sum can differ at the last ULP and rarely flip a
     // borderline `u*p_d <= p_t` accept) — validated coherent across genres
     // (no attractors), so default-on. Greedy path (temp==0) is never affected.
-    static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fast_sample_active = use_temp_sampling
-        && *FAST_SAMPLE_ENV.get_or_init(|| {
-            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0")
-        });
+    let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -4742,7 +4714,7 @@ pub fn spec_step_ddtree(
         tree_topk,
         0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
-        ddtree_logw_cutoff(),
+        gpu.flags.ddtree_logw_cutoff_value(),
     );
     record_ddtree_meta_nodes(tree.num_nodes());
 
@@ -5042,8 +5014,7 @@ pub fn spec_step_ddtree_batched(
     // Sequoia/SpecTr, distribution-exact, the broad-sweep perf winner) | naive
     // (simpler distribution-preserving fallback). SWOR drives the device Gumbel-
     // SWOR draft sampler below.
-    let use_swor =
-        temp > 0.0 && std::env::var("HIPFIRE_DDTREE_VERIFY").ok().as_deref() != Some("naive");
+    let use_swor = temp > 0.0 && !gpu.flags.ddtree_verify_naive;
 
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
@@ -5087,7 +5058,7 @@ pub fn spec_step_ddtree_batched(
         tree_topk,
         0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
-        ddtree_logw_cutoff(),
+        gpu.flags.ddtree_logw_cutoff_value(),
     );
     record_ddtree_meta_nodes(tree.num_nodes());
 
@@ -5158,7 +5129,7 @@ pub fn spec_step_ddtree_batched(
     // the slow-path re-verify that used to trigger on sibling pollution.
     //
     // Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected.
-    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
+    let use_tree_la = gpu.flags.ddtree_tree_la;
     if use_tree_la {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
@@ -5778,7 +5749,7 @@ pub fn spec_step_ddtree_path_c(
         tree_topk,
         0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
-        ddtree_logw_cutoff(),
+        gpu.flags.ddtree_logw_cutoff_value(),
     );
     record_ddtree_meta_nodes(tree.num_nodes());
 
