@@ -1169,6 +1169,7 @@ pub fn spec_step_dflash_mtp_tree(
         false, // greedy / temp=0
         ctx,
         verify_scratch,
+        false, // greedy path: argmax_per_pos is used by follow_verified_tree
     )?;
 
     let posterior = &verify_out.argmax_per_pos;

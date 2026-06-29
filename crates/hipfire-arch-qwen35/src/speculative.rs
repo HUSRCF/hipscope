@@ -2290,6 +2290,7 @@ pub fn verify_dflash_block(
         want_full_logits,
         None,
         verify_scratch,
+        false, // chain path always needs argmax
     )
 }
 
@@ -2315,6 +2316,11 @@ pub fn verify_dflash_block_tree(
     want_full_logits: bool,
     tree_verify: qwen35::TreeVerifyCtx<'_>,
     verify_scratch: &VerifyScratch,
+    // D9: when the caller will use the SWOR walk (which derives accepted
+    // indices from the 68-byte walk-result D2H, not from argmax_per_pos),
+    // skip the big_n × 4 byte argmax download entirely — the returned
+    // argmax_per_pos will be empty. Pass `false` for the greedy path.
+    skip_argmax_d2h: bool,
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu,
@@ -2326,6 +2332,7 @@ pub fn verify_dflash_block_tree(
         want_full_logits,
         Some(tree_verify),
         verify_scratch,
+        skip_argmax_d2h,
     )
 }
 
@@ -2339,6 +2346,9 @@ fn verify_dflash_block_inner(
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
+    // D9: skip the big_n × 4 argmax D2H when the caller will use SWOR walk
+    // (which gets accepted indices from the 68-byte walk-result D2H instead).
+    skip_argmax_d2h: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2620,10 +2630,23 @@ fn verify_dflash_block_inner(
     // multiple batch rows targeting the same cache slot — the async write
     // order lets a subsequent attention kernel read a partially-committed
     // slot. Fix TODO: either serialize within-kernel per-slot, or ensure
-    // the "winning" sibling's write happens last. Cost ~3–5 ms per cycle
-    // until fixed.
+    // the "winning" sibling's write happens last.
+    //
+    // D16: narrowed from device_synchronize() (full device drain, ~3–5 ms
+    // on PCIe, ~50–200 µs on UMA) to stream_synchronize (scoped to the
+    // active stream only). Semantically identical on hipfire's single-stream
+    // setup, but does not stall work enqueued on other streams. The ordering
+    // guarantee — all prior KV writes complete before the next attention
+    // kernel reads the slot — is preserved because all ops ride the same
+    // stream. Caller (spec_step_ddtree_batched) ensures active_stream is
+    // Some before reaching here; the fallback keeps the old full drain for
+    // the rare path where it isn't set.
     if batch_result.is_ok() && tree_verify.is_some() {
-        gpu.hip.device_synchronize()?;
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        } else {
+            gpu.hip.device_synchronize()?;
+        }
     }
     batch_result?;
 
@@ -2661,6 +2684,14 @@ fn verify_dflash_block_inner(
                 argmax_per_pos.push(argmax_u32(row));
             }
             logits_per_pos = host_logits;
+        } else if skip_argmax_d2h {
+            // D9: SWOR verify path — the accept walk uses the 68-byte walk-result
+            // D2H (D13), NOT argmax_per_pos. Skip this D2H entirely; argmax_per_pos
+            // stays empty. Still enqueue the GPU argmax kernel so verify_scratch.argmax
+            // is populated if some other consumer ever needs it (none currently).
+            let argmax_buf = verify_scratch.argmax.sub_offset(0, b);
+            gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b)?;
+            // argmax_per_pos intentionally left empty — caller must not read it.
         } else {
             // GPU-side batched argmax. Writes B i32 indices; we download just
             // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
@@ -4344,7 +4375,10 @@ fn run_dflash_draft_for_topk_gpu(
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
     draft_scratch: &mut DflashScratch,
-    target_hidden_host: &[f32],
+    // Stage 1b: `None` = GPU-resident path (scratch.target_hidden already
+    // populated via D2D scatter; thlog tracks the live rows). `Some(slice)`
+    // = ctx_slice diagnostic path (host shadow, always full H2D upload).
+    target_hidden_host: Option<&[f32]>,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
@@ -4392,22 +4426,45 @@ fn run_dflash_draft_for_topk_gpu(
             _ => panic!("ddtree draft: unsupported target embedding format"),
         }
     }
-    let effective_ctx_len = match ctx_slice {
-        Some(n) => n.min(position),
-        None => position,
-    };
-    let ctx_start = position - effective_ctx_len;
-    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
-    let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
-    let th_offset = ctx_start * ne * h;
-    let th_slice: &[f32] = &target_hidden_host[th_offset..];
+    // Stage 1b: positions and hidden-source depend on whether we are using the
+    // GPU-resident path (target_hidden_host=None) or the ctx_slice host path.
+    let (positions_q, positions_k, th_arg, effective_ctx_len) =
+        if let Some(host_slice) = target_hidden_host {
+            // ctx_slice diagnostic path: host shadow, simple contiguous positions.
+            let effective_ctx_len = match ctx_slice {
+                Some(n) => n.min(position),
+                None => position,
+            };
+            let ctx_start = position - effective_ctx_len;
+            let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+            let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
+            let th_offset = ctx_start * ne * h;
+            (positions_q, positions_k, Some(&host_slice[th_offset..]), effective_ctx_len)
+        } else {
+            // GPU-resident path: scratch.target_hidden already contains all rows
+            // via D2D scatter (Stage 1); thlog tracks uploaded_rows + abs_positions.
+            // Mirror the chain path (spec_step_dflash ~line 3157): use thlog's
+            // eviction-aware abs_positions for k-positions, pass None to skip H2D.
+            let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
+            let ctx_start = position - effective_ctx_len;
+            let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+            let th_abs = draft_scratch.thlog.abs_positions();
+            let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
+            let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);
+            positions_k.extend_from_slice(&th_abs[start_idx..]);
+            for p in 0..b {
+                positions_k.push(position as i32 + p as i32);
+            }
+            let _ = ctx_start; // not used in this branch
+            (positions_q, positions_k, None, effective_ctx_len)
+        };
 
     dflash::draft_forward(
         gpu,
         draft_weights,
         draft_cfg,
         None,
-        Some(th_slice),
+        th_arg,
         &positions_q,
         &positions_k,
         b,
@@ -4988,15 +5045,22 @@ pub fn spec_step_ddtree_batched(
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     assert!(b >= 2, "spec_step_ddtree_batched: block_size must be ≥ 2");
-    assert_eq!(
-        target_hidden_host.len(),
-        position * ne * h,
-        "target_hidden_host size mismatches position"
-    );
+    // Stage 1b: target_hidden_host is no longer maintained in the GPU-resident
+    // default path (ctx_slice=None). The length-invariant assert is removed
+    // to avoid false failures. The ctx_slice=Some path still uses the host Vec.
     assert!(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+
+    // D16: ensure active_stream is set before any work so memset_async and
+    // the stream-scoped sync in verify_dflash_block_inner have a non-null
+    // stream to ride on. Mirrors the identical setup in spec_step_dflash
+    // (~line 2968) — da2753e pattern.
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
     // Unused in the batched path (no per-path DFS), kept in signature for
     // API compatibility with `spec_step_ddtree` so callers can switch by
     // flipping a single fn pointer.
@@ -5010,24 +5074,36 @@ pub fn spec_step_ddtree_batched(
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
-    // Verify-scheme selector. HIPFIRE_DDTREE_VERIFY: swor (DEFAULT — q-exploiting
-    // Sequoia/SpecTr, distribution-exact, the broad-sweep perf winner) | naive
-    // (simpler distribution-preserving fallback). SWOR drives the device Gumbel-
-    // SWOR draft sampler below.
-    let use_swor = temp > 0.0 && !gpu.flags.ddtree_verify_naive;
+    // Verify-scheme selector. SWOR (q-exploiting Sequoia/SpecTr, distribution-
+    // exact) is the ONLY temp>0 verify path — the naive-sampling fallback
+    // (HIPFIRE_DDTREE_VERIFY=naive) was removed in D8 because it required
+    // a ~37 MB/cycle full-logits D2H and SWOR is strictly superior.
+    // temp=0 → greedy argmax walk; temp>0 → on-GPU SWOR.
+    let use_swor = temp > 0.0;
 
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
     // with an on-device top-K (~µs) plus a ~480 byte D2H. SWOR mode instead
     // Gumbel-top-k samples the children (download + CPU sample).
+    //
+    // Stage 1b: Pass `None` as target_hidden_host in the default production
+    // path (ctx_slice=None) so draft_forward skips the H2D upload — the
+    // GPU-resident scratch.target_hidden is already populated by the previous
+    // cycle's D2D scatter (or the prefill scatter). The ctx_slice diagnostic
+    // path (Some(n)) still uses the CPU host shadow.
+    let th_host_arg: Option<&[f32]> = if ctx_slice.is_none() {
+        None // GPU-resident: scratch.target_hidden populated via D2D scatter
+    } else {
+        Some(target_hidden_host.as_slice())
+    };
     let (top_tokens, top_log_probs, draft_logits_dev) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,
         draft_cfg,
         draft_scratch,
-        target_hidden_host,
+        th_host_arg,
         position,
         seed_token,
         ctx_slice,
@@ -5092,8 +5168,7 @@ pub fn spec_step_ddtree_batched(
         )?;
         let co = target.kv_cache.compact_offset as i32;
         draft_scratch.thlog.append_committed(position, 1, co);
-        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
+        // Stage 1b: no CPU download needed — GPU buffer is authoritative.
         return Ok(SpecStepResult {
             accepted: 0,
             bonus_token: bonus,
@@ -5206,13 +5281,11 @@ pub fn spec_step_ddtree_batched(
         pre_rope_k_capture: pre_rope_capture,
     };
     let t_pre_verify = t_all.elapsed();
-    // temp > 0 needs the full per-slot target logits for naive tree sampling;
-    // greedy keeps the cheap GPU-argmax + 4·B D2H.
-    // `use_swor` was resolved before the draft (the draft sampler keys off it).
-    // Only NAIVE needs the host download of the full logits; SWOR reads them
-    // on-device (verify_scratch.logits) in the fused kernel, so it skips the
-    // B×vocab D2H.
-    let want_full_logits = temp > 0.0 && !use_swor;
+    // D8: `want_full_logits` was `temp > 0.0 && !use_swor` (the naive path,
+    // gated by HIPFIRE_DDTREE_VERIFY=naive). Since use_swor is now the only
+    // temp>0 path (the naive flag and its ~37 MB/cycle D2H have been removed),
+    // want_full_logits is permanently false. Greedy: GPU-argmax + tiny D2H.
+    // SWOR: no host logits needed; verify_scratch.logits stays device-resident.
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -5220,18 +5293,21 @@ pub fn spec_step_ddtree_batched(
         position,
         hidden_rb,
         Some(gdn_tape),
-        want_full_logits,
+        false, // want_full_logits: always false; D8 naive path removed
         ctx,
         verify_scratch,
+        use_swor, // D9: SWOR uses 68-byte walk result, not argmax_per_pos
     )?;
     let t_post_verify = t_all.elapsed();
 
     // ── 8. Accept walk: longest accepted path + bonus ─────────────────────
-    // Greedy (temp 0 / forced) → argmax walk. temp>0: naive sampling
-    // (distribution-preserving; draw target, accept drafted child it lands on)
-    // OR — when use_swor — the q-exploiting Sequoia/SpecTr SWOR walk over the
-    // Gumbel-sampled tree. All return the same (accepted, bonus) shape; step 10's
-    // divergent-path commit handles non-linear accepted paths identically.
+    // temp=0 → greedy argmax walk (follow_verified_tree).
+    // temp>0 → q-exploiting Sequoia/SpecTr SWOR walk (use_swor, distribution-
+    //   exact). The naive-sampling fallback (HIPFIRE_DDTREE_VERIFY=naive) has
+    //   been removed (D8): it required a ~37 MB/cycle full-logits D2H and is
+    //   superseded by SWOR which achieves the same distribution-preservation
+    //   on-device. All paths return the same (accepted_node_indices, bonus_token)
+    //   shape; step 10's divergent-path commit handles non-linear accepted paths.
     let (accepted_node_indices, bonus_token) = if use_swor {
         // Fully on-device fused SWOR walk: target logits from verify scratch,
         // draft logits kept on device — no full-vocab host work, no q D2H.
@@ -5253,15 +5329,8 @@ pub fn spec_step_ddtree_batched(
             temp,
             seed,
         )?
-    } else if want_full_logits {
-        hipfire_runtime::ddtree::sample_verified_tree(
-            &tree,
-            &verify_out.logits_per_pos,
-            vocab,
-            temp,
-            rng_state,
-        )
     } else {
+        // Greedy (temp=0): follow argmax at each tree node.
         hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
     };
     // The kept draft logits are no longer needed once the walk has run.
@@ -5269,24 +5338,6 @@ pub fn spec_step_ddtree_batched(
         let _ = gpu.free_tensor(t);
     }
     let accept_len = accepted_node_indices.len();
-
-    // Phase-0 (p,q) dump for the q-exploiting-verify decision gate. Only on the
-    // temp>0 full-logits path; appends one JSONL record per cycle.
-    if want_full_logits {
-        if let Ok(path) = std::env::var("HIPFIRE_DDTREE_DUMP_PQ") {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static DUMP_CYCLE: AtomicU64 = AtomicU64::new(0);
-            let c = DUMP_CYCLE.fetch_add(1, Ordering::Relaxed);
-            hipfire_runtime::ddtree::dump_pq_jsonl(
-                &path,
-                &tree,
-                &verify_out.logits_per_pos,
-                vocab,
-                temp,
-                c,
-            );
-        }
-    }
 
     // ── 9. Build committed + drafted sequences ────────────────────────────
     let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
@@ -5638,6 +5689,9 @@ pub fn spec_step_ddtree_batched(
     let row_stride = ne * h;
     if hidden_rows_written == big_n && !fast_tape_ok {
         // Path B (WIP, opt-in): CPU-gather from big_n-row block. Unchanged.
+        // Stage 1b: the download here is kept because Path B gathers via
+        // host indices — it would need a separate D2D gather kernel to go fully
+        // GPU-resident. The CPU path (target_hidden_host) is the only consumer.
         let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
         target_hidden_host.extend_from_slice(&hidden_block[0..row_stride]);
         for i in 0..accept_len {
@@ -5661,9 +5715,11 @@ pub fn spec_step_ddtree_batched(
         draft_scratch
             .thlog
             .append_committed(position, rows_to_keep, co);
-        // Download rows_to_keep (not big_n) to keep target_hidden_host length-consistent.
-        let hidden_block = download_hidden_block(gpu, hidden_rb, rows_to_keep)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
+        // Stage 1b: GPU buffer (scratch.target_hidden) is now authoritative —
+        // the D2D scatter above populated it. No CPU download needed; the
+        // next cycle's draft_forward receives None and skips H2D entirely.
+        // target_hidden_host is intentionally NOT updated (it's unused in the
+        // GPU-resident path). Path B above still uses it for host-side gathering.
     }
 
     if debug_tm {

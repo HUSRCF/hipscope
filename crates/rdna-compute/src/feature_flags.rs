@@ -121,9 +121,10 @@ pub struct FeatureFlags {
     /// Override DDTree per-position top-K breadth (`HIPFIRE_DDTREE_TOPK`).
     /// `None` → use the per-call-site default (`DEFAULT_TREE_TOPK = 2`).
     pub ddtree_topk: Option<usize>,
-    /// qwen35 ddtree temp>0 verify scheme. `false` (default) → q-exploiting SWOR;
-    /// `true` → the simpler naive-sampling fallback (`HIPFIRE_DDTREE_VERIFY=naive`).
-    pub ddtree_verify_naive: bool,
+    // D8: ddtree_verify_naive removed — SWOR is the only temp>0 verify path.
+    // The naive fallback required a ~37 MB/cycle full-logits D2H and is
+    // superseded by SWOR (distribution-exact, on-GPU). HIPFIRE_DDTREE_VERIFY
+    // env var is no longer parsed; setting it has no effect.
     /// qwen35 ddtree tree-LA (linearized-ancestor) fast-tape path. **Default ON**;
     /// opt out with `HIPFIRE_DDTREE_TREE_LA=0`.
     pub ddtree_tree_la: bool,
@@ -305,7 +306,7 @@ impl FeatureFlags {
             dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() != Ok("0"),
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
-            ddtree_verify_naive: std::env::var("HIPFIRE_DDTREE_VERIFY").as_deref() == Ok("naive"),
+            // D8: ddtree_verify_naive removed; HIPFIRE_DDTREE_VERIFY env is no-op.
             ddtree_tree_la: std::env::var("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
             dflash_fast_sample: std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
             ddtree_logw_cutoff: std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
@@ -467,7 +468,7 @@ impl FeatureFlags {
             dflash_tree: true,
             ddtree_budget: None,
             ddtree_topk: None,
-            ddtree_verify_naive: false,
+            // D8: ddtree_verify_naive removed.
             ddtree_tree_la: true,
             dflash_fast_sample: true,
             ddtree_logw_cutoff: None,
