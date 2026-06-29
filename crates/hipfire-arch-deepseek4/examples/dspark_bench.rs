@@ -107,10 +107,13 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(160);
+    // Default 128 (not 24): gfx1151 DPM ramps over several seconds, and 24
+    // throwaway tokens (~1.5 s) leaves the timed run clock-cold — measured ~12%
+    // low vs a DPM-ramped warmup. Override via HIPFIRE_DEEPSEEK4_WARMUP.
     let warmup: usize = std::env::var("HIPFIRE_DEEPSEEK4_WARMUP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
+        .unwrap_or(128);
     let raw = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_RAW").ok().as_deref() == Some("1");
 
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
@@ -202,6 +205,8 @@ fn main() -> Result<(), String> {
                    n_max: usize|
          -> Result<Vec<u32>, String> {
             bundle.state.reset();
+            bundle.state.zero_decode_caches(gpu);
+            gpu.invalidate_graph_state();
             let last = forward::forward_prefill_batch_chunked(
                 &bundle.config,
                 &bundle.weights,
@@ -298,8 +303,17 @@ fn main() -> Result<(), String> {
     }
 
     // ── TIMED RUN: fresh prefill, then timed decode. ──
+    // Mirror the daemon's FULL reset contract (daemon.rs reset handler):
+    // state.reset() alone is NOT enough — it deliberately leaves the captured
+    // HIP graph in place (see DeepseekV4State::reset comment) so a stale,
+    // warmup-shaped graph would replay during the timed run, baking warmup-time
+    // host scalars (rope_pos etc.) → warmup-length-dependent τ. The daemon pairs
+    // reset() with zero_decode_caches() + invalidate_graph_state(); the bench
+    // must too, or the A/B measurement is contaminated by the warmup.
     spec.reset(&mut gpu);
     bundle.state.reset();
+    bundle.state.zero_decode_caches(&mut gpu);
+    gpu.invalidate_graph_state();
     let outcome = spec
         .prefill(
             &mut gpu,
