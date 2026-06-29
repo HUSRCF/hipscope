@@ -5080,6 +5080,18 @@ pub fn spec_step_ddtree_batched(
         )?;
         let logits0 = gpu.download_f32(&target.scratch.logits)?;
         let bonus = argmax_u32(&logits0);
+        // D2D scatter 1 row into draft_scratch.target_hidden, then keep
+        // target_hidden_host length-consistent for the next cycle's assert.
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            1,
+            1,
+        )?;
+        let co = target.kv_cache.compact_offset as i32;
+        draft_scratch.thlog.append_committed(position, 1, co);
         let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
         target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
         return Ok(SpecStepResult {
@@ -5604,15 +5616,29 @@ pub fn spec_step_ddtree_batched(
         hidden_rows_written = tape_block.len();
     }
 
-    // ── 11. Append (1 + accept_len) hidden rows to target_hidden_host ────
-    // Default slow path's 2nd verify wrote accept_len+1 rows in committed
-    // order → first N rows are correct. Fast path: rank-0 chain == linear
-    // prefix → first N rows still correct. Path A slow path keeps tree-
-    // verify's big_n rows in linearization order → CPU-gather committed
-    // rows out of the block.
-    let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
+    // ── 11. D2D-scatter committed rows into draft_scratch.target_hidden ─
+    // Mirror the chain path (spec_step_dflash ~line 3911): scatter only the
+    // accept_len+1 committed rows directly from hidden_rb into the GPU-resident
+    // draft_scratch.target_hidden buffer, then call thlog.append_committed so
+    // the next cycle's draft_forward sees prev==l and skips the H2D upload.
+    // We still download the same rows to CPU to maintain the target_hidden_host
+    // length invariant (checked at cycle entry, line 4992-4995).
+    //
+    // Fast-tape: hidden_rb holds big_n rows in linearization order; the first
+    // rows_to_keep are the committed prefix (spine_accept == true guarantees
+    // linear order). Pass block_size=big_n so scatter aligns to ring origin.
+    //
+    // Slow-tape: the 2nd verify (above) wrote exactly accept_len+1 rows in
+    // committed order to hidden_rb. Pass block_size=rows_to_keep.
+    //
+    // Path B dead-code branch (hidden_rows_written==big_n && !fast_tape_ok):
+    // this fires only when HIPFIRE_DDTREE_PATH_B_CAPTURE=1 with non-empty
+    // pre_rope_k. Left on the old D2H path for now (Path B is WIP/opt-in).
+    let rows_to_keep = accept_len + 1;
     let row_stride = ne * h;
     if hidden_rows_written == big_n && !fast_tape_ok {
+        // Path B (WIP, opt-in): CPU-gather from big_n-row block. Unchanged.
+        let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
         target_hidden_host.extend_from_slice(&hidden_block[0..row_stride]);
         for i in 0..accept_len {
             let src_row = accepted_node_indices[i] + 1;
@@ -5620,7 +5646,23 @@ pub fn spec_step_ddtree_batched(
             target_hidden_host.extend_from_slice(&hidden_block[src_start..src_start + row_stride]);
         }
     } else {
-        let rows_to_keep = accept_len + 1;
+        // Fast-tape: block_size=big_n, n_rows=rows_to_keep (take committed prefix).
+        // Slow-tape: block_size=rows_to_keep=hidden_rows_written (linear order).
+        let block_size = hidden_rows_written; // big_n for fast, rows_to_keep for slow
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            block_size,
+            rows_to_keep,
+        )?;
+        let co = target.kv_cache.compact_offset as i32;
+        draft_scratch
+            .thlog
+            .append_committed(position, rows_to_keep, co);
+        // Download rows_to_keep (not big_n) to keep target_hidden_host length-consistent.
+        let hidden_block = download_hidden_block(gpu, hidden_rb, rows_to_keep)?;
         target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
     }
 
