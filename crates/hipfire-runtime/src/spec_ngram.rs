@@ -152,15 +152,32 @@ pub struct ChainSpeculator<D: BlockDrafter> {
     block_size: usize,
     ctx_capacity: usize,
     scratch: Option<Box<dyn SpecScratch>>,
+    /// Whether the TARGET arch implements `SpecTarget::verify_block_sampled`
+    /// (set by `build_speculator` from arch_id). Drives `requires_greedy()`:
+    /// a target without sampled verify keeps the n-gram path greedy-only
+    /// (temp>0 → AR), so `step` never calls a verify that would `Err`.
+    samples: bool,
+    /// Per-request sampling, set via `set_sampling`. Default greedy (temp 0).
+    sample_temp: f32,
+    sample_top_p: f32,
+    sample_top_k: usize,
+    /// Sampled-verify RNG stream; reset to a fixed seed per request in
+    /// `set_sampling` so a sampled request is deterministic given its seed.
+    rng_state: u64,
 }
 
 impl<D: BlockDrafter> ChainSpeculator<D> {
-    pub fn new(drafter: D, block_size: usize, ctx_capacity: usize) -> Self {
+    pub fn new(drafter: D, block_size: usize, ctx_capacity: usize, samples: bool) -> Self {
         Self {
             drafter,
             block_size: block_size.max(2),
             ctx_capacity,
             scratch: None,
+            samples,
+            sample_temp: 0.0,
+            sample_top_p: 1.0,
+            sample_top_k: 0,
+            rng_state: 0x13579BDF,
         }
     }
 }
@@ -214,18 +231,44 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         block.push(seed);
         block.extend_from_slice(&draft);
 
+        // Sampling decision (set per request via `set_sampling`). `samples` is the
+        // target's capability; `sample_temp > 0` is the request asking for it.
+        let sampled = self.samples && self.sample_temp > 1e-6;
+        let (s_temp, s_top_p, s_top_k) = (self.sample_temp, self.sample_top_p, self.sample_top_k);
+        // Copy the RNG stream to a local so the verify call can take `&mut` on it
+        // alongside the `&mut scratch` borrow (both are `self` fields).
+        let mut rng_state = self.rng_state;
+
         let scratch = self
             .scratch
             .as_deref_mut()
             .ok_or("ChainSpeculator: step before prefill")?;
 
         // Verify: target snapshots its pre-state into `scratch`, runs the block,
-        // returns per-position greedy argmax, leaves state advanced by b.
-        let argmax = target.verify_block(gpu, &block, position, scratch, None)?;
+        // leaves state advanced by b. Greedy → per-position argmax; sampled →
+        // per-position sample at temp/(top_k,top_p) (faithful for a point-mass
+        // n-gram draft via the same accept-prefix below). The trailing `None`
+        // hidden_out sink is the DFlash hidden-capture arg the n-gram path never
+        // uses.
+        let picks = if sampled {
+            target.verify_block_sampled(
+                gpu,
+                &block,
+                position,
+                scratch,
+                s_temp,
+                s_top_p,
+                s_top_k,
+                &mut rng_state,
+            )?
+        } else {
+            target.verify_block(gpu, &block, position, scratch, None)?
+        };
 
-        // Shared greedy accept-prefix (eos=None: EOS handled downstream by the
-        // daemon decode loop). `committed` = accepted drafts ++ bonus.
-        let acc = accept_greedy_prefix(&draft, &argmax, None);
+        // Shared accept-prefix (eos=None: EOS handled downstream by the daemon
+        // decode loop). `committed` = accepted drafts ++ bonus. Faithful in both
+        // modes: greedy accepts on argmax match, sampled on target-sample match.
+        let acc = accept_greedy_prefix(&draft, &picks, None);
         let bonus = *acc
             .committed
             .last()
@@ -234,6 +277,8 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // Fix target state to the committed prefix block[..accept_len+1] (the
         // target decides full-accept-skip vs rewind+replay vs no-op internally).
         target.commit_prefix(gpu, &block, acc.accepted, position, scratch)?;
+        // Persist the advanced sampled-verify RNG stream (no-op in greedy mode).
+        self.rng_state = rng_state;
 
         self.drafter.observe(emitted, &acc.committed);
 
@@ -256,6 +301,25 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
 
     fn ctx_capacity(&self) -> usize {
         self.ctx_capacity
+    }
+
+    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+        // n-gram drafts are a point mass (no draft distribution), so cactus (the
+        // acceptance bump) does not apply. Store temp/top_p/top_k and reset the
+        // sampled-verify RNG stream to a fixed seed per request (deterministic
+        // given the seed). `step` only takes the sampled path when `samples`.
+        self.sample_temp = temp;
+        self.sample_top_p = top_p;
+        self.sample_top_k = top_k;
+        self.rng_state = 0x13579BDF;
+    }
+
+    fn requires_greedy(&self) -> bool {
+        // Sampled n-gram needs the target's `verify_block_sampled`; only arches
+        // that implement it are built with `samples = true` (build_speculator).
+        // When false, a temp>0 request is kept off this drafter by the daemon
+        // dispatch (`spec_can_sample`) and routes to AR — never silent-greedy.
+        !self.samples
     }
 
     fn free(mut self: Box<Self>, gpu: &mut Gpu) {

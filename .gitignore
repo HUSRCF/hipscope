@@ -64,6 +64,7 @@ __pycache__/
 .claude/
 # Personal CLI instructions
 cli/CLAUDE.md
+CLAUDE.local.md
 .pr_body_0_1_7_alpha.md
 .bench_0_1_7_alpha/
 
@@ -126,3 +127,13 @@ docs/investigations/*/sources/
 .scratch/
 .opencode/
 /.build/
+
+# rocprofv3 / rocpd profiler dumps. The rocpd_info_process table snapshots the
+# FULL process environment, so any exported secret (an OPENROUTER_API_KEY leaked
+# this way, 2026-06) ends up in the dump — and they're large binary artifacts.
+# Never track them anywhere in the tree.
+*_results.db
+*_results.json
+*_results.csv
+*.rocpd
+*.pftrace

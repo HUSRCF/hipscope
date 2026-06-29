@@ -30,6 +30,10 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
+// Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
+// it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
+use hipfire_arch_qwen35::Qwen35Bundle;
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
@@ -1363,12 +1367,21 @@ fn main() {
                         m.mtp_mode = mtp_mode;
                         m.mtp_k = mtp_k;
                         // Detect whether MTP weights are present in the loaded
-                        // model (DeepSeek V4 only today). Used by mtp_mode=auto
-                        // to decide whether to enable spec-decode at generate time.
-                        m.mtp_weights_present = m
+                        // model. Used by mtp_mode=auto to decide whether to
+                        // enable spec-decode at generate time. Two sources:
+                        //   - DeepSeek V4: the trunk's bundled `mtp_layer`.
+                        //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by
+                        //     the loader (`qwen35_mtp_head`, set from a bundled
+                        //     `.mq4-mtp` trailer or a `.mtp` sidecar). The loader
+                        //     already set `m.mtp_weights_present = true` in that
+                        //     case; OR it in here so the ds4 probe doesn't clobber
+                        //     it back to false for a qwen35 model.
+                        let ds4_mtp = m
                             .deepseek4()
                             .and_then(|b| b.weights.mtp_layer.as_ref())
                             .is_some();
+                        m.mtp_weights_present =
+                            ds4_mtp || m.qwen35_mtp_head.is_some() || m.mtp_weights_present;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -3866,10 +3879,30 @@ fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
-    // Request sampling temperature. The caller only routes temp>0 here when the
-    // speculator reports `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR);
-    // forwarded into the spec loop's verify.
+    // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
+    // historical DFlash posture). >0 → distribution-preserving spec decode via
+    // one of two verify mechanisms inside `DflashSpeculator::step`, picked by how
+    // the drafter loaded:
+    //   * ddtree mode — SWOR tree-verify, fed the `temp` arg directly; honors
+    //     temperature ONLY (the caller routes an explicit top_p/top_k/min_p to AR).
+    //   * chain mode — lossless rejection sampling (full-vocab softmax on BOTH
+    //     draft + target), fed the top_p/top_k/cactus args below via
+    //     `Speculator::set_sampling` (see the set_sampling call). Honors
+    //     temp+top_p+top_k; min_p is NOT plumbed (a min_p request routes to AR).
     temp: f32,
+    // Nucleus (top_p) cutoff for the chain rejection-sampling path, applied
+    // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
+    // 1.0 (>= 0.999) disables it. Ignored by the ddtree SWOR arm.
+    top_p: f32,
+    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20) for the chain
+    // sampled path, applied to both draft + target softmax rows. 0 = disabled.
+    // Ignored by the ddtree SWOR arm.
+    top_k: usize,
+    // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
+    // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
+    // daemon hardcodes 0.0; the param exists only so a future opt-in request
+    // field can reach it without re-touching this signature.
+    cactus_delta: f32,
 ) {
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
@@ -4057,6 +4090,16 @@ fn generate_dflash(
     // (`EmitSpec::Qwen35`), and the epilogue (asst-turn cache store + `done`
     // envelope). A future ds4 wrapper (Phase 4 T4c-2) builds its DSML render +
     // ds4 cache plan + `EmitSpec::Deepseek4` and writes its own ds4 `done`.
+    //
+    // Thread the request's sampling into the speculator BEFORE the step loop so
+    // `DflashSpeculator::step` runs lossless rejection sampling at temp>0 instead
+    // of decoding greedy (the #477-merge re-wire of spec-graph's sampled-DFlash).
+    // Greedy (temp 0) is unchanged. No-op for a greedy-only Speculator impl; the
+    // deepseek4 spec wrapper (`generate_deepseek4_spec`) deliberately never calls
+    // this, so ds4 MTP stays greedy. cactus_delta is 0.0 (lossless) from here.
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.set_sampling(temp, top_p, top_k, cactus_delta);
+    }
     let prefill_tokens_full = prefill_tokens.len();
     let run = match generate_spec(
         m,
@@ -4778,6 +4821,621 @@ fn generate_spec(
         total_s: t_end.duration_since(t0).as_secs_f64(),
         decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
     })
+}
+
+/// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
+///
+/// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
+/// drafts via the Qwen MTP head ([`hipfire_arch_qwen35::mtp_spec`]) instead of
+/// the diffusion drafter. The proven-durable config (27B-3.6 genre sweep, all
+/// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
+///
+/// Call sequence (mirrors `mtp_only_demo`):
+///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
+///   2. `prefill_trunk_and_mtp_cache` (trunk batched prefill + MTP private KV
+///      fill over the prompt positions),
+///   3. seed token = trunk argmax at the last prefill position,
+///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
+///      `result.committed` and advancing `cur_pos += result.advance` each cycle.
+///
+/// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
+/// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
+/// is allocated FRESH at the top of this function and freed at EVERY exit — so
+/// no recurrent MTP state survives between requests. The trunk's persistent DN
+/// state lives in the bundle and is cold-zeroed at the start of each request
+/// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
+/// persistent (loaded once on `LoadedModel.qwen35_mtp_head`).
+///
+/// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
+/// head is present (see the dispatch site in `generate`), so the DEFAULT serve
+/// path (DFlash/AR) is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn generate_qwen35_mtp(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+    // Request-resolved temp. 0.0 → greedy/argmax-match (p_min confidence cutoff
+    // applies). >0 → lossless residual-acceptance sampling (set_sampling below;
+    // mutually exclusive with p_min). Reached with temp>0 only when the dispatch
+    // gate saw HIPFIRE_MTP_SAMPLED=1 and a temp+top_p-only request.
+    temp: f32,
+    // Nucleus (top_p) cutoff for the sampled MTP path. Applied to BOTH draft +
+    // target nuclei (independent per-side truncation → lossless == AR-at-top_p).
+    // Ignored on the greedy path. <= 0.0 is treated as disabled (1.0).
+    top_p: f32,
+    // Top-k cutoff for the sampled MTP path (request- or card-recommended; e.g.
+    // qwen3.6 A3B ships top_k=20). Applied to BOTH draft + target nuclei
+    // alongside top_p, so it stays lossless == AR-at-(top_k,top_p). None / 0 →
+    // disabled (top_p-only). Ignored on the greedy path.
+    top_k: Option<u32>,
+    // Nucleus min-prob floor for the sampled MTP path: keep tokens with prob >=
+    // min_p * max_prob, folded into the GPU kernel's tau alongside top_p/top_k and
+    // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
+    // 0.0 = disabled. Ignored on the greedy path.
+    min_p: f32,
+) {
+    use hipfire_arch_qwen35::mtp_head::MtpKvMode;
+    use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
+    use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+
+    // ── Resolve the proven-durable MTP config ──────────────────────────
+    // K defaults to 3 (max_n); p_min defaults to 0.4. Both env-overridable so
+    // the GPU-validation thread can sweep. `set_p_min(0.4)` is applied below
+    // unconditionally (the MtpSpecState::new default p_min is arch-derived; we
+    // pin the proven value for the serve path and let HIPFIRE_MTP_P_MIN win).
+    let max_n: usize = std::env::var("HIPFIRE_MTP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|k| (1..=8).contains(k))
+        .unwrap_or(3);
+    let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|p: &f32| (0.0..=1.0).contains(p))
+        .unwrap_or(0.4);
+
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            emit_error_with_id(stdout, id, "tokenizer not loaded");
+            return;
+        }
+    };
+
+    // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let prompt_tokens: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) => h,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build()
+    };
+
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+
+    let im_end = tokenizer.encode("<|im_end|>");
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
+
+    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
+    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
+    // recurrent state + reset the KV write head so a fresh prompt prefills
+    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+        let dn = &b.dn_state;
+        for s in &dn.s_matrices {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.s_scales {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.conv_states {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+    }
+    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+        b.kv_cache.compact_offset = 0;
+    }
+
+    // ── Take the bundle → build a transient ModelSlot ───────────────────
+    // The mtp_spec helpers take `&mut ModelSlot`; the daemon owns the qwen35
+    // pieces in the bundle. Take them, build the slot, run, put them back at
+    // every exit (mirrors generate_dflash). The HfqFile is re-opened (mmap,
+    // few µs) because ModelSlot carries it; the MTP path doesn't read it.
+    let Qwen35Bundle {
+        config: orig_config,
+        weights,
+        scratch,
+        kv_cache,
+        dn_state,
+    } = match m.state.take() {
+        Some(ModelState::Qwen35(b)) => b,
+        _ => {
+            emit_error_with_id(stdout, id, "qwen35 MTP serve: model state is not Qwen35");
+            return;
+        }
+    };
+    let target_config = orig_config.clone();
+    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
+        Ok(h) => h,
+        Err(e) => {
+            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights,
+                scratch,
+                kv_cache,
+                dn_state,
+            }));
+            return;
+        }
+    };
+    let mut target = ModelSlot {
+        name: String::from("target"),
+        hfq,
+        config: target_config,
+        weights,
+        kv_cache,
+        dn_state,
+        scratch,
+        slot_config: ModelSlotConfig::default(),
+    };
+
+    // Helper closure analog: every early return must put the bundle back. We
+    // do it inline (Rust closures can't move `target` piecewise + keep using
+    // `m`), so each exit re-packs Qwen35Bundle from target's fields.
+    let eos_token = target.config.eos_token;
+    let dim = target.config.dim;
+    let vocab = target.config.vocab_size;
+
+    // Capacity guard: worst case per cycle writes max_n+1 verify slots before
+    // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
+    let max_seq_total = m.physical_cap;
+    if prompt_tokens
+        .len()
+        .saturating_add(max_tokens.saturating_mul(max_n + 1))
+        .saturating_add(16)
+        > max_seq_total
+    {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "prompt ({}) + max ({}) × (max_n+1) ({}) exceeds context capacity {} — reload with a larger max_seq",
+                prompt_tokens.len(),
+                max_tokens,
+                max_n + 1,
+                max_seq_total
+            ),
+        );
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
+        return;
+    }
+
+    // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
+    let head = m
+        .qwen35_mtp_head
+        .as_ref()
+        .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
+    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
+    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
+    // alloc below needs &mut state + &mut gpu.
+    let cvs_opt = head.weights.compressed_vocab_size;
+    let kv_mode = MtpKvMode::Q8;
+    let mut state =
+        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
+            Ok(s) => s,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
+                m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                    config: orig_config,
+                    weights: target.weights,
+                    scratch: target.scratch,
+                    kv_cache: target.kv_cache,
+                    dn_state: target.dn_state,
+                }));
+                return;
+            }
+        };
+    // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
+    // up front (mtp_only_demo does this; the daemon previously only set up the
+    // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
+    // heads (cvs == None) skip this entirely.
+    if let Some(cvs) = cvs_opt {
+        if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
+            emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
+            return;
+        }
+        if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
+            emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
+            return;
+        }
+    }
+    if temp > 1e-6 {
+        // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
+        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
+        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
+        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
+        // we feed the resolved p_min through instead of clearing it. p_min<=0
+        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
+        state.set_p_min(p_min);
+        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
+        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
+        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+        state.set_sampling(
+            mtp_spec::MtpSamplingConfig {
+                temp,
+                top_k: top_k.map(|k| k as usize).unwrap_or(0),
+                top_p: top_p_eff,
+                min_p,
+            },
+            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
+        );
+    } else {
+        state.set_p_min(p_min); // greedy MTP confidence cutoff
+    }
+
+    let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
+
+    let t0 = Instant::now();
+
+    // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
+    let head = m.qwen35_mtp_head.as_ref().unwrap();
+    let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
+        gpu,
+        &mut target,
+        head,
+        &mut state,
+        &prompt_tokens,
+        0,
+    );
+    if let Err(e) = prefill_res {
+        emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
+        state.free_gpu(gpu);
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Seed token = trunk argmax at the last prefill position. prefill left
+    // target.scratch.logits holding the post-prompt logits.
+    let seed_logits = match gpu.download_f32(&target.scratch.logits) {
+        Ok(v) => v,
+        Err(e) => {
+            emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
+            state.free_gpu(gpu);
+            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                config: orig_config,
+                weights: target.weights,
+                scratch: target.scratch,
+                kv_cache: target.kv_cache,
+                dn_state: target.dn_state,
+            }));
+            return;
+        }
+    };
+    let seed_token = seed_logits
+        .iter()
+        .enumerate()
+        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+            if v > bv {
+                (i as u32, v)
+            } else {
+                (best, bv)
+            }
+        })
+        .0;
+
+    // ── Decode loop ─────────────────────────────────────────────────────
+    let t_prefill = Instant::now();
+    let mut emitted: Vec<u32> = vec![seed_token];
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut last_committed = seed_token;
+    let mut cur_pos = prompt_tokens.len();
+    let mut generated = 0usize;
+    let mut cycles = 0usize;
+    let mut accepted_total = 0usize;
+    let mut think_count: usize = 0;
+    let mut prev_in_think = false;
+
+    // Emit the seed token first (TTFT = prefill).
+    streamed_tokens.push(seed_token);
+    emit_committed_event(
+        stdout,
+        id,
+        seed_token,
+        streamed_tokens.len() - 1,
+        t0.elapsed().as_millis() as u64,
+    );
+    {
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+            }
+        }
+    }
+    generated += 1;
+
+    let seed_is_eos = seed_token == eos_token
+        || im_end_token == Some(seed_token)
+        || tokenizer.is_terminator(seed_token);
+
+    let mut step_error: Option<String> = None;
+    while !seed_is_eos && generated < max_tokens {
+        if check_abort(id) {
+            break;
+        }
+        if cur_pos + max_n + 1 >= max_seq_total {
+            break;
+        }
+
+        let result = match mtp_spec::spec_step_mtp_compressed_serial(
+            gpu,
+            &mut target,
+            head,
+            &mut state,
+            cur_pos,
+            last_committed,
+            eos_token,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                step_error = Some(format!("{e:?}"));
+                break;
+            }
+        };
+        cycles += 1;
+        accepted_total += result.accept_count;
+
+        let mut hit_eos = false;
+        let mut think_cap_hit = false;
+        for &tok in &result.committed {
+            if generated >= max_tokens {
+                break;
+            }
+            emitted.push(tok);
+            streamed_tokens.push(tok);
+            emit_committed_event(
+                stdout,
+                id,
+                tok,
+                streamed_tokens.len() - 1,
+                t0.elapsed().as_millis() as u64,
+            );
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"token","id":"{}","text":{}}}"#,
+                        id,
+                        serde_json::to_string(&text).unwrap_or_default()
+                    );
+                    let _ = stdout.flush();
+                }
+            }
+            generated += 1;
+            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+                hit_eos = true;
+                break;
+            }
+            if !stop.is_empty() {
+                let decoded_suffix = tokenizer.decode(&streamed_tokens);
+                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                    hit_eos = true;
+                    break;
+                }
+            }
+            if max_think_tokens > 0 {
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let in_think = currently_in_think(
+                    raw_str,
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
+                );
+                if in_think && !prev_in_think {
+                    think_count = 0;
+                }
+                if in_think {
+                    think_count += 1;
+                }
+                prev_in_think = in_think;
+                if in_think && think_count >= max_think_tokens {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#,
+                        id
+                    );
+                    let _ = stdout.flush();
+                    think_cap_hit = true;
+                    break;
+                }
+            }
+        }
+        last_committed = match result.committed.last() {
+            Some(&t) => t,
+            None => break, // defensive: spec_step always commits ≥ 1
+        };
+        cur_pos += result.advance;
+        if result.hit_eos || hit_eos || think_cap_hit {
+            break;
+        }
+    }
+
+    let t_end = Instant::now();
+
+    // ── Free the per-request MtpSpecState + put the bundle back ─────────
+    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
+    // + the trunk DN snapshot, so the NEXT request starts with no residue.
+    state.free_gpu(gpu);
+    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
+    // next request cold-resets at the top of this fn (and the DFlash/AR paths
+    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
+    // empty conversation tracker (v1 is single-turn / no LCP reuse).
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+        config: orig_config,
+        weights: target.weights,
+        scratch: target.scratch,
+        kv_cache: target.kv_cache,
+        dn_state: target.dn_state,
+    }));
+
+    if let Some(e) = step_error {
+        emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
+        return;
+    }
+
+    // ── Done envelope ──────────────────────────────────────────────────
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prompt_tokens.len() as f64 / prefill_s
+    } else {
+        0.0
+    };
+    // τ = tokens committed per cycle (excludes the seed). > 1.0 = MTP speedup.
+    let tau = if cycles > 0 {
+        (emitted.len().saturating_sub(1)) as f64 / cycles as f64
+    } else {
+        0.0
+    };
+    let _ = accepted_total;
+    let hit_length_cap = generated >= max_tokens;
+    let finish_reason = if hit_length_cap { "length" } else { "stop" };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{},"mtp":true,"tau":{:.2},"cycles":{},"cached_tokens":0,"finish_reason":"{}"}}"#,
+        id,
+        generated,
+        tok_s,
+        prompt_tokens.len(),
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_ms,
+        tau,
+        cycles,
+        finish_reason,
+    );
+    let _ = stdout.flush();
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
@@ -5952,13 +6610,21 @@ fn generate(
     // `SpecTarget`) routes to the arch-generic spec loop, exactly like llama
     // (0/1). Without a speculator it falls through to the plain qwen2 decode
     // short-circuit below.
-    if m.arch_id == 7
-        && m.speculator.is_some()
-        && (temp <= 1e-6
-            || m.speculator
-                .as_ref()
-                .is_some_and(|sp| sp.supports_temp_verify()))
-    {
+    // The n-gram ChainSpeculator on arch 7/10/11/12 is greedy-only: `build_speculator`
+    // sets `samples=true` only for arch 5/6 (spec_build.rs), so `requires_greedy()` is
+    // true and `verify_block()` decodes argmax regardless of the requested temp. Gate
+    // each spec short-circuit the same way the qwen35/llama DFlash route is gated
+    // (~7042): route into the spec loop only when greedy (temp<=1e-6) OR the loaded
+    // drafter genuinely samples; a temp>0 request on a greedy-only drafter falls
+    // through to the arch's AR path below (faithful sampling) instead of being
+    // silently decoded greedy. Future-proof: a sampling-capable drafter on these
+    // arches auto-enables the temp>0 route with no further change.
+    let ngram_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
+    if m.arch_id == 7 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -5980,7 +6646,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp as f32,
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
+            0.0_f32, // cactus_delta: lossless serve path
         );
         return;
     }
@@ -6072,13 +6741,7 @@ fn generate(
     // (lfm2moe `SpecTarget`, conv-state snapshot/rollback) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10). Without a speculator
     // it falls through to the plain `generate_lfm2moe` short-circuit below.
-    if m.arch_id == 11
-        && m.speculator.is_some()
-        && (temp <= 1e-6
-            || m.speculator
-                .as_ref()
-                .is_some_and(|sp| sp.supports_temp_verify()))
-    {
+    if m.arch_id == 11 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6100,7 +6763,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp as f32,
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
+            0.0_f32, // cactus_delta: lossless serve path
         );
         return;
     }
@@ -6140,13 +6806,7 @@ fn generate(
     // state machine + empty-turn / think-budget generation guards) routes to the
     // arch-generic spec loop, like qwen2 (7) / minimax (10) / lfm2moe (11).
     // Without a speculator it falls through to the plain `generate_cohere2moe`.
-    if m.arch_id == 12
-        && m.speculator.is_some()
-        && (temp <= 1e-6
-            || m.speculator
-                .as_ref()
-                .is_some_and(|sp| sp.supports_temp_verify()))
-    {
+    if m.arch_id == 12 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6168,7 +6828,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp as f32,
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
+            0.0_f32, // cactus_delta: lossless serve path
         );
         return;
     }
@@ -6206,13 +6869,7 @@ fn generate(
     // (minimax `SpecTarget`) routes to the arch-generic spec loop, exactly like
     // qwen2 (7) above. Without a speculator it falls through to the plain
     // `generate_minimax` short-circuit below.
-    if m.arch_id == 10
-        && m.speculator.is_some()
-        && (temp <= 1e-6
-            || m.speculator
-                .as_ref()
-                .is_some_and(|sp| sp.supports_temp_verify()))
-    {
+    if m.arch_id == 10 && m.speculator.is_some() && (temp <= 1e-6 || ngram_can_sample) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -6234,7 +6891,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp as f32,
+            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            top_p, // nucleus cutoff — active only for a sampling-capable drafter
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
+            0.0_f32, // cactus_delta: lossless serve path
         );
         return;
     }
@@ -6304,9 +6964,16 @@ fn generate(
         );
         return;
     }
-    // DFlash fast path -- only when a draft model is loaded AND temperature is
-    // effectively 0 (DFlash is greedy-only in this integration). Skip the
-    // normal AR sampling setup entirely.
+    // DFlash fast path -- only when a draft model is loaded. DFlash now serves
+    // BOTH greedy (temp≈0 → argmax-accept) AND temp>0 (lossless rejection-
+    // sampling: full-vocab softmax on draft + target, accept `u*p_draft <=
+    // p_target`, rejection/all-accept bonus from the renormalized residual /
+    // target softmax — so the committed distribution exactly equals the target's
+    // own temp-T sampling at cactus_delta==0). Skip the normal AR sampling setup
+    // entirely. CAVEAT: top_p/top_k/min_p are NOT honored on the spec path
+    // (spec_step_dflash is full-vocab; truncating one side would break the
+    // rejection invariant) — a temp>0 request carrying a non-default top_p gets
+    // temp-only sampling and a one-time warn below.
     //
     // Exception: thinking-on + max_think_tokens currently needs the AR path.
     // DFlash's budget cap can close/strip the think span but does not yet
@@ -6318,6 +6985,83 @@ fn generate(
             assistant_prefix,
             hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
         );
+
+    // ── Qwen3.5/3.6 native-MTP serve path (opt-in) ─────────────────────
+    //
+    // Routed BEFORE the DFlash fast path so an operator who opts in gets MTP
+    // (durable on prose, ≥1.15× AR every genre; proven 27B-3.6 K=3 p_min=0.4
+    // compressed-serial). Gated tightly so the DEFAULT path (DFlash/AR) is
+    // unchanged: requires the env opt-in `HIPFIRE_QWEN_MTP=1`, a loaded MTP
+    // head (`m.qwen35_mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
+    // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
+    // budgeted-thinking (which needs the AR </think> splice). Anything not
+    // satisfying ALL of these falls through to the existing DFlash/AR routing.
+    //
+    // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
+    // but gated behind an opt-in env flag until the temp>0 coherence battery
+    // validates it. The arch layer's F5 DFlash-convention fix (mtp_spec.rs:
+    // independent per-side nuclei + sample_residual) makes the temp>0 branch
+    // lossless: draft + target each truncate to their own top_p nucleus, the
+    // accept ratio is computed against the truncated distributions, and the
+    // bonus is drawn from the renormalized residual (no longer the lossy
+    // un-truncated / sample_top_p(trunk) posture). Gating:
+    //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
+    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
+    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
+    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
+    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
+    // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
+    // through to DFlash (lossless sampled-spec) or AR exactly as before.
+    let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
+    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
+    // Sampled MTP honors temp + top_p + top_k: the residual-accept sampler
+    // applies the SAME top_k+top_p nucleus to BOTH the draft and target sides
+    // (see mtp_sampled_accept / the draft truncation), so it stays lossless ==
+    // AR-at-(top_k,top_p). min_p is ALSO plumbed through (min_p.unwrap_or(0.0)
+    // below → generate_qwen35_mtp → the mtp_spec min_p cutoff) and honored, not
+    // carved out. top_k + min_p flow through to generate_qwen35_mtp below and on
+    // into the nuclei — this is what lets a model whose card recommends top_k
+    // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
+    // instead of silently dropping top_k/min_p or losing MTP.
+    if qwen_mtp_opt_in
+        && m.qwen35_mtp_head.is_some()
+        && (temp <= 1e-6 || mtp_sampled_on)
+        && (m.arch_id == 5 || m.arch_id == 6)
+        && !budgeted_thinking_needs_ar
+    {
+        generate_qwen35_mtp(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+            stop,
+            temp,  // request-resolved temp (0.0 greedy / >0 lossless residual-accept sampling)
+            top_p, // nucleus cutoff: honored on the sampled MTP path
+            top_k, // top-k cutoff: honored on the sampled MTP path (both nuclei)
+            min_p.unwrap_or(0.0), // min_p floor: honored on the sampled MTP nuclei
+        );
+        // Silence unused-variable warnings for AR-only / DFlash-only knobs the
+        // MTP serve path does not consume.
+        let _ = (
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        return;
+    }
     // Prompt-cache routing (2026-05-30, native-reuse update). `generate_dflash`
     // now implements LCP prompt-cache reuse natively: on a pure conversation
     // extension it reuses the target KV + DeltaNet prefix and extends the
@@ -6330,48 +7074,106 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
-    // temp>0 routes to DFlash spec ONLY when (a) the speculator's verify is
-    // distribution-correct at temp>0 (qwen35 DFlash ddtree → SWOR), AND (b) the
-    // request did NOT explicitly set a non-temperature sampling control — the SWOR
-    // verify samples softmax(logits/temp) only, so it can't honor top_p / top_k /
-    // min_p / repeat / presence / frequency. Routing an EXPLICIT such request to
-    // spec would silently drop the user's controls, so fall back to AR (which
-    // applies them). A *defaulted* top_p (model recommendation) is advisory — a
-    // bare-temperature request still gets the spec speedup. Greedy (temp<=1e-6)
-    // routes to spec as before. Opt out: HIPFIRE_DFLASH_TEMP_SPEC=0 → temp>0 to AR.
-    let temp_spec_ok = temp > 1e-6
-        && !user_explicit_sampling
-        && std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() != Some("0")
-        && m.speculator
-            .as_ref()
-            .is_some_and(|s| s.supports_temp_verify());
+    // ── temp>0 DFlash spec routing — composes two distribution-preserving verifies ──
+    // The qwen35 DflashSpeculator carries BOTH temp>0 mechanisms, picked by how it
+    // LOADED (not per-request); both preserve the target distribution, differing only
+    // in which sampling controls they can honor (and in τ):
+    //   * ddtree mode (`supports_temp_verify`): SWOR tree-verify, fed `temp` directly
+    //     (#483). Distribution-exact but honors TEMPERATURE ONLY — it samples
+    //     softmax(logits/temp), so it cannot honor an explicit top_p/top_k/min_p/
+    //     penalty. Highest τ (multi-candidate tree).
+    //   * chain mode (`!ddtree`, `!requires_greedy`): master's lossless rejection
+    //     sampling via `set_sampling`, honoring temp + top_p + top_k (== AR at that
+    //     nucleus). Reproduces spec-graph's shipped default-on sampled-DFlash.
+    // Routing therefore PREFERS ddtree-SWOR for a bare-temperature request; an explicit
+    // sampling control SWOR can't honor falls to AR (ddtree mode) or is honored by
+    // chain rejection sampling (chain mode). A greedy-only drafter (MTP/n-gram) keeps
+    // temp>0 on AR. min_p is unimplemented on both spec paths (a min_p request → AR).
+    // Opt out of temp>0 spec entirely: HIPFIRE_DFLASH_TEMP_SPEC=0.
+    let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
+    let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
+    let temp_spec_env_off =
+        std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let supports_temp_swor = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_temp_verify());
+    // ddtree-SWOR: distribution-exact but temperature-only — engage only for a bare-
+    // temperature request (an explicit control it can't honor falls to AR below). A
+    // *defaulted* top_p (model recommendation) stays advisory.
+    let ddtree_swor_route =
+        temp > 1e-6 && supports_temp_swor && !user_explicit_sampling && !temp_spec_env_off;
+    // chain rejection sampling (master): honors temp+top_p+top_k. `!requires_greedy()`
+    // stops a sampled request from routing into a greedy-only drafter (MTP/n-gram) and
+    // being silently decoded greedy. Gate on `!supports_temp_swor` so a ddtree-mode
+    // drafter never takes this arm — its `step()` dispatches to the temp-only SWOR
+    // verify, which would silently drop top_p/top_k. In a default deployment
+    // `!supports_temp_swor` is exactly chain mode; the only other case is the opt-in
+    // greedy path_c debug mode (HIPFIRE_DDTREE_PATH_C), where temp>0 decodes greedy as
+    // it did on master.
+    let spec_can_sample = m.speculator.as_ref().map(|s| !s.requires_greedy()).unwrap_or(false);
+    let chain_sample_route = temp > 1e-6
+        && !supports_temp_swor
+        && spec_can_sample
+        && fast_sample_on
+        && !dflash_min_p_present
+        && !temp_spec_env_off;
+    // qwen3.5/3.6: greedy always; temp>0 via ddtree-SWOR or chain rejection sampling.
+    let qwen_dflash_route = (m.arch_id == 5 || m.arch_id == 6)
+        && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+    // llama (arch 0/1): #483 built + validated dense DFlash with ddtree tree-SWOR, so
+    // temp>0 engages ddtree-SWOR here too (bare temp). Chain-mode llama temp>0 stays on
+    // AR (no validated sampled-llama chain path — matches master's caution).
+    let llama_dflash_route =
+        (m.arch_id == 0 || m.arch_id == 1) && (temp <= 1e-6 || ddtree_swor_route);
     // Operator visibility: a temp>0 request on a DFlash-capable arch that did NOT
-    // qualify for SWOR spec silently runs AR (correct, but slower). Name the
-    // specific config reason so an operator can see why the spec speedup is off.
+    // qualify for spec silently runs AR (correct, but slower). Name the reason.
     if temp > 1e-6
         && m.speculator.is_some()
         && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
-        && !temp_spec_ok
+        && !qwen_dflash_route
+        && !llama_dflash_route
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
     {
-        let reason = if std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0") {
+        let reason = if temp_spec_env_off {
             "HIPFIRE_DFLASH_TEMP_SPEC=0"
-        } else if user_explicit_sampling {
-            "request set an explicit top_p/top_k/min_p/penalty (SWOR spec honors temperature only); AR applies them"
+        } else if supports_temp_swor && user_explicit_sampling {
+            "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
+        } else if dflash_min_p_present {
+            "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
+        } else if !spec_can_sample {
+            "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
         } else {
             "ddtree SWOR verify not active (needs ddtree_budget>0, no path_c)"
         };
         eprintln!(
-            "[hipfire] id={id}: temp>0 DFlash ddtree spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
+            "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
     if m.speculator.is_some()
-        && (temp <= 1e-6 || temp_spec_ok)
-        && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
+        && (qwen_dflash_route || llama_dflash_route)
     {
+        // One-time visibility: temp + top_p + top_k ARE now honored on the
+        // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
+        // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains
+        // unimplemented; warn once if a non-default min_p was requested so the
+        // residual mismatch is visible rather than silent.
+        let minp_requested = min_p.map(|p| p > 0.0).unwrap_or(false);
+        if temp > 1e-6 && minp_requested {
+            static SPEC_MINP_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SPEC_MINP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"warning","id":"{}","message":"DFlash spec-decode honors temp+top_p+top_k but ignores min_p; set HIPFIRE_DFLASH_CHAT=0 to route through AR for full min_p support"}}"#,
+                    id,
+                );
+                let _ = stdout.flush();
+            }
+        }
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -6410,14 +7212,17 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
-            stop, // hunt3 M-F: thread user stop sequences into the default DFlash path
-            temp as f32,
+            stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp,    // request-resolved temp: ddtree mode → SWOR (temp-only); chain mode → lossless rejection-sampling
+            top_p,   // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
+            0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );
         // Silence unused-variable warnings for the params DFlash doesn't
-        // consume (top_p / repeat penalties are AR-only sampling knobs;
-        // pflash_state is bypassed on the DFlash decode path).
+        // consume. top_p IS now applied to the spec sampling (nucleus on both
+        // draft + target). repeat penalties are AR-only sampling knobs;
+        // pflash_state is bypassed on the DFlash decode path.
         let _ = (
-            top_p,
             repeat_penalty,
             repeat_window,
             budget_alert_at_tok,

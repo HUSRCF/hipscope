@@ -635,7 +635,7 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // resolveThinkingBudget), so its return type narrows the optional field to
 // required — downstream readers can use `cfg.max_think_tokens > 0` without a
 // possibly-undefined check.
-type ResolvedConfig = HipfireConfig & { max_think_tokens: number };
+type ResolvedConfig = HipfireConfig & { max_think_tokens: number; max_think_explicit: boolean };
 
 function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
@@ -683,6 +683,15 @@ function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
 // a present value can ONLY have come from an explicit global save or a per-model
 // override. Absence is the signal that the preset should drive.
 function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfig {
+  // Did the operator set a think-budget EXPLICITLY, or is it the bare preset
+  // default? A raw `max_think_tokens` (absent from CONFIG_DEFAULTS) present here
+  // can only be an explicit save/override; a `thinking_budget` other than the
+  // "med" default is likewise an explicit choice. The serve path uses this to
+  // stay uncapped by default (so DFlash/MTP engage) while still honoring an
+  // explicit budget — see the serve handler's max_think_tokens block.
+  (cfg as ResolvedConfig).max_think_explicit =
+    (cfg.max_think_tokens !== undefined && cfg.max_think_tokens !== null) ||
+    (cfg.thinking_budget !== undefined && cfg.thinking_budget !== "med");
   if (cfg.max_think_tokens === undefined || cfg.max_think_tokens === null) {
     const tb = cfg.thinking_budget ?? "med";
     cfg.max_think_tokens = THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
@@ -701,17 +710,17 @@ function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfi
 /// the daemon NEVER sees its own card/arch defaults: the CLI always sent the
 /// global default.)
 ///
-/// NOTE: top_k and min_p are CARRIED through here (so a future P2 daemon that
-/// honors them inherits the card value) but the daemon sampler IGNORES them
-/// today — top-K is compile-time-fixed and min_p is unimplemented. presence_penalty,
-/// temperature, top_p, repeat_penalty DO take effect.
+/// NOTE: top_k is now HONORED by the daemon sampler (the spec-sampling kernel
+/// folds it into the nucleus on AR + DFlash + MTP). min_p is still carried-but-
+/// inert (unimplemented). presence_penalty, temperature, top_p, repeat_penalty
+/// also take effect.
 interface SamplingForSend {
   temperature?: number;
   top_p?: number;
   repeat_penalty?: number;
   presence_penalty?: number;
-  top_k?: number; // carried-but-inert until P2
-  min_p?: number; // carried-but-inert until P2
+  top_k?: number; // honored by the daemon (spec-sampling kernel folds into nucleus)
+  min_p?: number; // carried-but-inert (daemon unimplemented)
   system_prompt?: string;
 }
 export function resolveSamplingForSend(
@@ -1137,6 +1146,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     );
   }
 
+  params.mtp_mode = resolved.mtp_mode;
+  params.mtp_k = resolved.mtp_k;
+
+  // (Former DFlash+Q8 max_seq cap removed.) The captured-flash LDS cliff that
+  // 0-token'd Q8 KV at physical_cap>15000 is fixed in the engine: the captured
+  // verify forward now dispatches the tiled attention_flash_q8_0_batched_masked
+  // at any context (O(1) LDS, no per-position malloc). DFlash serves at the full
+  // resolved max_seq, VRAM-bound by the drafter context rather than a fixed cap.
   return { type: "load", model: path, params };
 }
 
@@ -1895,7 +1912,8 @@ async function runViaHttp(
     if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
     if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
     if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
-    // top_k / min_p: carried-but-inert (daemon ignores until P2).
+    // top_k is now HONORED by the daemon (folded into the nucleus on AR + DFlash
+    // + MTP by the spec-sampling kernel); min_p remains carried-but-inert.
     if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
     if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
   } else {
@@ -2459,8 +2477,8 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     if (typeof sv.top_p === "number") genMsg.top_p = sv.top_p;
     if (typeof sv.repeat_penalty === "number") genMsg.repeat_penalty = sv.repeat_penalty;
     if (typeof sv.presence_penalty === "number") genMsg.presence_penalty = sv.presence_penalty;
-    // top_k / min_p: carried-but-inert (daemon ignores until P2). Sent so a
-    // future daemon inherits the card value; harmless no-op today.
+    // top_k is now HONORED by the daemon (spec-sampling kernel); min_p stays
+    // carried-but-inert (sent so a future daemon inherits the card value).
     if (typeof sv.top_k === "number") genMsg.top_k = sv.top_k;
     if (typeof sv.min_p === "number") genMsg.min_p = sv.min_p;
   } else {
@@ -3331,7 +3349,10 @@ async function serve(port: number, host: string) {
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
         // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
         // independent max_seq <= 524288 clamp, hunt3 H-D contract).
-        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        let requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        // (Former DFlash+Q8 reload-bump guard removed alongside the load cap:
+        // buildLoadMessage no longer caps max_seq, so requiredMaxSeq need not be
+        // held down to the loaded cap — the engine serves the full context.)
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -3605,22 +3626,28 @@ async function serve(port: number, host: string) {
             ? Math.max(0, Number(body.presence_penalty) || 0)
             : sendView.presence_penalty;
           if (typeof pp === "number") genParams.presence_penalty = pp;
-          // top_k / min_p: carried-but-inert (daemon ignores until P2).
+          // top_k is now HONORED by the daemon (folded into the nucleus on AR +
+          // DFlash + MTP); min_p remains carried-but-inert.
           if (typeof sendView.top_k === "number") genParams.top_k = sendView.top_k;
           if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
         }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
-        // Mirror the `hipfire run` path's per-model max_think_tokens
-        // propagation. Without this, models with thinking=on can consume
-        // the entire max_tokens budget inside a single <think>...</think>
-        // block, leaving message.content empty after the downstream strip.
-        // Reported in #74 with qwen3.6:27b returning empty content + full
-        // 8192 completion_tokens despite max_think_tokens=2048 in config.
-        // thinking=off: hard-suppress by capping to 1 token, same as
-        // enable_thinking=false. Overrides any per-model max_think_tokens.
+        // Serve API is UNCAPPED by default (OpenAI/o1 convention — the client
+        // bounds length via max_tokens). The CLI-chat think-budget preset is a
+        // chat convenience, NOT an API default: forwarding the bare "med" preset
+        // here made the daemon route EVERY thinking request to AR (its
+        // `budgeted_thinking_needs_ar` gate), which DISABLED DFlash/MTP through
+        // the serve — they can't continue past a *forced* </think> so a budget
+        // sends them to AR. So forward a budget only when the operator set one
+        // EXPLICITLY (raw max_think_tokens or a non-default thinking_budget);
+        // `reasoning_effort` still caps per-request below and thinking=off
+        // hard-suppresses. (#74 trade-off accepted per design: an uncapped
+        // thinking model on a SMALL max_tokens can return empty content, so
+        // clients should size max_tokens for the reasoning they ask for, or pass
+        // reasoning_effort. The `hipfire run`/chat paths keep the preset budget.)
         if (effective.thinking === "off") {
           genParams.max_think_tokens = 1;
-        } else if (effective.max_think_tokens > 0) {
+        } else if (effective.max_think_tokens > 0 && effective.max_think_explicit) {
           genParams.max_think_tokens = effective.max_think_tokens;
         }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1

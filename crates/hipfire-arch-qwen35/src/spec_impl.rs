@@ -18,7 +18,8 @@
 
 use crate::qwen35::{self, DeltaNetState};
 use crate::speculative::{
-    verify_dflash_block, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    apply_topp_trunc, sample_categorical, verify_dflash_block, xorshift_next_unit,
+    DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -235,6 +236,91 @@ impl SpecTarget for ModelSlot {
         )
         .map_err(|e| e.to_string())?;
         Ok(out.argmax_per_pos)
+    }
+
+    fn verify_block_sampled(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+    ) -> Result<Vec<u32>, String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen35SpecScratch>()
+            .ok_or("verify_block_sampled: scratch is not Qwen35SpecScratch")?;
+        // SAME snapshot CONTRACT as verify_block: save recurrent + s_ef residual
+        // BEFORE the forward advances them, so commit_prefix can rewind a partial.
+        s.target_snap
+            .save_from(&self.dn_state, gpu)
+            .map_err(|e| e.to_string())?;
+        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
+        // Sampled verify. Run the verify forward with want_full_logits=FALSE: it
+        // leaves the per-position logits in `verify_scratch.logits` (GPU) and
+        // costs only a discarded GPU argmax — NOT the B×vocab logit D2H. Then do
+        // the softmax+nucleus on the GPU (`softmax_temp_topp_batched_into_f32`,
+        // mirroring the DFlash FAST_SAMPLE path) so the exp + the top_p/top_k
+        // histogram run on-device; the host does only the cheap nucleus-trunc +
+        // categorical draw. The first cut host-softmaxed (exp+sort) over 248K×B
+        // per step — that was the ~22 t/s bottleneck, not the D2H. For the
+        // point-mass n-gram draft, accept_greedy_prefix(draft, picks) on these
+        // SAMPLED picks is exact temp-T speculation (commit == target sample).
+        let _ = verify_dflash_block(
+            gpu,
+            self,
+            block,
+            position,
+            &mut s.hidden_rb,
+            None,  // gdn_tape: rewind by replay in commit_prefix, no tape
+            false, // logits stay on-GPU in verify_scratch.logits; no full D2H
+            &s.verify_scratch,
+        )
+        .map_err(|e| e.to_string())?;
+        let vocab = self.config.vocab_size;
+        let b = block.len();
+        // top_p of 0.0 means "disabled" upstream → 1.0 (no nucleus). top_k is
+        // folded into the GPU kernel's tau alongside top_p. min_p is routed to AR
+        // by the dispatch, so it is never set on this path.
+        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+        let logits_batch = s.verify_scratch.logits.sub_offset(0, b * vocab);
+        let probs_gpu = gpu
+            .alloc_tensor(&[b * vocab], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        gpu.softmax_temp_topp_batched_into_f32(
+            &logits_batch,
+            &probs_gpu,
+            &tau_gpu,
+            &z_gpu,
+            vocab,
+            b,
+            temp,
+            top_p_eff,
+            top_k,
+            0.0, // min_p: ngram min_p parity is the follow-up; off here
+        )
+        .map_err(|e| e.to_string())?;
+        let host_probs = gpu.download_f32(&probs_gpu).map_err(|e| e.to_string())?;
+        let tau = gpu.download_f32(&tau_gpu).map_err(|e| e.to_string())?;
+        let z = gpu.download_f32(&z_gpu).map_err(|e| e.to_string())?;
+        let _ = gpu.free_tensor(probs_gpu);
+        let _ = gpu.free_tensor(tau_gpu);
+        let _ = gpu.free_tensor(z_gpu);
+        let mut picks = Vec::with_capacity(b);
+        for i in 0..b {
+            let mut row = host_probs[i * vocab..(i + 1) * vocab].to_vec();
+            // Apply the SAME nucleus cut the GPU emitted tau/Z for (identity when
+            // top_p>=1 and top_k==0), then draw categorically.
+            apply_topp_trunc(&mut row, tau[i], z[i]);
+            let u = xorshift_next_unit(rng_state);
+            picks.push(sample_categorical(&row, u));
+        }
+        Ok(picks)
     }
 
     fn commit_prefix(
