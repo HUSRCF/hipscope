@@ -177,14 +177,6 @@ fn main() {
                                     // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
                                     // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
-    // --ddtree-path-c={phase1|phase2}: dispatch through `spec_step_ddtree_path_c`
-    // (PRD docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd).
-    //   phase1 = main-path-first linear verify only (bit-exact gate vs
-    //            verify_dflash_block on the same chain).
-    //   phase2 = phase1 + lazy branch FA-only re-verify on the unique
-    //            structurally-acceptable candidate (Steps 2+3).
-    // Implies --ddtree (and uses --ddtree-budget / --ddtree-topk).
-    let mut ddtree_path_c_phase: Option<String> = None;
     // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
     // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
     // Default ON (2026-04-17): bare prompts send the model off-distribution.
@@ -385,19 +377,6 @@ fn main() {
                 ddtree_batched = true;
                 ddtree_enabled = true; // implies --ddtree
                 i += 1;
-            }
-            "--ddtree-path-c" => {
-                let phase = args[i + 1].clone();
-                if phase != "phase1" && phase != "phase2" {
-                    eprintln!(
-                        "--ddtree-path-c expects 'phase1' or 'phase2' (got: {})",
-                        phase
-                    );
-                    std::process::exit(2);
-                }
-                ddtree_path_c_phase = Some(phase);
-                ddtree_enabled = true; // implies --ddtree
-                i += 2;
             }
             "--chatml" => {
                 chatml = true;
@@ -712,12 +691,6 @@ fn main() {
     // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
     let mut post_seed_snap =
         DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
-    // Path C Phase 2 auxiliary snapshots. Allocated unconditionally, used
-    // only when --ddtree-path-c=phase2. See speculative::Phase2Snapshots.
-    let mut path_c_parent_pre_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c parent-pre snap");
-    let mut path_c_main_end_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c main-end snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
@@ -1280,7 +1253,7 @@ fn main() {
         if ddtree_enabled {
             if temp > 0.0 && !ddtree_batched {
                 eprintln!(
-                    "WARNING: --ddtree (non-batched / path-c) with temp>0 falls back to greedy on \
+                    "WARNING: --ddtree (non-batched) with temp>0 falls back to greedy on \
                 the verify side. Use --ddtree-batched for distribution-preserving naive tree sampling."
                 );
             }
@@ -1638,35 +1611,7 @@ fn main() {
                 pld_hits += 1;
             }
             let step = if ddtree_enabled {
-                if let Some(phase) = ddtree_path_c_phase.as_deref() {
-                    let phase2_snaps = if phase == "phase2" {
-                        Some(speculative::Phase2Snapshots {
-                            parent_pre_snap: &mut path_c_parent_pre_snap,
-                            main_end_snap: &mut path_c_main_end_snap,
-                        })
-                    } else {
-                        None
-                    };
-                    speculative::spec_step_ddtree_path_c(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut gdn_tape,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                        phase2_snaps,
-                    )
-                    .expect("ddtree-path-c spec step")
-                } else if ddtree_batched {
+                if ddtree_batched {
                     speculative::spec_step_ddtree_batched(
                         &mut gpu,
                         &mut target,

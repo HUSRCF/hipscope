@@ -33,11 +33,11 @@ use hipfire_arch_qwen35::speculative;
 // Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
 // it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -4570,8 +4570,8 @@ fn generate_spec(
     }
     let first_token_is_eos = first_begin.stop.is_some();
 
-    // (The DFlash RNG cell and the `HIPFIRE_DDTREE_PATH_C` chain-vs-tree-vs-path_c
-    // resolution that used to live here are now resolved once at build time and
+    // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
+    // here are now resolved once at build time and
     // owned inside the speculator — see `build_dflash_speculator`.)
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
@@ -4610,8 +4610,8 @@ fn generate_spec(
             break;
         }
 
-        // One acceptance window. The speculator owns chain-vs-tree-vs-path_c
-        // dispatch internally; the daemon just hands it the borrowed target and
+        // One acceptance window. The speculator owns chain-vs-tree dispatch
+        // internally; the daemon just hands it the borrowed target and
         // the prior committed tokens (drafter repeat / n-gram context). The
         // in-step grammar mask comes from the emitter: qwen35 returns `None`
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
@@ -6646,7 +6646,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6763,7 +6763,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6828,7 +6828,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6891,7 +6891,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -7092,8 +7092,7 @@ fn generate(
     // Opt out of temp>0 spec entirely: HIPFIRE_DFLASH_TEMP_SPEC=0.
     let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
     let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
-    let temp_spec_env_off =
-        std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
     let supports_temp_swor = m
         .speculator
         .as_ref()
@@ -7107,11 +7106,13 @@ fn generate(
     // stops a sampled request from routing into a greedy-only drafter (MTP/n-gram) and
     // being silently decoded greedy. Gate on `!supports_temp_swor` so a ddtree-mode
     // drafter never takes this arm — its `step()` dispatches to the temp-only SWOR
-    // verify, which would silently drop top_p/top_k. In a default deployment
-    // `!supports_temp_swor` is exactly chain mode; the only other case is the opt-in
-    // greedy path_c debug mode (HIPFIRE_DDTREE_PATH_C), where temp>0 decodes greedy as
-    // it did on master.
-    let spec_can_sample = m.speculator.as_ref().map(|s| !s.requires_greedy()).unwrap_or(false);
+    // verify, which would silently drop top_p/top_k. `!supports_temp_swor` is exactly
+    // chain mode (no ddtree configured).
+    let spec_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
     let chain_sample_route = temp > 1e-6
         && !supports_temp_swor
         && spec_can_sample
@@ -7145,7 +7146,7 @@ fn generate(
         } else if !spec_can_sample {
             "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
         } else {
-            "ddtree SWOR verify not active (needs ddtree_budget>0, no path_c)"
+            "ddtree SWOR verify not active (needs ddtree_budget>0)"
         };
         eprintln!(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
@@ -7212,9 +7213,9 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
-            stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
-            temp,    // request-resolved temp: ddtree mode → SWOR (temp-only); chain mode → lossless rejection-sampling
-            top_p,   // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
+            stop,  // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp, // request-resolved temp: ddtree mode → SWOR (temp-only); chain mode → lossless rejection-sampling
+            top_p, // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
             0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );

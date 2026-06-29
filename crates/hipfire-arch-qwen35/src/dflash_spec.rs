@@ -15,9 +15,8 @@ use crate::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
 use crate::speculative::{
     apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
-    spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, DdtreeScratch,
-    DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, ModelSlot, Phase2Snapshots, SpecStepResult,
-    VerifyScratch,
+    spec_step_ddtree_batched, spec_step_dflash, DdtreeScratch, DeltaNetSnapshot, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
@@ -35,8 +34,6 @@ pub struct DdtreeState {
     pub scratch: DdtreeScratch,
     pub budget: usize,
     pub topk: usize,
-    pub path_c_parent_pre_snap: DeltaNetSnapshot,
-    pub path_c_main_end_snap: DeltaNetSnapshot,
 }
 
 // ─── DFlash state ─────────────────────────────────────────────────────
@@ -153,17 +150,11 @@ pub fn load_dflash_state(
             n_fa_layers,
         )
         .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
-        let path_c_parent_pre_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let path_c_main_end_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
         Some(DdtreeState {
             post_seed_snap,
             scratch,
             budget: ddtree_budget,
             topk,
-            path_c_parent_pre_snap,
-            path_c_main_end_snap,
         })
     } else {
         None
@@ -201,15 +192,14 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
 }
 
 /// DFlash / DDTree speculator: wraps the qwen35 `spec_step_*` chain/tree
-/// kernels behind the arch-generic [`Speculator`] trait. Chain-vs-tree and
-/// path_c are internal detail resolved at build (`ddtree` presence comes from
-/// the loaded `DflashState`; `path_c_mode` from `HIPFIRE_DDTREE_PATH_C`).
+/// kernels behind the arch-generic [`Speculator`] trait. Chain-vs-tree is an
+/// internal detail resolved at build (`ddtree` presence comes from the loaded
+/// `DflashState`).
 ///
 /// Owns the `DflashState` moved out of `LoadedModel.dflash`, plus the divergent-
 /// render DeltaNet checkpoint ring folded in from `LoadedModel.dflash_checkpoints`.
 pub struct DflashSpeculator {
     df: DflashState,
-    path_c_mode: Option<&'static str>,
     rng_state: u64,
     /// Per-request sampling, set via `set_sampling` before each step loop and
     /// applied in the chain-mode `spec_step_dflash` branch of `step`. Default
@@ -231,21 +221,12 @@ pub struct DflashSpeculator {
 }
 
 impl DflashSpeculator {
-    /// `path_c_mode` is the validated `HIPFIRE_DDTREE_PATH_C` value
-    /// (`Some("phase1"|"phase2")` or `None`); `resume_enabled`/`ck_interval`/
-    /// `ck_cap` mirror the daemon's `ckpt_resume_enabled()`/`ckpt_interval()`/
-    /// `ckpt_max()` — passed in by `build_dflash_speculator` so `new` itself is
-    /// env-free (and unit-testable).
-    pub fn new(
-        df: DflashState,
-        path_c_mode: Option<&'static str>,
-        resume_enabled: bool,
-        ck_interval: usize,
-        ck_cap: usize,
-    ) -> Self {
+    /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
+    /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
+    /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
+    pub fn new(df: DflashState, resume_enabled: bool, ck_interval: usize, ck_cap: usize) -> Self {
         Self {
             df,
-            path_c_mode,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
             // re-seeds it to this value per request (matching spec-graph's local
             // `let mut rng_state = 0x13579BDF` per `generate_dflash` call) so a
@@ -377,10 +358,11 @@ impl Speculator for DflashSpeculator {
         Ok(PrefillOutcome::Ready { first_token })
     }
 
-    /// Temp>0 verify is distribution-correct only on the ddtree-batched arm (SWOR).
-    /// path_c and chain mode are greedy, so they must NOT receive temp>0 routing.
+    /// Temp>0 verify is distribution-correct only on the ddtree-batched arm
+    /// (SWOR); chain mode is greedy, so a non-ddtree drafter must NOT receive
+    /// temp>0 routing.
     fn supports_temp_verify(&self) -> bool {
-        self.df.ddtree.is_some() && self.path_c_mode.is_none()
+        self.df.ddtree.is_some()
     }
 
     fn step(
@@ -398,65 +380,36 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
 
-        // Verbatim 3-way dispatch from the daemon's old generate_dflash loop:
-        // DDTree path_c → DDTree batched → chain-mode DFlash. The grammar arg is
-        // ignored — qwen35 enforces tool-call grammar post-hoc in the daemon.
+        // Two-way dispatch from the daemon's old generate_dflash loop: DDTree-
+        // batched (SWOR) verify when a tree is configured, else chain-mode DFlash.
+        // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
+        // in the daemon.
         let result = if let Some(dd) = self.df.ddtree.as_mut() {
-            if self.path_c_mode == Some("phase1") || self.path_c_mode == Some("phase2") {
-                let phase2_snaps = if self.path_c_mode == Some("phase2") {
-                    Some(Phase2Snapshots {
-                        parent_pre_snap: &mut dd.path_c_parent_pre_snap,
-                        main_end_snap: &mut dd.path_c_main_end_snap,
-                    })
-                } else {
-                    None
-                };
-                spec_step_ddtree_path_c(
-                    gpu,
-                    slot,
-                    &self.df.draft_weights,
-                    &self.df.draft_config,
-                    &mut self.df.draft_scratch,
-                    &mut self.df.hidden_rb,
-                    &mut self.df.target_hidden_host,
-                    &mut self.df.target_snap,
-                    &mut self.df.gdn_tape,
-                    &self.df.verify_scratch,
-                    position,
-                    seed,
-                    None, // ctx_slice = full history
-                    dd.budget,
-                    dd.topk,
-                    phase2_snaps,
-                )
-            } else {
-                spec_step_ddtree_batched(
-                    gpu,
-                    slot,
-                    &self.df.draft_weights,
-                    &self.df.draft_config,
-                    &mut self.df.draft_scratch,
-                    &mut self.df.hidden_rb,
-                    &mut self.df.target_hidden_host,
-                    &mut self.df.target_snap,
-                    &mut dd.post_seed_snap,
-                    &mut self.df.gdn_tape,
-                    &dd.scratch,
-                    &self.df.verify_scratch,
-                    position,
-                    seed,
-                    None, // ctx_slice = full history
-                    dd.budget,
-                    dd.topk,
-                    // Request temperature → distribution-preserving SWOR verify at
-                    // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is
-                    // the only DFlash mode with sampled verify; path_c/chain below
-                    // stay greedy, so `supports_temp_verify` gates serve routing to
-                    // ddtree only.
-                    temp,
-                    &mut self.rng_state,
-                )
-            }
+            spec_step_ddtree_batched(
+                gpu,
+                slot,
+                &self.df.draft_weights,
+                &self.df.draft_config,
+                &mut self.df.draft_scratch,
+                &mut self.df.hidden_rb,
+                &mut self.df.target_hidden_host,
+                &mut self.df.target_snap,
+                &mut dd.post_seed_snap,
+                &mut self.df.gdn_tape,
+                &dd.scratch,
+                &self.df.verify_scratch,
+                position,
+                seed,
+                None, // ctx_slice = full history
+                dd.budget,
+                dd.topk,
+                // Request temperature → distribution-preserving SWOR verify at
+                // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is the
+                // only DFlash mode with sampled verify; the chain below stays
+                // greedy, so `supports_temp_verify` gates serve routing to ddtree.
+                temp,
+                &mut self.rng_state,
+            )
         } else {
             spec_step_dflash(
                 gpu,
@@ -595,17 +548,11 @@ impl Speculator for DflashSpeculator {
 }
 
 /// Construct the DFlash speculator from a freshly-loaded `DflashState`, resolving
-/// the env config the daemon's old `generate_dflash` read inline: `path_c_mode`
-/// (`HIPFIRE_DDTREE_PATH_C`), checkpoint resume (`HIPFIRE_DFLASH_CKPT_RESUME` +
-/// no-eviction), and interval/cap (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching
-/// the daemon's `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
+/// the env config the daemon's old `generate_dflash` read inline: checkpoint
+/// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
+/// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
+/// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
 pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
-    let path_c_mode: Option<&'static str> =
-        match std::env::var("HIPFIRE_DDTREE_PATH_C").ok().as_deref() {
-            Some("phase1") => Some("phase1"),
-            Some("phase2") => Some("phase2"),
-            _ => None,
-        };
     let resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
         && eviction_is_none;
     let ck_interval = std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
@@ -620,7 +567,6 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         .max(1);
     Box::new(DflashSpeculator::new(
         df,
-        path_c_mode,
         resume_enabled,
         ck_interval,
         ck_cap,

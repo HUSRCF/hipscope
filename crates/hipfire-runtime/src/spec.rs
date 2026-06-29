@@ -500,8 +500,8 @@ pub struct EvictRetain {
 /// A speculative-decode drafter+verifier, owned by the loaded model behind a
 /// `Box<dyn Speculator>`. The daemon's decode loop holds `&mut dyn Speculator`
 /// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
-/// head, or a future n-gram / EAGLE drafter — chain-vs-tree, path_c, K, budget,
-/// and topk are all resolved at build time and stored inside the impl.
+/// head, or a future n-gram / EAGLE drafter — chain-vs-tree, K, budget, and
+/// topk are all resolved at build time and stored inside the impl.
 pub trait Speculator {
     /// Prefill the prompt: seed the target's hidden state (advancing its KV +
     /// recurrent state) and prime the drafter's cached target-hidden buffer,
