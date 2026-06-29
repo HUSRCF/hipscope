@@ -482,7 +482,7 @@ impl Speculator for GenericDflashSpeculator {
 
         // ── 3. Draft forward over the cumulative target-hidden prefix ───────
         // The host buffer is authoritative: hand draft_forward rows [0..position).
-        // Its incremental-upload fast path keys off scratch.uploaded_target_hidden_rows.
+        // Its incremental-upload fast path keys off scratch.thlog.uploaded_rows().
         let ctx_elems = position * ne * h;
         assert_eq!(
             self.target_hidden_host.len(),

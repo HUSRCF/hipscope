@@ -1062,11 +1062,10 @@ fn main() {
             prompt_tokens.len(), // n_rows:     keep all of them
         )
         .expect("seed scatter");
-        draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-        // Seed per-row absolute positions for the draft's cross-attention RoPE.
-        // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
-        // stay byte-identical to the old contiguous-range behaviour.
-        draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
+        // Seed the upload watermark + per-row absolute positions for the
+        // draft's cross-attention RoPE. Pre-eviction these match [0..prompt_len)
+        // exactly, so FlashCASK-free runs stay byte-identical.
+        draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         let prefill_secs = t2.elapsed().as_secs_f64();
         let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
         eprintln!(
@@ -1728,7 +1727,7 @@ fn main() {
                     if no_tape { None } else { Some(&mut gdn_tape) },
                     runtime_temp,
                     1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
-                    0, // top_k: demo has no top-k CLI; 0 = disabled
+                    0,       // top_k: demo has no top-k CLI; 0 = disabled
                     &mut rng_state,
                     block_override,
                     ngram_cache.as_ref(),

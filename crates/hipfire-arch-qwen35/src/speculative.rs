@@ -3152,10 +3152,7 @@ pub fn spec_step_dflash(
         // on this diagnostic path — callers using it don't expect FlashCASK.
         let effective_ctx_len = match ctx_slice {
             Some(n) => n.min(position),
-            None => draft_scratch
-                .target_hidden_abs_positions
-                .len()
-                .min(position),
+            None => draft_scratch.thlog.abs_positions().len().min(position),
         };
         let ctx_start = position - effective_ctx_len;
         let co = target.kv_cache.compact_offset as i32;
@@ -3167,7 +3164,7 @@ pub fn spec_step_dflash(
             (ctx_start as i32..(position + b) as i32).collect()
         } else {
             let mut v = Vec::with_capacity(effective_ctx_len + b);
-            let th_abs = &draft_scratch.target_hidden_abs_positions;
+            let th_abs = draft_scratch.thlog.abs_positions();
             let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
             v.extend_from_slice(&th_abs[start_idx..]);
             for p in 0..b {
@@ -3949,18 +3946,14 @@ pub fn spec_step_dflash(
         )?;
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
-        // GPU already has; and so the assertion-in-draft path stays coherent.
-        draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
-        // Track the absolute positions of the rows we just appended. These are
-        // the logical positions `position..position+rows_to_keep` plus the
-        // current target KV compact_offset (zero pre-eviction; non-zero after).
-        // Used by the next cycle's `positions_k` construction.
+        // GPU already has, and track the absolute positions of the appended
+        // rows (logical `position..position+rows_to_keep` plus the current
+        // target KV compact_offset — zero pre-eviction, non-zero after) for the
+        // next cycle's `positions_k` construction.
         let co = target.kv_cache.compact_offset as i32;
-        for p in 0..rows_to_keep {
-            draft_scratch
-                .target_hidden_abs_positions
-                .push(position as i32 + p as i32 + co);
-        }
+        draft_scratch
+            .thlog
+            .append_committed(position, rows_to_keep, co);
     }
 
     if phase_on {
@@ -6377,13 +6370,14 @@ pub fn seed_target_hidden_suffix_abortable(
 /// at eviction cadence (~once per β decoded tokens) so the PCIe round-trip
 /// is amortized — perf impact is small relative to the τ recovery.
 ///
-/// Post-conditions:
-/// - `draft_scratch.target_hidden_abs_positions` has exactly `budget` entries,
-///   each pulled from `retain_mask[i]` of the pre-eviction abs_positions.
+/// Post-conditions (all via `draft_scratch.thlog.rebuild_after_eviction`):
+/// - `thlog.abs_positions()` has exactly `budget` entries, each pulled from
+///   `retain_mask[i]` of the pre-eviction abs_positions.
 /// - `draft_scratch.target_hidden` GPU slots [0..budget) hold the retained
 ///   rows in ascending source order.
-/// - `draft_scratch.uploaded_target_hidden_rows = budget` so the next
-///   draft_forward sees the compacted layout as already-uploaded.
+/// - `thlog.uploaded_rows() == budget` so the next draft_forward sees the
+///   compacted layout as already-uploaded (and the projection cache is
+///   invalidated).
 pub fn apply_eviction_retain_to_draft(
     gpu: &mut rdna_compute::Gpu,
     draft_scratch: &mut dflash::DflashScratch,
@@ -6418,7 +6412,8 @@ pub fn apply_eviction_retain_to_draft(
         compacted.extend_from_slice(row);
         new_abs.push(
             *draft_scratch
-                .target_hidden_abs_positions
+                .thlog
+                .abs_positions()
                 .get(s)
                 .expect("retain_mask index out of range for abs_positions"),
         );
@@ -6428,12 +6423,12 @@ pub fn apply_eviction_retain_to_draft(
         unsafe { std::slice::from_raw_parts(compacted.as_ptr() as *const u8, dst_bytes) };
     gpu.hip
         .memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
-    draft_scratch.target_hidden_abs_positions = new_abs;
-    draft_scratch.uploaded_target_hidden_rows = budget;
-    // The per-layer k_ctx/v_ctx projection cache is indexed by the
-    // pre-eviction row layout. After compaction it's stale — rebuild on
-    // the next draft_forward. One slow cycle per eviction is fine.
-    draft_scratch.invalidate_draft_ctx_cache();
+    // Replace the row layout with the compacted positions and invalidate the
+    // per-layer k_ctx/v_ctx projection cache (indexed by the pre-eviction row
+    // layout, now stale — rebuilt on the next draft_forward; one slow cycle per
+    // eviction is fine). `rebuild_after_eviction` sets the upload watermark to
+    // `new_abs.len()` (== budget) so the two cursors can't desync.
+    draft_scratch.thlog.rebuild_after_eviction(new_abs);
     Ok(())
 }
 

@@ -355,13 +355,11 @@ impl Speculator for DflashSpeculator {
         ) {
             eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
         }
-        self.df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-        self.df.draft_scratch.target_hidden_abs_positions =
-            (0..prompt_tokens.len() as i32).collect();
+        self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         if let Some(ckpt) = resume_from {
             // Divergent rows [ckpt..len) were just overwritten; drop the draft's
             // projection cursor so the first spec step re-projects from `ckpt`.
-            self.df.draft_scratch.draft_ctx_cached_rows = ckpt;
+            self.df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
         }
 
         // First emit = target argmax at the final prompt position (seed already
@@ -494,8 +492,8 @@ impl Speculator for DflashSpeculator {
                 emitted,
                 self.sample_cactus, // 0.0 = lossless; >0 = deliberately lossy
                 None,               // pld_spine
-                1.0_f32, // repeat_penalty (off)
-                0,       // repeat_window
+                1.0_f32,            // repeat_penalty (off)
+                0,                  // repeat_window
             )
         };
 
