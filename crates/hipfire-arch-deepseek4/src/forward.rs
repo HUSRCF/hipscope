@@ -7627,7 +7627,6 @@ pub fn final_norm_and_head_all_batched(
         return Err("final_norm_and_head_all_batched: empty batch".to_string());
     }
     let stream_len = cfg.hc_mult * cfg.hidden_size;
-    let hidden = cfg.hidden_size;
     let vocab = cfg.vocab_size;
 
     // An MQ4 head needs a per-position FWHT rotation of the normed input that
@@ -7672,13 +7671,39 @@ pub fn final_norm_and_head_all_batched(
     }
 
     // ── Batched lm_head path ──────────────────────────────────────────────
-    // The lm_head weight is `[vocab, hidden]` (~565 MB Q8) and its GEMV is
-    // pure weight-bandwidth-bound (~2.4 ms on gfx1151). The scalar loop above
-    // re-reads that whole weight once PER verify position. Here we run only
-    // the cheap per-position prologue (head-HC + RMSNorm, ~22 µs) into a
-    // `[K, hidden]` buffer, then issue ONE batched GEMV that reads the weight
-    // a single time for all K positions. Buffers are cached on `state` so the
-    // hot spec-decode loop allocates them once.
+    // Fill `state.head_logits_batch` ([K, vocab]) with one weight-read GEMV,
+    // then download + split per position.
+    compute_batched_head_logits(cfg, weights, state, pbs, gpu, batch_size)?;
+    let logits_batch = state.head_logits_batch.as_ref().unwrap();
+    let flat = gpu
+        .download_f32(logits_batch)
+        .map_err(|e| format!("download batched logits: {e:?}"))?;
+    let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        all_logits.push(flat[i * vocab..(i + 1) * vocab].to_vec());
+    }
+    Ok(all_logits)
+}
+
+/// Fill `state.head_logits_batch` (`[batch_size, vocab]`, F32, cached on state)
+/// with the batched lm_head over `batch_size` verify positions: the cheap
+/// per-position head-HC + RMSNorm prologue staged into a `[K, hidden]` buffer,
+/// then ONE weight-bandwidth-bound GEMV reading the ~565 MB Q8 lm_head a single
+/// time for all K. Callers choose how to reduce the logits: download them
+/// (`final_norm_and_head_all_batched`) or argmax on-GPU
+/// (`final_norm_and_argmax_all_batched`). Assumes the Q8/F16/F32 batched head
+/// (the FWHT fallback stays in the callers' per-position loop).
+fn compute_batched_head_logits(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<(), String> {
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+    let hidden = cfg.hidden_size;
+    let vocab = cfg.vocab_size;
     if state
         .head_norm_batch
         .as_ref()
@@ -7757,16 +7782,82 @@ pub fn final_norm_and_head_all_batched(
         batch_size,
         Some(x_f16),
     )?;
+    Ok(())
+}
 
-    // Download the `[K, vocab]` logits block once, split per position.
-    let flat = gpu
-        .download_f32(logits_batch)
-        .map_err(|e| format!("download batched logits: {e:?}"))?;
-    let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
-    for i in 0..batch_size {
-        all_logits.push(flat[i * vocab..(i + 1) * vocab].to_vec());
+/// On-GPU greedy twin of [`final_norm_and_head_all_batched`]: runs the same
+/// batched lm_head, then argmaxes each row ON GPU and downloads only the
+/// `batch_size` token ids — avoiding the `batch_size × vocab` (~5 MB) logits
+/// d2h the host-argmax path pays every spec window. Used by the DSpark verify.
+pub fn final_norm_and_argmax_all_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<Vec<u32>, String> {
+    if batch_size == 0 {
+        return Err("final_norm_and_argmax_all_batched: empty batch".to_string());
     }
-    Ok(all_logits)
+    let vocab = cfg.vocab_size;
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+
+    // FWHT-head fallback: no batched GEMV path — argmax each position on GPU.
+    let head_needs_fwht = {
+        let head = weights
+            .head
+            .as_ref()
+            .ok_or_else(|| "head not uploaded".to_string())?;
+        weight_needs_fwht(head)
+    };
+    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    if head_needs_fwht || !batch_head {
+        let orig = state.residual_streams.take();
+        let mut ids: Vec<u32> = Vec::with_capacity(batch_size);
+        let result: Result<(), String> = (|| {
+            for i in 0..batch_size {
+                let off = i * stream_len;
+                let streams_i = pbs.streams_batch.sub_offset(off, stream_len);
+                state.residual_streams = Some(streams_i);
+                final_norm_and_head(cfg, weights, state, gpu)?;
+                let logits_tensor = state
+                    .logits
+                    .as_ref()
+                    .ok_or_else(|| "logits not allocated".to_string())?;
+                let idx = gpu
+                    .argmax_f32(logits_tensor, vocab)
+                    .map_err(|e| format!("argmax @pos {i}: {e:?}"))?;
+                ids.push(idx);
+            }
+            Ok(())
+        })();
+        state.residual_streams = orig;
+        result?;
+        return Ok(ids);
+    }
+
+    // Batched path: fill logits on GPU, argmax on GPU, download only the ids.
+    compute_batched_head_logits(cfg, weights, state, pbs, gpu, batch_size)?;
+    let logits_batch = state.head_logits_batch.as_ref().unwrap();
+    let argmax_buf = gpu
+        .alloc_tensor(&[batch_size], DType::F32)
+        .map_err(|e| format!("alloc argmax buf: {e:?}"))?;
+    gpu.argmax_f32_batched(logits_batch, &argmax_buf, vocab, batch_size)
+        .map_err(|e| format!("argmax_f32_batched: {e:?}"))?;
+    let mut host_idx = vec![0i32; batch_size];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch_size * 4)
+        };
+        gpu.hip
+            .memcpy_dtoh(bytes, &argmax_buf.buf)
+            .map_err(|e| format!("download argmax ids: {e:?}"))?;
+    }
+    let _ = gpu.free_tensor(argmax_buf);
+    Ok(host_idx.into_iter().map(|i| i as u32).collect())
 }
 
 /// Batched twin of `hc_ffn_mix`. Same shape as `hc_attn_mix_batched`

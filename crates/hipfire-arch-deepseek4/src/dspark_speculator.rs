@@ -343,7 +343,12 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
         )
         .map_err(|e| format!("dspark verify forward: {e}"))?;
 
-        let all_logits = forward::final_norm_and_head_all_batched(
+        // ── 4. Greedy accept (shared core). target_pick[i] = argmax at verify
+        //    slot i = the trunk's prediction for position+i+1. Argmax runs
+        //    ON GPU and downloads only the K+1 token ids — not the K+1 × 200k
+        //    logits the host-argmax path used to. EOS-aware so an accepted EOS
+        //    draft stops the window without a stale bonus. ─────────────────────
+        let target_pick = forward::final_norm_and_argmax_all_batched(
             &config,
             &bundle.weights,
             &mut bundle.state,
@@ -351,12 +356,7 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
             gpu,
             verify_tokens.len(),
         )
-        .map_err(|e| format!("dspark verify head: {e}"))?;
-
-        // ── 4. Greedy accept (shared core). target_pick[i] = argmax at verify
-        //    slot i = the trunk's prediction for position+i+1. EOS-aware so an
-        //    accepted EOS draft stops the window without a stale bonus. ─────────
-        let target_pick: Vec<u32> = all_logits.iter().map(|l| logits_argmax(l) as u32).collect();
+        .map_err(|e| format!("dspark verify head+argmax: {e}"))?;
         let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
         let committed = acc.committed;
         let n_accepted = acc.accepted;
