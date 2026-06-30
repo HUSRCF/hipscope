@@ -535,6 +535,14 @@ impl MtpDrafter for DsparkDrafter {
         // Invalidate main_hidden: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
         // during prefill (measured LOSS on code prompts — see dspark_speculator.rs).
+        //
+        // DELIBERATE DEVIATION from Deepseek4DsparkDrafter::mtp_prefill, which
+        // clears main_hidden_pos only on `!cache_hit`. We clear it
+        // unconditionally because the generic body may not preserve a valid
+        // cached hidden across a cache-hit prefill. This is behaviourally
+        // identical today (both paths leave the seed's main_hidden_pos = None at
+        // the end of prefill); the unconditional clear is the safe default for a
+        // future cache-hit fold.
         self.main_hidden_pos = None;
 
         if fill_tokens.is_empty() {
