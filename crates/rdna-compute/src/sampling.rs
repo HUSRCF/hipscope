@@ -1006,6 +1006,59 @@ impl Gpu {
         }
     }
 
+    /// Stage 3c: on-GPU greedy tree follow.
+    ///
+    /// Replicates `follow_verified_tree` on-device.  Reads the device-resident
+    /// verify argmax (`verify_scratch.argmax[0..big_n]`, stored as i32 in an
+    /// f32-typed buffer) plus the Stage-3b build outputs `parent_indices` and
+    /// `node_tokens`.  Writes `follow_result`:
+    ///
+    ///   follow_result[0]              = accept_len  (i32)
+    ///   follow_result[1]              = bonus_token (i32)
+    ///   follow_result[2..2+accept_len] = accepted_node_indices (i32, 0-based)
+    ///
+    /// Eliminates the ~big_n×4 B parents D2H and the ~big_n×4 B argmax D2H
+    /// from the greedy (temp=0) ddtree cycle.
+    pub fn ddtree_greedy_follow_f32(
+        &mut self,
+        argmax: &GpuTensor,          // [big_n] i32 (stored in f32-typed buf)
+        parent_indices: &GpuTensor,  // [big_n] i32 (Raw, 4*big_n bytes)
+        node_tokens: &GpuTensor,     // [big_n] i32 (Raw, 4*big_n bytes)
+        follow_result: &GpuTensor,   // [2 + max_nodes] i32 (Raw)
+        big_n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(big_n >= 1 && big_n <= 61, "ddtree_greedy_follow: big_n={big_n} out of [1,61]");
+        self.ensure_kernel(
+            "ddtree_greedy_follow",
+            kernels::DDTREE_GREEDY_FOLLOW_SRC,
+            "ddtree_greedy_follow_f32",
+        )?;
+        let func = &self.functions["ddtree_greedy_follow_f32"];
+        let mut am  = argmax.buf.as_ptr();
+        let mut pi  = parent_indices.buf.as_ptr();
+        let mut nt  = node_tokens.buf.as_ptr();
+        let mut fr  = follow_result.buf.as_ptr();
+        let mut bn  = big_n as i32;
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut am  as *mut _ as *mut std::ffi::c_void,
+            &mut pi  as *mut _ as *mut std::ffi::c_void,
+            &mut nt  as *mut _ as *mut std::ffi::c_void,
+            &mut fr  as *mut _ as *mut std::ffi::c_void,
+            &mut bn  as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.
     ///
     /// For each of `batch` rows in `probs[batch * vocab]`, applies the
