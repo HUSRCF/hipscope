@@ -3436,28 +3436,6 @@ pub const DDTREE_BUILD_ATTN_MASK_SRC: &str =
 pub const DDTREE_BUILD_AND_LINEARIZE_SRC: &str =
     include_str!("../../../kernels/src/ddtree_build_and_linearize.hip");
 
-/// Stage 3c: on-GPU greedy tree follow (single-thread, single-workgroup).
-///
-/// Replicates `follow_verified_tree` (ddtree.rs:387-409) on-device, reading
-/// `verify_scratch.argmax` (device-resident i32 indices) and the build
-/// kernel's `parent_indices` + `node_tokens` — eliminating the parents D2H
-/// (~big_n×4 B) and the argmax D2H (~big_n×4 B) from the greedy cycle.
-///
-/// Inputs:
-///   argmax         [big_n] i32 (stored in f32-typed buffer; read as int32_t)
-///   parent_indices [big_n] i32
-///   node_tokens    [big_n] i32
-///   big_n          scalar (passed as kernel arg after D2H)
-///
-/// Output (follow_result, [2 + max_nodes] i32):
-///   [0] = accept_len
-///   [1] = bonus_token (i32)
-///   [2 .. 2+accept_len] = accepted_node_indices (0-based)
-///
-/// Grid: [1,1,1]. Block: [1,1,1]. Byte-identical to host follow_verified_tree.
-pub const DDTREE_GREEDY_FOLLOW_SRC: &str =
-    include_str!("../../../kernels/src/ddtree_greedy_follow.hip");
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════

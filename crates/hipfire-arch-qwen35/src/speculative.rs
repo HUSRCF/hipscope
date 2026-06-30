@@ -1508,16 +1508,6 @@ pub struct DdtreeScratch {
     /// by build kernel; not directly consumed by existing kernels but used
     /// in the HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1 shadow assert.
     pub dev_node_tokens: GpuTensor,
-
-    // ── Stage 3c: GPU greedy follow result ───────────────────────────────
-    //
-    // Written by `ddtree_greedy_follow_f32`.  Layout (i32 each):
-    //   [0] = accept_len
-    //   [1] = bonus_token
-    //   [2 .. 2+accept_len] = accepted_node_indices (0-based)
-    //
-    // Sized to 2 + max_budget elements (max_budget ≤ 60 → ≤ 62 i32 = 248 B).
-    pub dev_follow_result: GpuTensor,
 }
 
 impl DdtreeScratch {
@@ -1590,10 +1580,6 @@ impl DdtreeScratch {
             gpu.alloc_tensor(&[4], rdna_compute::DType::Raw)?;
         let dev_node_tokens =
             gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
-        // Stage 3c: greedy follow result — 2 + max_budget i32 values.
-        // max_budget = max_n - 1 ≤ 60 → at most 62 i32s = 248 bytes.
-        let dev_follow_result =
-            gpu.alloc_tensor(&[(2 + (max_n - 1)) * 4], rdna_compute::DType::Raw)?;
 
         Ok(Self {
             max_n,
@@ -1610,7 +1596,6 @@ impl DdtreeScratch {
             dev_child_of_cand,
             dev_big_n,
             dev_node_tokens,
-            dev_follow_result,
         })
     }
 
@@ -1630,7 +1615,6 @@ impl DdtreeScratch {
         let _ = gpu.free_tensor(self.dev_child_of_cand);
         let _ = gpu.free_tensor(self.dev_big_n);
         let _ = gpu.free_tensor(self.dev_node_tokens);
-        let _ = gpu.free_tensor(self.dev_follow_result);
     }
 }
 
@@ -5444,27 +5428,58 @@ pub fn spec_step_ddtree_batched(
         mask_host = Vec::new();
         parent_host = Vec::new();
 
-        // Stage 3c: GPU-build path needs NO parents D2H and NO DdTree
-        // reconstruction. The GPU follow kernel (ddtree_greedy_follow_f32,
-        // launched at step 8 below) reads parent_indices + node_tokens +
-        // argmax directly from device buffers and writes the follow result.
+        // Build a minimal DdTree stub — only `nodes` is needed for token extraction
+        // in steps 9+ (follow_verified_tree / committed/drafted seq building).
+        // We DON'T need child_maps for the greedy path (follow_verified_tree uses it
+        // for child lookup, but we bypass it below when use_gpu_build is true).
+        // Actually follow_verified_tree DOES need child_maps. We need to reconstruct
+        // the tree from the D2H'd data.
         //
-        // Build a minimal DdTree stub (just `nodes`, no child_maps, no
-        // visibility) so the compiler is satisfied and step 9 can still call
-        // `tree.nodes[ni].token`. child_maps / visibility are unused in the
-        // GPU-follow path (follow_verified_tree is not called).
-        let nodes: Vec<hipfire_runtime::ddtree::DdNode> = (0..num_nodes)
-            .map(|i| hipfire_runtime::ddtree::DdNode {
+        // Build host DdNode vec from D2H'd node_toks + slot_depths + parent_host.
+        // parent_indices are on-device but we also need them for follow_verified_tree.
+        // We must D2H parent_indices for the greedy follow step.
+        let mut parents_raw = vec![0u8; big_n * 4];
+        gpu.hip.memcpy_dtoh(&mut parents_raw, &scratch.parent_indices.buf)?;
+        let parents: Vec<i32> = (0..big_n)
+            .map(|i| i32::from_ne_bytes(parents_raw[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+
+        // Reconstruct DdTree from D2H'd data so follow_verified_tree works.
+        // node[i].parent_index = parents[i+1] == 0 → -1 (direct child of root)
+        //                        parents[i+1] > 0 → parents[i+1] - 1 (node index).
+        let mut nodes = Vec::with_capacity(num_nodes);
+        for i in 0..num_nodes {
+            let parent_slot = parents[i + 1];
+            let parent_index = if parent_slot <= 0 { -1i32 } else { parent_slot - 1 };
+            nodes.push(hipfire_runtime::ddtree::DdNode {
                 token: node_toks[i + 1] as u32,
                 depth: slot_depths[i + 1] as u32,
-                parent_index: -1, // unused stub — greedy follow is on-GPU
-                logw: 0.0,
-            })
-            .collect();
-        // Empty child_maps + visibility (required by DdTree struct but unused
-        // when the GPU follow replaces follow_verified_tree).
-        let child_maps = Vec::new();
-        let visibility = Vec::new();
+                parent_index,
+                logw: 0.0, // not needed for greedy follow
+            });
+        }
+        // Rebuild child_maps for follow_verified_tree.
+        let mut child_maps: Vec<std::collections::HashMap<u32, usize>> =
+            (0..big_n).map(|_| std::collections::HashMap::new()).collect();
+        for (i, node) in nodes.iter().enumerate() {
+            let parent_slot = if node.parent_index < 0 {
+                0usize
+            } else {
+                node.parent_index as usize + 1
+            };
+            child_maps[parent_slot].insert(node.token, i);
+        }
+        // Build visibility (needed by follow_verified_tree path only if it uses it;
+        // actually follow_verified_tree only uses child_maps, not visibility).
+        // But DdTree requires visibility to be present (it's not Optional).
+        // Build it cheaply from the parent chain.
+        let mut visibility = vec![vec![false; big_n]; big_n];
+        visibility[0][0] = true;
+        for i in 1..big_n {
+            let p_slot = if parents[i] < 0 { 0usize } else { parents[i] as usize };
+            for j in 0..i { visibility[i][j] = visibility[p_slot][j]; }
+            visibility[i][i] = true;
+        }
         tree = hipfire_runtime::ddtree::DdTree { nodes, visibility, child_maps };
 
     } else {
@@ -5819,10 +5834,6 @@ pub fn spec_step_ddtree_batched(
     // temp>0 path (the naive flag and its ~37 MB/cycle D2H have been removed),
     // want_full_logits is permanently false. Greedy: GPU-argmax + tiny D2H.
     // SWOR: no host logits needed; verify_scratch.logits stays device-resident.
-    // D9 extension (Stage 3c): in GPU-build greedy mode the argmax is consumed
-    // entirely by the GPU follow kernel — no host download needed. Skip it the
-    // same way SWOR does (pass skip_argmax_d2h=true). The GPU argmax kernel
-    // still runs (populates verify_scratch.argmax for the follow kernel).
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -5833,26 +5844,18 @@ pub fn spec_step_ddtree_batched(
         false, // want_full_logits: always false; D8 naive path removed
         ctx,
         verify_scratch,
-        use_swor || use_gpu_build, // D9: skip argmax D2H for SWOR and GPU-follow greedy
+        use_swor, // D9: SWOR uses 68-byte walk result, not argmax_per_pos
     )?;
     let t_post_verify = t_all.elapsed();
 
     // ── 8. Accept walk: longest accepted path + bonus ─────────────────────
-    // temp=0, GPU-build → GPU follow (Stage 3c): ddtree_greedy_follow_f32
-    //   reads verify_scratch.argmax + parent_indices + node_tokens from device,
-    //   writes {accept_len, bonus_token, accepted_node_indices[]} to
-    //   scratch.dev_follow_result; D2H is ≤ (2 + accept_len) × 4 bytes.
-    // temp=0, fallback → host follow_verified_tree (verify_gpu_build mode only).
+    // temp=0 → greedy argmax walk (follow_verified_tree).
     // temp>0 → q-exploiting Sequoia/SpecTr SWOR walk (use_swor, distribution-
-    //   exact). All paths return the same (accepted_node_indices, bonus_token)
+    //   exact). The naive-sampling fallback (HIPFIRE_DDTREE_VERIFY=naive) has
+    //   been removed (D8): it required a ~37 MB/cycle full-logits D2H and is
+    //   superseded by SWOR which achieves the same distribution-preservation
+    //   on-device. All paths return the same (accepted_node_indices, bonus_token)
     //   shape; step 10's divergent-path commit handles non-linear accepted paths.
-
-    // HIPFIRE_DDTREE_VERIFY_FOLLOW=1: shadow-assert mode. Run BOTH the GPU
-    // follow kernel AND the host follow_verified_tree, assert they agree.
-    // Only valid when use_gpu_build=true (requires device argmax + build outputs).
-    let verify_follow = use_gpu_build
-        && std::env::var("HIPFIRE_DDTREE_VERIFY_FOLLOW").ok().as_deref() == Some("1");
-
     let (accepted_node_indices, bonus_token) = if use_swor {
         // Fully on-device fused SWOR walk: target logits from verify scratch,
         // draft logits kept on device — no full-vocab host work, no q D2H.
@@ -5874,93 +5877,8 @@ pub fn spec_step_ddtree_batched(
             temp,
             seed,
         )?
-    } else if use_gpu_build {
-        // Stage 3c: GPU greedy follow. Reads device-resident argmax
-        // (verify_scratch.argmax) + parent_indices + node_tokens from the
-        // build kernel's outputs. No D2H for argmax or parents.
-        let argmax_dev = verify_scratch.argmax.sub_offset(0, big_n);
-        gpu.ddtree_greedy_follow_f32(
-            &argmax_dev,
-            &scratch.parent_indices,
-            &scratch.dev_node_tokens,
-            &scratch.dev_follow_result,
-            big_n,
-        )?;
-        // Synchronize so the single-thread kernel finishes before D2H.
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_synchronize(stream)?;
-        } else {
-            gpu.hip.device_synchronize()?;
-        }
-        // D2H: follow_result (accept_len + bonus_token + accepted_node_indices).
-        // Size: min(2 + accept_len, 2 + max_nodes) i32s. We read the header
-        // first (accept_len at [0]) to know how many indices follow.
-        let max_follow_bytes = (2 + (scratch.max_n - 1)) * 4;
-        let mut follow_raw = vec![0u8; max_follow_bytes];
-        gpu.hip.memcpy_dtoh(&mut follow_raw, &scratch.dev_follow_result.buf)?;
-        let accept_len_gpu = i32::from_ne_bytes(follow_raw[0..4].try_into().unwrap()) as usize;
-        let bonus_gpu = i32::from_ne_bytes(follow_raw[4..8].try_into().unwrap()) as u32;
-        let gpu_accepted: Vec<usize> = (0..accept_len_gpu)
-            .map(|i| {
-                let off = (2 + i) * 4;
-                i32::from_ne_bytes(follow_raw[off..off+4].try_into().unwrap()) as usize
-            })
-            .collect();
-
-        // Shadow assert: verify GPU follow matches host follow_verified_tree.
-        if verify_follow {
-            // Download argmax to run host follow.
-            let argmax_host = dflash_download_verify_argmax(gpu, verify_scratch, big_n)?;
-            // Rebuild child_maps from device parent_indices for host follow.
-            // (The stub tree built above has empty child_maps; we need real ones
-            // for follow_verified_tree to walk.)
-            let mut parents_raw_va = vec![0u8; big_n * 4];
-            gpu.hip.memcpy_dtoh(&mut parents_raw_va, &scratch.parent_indices.buf)?;
-            let parents_va: Vec<i32> = (0..big_n)
-                .map(|i| i32::from_ne_bytes(parents_raw_va[i*4..(i+1)*4].try_into().unwrap()))
-                .collect();
-            let mut child_maps_va: Vec<std::collections::HashMap<u32, usize>> =
-                (0..big_n).map(|_| std::collections::HashMap::new()).collect();
-            for (i, node) in tree.nodes.iter().enumerate() {
-                let parent_slot = if parents_va[i + 1] <= 0 { 0usize } else { parents_va[i + 1] as usize };
-                child_maps_va[parent_slot].insert(node.token, i);
-            }
-            let tree_va = hipfire_runtime::ddtree::DdTree {
-                nodes: tree.nodes.clone(),
-                visibility: Vec::new(), // follow_verified_tree doesn't use visibility
-                child_maps: child_maps_va,
-            };
-            let (host_accepted, host_bonus) =
-                hipfire_runtime::ddtree::follow_verified_tree(&tree_va, &argmax_host);
-            assert_eq!(
-                accept_len_gpu, host_accepted.len(),
-                "VERIFY_FOLLOW: accept_len mismatch: gpu={accept_len_gpu} host={}",
-                host_accepted.len(),
-            );
-            assert_eq!(
-                bonus_gpu, host_bonus,
-                "VERIFY_FOLLOW: bonus_token mismatch: gpu={bonus_gpu} host={host_bonus}",
-            );
-            for i in 0..accept_len_gpu {
-                assert_eq!(
-                    gpu_accepted[i], host_accepted[i],
-                    "VERIFY_FOLLOW: accepted_node_indices[{i}] mismatch: gpu={} host={}",
-                    gpu_accepted[i], host_accepted[i],
-                );
-            }
-            eprintln!(
-                "[DDTREE_VERIFY_FOLLOW] cycle OK: accept_len={accept_len_gpu} bonus={bonus_gpu} \
-                 accepted={gpu_accepted:?} byte-identical"
-            );
-        }
-
-        (gpu_accepted, bonus_gpu)
     } else {
-        // Fallback path: verify_gpu_build shadow-assert mode (host path for SWOR
-        // shadow or non-GPU-build diagnostic). Use host follow_verified_tree.
-        // Download argmax now (skip_argmax_d2h was false in this branch? —
-        // no: use_swor||use_gpu_build was the skip condition; in verify_gpu_build
-        // mode neither flag is set, so argmax was downloaded into verify_out).
+        // Greedy (temp=0): follow argmax at each tree node.
         hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
     };
     // The kept draft logits are no longer needed once the walk has run.
