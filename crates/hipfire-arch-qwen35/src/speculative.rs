@@ -5289,51 +5289,85 @@ pub fn spec_step_ddtree_batched(
     }
 
     // ── 4. Linearize the tree into (tokens, positions, mask_host, parents) ─
+    //
+    // mask_host is computed here for the HIPFIRE_DDTREE_ASSERT_MASK=1 dual-
+    // path check (byte-equality proof vs GPU build). In normal operation it
+    // is not uploaded — the GPU kernel (step 5) rebuilds it on-device.
     let (verify_tokens, verify_positions, mask_host, parent_host) =
         hipfire_runtime::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
     let big_n = verify_tokens.len();
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
     debug_assert_eq!(parent_host.len(), big_n);
 
-    // ── 5. Upload mask to GPU into the persistent bias scratch ───────────
-    //
-    // Reuses `scratch.attn_bias` (sized for max_budget at init time), so
-    // per cycle we only pay for the htod of the current cycle's mask. The
-    // FA kernel reads at `row * block_cols + col` with block_cols = big_n;
-    // unused tail space in the buffer is never accessed.
     assert!(
         big_n <= scratch.max_n,
         "tree big_n {} exceeds scratch.max_n {} (increase DdtreeScratch size)",
         big_n,
         scratch.max_n,
     );
-    {
-        let mask_bytes = unsafe {
-            std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
-        };
-        gpu.hip.memcpy_htod(&scratch.attn_bias.buf, mask_bytes)?;
-    }
 
-    // ── 5b. Upload parent_indices for tree-aware LA kernels ──────────────
+    // ── 5. Upload parent_indices; build attn_bias mask on-GPU (Stage 3a) ─
     //
-    // ON BY DEFAULT as of 2026-04-24 — Task #101 Phase 3d validation bench
-    // (3-run medians on 27B MQ4 asym3 b12-k2, commit 4a3f2b3):
-    //   code:     110.0 → 119.1 tok/s (+8.3 %)   τ 6.80 → 7.30 (+7 %)
-    //   prose:     52.3 →  57.8 tok/s (+10.5 %)  τ 3.00 → 3.52 (+17 %)
-    //   instruct:  42.1 →  47.4 tok/s (+12.6 %)  τ 2.02 → 2.47 (+22 %)
-    // Coherence-gate-dflash passes on all 4 tests. Mechanism: tree-aware
-    // LA kernels read parent_indices to walk ancestor chains correctly at
-    // topk>1, so the fast-tape path fires on 90 %+ of cycles instead of
-    // the slow-path re-verify that used to trigger on sibling pollution.
+    // D5: parent_indices H2D (244 B, stays — needed for tree-aware LA and
+    // for the mask kernel itself).  D4 (attn_bias H2D, ~15 KB/cycle) is
+    // eliminated: instead of uploading mask_host we launch
+    // ddtree_build_attn_mask_f32 which walks the parent chain per-thread
+    // and writes scratch.attn_bias directly on-device.
     //
-    // Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected.
+    // parent_indices is always uploaded (needed both by the mask kernel and,
+    // when ddtree_tree_la=true, by the tree-aware GDN kernels).
     let use_tree_la = gpu.flags.ddtree_tree_la;
-    if use_tree_la {
+    {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
         };
         gpu.hip
             .memcpy_htod(&scratch.parent_indices.buf, parent_bytes)?;
+    }
+
+    // Build attn_bias on GPU from the now-resident parent_indices. The sub-
+    // offset view is used by the FA kernel (step 7) to bound-check big_n²
+    // reads.  The kernel writes exactly big_n² floats at the head of
+    // scratch.attn_bias; tail is never read by the FA kernel.
+    gpu.ddtree_build_attn_mask_f32(&scratch.parent_indices, &scratch.attn_bias, big_n)?;
+
+    // ── 5b. Byte-equality assert (HIPFIRE_DDTREE_ASSERT_MASK=1) ──────────
+    //
+    // Dual-path proof: download the GPU mask and compare byte-for-byte with
+    // the host mask_host computed by linearize_tree_with_parents above.
+    // Off by default (costs one D2H per cycle).
+    if std::env::var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
+        // Synchronize so the kernel has finished writing before the D2H.
+        gpu.hip.device_synchronize()?;
+        let n_floats = big_n * big_n;
+        let mut gpu_mask = vec![0.0f32; n_floats];
+        let gpu_mask_bytes = unsafe {
+            std::slice::from_raw_parts_mut(gpu_mask.as_mut_ptr() as *mut u8, n_floats * 4)
+        };
+        gpu.hip
+            .memcpy_dtoh(gpu_mask_bytes, &scratch.attn_bias.buf)?;
+        // mask_host is big_n*big_n; gpu_mask is big_n*big_n.
+        assert_eq!(
+            mask_host.len(),
+            n_floats,
+            "ASSERT_MASK: mask_host.len() mismatch"
+        );
+        for idx in 0..n_floats {
+            let h = mask_host[idx].to_bits();
+            let g = gpu_mask[idx].to_bits();
+            assert_eq!(
+                h, g,
+                "ASSERT_MASK: mismatch at flat index {idx} (row={}, col={}): host={:08x} gpu={:08x}",
+                idx / big_n,
+                idx % big_n,
+                h,
+                g,
+            );
+        }
+        eprintln!(
+            "[DDTREE_ASSERT_MASK] big_n={big_n} mask byte-identical ({} floats)",
+            n_floats
+        );
     }
 
     // ── 6. Snapshot pre-seed target state ─────────────────────────────────

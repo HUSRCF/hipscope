@@ -3411,6 +3411,14 @@ pub const DDTREE_SWOR_WALK_SRC: &str =
 pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/ddtree_gumbel_topk_batched.hip");
 
+/// Stage 3a: on-GPU ddtree attention-mask builder. Reads `parent_indices`
+/// (already device-resident from H2D) and writes the `attn_bias[big_n ×
+/// big_n]` f32 mask in-place, eliminating the ~15 KB H2D per cycle (D4).
+/// Grid: [big_n,1,1]. Block: [big_n,1,1]. Each thread i walks the parent
+/// chain upward, setting 0.0 for ancestor slots and -INF elsewhere.
+pub const DDTREE_BUILD_ATTN_MASK_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_build_attn_mask.hip");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════

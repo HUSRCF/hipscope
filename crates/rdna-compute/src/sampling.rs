@@ -879,6 +879,50 @@ impl Gpu {
         )
     }
 
+    /// Stage 3a: on-GPU ddtree attention-mask builder.
+    ///
+    /// Reads `parent_indices[big_n]` (i32, device-resident) and fills
+    /// `attn_bias[big_n * big_n]` (f32, row-major). Thread `i` walks the
+    /// parent chain from `i` up to the root (-1 sentinel), setting 0.0 for
+    /// each visited ancestor and -INF everywhere else. Exactly mirrors the
+    /// host `visibility` bottom-up pass + row-major flatten in ddtree.rs.
+    ///
+    /// Grid: [big_n, 1, 1]. Block: [big_n, 1, 1]. At big_n ≤ 61 this is
+    /// 61 threads total — occupancy is trivial; the kernel runs < 1 µs.
+    pub fn ddtree_build_attn_mask_f32(
+        &mut self,
+        parent_indices: &GpuTensor, // [big_n] i32 (stored as Raw, 4*big_n bytes)
+        attn_bias: &GpuTensor,      // [big_n * big_n] f32
+        big_n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(big_n >= 1 && big_n <= 4096, "ddtree_build_attn_mask: big_n={big_n} out of range");
+        self.ensure_kernel(
+            "ddtree_build_attn_mask",
+            kernels::DDTREE_BUILD_ATTN_MASK_SRC,
+            "ddtree_build_attn_mask_f32",
+        )?;
+        let func = &self.functions["ddtree_build_attn_mask_f32"];
+        let mut pi = parent_indices.buf.as_ptr();
+        let mut ab = attn_bias.buf.as_ptr();
+        let mut nn = big_n as i32;
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut pi as *mut _ as *mut std::ffi::c_void,
+            &mut ab as *mut _ as *mut std::ffi::c_void,
+            &mut nn as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [big_n as u32, 1, 1],
+                [big_n as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.
     ///
     /// For each of `batch` rows in `probs[batch * vocab]`, applies the
