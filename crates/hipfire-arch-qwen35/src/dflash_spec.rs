@@ -132,24 +132,10 @@ pub fn load_dflash_state(
     // DDTree (budget read once above, used for scratch sizing).
     let ddtree = if ddtree_budget > 0 {
         let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
-        let qkv_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim * 2
-            + target_config.linear_num_value_heads * target_config.linear_value_head_dim;
-        let n_fa_layers = target_config
-            .layer_types
-            .iter()
-            .filter(|t| **t == LayerType::FullAttention)
-            .count();
         let post_seed_snap =
             DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let scratch = DdtreeScratch::new(
-            gpu,
-            ddtree_budget,
-            target_config.n_kv_heads,
-            target_config.head_dim,
-            qkv_dim,
-            n_fa_layers,
-        )
-        .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
+        let scratch = DdtreeScratch::new(gpu, ddtree_budget)
+            .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
         Some(DdtreeState {
             post_seed_snap,
             scratch,

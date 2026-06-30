@@ -1156,7 +1156,6 @@ pub fn spec_step_dflash_mtp_tree(
         } else {
             None
         },
-        pre_rope_k_capture: None,
     };
 
     let verify_out: DflashVerifyOutput = speculative::verify_dflash_block_tree(
