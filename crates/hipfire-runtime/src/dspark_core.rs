@@ -244,6 +244,69 @@ fn gemv_auto_batched_wmma(
 
 // ── public API ───────────────────────────────────────────────────────────────
 
+/// GEMV `main_proj` over `main_hidden` then `rmsnorm_f32` with `main_norm`
+/// in place, writing the result into `out` (`[dim]` F32).
+///
+/// The concat width is `weights.cfg.target_layer_ids.len() * dim`
+/// (generalised from deepseek4's hard-coded `3*hidden`), so 5 target layers
+/// work for qwen3 as well as 3 for deepseek4.
+///
+/// The FWHT-rotation guard is preserved faithfully: when `main_proj` is an
+/// MQ4 weight (`weight_needs_fwht` is true), `main_hidden` is rotated into a
+/// temporary buffer before the GEMV.
+///
+/// `main_norm` is `Option` in [`DsparkWeights`]; an error is returned if
+/// either `main_proj` or `main_norm` is `None`.
+pub fn main_proj_ingest(
+    gpu: &mut Gpu,
+    weights: &DsparkWeights,
+    main_hidden: &GpuTensor,
+    out: &GpuTensor,
+) -> Result<(), String> {
+    let main_proj = weights
+        .main_proj
+        .as_ref()
+        .ok_or("main_proj_ingest: main_proj missing")?;
+    let main_norm = weights
+        .main_norm
+        .as_ref()
+        .ok_or("main_proj_ingest: main_norm missing")?;
+
+    let n_targets = weights.cfg.target_layer_ids.len();
+    // out is [dim]; infer dim from its length.
+    let dim = out.shape.last().copied().unwrap_or(0);
+    if dim == 0 {
+        return Err("main_proj_ingest: out has zero dim".to_string());
+    }
+    let concat_w = n_targets * dim;
+
+    if weight_needs_fwht(main_proj) {
+        let rot = gpu
+            .alloc_tensor(&[concat_w], DType::F32)
+            .map_err(|e| format!("main_proj_ingest alloc rot: {e:?}"))?;
+        gpu.rotate_x_mq(main_hidden, &rot, concat_w)
+            .map_err(|e| format!("main_proj_ingest rotate main_hidden: {e:?}"))?;
+        gemv_auto(gpu, main_proj, &rot, main_hidden, out, dim, concat_w)?;
+        let _ = gpu.free_tensor(rot);
+    } else {
+        gemv_auto(gpu, main_proj, main_hidden, main_hidden, out, dim, concat_w)?;
+    }
+
+    // main_norm RMSNorm in place. Use 1e-6 (compatible with deepseek4 + qwen3).
+    gpu.rmsnorm_f32(out, main_norm, out, 1e-6f32)
+        .map_err(|e| format!("main_proj_ingest main_norm: {e:?}"))?;
+
+    Ok(())
+}
+
+/// Build the noise token id block for one DSpark window:
+/// `[seed, noise_token_id, noise_token_id, ...]` of length `cfg.block_size`.
+pub fn noise_block_ids(cfg: &DsparkConfig, seed: u32) -> Vec<u32> {
+    let mut ids = vec![cfg.noise_token_id; cfg.block_size];
+    ids[0] = seed;
+    ids
+}
+
 /// Run the DSpark head pipeline over a completed `x_head` block:
 /// 1. lm-head GEMV: `rmsnorm(x_head, stage_norm)` → optional FWHT → batched
 ///    `lm_head` GEMV → `logits[block, vocab]` (resident on GPU).
