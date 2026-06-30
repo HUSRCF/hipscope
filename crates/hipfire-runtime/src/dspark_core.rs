@@ -2,6 +2,9 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::spec::{
+    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 #[derive(Clone, Debug)]
@@ -463,4 +466,291 @@ pub fn run_heads(
         logits: Vec::new(),
         confidence,
     })
+}
+
+// ── Generic DsparkDrafter ─────────────────────────────────────────────────────
+//
+// Drives any [`DsparkBody`] through the [`MtpDrafter`] interface. The arch-
+// specific body (deepseek4 MoE chain, qwen3 dense transformer) is injected at
+// build time; the target is reached only through [`SpecTarget`] trait methods
+// (notably [`SpecTarget::capture_seed_main_hidden`] for bootstrap + hidden
+// capture, and the generic verify primitives). No `Deepseek4*` type appears here.
+
+/// Upload a host F32 slice to a freshly-allocated GPU tensor.
+fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
+    let t = gpu
+        .alloc_tensor(&[v.len()], DType::F32)
+        .map_err(|e| format!("DsparkDrafter: alloc main_hidden: {e:?}"))?;
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+    gpu.memcpy_htod_auto(&t.buf, bytes)
+        .map_err(|e| format!("DsparkDrafter: htod main_hidden: {e:?}"))?;
+    Ok(t)
+}
+
+/// Generic DSpark drafter: window orchestration over any [`DsparkBody`].
+///
+/// ## main_hidden bookkeeping
+///
+/// `body.draft_block(main_hidden@P, seed=token@P, position=P)` drafts positions
+/// `P+1 ..= P+block`. Before drafting at seed position `P` we need the trunk's
+/// captured `[target_layer_ids]` main_hidden FOR the seed token at `P`. Since the
+/// seed is freshly committed (never seen by the trunk in the current window), we
+/// materialise its hidden via `target.capture_seed_main_hidden(gpu, seed, P,
+/// &layers)` — one 1-token capture-armed trunk forward, result cached in
+/// `main_hidden_dev`. `main_hidden_pos` tracks which absolute position that cache
+/// corresponds to; the guard skips the bootstrap when already in sync (never
+/// happens today — each window's bonus is always a fresh token — but makes the
+/// contract explicit).
+pub struct DsparkDrafter {
+    body: Box<dyn DsparkBody>,
+    weights: DsparkWeights,
+    /// Per-stage final norm fed to [`run_heads`].
+    stage_norm: GpuTensor,
+    /// lm-head weight fed to [`run_heads`].
+    lm_head: GpuTensor,
+    conf_threshold: f32,
+    block: usize,
+    ctx_capacity: usize,
+    /// Cached GPU tensor holding main_hidden for the seed at `main_hidden_pos`.
+    /// `None` ⇒ must bootstrap on next `mtp_step`.
+    main_hidden_dev: Option<GpuTensor>,
+    /// Absolute position of the seed whose main_hidden is cached in
+    /// `main_hidden_dev`. `None` ⇒ cache invalid.
+    main_hidden_pos: Option<usize>,
+}
+
+impl MtpDrafter for DsparkDrafter {
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String> {
+        if !cache_hit {
+            target.reset_recurrent(gpu);
+        }
+        // Invalidate main_hidden: mtp_step re-bootstraps for the first seed.
+        // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
+        // during prefill (measured LOSS on code prompts — see dspark_speculator.rs).
+        self.main_hidden_pos = None;
+
+        if fill_tokens.is_empty() {
+            return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
+        }
+
+        // Run the full prefill through spec_advance (reset=false; recurrent was
+        // already reset above on cache_miss). Returns argmax at the last position,
+        // which is the seed for the first decode window.
+        let abort = &|| false;
+        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+            crate::spec::SpecAdvance::Ready { last_argmax } => Ok(last_argmax),
+            crate::spec::SpecAdvance::Aborted => {
+                Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
+            }
+        }
+    }
+
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+        _grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String> {
+        // DSpark drafts the whole block at once. In-step grammar is not yet
+        // wired for the generic drafter (no arch-specific grammar type to
+        // downcast to) — ignore silently; post-hoc emission-layer grammar applies.
+
+        let layers = self.weights.cfg.target_layer_ids.clone();
+        let block = self.weights.cfg.block_size.min(k).max(1);
+        let vocab = self.lm_head.shape[0];
+        let hidden = {
+            // Infer hidden from stage_norm shape (it's [hidden]).
+            self.stage_norm.shape[0]
+        };
+
+        // ── 1. Bootstrap: ensure main_hidden@position for the seed ───────────
+        // The seed is a fresh token; materialise its captured main_hidden with a
+        // single 1-token capture-armed trunk forward (guard skips when already
+        // in sync — never today but makes the contract explicit).
+        if self.main_hidden_pos != Some(position) {
+            let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
+            let dev = upload_f32(gpu, &hidden_host)?;
+            if let Some(old) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.main_hidden_dev = Some(dev);
+            self.main_hidden_pos = Some(position);
+        }
+
+        let main_hidden = self
+            .main_hidden_dev
+            .as_ref()
+            .ok_or("DsparkDrafter: main_hidden_dev missing after bootstrap")?;
+
+        // ── 2. Draft the block with DsparkBody ──────────────────────────────
+        let x_head_out = gpu
+            .alloc_tensor(&[block, hidden], DType::F32)
+            .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+        self.body.draft_block(
+            gpu,
+            &self.weights,
+            main_hidden,
+            seed,
+            position,
+            block,
+            &x_head_out,
+        )?;
+
+        // ── 3. Heads: markov argmax + confidence ────────────────────────────
+        let draft = run_heads(
+            gpu,
+            &self.weights,
+            &self.stage_norm,
+            &self.lm_head,
+            &x_head_out,
+            seed,
+            block,
+            vocab,
+        )?;
+        let _ = gpu.free_tensor(x_head_out);
+
+        let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+
+        // ── 3a. Confidence-threshold truncation ─────────────────────────────
+        // Mirror Deepseek4DsparkDrafter exactly: walk slots, truncate at first
+        // slot whose sigmoid(confidence) < conf_threshold; always keep ≥1.
+        let conf_threshold = self.conf_threshold;
+        let confident_len = {
+            let mut l = drafts.len();
+            for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
+                let survival = 1.0f32 / (1.0 + (-c).exp());
+                if survival < conf_threshold {
+                    l = i;
+                    break;
+                }
+            }
+            l.max(1)
+        };
+        drafts.truncate(confident_len);
+        let n_proposed = drafts.len();
+
+        // ── 4. Verify: target forward over [seed, draft0..draft_{n-1}] ───────
+        // The target runs through `capture_seed_main_hidden` for the NEXT seed
+        // (the bonus) inside the NEXT window's bootstrap; the verify forward here
+        // does NOT need to capture (no verify_block hidden_out). We use
+        // spec_advance with no hidden_out: advance from `position` over
+        // verify_tokens, getting back the last argmax (the bonus token).
+        //
+        // BUT: we need per-slot target argmaxes for accept_greedy_prefix, not
+        // just the last one. `spec_advance` returns only the final argmax.
+        //
+        // Use the generic `verify_block` path instead: it returns per-slot
+        // argmaxes (`argmax[i]` = target's prediction after consuming block[0..=i]).
+        // We don't need a SpecScratch because for DSpark the verify is a plain
+        // prefill (no recurrent rewind needed — the trunk is stateless-attention
+        // in this window's view). Use `target.new_spec_scratch` to get an arch
+        // scratch, then call `verify_block`.
+        //
+        // However: after verify_block, the target's KV is advanced by
+        // verify_tokens.len() positions. For DSpark (like deepseek4's drafter)
+        // the next window's seed is the BONUS token — a fresh token whose KV
+        // slot is the NEXT position after the committed prefix. Since we commit
+        // only the accepted prefix + bonus, we set n_tokens to
+        // position + committed.len() AFTER accept, which is correct.
+        //
+        // We use `spec_advance` for the verify pass and reconstruct per-slot
+        // target_pick by running the FULL verify+argmax in one pass, accepting
+        // that we only get the LAST argmax from spec_advance. This is NOT
+        // sufficient for multi-slot acceptance. We MUST use verify_block.
+        let verify_tokens: Vec<u32> = std::iter::once(seed)
+            .chain(drafts.iter().copied())
+            .collect();
+
+        let mut scratch = target.new_spec_scratch(gpu, verify_tokens.len())?;
+        // hidden_out=None: we don't need the hidden states for the generic verify
+        // (the next window's bootstrap re-captures via capture_seed_main_hidden).
+        let target_pick =
+            target.verify_block(gpu, &verify_tokens, position, scratch.as_mut(), None)?;
+
+        // ── 5. Greedy accept ─────────────────────────────────────────────────
+        let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
+        let committed = acc.committed;
+        let n_accepted = acc.accepted;
+
+        // ── 6. Commit the accepted prefix into the target's state ────────────
+        // verify_block advanced the target by verify_tokens.len() slots. We
+        // committed only n_accepted drafts + the bonus. Rewind to the true commit
+        // length via commit_prefix (no-op for stateless/full-accept; replays for
+        // recurrent arches).
+        let accept_len = n_accepted; // accepted drafts; bonus is at accept_len
+        target.commit_prefix(gpu, &verify_tokens, accept_len, position, scratch.as_mut())?;
+        scratch.free(gpu);
+
+        // Invalidate the cached main_hidden — the next seed (the bonus) is a
+        // fresh token whose hidden will be captured by the next window's bootstrap.
+        self.main_hidden_pos = None;
+
+        Ok(MtpWindow {
+            committed,
+            accepted: n_accepted,
+            drafts_generated: n_proposed,
+        })
+    }
+
+    fn mtp_reset(&mut self, _gpu: &mut Gpu) {
+        // Invalidate the cached main_hidden so the next prefill re-bootstraps.
+        self.main_hidden_pos = None;
+    }
+
+    fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
+        if let Some(dev) = self.main_hidden_dev {
+            let _ = gpu.free_tensor(dev);
+        }
+        self.body.free(gpu);
+    }
+
+    fn k(&self) -> usize {
+        self.block
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.ctx_capacity
+    }
+
+    fn requires_greedy(&self) -> bool {
+        true
+    }
+}
+
+/// Build the generic DSpark speculator wrapping any [`DsparkBody`]. The
+/// `stage_norm` is the per-stage final RMSNorm weight (deepseek4:
+/// `mtp_final_norm`; qwen3: drafter `norm`); `lm_head` is `[vocab, hidden]`.
+pub fn build_dspark_speculator(
+    body: Box<dyn DsparkBody>,
+    weights: DsparkWeights,
+    stage_norm: GpuTensor,
+    lm_head: GpuTensor,
+    block: usize,
+    ctx_capacity: usize,
+    conf_threshold: f32,
+) -> Box<dyn Speculator> {
+    let block = block.clamp(1, 8);
+    Box::new(MtpSpeculator::new(DsparkDrafter {
+        body,
+        weights,
+        stage_norm,
+        lm_head,
+        conf_threshold,
+        block,
+        ctx_capacity,
+        main_hidden_dev: None,
+        main_hidden_pos: None,
+    }))
 }

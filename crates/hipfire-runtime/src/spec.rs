@@ -391,6 +391,28 @@ pub trait SpecTarget {
     /// for targets that do not expose hidden states (their [`dflash_extract_layers`](Self::dflash_extract_layers)
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
+
+    /// Capture the target's residual hidden states at `layers` for a freshly-
+    /// committed `seed` token at absolute `position`, returning the concatenated
+    /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
+    ///
+    /// The generic [`crate::dspark_core::DsparkDrafter`] calls this once per
+    /// window (the "bootstrap" forward) to materialise the seed's hidden before
+    /// the DSpark draft block runs. The target runs a 1-token forward with capture
+    /// armed at `layers`, assembles the concat, and returns it. The generic drafter
+    /// then uploads it to GPU for [`crate::dspark_core::DsparkBody::draft_block`].
+    ///
+    /// Default: returns `Err` (unsupported). Targets that provide a DSpark body
+    /// (deepseek4, qwen3) override this in Tasks 5 / 9.
+    fn capture_seed_main_hidden(
+        &mut self,
+        _gpu: &mut Gpu,
+        _seed: u32,
+        _position: usize,
+        _layers: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        Err("capture_seed_main_hidden: target does not support DSpark capture".to_string())
+    }
 }
 
 /// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched
