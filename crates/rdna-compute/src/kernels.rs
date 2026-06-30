@@ -3419,6 +3419,23 @@ pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
 pub const DDTREE_BUILD_ATTN_MASK_SRC: &str =
     include_str!("../../../kernels/src/ddtree_build_attn_mask.hip");
 
+/// Stage 3b: on-GPU DDTree build + linearize (single-thread, single-workgroup).
+///
+/// Reads device-resident draft logits `[depth × vocab]`; produces:
+///   top_tokens_out   [depth × topk] i32  — deterministic top-K, ascending-idx tie-break
+///   top_log_probs_out[depth × topk] f32  — log-softmax (f64 lse accumulator, matches host)
+///   attn_bias        [max_n × max_n] f32 — row-major mask (0.0 / -INF)
+///   parent_indices   [max_n]         i32 — linearized parent slot per slot
+///   slot_depth       [max_n]         i32 — tree depth per slot (0 = root)
+///   child_of_cand    [max_n × topk]  i32 — child node index per (slot, rank), -1=absent
+///   big_n_out        [1]             i32 — actual 1 + num_nodes
+///   node_tokens_out  [max_n]         i32 — draft token per slot (-1 at slot 0)
+///
+/// Grid: [1,1,1]. Block: [1,1,1]. Byte-identical to host `build_ddtree_tree_bounded`
+/// at temp=0 by design (f64 lse, ascending-idx tie-break, volatile logw to prevent FMA).
+pub const DDTREE_BUILD_AND_LINEARIZE_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_build_and_linearize.hip");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
 // ═══════════════════════════════════════════════════════════════════════════

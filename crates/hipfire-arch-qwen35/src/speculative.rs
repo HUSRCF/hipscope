@@ -1481,6 +1481,33 @@ pub struct DdtreeScratch {
     /// then re-RoPEs with committed positions instead of linearization
     /// positions. Empty Vec when Path B isn't wired (default today).
     pub pre_rope_k: Vec<GpuTensor>,
+
+    // ── Stage 3b: GPU-resident tree build outputs ─────────────────────
+    //
+    // These are written by `ddtree_build_and_linearize_f32` and read by
+    // subsequent kernels without any H2D or D2H (except `big_n_out`, one
+    // 4-byte scalar readback for loop control).
+    //
+    // Sizes use the kernel's compile-time MAX limits (depth ≤ 63, topk ≤ 8,
+    // max_n ≤ 61) — all are < 4 KB total, so over-allocation is negligible.
+    //
+    /// `[MAX_DEPTH × MAX_TOPK]` i32 — top-K token ids per draft row.
+    /// Also serves as `pos_cands` for the SWOR walk (draw-ordered in Gumbel
+    /// mode; deterministic top-K in greedy mode). Written by the build kernel.
+    pub dev_top_tokens: GpuTensor,
+    /// `[MAX_DEPTH × MAX_TOPK]` f32 — per-row log-probs (log-softmax).
+    pub dev_top_log_probs: GpuTensor,
+    /// `[max_n]` i32 — depth per slot (0 = root). Written by build kernel.
+    pub dev_slot_depth: GpuTensor,
+    /// `[max_n × MAX_TOPK]` i32 — child_of_cand mapping. Written by build.
+    pub dev_child_of_cand: GpuTensor,
+    /// `[1]` i32 — 4-byte scalar: actual `big_n = 1 + num_nodes`. The ONLY
+    /// D2H per cycle from the build kernel (gates grid size for verify).
+    pub dev_big_n: GpuTensor,
+    /// `[max_n]` i32 — draft token per slot (slot 0 = -1/unused). Written
+    /// by build kernel; not directly consumed by existing kernels but used
+    /// in the HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1 shadow assert.
+    pub dev_node_tokens: GpuTensor,
 }
 
 impl DdtreeScratch {
@@ -1532,6 +1559,28 @@ impl DdtreeScratch {
         // Tape rows are F32 projections, so sized in F32 elements directly.
         let tape_gather_scratch = gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?;
 
+        // Stage 3b: GPU-resident tree build scratch.
+        // Conservative max sizes matching the kernel's compile-time limits.
+        const MAX_DEPTH: usize = 63;
+        const MAX_TOPK: usize = 8;
+        // top_tokens / top_log_probs: [MAX_DEPTH × MAX_TOPK] each, stored as
+        // i32 / f32 respectively.  Both are F32-element tensors (i32 is
+        // reinterpreted by callers, matching the existing topk convention).
+        let dev_top_tokens =
+            gpu.alloc_tensor(&[MAX_DEPTH * MAX_TOPK], rdna_compute::DType::F32)?;
+        let dev_top_log_probs =
+            gpu.alloc_tensor(&[MAX_DEPTH * MAX_TOPK], rdna_compute::DType::F32)?;
+        // slot_depth, child_of_cand, big_n, node_tokens: Raw byte tensors
+        // (i32 arrays; no native i32 DType in rdna-compute).
+        let dev_slot_depth =
+            gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+        let dev_child_of_cand =
+            gpu.alloc_tensor(&[max_n * MAX_TOPK * 4], rdna_compute::DType::Raw)?;
+        let dev_big_n =
+            gpu.alloc_tensor(&[4], rdna_compute::DType::Raw)?;
+        let dev_node_tokens =
+            gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+
         Ok(Self {
             max_n,
             attn_bias,
@@ -1541,6 +1590,12 @@ impl DdtreeScratch {
             kv_gather_scratch_v,
             tape_gather_scratch,
             pre_rope_k,
+            dev_top_tokens,
+            dev_top_log_probs,
+            dev_slot_depth,
+            dev_child_of_cand,
+            dev_big_n,
+            dev_node_tokens,
         })
     }
 
@@ -1554,6 +1609,12 @@ impl DdtreeScratch {
         for t in self.pre_rope_k {
             let _ = gpu.free_tensor(t);
         }
+        let _ = gpu.free_tensor(self.dev_top_tokens);
+        let _ = gpu.free_tensor(self.dev_top_log_probs);
+        let _ = gpu.free_tensor(self.dev_slot_depth);
+        let _ = gpu.free_tensor(self.dev_child_of_cand);
+        let _ = gpu.free_tensor(self.dev_big_n);
+        let _ = gpu.free_tensor(self.dev_node_tokens);
     }
 }
 
@@ -4501,11 +4562,23 @@ fn run_dflash_draft_for_topk_gpu(
     // genuine draft samples, which is what the q-exploiting SWOR verify needs to
     // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
     sample: Option<(f32, &mut u64)>,
+    // If true, keep the `[batch × vocab]` logits tensor alive and return it
+    // as the 3rd element even in the top-k (greedy) path (where it would
+    // otherwise be freed). Caller is responsible for freeing it. Used by
+    // HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1 shadow mode to feed the GPU build kernel.
+    keep_logits: bool,
+    // If true, SKIP the `topk_logsumexp` kernel + D2H entirely and return
+    // the raw logits tensor as the 3rd element (with empty top_tokens /
+    // top_log_probs vecs). The caller drives all top-K + tree-build on-GPU.
+    // Only valid when `sample` is None (greedy mode). In SWOR mode, the
+    // Gumbel-top-k is already GPU-resident; set `sample = Some(...)` instead.
+    gpu_build_only: bool,
 ) -> HipResult<(Vec<u32>, Vec<f32>, Option<GpuTensor>)> {
     // The 3rd return is the draft logits kept ON DEVICE (`[batch·vocab]`),
-    // populated only in `sample` mode — the fused GPU SWOR walk softmaxes them
-    // for its residual, so they must NOT be freed here. `None` on the top-k path;
-    // the SWOR caller frees the tensor after the walk.
+    // populated only in `sample` mode OR when `keep_logits=true`. The fused
+    // GPU SWOR walk softmaxes them for its residual, so they must NOT be freed
+    // here in sample mode. `None` on the top-k path unless keep_logits; the
+    // SWOR caller frees the tensor after the walk.
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
@@ -4730,6 +4803,14 @@ fn run_dflash_draft_for_topk_gpu(
         return Ok((top_tokens, top_log_probs, Some(logits_batch)));
     }
 
+    // GPU-build-only path: skip topk entirely, return raw logits on device.
+    // The GPU build kernel (`ddtree_build_and_linearize_f32`) drives all top-K
+    // extraction + tree construction on-device. Empty host top_tokens / log_probs.
+    if gpu_build_only {
+        debug_assert!(sample.is_none(), "gpu_build_only and sample are mutually exclusive");
+        return Ok((Vec::new(), Vec::new(), Some(logits_batch)));
+    }
+
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
     let topk_idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
     let topk_val_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
@@ -4741,10 +4822,18 @@ fn run_dflash_draft_for_topk_gpu(
         k,
         batch,
     );
-    let _ = gpu.free_tensor(logits_batch);
+    // Free logits_batch unless the caller requested keeping it alive
+    // (HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1 shadow mode).
+    let kept_logits = if keep_logits {
+        Some(logits_batch)
+    } else {
+        let _ = gpu.free_tensor(logits_batch);
+        None
+    };
     if let Err(e) = topk_result {
         let _ = gpu.free_tensor(topk_idx_gpu);
         let _ = gpu.free_tensor(topk_val_gpu);
+        if let Some(t) = kept_logits { let _ = gpu.free_tensor(t); }
         return Err(e);
     }
 
@@ -4761,7 +4850,7 @@ fn run_dflash_draft_for_topk_gpu(
     let _ = gpu.free_tensor(topk_val_gpu);
 
     let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
-    Ok((top_tokens, val_host, None))
+    Ok((top_tokens, val_host, kept_logits))
 }
 
 /// Enumerate all root-to-leaf paths in a DdTree. Returns paths as Vec<Vec<usize>>
@@ -5203,11 +5292,24 @@ pub fn spec_step_ddtree_batched(
     // GPU-resident scratch.target_hidden is already populated by the previous
     // cycle's D2D scatter (or the prefill scatter). The ctx_slice diagnostic
     // path (Some(n)) still uses the CPU host shadow.
+    //
+    // Stage 3b: HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1 runs BOTH host build and
+    // GPU build per cycle to validate byte-identity before switching production.
+    let verify_gpu_build =
+        std::env::var("HIPFIRE_DDTREE_VERIFY_TREE_BUILD").ok().as_deref() == Some("1");
+
     let th_host_arg: Option<&[f32]> = if ctx_slice.is_none() {
         None // GPU-resident: scratch.target_hidden populated via D2D scatter
     } else {
         Some(target_hidden_host.as_slice())
     };
+    // Stage 3b production: in greedy mode (temp=0), skip the host-side
+    // topk_logsumexp + D2H and let the GPU build kernel do all top-K work.
+    // SWOR mode already runs a GPU Gumbel-top-k and keeps logits on device,
+    // so the build kernel reads from `dev_top_tokens`/`dev_top_log_probs`
+    // written by the Gumbel kernel in that path.
+    let use_gpu_build = !use_swor && !verify_gpu_build;
+
     let (top_tokens, top_log_probs, draft_logits_dev) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
@@ -5225,29 +5327,184 @@ pub fn spec_step_ddtree_batched(
         } else {
             None
         },
+        // Keep logits alive in greedy/shadow mode to feed the GPU build kernel.
+        // In SWOR mode logits are already kept alive by the Gumbel path.
+        // In gpu_build_only mode, the fn returns raw logits (empty top_tokens).
+        verify_gpu_build && !use_swor,
+        // gpu_build_only: skip the topk + D2H steps; return raw logits for the
+        // GPU build kernel to consume. Only valid for greedy path; SWOR uses
+        // Gumbel instead which is already GPU-resident.
+        use_gpu_build,
     )?;
     // SWOR verify needs the draw-ordered candidates per position; `top_tokens` is
     // already in Gumbel-draw order (rank 0 = first drawn) in sample mode.
+    // In GPU-build mode (greedy), top_tokens is empty; SWOR candidates come
+    // from dev_top_tokens (populated by the build kernel below).
     let swor_pos_cands = top_tokens.clone();
 
     let t_draft = t_all.elapsed();
     let t_topk = t_draft; // fused with draft now
 
-    // ── 3. Build the DDTree ───────────────────────────────────────────────
-    // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner: stop
-    // heap expansion when the next candidate's cumulative log-probability
-    // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
-    // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
-        &top_tokens,
-        &top_log_probs,
-        b - 1,
-        tree_topk,
-        0, // min_nodes=0: pure-cutoff DDTree build
-        tree_budget,
-        gpu.flags.ddtree_logw_cutoff_value(),
-    );
-    record_ddtree_meta_nodes(tree.num_nodes());
+    // ── 3. Build/linearize the DDTree ────────────────────────────────────
+    //
+    // Production path (use_gpu_build=true, greedy): run the GPU build kernel.
+    //   - Reads device-resident draft logits from `draft_logits_dev`.
+    //   - Writes parent_indices, slot_depth, child_of_cand, attn_bias,
+    //     node_tokens, top_tokens, top_log_probs to device scratch.
+    //   - D2H only: big_n (4B) + node_tokens[0..big_n] (for verify_tokens)
+    //     + slot_depth[0..big_n] (for verify_positions).
+    //   - Skips host tree build, host linearize, and all H2D uploads.
+    //
+    // Fallback (verify_gpu_build or use_swor): existing host path (top-K D2H
+    //   + host tree build + host linearize + parent_indices H2D + mask kernel).
+    //   Shadow assert (verify_gpu_build) additionally runs the GPU build and
+    //   compares byte-for-byte before continuing on the host path.
+
+    // These are populated by whichever path runs:
+    let tree: hipfire_runtime::ddtree::DdTree; // host tree (fallback path)
+    let big_n: usize;
+    let verify_tokens: Vec<u32>;
+    let verify_positions: Vec<i32>;
+    let mask_host: Vec<f32>; // only used by shadow assert + ASSERT_MASK
+    let parent_host: Vec<i32>; // host parent_indices (needed by shadow assert + tree-LA h2d in fallback)
+
+    if use_gpu_build {
+        // ── 3b GPU path (greedy, production) ─────────────────────────────
+        // draft_logits_dev is Some(_) because gpu_build_only=true was passed.
+        let logits_dev = draft_logits_dev
+            .as_ref()
+            .expect("gpu_build_only ⇒ draft logits alive");
+
+        // Launch single-thread GPU build kernel.
+        gpu.ddtree_build_and_linearize_f32(
+            logits_dev,
+            &scratch.dev_top_tokens,
+            &scratch.dev_top_log_probs,
+            &scratch.attn_bias,
+            &scratch.parent_indices,
+            &scratch.dev_slot_depth,
+            &scratch.dev_child_of_cand,
+            &scratch.dev_big_n,
+            &scratch.dev_node_tokens,
+            vocab,
+            b - 1,
+            tree_topk,
+            tree_budget,
+            gpu.flags.ddtree_logw_cutoff_value(),
+        )?;
+
+        // D2H: big_n scalar (4 bytes — gates grid size of verify forward).
+        let mut big_n_raw = [0u8; 4];
+        gpu.hip.memcpy_dtoh(&mut big_n_raw, &scratch.dev_big_n.buf)?;
+        big_n = i32::from_ne_bytes(big_n_raw) as usize;
+        let num_nodes = big_n - 1;
+        record_ddtree_meta_nodes(num_nodes);
+
+        // D2H: node_tokens[0..big_n] (slot 0 = -1/unused; slots 1..=num_nodes = tree nodes).
+        // Needed to build verify_tokens host slice for the tree verify forward.
+        let mut node_toks_raw = vec![0u8; big_n * 4];
+        gpu.hip.memcpy_dtoh(&mut node_toks_raw, &scratch.dev_node_tokens.buf)?;
+        let node_toks: Vec<i32> = (0..big_n)
+            .map(|i| i32::from_ne_bytes(node_toks_raw[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+
+        // D2H: slot_depth[0..big_n] (needed to build verify_positions).
+        let mut sd_raw = vec![0u8; big_n * 4];
+        gpu.hip.memcpy_dtoh(&mut sd_raw, &scratch.dev_slot_depth.buf)?;
+        let slot_depths: Vec<i32> = (0..big_n)
+            .map(|i| i32::from_ne_bytes(sd_raw[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+
+        // Build verify_tokens: slot 0 = seed_token; slot i+1 = node_toks[i+1] as u32.
+        verify_tokens = std::iter::once(seed_token)
+            .chain(node_toks[1..big_n].iter().map(|&t| t as u32))
+            .collect();
+
+        // Build verify_positions: base_pos + slot_depth[i].
+        verify_positions = slot_depths.iter().map(|&d| position as i32 + d).collect();
+
+        // mask_host and parent_host: not needed in this path (mask is on-device,
+        // parent_indices are on-device). Set to empty vecs so the compiler is happy.
+        mask_host = Vec::new();
+        parent_host = Vec::new();
+
+        // Build a minimal DdTree stub — only `nodes` is needed for token extraction
+        // in steps 9+ (follow_verified_tree / committed/drafted seq building).
+        // We DON'T need child_maps for the greedy path (follow_verified_tree uses it
+        // for child lookup, but we bypass it below when use_gpu_build is true).
+        // Actually follow_verified_tree DOES need child_maps. We need to reconstruct
+        // the tree from the D2H'd data.
+        //
+        // Build host DdNode vec from D2H'd node_toks + slot_depths + parent_host.
+        // parent_indices are on-device but we also need them for follow_verified_tree.
+        // We must D2H parent_indices for the greedy follow step.
+        let mut parents_raw = vec![0u8; big_n * 4];
+        gpu.hip.memcpy_dtoh(&mut parents_raw, &scratch.parent_indices.buf)?;
+        let parents: Vec<i32> = (0..big_n)
+            .map(|i| i32::from_ne_bytes(parents_raw[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+
+        // Reconstruct DdTree from D2H'd data so follow_verified_tree works.
+        // node[i].parent_index = parents[i+1] == 0 → -1 (direct child of root)
+        //                        parents[i+1] > 0 → parents[i+1] - 1 (node index).
+        let mut nodes = Vec::with_capacity(num_nodes);
+        for i in 0..num_nodes {
+            let parent_slot = parents[i + 1];
+            let parent_index = if parent_slot <= 0 { -1i32 } else { parent_slot - 1 };
+            nodes.push(hipfire_runtime::ddtree::DdNode {
+                token: node_toks[i + 1] as u32,
+                depth: slot_depths[i + 1] as u32,
+                parent_index,
+                logw: 0.0, // not needed for greedy follow
+            });
+        }
+        // Rebuild child_maps for follow_verified_tree.
+        let mut child_maps: Vec<std::collections::HashMap<u32, usize>> =
+            (0..big_n).map(|_| std::collections::HashMap::new()).collect();
+        for (i, node) in nodes.iter().enumerate() {
+            let parent_slot = if node.parent_index < 0 {
+                0usize
+            } else {
+                node.parent_index as usize + 1
+            };
+            child_maps[parent_slot].insert(node.token, i);
+        }
+        // Build visibility (needed by follow_verified_tree path only if it uses it;
+        // actually follow_verified_tree only uses child_maps, not visibility).
+        // But DdTree requires visibility to be present (it's not Optional).
+        // Build it cheaply from the parent chain.
+        let mut visibility = vec![vec![false; big_n]; big_n];
+        visibility[0][0] = true;
+        for i in 1..big_n {
+            let p_slot = if parents[i] < 0 { 0usize } else { parents[i] as usize };
+            for j in 0..i { visibility[i][j] = visibility[p_slot][j]; }
+            visibility[i][i] = true;
+        }
+        tree = hipfire_runtime::ddtree::DdTree { nodes, visibility, child_maps };
+
+    } else {
+        // ── 3b Host path (SWOR or shadow-assert mode) ─────────────────────
+        // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner.
+        let built = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
+            &top_tokens,
+            &top_log_probs,
+            b - 1,
+            tree_topk,
+            0, // min_nodes=0: pure-cutoff DDTree build
+            tree_budget,
+            gpu.flags.ddtree_logw_cutoff_value(),
+        );
+        record_ddtree_meta_nodes(built.num_nodes());
+        big_n = 1 + built.num_nodes();
+        // Linearize for verify_tokens, verify_positions, mask_host, parent_host.
+        let (vt, vp, mh, ph) =
+            hipfire_runtime::ddtree::linearize_tree_with_parents(&built, seed_token, position as u32);
+        verify_tokens = vt;
+        verify_positions = vp;
+        mask_host = mh;
+        parent_host = ph;
+        tree = built;
+    };
 
     let t_build = t_all.elapsed();
 
@@ -5288,17 +5545,6 @@ pub fn spec_step_ddtree_batched(
         });
     }
 
-    // ── 4. Linearize the tree into (tokens, positions, mask_host, parents) ─
-    //
-    // mask_host is computed here for the HIPFIRE_DDTREE_ASSERT_MASK=1 dual-
-    // path check (byte-equality proof vs GPU build). In normal operation it
-    // is not uploaded — the GPU kernel (step 5) rebuilds it on-device.
-    let (verify_tokens, verify_positions, mask_host, parent_host) =
-        hipfire_runtime::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
-    let big_n = verify_tokens.len();
-    debug_assert_eq!(big_n, 1 + tree.num_nodes());
-    debug_assert_eq!(parent_host.len(), big_n);
-
     assert!(
         big_n <= scratch.max_n,
         "tree big_n {} exceeds scratch.max_n {} (increase DdtreeScratch size)",
@@ -5306,68 +5552,225 @@ pub fn spec_step_ddtree_batched(
         scratch.max_n,
     );
 
-    // ── 5. Upload parent_indices; build attn_bias mask on-GPU (Stage 3a) ─
+    // ── 4+5. Upload parent_indices + build attn_bias (fallback / SWOR path) ─
     //
-    // D5: parent_indices H2D (244 B, stays — needed for tree-aware LA and
-    // for the mask kernel itself).  D4 (attn_bias H2D, ~15 KB/cycle) is
-    // eliminated: instead of uploading mask_host we launch
-    // ddtree_build_attn_mask_f32 which walks the parent chain per-thread
-    // and writes scratch.attn_bias directly on-device.
-    //
-    // parent_indices is always uploaded (needed both by the mask kernel and,
-    // when ddtree_tree_la=true, by the tree-aware GDN kernels).
+    // In the GPU-build (greedy) path, parent_indices and attn_bias are already
+    // device-resident from the build kernel. In the fallback (SWOR / shadow)
+    // path, run Stage 3a: D5 H2D (parent_indices, 244B) + mask kernel.
     let use_tree_la = gpu.flags.ddtree_tree_la;
-    {
-        let parent_bytes = unsafe {
-            std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
-        };
-        gpu.hip
-            .memcpy_htod(&scratch.parent_indices.buf, parent_bytes)?;
+    if !use_gpu_build {
+        // D5: parent_indices H2D (SWOR / shadow-assert fallback path only).
+        if !parent_host.is_empty() {
+            let parent_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    parent_host.as_ptr() as *const u8,
+                    parent_host.len() * 4,
+                )
+            };
+            gpu.hip.memcpy_htod(&scratch.parent_indices.buf, parent_bytes)?;
+        }
+        // Stage 3a: build attn_bias on-GPU from parent_indices.
+        gpu.ddtree_build_attn_mask_f32(&scratch.parent_indices, &scratch.attn_bias, big_n)?;
+
+        // HIPFIRE_DDTREE_ASSERT_MASK=1: compare GPU mask vs host mask_host.
+        if std::env::var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1")
+            && !mask_host.is_empty()
+        {
+            gpu.hip.device_synchronize()?;
+            let n_floats = big_n * big_n;
+            let mut gpu_mask = vec![0.0f32; n_floats];
+            let gpu_mask_bytes = unsafe {
+                std::slice::from_raw_parts_mut(gpu_mask.as_mut_ptr() as *mut u8, n_floats * 4)
+            };
+            gpu.hip.memcpy_dtoh(gpu_mask_bytes, &scratch.attn_bias.buf)?;
+            assert_eq!(mask_host.len(), n_floats, "ASSERT_MASK: mask_host.len() mismatch");
+            for idx in 0..n_floats {
+                let h = mask_host[idx].to_bits();
+                let g = gpu_mask[idx].to_bits();
+                assert_eq!(
+                    h, g,
+                    "ASSERT_MASK: mismatch at flat index {idx} (row={}, col={}): host={:08x} gpu={:08x}",
+                    idx / big_n, idx % big_n, h, g,
+                );
+            }
+            eprintln!("[DDTREE_ASSERT_MASK] big_n={big_n} mask byte-identical ({n_floats} floats)");
+        }
     }
 
-    // Build attn_bias on GPU from the now-resident parent_indices. The sub-
-    // offset view is used by the FA kernel (step 7) to bound-check big_n²
-    // reads.  The kernel writes exactly big_n² floats at the head of
-    // scratch.attn_bias; tail is never read by the FA kernel.
-    gpu.ddtree_build_attn_mask_f32(&scratch.parent_indices, &scratch.attn_bias, big_n)?;
-
-    // ── 5b. Byte-equality assert (HIPFIRE_DDTREE_ASSERT_MASK=1) ──────────
+    // ── 5c. Stage 3b shadow assert (HIPFIRE_DDTREE_VERIFY_TREE_BUILD=1) ──
     //
-    // Dual-path proof: download the GPU mask and compare byte-for-byte with
-    // the host mask_host computed by linearize_tree_with_parents above.
-    // Off by default (costs one D2H per cycle).
-    if std::env::var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
-        // Synchronize so the kernel has finished writing before the D2H.
-        gpu.hip.device_synchronize()?;
-        let n_floats = big_n * big_n;
-        let mut gpu_mask = vec![0.0f32; n_floats];
-        let gpu_mask_bytes = unsafe {
-            std::slice::from_raw_parts_mut(gpu_mask.as_mut_ptr() as *mut u8, n_floats * 4)
-        };
-        gpu.hip
-            .memcpy_dtoh(gpu_mask_bytes, &scratch.attn_bias.buf)?;
-        // mask_host is big_n*big_n; gpu_mask is big_n*big_n.
-        assert_eq!(
-            mask_host.len(),
-            n_floats,
-            "ASSERT_MASK: mask_host.len() mismatch"
-        );
-        for idx in 0..n_floats {
-            let h = mask_host[idx].to_bits();
-            let g = gpu_mask[idx].to_bits();
+    // Run the GPU tree-build kernel with the same draft logits that produced
+    // `tree` (host path), then assert byte-identical:
+    //   - big_n
+    //   - parent_indices[0..big_n]
+    //   - slot_depth[0..big_n]
+    //   - node_tokens[0..big_n] (tokens per slot; slot 0 = -1/unused)
+    //   - child_of_cand[0..n_slots*topk]
+    //
+    // This catches any divergence between the GPU and host builds before it
+    // silently produces different trees and wrong accepted tokens.
+    // Off by default (one GPU launch + several D2Hs per cycle).
+    if verify_gpu_build {
+        // In verify_gpu_build mode: SWOR keeps logits for the walk; greedy
+        // was called with keep_logits=true so draft_logits_dev is also Some.
+        if let Some(logits_dev) = draft_logits_dev.as_ref() {
+            // Launch the GPU build kernel. It writes into scratch.*_gpu fields.
+            gpu.ddtree_build_and_linearize_f32(
+                logits_dev,
+                &scratch.dev_top_tokens,
+                &scratch.dev_top_log_probs,
+                // Kernel writes attn_bias into scratch.attn_bias — but we already
+                // used scratch.attn_bias (Step 5 / Stage 3a), so use a temporary
+                // slice of attn_bias that doesn't overlap the live data.
+                // SAFE: we only use the shadow assert in debug/verify mode; the
+                // production path (below step 5c) uses scratch.attn_bias after
+                // this block exits and the GPU kernel has completed.
+                // Re-use scratch.attn_bias: the kernel writes big_n² floats at
+                // offset 0, which is what Stage 3a already wrote. The assert then
+                // reads back and compares — both must match mask_host.
+                &scratch.attn_bias,
+                &scratch.parent_indices,
+                &scratch.dev_slot_depth,
+                &scratch.dev_child_of_cand,
+                &scratch.dev_big_n,
+                &scratch.dev_node_tokens,
+                vocab,
+                b - 1,
+                tree_topk,
+                tree_budget,
+                gpu.flags.ddtree_logw_cutoff_value(),
+            )?;
+            // Synchronize so all kernel writes are visible before D2H.
+            gpu.hip.device_synchronize()?;
+
+            // D2H: big_n scalar (4 bytes).
+            let mut gpu_big_n_raw = [0u8; 4];
+            gpu.hip.memcpy_dtoh(&mut gpu_big_n_raw, &scratch.dev_big_n.buf)?;
+            let gpu_big_n = i32::from_ne_bytes(gpu_big_n_raw) as usize;
             assert_eq!(
-                h, g,
-                "ASSERT_MASK: mismatch at flat index {idx} (row={}, col={}): host={:08x} gpu={:08x}",
-                idx / big_n,
-                idx % big_n,
-                h,
-                g,
+                big_n, gpu_big_n,
+                "VERIFY_TREE_BUILD: big_n mismatch: host={big_n} gpu={gpu_big_n}"
+            );
+
+            // D2H: parent_indices[0..big_n] (big_n × 4 bytes).
+            let mut gpu_parents = vec![0i32; big_n];
+            let gpu_parents_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    gpu_parents.as_mut_ptr() as *mut u8,
+                    big_n * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(gpu_parents_bytes, &scratch.parent_indices.buf)?;
+            for i in 0..big_n {
+                assert_eq!(
+                    parent_host[i], gpu_parents[i],
+                    "VERIFY_TREE_BUILD: parent_indices[{i}] mismatch: host={} gpu={}",
+                    parent_host[i], gpu_parents[i],
+                );
+            }
+
+            // D2H: slot_depth[0..big_n].
+            let mut gpu_slot_depth = vec![0i32; big_n];
+            let gpu_sd_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    gpu_slot_depth.as_mut_ptr() as *mut u8,
+                    big_n * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(gpu_sd_bytes, &scratch.dev_slot_depth.buf)?;
+            // host slot_depth: slot 0 = 0, slot i+1 = node[i].depth
+            for i in 0..big_n {
+                let host_depth = if i == 0 {
+                    0i32
+                } else {
+                    tree.nodes[i - 1].depth as i32
+                };
+                assert_eq!(
+                    host_depth, gpu_slot_depth[i],
+                    "VERIFY_TREE_BUILD: slot_depth[{i}] mismatch: host={host_depth} gpu={}",
+                    gpu_slot_depth[i],
+                );
+            }
+
+            // D2H: node_tokens[0..big_n].
+            let mut gpu_node_tokens = vec![0i32; big_n];
+            let gpu_nt_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    gpu_node_tokens.as_mut_ptr() as *mut u8,
+                    big_n * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(gpu_nt_bytes, &scratch.dev_node_tokens.buf)?;
+            // host: slot 0 token = seed_token (the kernel writes -1 at slot 0;
+            // caller fills seed. Don't compare slot 0 token — it's a sentinel.)
+            // Compare slots 1..big_n (tree nodes).
+            for i in 1..big_n {
+                let host_tok = tree.nodes[i - 1].token as i32;
+                assert_eq!(
+                    host_tok, gpu_node_tokens[i],
+                    "VERIFY_TREE_BUILD: node_tokens[{i}] mismatch: host={host_tok} gpu={}",
+                    gpu_node_tokens[i],
+                );
+            }
+
+            // D2H: child_of_cand[0..big_n * tree_topk].
+            let n_coc = big_n * tree_topk;
+            let mut gpu_coc = vec![0i32; n_coc];
+            let gpu_coc_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    gpu_coc.as_mut_ptr() as *mut u8,
+                    n_coc * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(gpu_coc_bytes, &scratch.dev_child_of_cand.buf)?;
+            // Reconstruct host child_of_cand the same way swor_walk_gpu does.
+            let n_slots_h = big_n;
+            let depth_h = b - 1;
+            for s in 0..n_slots_h {
+                let d = if s == 0 { 0usize } else { tree.nodes[s-1].depth as usize };
+                for r in 0..tree_topk {
+                    let host_coc = if d >= depth_h {
+                        -1i32
+                    } else {
+                        let tok = top_tokens[d * tree_topk + r];
+                        tree.child_maps[s].get(&tok).copied().map(|ci| ci as i32).unwrap_or(-1)
+                    };
+                    let gpu_coc_v = gpu_coc[s * tree_topk + r];
+                    assert_eq!(
+                        host_coc, gpu_coc_v,
+                        "VERIFY_TREE_BUILD: child_of_cand[slot={s},rank={r}] mismatch: host={host_coc} gpu={gpu_coc_v}",
+                    );
+                }
+            }
+
+            // Also re-check attn_bias (GPU kernel re-wrote it; verify same as mask_host).
+            let n_floats = big_n * big_n;
+            let mut gpu_mask_rebld = vec![0.0f32; n_floats];
+            let gm_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    gpu_mask_rebld.as_mut_ptr() as *mut u8,
+                    n_floats * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(gm_bytes, &scratch.attn_bias.buf)?;
+            for idx in 0..n_floats {
+                let h = mask_host[idx].to_bits();
+                let g = gpu_mask_rebld[idx].to_bits();
+                assert_eq!(
+                    h, g,
+                    "VERIFY_TREE_BUILD: attn_bias[{idx}] (row={}, col={}): host={:08x} gpu={:08x}",
+                    idx / big_n, idx % big_n, h, g,
+                );
+            }
+
+            eprintln!(
+                "[DDTREE_VERIFY_TREE_BUILD] cycle OK: big_n={big_n} parent_indices + slot_depth + node_tokens + child_of_cand + attn_bias byte-identical"
+            );
+        } else {
+            eprintln!(
+                "[DDTREE_VERIFY_TREE_BUILD] WARNING: no device logits available (use_swor={use_swor}); skipping GPU build assert this cycle"
             );
         }
-        eprintln!(
-            "[DDTREE_ASSERT_MASK] big_n={big_n} mask byte-identical ({} floats)",
-            n_floats
-        );
     }
 
     // ── 6. Snapshot pre-seed target state ─────────────────────────────────
