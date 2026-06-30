@@ -242,7 +242,7 @@ fn gemv_auto_batched_wmma(
 // ── public API ───────────────────────────────────────────────────────────────
 
 /// Run the DSpark head pipeline over a completed `x_head` block:
-/// 1. lm-head GEMV: `rmsnorm(x_head, output_norm)` → optional FWHT → batched
+/// 1. lm-head GEMV: `rmsnorm(x_head, stage_norm)` → optional FWHT → batched
 ///    `lm_head` GEMV → `logits[block, vocab]` (resident on GPU).
 /// 2. Sequential markov sampling loop: for each slot `i`, look up
 ///    `markov_w1[prev_token]`, (optionally) compute the on-GPU confidence
@@ -254,13 +254,15 @@ fn gemv_auto_batched_wmma(
 ///    downstream truncation).
 ///
 /// `x_head` is `[block, hidden]` F32 produced by [`DsparkBody::draft_block`].
-/// `output_norm` is the trunk lm-head norm weight (passed through, not used
-/// for the stage norm — see comments inline). `lm_head` is `[vocab, hidden]`.
+/// `stage_norm` is the per-stage final RMSNorm weight applied to `x_head`
+/// before the lm-head GEMV. Callers supply the arch-specific norm: deepseek4
+/// passes `mtp_final_norm`; qwen3 passes its drafter `norm` tensor.
+/// `lm_head` is `[vocab, hidden]`.
 /// `prev_token` is the last committed token before this draft window.
 pub fn run_heads(
     gpu: &mut Gpu,
     weights: &DsparkWeights,
-    output_norm: &GpuTensor,
+    stage_norm: &GpuTensor,
     lm_head: &GpuTensor,
     x_head: &GpuTensor, // [block, hidden]
     prev_token: u32,
@@ -268,6 +270,12 @@ pub fn run_heads(
     vocab: usize,
 ) -> Result<DraftResult, String> {
     let cfg = &weights.cfg;
+
+    // Guard: confidence head requires confidence_proj to be present.
+    if cfg.enable_confidence && weights.confidence_proj.is_none() {
+        return Err("run_heads: enable_confidence=true but confidence_proj missing".to_string());
+    }
+
     let markov_rank = cfg.markov_rank;
 
     let markov_w1 = weights
@@ -285,12 +293,10 @@ pub fn run_heads(
         return Err("run_heads: x_head has zero hidden dim".to_string());
     }
 
-    // ── lm-head GEMV: rmsnorm(x_head) → [optional FWHT] → batched GEMV ──
+    // ── lm-head GEMV: rmsnorm(x_head, stage_norm) → [optional FWHT] → batched GEMV ──
     //
-    // `output_norm` is the trunk norm weight; deepseek4 applies the per-stage
-    // `mtp_final_norm` before reaching here (inside `draft_block`), so we feed
-    // `x_head` through `output_norm` here for architectures that supply it
-    // as the final lm-head norm.
+    // `stage_norm` is the per-stage final norm supplied by the caller
+    // (deepseek4: `mtp_final_norm`; qwen3: drafter `norm`).
     let normed = gpu
         .alloc_tensor(&[block, hidden], DType::F32)
         .map_err(|e| format!("run_heads alloc normed: {e:?}"))?;
@@ -298,7 +304,7 @@ pub fn run_heads(
     // should extend DsparkConfig. For now 1e-6 is compatible with both
     // DeepSeek V4 and Qwen3.
     let rms_norm_eps = 1e-6f32;
-    gpu.rmsnorm_batched(x_head, output_norm, &normed, block, hidden, rms_norm_eps)
+    gpu.rmsnorm_batched(x_head, stage_norm, &normed, block, hidden, rms_norm_eps)
         .map_err(|e| format!("run_heads final rmsnorm: {e:?}"))?;
 
     let normed_rot = if weight_needs_fwht(lm_head) {
