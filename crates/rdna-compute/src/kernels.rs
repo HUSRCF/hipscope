@@ -3377,6 +3377,21 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
+/// C8 Kernel 0: batched categorical sampler (one block per row).
+/// Takes probs[batch*vocab] already softmax'd, tau_cut[batch], z[batch] from
+/// softmax_temp_topp_batched_f32; outputs tokens[batch] (i32) and
+/// prob_at_token[batch] (f32).  D2H: batch*8 bytes instead of batch*vocab*4.
+pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
+    include_str!("../../../kernels/src/batched_categorical_sample.hip");
+
+/// C8 Kernel 1: on-GPU chain rejection-sampling accept.
+/// Fused accept loop for the chain spec-decode temp>0 path.  Takes
+/// tgt_probs[b*vocab], dft_probs[b*vocab], draft_tokens[b], draft_p_at_token[b],
+/// tau/z arrays for both sides, rng_seed, cactus_delta; outputs
+/// {accept_len, bonus_token, rejected_at, new_rng} in a 16-byte int[4].
+pub const CHAIN_ACCEPT_SPEC_SRC: &str =
+    include_str!("../../../kernels/src/chain_accept_spec.hip");
+
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");

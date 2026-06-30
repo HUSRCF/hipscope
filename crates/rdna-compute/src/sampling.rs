@@ -878,4 +878,176 @@ impl Gpu {
             },
         )
     }
+
+    /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.
+    ///
+    /// For each of `batch` rows in `probs[batch * vocab]`, applies the
+    /// top-p truncation `(p >= tau_cut[r]) ? p / z[r] : 0`, draws one
+    /// categorical sample (LCG seeded per-row from `seed ^ row | 1`), and
+    /// writes the sampled token id and its effective probability.
+    ///
+    /// D2H after this call: `batch * 8 bytes` (token + prob per row),
+    /// replacing the `batch * vocab * 4` download that the FAST_SAMPLE path
+    /// previously required.
+    ///
+    /// `probs` is left unmodified — it is also consumed by
+    /// `chain_accept_spec_f32` as the draft prob buffer.
+    ///
+    /// `tau_cut` and `z` come from `softmax_temp_topp_batched_into_f32`.
+    /// Pass zero-filled buffers (tau=0, z=1) when top-p is disabled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_categorical_sample_f32(
+        &mut self,
+        probs: &GpuTensor,      // [batch * vocab] f32 — softmax output
+        tau_cut: &GpuTensor,    // [batch] f32 — top-p threshold per row
+        z: &GpuTensor,          // [batch] f32 — kept mass per row
+        out_tokens: &GpuTensor, // [batch] i32 — sampled token ids
+        out_probs: &GpuTensor,  // [batch] f32 — prob at sampled token
+        vocab: usize,
+        batch: usize,
+        seed: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "batched_categorical_sample",
+            kernels::BATCHED_CATEGORICAL_SAMPLE_SRC,
+            "batched_categorical_sample_f32",
+        )?;
+
+        let pp = probs.buf.as_ptr();
+        let tp = tau_cut.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let vs = vocab as i32;
+        let mut sd = seed;
+        let ot = out_tokens.buf.as_ptr();
+        let op = out_probs.buf.as_ptr();
+
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &mut sd as *mut _ as *mut c_void,
+            &ot as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+        ];
+
+        // One block per row; 256 threads per block.
+        self.launch_maybe_blob(
+            "batched_categorical_sample_f32",
+            [batch as u32, 1, 1],
+            [256, 1, 1],
+            256 * 4 * 2, // s_red[256] + s_total_mass + s_pick + s_pick_prob ≈ 2 KB
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(zp);
+                b.push_i32(vs);
+                b.push_u32(sd);
+                b.push_ptr(ot);
+                b.push_ptr(op);
+                b
+            },
+        )
+    }
+
+    /// C8 Kernel 1: on-GPU chain rejection-sampling accept loop.
+    ///
+    /// Runs the entire spec-decode accept chain (Chen & Leviathan 2023,
+    /// Algorithm 1) on-device over `b` speculated positions.  Replaces the
+    /// host loop in `speculative.rs` that required two ~9 MB D2H transfers.
+    ///
+    /// `tgt_probs` must have `(b + 1) * vocab` elements: rows 0..b are the
+    /// target probs for the drafted positions; row `b` is used for the bonus
+    /// draw when all b positions are accepted.
+    ///
+    /// `dft_probs` must have `b * vocab` elements (draft side only).
+    ///
+    /// Returns the 16-byte output buffer contents as `[accept_len, bonus_token,
+    /// rejected_at, new_rng_state]` (all i32/u32 words).  The caller reads the
+    /// first three as i32 and the last as u32 for RNG bookkeeping.
+    ///
+    /// `cactus_delta = 0.0` disables the CACTUS boost (plain rejection sampling).
+    #[allow(clippy::too_many_arguments)]
+    pub fn chain_accept_spec_f32(
+        &mut self,
+        tgt_probs: &GpuTensor,        // [(b+1) * vocab] f32
+        dft_probs: &GpuTensor,        // [b * vocab] f32
+        draft_tokens: &GpuTensor,     // [b] i32
+        draft_p_at_token: &GpuTensor, // [b] f32
+        tau_t: &GpuTensor,            // [(b+1)] f32 — target topp tau per row
+        z_t: &GpuTensor,              // [(b+1)] f32 — target topp Z per row
+        tau_d: &GpuTensor,            // [b] f32 — draft topp tau per row
+        z_d: &GpuTensor,              // [b] f32 — draft topp Z per row
+        out: &GpuTensor,              // [4] i32 output buffer
+        b: usize,
+        vocab: usize,
+        rng_seed: u32,
+        cactus_delta: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chain_accept_spec",
+            kernels::CHAIN_ACCEPT_SPEC_SRC,
+            "chain_accept_spec_f32",
+        )?;
+
+        let tgt_p = tgt_probs.buf.as_ptr();
+        let dft_p = dft_probs.buf.as_ptr();
+        let dtok = draft_tokens.buf.as_ptr();
+        let dpat = draft_p_at_token.buf.as_ptr();
+        let tt = tau_t.buf.as_ptr();
+        let zt = z_t.buf.as_ptr();
+        let td = tau_d.buf.as_ptr();
+        let zd = z_d.buf.as_ptr();
+        let outp = out.buf.as_ptr();
+        let bv = b as i32;
+        let vs = vocab as i32;
+        let mut sd = rng_seed;
+        let mut cd = cactus_delta;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &tgt_p as *const _ as *mut c_void,
+            &dft_p as *const _ as *mut c_void,
+            &dtok as *const _ as *mut c_void,
+            &dpat as *const _ as *mut c_void,
+            &tt as *const _ as *mut c_void,
+            &zt as *const _ as *mut c_void,
+            &td as *const _ as *mut c_void,
+            &zd as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &mut sd as *mut _ as *mut c_void,
+            &mut cd as *mut _ as *mut c_void,
+            &outp as *const _ as *mut c_void,
+        ];
+
+        // Single block of 256 threads — the accept chain is sequential.
+        self.launch_maybe_blob(
+            "chain_accept_spec_f32",
+            [1, 1, 1],
+            [256, 1, 1],
+            256 * 4 + 32, // s_red[256] + small shared scalars ≈ 1056 bytes
+            &mut params,
+            || {
+                let mut bl = hip_bridge::KernargBlob::new();
+                bl.push_ptr(tgt_p);
+                bl.push_ptr(dft_p);
+                bl.push_ptr(dtok);
+                bl.push_ptr(dpat);
+                bl.push_ptr(tt);
+                bl.push_ptr(zt);
+                bl.push_ptr(td);
+                bl.push_ptr(zd);
+                bl.push_i32(bv);
+                bl.push_i32(vs);
+                bl.push_u32(sd);
+                bl.push_f32(cd);
+                bl.push_ptr(outp);
+                bl
+            },
+        )
+    }
 }
