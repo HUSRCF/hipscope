@@ -461,15 +461,19 @@ impl Speculator for GenericDflashSpeculator {
         let mut block: Vec<u32> = vec![self.config.mask_token_id; b];
         block[0] = seed;
 
-        // ── 2. Build the block-diffusion draft INPUT (review finding H1) ────
-        // noise_embedding: the target's mask-token embedding row, broadcast across
-        // all `b` masked block positions (b×hidden f32). The qwen35 path writes the
-        // per-slot embedding directly into draft_scratch.x via D2D; we go through
-        // the host (one embed_row lookup) and let draft_forward upload it.
+        // ── 2. Build the block-diffusion draft INPUT ────────────────────────
+        // noise_embedding mirrors the z-lab reference `embed_tokens([seed, MASK,
+        // …, MASK])` (dflash.py:235-237): position 0 carries the COMMITTED seed
+        // token's embedding (it anchors the bidirectional block — every drafted
+        // slot attends to it), positions 1..b are the mask-token embedding.
+        // Broadcasting MASK to slot 0 too (the old behavior) stripped the anchor
+        // and collapsed the drafts into degenerate repetition → low acceptance.
         let mask_row = target.embed_row(gpu, self.config.mask_token_id)?;
+        let seed_row = target.embed_row(gpu, seed)?;
         debug_assert_eq!(mask_row.len(), h, "embed_row length != hidden");
         let mut noise_embedding: Vec<f32> = Vec::with_capacity(b * h);
-        for _ in 0..b {
+        noise_embedding.extend_from_slice(&seed_row);
+        for _ in 1..b {
             noise_embedding.extend_from_slice(&mask_row);
         }
 
