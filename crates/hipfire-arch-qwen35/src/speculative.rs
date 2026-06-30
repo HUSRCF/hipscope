@@ -3091,6 +3091,15 @@ pub fn spec_step_dflash(
         draft_ffn_graph_env.as_deref(),
     );
 
+    // C8: device tensors kept alive from draft-sample through verify-accept.
+    // Only populated when fast_sample_active AND the batched GEMM path runs.
+    // Otherwise stays None and the host accept loop falls back to draft_softmaxes.
+    let mut c8_draft_probs_dev: Option<GpuTensor> = None;
+    let mut c8_draft_tau_dev: Option<GpuTensor> = None;
+    let mut c8_draft_z_dev: Option<GpuTensor> = None;
+    let mut c8_draft_tokens_dev: Option<GpuTensor> = None;
+    let mut c8_draft_p_at_token_dev: Option<GpuTensor> = None;
+
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
@@ -3345,24 +3354,19 @@ pub fn spec_step_dflash(
             }
 
             if use_temp_sampling && fast_sample_active {
-                // FAST_SAMPLE: GPU softmax → download probs (same D2H size as
-                // logits). Host RNG/sample math is byte-for-byte the same calls
-                // as the default arm below — only the softmax `exp` work moved
-                // off-host. Distribution-parity, not byte-parity (see flag doc).
-                let probs_gpu = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-                // top_p nucleus: when active, the GPU kernel additionally emits
-                // per-row tau_cut/Z so the host can apply the SAME nucleus cut as
-                // the target side (parity + acceptance efficiency). When
-                // inactive, fall back to the plain softmax (tau_cut/Z absent →
-                // truncation identity).
-                let (host_tau, host_z) = if topp_active {
-                    let tau_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    let z_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                // C8 GPU-sample path: softmax stays device-resident; only
+                // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
+                // draft_probs_dev is kept alive in c8_draft_probs_dev until
+                // chain_accept_spec_f32 consumes it after verify.
+                let probs_dev = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+                let (tau_dev, z_dev) = if topp_active {
+                    let tau_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
                     gpu.softmax_temp_topp_batched_into_f32(
                         &logits_batch,
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
+                        &probs_dev,
+                        &tau_d,
+                        &z_d,
                         vocab,
                         batch,
                         temp,
@@ -3370,36 +3374,67 @@ pub fn spec_step_dflash(
                         top_k,
                         0.0, // min_p: DFlash min_p parity is the follow-up; off here
                     )?;
-                    let tau = gpu.download_f32(&tau_gpu)?;
-                    let z = gpu.download_f32(&z_gpu)?;
-                    let _ = gpu.free_tensor(tau_gpu);
-                    let _ = gpu.free_tensor(z_gpu);
-                    (Some(tau), Some(z))
+                    (tau_d, z_d)
                 } else {
                     gpu.softmax_temp_batched_into_f32(
                         &logits_batch,
-                        &probs_gpu,
+                        &probs_dev,
                         vocab,
                         batch,
                         temp,
                     )?;
-                    (None, None)
+                    // topp inactive: kernel expects tau=0 (no truncation) and z=1
+                    // (inv_z=1 → eff_prob returns p unchanged). Use zeros() for tau
+                    // (0.0 bit-pattern = 0x00000000) and fill_f32 for z.
+                    let tau_d = gpu.zeros(&[batch], rdna_compute::DType::F32)?;
+                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    gpu.fill_f32(&z_d, 1.0f32)?;
+                    (tau_d, z_d)
                 };
-                let host_probs = gpu.download_f32(&probs_gpu)?;
-                let _ = gpu.free_tensor(probs_gpu);
-                debug_assert_eq!(host_probs.len(), batch * vocab);
-                draft_softmaxes.reserve(batch);
-                for i in 0..batch {
-                    let mut probs = host_probs[i * vocab..(i + 1) * vocab].to_vec();
-                    if let (Some(tau), Some(z)) = (&host_tau, &host_z) {
-                        apply_topp_trunc(&mut probs, tau[i], z[i]);
-                    }
-                    let u = xorshift_next_unit(rng_state);
-                    let t = sample_categorical(&probs, u);
-                    draft_probs_at_drafted.push(probs[t as usize]);
-                    drafted.push(t);
-                    draft_softmaxes.push(probs);
+                // GPU categorical sample per row: writes draft_tokens + draft_p_at_token.
+                let tok_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?; // i32 via f32 slot
+                let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+                gpu.batched_categorical_sample_f32(
+                    &probs_dev,
+                    &tau_dev,
+                    &z_dev,
+                    &tok_dev,
+                    &pat_dev,
+                    vocab,
+                    batch,
+                    seed_u32,
+                )?;
+                // Download only tokens + probs: batch×8 bytes total.
+                let mut raw_tok = vec![0i32; batch];
+                {
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            raw_tok.as_mut_ptr() as *mut u8,
+                            batch * 4,
+                        )
+                    };
+                    gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
+                let raw_pat = gpu.download_f32(&pat_dev)?;
+                // Keep pat_dev alive on device for chain_accept_spec_f32.
+                for i in 0..batch {
+                    drafted.push(raw_tok[i] as u32);
+                    draft_probs_at_drafted.push(raw_pat[i]);
+                }
+                // Advance host rng_state by batch steps to maintain entropy across
+                // cycles (GPU uses its own LCG; host state must change per cycle).
+                for _ in 0..batch {
+                    xorshift_next_unit(rng_state);
+                }
+                // Stash device tensors for chain_accept_spec_f32 in verify step.
+                c8_draft_probs_dev = Some(probs_dev);
+                c8_draft_tau_dev = Some(tau_dev);
+                c8_draft_z_dev = Some(z_dev);
+                c8_draft_tokens_dev = Some(tok_dev);
+                c8_draft_p_at_token_dev = Some(pat_dev);
+                // draft_probs_at_drafted populated above; draft_softmaxes NOT
+                // populated (not needed when GPU accept kernel runs).
             } else if use_temp_sampling {
                 // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
                 let host_logits = gpu.download_f32(&logits_batch)?;
@@ -3612,146 +3647,215 @@ pub fn spec_step_dflash(
     let mut accept_len = 0usize;
     let bonus_token;
     if use_temp_sampling {
-        debug_assert_eq!(draft_softmaxes.len(), b - 1);
-        // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
-        // all B rows and download the probs. The accept loop below then reads
-        // `target_probs` from this buffer instead of calling the host
-        // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
-        // distribution-parity probs. The verify logits are still resident in
-        // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
-        // and only ran GPU-argmax afterwards, which does not overwrite it).
-        // On the fast path, GPU per-row target softmax (+ optional nucleus
-        // tau_cut/Z when topp_active) for all b rows.
-        let mut fast_tgt_tau: Option<Vec<f32>> = None;
-        let mut fast_tgt_z: Option<Vec<f32>> = None;
-        let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+        // When the GPU sampling path ran on the draft side AND we have the
+        // required device tensors, run chain_accept_spec_f32 for the full
+        // accept loop (C8b: eliminates the ~9 MB target probs D2H + host loop).
+        // Otherwise fall through to the host loop (PLD, fallback per-row path).
+        let gpu_accept = fast_sample_active
+            && c8_draft_probs_dev.is_some()
+            && c8_draft_tokens_dev.is_some()
+            && c8_draft_p_at_token_dev.is_some();
+
+        if gpu_accept {
+            // ── C8 GPU accept path ──────────────────────────────────────────
+            // verify_scratch.logits[0..b*vocab] contains the target logits for
+            // all b positions (b = draft_batch + 1; last row = bonus position).
+            // Softmax them into tgt_probs_dev (kept device-resident).
             let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-            let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-            if topp_active {
-                let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            let tgt_probs_dev = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+            let (tau_t_dev, z_t_dev) = if topp_active {
+                let tau_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
                 gpu.softmax_temp_topp_batched_into_f32(
                     &logits_batch,
-                    &probs_gpu,
-                    &tau_gpu,
-                    &z_gpu,
+                    &tgt_probs_dev,
+                    &tau_t,
+                    &z_t,
                     vocab,
                     b,
                     temp,
                     top_p,
                     top_k,
-                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                    0.0,
                 )?;
-                fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
-                fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
-                let _ = gpu.free_tensor(tau_gpu);
-                let _ = gpu.free_tensor(z_gpu);
+                (tau_t, z_t)
             } else {
-                gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
-            }
-            let host = gpu.download_f32(&probs_gpu)?;
-            let _ = gpu.free_tensor(probs_gpu);
-            debug_assert_eq!(host.len(), b * vocab);
-            Some(host)
-        } else {
-            // Non-fast path: the host full-vocab logits from verify are the
-            // softmax input. Bound here so the fast path never touches the
-            // (now-empty) `logits_per_pos`.
-            debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
-            None
-        };
-        let tgt_logits = &verify_out.logits_per_pos;
-        let mut target_probs = Vec::with_capacity(vocab);
-        let mut rejected_bonus: Option<u32> = None;
-        // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
-        // Leviathan acceptance ratio by a KL-bounded bump √(2δ·q·(1−q)),
-        // trading controlled divergence from the verifier for higher τ.
-        // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
-        let use_cactus = cactus_delta > 0.0;
-        for i in 0..b - 1 {
-            if let Some(fast) = &fast_tgt_probs {
-                target_probs.clear();
-                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                // top_p nucleus, IDENTICAL cut to the draft side (GPU tau/Z).
-                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                }
-            } else {
-                softmax_temp_into(
-                    &tgt_logits[i * vocab..(i + 1) * vocab],
-                    temp,
-                    &mut target_probs,
-                );
-                // Non-fast temp arm: host nucleus so top_p holds here too.
-                if topp_active {
-                    apply_host_nucleus(&mut target_probs, top_p);
-                }
-            }
-            let t = block[i + 1] as usize;
-            let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
-            let p_t = target_probs[t];
-            // Bumped acceptance probability: γ* = min(p_t + √(2·δ·p_t·(1−p_t)), 1).
-            // When δ==0 → γ* = p_t (standard Leviathan & Chen 2023).
-            let accept_prob = if use_cactus {
-                let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
-                (p_t + bump).min(1.0)
-            } else {
-                p_t
+                gpu.softmax_temp_batched_into_f32(&logits_batch, &tgt_probs_dev, vocab, b, temp)?;
+                let tau_t = gpu.zeros(&[b], rdna_compute::DType::F32)?;
+                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                gpu.fill_f32(&z_t, 1.0f32)?;
+                (tau_t, z_t)
             };
-            let u = xorshift_next_unit(rng_state);
-            if u * p_d <= accept_prob {
-                accept_len += 1;
+
+            let dft_probs_dev = c8_draft_probs_dev.as_ref().unwrap();
+            let dft_tok_dev = c8_draft_tokens_dev.as_ref().unwrap();
+            let dft_pat_dev = c8_draft_p_at_token_dev.as_ref().unwrap();
+            let tau_d_dev = c8_draft_tau_dev.as_ref().unwrap();
+            let z_d_dev = c8_draft_z_dev.as_ref().unwrap();
+
+            let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?; // 4×i32 via f32 slot
+            // kernel's b parameter = number of draft comparison positions = b-1
+            let draft_b = b - 1;
+            let rng_seed = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+            gpu.chain_accept_spec_f32(
+                &tgt_probs_dev,
+                dft_probs_dev,
+                dft_tok_dev,
+                dft_pat_dev,
+                &tau_t_dev,
+                &z_t_dev,
+                tau_d_dev,
+                z_d_dev,
+                &out_dev,
+                draft_b,
+                vocab,
+                rng_seed,
+                cactus_delta,
+            )?;
+
+            // Download 16 bytes: {accept_len, bonus_token, rejected_at, new_rng}
+            let mut out_raw = [0i32; 4];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &out_dev.buf)?;
+            }
+            accept_len = out_raw[0] as usize;
+            bonus_token = out_raw[1] as u32;
+            // Advance host rng_state once so future cycles seed differently.
+            // GPU consumed its own LCG draws; host state just needs to change.
+            xorshift_next_unit(rng_state);
+
+            let _ = gpu.free_tensor(out_dev);
+            let _ = gpu.free_tensor(tgt_probs_dev);
+            let _ = gpu.free_tensor(tau_t_dev);
+            let _ = gpu.free_tensor(z_t_dev);
+        } else {
+            // ── Host accept path (PLD / fallback per-row) ──────────────────
+            debug_assert_eq!(draft_softmaxes.len(), b - 1);
+            // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
+            // all B rows and download the probs. The accept loop below then reads
+            // `target_probs` from this buffer instead of calling the host
+            // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+            // distribution-parity probs. The verify logits are still resident in
+            // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
+            // and only ran GPU-argmax afterwards, which does not overwrite it).
+            let mut fast_tgt_tau: Option<Vec<f32>> = None;
+            let mut fast_tgt_z: Option<Vec<f32>> = None;
+            let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+                let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+                let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+                if topp_active {
+                    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                    gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        vocab,
+                        b,
+                        temp,
+                        top_p,
+                        top_k,
+                        0.0,
+                    )?;
+                    fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
+                    fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
+                    let _ = gpu.free_tensor(tau_gpu);
+                    let _ = gpu.free_tensor(z_gpu);
+                } else {
+                    gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
+                }
+                let host = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                debug_assert_eq!(host.len(), b * vocab);
+                Some(host)
             } else {
-                // Rejected — sample bonus from the CACTUS-revised target h
-                // (§2.3, Theorem 2), not raw q. h is built in-place over
-                // target_probs (loop breaks right after, so no reuse):
-                //   h(t)   = γ*
-                //   h(i≠t) = (1−γ*)/(1−q(t)) · q(i)
-                if use_cactus {
-                    let qn = p_t.clamp(0.0, 1.0);
-                    let gamma_star = accept_prob;
-                    if qn >= 1.0 - 1e-6 {
-                        // Degenerate: q is (near) one-hot on t; h is one-hot on t too.
-                        for v in target_probs.iter_mut() {
-                            *v = 0.0;
-                        }
-                        target_probs[t] = 1.0;
-                    } else {
-                        let scale = (1.0 - gamma_star) / (1.0 - qn);
-                        for (j, v) in target_probs.iter_mut().enumerate() {
-                            *v = if j == t { gamma_star } else { scale * *v };
-                        }
+                debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
+                None
+            };
+            let tgt_logits = &verify_out.logits_per_pos;
+            let mut target_probs = Vec::with_capacity(vocab);
+            let mut rejected_bonus: Option<u32> = None;
+            // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5).
+            let use_cactus = cactus_delta > 0.0;
+            for i in 0..b - 1 {
+                if let Some(fast) = &fast_tgt_probs {
+                    target_probs.clear();
+                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                    }
+                } else {
+                    softmax_temp_into(
+                        &tgt_logits[i * vocab..(i + 1) * vocab],
+                        temp,
+                        &mut target_probs,
+                    );
+                    if topp_active {
+                        apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
-                let u2 = xorshift_next_unit(rng_state);
-                rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
-                break;
-            }
-        }
-        bonus_token = if let Some(b) = rejected_bonus {
-            b
-        } else {
-            // All accepted: sample from target_softmax at position B-1.
-            let i = b - 1;
-            if let Some(fast) = &fast_tgt_probs {
-                target_probs.clear();
-                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                let t = block[i + 1] as usize;
+                let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
+                let p_t = target_probs[t];
+                let accept_prob = if use_cactus {
+                    let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
+                    (p_t + bump).min(1.0)
+                } else {
+                    p_t
+                };
+                let u = xorshift_next_unit(rng_state);
+                if u * p_d <= accept_prob {
+                    accept_len += 1;
+                } else {
+                    if use_cactus {
+                        let qn = p_t.clamp(0.0, 1.0);
+                        let gamma_star = accept_prob;
+                        if qn >= 1.0 - 1e-6 {
+                            for v in target_probs.iter_mut() {
+                                *v = 0.0;
+                            }
+                            target_probs[t] = 1.0;
+                        } else {
+                            let scale = (1.0 - gamma_star) / (1.0 - qn);
+                            for (j, v) in target_probs.iter_mut().enumerate() {
+                                *v = if j == t { gamma_star } else { scale * *v };
+                            }
+                        }
+                    }
+                    let u2 = xorshift_next_unit(rng_state);
+                    rejected_bonus =
+                        Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
+                    break;
                 }
+            }
+            bonus_token = if let Some(b) = rejected_bonus {
+                b
             } else {
-                softmax_temp_into(
-                    &tgt_logits[i * vocab..(i + 1) * vocab],
-                    temp,
-                    &mut target_probs,
-                );
-                if topp_active {
-                    apply_host_nucleus(&mut target_probs, top_p);
+                let i = b - 1;
+                if let Some(fast) = &fast_tgt_probs {
+                    target_probs.clear();
+                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                    }
+                } else {
+                    softmax_temp_into(
+                        &tgt_logits[i * vocab..(i + 1) * vocab],
+                        temp,
+                        &mut target_probs,
+                    );
+                    if topp_active {
+                        apply_host_nucleus(&mut target_probs, top_p);
+                    }
                 }
-            }
-            let u = xorshift_next_unit(rng_state);
-            sample_categorical(&target_probs, u)
-        };
+                let u = xorshift_next_unit(rng_state);
+                sample_categorical(&target_probs, u)
+            };
+        }
     } else {
         // Greedy path. If RP or n-gram-block is active, re-derive argmax per
         // row after applying penalties to the full target logits (requires
@@ -3826,6 +3930,13 @@ pub fn spec_step_dflash(
             );
         }
     }
+
+    // Free C8 device tensors now that accept is resolved.
+    if let Some(t) = c8_draft_probs_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_tau_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_z_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_tokens_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_p_at_token_dev { let _ = gpu.free_tensor(t); }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
     // Three position-based proxies for the next cycle's `seed_token`
