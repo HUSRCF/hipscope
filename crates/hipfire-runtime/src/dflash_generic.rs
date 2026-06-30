@@ -27,11 +27,13 @@
 //!   5. greedy-accept the longest matching prefix + bonus, append ONLY the
 //!      committed-prefix hidden to `target_hidden_host`, and advance.
 //!
-//! **The DDTree tree-SWOR arm is the SHIPPED DEFAULT** — it works out of the
-//! box and is the strictly-more-capable verify (higher τ, distribution-exact at
-//! any temperature, lossless == AR at temp 0). Opt out with
-//! `HIPFIRE_DFLASH_TREE=0` to fall back to the greedy chain path, which is also
-//! lossless at temp 0 and distribution-exact at temp>0 (naive sampling).
+//! **Linear chain is the SHIPPED DEFAULT.** The DDTree tree-SWOR arm raises τ
+//! (acceptance) but costs more per cycle, and net loses to chain on every
+//! drafter measured (DeltaNet + non-DeltaNet qwen3-8b/Bielik) — the DFlash
+//! drafter emits independent per-position marginals, so a tree branch has no
+//! joint to exploit. Opt IN to the tree with the CLI `--ddtree` flag (sets
+//! `HIPFIRE_DFLASH_TREE=1`). Both arms are lossless at temp 0 and
+//! distribution-exact at temp>0 (chain via naive sampling, tree via SWOR).
 //!
 //! The chain (linear) verify supports BOTH greedy (temp≈0) and a
 //! distribution-EXACT temp>0 path: SpecInfer NAIVE sampling (draw `x ~
@@ -40,7 +42,7 @@
 //! So [`supports_temp_verify`](Speculator::supports_temp_verify) is `true` for the
 //! chain.
 //!
-//! The tree arm (default; `HIPFIRE_DFLASH_TREE=0` to disable) verifies the WHOLE bounded
+//! The tree arm (opt-in; `--ddtree` / `HIPFIRE_DFLASH_TREE=1`) verifies the WHOLE bounded
 //! DDTree in ONE tree-masked target forward ([`SpecTarget::verify_tree_logits`])
 //! and walks the per-node logits with the q-exploiting without-replacement
 //! speculative sampler ([`crate::ddtree::sample_verified_tree_swor`]). This is
@@ -136,7 +138,7 @@ pub struct GenericDflashSpeculator {
     verify_scratch: Option<Box<dyn SpecScratch>>,
     block_size: usize,
     ctx_capacity: usize,
-    /// Tree-verify policy (default on; `HIPFIRE_DFLASH_TREE=0` to disable). When
+    /// Tree-verify policy (default OFF; opt in via `--ddtree` / `HIPFIRE_DFLASH_TREE=1`). When
     /// `enabled` is false the `step` takes the original single-path chain verify.
     tree: TreeMode,
     /// Xorshift64* RNG state for the temp>0 chain naive sampler. Bit-compatible
@@ -529,7 +531,7 @@ impl Speculator for GenericDflashSpeculator {
             block[i + 1] = d;
         }
 
-        // ── Tree-verify arm (default; HIPFIRE_DFLASH_TREE=0 to disable) ─────
+        // ── Tree-verify arm (opt-in; --ddtree / HIPFIRE_DFLASH_TREE=1) ─────
         // Build a bounded DDTree from the per-position draft marginals and verify
         // the WHOLE tree in ONE tree-masked forward (`verify_tree_logits`), then
         // walk it with the distribution-exact SWOR sampler. temp 0 → greedy

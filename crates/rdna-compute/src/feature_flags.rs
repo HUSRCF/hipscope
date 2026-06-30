@@ -110,10 +110,12 @@ pub struct FeatureFlags {
     pub force_unfused: bool,
 
     // ── Speculative decode (DFlash/DDTree) ────────────────────────
-    /// DDTree tree-SWOR verify arm. **Default ON** — it works out of the box;
-    /// opt out with `HIPFIRE_DFLASH_TREE=0` to fall back to the chain path
-    /// (the only other execution path). Tree-SWOR is distribution-exact at any
-    /// temperature and lossless (== AR) at temp 0, so default-on is safe.
+    /// DDTree tree-SWOR verify arm. **Default OFF** — linear chain wins on
+    /// every drafter measured (the DFlash drafter's independent per-position
+    /// marginals give a tree branch no joint to exploit). Opt in with the CLI
+    /// `--ddtree` flag (sets `HIPFIRE_DFLASH_TREE=1`). Tree-SWOR is still
+    /// distribution-exact at any temperature and lossless (== AR) at temp 0 —
+    /// it's just slower than chain — so the opt-in path stays correct.
     pub dflash_tree: bool,
     /// Override DDTree node budget (`HIPFIRE_DDTREE_BUDGET`). `None` → use the
     /// per-call-site default (`DEFAULT_TREE_BUDGET = 8`).
@@ -302,8 +304,13 @@ impl FeatureFlags {
                 .map(|v| v == "1")
                 .unwrap_or(false),
 
-            // Speculative decode (DFlash/DDTree)
-            dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() != Ok("0"),
+            // Speculative decode (DFlash/DDTree). DEFAULT OFF (chain): ddtree
+            // tree-verify loses to linear chain on every drafter measured
+            // (DeltaNet + non-DeltaNet qwen3-8b/Bielik) because the DFlash
+            // drafter emits independent per-position marginals — a tree branch
+            // has no joint to exploit. Opt in with the CLI `--ddtree` flag (sets
+            // HIPFIRE_DFLASH_TREE=1).
+            dflash_tree: std::env::var("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1"),
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
             // D8: ddtree_verify_naive removed; HIPFIRE_DDTREE_VERIFY env is no-op.

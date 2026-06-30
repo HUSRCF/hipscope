@@ -7521,6 +7521,17 @@ if (cmd === "help" && rest.length > 0 && !rest[0].startsWith("-")) {
   rest = ["--help"];
 }
 
+// `--ddtree`: opt into DDTree tree-verify speculation. The default is linear
+// chain DFlash — tree-verify raises acceptance (τ) but costs more per cycle and
+// net-loses to chain on every drafter measured (the DFlash drafter's
+// independent per-position marginals give a tree branch no joint to exploit).
+// Global flag: strip it here and set the env that every spawned daemon inherits
+// (engine reads HIPFIRE_DFLASH_TREE; budget/topk keep their defaults of 8/2
+// unless HIPFIRE_DDTREE_BUDGET/_TOPK are set).
+if (takeFlag(rest, "--ddtree")) {
+  process.env.HIPFIRE_DFLASH_TREE = "1";
+}
+
 try {
 switch (cmd) {
   case "serve": {
