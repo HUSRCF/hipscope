@@ -9345,10 +9345,16 @@ pub fn dspark_forward(
 /// arch-agnostic `dspark_core::DsparkDrafter` calls `draft_block` to get
 /// `x_head` and then passes it to `dspark_core::run_heads` for the rest.
 ///
-/// Contract: `state.dspark_main_x` must already hold the `main_proj_ingest`
-/// output for this step (set by the caller before this function runs). The
-/// `state.dspark_pbs` and `state.dspark_swa_k` are lazily allocated here
-/// (same as `dspark_forward`).
+/// **Stage 3 multi-slot main_kv population:**
+/// `main_x_batch` is `[ctx_len * hidden]` F32 — the output of
+/// `main_proj_ingest_batched` applied to the accepted-prefix multi-slot context.
+/// For each of the `ctx_len` context slots at `ctx_positions[j]`, step 5 now
+/// calls `dspark_stage_main_kv_to_ring` at the slot's absolute position, filling
+/// the ring with all `ctx_len` context entries instead of just the single
+/// bootstrap seed. With `ctx_len=1` this is identical to the prior single-slot
+/// contract (backward-compatible).
+///
+/// `state.dspark_pbs` and `state.dspark_swa_k` are lazily allocated here.
 #[allow(clippy::too_many_arguments)]
 pub fn dspark_run_body_and_hc_gate(
     cfg: &DeepseekV4Config,
@@ -9356,6 +9362,8 @@ pub fn dspark_run_body_and_hc_gate(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     token_embd: &GpuTensor,
+    main_x_batch: &GpuTensor, // [ctx_len * hidden] F32 — multi-slot main_proj output
+    ctx_positions: &[usize],  // absolute positions for each context slot; len = ctx_len
     prev_token: u32,
     position: u32,
     block: usize,
@@ -9472,13 +9480,22 @@ pub fn dspark_run_body_and_hc_gate(
             apply_tail_rope_batched(cfg, layer, pbs, gpu, s, block)?;
         }
         {
-            let main_x = state
-                .dspark_main_x
-                .as_ref()
-                .ok_or("dspark_run_body_and_hc_gate: dspark_main_x missing")?
-                .shallow_clone();
+            // Stage 3 multi-slot: write one ring entry per context slot.
+            // For ctx_len=1 this is identical to the prior single-slot write.
+            let hidden = cfg.hidden_size;
             let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
-            dspark_stage_main_kv_to_ring(cfg, layer, gpu, &main_x, &ring, s, position)?;
+            for (j, &ctx_pos) in ctx_positions.iter().enumerate() {
+                let mx_row = main_x_batch.sub_offset(j * hidden, hidden);
+                dspark_stage_main_kv_to_ring(
+                    cfg,
+                    layer,
+                    gpu,
+                    &mx_row,
+                    &ring,
+                    s,
+                    ctx_pos as u32,
+                )?;
+            }
         }
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();

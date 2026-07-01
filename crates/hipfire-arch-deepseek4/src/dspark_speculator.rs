@@ -5,7 +5,7 @@
 //! deepseek4 3-stage MoE/MLA chain into the arch-agnostic
 //! [`hipfire_runtime::dspark_core::DsparkDrafter`].
 //!
-//! ## Role in the refactor (Task 5)
+//! ## Stage 3: multi-slot accepted-prefix context (faithful rework)
 //!
 //! The generic `DsparkDrafter` in `dspark_core` drives drafting through
 //! the `DsparkBody` trait and verifies through the `SpecTarget` trait.
@@ -14,9 +14,11 @@
 //! - `Deepseek4DsparkBody` — holds a body-local `DeepseekV4State` (only the
 //!   dspark-specific fields are populated) plus shallow-cloned stage weights
 //!   and `token_embd`. Its `draft_block` calls:
-//!   1. `dspark_core::main_proj_ingest` → `draft_state.dspark_main_x` (part A).
-//!   2. `forward::dspark_run_body_and_hc_gate` → `x_head_out[block, hidden]`
-//!      (parts B + C.begin).
+//!   1. `dspark_core::main_proj_ingest_batched` — projects all `ctx_len` context
+//!      slots through `main_proj` + `main_norm` → `main_x_batch [ctx_len * hidden]`.
+//!   2. `forward::dspark_run_body_and_hc_gate` — for each context slot writes
+//!      `main_kv` into the SWA ring at its absolute position, then runs the
+//!      3-stage chain → `x_head_out[block, hidden]` (B+C.begin).
 //!   The markov + confidence + lm-head (part C.rest) run inside
 //!   `dspark_core::run_heads` after `draft_block` returns.
 //!
@@ -26,21 +28,20 @@
 //! - `build_deepseek4_dspark_speculator` — convenience wrapper that builds
 //!   `dspark_core::DsparkWeights` + calls `build_dspark_speculator`.
 //!
-//! ## Byte-identical guarantee
+//! ## Faithfulness vs Task-5 byte-identity
 //!
-//! The verify + bootstrap paths run through `Deepseek4Bundle`'s `SpecTarget`
-//! impl (`spec_impl.rs`), which calls the SAME `forward_prefill_batch_chunk`
-//! + `final_norm_and_argmax_all_batched` + `dspark_assemble_main_hidden` the
-//! old inline `Deepseek4DsparkDrafter` used. `dspark_run_body_and_hc_gate`
-//! calls the same stage kernels as `dspark_forward` body B+C.begin.
-//! `main_proj_ingest` in `dspark_core` mirrors `dspark_forward` part A exactly.
-//! No kernel path changes — this is a pure code move.
+//! Stage 3 intentionally changes the numeric output: the context source for
+//! `dspark_run_body_and_hc_gate` is now the accepted-prefix hidden (multi-slot,
+//! populated from `verify_block`'s `dspark_caps` download) instead of the
+//! single-slot bootstrap-captured seed. This matches the DeepSpec reference
+//! `_update` exactly. The Task-5 byte-identity no longer applies; correctness
+//! is validated by coherence gate (6/6 OK) and acceptance-rate improvement.
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward;
 use hipfire_runtime::dspark_core::{
-    build_dspark_speculator, main_proj_ingest, DsparkBody, DsparkConfig as CoreDsparkConfig,
-    DsparkWeights as CoreDsparkWeights,
+    build_dspark_speculator, main_proj_ingest, main_proj_ingest_batched, DsparkBody,
+    DsparkConfig as CoreDsparkConfig, DsparkWeights as CoreDsparkWeights,
 };
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -51,13 +52,15 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// `DeepseekV4State` (only the dspark-specific fields are used) and
 /// shallow-clones of the sidecar stage weights + trunk `token_embd`.
 ///
-/// `draft_block` runs:
-/// 1. `main_proj_ingest` → `draft_state.dspark_main_x[hidden]` (part A).
-/// 2. `dspark_run_body_and_hc_gate` → `x_head_out[block, hidden]` (B+C.begin).
+/// `draft_block` runs (Stage 3):
+/// 1. `main_proj_ingest_batched` → `main_x_batch [ctx_len * hidden]` (part A,
+///    multi-slot: all accepted-prefix context slots projected at once).
+/// 2. `dspark_run_body_and_hc_gate` → `x_head_out[block, hidden]` (B+C.begin,
+///    multi-slot ring writes: one `main_kv` ring entry per context slot).
 ///
 /// All weight tensors are **shallow clones** — the bundle keeps ownership and
 /// must outlive the body. `free` releases only the draft-local state buffers
-/// (`dspark_pbs`, `dspark_main_x`, `dspark_swa_k`).
+/// (`dspark_pbs`, `dspark_swa_k`).
 pub struct Deepseek4DsparkBody {
     config: DeepseekV4Config,
     /// Shallow-cloned sidecar stages. The bundle's `weights.dspark.stages`
@@ -75,31 +78,29 @@ impl DsparkBody for Deepseek4DsparkBody {
         &mut self,
         gpu: &mut Gpu,
         weights: &CoreDsparkWeights,
-        main_hidden: &GpuTensor, // [ctx_len * n_targets * hidden] — deepseek4 uses ctx_len=1
-        ctx_positions: &[usize], // absolute positions; len = ctx_len (deepseek4 ignores >1 slots)
+        main_hidden: &GpuTensor, // [ctx_len * n_targets * hidden] flat
+        ctx_positions: &[usize], // absolute positions; len = ctx_len
         seed: u32,
         position: usize,
         block: usize,
         x_head_out: &GpuTensor, // [block, hidden] out
     ) -> Result<(), String> {
-        let _ = ctx_positions; // deepseek4 Stage 3 will use this; for now always ctx_len=1
         let hidden = self.config.hidden_size;
+        let ctx_len = ctx_positions.len().max(1);
 
-        // ── Part A: main_proj_ingest ──────────────────────────────────────
-        // Lazily allocate draft_state.dspark_main_x[hidden].
-        if self.draft_state.dspark_main_x.is_none() {
-            self.draft_state.dspark_main_x = Some(
-                gpu.alloc_tensor(&[hidden], DType::F32)
-                    .map_err(|e| format!("Deepseek4DsparkBody: alloc main_x: {e:?}"))?,
-            );
+        // ── Part A: main_proj_ingest (multi-slot, Stage 3) ───────────────
+        // Produce main_x_batch [ctx_len * hidden] F32 by projecting all ctx_len
+        // context slots through main_proj + main_norm in one batched call.
+        // For ctx_len=1 this is identical to the prior single-slot path
+        // (main_proj_ingest and main_proj_ingest_batched produce the same result).
+        let main_x_batch = gpu
+            .alloc_tensor(&[ctx_len * hidden], DType::F32)
+            .map_err(|e| format!("Deepseek4DsparkBody: alloc main_x_batch: {e:?}"))?;
+        if ctx_len == 1 {
+            main_proj_ingest(gpu, weights, main_hidden, &main_x_batch)?;
+        } else {
+            main_proj_ingest_batched(gpu, weights, main_hidden, &main_x_batch, ctx_len, hidden)?;
         }
-        let main_x_out = self
-            .draft_state
-            .dspark_main_x
-            .as_ref()
-            .unwrap()
-            .shallow_clone();
-        main_proj_ingest(gpu, weights, main_hidden, &main_x_out)?;
 
         // ── Parts B + C.begin: 3-stage chain + HC gate ────────────────────
         // Build a temporary shallow-clone DsparkWeights (deepseek4 type) for
@@ -130,12 +131,15 @@ impl DsparkBody for Deepseek4DsparkBody {
             &mut self.draft_state,
             gpu,
             &self.token_embd,
+            &main_x_batch,
+            ctx_positions,
             seed,
             position as u32,
             block,
             x_head_out,
         )?;
 
+        let _ = gpu.free_tensor(main_x_batch);
         // ds4_weights contains shallow-cloned GpuTensors; dropping them is fine
         // (no GPU free, the bundle owns the buffers).
 

@@ -1037,14 +1037,11 @@ impl MtpDrafter for DsparkDrafter {
         let n_verify = verify_tokens.len(); // seed + n_proposed drafts
 
         let mut scratch = target.new_spec_scratch(gpu, n_verify)?;
-        // Capture hidden for context update — only when n_verify >= 4 (the
-        // batched-forward threshold in llama_spec::verify_block_argmax).  Below
-        // that threshold the batched path is ineligible and hidden capture would
-        // panic.  When we can't capture here we fall back to `capture_seed_main_hidden`
-        // after accept (ctx_len=1 bootstrap for the next window — same as Stage 1).
-        // With block_size=7 the common case (n_proposed ≥ 3) always captures;
-        // only low-confidence-truncated windows (n_proposed=1..2) use the fallback.
-        let capture_eligible = n_verify >= 4;
+        // Always pass `hidden_out = Some` and let each arch's `verify_block` impl
+        // decide whether to populate it (arch-specific minimum-batch constraints).
+        // For deepseek4, every batch size is eligible; for llama/qwen3, the batched
+        // path requires n_verify >= 4 — that impl leaves hidden_capture empty for
+        // smaller batches, and the context-update check below handles that gracefully.
         let mut hidden_capture: Vec<f32> = Vec::new();
         let t_verify = self.profiler.sync_start(gpu);
         let target_pick = target.verify_block(
@@ -1052,11 +1049,7 @@ impl MtpDrafter for DsparkDrafter {
             &verify_tokens,
             position,
             scratch.as_mut(),
-            if capture_eligible {
-                Some(&mut hidden_capture)
-            } else {
-                None
-            },
+            Some(&mut hidden_capture),
         )?;
         self.profiler.sync_end(gpu, t_verify, 3);
 

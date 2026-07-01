@@ -211,11 +211,11 @@ fn verify_block_logits_or_argmax(
 
     // DFlash hidden capture only flows through the batched path; the per-token
     // fallback below does not run the capturing per-layer loop.
-    assert!(
-        eligible || capture.is_none(),
-        "verify_block: hidden capture requested but block is ineligible \
-         for the batched path (n={n}, kv_ok={kv_ok}, weights_ok={weights_ok})"
-    );
+    // When the block is too small for the batched path (n < MIN_BATCH), silently
+    // skip the capture by clearing the capture sink — the caller checks whether
+    // hidden_out is non-empty, so an empty result is the correct "not captured"
+    // signal and does not break correctness.
+    let capture = if !eligible { None } else { capture };
 
     if eligible {
         // Single batched forward (n <= pbs.max_batch ⇒ one chunk) populates
