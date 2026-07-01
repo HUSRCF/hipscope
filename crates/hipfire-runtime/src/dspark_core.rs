@@ -7,6 +7,109 @@ use crate::spec::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+// ── Per-window phase profiler (HIPFIRE_DSPARK_PROFILE=1) ─────────────────────
+// Gated behind an env var; zero overhead when disabled.
+#[derive(Default)]
+struct DsparkProfiler {
+    enabled: bool,
+    windows: u64,
+    bootstrap_ms: f64,
+    draft_ms: f64,
+    heads_ms: f64,
+    verify_ms: f64,
+    rest_ms: f64,
+}
+
+impl DsparkProfiler {
+    fn new() -> Self {
+        let enabled = std::env::var("HIPFIRE_DSPARK_PROFILE")
+            .map(|s| s == "1")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Sync GPU and start a phase timer. Returns `Instant::now()` (always, even
+    /// when disabled, to avoid branching at the call site — the cost is one
+    /// `Instant::now()` per phase when profiling is off, which is nanoseconds).
+    fn sync_start(&self, gpu: &mut Gpu) -> std::time::Instant {
+        if self.enabled {
+            let _ = gpu.hip.device_synchronize();
+        }
+        std::time::Instant::now()
+    }
+
+    /// Sync GPU, accumulate elapsed ms into the given bucket.
+    fn sync_end(&mut self, gpu: &mut Gpu, t: std::time::Instant, bucket: u8) {
+        if !self.enabled {
+            return;
+        }
+        let _ = gpu.hip.device_synchronize();
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        match bucket {
+            0 => self.bootstrap_ms += ms,
+            1 => self.draft_ms += ms,
+            2 => self.heads_ms += ms,
+            3 => self.verify_ms += ms,
+            _ => self.rest_ms += ms,
+        }
+    }
+
+    fn end_window(&mut self) {
+        if self.enabled {
+            self.windows += 1;
+        }
+    }
+
+    fn print_summary(&self) {
+        if !self.enabled || self.windows == 0 {
+            return;
+        }
+        let total =
+            self.bootstrap_ms + self.draft_ms + self.heads_ms + self.verify_ms + self.rest_ms;
+        let pct = |x: f64| if total > 0.0 { x / total * 100.0 } else { 0.0 };
+        let mean = |x: f64| x / self.windows as f64;
+        eprintln!("=== HIPFIRE_DSPARK_PROFILE ({} windows) ===", self.windows);
+        eprintln!(
+            "  bootstrap (capture_seed_main_hidden): {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            self.bootstrap_ms,
+            pct(self.bootstrap_ms),
+            mean(self.bootstrap_ms)
+        );
+        eprintln!(
+            "  draft_block:                          {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            self.draft_ms,
+            pct(self.draft_ms),
+            mean(self.draft_ms)
+        );
+        eprintln!(
+            "  run_heads:                            {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            self.heads_ms,
+            pct(self.heads_ms),
+            mean(self.heads_ms)
+        );
+        eprintln!(
+            "  verify_block:                         {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            self.verify_ms,
+            pct(self.verify_ms),
+            mean(self.verify_ms)
+        );
+        eprintln!(
+            "  rest (accept+commit+etc):             {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            self.rest_ms,
+            pct(self.rest_ms),
+            mean(self.rest_ms)
+        );
+        eprintln!(
+            "  total window time: {:.2} ms  mean={:.2}ms/window",
+            total,
+            mean(total)
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DsparkConfig {
     pub block_size: usize,
@@ -655,6 +758,8 @@ pub struct DsparkDrafter {
     /// Absolute position of the seed whose main_hidden is cached in
     /// `main_hidden_dev`. `None` ⇒ cache invalid.
     main_hidden_pos: Option<usize>,
+    /// Per-window phase profiler; active only when `HIPFIRE_DSPARK_PROFILE=1`.
+    profiler: DsparkProfiler,
 }
 
 impl MtpDrafter for DsparkDrafter {
@@ -724,6 +829,7 @@ impl MtpDrafter for DsparkDrafter {
         // The seed is a fresh token; materialise its captured main_hidden with a
         // single 1-token capture-armed trunk forward (guard skips when already
         // in sync — never today but makes the contract explicit).
+        let t_bootstrap = self.profiler.sync_start(gpu);
         if self.main_hidden_pos != Some(position) {
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
             let dev = upload_f32(gpu, &hidden_host)?;
@@ -733,6 +839,7 @@ impl MtpDrafter for DsparkDrafter {
             self.main_hidden_dev = Some(dev);
             self.main_hidden_pos = Some(position);
         }
+        self.profiler.sync_end(gpu, t_bootstrap, 0);
 
         let main_hidden = self
             .main_hidden_dev
@@ -743,6 +850,7 @@ impl MtpDrafter for DsparkDrafter {
         let x_head_out = gpu
             .alloc_tensor(&[block, hidden], DType::F32)
             .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+        let t_draft = self.profiler.sync_start(gpu);
         self.body.draft_block(
             gpu,
             &self.weights,
@@ -752,8 +860,10 @@ impl MtpDrafter for DsparkDrafter {
             block,
             &x_head_out,
         )?;
+        self.profiler.sync_end(gpu, t_draft, 1);
 
         // ── 3. Heads: markov argmax + confidence ────────────────────────────
+        let t_heads = self.profiler.sync_start(gpu);
         let draft = run_heads(
             gpu,
             &self.weights,
@@ -764,6 +874,7 @@ impl MtpDrafter for DsparkDrafter {
             block,
             vocab,
         )?;
+        self.profiler.sync_end(gpu, t_heads, 2);
         let _ = gpu.free_tensor(x_head_out);
 
         let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
@@ -821,10 +932,13 @@ impl MtpDrafter for DsparkDrafter {
         let mut scratch = target.new_spec_scratch(gpu, verify_tokens.len())?;
         // hidden_out=None: we don't need the hidden states for the generic verify
         // (the next window's bootstrap re-captures via capture_seed_main_hidden).
+        let t_verify = self.profiler.sync_start(gpu);
         let target_pick =
             target.verify_block(gpu, &verify_tokens, position, scratch.as_mut(), None)?;
+        self.profiler.sync_end(gpu, t_verify, 3);
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
+        let t_rest = self.profiler.sync_start(gpu);
         let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
         let committed = acc.committed;
         let n_accepted = acc.accepted;
@@ -837,10 +951,12 @@ impl MtpDrafter for DsparkDrafter {
         let accept_len = n_accepted; // accepted drafts; bonus is at accept_len
         target.commit_prefix(gpu, &verify_tokens, accept_len, position, scratch.as_mut())?;
         scratch.free(gpu);
+        self.profiler.sync_end(gpu, t_rest, 4);
 
         // Invalidate the cached main_hidden — the next seed (the bonus) is a
         // fresh token whose hidden will be captured by the next window's bootstrap.
         self.main_hidden_pos = None;
+        self.profiler.end_window();
 
         Ok(MtpWindow {
             committed,
@@ -855,6 +971,7 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
+        self.profiler.print_summary();
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
@@ -897,5 +1014,6 @@ pub fn build_dspark_speculator(
         ctx_capacity,
         main_hidden_dev: None,
         main_hidden_pos: None,
+        profiler: DsparkProfiler::new(),
     }))
 }
