@@ -852,10 +852,13 @@ impl Carrier for Deepseek4Carrier {
             eprintln!("  deepseek4 DSpark speculator enabled (sidecar, block={block})");
             Some(
                 hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator(
+                    &config,
+                    &weights,
                     block,
                     ctx_capacity,
                     ctx.spec.dspark_conf_threshold,
-                ),
+                )
+                .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )
         } else if weights.mtp_layer.is_some() {
             // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →

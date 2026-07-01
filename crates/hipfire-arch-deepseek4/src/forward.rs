@@ -9337,6 +9337,242 @@ pub fn dspark_forward(
     )
 }
 
+/// DSpark body-only forward: runs body B (3-stage MoE/SWA chain) + body C.begin
+/// (HC-gate reduction) from [`dspark_forward`], writing `x_head[block, hidden]`
+/// into `x_head_out` WITHOUT running the markov/confidence/lm-head (part C.rest).
+///
+/// Called by `Deepseek4DsparkBody::draft_block` in `dspark_speculator.rs`: the
+/// arch-agnostic `dspark_core::DsparkDrafter` calls `draft_block` to get
+/// `x_head` and then passes it to `dspark_core::run_heads` for the rest.
+///
+/// Contract: `state.dspark_main_x` must already hold the `main_proj_ingest`
+/// output for this step (set by the caller before this function runs). The
+/// `state.dspark_pbs` and `state.dspark_swa_k` are lazily allocated here
+/// (same as `dspark_forward`).
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_run_body_and_hc_gate(
+    cfg: &DeepseekV4Config,
+    dspark: &crate::deepseek4::DsparkWeights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_embd: &GpuTensor,
+    prev_token: u32,
+    position: u32,
+    block: usize,
+    x_head_out: &GpuTensor, // [block, hidden] F32 output
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_kv = cfg.num_key_value_heads;
+    let n_groups = cfg.o_groups;
+    let win = cfg.sliding_window;
+    let n_stages = dspark.stages.len();
+    if n_stages == 0 {
+        return Err("dspark_run_body_and_hc_gate: no stages loaded".to_string());
+    }
+    let kv_dim = n_kv * head_dim;
+
+    let n_committed = (position as usize + 1).min(win);
+    let stage_w = win + block;
+    if n_committed + block > 1024 {
+        return Err(format!(
+            "dspark_run_body_and_hc_gate: n_valid {} exceeds kernel MAX_WINDOW 1024",
+            n_committed + block
+        ));
+    }
+
+    // Ensure async stream.
+    if gpu.active_stream.is_none() {
+        let s = gpu
+            .hip
+            .stream_create()
+            .map_err(|e| format!("dspark body stream_create: {e:?}"))?;
+        gpu.active_stream = Some(s);
+    }
+
+    // Block scratch — allocate once, reuse across decode steps.
+    if state.dspark_pbs.is_none() {
+        state.dspark_pbs = Some(PrefillBatchScratch::new(gpu, cfg, block.max(8))?);
+    }
+    // Per-stage main_kv rings — lazy.
+    if state.dspark_swa_k.len() != n_stages {
+        state.dspark_swa_k = (0..n_stages).map(|_| None).collect();
+    }
+    for s in 0..n_stages {
+        if state.dspark_swa_k[s].is_none() {
+            state.dspark_swa_k[s] = Some(
+                gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                    .map_err(|e| format!("dspark body alloc ring[{s}]: {e:?}"))?,
+            );
+        }
+    }
+
+    // Build block token ids and embed.
+    let mut block_ids = vec![dspark.cfg.noise_token_id; block];
+    block_ids[0] = prev_token;
+    {
+        let pbs = state.dspark_pbs.as_ref().unwrap();
+        let tok_host: Vec<i32> = block_ids.iter().map(|&t| t as i32).collect();
+        let tok_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tok_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.tokens.buf, tok_bytes)
+            .map_err(|e| format!("dspark body htod block tokens: {e:?}"))?;
+        gpu.embedding_lookup_q8_batched(token_embd, &pbs.embed_batch, &pbs.tokens, block, hidden)
+            .map_err(|e| format!("dspark body embedding_lookup_q8_batched: {e:?}"))?;
+        gpu.hc_streams_init_from_embed_batched(
+            &pbs.embed_batch,
+            &pbs.streams_batch,
+            hidden as i32,
+            hc_mult as i32,
+            block as i32,
+        )
+        .map_err(|e| format!("dspark body hc_streams_init: {e:?}"))?;
+        let pos_host: Vec<i32> = (0..block).map(|i| position as i32 + 1 + i as i32).collect();
+        let pos_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.positions.buf, pos_bytes)
+            .map_err(|e| format!("dspark body htod block positions: {e:?}"))?;
+        let nv_host: Vec<i32> = vec![(n_committed + block) as i32; block];
+        let nv_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(nv_host.as_ptr() as *const u8, block * 4) };
+        gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, nv_bytes)
+            .map_err(|e| format!("dspark body htod n_valid: {e:?}"))?;
+    }
+
+    // Per-call staging buffer.
+    let staged = gpu
+        .alloc_tensor(&[block, head_dim, stage_w], DType::F32)
+        .map_err(|e| format!("dspark body alloc staged: {e:?}"))?;
+
+    // ── B. 3-stage chain (identical to dspark_forward body B) ──────────────
+    for s in 0..n_stages {
+        let layer = &dspark.stages[s];
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            mhc_pre_batched(cfg, layer, pbs, gpu, s, true, block)?;
+        }
+        {
+            let hc_x_in = state
+                .dspark_pbs
+                .as_ref()
+                .unwrap()
+                .hc_x_in_batch
+                .shallow_clone();
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            q_lora_batched(cfg, layer, pbs, &hc_x_in, gpu, s, block)?;
+        }
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            kv_joint_batched(cfg, layer, pbs, gpu, s, block)?;
+        }
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            apply_tail_rope_batched(cfg, layer, pbs, gpu, s, block)?;
+        }
+        {
+            let main_x = state
+                .dspark_main_x
+                .as_ref()
+                .ok_or("dspark_run_body_and_hc_gate: dspark_main_x missing")?
+                .shallow_clone();
+            let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
+            dspark_stage_main_kv_to_ring(cfg, layer, gpu, &main_x, &ring, s, position)?;
+        }
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
+            let block_kv = pbs.kv_batch.sub_offset(0, block * kv_dim);
+            gpu.dspark_stage_kv(
+                &ring,
+                &block_kv,
+                &staged,
+                win,
+                kv_dim,
+                head_dim,
+                n_committed,
+                block,
+                stage_w,
+            )
+            .map_err(|e| format!("dspark body stage_kv[{s}]: {e:?}"))?;
+        }
+        {
+            let attn_sink = layer
+                .attn_sink
+                .as_ref()
+                .ok_or_else(|| format!("dspark body stage {s} attn_sink missing"))?;
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            gpu.deepseek4_attn_swa_batched(
+                &pbs.q_batch,
+                &staged,
+                &staged,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                n_groups as i32,
+                stage_w as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark body attn[{s}]: {e:?}"))?;
+        }
+        dspark_wo_project(cfg, layer, state, gpu, s, block)?;
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            hc_attn_mix_batched(cfg, pbs, gpu, block)?;
+        }
+        {
+            let pbs = state.dspark_pbs.as_ref().unwrap();
+            mhc_pre_batched(cfg, layer, pbs, gpu, s, false, block)?;
+            ffn_batched(cfg, layer, pbs, gpu, s, false, block, &[])?;
+            hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
+        }
+    }
+    let _ = gpu.free_tensor(staged);
+
+    // ── C.begin: HC-gate reduction → x_head_out[block, hidden] ───────────
+    let last = &dspark.stages[n_stages - 1];
+    let hc_head_fn = last
+        .mtp_hc_head_fn
+        .as_ref()
+        .ok_or("dspark body: mtp_hc_head_fn missing on last stage")?;
+    let hc_head_base = last
+        .mtp_hc_head_base
+        .as_ref()
+        .ok_or("dspark body: mtp_hc_head_base missing on last stage")?;
+    let hc_pre = gpu
+        .alloc_tensor(&[hc_mult], DType::F32)
+        .map_err(|e| format!("dspark body alloc head hc_pre: {e:?}"))?;
+    {
+        let pbs = state.dspark_pbs.as_ref().unwrap();
+        let stream_len = hc_mult * hidden;
+        let x_dim = hidden * hc_mult;
+        for b in 0..block {
+            let streams_b = pbs.streams_batch.sub_offset(b * stream_len, stream_len);
+            gpu.hc_head_compute_pre(
+                &streams_b,
+                hc_head_fn,
+                hc_head_base,
+                &hc_pre,
+                hc_mult as i32,
+                x_dim as i32,
+                last.mtp_hc_head_scale,
+                cfg.rms_norm_eps,
+                cfg.hc_eps,
+            )
+            .map_err(|e| format!("dspark body hc_head_compute_pre b{b}: {e:?}"))?;
+            let x_head_b = x_head_out.sub_offset(b * hidden, hidden);
+            gpu.hc_input_map_4stream(&hc_pre, &streams_b, &x_head_b, hidden as i32)
+                .map_err(|e| format!("dspark body hc_input_map head b{b}: {e:?}"))?;
+        }
+    }
+    let _ = gpu.free_tensor(hc_pre);
+
+    Ok(())
+}
+
 /// Gated NaN/range diagnostic for DSpark forward bring-up. Downloads an F32
 /// tensor and prints len/nan/inf/head; no-op unless HIPFIRE_DSPARK_DEBUG=1.
 fn dspark_nan_dbg(gpu: &Gpu, label: &str, t: &GpuTensor, n: usize) {

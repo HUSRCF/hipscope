@@ -1,440 +1,264 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! DeepSeek V4 **DSpark** `MtpDrafter` impl — the DSpark draft module wired
-//! into the unified MTP spec-decode core ([`hipfire_runtime::spec::MtpDrafter`]
-//! + [`MtpSpeculator`]), mirroring [`crate::mtp_speculator::Deepseek4MtpDrafter`].
+//! DeepSeek V4 `Deepseek4DsparkBody` — the arch-specific seam wiring the
+//! deepseek4 3-stage MoE/MLA chain into the arch-agnostic
+//! [`hipfire_runtime::dspark_core::DsparkDrafter`].
 //!
-//! The ONLY difference from the MTP drafter is the DRAFT SOURCE: instead of K
-//! iterations of `mtp_forward`, one [`crate::forward::dspark_forward`] call
-//! produces all `block_size` draft tokens in a single block-batched pass. The
-//! VERIFY + ACCEPT machinery is the shared trunk-forward + `accept_greedy_prefix`
-//! used by [`crate::spec_decode`].
+//! ## Role in the refactor (Task 5)
 //!
-//! ## main_hidden bookkeeping (the crux)
+//! The generic `DsparkDrafter` in `dspark_core` drives drafting through
+//! the `DsparkBody` trait and verifies through the `SpecTarget` trait.
+//! This file provides:
 //!
-//! `dspark_forward(main_hidden@P, prev_token=token@P, position=P)` drafts the
-//! tokens at positions `P+1 ..= P+block`. So before drafting at the seed
-//! position `P` we need the trunk's captured `[40,41,42]` main_hidden FOR the
-//! seed token at `P`. The seed token is freshly committed (it has never been
-//! forwarded through the trunk), so we materialize its main_hidden with a single
-//! 1-token capture-armed trunk forward, caching its position in
-//! `self.main_hidden_pos`. The window's K+1 verify forward also captures, but it
-//! captures the *seed + drafts* positions — NOT the next seed (the bonus), which
-//! is a brand-new token. Hence the bootstrap forward fires once per window.
-//! (Warming the DSpark stage KV rings during prefill — a τ optimisation — is a
-//! TODO; see `mtp_prefill`.)
+//! - `Deepseek4DsparkBody` — holds a body-local `DeepseekV4State` (only the
+//!   dspark-specific fields are populated) plus shallow-cloned stage weights
+//!   and `token_embd`. Its `draft_block` calls:
+//!   1. `dspark_core::main_proj_ingest` → `draft_state.dspark_main_x` (part A).
+//!   2. `forward::dspark_run_body_and_hc_gate` → `x_head_out[block, hidden]`
+//!      (parts B + C.begin).
+//!   The markov + confidence + lm-head (part C.rest) run inside
+//!   `dspark_core::run_heads` after `draft_block` returns.
+//!
+//! - `build_deepseek4_dspark_body` — constructs the body from the loaded
+//!   sidecar weights (all shallow-cloned; the bundle owns the GPU memory).
+//!
+//! - `build_deepseek4_dspark_speculator` — convenience wrapper that builds
+//!   `dspark_core::DsparkWeights` + calls `build_dspark_speculator`.
+//!
+//! ## Byte-identical guarantee
+//!
+//! The verify + bootstrap paths run through `Deepseek4Bundle`'s `SpecTarget`
+//! impl (`spec_impl.rs`), which calls the SAME `forward_prefill_batch_chunk`
+//! + `final_norm_and_argmax_all_batched` + `dspark_assemble_main_hidden` the
+//! old inline `Deepseek4DsparkDrafter` used. `dspark_run_body_and_hc_gate`
+//! calls the same stage kernels as `dspark_forward` body B+C.begin.
+//! `main_proj_ingest` in `dspark_core` mirrors `dspark_forward` part A exactly.
+//! No kernel path changes — this is a pure code move.
 
-use crate::forward::{self, dspark_assemble_main_hidden, dspark_forward, PrefillBatchScratch};
-use crate::mtp_speculator::Deepseek4SpecGrammar;
-use crate::spec_decode::logits_argmax;
-use crate::spec_impl::Deepseek4Bundle;
-use hipfire_runtime::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
+use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
+use crate::forward;
+use hipfire_runtime::dspark_core::{
+    build_dspark_speculator, main_proj_ingest, DsparkBody, DsparkConfig as CoreDsparkConfig,
+    DsparkWeights as CoreDsparkWeights,
 };
-use rdna_compute::Gpu;
+use hipfire_runtime::spec::Speculator;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// DeepSeek V4 DSpark drafter. Holds its own trunk-sized `PrefillBatchScratch`
-/// (the verify + bootstrap forwards run through it) allocated lazily on the
-/// first `mtp_prefill`. `main_hidden_pos` tracks which absolute position the
-/// seed's main_hidden currently in `state.dspark_main_hidden` belongs to, so a
-/// window can skip the bootstrap forward when it's already in sync (it never is
-/// today — each window's next seed is a fresh token — but the guard keeps the
-/// contract explicit and makes a future fold cheap).
-pub struct Deepseek4DsparkDrafter {
-    pbs: Option<PrefillBatchScratch>,
-    /// Absolute position of the seed token whose main_hidden lives in
-    /// `state.dspark_main_hidden`. `None` ⇒ must bootstrap.
-    main_hidden_pos: Option<usize>,
-    block: usize,
-    ctx_capacity: usize,
-    /// Confidence-truncation threshold (survival sigmoid cutoff). Resolved once
-    /// at build time as env > CLI param > 0.5 — see `build_deepseek4_dspark_speculator`.
-    conf_threshold: f32,
+// ── Deepseek4DsparkBody ───────────────────────────────────────────────────────
+
+/// Arch-specific DSpark body for DeepSeek V4. Owns a body-local
+/// `DeepseekV4State` (only the dspark-specific fields are used) and
+/// shallow-clones of the sidecar stage weights + trunk `token_embd`.
+///
+/// `draft_block` runs:
+/// 1. `main_proj_ingest` → `draft_state.dspark_main_x[hidden]` (part A).
+/// 2. `dspark_run_body_and_hc_gate` → `x_head_out[block, hidden]` (B+C.begin).
+///
+/// All weight tensors are **shallow clones** — the bundle keeps ownership and
+/// must outlive the body. `free` releases only the draft-local state buffers
+/// (`dspark_pbs`, `dspark_main_x`, `dspark_swa_k`).
+pub struct Deepseek4DsparkBody {
+    config: DeepseekV4Config,
+    /// Shallow-cloned sidecar stages. The bundle's `weights.dspark.stages`
+    /// retains GPU-buffer ownership.
+    stages_shallow: Vec<crate::deepseek4::DeepseekV4LayerWeights>,
+    /// Shallow clone of `DeepseekV4Weights::token_embd`.
+    token_embd: GpuTensor,
+    /// Draft-local state; only `dspark_pbs`, `dspark_main_x`, `dspark_swa_k`
+    /// are populated — the trunk fields stay None.
+    draft_state: DeepseekV4State,
 }
 
-impl Deepseek4DsparkDrafter {
-    pub fn new(block: usize, ctx_capacity: usize, conf_threshold: f32) -> Self {
-        Self {
-            pbs: None,
-            main_hidden_pos: None,
-            block: block.clamp(1, 8),
-            ctx_capacity,
-            conf_threshold,
-        }
-    }
-
-    fn bundle(target: &mut dyn SpecTarget) -> Result<&mut Deepseek4Bundle, String> {
-        target
-            .as_any_mut()
-            .downcast_mut::<Deepseek4Bundle>()
-            .ok_or_else(|| "Deepseek4DsparkDrafter: target is not a Deepseek4Bundle".to_string())
-    }
-
-    fn pbs_max_batch() -> usize {
-        std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024)
-    }
-}
-
-impl MtpDrafter for Deepseek4DsparkDrafter {
-    fn mtp_prefill(
+impl DsparkBody for Deepseek4DsparkBody {
+    fn draft_block(
         &mut self,
         gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        fill_tokens: &[u32],
-        start_pos: usize,
-        cache_hit: bool,
-    ) -> Result<u32, String> {
-        if !cache_hit {
-            target.reset_recurrent(gpu);
-            self.main_hidden_pos = None;
-        }
+        weights: &CoreDsparkWeights,
+        main_hidden: &GpuTensor, // [target_layer_ids.len() * hidden]
+        seed: u32,
+        position: usize,
+        block: usize,
+        x_head_out: &GpuTensor, // [block, hidden] out
+    ) -> Result<(), String> {
+        let hidden = self.config.hidden_size;
 
-        if self.pbs.is_none() {
-            let bundle = Self::bundle(target)?;
-            self.pbs = Some(
-                PrefillBatchScratch::new(gpu, &bundle.config, Self::pbs_max_batch())
-                    .map_err(|e| format!("Deepseek4DsparkDrafter: alloc PBS: {e}"))?,
+        // ── Part A: main_proj_ingest ──────────────────────────────────────
+        // Lazily allocate draft_state.dspark_main_x[hidden].
+        if self.draft_state.dspark_main_x.is_none() {
+            self.draft_state.dspark_main_x = Some(
+                gpu.alloc_tensor(&[hidden], DType::F32)
+                    .map_err(|e| format!("Deepseek4DsparkBody: alloc main_x: {e:?}"))?,
             );
         }
-
-        let bundle = Self::bundle(target)?;
-        let Deepseek4Bundle {
-            config,
-            weights,
-            state,
-            ..
-        } = bundle;
-
-        if weights.dspark.is_none() {
-            return Err("Deepseek4DsparkDrafter: weights.dspark is None".into());
-        }
-
-        // Arm the [40,41,42] target-hidden capture for the prefill forward.
-        state.dspark_target_layers = weights
-            .dspark
+        let main_x_out = self
+            .draft_state
+            .dspark_main_x
             .as_ref()
             .unwrap()
-            .cfg
-            .target_layer_ids
-            .clone();
-        state.dspark_capture_active = true;
+            .shallow_clone();
+        main_proj_ingest(gpu, weights, main_hidden, &main_x_out)?;
 
-        let pbs = self.pbs.as_ref().expect("just built");
-        // Strict batched-only trunk prefill with capture armed (same path the
-        // validated dspark_forward_smoke uses). Returns the LAST position's
-        // trunk logits; their argmax is the AR seed.
-        let last_logits = forward::forward_prefill_batch_chunked(
-            config,
-            weights,
-            state,
+        // ── Parts B + C.begin: 3-stage chain + HC gate ────────────────────
+        // Build a temporary shallow-clone DsparkWeights (deepseek4 type) for
+        // dspark_run_body_and_hc_gate. The stages are owned by the bundle;
+        // we use the shallow-cloned `stages_shallow` here.
+        let ds4_weights = crate::deepseek4::DsparkWeights {
+            cfg: crate::deepseek4::DsparkConfig {
+                block_size: weights.cfg.block_size,
+                target_layer_ids: weights.cfg.target_layer_ids.clone(),
+                markov_rank: weights.cfg.markov_rank,
+                noise_token_id: weights.cfg.noise_token_id,
+            },
+            stages: self
+                .stages_shallow
+                .iter()
+                .map(|l| l.shallow_clone())
+                .collect(),
+            main_proj: weights.main_proj.as_ref().map(|t| t.shallow_clone()),
+            main_norm: weights.main_norm.as_ref().map(|t| t.shallow_clone()),
+            markov_w1: weights.markov_w1.as_ref().map(|t| t.shallow_clone()),
+            markov_w2: weights.markov_w2.as_ref().map(|t| t.shallow_clone()),
+            confidence_proj: weights.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+        };
+
+        forward::dspark_run_body_and_hc_gate(
+            &self.config,
+            &ds4_weights,
+            &mut self.draft_state,
             gpu,
-            fill_tokens,
-            start_pos as u32,
-            pbs,
-        )
-        .map_err(|e| format!("dspark prefill: {e}"))?;
-
-        // NOTE: we deliberately do NOT warm the DSpark stage main_kv rings over
-        // the prompt here. The reference forward_spec(start_pos==0) does prime
-        // them, and an experimental `forward::dspark_warm_rings` reproduces that
-        // (phase-correct, sharing `dspark_stage_main_kv_to_ring` with decode).
-        // But measured on this MQ2-Lloyd build it is a consistent LOSS: on a
-        // 96-token code prompt, priming dropped τ 3.24→2.55 and decode 13.8→10.8
-        // tok/s (deterministic, interleaved A/B). The trained draft attends
-        // BETTER to a sparse recent-decode window than to the full committed
-        // prompt history — injecting the prompt's main_kv misaligns the draft
-        // from the target under this quant. Left unwired pending a full-precision
-        // model where the reference's priming actually pays. See the branch's
-        // bench notes / dspark-v4-deepseek4-port memory entry.
-        //
-        // The seed sits one position past the last prefilled position; its
-        // main_hidden is materialised on the first mtp_step's bootstrap forward,
-        // so we leave main_hidden_pos = None.
-        self.main_hidden_pos = None;
-
-        Ok(logits_argmax(&last_logits) as u32)
-    }
-
-    fn mtp_step(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        position: usize,
-        seed: u32,
-        k: usize,
-        eos: u32,
-        grammar: Option<&mut dyn SpecGrammar>,
-    ) -> Result<MtpWindow, String> {
-        // DSpark drafts the whole block at once; the in-step grammar (tool-call)
-        // path is not yet wired for DSpark — downcast to surface a wrong pairing
-        // loudly rather than silently dropping the mask, but otherwise ignore it
-        // (the daemon's post-hoc emission-layer grammar still applies).
-        if let Some(g) = grammar {
-            let _ = g
-                .as_any_mut()
-                .downcast_mut::<Deepseek4SpecGrammar>()
-                .ok_or("Deepseek4DsparkDrafter: grammar handle is not a Deepseek4SpecGrammar")?;
-        }
-
-        let bundle = Self::bundle(target)?;
-        // Detach config (small, Clone) so it doesn't pin `&bundle`. The remaining
-        // accesses go through disjoint field paths (`bundle.weights.*` immutable,
-        // `bundle.state` mutable) which the borrow checker allows.
-        let config = bundle.config.clone();
-
-        if bundle.weights.dspark.is_none() {
-            return Err("Deepseek4DsparkDrafter: weights.dspark is None".into());
-        }
-        let target_layers = bundle
-            .weights
-            .dspark
-            .as_ref()
-            .unwrap()
-            .cfg
-            .target_layer_ids
-            .clone();
-        let block = bundle
-            .weights
-            .dspark
-            .as_ref()
-            .unwrap()
-            .cfg
-            .block_size
-            .min(k)
-            .max(1);
-
-        // Trunk tensors (embedding / lm_head / output norm). shallow_clone()
-        // detaches them from the `weights` borrow so they can coexist with the
-        // `&mut state` the forwards take.
-        let token_embd = bundle
-            .weights
-            .token_embd
-            .as_ref()
-            .ok_or("Deepseek4DsparkDrafter: weights.token_embd is None")?
-            .shallow_clone();
-        let head = bundle
-            .weights
-            .head
-            .as_ref()
-            .ok_or("Deepseek4DsparkDrafter: weights.head is None")?
-            .shallow_clone();
-        let output_norm = bundle
-            .weights
-            .output_norm
-            .as_ref()
-            .ok_or("Deepseek4DsparkDrafter: weights.output_norm is None")?
-            .shallow_clone();
-
-        // Read the in-sync guard before borrowing pbs (which pins `self`); all
-        // writes to `self.main_hidden_pos` happen after pbs's last use (step 5).
-        let need_bootstrap = self.main_hidden_pos != Some(position);
-        let pbs = self
-            .pbs
-            .as_ref()
-            .ok_or("Deepseek4DsparkDrafter: mtp_step before mtp_prefill")?;
-
-        // ── 1. Ensure main_hidden@position for the seed ─────────────────────
-        // The seed is a fresh token; materialise its captured [40,41,42] hidden
-        // with a single 1-token capture-armed trunk forward. (Guard lets a
-        // future verify-fold skip this when already in sync.)
-        if need_bootstrap {
-            bundle.state.dspark_target_layers = target_layers.clone();
-            bundle.state.dspark_capture_active = true;
-            forward::forward_prefill_batch_chunk(
-                &config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                pbs,
-                &[seed],
-                position as u32,
-            )
-            .map_err(|e| format!("dspark bootstrap forward: {e}"))?;
-            dspark_assemble_main_hidden(&mut bundle.state, gpu, &config, 0)
-                .map_err(|e| format!("dspark assemble bootstrap main_hidden: {e}"))?;
-        }
-
-        // ── 2. Draft the block with DSpark ──────────────────────────────────
-        let main_hidden = bundle
-            .state
-            .dspark_main_hidden
-            .as_ref()
-            .ok_or("dspark: main_hidden missing after bootstrap")?
-            .shallow_clone();
-        let draft = dspark_forward(
-            &config,
-            bundle.weights.dspark.as_ref().unwrap(),
-            &mut bundle.state,
-            gpu,
-            &main_hidden,
-            &token_embd,
-            &head,
-            &output_norm,
+            &self.token_embd,
             seed,
             position as u32,
-        )
-        .map_err(|e| format!("dspark draft: {e}"))?;
-        let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+            block,
+            x_head_out,
+        )?;
 
-        // ── 2a. Confidence-threshold draft truncation (DSpark's own adaptive
-        // draft-length mechanism — reference deepspec `_confident_prefix_length`).
-        //
-        // `dspark_forward`'s confidence head emits a per-slot confidence LOGIT
-        // (pre-sigmoid). Survival of slot i is `sigmoid(confidence[i])`; the
-        // reference truncates the proposal at the FIRST slot whose survival drops
-        // below a threshold. Truncating BEFORE the verify forward means the heavy
-        // 43-layer/256-expert trunk runs over fewer positions on uncertain (prose)
-        // drafts — cheaper windows — while the full block survives where the model
-        // is confident (code). This does NOT change which tokens get committed
-        // when the model is confident: a slot below threshold is one the draft is
-        // unsure of and likely-to-be-rejected anyway, so cutting it trades a sliver
-        // of potential acceptance for a strictly cheaper verify. The committed
-        // stream remains target-verified greedy ⇒ coherence is preserved.
-        //
-        // Threshold default 0.5: survival 0.5 ⇔ confidence logit 0.0, i.e. keep a
-        // slot iff the head's confidence logit is non-negative. This is the natural
-        // decision boundary of a sigmoid gate and matches the reference default.
-        // Resolved once at build (env > `--dspark-conf-threshold` > 0.5).
-        let conf_threshold = self.conf_threshold;
-        let confident_len = {
-            // First slot below threshold cuts the proposal there; always keep ≥1.
-            let mut l = drafts.len();
-            for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
-                let survival = 1.0f32 / (1.0 + (-c).exp());
-                if survival < conf_threshold {
-                    l = i;
-                    break;
-                }
+        // ds4_weights contains shallow-cloned GpuTensors; dropping them is fine
+        // (no GPU free, the bundle owns the buffers).
+
+        Ok(())
+    }
+
+    fn block_size(&self) -> usize {
+        // The authoritative block_size is in CoreDsparkWeights.cfg, passed to
+        // build_dspark_speculator which clamps and stores it. This method is
+        // only advisory (DsparkDrafter uses its own stored block). Return the
+        // V4-Flash default (5) as a safe fallback.
+        5
+    }
+
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        // Free draft-local state buffers only (NOT the shallow-cloned weights).
+        let mut state = self.draft_state;
+        fn free_opt(gpu: &mut Gpu, t: &mut Option<GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
             }
-            l.max(1)
-        };
-        drafts.truncate(confident_len);
-        let n_proposed = drafts.len();
-
-        // ── 3. Verify: trunk forward [seed, draft0..draft_{n-1}] ────────────
-        // Placed at their TRUE trunk positions (seed@position, drafts at
-        // position+1..). Capture armed so the verify pass also refreshes the
-        // captures, though the next seed (bonus) is a fresh token captured by the
-        // next window's bootstrap forward.
-        let verify_tokens: Vec<u32> = std::iter::once(seed)
-            .chain(drafts.iter().copied())
-            .collect();
-        if pbs.max_batch < verify_tokens.len() {
-            return Err(format!(
-                "dspark verify: PBS max_batch ({}) < verify len ({})",
-                pbs.max_batch,
-                verify_tokens.len()
-            ));
         }
-        bundle.state.dspark_target_layers = target_layers.clone();
-        bundle.state.dspark_capture_active = true;
-        forward::forward_prefill_batch_chunk(
-            &config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            pbs,
-            &verify_tokens,
-            position as u32,
-        )
-        .map_err(|e| format!("dspark verify forward: {e}"))?;
-
-        // ── 4. Greedy accept (shared core). target_pick[i] = argmax at verify
-        //    slot i = the trunk's prediction for position+i+1. Argmax runs
-        //    ON GPU and downloads only the K+1 token ids — not the K+1 × 200k
-        //    logits the host-argmax path used to. EOS-aware so an accepted EOS
-        //    draft stops the window without a stale bonus. ─────────────────────
-        let target_pick = forward::final_norm_and_argmax_all_batched(
-            &config,
-            &bundle.weights,
-            &mut bundle.state,
-            pbs,
-            gpu,
-            verify_tokens.len(),
-        )
-        .map_err(|e| format!("dspark verify head+argmax: {e}"))?;
-        let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
-        let committed = acc.committed;
-        let n_accepted = acc.accepted;
-
-        // ── 5. Advance trunk position + invalidate the next seed's main_hidden.
-        // The verify forward wrote ring slots position..position+n_proposed using
-        // (possibly rejected) drafts; only the first committed.len() are real.
-        // The next window's bootstrap forward overwrites the next-seed slot.
-        //
-        // NOTE: the next seed (committed.last() = the verifier's bonus) is the one
-        // token never run through the trunk, so its [40,41,42] main_hidden is NOT
-        // in the capture buffer — we force a fresh 1-token bootstrap forward next
-        // window. We tried folding this away (Lever 2): emit only the accepted
-        // prefix and seed the next window from the last accepted token, whose
-        // main_hidden IS captured (dspark_caps[a]), re-proposing the bonus as the
-        // next window's first draft. It is correct and coherent but a measured
-        // LOSS (short prompt 10.6→8.8, code 13.8→12.9 tok/s): DSpark's verify is a
-        // full 43-layer MoE trunk pass that dominates the cheap 1-token bootstrap,
-        // so dropping the free bonus (≈ −1 token/window ⇒ ~1.4× more expensive
-        // verify forwards) costs more than the bootstrap saves. The free bonus is
-        // worth more than the bootstrap is expensive — so we keep the 2-forward
-        // shape. See the branch bench notes.
-        bundle.state.n_tokens = (position + committed.len()) as u64;
-        self.main_hidden_pos = None;
-
-        Ok(MtpWindow {
-            committed,
-            accepted: n_accepted,
-            drafts_generated: n_proposed,
-        })
-    }
-
-    fn mtp_reset(&mut self, _gpu: &mut Gpu) {
-        // No drafter-local conversation state beyond `pbs` (scratch). The target
-        // bundle's recurrent reset is the daemon's job. Invalidate the cached
-        // main_hidden position so the next prefill re-bootstraps cleanly.
-        self.main_hidden_pos = None;
-    }
-
-    fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        if let Some(pbs) = self.pbs {
+        for t in state.dspark_swa_k.drain(..).flatten() {
+            let _ = gpu.free_tensor(t);
+        }
+        free_opt(gpu, &mut state.dspark_main_x);
+        if let Some(pbs) = state.dspark_pbs.take() {
             pbs.free_gpu(gpu);
         }
     }
-
-    fn k(&self) -> usize {
-        self.block
-    }
-
-    fn ctx_capacity(&self) -> usize {
-        self.ctx_capacity
-    }
-
-    fn requires_greedy(&self) -> bool {
-        true
-    }
 }
 
-/// Build the deepseek4 DSpark speculator (the boxed `dyn Speculator` the loader
-/// returns when a `-dspark` sidecar is present). The trunk-sized
-/// `PrefillBatchScratch` is allocated lazily on the first `mtp_prefill`.
+// ── Builder functions ─────────────────────────────────────────────────────────
+
+/// Build the `Deepseek4DsparkBody` from the loaded sidecar and trunk weights.
+/// Shallow-clones all weight tensors — `DeepseekV4Weights` retains ownership.
+pub fn build_deepseek4_dspark_body(
+    config: &DeepseekV4Config,
+    dspark_weights: &crate::deepseek4::DsparkWeights,
+    token_embd: &GpuTensor,
+) -> Result<Box<dyn DsparkBody>, String> {
+    let stages_shallow: Vec<_> = dspark_weights
+        .stages
+        .iter()
+        .map(|l| l.shallow_clone())
+        .collect();
+    let draft_state = DeepseekV4State::new(config)
+        .map_err(|e| format!("build_deepseek4_dspark_body: draft_state::new: {e}"))?;
+    Ok(Box::new(Deepseek4DsparkBody {
+        config: config.clone(),
+        stages_shallow,
+        token_embd: token_embd.shallow_clone(),
+        draft_state,
+    }))
+}
+
+/// Build the generic DSpark speculator for DeepSeek V4 using the shared
+/// `dspark_core::DsparkDrafter`. Constructs the `Deepseek4DsparkBody` +
+/// `CoreDsparkWeights` (all shallow-cloned) and calls `build_dspark_speculator`.
 ///
-/// `conf_threshold` is the CLI-forwarded confidence-truncation cutoff (`None` =
-/// loader default 0.5). Ladder: env `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD`
-/// wins, else the CLI param, else 0.5.
+/// The bundle must outlive the returned speculator; call `spec.free(gpu)` BEFORE
+/// `bundle.weights.free_gpu(gpu)` on unload.
+///
+/// Confidence threshold ladder: `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` env
+/// > `conf_threshold` arg > 0.5.
 pub fn build_deepseek4_dspark_speculator(
+    config: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
     block: usize,
     ctx_capacity: usize,
     conf_threshold: Option<f32>,
-) -> Box<dyn Speculator> {
+) -> Result<Box<dyn Speculator>, String> {
+    let dspark = weights
+        .dspark
+        .as_ref()
+        .ok_or("build_deepseek4_dspark_speculator: weights.dspark is None")?;
+    let token_embd = weights
+        .token_embd
+        .as_ref()
+        .ok_or("build_deepseek4_dspark_speculator: weights.token_embd is None")?;
+    let lm_head = weights
+        .head
+        .as_ref()
+        .ok_or("build_deepseek4_dspark_speculator: weights.head is None")?;
+    let last_stage = dspark
+        .stages
+        .last()
+        .ok_or("build_deepseek4_dspark_speculator: dspark has no stages")?;
+    let stage_norm = last_stage
+        .mtp_final_norm
+        .as_ref()
+        .ok_or("build_deepseek4_dspark_speculator: mtp_final_norm missing on last stage")?;
+
     let conf_threshold = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)
         .unwrap_or(0.5);
-    Box::new(MtpSpeculator::new(Deepseek4DsparkDrafter::new(
+
+    // Build arch-agnostic CoreDsparkWeights from sidecar globals (shallow clones).
+    let core_weights = CoreDsparkWeights {
+        cfg: CoreDsparkConfig {
+            block_size: dspark.cfg.block_size,
+            target_layer_ids: dspark.cfg.target_layer_ids.clone(),
+            markov_rank: dspark.cfg.markov_rank,
+            noise_token_id: dspark.cfg.noise_token_id,
+            enable_confidence: true, // deepseek4 always has a confidence head
+        },
+        main_proj: dspark.main_proj.as_ref().map(|t| t.shallow_clone()),
+        main_norm: dspark.main_norm.as_ref().map(|t| t.shallow_clone()),
+        markov_w1: dspark.markov_w1.as_ref().map(|t| t.shallow_clone()),
+        markov_w2: dspark.markov_w2.as_ref().map(|t| t.shallow_clone()),
+        confidence_proj: dspark.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+        confidence_bias: None, // deepseek4 has no bias on the confidence head
+    };
+
+    let body = build_deepseek4_dspark_body(config, dspark, token_embd)?;
+
+    Ok(build_dspark_speculator(
+        body,
+        core_weights,
+        stage_norm.shallow_clone(),
+        lm_head.shallow_clone(),
         block,
         ctx_capacity,
         conf_threshold,
-    )))
+    ))
 }

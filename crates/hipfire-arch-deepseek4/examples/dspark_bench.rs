@@ -162,7 +162,7 @@ fn main() -> Result<(), String> {
 
     let ctx_cap = cfg.max_position_embeddings;
     let mut spec: Box<dyn Speculator> = if dspark_enabled {
-        build_deepseek4_dspark_speculator(block, ctx_cap, None)
+        build_deepseek4_dspark_speculator(&bundle.config, &bundle.weights, block, ctx_cap, None)?
     } else {
         let k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
             .ok()

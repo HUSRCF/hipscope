@@ -557,6 +557,79 @@ pub struct DeepseekV4LayerWeights {
 }
 
 impl DeepseekV4LayerWeights {
+    /// Shallow-clone this layer: all `Option<GpuTensor>` fields are
+    /// non-owning aliases of the same device buffers; CPU-side vecs and
+    /// scalar fields are cheap-copied. Used by `Deepseek4DsparkBody` to
+    /// hold references into the bundle's DSpark stage weights without
+    /// taking ownership.
+    pub fn shallow_clone(&self) -> Self {
+        fn sc(t: &Option<rdna_compute::GpuTensor>) -> Option<rdna_compute::GpuTensor> {
+            t.as_ref().map(|t| t.shallow_clone())
+        }
+        Self {
+            compress_ratio: self.compress_ratio,
+            attn_norm: sc(&self.attn_norm),
+            ffn_norm: sc(&self.ffn_norm),
+            q_norm: sc(&self.q_norm),
+            kv_norm: sc(&self.kv_norm),
+            attn_sink: sc(&self.attn_sink),
+            wq_a: sc(&self.wq_a),
+            wq_b: sc(&self.wq_b),
+            wkv: sc(&self.wkv),
+            wo_a: sc(&self.wo_a),
+            wo_b: sc(&self.wo_b),
+            compressor_wkv: sc(&self.compressor_wkv),
+            compressor_wgate: sc(&self.compressor_wgate),
+            compressor_norm: sc(&self.compressor_norm),
+            compressor_ape: sc(&self.compressor_ape),
+            compressor_wkv_f16: sc(&self.compressor_wkv_f16),
+            compressor_wgate_f16: sc(&self.compressor_wgate_f16),
+            indexer_wq_b: sc(&self.indexer_wq_b),
+            indexer_weights_proj: sc(&self.indexer_weights_proj),
+            indexer_compressor_wkv: sc(&self.indexer_compressor_wkv),
+            indexer_compressor_wgate: sc(&self.indexer_compressor_wgate),
+            indexer_compressor_wkv_f16: sc(&self.indexer_compressor_wkv_f16),
+            indexer_compressor_wgate_f16: sc(&self.indexer_compressor_wgate_f16),
+            indexer_compressor_norm: sc(&self.indexer_compressor_norm),
+            indexer_compressor_ape: sc(&self.indexer_compressor_ape),
+            mtp_enorm: sc(&self.mtp_enorm),
+            mtp_hnorm: sc(&self.mtp_hnorm),
+            mtp_e_proj: sc(&self.mtp_e_proj),
+            mtp_h_proj: sc(&self.mtp_h_proj),
+            mtp_final_norm: sc(&self.mtp_final_norm),
+            mtp_hc_head_fn: sc(&self.mtp_hc_head_fn),
+            mtp_hc_head_base: sc(&self.mtp_hc_head_base),
+            mtp_hc_head_scale: self.mtp_hc_head_scale,
+            hc_attn_base: sc(&self.hc_attn_base),
+            hc_attn_fn: sc(&self.hc_attn_fn),
+            hc_attn_scale: sc(&self.hc_attn_scale),
+            hc_ffn_base: sc(&self.hc_ffn_base),
+            hc_ffn_fn: sc(&self.hc_ffn_fn),
+            hc_ffn_scale: sc(&self.hc_ffn_scale),
+            gate_weight: sc(&self.gate_weight),
+            gate_bias: sc(&self.gate_bias),
+            gate_bias_host: self.gate_bias_host.clone(),
+            tid2eid_host: self.tid2eid_host.clone(),
+            tid2eid_dev: sc(&self.tid2eid_dev),
+            shared_w1: sc(&self.shared_w1),
+            shared_w2: sc(&self.shared_w2),
+            shared_w3: sc(&self.shared_w3),
+            expert_w1_blob: sc(&self.expert_w1_blob),
+            expert_w2_blob: sc(&self.expert_w2_blob),
+            expert_w3_blob: sc(&self.expert_w3_blob),
+            expert_w1_ptrs: sc(&self.expert_w1_ptrs),
+            expert_w2_ptrs: sc(&self.expert_w2_ptrs),
+            expert_w3_ptrs: sc(&self.expert_w3_ptrs),
+            expert_w1_stride: self.expert_w1_stride,
+            expert_w2_stride: self.expert_w2_stride,
+            expert_w3_stride: self.expert_w3_stride,
+            expert_gate_up_blob: sc(&self.expert_gate_up_blob),
+            expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
+            expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
+        }
+    }
+
     pub fn new_empty(compress_ratio: u32) -> Self {
         DeepseekV4LayerWeights {
             compress_ratio,
@@ -1161,6 +1234,12 @@ pub struct DeepseekV4State {
     /// concatenation of the captured per-target-layer slots for one batch
     /// position. Reused across `dspark_assemble_main_hidden` calls.
     pub dspark_main_hidden: Option<rdna_compute::GpuTensor>,
+    /// Trunk-sized PrefillBatchScratch used by the generic `DsparkDrafter`
+    /// to run the bootstrap (1-token capture) and verify (K+1 token trunk
+    /// prefill) forwards. Separate from `dspark_pbs` (which is body-owned
+    /// and sized to the DSpark block, not the trunk verify window).
+    /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
+    pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
 
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
@@ -1265,6 +1344,7 @@ impl DeepseekV4State {
             dspark_caps: None,
             dspark_cap_ones: None,
             dspark_main_hidden: None,
+            dspark_verify_pbs: None,
             n_tokens: 0,
             _scaffold: (),
         })
@@ -1481,6 +1561,9 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.dspark_cap_ones);
         free_opt(gpu, &mut self.dspark_main_hidden);
         if let Some(pbs) = self.dspark_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
+        if let Some(pbs) = self.dspark_verify_pbs.take() {
             pbs.free_gpu(gpu);
         }
     }

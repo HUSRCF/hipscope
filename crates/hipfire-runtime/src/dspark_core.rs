@@ -506,7 +506,11 @@ pub fn run_heads(
 
     // ── Confidence download ───────────────────────────────────────────────
     // When confidence is disabled, return +inf so downstream truncation
-    // is a no-op. When enabled, download the `block` logits and sigmoid.
+    // is a no-op. When enabled, download the `block` raw confidence LOGITS
+    // (pre-sigmoid). The caller (`DsparkDrafter::mtp_step`) applies
+    // `sigmoid(c)` itself when comparing against `conf_threshold`, matching
+    // the `Deepseek4DsparkDrafter` convention: confidence stores raw logits,
+    // sigmoid is applied at the truncation site.
     let confidence = if cfg.enable_confidence && weights.confidence_proj.is_some() {
         let mut raw = vec![0.0f32; block];
         {
@@ -516,8 +520,7 @@ pub fn run_heads(
                 .memcpy_dtoh(bytes, &conf_batch.buf)
                 .map_err(|e| format!("run_heads d2h confidence: {e:?}"))?;
         }
-        // sigmoid: 1 / (1 + exp(-x))
-        raw.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect()
+        raw
     } else {
         vec![f32::INFINITY; block]
     };
