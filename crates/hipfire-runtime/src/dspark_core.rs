@@ -15,6 +15,13 @@ pub struct DsparkConfig {
     pub noise_token_id: u32,
     /// false ⇒ DFlash heads-off path (no confidence truncation).
     pub enable_confidence: bool,
+    /// true ⇒ confidence head reads `normed[i]` (once-normed hidden, after
+    /// `rmsnorm(x_head, stage_norm)`), matching the qwen3 reference
+    /// `predict_confidence_step` which feeds `output_hidden = self.norm(hidden)`.
+    /// false ⇒ confidence head reads raw `x_head[i]` (pre-norm), preserving
+    /// deepseek4's original behavior (byte-identical baseline from task-5).
+    /// Default: false (deepseek4-preserving).
+    pub confidence_uses_normed: bool,
 }
 
 impl DsparkConfig {
@@ -27,6 +34,9 @@ impl DsparkConfig {
     /// `dspark_markov_rank`, `dspark_noise_token_id`,
     /// `dspark_enable_confidence` (defaults to `true` when absent, matching
     /// the deepseek4 behaviour where confidence is always enabled).
+    /// `dspark_confidence_uses_normed` (defaults to `false` — callers that
+    /// need the once-normed input, e.g. qwen3, must set this explicitly after
+    /// parsing or emit it in the sidecar metadata).
     pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
         let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let cfg = wrapper.get("config")?;
@@ -46,12 +56,17 @@ impl DsparkConfig {
             .get("dspark_enable_confidence")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let confidence_uses_normed = cfg
+            .get("dspark_confidence_uses_normed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Some(Self {
             block_size,
             target_layer_ids,
             markov_rank,
             noise_token_id,
             enable_confidence,
+            confidence_uses_normed,
         })
     }
 }
@@ -482,15 +497,19 @@ pub fn run_heads(
         // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank] (unrotated).
         dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
 
-        // Confidence slot i ON GPU: stage [normed[i] ++ markov_embed[i]] then
+        // Confidence slot i ON GPU: stage [hidden_i ++ markov_embed[i]] then
         // a 1-row `confidence_proj` gemv → conf_batch[i]. Uses the UNROTATED
         // emb_dev (matches the reference which dotted the raw markov embed).
-        // Uses `normed` (once-normed hidden), matching modeling.py which feeds
-        // output_hidden (= _forward_backbone result = self.norm(hidden)) to
-        // predict_confidence_step — not the pre-norm x_head.
+        // `hidden_i` is arch-specific: qwen3 uses `normed[i]` (once-normed,
+        // matching modeling.py's predict_confidence_step input = self.norm(hidden));
+        // deepseek4 uses raw `x_head[i]` (pre-norm, byte-identical to task-5 baseline).
         if cfg.enable_confidence {
             if let Some(confidence_proj) = weights.confidence_proj.as_ref() {
-                let xh_i = normed.sub_offset(i * hidden, hidden);
+                let xh_i = if cfg.confidence_uses_normed {
+                    normed.sub_offset(i * hidden, hidden)
+                } else {
+                    x_head.sub_offset(i * hidden, hidden)
+                };
                 let c_hidden = concat_dev.sub_offset(0, hidden);
                 let c_markov = concat_dev.sub_offset(hidden, markov_rank);
                 gpu.memcpy_dtod_auto(&c_hidden.buf, &xh_i.buf, hidden * 4)

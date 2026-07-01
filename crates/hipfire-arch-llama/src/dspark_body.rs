@@ -218,8 +218,13 @@ pub fn load_qwen3_dspark(
         None
     };
 
+    // qwen3 reference modeling.py feeds once-normed hidden (self.norm(hidden))
+    // to predict_confidence_step; set the flag so run_heads uses normed[i].
+    let mut qwen3_cfg = dspark_cfg.clone();
+    qwen3_cfg.confidence_uses_normed = true;
+
     let dspark_weights = DsparkWeights {
-        cfg: dspark_cfg.clone(),
+        cfg: qwen3_cfg,
         main_proj,
         main_norm: Some(main_norm),
         markov_w1,
