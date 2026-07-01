@@ -575,9 +575,66 @@ impl Carrier for LlamaCarrier {
                     scratch,
                     kv,
                     dflash_extract_layers: Vec::new(),
+                    dspark_weights: None,
+                    dspark_assets: None,
                 }
             }
         };
+
+        // ── DSpark sidecar discovery ──────────────────────────────────────────
+        // When a `<stem>-dspark.<ext>` sidecar exists alongside the main model
+        // and speculation is not explicitly disabled (`ctx.spec.dspark != Some(false)`),
+        // load the Qwen3-8B drafter body + DSpark globals into the bundle.
+        //
+        // The speculator BUILD arm (Task 10) reads bundle.dspark_weights +
+        // bundle.dspark_assets to wire the DsparkDrafter into the serve path.
+        // This block only does the load — no speculator is built here.
+        if ctx.spec.dspark != Some(false) {
+            let base_path = std::path::Path::new(ctx.path);
+            let dspark_path: Option<std::path::PathBuf> = match (
+                base_path.parent(),
+                base_path.file_stem(),
+                base_path.extension(),
+            ) {
+                (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
+                    "{}-dspark.{}",
+                    stem.to_string_lossy(),
+                    ext.to_string_lossy()
+                ))),
+                _ => None,
+            };
+            if let Some(p) = dspark_path.filter(|p| p.exists()) {
+                eprintln!("llama: opening DSpark sidecar HFQ {p:?}");
+                match hipfire_runtime::hfq::HfqFile::open(&p) {
+                    Ok(mut sidecar) => {
+                        sidecar.drop_mmap();
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
+                            Ok(Some((dspark_weights, dspark_assets))) => {
+                                eprintln!(
+                                    "  llama: DSpark sidecar loaded (block_size={}, target_layers={:?})",
+                                    dspark_weights.cfg.block_size,
+                                    dspark_weights.cfg.target_layer_ids,
+                                );
+                                bundle.dspark_weights = Some(dspark_weights);
+                                bundle.dspark_assets = Some(dspark_assets);
+                            }
+                            Ok(None) => {
+                                eprintln!(
+                                    "  llama: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("  llama: WARNING DSpark sidecar load failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  llama: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                    }
+                }
+            }
+        }
 
         // ── single shared tail ──
         // If a DFlash draft (arch_id=20 HFQ) is configured for this dense llama/qwen3

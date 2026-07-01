@@ -17,6 +17,45 @@ pub struct DsparkConfig {
     pub enable_confidence: bool,
 }
 
+impl DsparkConfig {
+    /// Parse from the HFQ `metadata_json` string (the outer
+    /// `{"architecture":.., "config":{..}}` envelope). Returns `None`
+    /// when `config` or `dspark_block_size` is absent — i.e. the file
+    /// is not a DSpark sidecar.
+    ///
+    /// Reads: `dspark_block_size`, `dspark_target_layer_ids`,
+    /// `dspark_markov_rank`, `dspark_noise_token_id`,
+    /// `dspark_enable_confidence` (defaults to `true` when absent, matching
+    /// the deepseek4 behaviour where confidence is always enabled).
+    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
+        let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+        let cfg = wrapper.get("config")?;
+        let block_size = cfg.get("dspark_block_size")?.as_u64()? as usize;
+        if block_size == 0 {
+            return None;
+        }
+        let target_layer_ids = cfg
+            .get("dspark_target_layer_ids")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect::<Vec<_>>();
+        let markov_rank = cfg.get("dspark_markov_rank")?.as_u64()? as usize;
+        let noise_token_id = cfg.get("dspark_noise_token_id")?.as_u64()? as u32;
+        let enable_confidence = cfg
+            .get("dspark_enable_confidence")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        Some(Self {
+            block_size,
+            target_layer_ids,
+            markov_rank,
+            noise_token_id,
+            enable_confidence,
+        })
+    }
+}
+
 pub struct DsparkWeights {
     pub cfg: DsparkConfig,
     pub main_proj: Option<GpuTensor>, // [dim, target_layer_ids.len()*dim]

@@ -1,5 +1,7 @@
+use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::dspark_core::DsparkWeights;
 use hipfire_runtime::llama::{
     ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
 };
@@ -16,6 +18,12 @@ pub struct LlamaBundle {
     /// speculator sets the real `target_layer_ids` via
     /// [`LlamaBundle::set_dflash_extract_layers`].
     pub dflash_extract_layers: Vec<usize>,
+    /// Loaded DSpark drafter sidecar globals. `None` when no `-dspark` sidecar
+    /// was found or speculation was disabled. Task-10 wires the speculator build.
+    pub dspark_weights: Option<DsparkWeights>,
+    /// Loaded DSpark drafter body assets (5-layer dense-GQA transformer +
+    /// block-only KvCache/scratch).  `None` when `dspark_weights` is `None`.
+    pub dspark_assets: Option<Qwen3DrafterAssets>,
 }
 
 /// Build the LLaMA GPU bundle from an HFQ source.
@@ -54,6 +62,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         scratch,
         kv,
         dflash_extract_layers: Vec::new(),
+        dspark_weights: None,
+        dspark_assets: None,
     })
 }
 
