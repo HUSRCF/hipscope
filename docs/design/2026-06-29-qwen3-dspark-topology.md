@@ -1,35 +1,65 @@
 # Qwen3-8B DSpark drafter — ingest topology & attention mode (Task 0)
 
-Settles the unknowns the config alone doesn't reveal, by reading the drafter
-safetensors header + the DeepSpec reference (`deepspec/modeling/dspark/qwen3/
-modeling.py`, and the on-disk deepseek4 reference `~/dspark-work/ref/model.py`).
+**Target arch (nail this first):** the drafter targets **plain Qwen3-8B dense** =
+hipfire **`arch_id=1`, the `hipfire-arch-llama` crate** (`config.json`:
+`model_type: qwen3`, 36 target layers, dim 4096, 32h/8kv/hd128, QK-norm, rope
+θ=1e6). This is **NOT** Qwen3.5/3.6 (`arch_id=5/6`, the `hipfire-arch-qwen35`
+DeltaNet-hybrid crate) — that arch and its existing "DFlash" spec machinery are
+unrelated and must not be touched. The verify path + per-layer dense compute ride
+llama; only the *drafting algorithm shape* is borrowed from deepseek4 (below).
+
+**Provenance (corrected — both weights AND source now verified):**
+- Tensor table below: **verified from the real drafter weights** —
+  `/home/bjoern/dspark-work/qwen3/ckpt/model.safetensors` (4.7GB BF16, single file,
+  64 tensors), downloaded 2026-07-01 (the original note asserted this table without
+  the weights on disk).
+- Forward-logic claims (bidirectional block, `main_x` dual-stream KV-fusion):
+  **byte-confirmed from the real `Qwen3DSparkModel` source** — DeepSpec (DeepSeek's
+  spec-decode codebase, MIT, released 2026-06-27), cloned to
+  `/home/bjoern/dspark-work/DeepSpec/deepspec/modeling/dspark/qwen3/modeling.py`
+  (repo `github.com/deepseek-ai/DeepSpec`). This source does **not** ship with the
+  HF checkpoint — it lives only in the DeepSpec repo. Key confirmations:
+  `fc = Linear(5*hidden, hidden, bias=False)` then `hidden_norm(fc(...))` before the
+  layer loop (modeling.py:130-134,275); noise embedding and `target_hidden` are
+  **separate dual-stream layer inputs**, not summed (:277-284); `is_causal = False`
+  (:102) with `create_dspark_attention_mask` (:313); and the KV fusion is literally
+  `k = cat([k_proj(target_hidden), k_proj(hidden)])` reusing the same `k_proj`/`v_proj`
+  (:148-152). The deepseek4 analog (`~/dspark-work/ref/model.py`) matches.
 
 **Headline finding (revises the plan):** the qwen3 DSpark drafter is **not** a
 plain dense self-attention transformer with a modified layer-0 input. It is
 **deepseek4's DSpark body algorithm with dense Qwen3 layers** — each layer's
 attention is **bidirectional** and prepends a **projected target-hidden context**
-to its KV (`KV = cat([k_proj(target_ctx), k_proj(block)])`). hipfire's deepseek4
-`dspark_forward` (`crates/hipfire-arch-deepseek4/src/forward.rs:8911+`) already
-implements this exact structure (MoE/MLA variant); the qwen3 body is the dense
-variant of the same thing.
+to its KV (`KV = cat([k_proj(target_ctx), k_proj(block)])`, reusing the layer's own
+`k_proj`/`v_proj` — consistent with the single per-layer q/k/v/o set in the weights).
+hipfire's deepseek4 `dspark_forward`
+(`crates/hipfire-arch-deepseek4/src/forward.rs:8911+`) already implements this exact
+structure (MoE/MLA variant); the qwen3 body is the dense variant of the same thing.
 
-## Tensor name → role table (`dspark_qwen3_8b_block7`)
+## Tensor name → role table (`dspark_qwen3_8b_block7`, verified from `model.safetensors`)
+
+Exact tensor names — note **no `model.` prefix**, and markov tensors are nested
+under `markov_head.` (the original draft mis-prefixed both; the loader must use
+these names).
 
 | tensor (safetensors) | shape | dtype | role |
 |---|---|---|---|
-| `model.embed_tokens.weight` | [151936, 4096] | bf16 | token embedding (noise block) |
-| `model.layers.{0..4}.self_attn.{q,k,v,o}_proj.weight` | GQA (32h/8kv/hd128) | bf16 | dense Qwen3 attention |
-| `model.layers.{0..4}.self_attn.{q,k}_norm.weight` | [128] | bf16 | QK-norm (Qwen3) |
-| `model.layers.{0..4}.{input_layernorm,post_attention_layernorm}.weight` | [4096] | bf16 | block norms |
-| `model.layers.{0..4}.mlp.{gate,up,down}_proj.weight` | inter 12288 | bf16 | SwiGLU MLP |
-| `fc.weight` (`main_proj`) | **[4096, 20480]** | bf16 | **single concat** `[hidden, 5*hidden]` ingest |
+| `embed_tokens.weight` | [151936, 4096] | bf16 | token embedding (noise block) |
+| `layers.{0..4}.self_attn.q_proj.weight` | [4096, 4096] | bf16 | Q (32h × 128) |
+| `layers.{0..4}.self_attn.{k,v}_proj.weight` | [1024, 4096] | bf16 | K/V (8kv × 128, GQA) |
+| `layers.{0..4}.self_attn.o_proj.weight` | [4096, 4096] | bf16 | attn out |
+| `layers.{0..4}.self_attn.{q,k}_norm.weight` | [128] | bf16 | QK-norm (Qwen3) |
+| `layers.{0..4}.{input_layernorm,post_attention_layernorm}.weight` | [4096] | bf16 | block norms |
+| `layers.{0..4}.mlp.{gate,up}_proj.weight` | [12288, 4096] | bf16 | SwiGLU MLP (inter 12288) |
+| `layers.{0..4}.mlp.down_proj.weight` | [4096, 12288] | bf16 | SwiGLU MLP down |
+| `fc.weight` (`main_proj`) | **[4096, 20480]** | bf16 | **single concat** `[hidden, 5*hidden]` ingest ✓verified |
 | `hidden_norm.weight` | [4096] | bf16 | RMSNorm after `fc`, before layers |
 | `norm.weight` | [4096] | bf16 | final norm → `x_head` |
-| `markov_w1.weight` | [151936, 256] | bf16 | vanilla markov embed |
-| `markov_w2.weight` | [151936, 256] | bf16 | vanilla markov bias proj |
-| `confidence_head.proj.weight` | [1, 4352] | bf16 | confidence Linear (dim+rank) |
-| `confidence_head.proj.bias` | [1] | bf16 | **confidence HAS BIAS** (deepseek4 has none) |
-| `lm_head.weight` | [151936, 4096] | bf16 | separate lm_head (untied) |
+| `markov_head.markov_w1.weight` | [151936, 256] | bf16 | vanilla markov embed (`[vocab, rank]`) |
+| `markov_head.markov_w2.weight` | [151936, 256] | bf16 | vanilla markov bias proj (`[vocab, rank]`) |
+| `confidence_head.proj.weight` | [1, 4352] | bf16 | confidence Linear (dim+rank = 4096+256) |
+| `confidence_head.proj.bias` | [1] | bf16 | **confidence HAS BIAS** ✓verified present (deepseek4 has none) |
+| `lm_head.weight` | [151936, 4096] | bf16 | separate lm_head (untied, `tie_word_embeddings:false`) |
 
 ## The 7 questions
 
@@ -46,17 +76,23 @@ variant of the same thing.
 3. **Block attention:** **bidirectional.** Reference `DSparkAttention.is_causal =
    False`; at inference `attention_mask=None` ⇒ every block slot attends to all
    context + all block slots. Matches deepseek4's bidirectional mode.
-4. **Persistent KV across windows:** NO. `deepspec_draft_ops.py` crops the draft
-   KV per block (`past_key_values_draft.crop(start)`); committed context enters
-   only through `main_x`, not a carried KV. (deepseek4 keeps a `win`-sized main_kv
-   ring but writes only the seed per window — functionally the same "context =
-   projected target hidden" scheme.)
+4. **KV lifetime (reworded — the original "NO" was imprecise):** the *draft-block*
+   KV is **cropped per block** (`deepspec_draft_ops.py`:
+   `past_key_values_draft.crop(start)`), so the speculative block's own KV is
+   discarded each window. But the *context/main* KV **is persistent** — deepseek4
+   keeps a `win`-sized `main_kv` ring (`model.py:763-768/783-784`) that carries the
+   projected committed context across windows; only the per-window seed is written
+   into it. So: committed context = a persistent `main_x`-derived KV ring; draft
+   block KV = rebuilt per block.
 5. **Markov head:** vanilla rank-256, identical to deepseek4 (`markov_w1`
    Emb[vocab,256], `markov_w2` Linear[256→vocab] used as bias). matches
    `forward.rs:9663-9715`.
 6. **Confidence head:** `Linear[dim+rank=4352, 1]` over `[x_head ++ markov_emb]` —
-   **with bias** (deepseek4's is bias-free fp32). Loader + forward must include the
-   `confidence_head.proj.bias` term.
+   **with bias** ✓**verified**: `confidence_head.proj.weight [1,4352]` +
+   `confidence_head.proj.bias [1]` both present in the weights (deepseek4's is
+   bias-free). Loader + forward must include the `confidence_head.proj.bias` term —
+   already carried as `dspark_core::DsparkWeights::confidence_bias` (None-safe
+   optional, added in the bias-add at `run_heads` ~468-471).
 7. **`x_head` / `lm_head`:** `x_head` = post-`norm` hidden; `lm_head` is a separate
    `[151936,4096]` tensor (`tie_word_embeddings:false`).
 
