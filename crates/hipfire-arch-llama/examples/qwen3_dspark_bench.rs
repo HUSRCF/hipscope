@@ -348,7 +348,7 @@ fn main() -> Result<(), String> {
         let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.5f32);
+            .unwrap_or(0.1f32);
 
         eprintln!("DSpark speculator: block={block}  conf_threshold={conf_threshold:.2}");
 
