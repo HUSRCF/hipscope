@@ -54,7 +54,8 @@
 //!    local `DsparkConfig` hardcodes `enable_confidence: true`.
 
 use hipfire_runtime::dspark_core::{
-    main_proj_ingest, noise_block_ids, DsparkBody, DsparkConfig, DsparkWeights,
+    main_proj_ingest, main_proj_ingest_batched, noise_block_ids, DsparkBody, DsparkConfig,
+    DsparkWeights,
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
@@ -1121,35 +1122,42 @@ impl DsparkBody for Qwen3DsparkBody {
         &mut self,
         gpu: &mut Gpu,
         weights: &DsparkWeights,
-        main_hidden: &GpuTensor, // [target_layer_ids.len()*dim]
+        main_hidden: &GpuTensor, // [ctx_len * n_targets * dim] flat
+        ctx_positions: &[usize], // absolute RoPE positions; len = ctx_len
         seed: u32,
         position: usize,
         block: usize,
         x_head_out: &GpuTensor, // [block, dim] out
     ) -> Result<(), String> {
         let dim = self.assets.config.dim;
+        let ctx_len = ctx_positions.len().max(1);
 
-        // ── 1. main_proj_ingest: fc(main_hidden) + main_norm → main_x [dim] ───
-        // Single-slot (ctx_len=1): Stage 1 loop unchanged.  Stage 2 will pass
-        // ctx_len accepted positions instead.
+        // ── 1. main_proj_ingest: fc(main_hidden) + main_norm → main_x  ────────
+        // For ctx_len=1 use the scalar variant; for ctx_len>1 use the batched
+        // variant which produces [ctx_len, dim] F32 in one call.
         let main_x = gpu
-            .alloc_tensor(&[dim], DType::F32)
+            .alloc_tensor(&[ctx_len * dim], DType::F32)
             .map_err(|e| format!("Qwen3DsparkBody: alloc main_x: {e:?}"))?;
-        main_proj_ingest(gpu, weights, main_hidden, &main_x)?;
+        if ctx_len == 1 {
+            main_proj_ingest(gpu, weights, main_hidden, &main_x)?;
+        } else {
+            main_proj_ingest_batched(gpu, weights, main_hidden, &main_x, ctx_len, dim)?;
+        }
 
         // ── 2. block_ids = [seed, noise, noise, ...] ──────────────────────────
         let block_ids = noise_block_ids(&weights.cfg, seed);
 
-        // ── 3. Block-attention forward (ctx_len=1) → x_head_out ──────────────
-        // ctx_positions = [position] (single seed position).
+        // ── 3. Block-attention forward → x_head_out ───────────────────────────
         // block_positions = [position, position+1, ..., position+block-1].
+        // These are the block's absolute positions; the block token[0] is the
+        // seed, and the drafts occupy positions [position+1 .. position+block].
         let block_positions: Vec<usize> = (0..block).map(|i| position + i).collect();
         dspark_qwen3_block_forward(
             gpu,
             &self.assets.weights,
             &self.assets.config,
             &main_x,
-            &[position], // ctx_positions (1 slot)
+            ctx_positions,
             &block_ids,
             &block_positions,
             block,
@@ -1162,8 +1170,10 @@ impl DsparkBody for Qwen3DsparkBody {
     }
 
     fn block_size(&self) -> usize {
-        // kv_cap = 1 + block_size (ctx slot + block slots) → block_size = cap - 1.
-        self.scratch.kv.physical_cap.saturating_sub(1)
+        // kv_cap = max_ctx_len + block_size; max_ctx_len = block_size + 1.
+        // So kv_cap = 2 * block_size + 1 → block_size = (kv_cap - 1) / 2.
+        // Use pbs.max_batch which was set to block_size directly at construction.
+        self.scratch.pbs.max_batch
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1188,16 +1198,17 @@ impl DsparkBody for Qwen3DsparkBody {
 /// [`hipfire_runtime::dspark_core::build_dspark_speculator`].
 ///
 /// Allocates the [`Qwen3DsparkScratch`] using `block_size` from
-/// `DsparkWeights::cfg`. The scratch is sized for the block-only forward
-/// (kv_cap = 1 + block_size).
+/// `DsparkWeights::cfg`. The scratch is sized for the multi-slot context
+/// forward: `max_ctx_len = block_size + 1` so that the accepted-prefix of a
+/// full-accept window (up to `block_size` accepted drafts + the seed = at most
+/// `block_size + 1` slots) fits without reallocation.
 pub fn build_qwen3_dspark_body(
     assets: Qwen3DrafterAssets,
     cfg: &DsparkConfig,
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
-    // Stage 1: single-slot context (max_ctx_len=1). Stage 2 will increase this
-    // to the accepted-window length once the loop passes multi-slot context.
-    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, 1)
+    let max_ctx_len = cfg.block_size + 1;
+    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len)
         .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }

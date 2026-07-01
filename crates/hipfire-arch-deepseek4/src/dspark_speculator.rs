@@ -75,12 +75,14 @@ impl DsparkBody for Deepseek4DsparkBody {
         &mut self,
         gpu: &mut Gpu,
         weights: &CoreDsparkWeights,
-        main_hidden: &GpuTensor, // [target_layer_ids.len() * hidden]
+        main_hidden: &GpuTensor, // [ctx_len * n_targets * hidden] — deepseek4 uses ctx_len=1
+        ctx_positions: &[usize], // absolute positions; len = ctx_len (deepseek4 ignores >1 slots)
         seed: u32,
         position: usize,
         block: usize,
         x_head_out: &GpuTensor, // [block, hidden] out
     ) -> Result<(), String> {
+        let _ = ctx_positions; // deepseek4 Stage 3 will use this; for now always ctx_len=1
         let hidden = self.config.hidden_size;
 
         // ── Part A: main_proj_ingest ──────────────────────────────────────

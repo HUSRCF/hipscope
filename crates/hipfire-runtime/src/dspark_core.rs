@@ -73,7 +73,7 @@ impl DsparkProfiler {
         let mean = |x: f64| x / self.windows as f64;
         eprintln!("=== HIPFIRE_DSPARK_PROFILE ({} windows) ===", self.windows);
         eprintln!(
-            "  bootstrap (capture_seed_main_hidden): {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
+            "  bootstrap (initial-ctx seed capture):  {:8.2} ms total  {:5.1}%  mean={:.2}ms/window",
             self.bootstrap_ms,
             pct(self.bootstrap_ms),
             mean(self.bootstrap_ms)
@@ -196,13 +196,24 @@ pub struct DsparkWeights {
 }
 
 /// The arch-specific seam: draft one window's block given the assembled
-/// `main_hidden`, returning the per-slot post-final-norm hidden (`x_head`).
+/// multi-slot context, returning the per-slot post-final-norm hidden (`x_head`).
+///
+/// `main_hidden` is `[ctx_len * n_targets * dim]` flat (row-major): the raw
+/// target extract-layer hidden states for the `ctx_len` context slots.
+/// `ctx_positions` has length `ctx_len` and carries the absolute RoPE position
+/// of each context slot.  `ctx_len = ctx_positions.len()` and must be ≥ 1.
+///
+/// For `ctx_len = 1` the behaviour is identical to the original single-slot
+/// contract (backward-compatible with Stage 1).  The deepseek4 body always
+/// calls with `ctx_len = 1` (Stage 3 will change this); the qwen3 body uses
+/// the full multi-slot `ctx_len` once Stage 2 wires it.
 pub trait DsparkBody {
     fn draft_block(
         &mut self,
         gpu: &mut Gpu,
         weights: &DsparkWeights,
-        main_hidden: &GpuTensor, // [target_layer_ids.len()*dim]
+        main_hidden: &GpuTensor, // [ctx_len * n_targets * dim] flat
+        ctx_positions: &[usize], // absolute RoPE positions; len = ctx_len
         seed: u32,
         position: usize,
         block: usize,
@@ -818,18 +829,22 @@ fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
 
 /// Generic DSpark drafter: window orchestration over any [`DsparkBody`].
 ///
-/// ## main_hidden bookkeeping
+/// ## Context bookkeeping (Stage 2+)
 ///
-/// `body.draft_block(main_hidden@P, seed=token@P, position=P)` drafts positions
-/// `P+1 ..= P+block`. Before drafting at seed position `P` we need the trunk's
-/// captured `[target_layer_ids]` main_hidden FOR the seed token at `P`. Since the
-/// seed is freshly committed (never seen by the trunk in the current window), we
-/// materialise its hidden via `target.capture_seed_main_hidden(gpu, seed, P,
-/// &layers)` — one 1-token capture-armed trunk forward, result cached in
-/// `main_hidden_dev`. `main_hidden_pos` tracks which absolute position that cache
-/// corresponds to; the guard skips the bootstrap when already in sync (never
-/// happens today — each window's bonus is always a fresh token — but makes the
-/// contract explicit).
+/// After each verify+accept window, the multi-slot context for the NEXT window
+/// is the verify-forward's accepted-prefix hidden at the target's extract layers
+/// (positions `P ..= P + accepted`, i.e. `accepted+1` slots). This matches the
+/// Python reference `_update`: `context.target_hidden_states =
+/// verified_target_hidden[:, :accepted_draft_tokens+1, :]`.
+///
+/// `ctx_hidden_raw` holds these raw (pre-`main_proj_ingest`) hidden floats as
+/// `[ctx_len * n_targets * dim]` flat F32 on the host.  `ctx_positions` holds
+/// the corresponding absolute positions.
+///
+/// The INITIAL window (no previous verify) uses a single-slot bootstrap via
+/// `capture_seed_main_hidden` (matching `_init_context`), giving `ctx_len=1`.
+/// After the first window the loop uses the verify hidden directly and skips
+/// `capture_seed_main_hidden` entirely.
 pub struct DsparkDrafter {
     body: Box<dyn DsparkBody>,
     weights: DsparkWeights,
@@ -840,12 +855,13 @@ pub struct DsparkDrafter {
     conf_threshold: f32,
     block: usize,
     ctx_capacity: usize,
-    /// Cached GPU tensor holding main_hidden for the seed at `main_hidden_pos`.
-    /// `None` ⇒ must bootstrap on next `mtp_step`.
+    /// GPU tensor holding the multi-slot context main_hidden for `ctx_positions`.
+    /// `[ctx_len * n_targets * dim]` F32 (flat).  `None` ⇒ must bootstrap on
+    /// next `mtp_step` (initial window or after reset/prefill).
     main_hidden_dev: Option<GpuTensor>,
-    /// Absolute position of the seed whose main_hidden is cached in
-    /// `main_hidden_dev`. `None` ⇒ cache invalid.
-    main_hidden_pos: Option<usize>,
+    /// Absolute positions whose main_hidden is cached in `main_hidden_dev`.
+    /// Empty ⇒ cache invalid (same condition as `main_hidden_dev.is_none()`).
+    ctx_positions: Vec<usize>,
     /// Per-window phase profiler; active only when `HIPFIRE_DSPARK_PROFILE=1`.
     profiler: DsparkProfiler,
 }
@@ -862,7 +878,7 @@ impl MtpDrafter for DsparkDrafter {
         if !cache_hit {
             target.reset_recurrent(gpu);
         }
-        // Invalidate main_hidden: mtp_step re-bootstraps for the first seed.
+        // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
         // during prefill (measured LOSS on code prompts — see dspark_speculator.rs).
         //
@@ -870,10 +886,11 @@ impl MtpDrafter for DsparkDrafter {
         // clears main_hidden_pos only on `!cache_hit`. We clear it
         // unconditionally because the generic body may not preserve a valid
         // cached hidden across a cache-hit prefill. This is behaviourally
-        // identical today (both paths leave the seed's main_hidden_pos = None at
-        // the end of prefill); the unconditional clear is the safe default for a
-        // future cache-hit fold.
-        self.main_hidden_pos = None;
+        // identical today; the unconditional clear is the safe default.
+        if let Some(dev) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(dev);
+        }
+        self.ctx_positions.clear();
 
         if fill_tokens.is_empty() {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
@@ -906,6 +923,7 @@ impl MtpDrafter for DsparkDrafter {
         // downcast to) — ignore silently; post-hoc emission-layer grammar applies.
 
         let layers = self.weights.cfg.target_layer_ids.clone();
+        let n_targets = layers.len();
         let block = self.weights.cfg.block_size.min(k).max(1);
         let vocab = self.lm_head.shape[0];
         let hidden = {
@@ -913,26 +931,31 @@ impl MtpDrafter for DsparkDrafter {
             self.stage_norm.shape[0]
         };
 
-        // ── 1. Bootstrap: ensure main_hidden@position for the seed ───────────
-        // The seed is a fresh token; materialise its captured main_hidden with a
-        // single 1-token capture-armed trunk forward (guard skips when already
-        // in sync — never today but makes the contract explicit).
+        // ── 1. Bootstrap or reuse ctx from previous verify ──────────────────
+        // INITIAL window (ctx_positions is empty): materialise a 1-slot bootstrap
+        // via `capture_seed_main_hidden` — matches the reference `_init_context`.
+        // STEADY-STATE: ctx_hidden_dev/ctx_positions were populated by the
+        // previous window's verify; skip `capture_seed_main_hidden` entirely.
         let t_bootstrap = self.profiler.sync_start(gpu);
-        if self.main_hidden_pos != Some(position) {
+        if self.ctx_positions.is_empty() {
+            // Initial window: bootstrap with a 1-token capture-armed forward.
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
             let dev = upload_f32(gpu, &hidden_host)?;
             if let Some(old) = self.main_hidden_dev.take() {
                 let _ = gpu.free_tensor(old);
             }
             self.main_hidden_dev = Some(dev);
-            self.main_hidden_pos = Some(position);
+            self.ctx_positions = vec![position];
         }
+        // Steady-state: main_hidden_dev and ctx_positions are already set from
+        // the previous window's accepted-prefix capture.
         self.profiler.sync_end(gpu, t_bootstrap, 0);
 
+        let ctx_positions = self.ctx_positions.clone();
         let main_hidden = self
             .main_hidden_dev
             .as_ref()
-            .ok_or("DsparkDrafter: main_hidden_dev missing after bootstrap")?;
+            .ok_or("DsparkDrafter: main_hidden_dev missing")?;
 
         // ── 2. Draft the block with DsparkBody ──────────────────────────────
         let x_head_out = gpu
@@ -943,6 +966,7 @@ impl MtpDrafter for DsparkDrafter {
             gpu,
             &self.weights,
             main_hidden,
+            &ctx_positions,
             seed,
             position,
             block,
@@ -986,43 +1010,38 @@ impl MtpDrafter for DsparkDrafter {
         let n_proposed = drafts.len();
 
         // ── 4. Verify: target forward over [seed, draft0..draft_{n-1}] ───────
-        // The target runs through `capture_seed_main_hidden` for the NEXT seed
-        // (the bonus) inside the NEXT window's bootstrap; the verify forward here
-        // does NOT need to capture (no verify_block hidden_out). We use
-        // spec_advance with no hidden_out: advance from `position` over
-        // verify_tokens, getting back the last argmax (the bonus token).
-        //
-        // BUT: we need per-slot target argmaxes for accept_greedy_prefix, not
-        // just the last one. `spec_advance` returns only the final argmax.
-        //
-        // Use the generic `verify_block` path instead: it returns per-slot
-        // argmaxes (`argmax[i]` = target's prediction after consuming block[0..=i]).
-        // We don't need a SpecScratch because for DSpark the verify is a plain
-        // prefill (no recurrent rewind needed — the trunk is stateless-attention
-        // in this window's view). Use `target.new_spec_scratch` to get an arch
-        // scratch, then call `verify_block`.
-        //
-        // However: after verify_block, the target's KV is advanced by
-        // verify_tokens.len() positions. For DSpark (like deepseek4's drafter)
-        // the next window's seed is the BONUS token — a fresh token whose KV
-        // slot is the NEXT position after the committed prefix. Since we commit
-        // only the accepted prefix + bonus, we set n_tokens to
-        // position + committed.len() AFTER accept, which is correct.
-        //
-        // We use `spec_advance` for the verify pass and reconstruct per-slot
-        // target_pick by running the FULL verify+argmax in one pass, accepting
-        // that we only get the LAST argmax from spec_advance. This is NOT
-        // sufficient for multi-slot acceptance. We MUST use verify_block.
+        // Capture the target's hidden states at extract layers for ALL verified
+        // positions.  After acceptance, positions 0..=accepted (accepted+1 slots)
+        // become the NEXT window's multi-slot context (reference `_update`).
+        // The hidden_out format: (verify_tokens.len()) × (n_targets × hidden)
+        // row-major — one (n_targets × hidden) row per consumed position.
         let verify_tokens: Vec<u32> = std::iter::once(seed)
             .chain(drafts.iter().copied())
             .collect();
+        let n_verify = verify_tokens.len(); // seed + n_proposed drafts
 
-        let mut scratch = target.new_spec_scratch(gpu, verify_tokens.len())?;
-        // hidden_out=None: we don't need the hidden states for the generic verify
-        // (the next window's bootstrap re-captures via capture_seed_main_hidden).
+        let mut scratch = target.new_spec_scratch(gpu, n_verify)?;
+        // Capture hidden for context update — only when n_verify >= 4 (the
+        // batched-forward threshold in llama_spec::verify_block_argmax).  Below
+        // that threshold the batched path is ineligible and hidden capture would
+        // panic.  When we can't capture here we fall back to `capture_seed_main_hidden`
+        // after accept (ctx_len=1 bootstrap for the next window — same as Stage 1).
+        // With block_size=7 the common case (n_proposed ≥ 3) always captures;
+        // only low-confidence-truncated windows (n_proposed=1..2) use the fallback.
+        let capture_eligible = n_verify >= 4;
+        let mut hidden_capture: Vec<f32> = Vec::new();
         let t_verify = self.profiler.sync_start(gpu);
-        let target_pick =
-            target.verify_block(gpu, &verify_tokens, position, scratch.as_mut(), None)?;
+        let target_pick = target.verify_block(
+            gpu,
+            &verify_tokens,
+            position,
+            scratch.as_mut(),
+            if capture_eligible {
+                Some(&mut hidden_capture)
+            } else {
+                None
+            },
+        )?;
         self.profiler.sync_end(gpu, t_verify, 3);
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
@@ -1039,11 +1058,50 @@ impl MtpDrafter for DsparkDrafter {
         let accept_len = n_accepted; // accepted drafts; bonus is at accept_len
         target.commit_prefix(gpu, &verify_tokens, accept_len, position, scratch.as_mut())?;
         scratch.free(gpu);
-        self.profiler.sync_end(gpu, t_rest, 4);
 
-        // Invalidate the cached main_hidden — the next seed (the bonus) is a
-        // fresh token whose hidden will be captured by the next window's bootstrap.
-        self.main_hidden_pos = None;
+        // ── 7. Update multi-slot context for the NEXT window ─────────────────
+        // Reference `_update`: next ctx = verify hidden at accepted prefix
+        // (positions 0..=accepted, i.e. accepted+1 slots).
+        // Each slot contributes n_targets * hidden floats (row = concat of
+        // extract-layer hiddens at that position).
+        // Cap ctx_len to block+1 (the scratch `max_ctx_len` in the qwen3 body).
+        let new_ctx_len_raw = accept_len + 1; // seed + accepted drafts
+        let new_ctx_len = new_ctx_len_raw.min(block + 1);
+        let expected_hidden_per_pos = n_targets * hidden;
+        let expected_total = n_verify * expected_hidden_per_pos;
+        if !hidden_capture.is_empty() && hidden_capture.len() == expected_total {
+            // Slice the first new_ctx_len positions from the captured hidden.
+            // We take the LAST new_ctx_len slots of the accepted prefix when
+            // the full ctx_len_raw > block+1 (cap); in practice block+1 is
+            // usually ≥ accepted+1, so no truncation.
+            let start_slot = new_ctx_len_raw - new_ctx_len; // 0 in normal case
+            let n_floats = new_ctx_len * expected_hidden_per_pos;
+            let src_offset = start_slot * expected_hidden_per_pos;
+            let slice = &hidden_capture[src_offset..src_offset + n_floats];
+            let dev = upload_f32(gpu, slice)?;
+            if let Some(old) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.main_hidden_dev = Some(dev);
+            // ctx positions: position + start_slot .. position + start_slot + new_ctx_len
+            self.ctx_positions = (start_slot..start_slot + new_ctx_len)
+                .map(|s| position + s)
+                .collect();
+        } else {
+            // Hidden capture not available (n_verify < 4 or deepseek4): clear the
+            // context so the NEXT window bootstraps via `capture_seed_main_hidden`
+            // with the bonus token as seed.  That bootstrap is KV-correct (the
+            // commit_prefix leaves KV at the committed prefix; the next
+            // `mtp_step` call receives seed=bonus, position=committed_end, so
+            // `capture_seed_main_hidden` advances the KV by exactly 1 for the
+            // bonus, which is the right thing).  This is the Stage 1 behaviour
+            // and is correct — just forfeits the multi-slot ctx for one window.
+            if let Some(old) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.ctx_positions.clear();
+        }
+        self.profiler.sync_end(gpu, t_rest, 4);
         self.profiler.end_window();
 
         Ok(MtpWindow {
@@ -1053,9 +1111,12 @@ impl MtpDrafter for DsparkDrafter {
         })
     }
 
-    fn mtp_reset(&mut self, _gpu: &mut Gpu) {
-        // Invalidate the cached main_hidden so the next prefill re-bootstraps.
-        self.main_hidden_pos = None;
+    fn mtp_reset(&mut self, gpu: &mut Gpu) {
+        // Clear multi-slot context so the next prefill re-bootstraps.
+        if let Some(dev) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(dev);
+        }
+        self.ctx_positions.clear();
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1101,7 +1162,7 @@ pub fn build_dspark_speculator(
         block,
         ctx_capacity,
         main_hidden_dev: None,
-        main_hidden_pos: None,
+        ctx_positions: Vec::new(),
         profiler: DsparkProfiler::new(),
     }))
 }
