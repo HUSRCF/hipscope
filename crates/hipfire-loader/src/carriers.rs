@@ -637,17 +637,65 @@ impl Carrier for LlamaCarrier {
         }
 
         // ── single shared tail ──
-        // If a DFlash draft (arch_id=20 HFQ) is configured for this dense llama/qwen3
-        // target, build the target-generic chain DFlash speculator. This wins over n-gram
-        // (mirrors qwen35's dflash-over-ngram precedence) and is set directly — not through
-        // build_speculator — because build_speculator's `dflash` param is qwen35-typed
-        // (DflashState) and cannot carry the generic Box<dyn Speculator>.
+        // Precedence (arch_id=0/1): DSpark > DFlash > n-gram.
         //
-        // If no DFlash draft is present (or it isn't arch_id=20), fall through to
-        // build_speculator for the opt-in n-gram arm (HIPFIRE_NGRAM_DRAFT=1).
-        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if let Some(dp) =
-            ctx.draft_path
+        // DSpark sidecar speculator: present when the `-dspark` sidecar was loaded
+        // (bundle.dspark_weights.is_some()) AND speculation is not explicitly disabled.
+        // Consumes the assets from the bundle (moves them into the speculator body).
+        //
+        // If no DSpark sidecar is available, fall through to:
+        // - DFlash generic speculator (arch_id=20 draft).
+        // - Opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1).
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if bundle
+            .dspark_weights
+            .is_some()
+            && ctx.spec.dspark != Some(false)
         {
+            let dspark_weights = bundle.dspark_weights.take().unwrap();
+            let assets = bundle.dspark_assets.take().unwrap();
+            let block = dspark_weights.cfg.block_size;
+            let vocab = assets.config.vocab_size;
+
+            // stage_norm = drafter's final `norm.weight` (output_norm in the sidecar).
+            // Shallow-clone so the LlamaWeights (assets) owns the primary GpuTensor;
+            // the speculator holds an alias that is freed before the weights on unload.
+            let stage_norm = assets.weights.output_norm.shallow_clone();
+
+            // lm_head fix: assets.weights.output.buf.dtype == Raw (upload_raw always
+            // sets Raw), but the actual data layout is F16.  run_heads dispatches on
+            // GpuTensor.dtype, so we shallow_clone and fix the dtype + shape here.
+            // (The parity harness does the same at qwen3_dspark_parity.rs:215-217.)
+            let mut lm_head = assets.weights.output.buf.shallow_clone();
+            lm_head.dtype = rdna_compute::DType::F16;
+            lm_head.shape = vec![vocab];
+
+            // conf_threshold ladder: env > CLI arg > 0.5
+            let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(ctx.spec.dspark_conf_threshold)
+                .unwrap_or(0.5f32);
+
+            eprintln!(
+                "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
+                block, conf_threshold
+            );
+            let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+                assets,
+                &dspark_weights.cfg,
+                ctx.gpu,
+            )
+            .map_err(|e| format!("llama DSpark body build failed: {e}"))?;
+            Some(hipfire_runtime::dspark_core::build_dspark_speculator(
+                body,
+                dspark_weights,
+                stage_norm,
+                lm_head,
+                block,
+                ctx.max_seq,
+                conf_threshold,
+            ))
+        } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder
             // opens it again internally.
             match hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(dp)) {
