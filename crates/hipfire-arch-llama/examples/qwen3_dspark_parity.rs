@@ -157,6 +157,10 @@ fn main() -> Result<(), String> {
     let check_a = parity_stats("(a) main_x", &gpu_main_x, &cpu_main_x, 0.999, None);
 
     // ── Check (b): x_head_out from dspark_qwen3_block_forward ─────────────────
+    // After the double-norm fix, dspark_qwen3_block_forward returns PRE-final-norm
+    // hidden states. run_heads applies stage_norm (= output_norm) exactly once.
+    // For check (b) we apply stage_norm to the GPU body output and compare to
+    // cpu_x_head (= model.norm(hidden) = single-norm, from _forward_backbone).
     // Allocate as [BLOCK, dim] (2-D) so run_heads can infer hidden = dim via shape.last().
     let scratch = Qwen3DsparkScratch::new(&mut gpu, &assets.config, BLOCK)
         .map_err(|e| format!("Qwen3DsparkScratch::new: {e}"))?;
@@ -175,13 +179,32 @@ fn main() -> Result<(), String> {
         &scratch,
         &x_head_dev,
     )?;
-    let gpu_x_head = gpu
-        .download_f32(&x_head_dev)
-        .map_err(|e| format!("d2h x_head: {e:?}"))?;
-    let check_b = parity_stats("(b) x_head_out", &gpu_x_head, &cpu_x_head, 0.999, None);
+    // Apply output_norm once to get normed x_head (= what run_heads sees as input to lm_head).
+    let stage_norm_ref = &assets.weights.output_norm;
+    let x_head_normed_dev = gpu
+        .alloc_tensor(&[BLOCK, dim], DType::F32)
+        .map_err(|e| format!("alloc x_head_normed: {e:?}"))?;
+    gpu.rmsnorm_batched(
+        &x_head_dev,
+        stage_norm_ref,
+        &x_head_normed_dev,
+        BLOCK,
+        dim,
+        assets.config.norm_eps,
+    )
+    .map_err(|e| format!("rmsnorm x_head (b): {e:?}"))?;
+    let gpu_x_head_normed = gpu
+        .download_f32(&x_head_normed_dev)
+        .map_err(|e| format!("d2h x_head_normed: {e:?}"))?;
+    let check_b = parity_stats(
+        "(b) x_head (normed once)",
+        &gpu_x_head_normed,
+        &cpu_x_head,
+        0.999,
+        None,
+    );
 
     // ── Check (c) + (d): run_heads → markov tokens + confidence ───────────────
-    let stage_norm_ref = &assets.weights.output_norm;
 
     // The lm_head in LlamaWeights is a WeightTensor whose buf.dtype=Raw (upload_raw
     // always sets Raw), but the actual weight data is F16 (WeightTensor.gpu_dtype=F16).
@@ -260,6 +283,7 @@ fn main() -> Result<(), String> {
     let _ = gpu.free_tensor(main_x_dev);
     scratch.free_gpu(&mut gpu);
     let _ = gpu.free_tensor(x_head_dev);
+    let _ = gpu.free_tensor(x_head_normed_dev);
 
     let all_pass = check_a.pass && check_b.pass && tokens_match && check_d.pass;
     if all_pass {

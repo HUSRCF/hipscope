@@ -598,7 +598,8 @@ impl Qwen3DsparkScratch {
 /// * `seed_position` — absolute KV position of the seed token.
 /// * `block`   — number of block slots (= block_size in practice).
 /// * `scratch` — pre-allocated [`Qwen3DsparkScratch`].
-/// * `x_head_out` — `[block × dim]` F32 output (post-final-norm hidden states).
+/// * `x_head_out` — `[block × dim]` F32 output (pre-final-norm hidden states).
+///                  Callers (e.g. `run_heads`) apply `stage_norm` exactly once.
 pub fn dspark_qwen3_block_forward(
     gpu: &mut Gpu,
     drafter: &LlamaWeights,
@@ -1068,17 +1069,15 @@ pub fn dspark_qwen3_block_forward(
         }
     }
 
-    // ── 3. Final norm: output_norm(x_batch) → x_head_out  ─────────────────────
-    // modeling.py:386  `return self.norm(hidden_states)`
-    // Apply drafter.output_norm (= sidecar `norm.weight`) to each of the `block`
-    // rows in pbs.x_batch, writing into x_head_out[block × dim].
-    for i in 0..block {
-        // sub_offset(i*dim, dim): row i of x_batch / x_head_out (F32, offset in elements).
-        let x_row = scratch.pbs.x_batch.sub_offset(i * dim, dim);
-        let out_row = x_head_out.sub_offset(i * dim, dim);
-        gpu.rmsnorm_f32(&x_row, &drafter.output_norm, &out_row, config.norm_eps)
-            .map_err(|e| format!("dspark_qwen3: output_norm[{i}]: {e:?}"))?;
-    }
+    // ── 3. Copy x_batch → x_head_out  ─────────────────────────────────────────
+    // x_head_out carries the PRE-final-norm hidden states. The single final
+    // RMSNorm (`stage_norm` = `output_norm`) is applied once downstream by
+    // `run_heads`, matching modeling.py:386 `return self.norm(hidden_states)`
+    // followed by `compute_logits(output_hidden) = lm_head(output_hidden)` —
+    // no second norm between `_forward_backbone`'s return and `lm_head`.
+    let n_bytes = block * dim * std::mem::size_of::<f32>();
+    gpu.copy_d2d(&scratch.pbs.x_batch, x_head_out, n_bytes)
+        .map_err(|e| format!("dspark_qwen3: x_batch → x_head_out copy: {e:?}"))?;
 
     Ok(())
 }

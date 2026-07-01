@@ -443,9 +443,10 @@ pub fn run_heads(
         let _ = gpu.free_tensor(r);
     }
     let _ = gpu.free_tensor(x_f16);
-    let _ = gpu.free_tensor(normed);
+    // `normed` is kept alive until after the loop: the confidence head
+    // reads normed[i] per slot (modeling.py uses once-normed hidden for confidence).
     // `logits_dev` stays resident: the markov loop adds each slot's bias
-    // and argmaxes ON-GPU. Freed after the loop.
+    // and argmaxes ON-GPU. Both freed after the loop.
 
     // ── Sequential markov in-block sampling (greedy) ─────────────────────
     // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
@@ -481,12 +482,15 @@ pub fn run_heads(
         // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank] (unrotated).
         dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
 
-        // Confidence slot i ON GPU: stage [x_head[i] ++ markov_embed[i]] then
+        // Confidence slot i ON GPU: stage [normed[i] ++ markov_embed[i]] then
         // a 1-row `confidence_proj` gemv → conf_batch[i]. Uses the UNROTATED
         // emb_dev (matches the reference which dotted the raw markov embed).
+        // Uses `normed` (once-normed hidden), matching modeling.py which feeds
+        // output_hidden (= _forward_backbone result = self.norm(hidden)) to
+        // predict_confidence_step — not the pre-norm x_head.
         if cfg.enable_confidence {
             if let Some(confidence_proj) = weights.confidence_proj.as_ref() {
-                let xh_i = x_head.sub_offset(i * hidden, hidden);
+                let xh_i = normed.sub_offset(i * hidden, hidden);
                 let c_hidden = concat_dev.sub_offset(0, hidden);
                 let c_markov = concat_dev.sub_offset(hidden, markov_rank);
                 gpu.memcpy_dtod_auto(&c_hidden.buf, &xh_i.buf, hidden * 4)
@@ -539,6 +543,7 @@ pub fn run_heads(
     let _ = gpu.free_tensor(emb_dev);
     let _ = gpu.free_tensor(bias_dev);
     let _ = gpu.free_tensor(logits_dev);
+    let _ = gpu.free_tensor(normed);
     if let Some(r) = emb_rot {
         let _ = gpu.free_tensor(r);
     }
