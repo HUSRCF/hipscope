@@ -31,10 +31,10 @@
 //! ## Sidecar tensor layout (flat — no `model.` prefix)
 //!
 //! ```text
-//! layers.{0..4}.self_attn.{q,k,v,o}_proj.weight   (qt=3, MQ4G256)
+//! layers.{0..4}.self_attn.{q,k,v,o}_proj.weight   (qt=3, Q8_0/Q8F16 — 8-bit: F16 scale + 32×i8)
 //! layers.{0..4}.self_attn.{q,k}_norm.weight        (qt=1, F16 → F32)
 //! layers.{0..4}.{input_layernorm,post_attention_layernorm}.weight  (qt=1)
-//! layers.{0..4}.mlp.{gate,up,down}_proj.weight     (qt=3)
+//! layers.{0..4}.mlp.{gate,up,down}_proj.weight     (qt=3, Q8_0/Q8F16)
 //! embed_tokens.weight                              (qt=1, F16 → F32)
 //! main_proj.weight                                 (qt=1, F16)
 //! main_norm.weight                                 (qt=1, F16 → F32)
@@ -566,8 +566,20 @@ impl Qwen3DsparkScratch {
 /// `apply_rotary_pos_emb` (modeling.py:34–40) takes `cos/sin` shaped
 /// `[1+block, head_dim]` (computed from full position_ids = [seed_pos,
 /// seed_pos+1, ..., seed_pos+block]).  For Q it uses the LAST `q_len` entries
-/// (`cos[..., -q_len:, :]`), i.e. the block positions `seed_pos+1..=+block`.
-/// For K it uses the full sequence.
+/// (`cos[..., -q_len:, :]`), selecting entries at indices 1..=block of the
+/// `position_ids` tensor, i.e. positions `seed_pos+1..=seed_pos+block`.
+/// For K it uses the full sequence (all 1+block entries).
+///
+/// The convention implemented here (block slot `i` → position `seed_position+1+i`,
+/// per `dspark_core.rs:600`) uses a +1 block-slot offset so that block slot 0
+/// gets `seed_pos+1`, block slot 1 gets `seed_pos+2`, etc.
+///
+/// // PARITY-VERIFY: Task 9's GPU-vs-CPU parity (against modeling.py's
+/// // `create_position_ids`) MUST confirm: (a) this +1 block-slot offset is
+/// // correct, and (b) the single-vector context-row position (`seed_pos`) is
+/// // correct, since the engine collapses the reference's full-prefix context
+/// // into one `main_x` vector.  Do NOT change the numeric positions here
+/// // until parity is established — the parity harness is the arbiter.
 ///
 /// Implemented here via two `rope_batched_f32` calls:
 ///   - Q: positions_q_block = [seed_pos+1, ..., seed_pos+block]
@@ -890,16 +902,47 @@ pub(crate) fn dspark_qwen3_block_forward(
         // ── 2i. o_proj(attn_out) + residual  ──────────────────────────────────
         // modeling.py:148–150  `attn_output = attn_output.reshape(...)` then `o_proj`
         // modeling.py:194      `hidden_states = residual + hidden_states`
-        // gemm_hfq4g256_residual handles the MQ4 o_proj + residual accumulation.
-        gpu.gemm_hfq4g256_residual(
-            &layer.wo.buf,
-            &scratch.pbs.fa_attn_out_batch,
-            &scratch.pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            block,
-        )
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj: {e:?}"))?;
+        // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2761–2826):
+        // Q8_0 weights use gemm_q8_0_residual_wmma (WMMA arch) or
+        // gemm_q8_0_batched_chunked+add_inplace_f32 (non-WMMA); HFQ4G256 otherwise.
+        let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+        let q8_wmma_arch = gpu.arch_caps.has_wmma();
+        if wo_is_q8 && q8_wmma_arch {
+            let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.wo.m);
+            gpu.gemm_q8_0_residual_wmma(
+                &layer.wo.buf,
+                &scratch.pbs.fa_attn_out_batch,
+                &x_n,
+                layer.wo.m,
+                layer.wo.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (q8 wmma): {e:?}"))?;
+        } else if wo_is_q8 {
+            let tmp = scratch.pbs.x_rot_batch.sub_offset(0, block * layer.wo.m);
+            gpu.gemm_q8_0_batched_chunked(
+                &layer.wo.buf,
+                &scratch.pbs.fa_attn_out_batch,
+                &tmp,
+                layer.wo.m,
+                layer.wo.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (q8 chunked): {e:?}"))?;
+            let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &tmp)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj residual add: {e:?}"))?;
+        } else {
+            gpu.gemm_hfq4g256_residual(
+                &layer.wo.buf,
+                &scratch.pbs.fa_attn_out_batch,
+                &scratch.pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (hfq4): {e:?}"))?;
+        }
 
         // ── 2j. post_attention_layernorm(x_batch) → x_rot_batch  ──────────────
         // modeling.py:196  `hidden_states = self.post_attention_layernorm(hidden_states)`
@@ -916,18 +959,55 @@ pub(crate) fn dspark_qwen3_block_forward(
         // ── 2k. MLP SwiGLU: gate/up → silu_mul → down + residual  ─────────────
         // modeling.py:197  `hidden_states = self.mlp(hidden_states)` (Qwen3MLP = SwiGLU)
         // modeling.py:198  `return residual + hidden_states`
-        gpu.gemm_gate_up_hfq4g256(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &scratch.pbs.x_rot_batch,
-            &scratch.pbs.gate_ffn_batch,
-            &scratch.pbs.up_batch,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-            block,
-        )
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate_up: {e:?}"))?;
+        // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2838–2939):
+        // Q8_0 → gemm_gate_up_q8_0_wmma (WMMA) or two gemm_q8_0_batched_chunked calls.
+        let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+        if ffn_is_q8 && q8_wmma_arch {
+            gpu.gemm_gate_up_q8_0_wmma(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &scratch.pbs.x_rot_batch,
+                &scratch.pbs.gate_ffn_batch,
+                &scratch.pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate_up (q8 wmma): {e:?}"))?;
+        } else if ffn_is_q8 {
+            gpu.gemm_q8_0_batched_chunked(
+                &layer.w_gate.buf,
+                &scratch.pbs.x_rot_batch,
+                &scratch.pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate (q8 chunked): {e:?}"))?;
+            gpu.gemm_q8_0_batched_chunked(
+                &layer.w_up.buf,
+                &scratch.pbs.x_rot_batch,
+                &scratch.pbs.up_batch,
+                layer.w_up.m,
+                layer.w_up.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: up (q8 chunked): {e:?}"))?;
+        } else {
+            gpu.gemm_gate_up_hfq4g256(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &scratch.pbs.x_rot_batch,
+                &scratch.pbs.gate_ffn_batch,
+                &scratch.pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate_up (hfq4): {e:?}"))?;
+        }
 
         gpu.silu_mul_f32(
             &scratch.pbs.gate_ffn_batch,
@@ -936,15 +1016,48 @@ pub(crate) fn dspark_qwen3_block_forward(
         )
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: silu_mul: {e:?}"))?;
 
-        gpu.gemm_hfq4g256_residual(
-            &layer.w_down.buf,
-            &scratch.pbs.ffn_hidden_batch,
-            &scratch.pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            block,
-        )
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down: {e:?}"))?;
+        // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2947–3020):
+        // Q8_0 → gemm_q8_0_residual_wmma (WMMA) or gemm_q8_0_batched_chunked+add_inplace.
+        let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+        if w_down_is_q8 && q8_wmma_arch {
+            let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.w_down.m);
+            gpu.gemm_q8_0_residual_wmma(
+                &layer.w_down.buf,
+                &scratch.pbs.ffn_hidden_batch,
+                &x_n,
+                layer.w_down.m,
+                layer.w_down.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down (q8 wmma): {e:?}"))?;
+        } else if w_down_is_q8 {
+            let tmp = scratch
+                .pbs
+                .x_rot_batch
+                .sub_offset(0, block * layer.w_down.m);
+            gpu.gemm_q8_0_batched_chunked(
+                &layer.w_down.buf,
+                &scratch.pbs.ffn_hidden_batch,
+                &tmp,
+                layer.w_down.m,
+                layer.w_down.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down (q8 chunked): {e:?}"))?;
+            let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.w_down.m);
+            gpu.add_inplace_f32(&x_n, &tmp)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down residual add: {e:?}"))?;
+        } else {
+            gpu.gemm_hfq4g256_residual(
+                &layer.w_down.buf,
+                &scratch.pbs.ffn_hidden_batch,
+                &scratch.pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down (hfq4): {e:?}"))?;
+        }
     }
 
     // ── 3. Final norm: output_norm(x_batch) → x_head_out  ─────────────────────
