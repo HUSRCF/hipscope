@@ -22,6 +22,10 @@ pub struct DsparkConfig {
     /// deepseek4's original behavior (byte-identical baseline from task-5).
     /// Default: false (deepseek4-preserving).
     pub confidence_uses_normed: bool,
+    /// RMSNorm epsilon used in `main_proj_ingest` and `run_heads`.
+    /// Both DeepSeek V4 and Qwen3 use 1e-6; set per-arch at construction time
+    /// so callers can plumb the model's actual config value.
+    pub rms_norm_eps: f32,
 }
 
 impl DsparkConfig {
@@ -37,6 +41,7 @@ impl DsparkConfig {
     /// `dspark_confidence_uses_normed` (defaults to `false` — callers that
     /// need the once-normed input, e.g. qwen3, must set this explicitly after
     /// parsing or emit it in the sidecar metadata).
+    /// `norm_eps` (defaults to `1e-6` — compatible with both DeepSeek V4 and Qwen3).
     pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
         let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let cfg = wrapper.get("config")?;
@@ -60,6 +65,11 @@ impl DsparkConfig {
             .get("dspark_confidence_uses_normed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let rms_norm_eps = cfg
+            .get("norm_eps")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1e-6f32);
         Some(Self {
             block_size,
             target_layer_ids,
@@ -67,6 +77,7 @@ impl DsparkConfig {
             noise_token_id,
             enable_confidence,
             confidence_uses_normed,
+            rms_norm_eps,
         })
     }
 }
@@ -217,7 +228,7 @@ fn gemv_auto_batched_wmma(
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
         DType::Q8_0 => {
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA")
+            let wmma_on = std::env::var("HIPFIRE_DSPARK_Q8_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on && gpu.arch_caps.is_rdna4() {
@@ -225,7 +236,7 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
+                    let opt_out = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -246,7 +257,7 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
+                    let opt_out_4w = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -277,7 +288,7 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
+            let wmma_on = std::env::var("HIPFIRE_DSPARK_HFQ4_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on {
@@ -346,8 +357,8 @@ pub fn main_proj_ingest(
         gemv_auto(gpu, main_proj, main_hidden, main_hidden, out, dim, concat_w)?;
     }
 
-    // main_norm RMSNorm in place. Use 1e-6 (compatible with deepseek4 + qwen3).
-    gpu.rmsnorm_f32(out, main_norm, out, 1e-6f32)
+    // main_norm RMSNorm in place.
+    gpu.rmsnorm_f32(out, main_norm, out, weights.cfg.rms_norm_eps)
         .map_err(|e| format!("main_proj_ingest main_norm: {e:?}"))?;
 
     Ok(())
@@ -420,10 +431,7 @@ pub fn run_heads(
     let normed = gpu
         .alloc_tensor(&[block, hidden], DType::F32)
         .map_err(|e| format!("run_heads alloc normed: {e:?}"))?;
-    // rms_norm_eps: use a sensible default; callers that need per-arch eps
-    // should extend DsparkConfig. For now 1e-6 is compatible with both
-    // DeepSeek V4 and Qwen3.
-    let rms_norm_eps = 1e-6f32;
+    let rms_norm_eps = cfg.rms_norm_eps;
     gpu.rmsnorm_batched(x_head, stage_norm, &normed, block, hidden, rms_norm_eps)
         .map_err(|e| format!("run_heads final rmsnorm: {e:?}"))?;
 

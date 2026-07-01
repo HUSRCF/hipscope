@@ -1033,7 +1033,7 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
-pub fn load_weight_tensor(
+pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
     name: &str,

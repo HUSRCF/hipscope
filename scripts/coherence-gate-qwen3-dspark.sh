@@ -271,6 +271,13 @@ JL
         status="HARD-FAIL"
         hard_errors=$((hard_errors+1))
     fi
+    # Hard-fail if the DSpark speculator was not engaged: a missing sidecar silently
+    # falls back to AR, producing false-green results for the gate.
+    if [ -z "$dspark_active" ]; then
+        echo "HARD FAIL: DSpark speculator not engaged for row $label" >&2
+        status="HARD-FAIL(dspark-not-engaged)"
+        hard_errors=$((hard_errors+1))
+    fi
     tier3_flag=$(echo "$detector" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('FLAG' if d.get('tier3_3gram_flag') else 'ok')" 2>/dev/null || echo "?")
     if [ "$status" = "OK" ] && [ "$tier3_flag" = "FLAG" ]; then
         status="OK(tier3-soft-flag)"

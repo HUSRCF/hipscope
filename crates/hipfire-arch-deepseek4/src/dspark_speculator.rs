@@ -242,6 +242,7 @@ pub fn build_deepseek4_dspark_speculator(
             noise_token_id: dspark.cfg.noise_token_id,
             enable_confidence: true, // deepseek4 always has a confidence head
             confidence_uses_normed: false, // deepseek4 uses pre-norm x_head (byte-identical to task-5)
+            rms_norm_eps: config.rms_norm_eps, // 1e-6 from deepseek4 config (byte-identical)
         },
         main_proj: dspark.main_proj.as_ref().map(|t| t.shallow_clone()),
         main_norm: dspark.main_norm.as_ref().map(|t| t.shallow_clone()),

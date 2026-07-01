@@ -220,8 +220,10 @@ pub fn load_qwen3_dspark(
 
     // qwen3 reference modeling.py feeds once-normed hidden (self.norm(hidden))
     // to predict_confidence_step; set the flag so run_heads uses normed[i].
+    // Also pin rms_norm_eps from the derived drafter config (1e-6 for qwen3).
     let mut qwen3_cfg = dspark_cfg.clone();
     qwen3_cfg.confidence_uses_normed = true;
+    qwen3_cfg.rms_norm_eps = cfg.norm_eps;
 
     let dspark_weights = DsparkWeights {
         cfg: qwen3_cfg,
