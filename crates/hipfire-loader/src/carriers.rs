@@ -669,12 +669,14 @@ impl Carrier for LlamaCarrier {
             lm_head.dtype = rdna_compute::DType::F16;
             lm_head.shape = vec![vocab];
 
-            // conf_threshold ladder: env > CLI arg > 0.5
+            // conf_threshold ladder: env > CLI arg > 0.1
+            // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
+            // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
             let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or(ctx.spec.dspark_conf_threshold)
-                .unwrap_or(0.5f32);
+                .unwrap_or(0.1f32);
 
             eprintln!(
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
