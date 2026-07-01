@@ -302,6 +302,51 @@ impl SpecTarget for LlamaBundle {
         LlamaBundle::set_dflash_extract_layers(self, layers);
     }
 
+    /// Capture the target's residual hidden states at `layers` for a single
+    /// seed token at `position`, returning the concatenated `[layers.len()*dim]` F32.
+    ///
+    /// Runs a 1-token capture-armed forward via
+    /// `forward_scratch_embed` + `forward_scratch_compute_capture`, reusing the
+    /// same `HiddenCaptureSink` path as `spec_advance`. The `layers` parameter
+    /// comes from the generic drafter's `DsparkConfig::target_layer_ids` and may
+    /// differ from `self.dflash_extract_layers` (e.g. when the bundle was not
+    /// configured as a DFlash target), so we use the argument directly rather
+    /// than `self.dflash_extract_layers`.
+    fn capture_seed_main_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        seed: u32,
+        position: usize,
+        layers: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        let mut hidden_out: Vec<f32> = Vec::new();
+        let mut sink = llama::HiddenCaptureSink {
+            extract_layers: layers,
+            hidden: &mut hidden_out,
+        };
+        llama::forward_scratch_embed(
+            gpu,
+            &self.weights,
+            &self.config,
+            seed,
+            position,
+            &self.scratch,
+        )
+        .map_err(|e| format!("capture_seed_main_hidden embed: {e:?}"))?;
+        llama::forward_scratch_compute_capture(
+            gpu,
+            &self.weights,
+            &self.config,
+            position,
+            &mut self.kv,
+            &self.scratch,
+            Some(&mut sink),
+        )
+        .map_err(|e| format!("capture_seed_main_hidden compute: {e:?}"))?;
+        // hidden_out should now hold layers.len() * dim floats (one dim-vector per layer).
+        Ok(hidden_out)
+    }
+
     fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
         // Look up one embedding row into the per-token scratch `x` (`[dim]` F32),
         // dispatching on the table's storage format, then download to host. Used

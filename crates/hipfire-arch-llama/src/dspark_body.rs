@@ -53,7 +53,9 @@
 //!    `DsparkConfig::from_metadata_json` (in dspark_core) reads it; deepseek4's
 //!    local `DsparkConfig` hardcodes `enable_confidence: true`.
 
-use hipfire_runtime::dspark_core::{DsparkConfig, DsparkWeights};
+use hipfire_runtime::dspark_core::{
+    main_proj_ingest, noise_block_ids, DsparkBody, DsparkConfig, DsparkWeights,
+};
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
     weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
@@ -428,17 +430,17 @@ pub struct Qwen3DsparkScratch {
     pub all_v: GpuTensor,
 
     /// KV positions for the combined [ctx ++ block] sequence,
-    /// shape [1+block_size], as i32-in-F32.  Set to [seed_pos, seed_pos+1, ...,
-    /// seed_pos+block] on each call.  Used for:
+    /// shape [1+block_size], as i32-in-F32.  Set to
+    /// [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1] on each call
+    /// (ctx=seed_pos, block=seed_pos..=seed_pos+block-1, matching
+    /// full_position_ids from create_position_ids). Used for:
     ///   1. RoPE on the concatenated K (modeling.py:116 applies RoPE to all k).
     ///   2. Q8_0 KV-cache write (kv_cache_write_q8_0_batched positions arg).
     pub positions_kv_all: GpuTensor,
 
     /// Block query RoPE positions [block_size] i32-in-F32.
-    /// = [seed_pos+1, seed_pos+2, ..., seed_pos+block].
-    /// Separate from positions_kv_all because rope_batched_f32 takes one
-    /// positions buffer for [Q++K] jointly, and we need Q-only positions for
-    /// the block queries.
+    /// = [seed_pos, seed_pos+1, ..., seed_pos+block-1].
+    /// Matches Q positions from apply_rotary_pos_emb (cos[..., -q_len:, :]).
     pub positions_q_block: GpuTensor,
 
     /// Compact attention positions [block_size] i32-in-F32 = [1, 2, ..., block].
@@ -570,21 +572,15 @@ impl Qwen3DsparkScratch {
 /// `position_ids` tensor, i.e. positions `seed_pos+1..=seed_pos+block`.
 /// For K it uses the full sequence (all 1+block entries).
 ///
-/// The convention implemented here (block slot `i` → position `seed_position+1+i`,
-/// per `dspark_core.rs:600`) uses a +1 block-slot offset so that block slot 0
-/// gets `seed_pos+1`, block slot 1 gets `seed_pos+2`, etc.
-///
-/// // PARITY-VERIFY: Task 9's GPU-vs-CPU parity (against modeling.py's
-/// // `create_position_ids`) MUST confirm: (a) this +1 block-slot offset is
-/// // correct, and (b) the single-vector context-row position (`seed_pos`) is
-/// // correct, since the engine collapses the reference's full-prefix context
-/// // into one `main_x` vector.  Do NOT change the numeric positions here
-/// // until parity is established — the parity harness is the arbiter.
+/// The convention follows `create_position_ids` exactly: block slot `i` gets
+/// position `seed_pos + i` (0-indexed), so block slot 0 = `seed_pos`,
+/// block slot 1 = `seed_pos+1`, etc.  This was confirmed by Task-9 GPU-vs-CPU
+/// parity against the real `Qwen3DSparkModel._forward_backbone` reference.
 ///
 /// Implemented here via two `rope_batched_f32` calls:
-///   - Q: positions_q_block = [seed_pos+1, ..., seed_pos+block]
-///   - K: positions_kv_all  = [seed_pos, seed_pos+1, ..., seed_pos+block]
-///     (1 ctx row at seed_pos + block rows at seed_pos+1..=+block)
+///   - Q: positions_q_block = [seed_pos, ..., seed_pos+block-1]
+///   - K: positions_kv_all  = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]
+///     (1 ctx row at seed_pos + block rows at seed_pos..=seed_pos+block-1)
 ///
 /// ## Bidirectional mask
 ///
@@ -603,7 +599,7 @@ impl Qwen3DsparkScratch {
 /// * `block`   — number of block slots (= block_size in practice).
 /// * `scratch` — pre-allocated [`Qwen3DsparkScratch`].
 /// * `x_head_out` — `[block × dim]` F32 output (post-final-norm hidden states).
-pub(crate) fn dspark_qwen3_block_forward(
+pub fn dspark_qwen3_block_forward(
     gpu: &mut Gpu,
     drafter: &LlamaWeights,
     config: &LlamaConfig,
@@ -626,11 +622,23 @@ pub(crate) fn dspark_qwen3_block_forward(
     let kv_cap = 1 + block; // compact slots: 0=ctx, 1..=block=block rows
 
     // ── 0. Upload positions ────────────────────────────────────────────────────
+    //
+    // RoPE positions match modeling.py's create_position_ids + the full
+    // position_ids = cat([ctx_pos], create_position_ids([anchor_pos], block_size)):
+    //   create_position_ids returns anchor_pos + [0, 1, ..., block_size-1]
+    //   so full_position_ids = [anchor_pos, anchor_pos+0, anchor_pos+1, ..., anchor_pos+block-1]
+    //   = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]  (1 + block entries)
+    //
+    // apply_rotary_pos_emb: q uses cos[..., -q_len:, :] = last block entries
+    //   → Q positions = [seed_pos, seed_pos+1, ..., seed_pos+block-1]
+    //   K uses full cos → positions = [seed_pos(ctx), seed_pos, ..., seed_pos+block-1]
 
-    // positions_kv_all = [seed_pos, seed_pos+1, ..., seed_pos+block]
+    // positions_kv_all = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]
+    // (1+block entries: ctx slot at seed_pos, block slots at seed_pos..=seed_pos+block-1)
     {
-        let pos: Vec<i32> = (0..=block as i32)
-            .map(|i| seed_position as i32 + i)
+        let seed = seed_position as i32;
+        let pos: Vec<i32> = std::iter::once(seed)
+            .chain((0..block as i32).map(|i| seed + i))
             .collect();
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, kv_cap * 4) };
@@ -639,11 +647,11 @@ pub(crate) fn dspark_qwen3_block_forward(
             .map_err(|e| format!("dspark_qwen3: htod positions_kv_all: {e:?}"))?;
     }
 
-    // positions_q_block = [seed_pos+1, seed_pos+2, ..., seed_pos+block]
+    // positions_q_block = [seed_pos, seed_pos+1, ..., seed_pos+block-1]
+    // (block entries: Q positions for the block queries)
     {
-        let pos: Vec<i32> = (1..=block as i32)
-            .map(|i| seed_position as i32 + i)
-            .collect();
+        let seed = seed_position as i32;
+        let pos: Vec<i32> = (0..block as i32).map(|i| seed + i).collect();
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, block * 4) };
         gpu.hip
@@ -1073,4 +1081,99 @@ pub(crate) fn dspark_qwen3_block_forward(
     }
 
     Ok(())
+}
+
+// ── Qwen3DsparkBody impl DsparkBody ───────────────────────────────────────────
+
+/// Arch-specific DSpark body for the 5-layer Qwen3-8B drafter.
+///
+/// Implements [`DsparkBody`] so that the arch-agnostic [`DsparkDrafter`]
+/// (in `dspark_core`) can drive the Qwen3 block-attention forward without any
+/// Qwen3-specific knowledge.
+///
+/// Ownership: the body owns the scratch buffers allocated at load time;
+/// the weights live in [`Qwen3DrafterAssets`] which the body also owns.
+pub struct Qwen3DsparkBody {
+    assets: Qwen3DrafterAssets,
+    scratch: Qwen3DsparkScratch,
+}
+
+impl DsparkBody for Qwen3DsparkBody {
+    fn draft_block(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &DsparkWeights,
+        main_hidden: &GpuTensor, // [target_layer_ids.len()*dim]
+        seed: u32,
+        position: usize,
+        block: usize,
+        x_head_out: &GpuTensor, // [block, dim] out
+    ) -> Result<(), String> {
+        let dim = self.assets.config.dim;
+
+        // ── 1. main_proj_ingest: fc(main_hidden) + main_norm → main_x [dim] ───
+        // modeling.py:373  `target_hidden_states = self.hidden_norm(self.fc(...))`
+        // main_x is one context vector shared across all 5 layers.
+        let main_x = gpu
+            .alloc_tensor(&[dim], DType::F32)
+            .map_err(|e| format!("Qwen3DsparkBody: alloc main_x: {e:?}"))?;
+        main_proj_ingest(gpu, weights, main_hidden, &main_x)?;
+
+        // ── 2. block_ids = [seed, noise, noise, ...] ──────────────────────────
+        let block_ids = noise_block_ids(&weights.cfg, seed);
+
+        // ── 3. Block-attention forward → x_head_out ───────────────────────────
+        dspark_qwen3_block_forward(
+            gpu,
+            &self.assets.weights,
+            &self.assets.config,
+            &main_x,
+            &block_ids,
+            position,
+            block,
+            &self.scratch,
+            x_head_out,
+        )?;
+
+        let _ = gpu.free_tensor(main_x);
+        Ok(())
+    }
+
+    fn block_size(&self) -> usize {
+        // kv_cap = 1 + block_size (ctx slot + block slots) → block_size = cap - 1.
+        self.scratch.kv.physical_cap.saturating_sub(1)
+    }
+
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        self.scratch.free_gpu(gpu);
+        let Qwen3DrafterAssets {
+            config: _,
+            weights,
+            kv,
+            scratch,
+            pbs,
+        } = self.assets;
+        weights.free_gpu(gpu);
+        kv.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        pbs.free_gpu(gpu);
+    }
+}
+
+/// Build the Qwen3-8B DSpark body from [`Qwen3DrafterAssets`].
+///
+/// Returns a `Box<dyn DsparkBody>` suitable for passing to
+/// [`hipfire_runtime::dspark_core::build_dspark_speculator`].
+///
+/// Allocates the [`Qwen3DsparkScratch`] using `block_size` from
+/// `DsparkWeights::cfg`. The scratch is sized for the block-only forward
+/// (kv_cap = 1 + block_size).
+pub fn build_qwen3_dspark_body(
+    assets: Qwen3DrafterAssets,
+    cfg: &DsparkConfig,
+    gpu: &mut Gpu,
+) -> Result<Box<dyn DsparkBody>, String> {
+    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size)
+        .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
+    Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }
