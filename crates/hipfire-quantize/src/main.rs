@@ -6301,6 +6301,224 @@ fn main() {
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
 
+    // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
+    // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
+    // body + DSpark globals (main_proj, main_norm, markov_w1/w2, confidence_proj
+    // + confidence_bias) + lm_head, with DSpark metadata keys so the arch-side
+    // loader can detect and configure the speculator.
+    //
+    // Quant recipe (small trained drafter — preserve precision):
+    //   2D matmul weights (attn q/k/v/o, mlp gate/up/down) → Q8F16
+    //   Everything else (norms, embed, main_proj/main_norm, markov, confidence,
+    //   lm_head, bias) → F16 (or F32 for scalar bias)
+    //
+    // Tensor name mapping (source → sidecar):
+    //   fc.weight           → main_proj.weight   (the `[hidden, 5*hidden]` concat)
+    //   hidden_norm.weight  → main_norm.weight    (RMSNorm after fc)
+    //   all others          → kept as-is
+    if format == "qwen3-dspark-q8" {
+        let input_dir = Path::new(input_dir.as_str());
+        let output_path = Path::new(output_path.as_str());
+
+        // Read config
+        let config_path = input_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+            eprintln!(
+                "qwen3-dspark-q8: cannot read {}: {e}",
+                config_path.display()
+            );
+            std::process::exit(1);
+        });
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
+            eprintln!("qwen3-dspark-q8: config.json parse error: {e}");
+            std::process::exit(1);
+        });
+
+        // Verify architecture
+        let archs = config.get("architectures").and_then(|v| v.as_array());
+        let is_dspark = archs
+            .map(|a| a.iter().any(|v| v.as_str() == Some("Qwen3DSparkModel")))
+            .unwrap_or(false);
+        if !is_dspark {
+            eprintln!(
+                "qwen3-dspark-q8: architectures does not contain Qwen3DSparkModel (got {:?})",
+                archs
+            );
+            std::process::exit(1);
+        }
+
+        // Read DSpark config fields (from config.json directly)
+        let block_size = config
+            .get("block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7) as usize;
+        let target_layer_ids: Vec<u64> = config
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+            .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
+        let markov_rank = config
+            .get("markov_rank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256) as usize;
+        let noise_token_id = config
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(151669) as u32;
+
+        eprintln!(
+            "qwen3-dspark-q8: block_size={block_size} target_layer_ids={target_layer_ids:?} \
+             markov_rank={markov_rank} noise_token_id={noise_token_id}"
+        );
+
+        // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads
+        let metadata = serde_json::json!({
+            "architecture": "qwen3",
+            "config": {
+                "dspark_block_size": block_size,
+                "dspark_target_layer_ids": target_layer_ids,
+                "dspark_markov_rank": markov_rank,
+                "dspark_noise_token_id": noise_token_id,
+                "dspark_enable_confidence": true,
+            },
+        });
+        let metadata_json = serde_json::to_string(&metadata).unwrap();
+
+        // Load safetensors
+        let st_paths = find_safetensors(input_dir);
+        if st_paths.is_empty() {
+            eprintln!(
+                "qwen3-dspark-q8: no safetensors found in {}",
+                input_dir.display()
+            );
+            std::process::exit(1);
+        }
+        let st_files: Vec<SafetensorsFile> = st_paths
+            .iter()
+            .map(|p| {
+                eprintln!("Loading: {}", p.display());
+                SafetensorsFile::open(p).unwrap()
+            })
+            .collect();
+
+        let mut all_tensors: Vec<(&str, usize)> = Vec::new();
+        for (fi, st) in st_files.iter().enumerate() {
+            for name in st.tensor_names() {
+                all_tensors.push((name, fi));
+            }
+        }
+        all_tensors.sort_by_key(|(name, _)| name.to_string());
+        eprintln!("qwen3-dspark-q8: {} tensors found", all_tensors.len());
+
+        // Determine which 2D weights get Q8F16 (attn projections + MLP projections)
+        let is_dspark_matmul_weight = |name: &str| -> bool {
+            // Attn projections: q/k/v/o_proj
+            let is_attn = name.contains("self_attn.")
+                && (name.ends_with("q_proj.weight")
+                    || name.ends_with("k_proj.weight")
+                    || name.ends_with("v_proj.weight")
+                    || name.ends_with("o_proj.weight"));
+            // MLP projections: gate/up/down_proj
+            let is_mlp = name.contains("mlp.")
+                && (name.ends_with("gate_proj.weight")
+                    || name.ends_with("up_proj.weight")
+                    || name.ends_with("down_proj.weight"));
+            is_attn || is_mlp
+        };
+
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let mut total_params = 0u64;
+        let mut q8_params = 0u64;
+        let mut f16_params = 0u64;
+
+        for (name, file_idx) in &all_tensors {
+            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n_elements: usize = meta.shape.iter().product();
+            total_params += n_elements as u64;
+
+            // Map source tensor name → sidecar name
+            let sidecar_name = if *name == "fc.weight" {
+                "main_proj.weight".to_string()
+            } else if *name == "hidden_norm.weight" {
+                "main_norm.weight".to_string()
+            } else {
+                name.to_string()
+            };
+
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+
+            if is_dspark_matmul_weight(name) && n_elements >= 32 {
+                // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
+                let f32_data = to_f32(raw_data, &meta.dtype);
+                let q = quantize_q8f16(&f32_data);
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                    "Q8_F16",
+                    sidecar_name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                q8_params += n_elements as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::Q8F16,
+                    shape,
+                    group_size: 32,
+                    data: q,
+                    spilled_len: 0,
+                });
+            } else {
+                // Everything else → F16 (norms, embeds, main_proj, markov, confidence, lm_head)
+                let f32_data = to_f32(raw_data, &meta.dtype);
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                    "F16",
+                    sidecar_name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    f16_bytes.len() as f64 / 1024.0
+                );
+                f16_params += n_elements as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F16,
+                    shape,
+                    group_size: 0,
+                    data: f16_bytes,
+                    spilled_len: 0,
+                });
+            }
+        }
+
+        eprintln!(
+            "\n=== qwen3-dspark-q8 Summary ===\n\
+             Total params:  {total_params}\n\
+             Q8F16 params:  {q8_params} ({:.1}%)\n\
+             F16 params:    {f16_params} ({:.1}%)\n\
+             Tensors:       {}",
+            100.0 * q8_params as f64 / total_params as f64,
+            100.0 * f16_params as f64 / total_params as f64,
+            hfq_tensors.len()
+        );
+
+        eprintln!("\nWriting: {}", output_path.display());
+        write_hfq(output_path, 1u32, &metadata_json, &hfq_tensors, None).unwrap_or_else(|e| {
+            eprintln!("qwen3-dspark-q8: write_hfq failed: {e}");
+            std::process::exit(2);
+        });
+
+        let file_size = std::fs::metadata(output_path).unwrap().len();
+        eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+        return;
+    }
+
     // SP4 selective re-quant overlay mode. `--reap-overlay <plan-dir>` activates
     // it: instead of quantizing the whole model, only the tensors named by the
     // plan's `quant_overrides` are decoded from the original safetensors and
