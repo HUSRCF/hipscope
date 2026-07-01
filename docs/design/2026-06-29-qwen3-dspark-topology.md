@@ -107,6 +107,13 @@ these names).
 | confidence | include bias term |
 | heads | separate `lm_head`; vanilla markov == deepseek4 |
 
+## Deployed sidecar naming convention
+
+Deployed sidecar = `<target_stem>-dspark.<target_ext>`; discovery in `carriers.rs:599`.
+For target `qwen3-8b.mq4` the discovered path is `qwen3-8b-dspark.mq4` (HFQ container,
+`.mq4` ext mirrors the target). Source-of-truth build artifact may be kept as
+`qwen3-8b-dspark.hfq`; the deployed copy at the canonical name is byte-identical.
+
 ## Plan impact (escalated to human)
 
 The Stage-1 plan's premise — "the qwen3 body fits llama's existing forward

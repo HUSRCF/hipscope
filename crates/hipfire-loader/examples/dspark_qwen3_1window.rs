@@ -20,7 +20,7 @@
 //! ```
 //!
 //! The sidecar must be at `<stem>-dspark.<ext>` next to the target
-//! (e.g. `qwen3-8b.mq4-dspark.hfq`).
+//! (e.g. `qwen3-8b-dspark.mq4`).
 
 fn main() -> Result<(), String> {
     let target_path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -58,7 +58,7 @@ fn main() -> Result<(), String> {
     let spec = m.speculator.as_mut().ok_or_else(|| {
         "No speculator loaded — DSpark sidecar discovery failed or ctx.spec.dspark=false.\n\
          Expected sidecar at <stem>-dspark.<ext> next to the target.\n\
-         For qwen3-8b.mq4 → qwen3-8b.mq4-dspark.hfq"
+         For qwen3-8b.mq4 → qwen3-8b-dspark.mq4"
             .to_string()
     })?;
 
