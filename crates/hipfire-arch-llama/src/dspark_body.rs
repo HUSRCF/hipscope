@@ -37,13 +37,14 @@
 //!    local `DsparkConfig` hardcodes `enable_confidence: true`.
 
 use hipfire_runtime::dspark_core::{DsparkConfig, DsparkWeights};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
     ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
     PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
+    HfqBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -111,12 +112,10 @@ pub fn load_qwen3_dspark(
     // 3. Load 5-layer drafter body
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
-        eprintln!("  qwen3_dspark: loading layer {i}/{} ...", cfg.n_layers);
         layers.push(load_drafter_layer(source, gpu, &cfg, i, q_out_dim, kv_dim)?);
     }
 
     // 4. Embedding table (embed_tokens.weight, qt=1 F16 → F32 EmbeddingFormat::F32)
-    eprintln!("  qwen3_dspark: loading embed_tokens...");
     let (token_embd, embd_format) = {
         let (ei, ed) = source
             .tensor_data_pread("embed_tokens.weight")
@@ -127,7 +126,6 @@ pub fn load_qwen3_dspark(
     };
 
     // 5. Final norm (norm.weight → F32)
-    eprintln!("  qwen3_dspark: loading norm.weight...");
     let output_norm = {
         let (ni, nd) = source
             .tensor_data_pread("norm.weight")
@@ -138,7 +136,6 @@ pub fn load_qwen3_dspark(
     };
 
     // 6. lm_head.weight (qt=1 F16, used as WeightTensor for logit projection)
-    eprintln!("  qwen3_dspark: loading lm_head.weight...");
     let lm_head = load_global_proj(source, gpu, "lm_head.weight", cfg.vocab_size, cfg.dim)?;
 
     let weights = LlamaWeights {
@@ -152,11 +149,9 @@ pub fn load_qwen3_dspark(
 
     // 7. DSpark globals
     //    main_proj: [dim, n_targets * dim] F16 on GPU
-    eprintln!("  qwen3_dspark: loading main_proj.weight...");
     let main_proj = Some(load_global_tensor(source, gpu, "main_proj.weight")?);
 
     //    main_norm: [dim] F32
-    eprintln!("  qwen3_dspark: loading main_norm.weight...");
     let main_norm = {
         let (mi, md) = source
             .tensor_data_pread("main_norm.weight")
@@ -167,13 +162,11 @@ pub fn load_qwen3_dspark(
     };
 
     //    markov_w1/w2: [vocab, rank] F16
-    eprintln!("  qwen3_dspark: loading markov_head.markov_w1.weight...");
     let markov_w1 = Some(load_global_tensor(
         source,
         gpu,
         "markov_head.markov_w1.weight",
     )?);
-    eprintln!("  qwen3_dspark: loading markov_head.markov_w2.weight...");
     let markov_w2 = Some(load_global_tensor(
         source,
         gpu,
@@ -182,7 +175,6 @@ pub fn load_qwen3_dspark(
 
     //    confidence_head.proj.weight: [1, dim+rank] F16
     let confidence_proj = if dspark_cfg.enable_confidence {
-        eprintln!("  qwen3_dspark: loading confidence_head.proj.weight...");
         Some(load_global_tensor(
             source,
             gpu,
@@ -194,7 +186,6 @@ pub fn load_qwen3_dspark(
 
     //    confidence_head.proj.bias: [1] F16 → F32 — hard req #1 (qwen3 has bias)
     let confidence_bias = if dspark_cfg.enable_confidence {
-        eprintln!("  qwen3_dspark: loading confidence_head.proj.bias...");
         let bias_gpu = {
             let (bi, bd) = source
                 .tensor_data_pread("confidence_head.proj.bias")
@@ -220,10 +211,6 @@ pub fn load_qwen3_dspark(
 
     // 8. Allocate drafter KvCache (block-only: cap = block_size tokens)
     let block_cap = dspark_cfg.block_size;
-    eprintln!(
-        "  qwen3_dspark: KvCache (layers={}, kv_heads={}, head_dim={}, cap={}) ...",
-        cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, block_cap,
-    );
     let kv = KvCache::new_gpu(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, block_cap)
         .map_err(|e| format!("qwen3_dspark: KvCache::new_gpu: {e:?}"))?;
 
@@ -248,9 +235,11 @@ pub fn load_qwen3_dspark(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Load one 5-layer drafter body layer from the flat-name sidecar.
-/// Mirrors `hipfire_runtime::hfq::load_layer` but uses bare names (no
-/// `model.` prefix) directly.
+/// Load one drafter body layer from the flat-name sidecar.
+///
+/// Delegates to `hipfire_runtime::hfq::load_layer` via an `HfqBackend`
+/// configured with `bare_name_candidates` so it resolves `layers.N.*`
+/// without the `model.` prefix that `flat_name_candidates` would prepend.
 fn load_drafter_layer(
     source: &HfqFile,
     gpu: &mut Gpu,
@@ -259,160 +248,16 @@ fn load_drafter_layer(
     q_out_dim: usize,
     kv_dim: usize,
 ) -> Result<LayerWeights, String> {
-    // ── Norms ──────────────────────────────────────────────────────────────
-    let attn_norm = load_norm_by_name(
-        source,
+    let mut b = HfqBackend {
+        hfq: source,
         gpu,
-        &format!("layers.{i}.input_layernorm.weight"),
-        &[cfg.dim],
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: attn_norm: {e}"))?;
-
-    let ffn_norm = load_norm_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.post_attention_layernorm.weight"),
-        &[cfg.dim],
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: ffn_norm: {e}"))?;
-
-    let q_norm = if cfg.has_qk_norm {
-        Some(
-            load_norm_by_name(
-                source,
-                gpu,
-                &format!("layers.{i}.self_attn.q_norm.weight"),
-                &[cfg.head_dim],
-            )
-            .map_err(|e| format!("qwen3_dspark layer {i}: q_norm: {e}"))?,
-        )
-    } else {
-        None
+        norm_bias: 0.0,
+        candidates: bare_name_candidates,
+        read_proj: load_weight_tensor_pread,
+        layer: i,
     };
-    let k_norm = if cfg.has_qk_norm {
-        Some(
-            load_norm_by_name(
-                source,
-                gpu,
-                &format!("layers.{i}.self_attn.k_norm.weight"),
-                &[cfg.head_dim],
-            )
-            .map_err(|e| format!("qwen3_dspark layer {i}: k_norm: {e}"))?,
-        )
-    } else {
-        None
-    };
-
-    // ── Projections ────────────────────────────────────────────────────────
-    let wq = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.self_attn.q_proj.weight"),
-        q_out_dim,
-        cfg.dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: wq: {e}"))?;
-
-    let wk = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.self_attn.k_proj.weight"),
-        kv_dim,
-        cfg.dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: wk: {e}"))?;
-
-    let wv = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.self_attn.v_proj.weight"),
-        kv_dim,
-        cfg.dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: wv: {e}"))?;
-
-    let wo = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.self_attn.o_proj.weight"),
-        cfg.dim,
-        q_out_dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: wo: {e}"))?;
-
-    let w_gate = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.mlp.gate_proj.weight"),
-        cfg.hidden_dim,
-        cfg.dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: w_gate: {e}"))?;
-
-    let w_up = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.mlp.up_proj.weight"),
-        cfg.hidden_dim,
-        cfg.dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: w_up: {e}"))?;
-
-    let w_down = load_proj_by_name(
-        source,
-        gpu,
-        &format!("layers.{i}.mlp.down_proj.weight"),
-        cfg.dim,
-        cfg.hidden_dim,
-    )
-    .map_err(|e| format!("qwen3_dspark layer {i}: w_down: {e}"))?;
-
-    Ok(LayerWeights {
-        attn_norm,
-        wq,
-        wk,
-        wv,
-        wo,
-        q_norm,
-        k_norm,
-        ffn_norm,
-        w_gate,
-        w_up,
-        w_down,
-    })
-}
-
-/// Load a norm tensor (F16 → F32, shape `shape`) from the flat-name sidecar.
-fn load_norm_by_name(
-    source: &HfqFile,
-    gpu: &mut Gpu,
-    name: &str,
-    shape: &[usize],
-) -> Result<GpuTensor, String> {
-    let (info, data) = source
-        .tensor_data_pread(name)
-        .ok_or_else(|| format!("{name} missing"))?;
-    let qt = info.quant_type;
-    dequant_norm(gpu, qt, &data, shape, 0.0).map_err(|e| format!("{name}: {e:?}"))
-}
-
-/// Load a projection weight tensor (quantized or F16) from the flat-name sidecar.
-/// Attaches AWQ sidecar when present.
-fn load_proj_by_name(
-    source: &HfqFile,
-    gpu: &mut Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> Result<WeightTensor, String> {
-    let (info, data) =
-        read_first(source, name, bare_name_candidates).ok_or_else(|| format!("{name} missing"))?;
-    let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k)
-        .map_err(|e| format!("{name}: {e:?}"))?;
-    if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale_for(source, gpu, name, k);
-    }
-    Ok(wt)
+    load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
+        .map_err(|e| format!("qwen3_dspark layer {i}: {e:?}"))
 }
 
 /// Upload a global weight tensor as `GpuTensor` (F16 kept as F16, MQ4 as
