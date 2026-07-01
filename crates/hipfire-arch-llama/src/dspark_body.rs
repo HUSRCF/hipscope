@@ -406,19 +406,27 @@ fn config_from_sidecar_tensors(source: &HfqFile) -> Result<LlamaConfig, String> 
 
 /// GPU scratch buffers for [`dspark_qwen3_block_forward`].
 ///
-/// Allocated once per model load (sized to `block_size`).  Reset is implicit:
-/// every call re-embeds `block_ids` from scratch, so no state carries over.
+/// Allocated once per model load (sized to `max_ctx_len + block_size`).
+/// Reset is implicit: every call re-embeds `block_ids` from scratch, so no
+/// state carries over.
 ///
 /// Buffer sizing (qwen3-8b defaults: dim=4096, n_heads=32, n_kv_heads=8,
 /// head_dim=128, hidden_dim=14336):
 ///   `q_dim = n_heads * head_dim = 4096`
 ///   `kv_dim = n_kv_heads * head_dim = 1024`
-///   KV cache capacity = `1 + block_size` (context slot 0 + block slots 1..=block)
+///   KV cache capacity = `max_ctx_len + block_size`
+///
+/// `max_ctx_len=1` reproduces the previous single-slot behaviour.
 pub struct Qwen3DsparkScratch {
-    /// Q8_0 KV cache (5 drafter layers, capacity = 1 + block_size).
-    /// Layout: context K/V at compact slot 0; block K/V at slots 1..=block.
-    /// Compact slots decouple absolute RoPE positions from KV write positions,
-    /// matching the deepseek4 DSpark staging approach.
+    /// Maximum context length this scratch can handle.  Calls to
+    /// [`dspark_qwen3_block_forward`] must pass `ctx_positions.len() <=
+    /// max_ctx_len`.
+    pub max_ctx_len: usize,
+
+    /// Q8_0 KV cache (5 drafter layers, capacity = max_ctx_len + block_size).
+    /// Layout: context K/V at compact slots 0..ctx_len; block K/V at
+    /// slots ctx_len..ctx_len+block.  Compact slots decouple absolute RoPE
+    /// positions from KV write positions.
     pub kv: KvCache,
 
     /// Block-parallel scratch: x_batch[block×dim], fa_q/k/v[block×*], etc.
@@ -426,39 +434,42 @@ pub struct Qwen3DsparkScratch {
     /// `forward_prefill_chunk` (fa_q_batch, x_rot_batch, …).
     pub pbs: PrefillBatchScratch,
 
-    /// Concatenated [ctx(1) ++ block(block)] K buffer [(1+block)×kv_dim] F32.
+    /// Concatenated [ctx(ctx_len) ++ block(block)] K buffer
+    /// [(max_ctx_len+block)×kv_dim] F32.
     /// Used to apply k_norm to the full combined K sequence before KV write
     /// (modeling.py:107–113 cats k_ctx+k_noise before applying k_norm).
     pub all_k: GpuTensor,
 
-    /// Concatenated [ctx(1) ++ block(block)] V buffer [(1+block)×kv_dim] F32.
+    /// Concatenated [ctx(ctx_len) ++ block(block)] V buffer
+    /// [(max_ctx_len+block)×kv_dim] F32.
     /// V has no norm (modeling.py:114 just transposes), but is staged here for
     /// the batched Q8_0 KV-cache write.
     pub all_v: GpuTensor,
 
     /// KV positions for the combined [ctx ++ block] sequence,
-    /// shape [1+block_size], as i32-in-F32.  Set to
-    /// [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1] on each call
-    /// (ctx=seed_pos, block=seed_pos..=seed_pos+block-1, matching
-    /// full_position_ids from create_position_ids). Used for:
+    /// shape [max_ctx_len+block_size], as i32-in-F32.
+    /// Set per-call to [ctx_pos[0], ..., ctx_pos[ctx_len-1],
+    ///                   block_pos[0], ..., block_pos[block-1]].
+    /// Used for:
     ///   1. RoPE on the concatenated K (modeling.py:116 applies RoPE to all k).
     ///   2. Q8_0 KV-cache write (kv_cache_write_q8_0_batched positions arg).
     pub positions_kv_all: GpuTensor,
 
     /// Block query RoPE positions [block_size] i32-in-F32.
-    /// = [seed_pos, seed_pos+1, ..., seed_pos+block-1].
+    /// = [anchor_pos, anchor_pos+1, ..., anchor_pos+block-1].
     /// Matches Q positions from apply_rotary_pos_emb (cos[..., -q_len:, :]).
     pub positions_q_block: GpuTensor,
 
-    /// Compact attention positions [block_size] i32-in-F32 = [1, 2, ..., block].
+    /// Compact attention positions [block_size] i32-in-F32 =
+    /// [ctx_len, ctx_len+1, ..., ctx_len+block-1].
     /// Passed as `positions` to `attention_q8_0_kv_batched_masked`: each block
-    /// query row i uses compact slot i+1 (KV was written at compact 1..=block),
-    /// while the context slot 0 is always visible (it precedes block_start=1).
+    /// query row i uses compact slot ctx_len+i (KV was written at those slots),
+    /// while context slots 0..ctx_len are always visible (they precede block_start).
     pub positions_compact: GpuTensor,
 
     /// Additive bias [block × block] F32 = 0.0 (bidirectional in-block mask).
-    /// Combined with `block_start=1`, `block_cols=block` in the masked-attention
-    /// kernel: all block queries attend to all block keys.
+    /// Combined with `block_start=ctx_len`, `block_cols=block` in the
+    /// masked-attention kernel: all block queries attend to all block keys.
     /// (modeling.py:58 `self.is_causal = False`; `create_dspark_attention_mask`
     /// makes every block query see all block keys.)
     pub bias: GpuTensor,
@@ -466,8 +477,18 @@ pub struct Qwen3DsparkScratch {
 
 impl Qwen3DsparkScratch {
     /// Allocate scratch for a drafter with the given config and `block_size`.
-    pub fn new(gpu: &mut Gpu, config: &LlamaConfig, block_size: usize) -> Result<Self, String> {
-        let kv_cap = 1 + block_size;
+    ///
+    /// `max_ctx_len` is the maximum number of context slots this scratch can
+    /// handle.  Pass `1` for the original single-slot behaviour.  The KV cache
+    /// capacity is `max_ctx_len + block_size`.
+    pub fn new(
+        gpu: &mut Gpu,
+        config: &LlamaConfig,
+        block_size: usize,
+        max_ctx_len: usize,
+    ) -> Result<Self, String> {
+        let max_ctx_len = max_ctx_len.max(1);
+        let kv_cap = max_ctx_len + block_size;
         let kv = KvCache::new_gpu_q8(
             gpu,
             config.n_layers,
@@ -502,6 +523,7 @@ impl Qwen3DsparkScratch {
             .map_err(|e| format!("Qwen3DsparkScratch: bias: {e:?}"))?;
 
         Ok(Self {
+            max_ctx_len,
             kv,
             pbs,
             all_k,
@@ -533,38 +555,38 @@ impl Qwen3DsparkScratch {
 // ── dspark_qwen3_block_forward ─────────────────────────────────────────────────
 
 /// Qwen3-8B DSpark block-attention forward: 5-layer dense GQA over the
-/// bidirectional `[context(1) ++ block(N)]` KV set.
+/// bidirectional `[context(ctx_len) ++ block(N)]` KV set.
 ///
 /// # Numeric contract (verified against modeling.py)
 ///
-/// ## `main_x` context: computed once, shared across all 5 layers
+/// ## `main_x` context: `[ctx_len, dim]`, shared across all 5 layers
 ///
-/// Caller computes `main_x = hidden_norm(fc(main_hidden))` (modeling.py:373).
-/// Each layer re-uses the SAME `main_x` to form its context K/V via
-/// this layer's `k_proj`/`v_proj` (modeling.py:103–106).
+/// Caller computes `main_x[j] = hidden_norm(fc(main_hidden[j]))` per context
+/// slot (modeling.py:373, applied over the full ctx_len batch).
+/// Each layer re-uses the same `main_x` to form its context K/V via this
+/// layer's `k_proj`/`v_proj` (modeling.py:103–106).
+/// `ctx_len=1` reproduces the single-slot forward from Task 9.
 ///
 /// ## Per-layer op sequence (modeling.py:181–198, 99–151)
 ///
 /// ```text
-/// 1. input_layernorm(x_block)   [modeling.py:181]
-/// 2. q_proj(normed_block)       [modeling.py:99]
-/// 3. q_norm(q, per-head)        [modeling.py:102  — BEFORE RoPE]
-/// 4. k_proj(main_x)  → ctx_k   [modeling.py:103]
+/// 1. input_layernorm(x_block)      [modeling.py:181]
+/// 2. q_proj(normed_block)          [modeling.py:99]
+/// 3. q_norm(q, per-head)           [modeling.py:102  — BEFORE RoPE]
+/// 4. k_proj(main_x[j]) → ctx_k[j] for j in 0..ctx_len  [modeling.py:103]
 /// 5. k_proj(normed_block) → blk_k [modeling.py:104]
 /// 6. cat([ctx_k, blk_k]) → all_k  [modeling.py:107]
-/// 7. k_norm(all_k, per-head)    [modeling.py:113  — on concatenated K, BEFORE RoPE]
-/// 8. v_proj(main_x)  → ctx_v   [modeling.py:105]
+/// 7. k_norm(all_k, per-head)       [modeling.py:113 — on full (ctx_len+block) K, BEFORE RoPE]
+/// 8. v_proj(main_x[j]) → ctx_v[j] for j in 0..ctx_len  [modeling.py:105]
 /// 9. v_proj(normed_block) → blk_v [modeling.py:106]
 /// 10. cat([ctx_v, blk_v]) → all_v  [modeling.py:110]
-/// 11. RoPE(q, ctx_k=0_row_of_all_k, blk_k=1..=block_rows_of_all_k)
-///         positions: ctx→seed_pos, blk→seed_pos+1..=+block
-///         [modeling.py:116; apply_rotary_pos_emb:34–40 — q uses last q_len
-///          entries of cos/sin, k uses full cos/sin]
-/// 12. Write all_k, all_v to Q8 KV cache at compact slots 0..=block
+/// 11. RoPE(q at block_positions; all_k at [ctx_positions ++ block_positions])
+///          [modeling.py:116; apply_rotary_pos_emb:34–40]
+/// 12. Write all_k, all_v to Q8 KV cache at compact slots 0..ctx_len+block
 /// 13. attention_q8_0_kv_batched_masked:
-///         positions_compact=[1..=block], block_start=1, block_cols=block,
-///         bias=zeros → bidirectional (slot 0 always visible, all block-slots open)
-///         [modeling.py:58 `is_causal=False`]
+///          positions_compact=[ctx_len..ctx_len+block], block_start=ctx_len,
+///          block_cols=block, bias=zeros → bidirectional
+///          [modeling.py:58 `is_causal=False`]
 /// 14. o_proj(attn_out) + residual  [modeling.py:193–194]
 /// 15. post_attention_layernorm(x_block)  [modeling.py:196]
 /// 16. MLP(gate/up SwiGLU) + residual    [modeling.py:197–198]
@@ -573,52 +595,62 @@ impl Qwen3DsparkScratch {
 /// ## RoPE position assignment
 ///
 /// `apply_rotary_pos_emb` (modeling.py:34–40) takes `cos/sin` shaped
-/// `[1+block, head_dim]` (computed from full position_ids = [seed_pos,
-/// seed_pos+1, ..., seed_pos+block]).  For Q it uses the LAST `q_len` entries
-/// (`cos[..., -q_len:, :]`), selecting entries at indices 1..=block of the
-/// `position_ids` tensor, i.e. positions `seed_pos+1..=seed_pos+block`.
-/// For K it uses the full sequence (all 1+block entries).
+/// `[ctx_len+block, head_dim]` computed from
+/// `full_position_ids = [ctx_positions[0], ..., ctx_positions[ctx_len-1],
+///                        block_positions[0], ..., block_positions[block-1]]`.
 ///
-/// The convention follows `create_position_ids` exactly: block slot `i` gets
-/// position `seed_pos + i` (0-indexed), so block slot 0 = `seed_pos`,
-/// block slot 1 = `seed_pos+1`, etc.  This was confirmed by Task-9 GPU-vs-CPU
-/// parity against the real `Qwen3DSparkModel._forward_backbone` reference.
+/// For Q it uses the LAST `q_len=block` entries
+/// (`cos[..., -q_len:, :]`) → `block_positions`.
+/// For K it uses the full `ctx_len + block` entries.
 ///
-/// Implemented here via two `rope_batched_f32` calls:
-///   - Q: positions_q_block = [seed_pos, ..., seed_pos+block-1]
-///   - K: positions_kv_all  = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]
-///     (1 ctx row at seed_pos + block rows at seed_pos..=seed_pos+block-1)
+/// `block_positions[i] = anchor_pos + i` (0-indexed), where `anchor_pos` is
+/// the anchor absolute position (= ctx_positions[ctx_len-1]+1 in typical use,
+/// but the caller sets both explicitly). Derived from `create_position_ids`.
 ///
 /// ## Bidirectional mask
 ///
-/// `attention_q8_0_kv_batched_masked` with `block_start=1`, `block_cols=block`,
-/// `bias=zeros[block×block]` gives every block query full visibility of all
-/// in-block keys.  Slot 0 (context) is before `block_start`, so it is always
-/// visible (the kernel never masks prompt keys).
+/// `attention_q8_0_kv_batched_masked` with `block_start=ctx_len`,
+/// `block_cols=block`, `bias=zeros[block×block]` gives every block query full
+/// visibility of all in-block keys.  Slots 0..ctx_len (context) are before
+/// `block_start` → always visible.
 ///
 /// # Arguments
 ///
-/// * `drafter` — 5-layer Qwen3-8B body weights (LlamaWeights).
-/// * `config`  — `n_layers=5`, `has_qk_norm=true`, `rope_freq_base=1e6`.
-/// * `main_x`  — `[dim]` F32 context vector (= `hidden_norm(fc(main_hidden))`).
-/// * `block_ids` — `[block]` token ids: `[seed_token, noise, noise, ...]`.
-/// * `seed_position` — absolute KV position of the seed token.
-/// * `block`   — number of block slots (= block_size in practice).
-/// * `scratch` — pre-allocated [`Qwen3DsparkScratch`].
-/// * `x_head_out` — `[block × dim]` F32 output (pre-final-norm hidden states).
-///                  Callers (e.g. `run_heads`) apply `stage_norm` exactly once.
+/// * `drafter`       — 5-layer Qwen3-8B body weights (LlamaWeights).
+/// * `config`        — `n_layers=5`, `has_qk_norm=true`, `rope_freq_base=1e6`.
+/// * `main_x`        — `[ctx_len * dim]` F32 context rows (per-slot output of
+///                     `hidden_norm(fc(main_hidden))`).
+/// * `ctx_positions` — absolute RoPE positions for the `ctx_len` context rows.
+///                     Length must equal `ctx_len = main_x.shape[0] / dim`.
+/// * `block_ids`     — `[block]` token ids: `[seed_token, noise, noise, ...]`.
+/// * `block_positions` — absolute RoPE positions for the `block` query/key rows.
+///                       Length must equal `block`.
+/// * `block`         — number of block slots (= block_size in practice).
+/// * `scratch`       — pre-allocated [`Qwen3DsparkScratch`] with
+///                     `max_ctx_len >= ctx_positions.len()`.
+/// * `x_head_out`    — `[block × dim]` F32 output (pre-final-norm hidden states).
+///                     Callers (e.g. `run_heads`) apply `stage_norm` exactly once.
 pub fn dspark_qwen3_block_forward(
     gpu: &mut Gpu,
     drafter: &LlamaWeights,
     config: &LlamaConfig,
     main_x: &GpuTensor,
+    ctx_positions: &[usize],
     block_ids: &[u32],
-    seed_position: usize,
+    block_positions: &[usize],
     block: usize,
     scratch: &Qwen3DsparkScratch,
     x_head_out: &GpuTensor,
 ) -> Result<(), String> {
+    let ctx_len = ctx_positions.len();
     debug_assert_eq!(block_ids.len(), block);
+    debug_assert_eq!(block_positions.len(), block);
+    debug_assert!(ctx_len >= 1, "ctx_len must be >= 1");
+    debug_assert!(
+        ctx_len <= scratch.max_ctx_len,
+        "ctx_len {ctx_len} > scratch.max_ctx_len {}",
+        scratch.max_ctx_len
+    );
     debug_assert!(
         block <= scratch.pbs.max_batch,
         "block {block} > pbs.max_batch"
@@ -627,26 +659,24 @@ pub fn dspark_qwen3_block_forward(
     let dim = config.dim;
     let q_dim = config.n_heads * config.head_dim;
     let kv_dim = config.n_kv_heads * config.head_dim;
-    let kv_cap = 1 + block; // compact slots: 0=ctx, 1..=block=block rows
+    let kv_cap = ctx_len + block; // compact slots: 0..ctx_len=ctx, ctx_len..kv_cap=block
 
     // ── 0. Upload positions ────────────────────────────────────────────────────
     //
-    // RoPE positions match modeling.py's create_position_ids + the full
-    // position_ids = cat([ctx_pos], create_position_ids([anchor_pos], block_size)):
-    //   create_position_ids returns anchor_pos + [0, 1, ..., block_size-1]
-    //   so full_position_ids = [anchor_pos, anchor_pos+0, anchor_pos+1, ..., anchor_pos+block-1]
-    //   = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]  (1 + block entries)
+    // full_position_ids (modeling.py training):
+    //   [ctx_positions[0..ctx_len], block_positions[0..block]]
     //
-    // apply_rotary_pos_emb: q uses cos[..., -q_len:, :] = last block entries
-    //   → Q positions = [seed_pos, seed_pos+1, ..., seed_pos+block-1]
-    //   K uses full cos → positions = [seed_pos(ctx), seed_pos, ..., seed_pos+block-1]
+    // apply_rotary_pos_emb (modeling.py:34–40):
+    //   K uses the full kv_cap positions.
+    //   Q uses the LAST block entries (cos[..., -q_len:, :]).
+    //   → positions_q_block = block_positions.
 
-    // positions_kv_all = [seed_pos, seed_pos, seed_pos+1, ..., seed_pos+block-1]
-    // (1+block entries: ctx slot at seed_pos, block slots at seed_pos..=seed_pos+block-1)
+    // positions_kv_all = [ctx_positions ++ block_positions] (kv_cap entries)
     {
-        let seed = seed_position as i32;
-        let pos: Vec<i32> = std::iter::once(seed)
-            .chain((0..block as i32).map(|i| seed + i))
+        let pos: Vec<i32> = ctx_positions
+            .iter()
+            .chain(block_positions.iter())
+            .map(|&p| p as i32)
             .collect();
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, kv_cap * 4) };
@@ -655,11 +685,9 @@ pub fn dspark_qwen3_block_forward(
             .map_err(|e| format!("dspark_qwen3: htod positions_kv_all: {e:?}"))?;
     }
 
-    // positions_q_block = [seed_pos, seed_pos+1, ..., seed_pos+block-1]
-    // (block entries: Q positions for the block queries)
+    // positions_q_block = block_positions (block entries: Q positions)
     {
-        let seed = seed_position as i32;
-        let pos: Vec<i32> = (0..block as i32).map(|i| seed + i).collect();
+        let pos: Vec<i32> = block_positions.iter().map(|&p| p as i32).collect();
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, block * 4) };
         gpu.hip
@@ -667,9 +695,10 @@ pub fn dspark_qwen3_block_forward(
             .map_err(|e| format!("dspark_qwen3: htod positions_q_block: {e:?}"))?;
     }
 
-    // positions_compact = [1, 2, ..., block]  (compact KV-cache slots for attention)
+    // positions_compact = [ctx_len, ctx_len+1, ..., ctx_len+block-1]
+    // (compact KV-cache slots for the block queries)
     {
-        let pos: Vec<i32> = (1..=block as i32).collect();
+        let pos: Vec<i32> = (ctx_len as i32..(ctx_len + block) as i32).collect();
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, block * 4) };
         gpu.hip
@@ -695,8 +724,6 @@ pub fn dspark_qwen3_block_forward(
 
         // ── 2a. input_layernorm(x_batch) → x_rot_batch  ───────────────────────
         // modeling.py:181  `residual = hidden_states; hidden_states = input_layernorm(hidden_states)`
-        // No MQ rotation here (drafter uses MQ4G256 for projections, but x is F32 and the
-        // rmsnorm_batched path produces the normed output into x_rot_batch for the projections).
         gpu.rmsnorm_batched(
             &scratch.pbs.x_batch,
             &layer.attn_norm,
@@ -709,9 +736,6 @@ pub fn dspark_qwen3_block_forward(
 
         // ── 2b. Q projection: wq(normed_block) → fa_q_batch  ──────────────────
         // modeling.py:99   `q = self.q_proj(hidden_states).view(...)`
-        // fa_q_batch is [block × q_dim] F32.
-        // weight_gemv handles MQ4 auto-rotate internally.
-        // sub_offset offset is in ELEMENTS (F32 tensors: 1 element = 4 bytes).
         for i in 0..block {
             let x_row = scratch.pbs.x_rot_batch.sub_offset(i * dim, dim);
             let q_row = scratch.pbs.fa_q_batch.sub_offset(i * q_dim, q_dim);
@@ -720,7 +744,7 @@ pub fn dspark_qwen3_block_forward(
         }
 
         // ── 2c. q_norm(q, per-head) — BEFORE RoPE  ────────────────────────────
-        // modeling.py:102  `q = self.q_norm(q).transpose(1, 2)` — before apply_rotary_pos_emb
+        // modeling.py:102  `q = self.q_norm(q).transpose(1, 2)`
         if let Some(ref qn) = layer.q_norm {
             gpu.rmsnorm_batched(
                 &scratch.pbs.fa_q_batch,
@@ -733,45 +757,48 @@ pub fn dspark_qwen3_block_forward(
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: q_norm: {e:?}"))?;
         }
 
-        // ── 2d. Context K/V + block K/V → all_k, all_v  ───────────────────────
-        // modeling.py:103  `k_ctx  = self.k_proj(target_hidden_states)` (main_x, 1 row)
+        // ── 2d. Context K/V (ctx_len rows) + block K/V → all_k, all_v  ─────────
+        // modeling.py:103  `k_ctx  = self.k_proj(target_hidden_states)` (ctx_len rows)
         // modeling.py:104  `k_noise = self.k_proj(hidden_states)`        (block rows)
-        // modeling.py:105  `v_ctx  = self.v_proj(target_hidden_states)`
-        // modeling.py:106  `v_noise = self.v_proj(hidden_states)`
-        // modeling.py:107  `k = cat([k_ctx, k_noise], dim=1)` → all_k[0..=block]
-        // modeling.py:110  `v = cat([v_ctx, v_noise], dim=1)` → all_v[0..=block]
+        // modeling.py:107  `k = cat([k_ctx, k_noise], dim=1)` → all_k[0..kv_cap]
+        // modeling.py:110  `v = cat([v_ctx, v_noise], dim=1)` → all_v[0..kv_cap]
 
-        // Context K at slot 0 of all_k.
-        let ctx_k = scratch.all_k.sub_offset(0, kv_dim);
-        weight_gemv(gpu, &layer.wk, main_x, &ctx_k)
-            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: k_proj(ctx): {e:?}"))?;
+        // Context K at slots 0..ctx_len of all_k.
+        for j in 0..ctx_len {
+            let mx_row = main_x.sub_offset(j * dim, dim);
+            let k_row = scratch.all_k.sub_offset(j * kv_dim, kv_dim);
+            weight_gemv(gpu, &layer.wk, &mx_row, &k_row)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: k_proj(ctx[{j}]): {e:?}"))?;
+        }
 
-        // Block K at slots 1..=block of all_k (offset in ELEMENTS for F32).
+        // Block K at slots ctx_len..ctx_len+block of all_k.
         for i in 0..block {
             let x_row = scratch.pbs.x_rot_batch.sub_offset(i * dim, dim);
-            let k_row = scratch.all_k.sub_offset((1 + i) * kv_dim, kv_dim);
+            let k_row = scratch.all_k.sub_offset((ctx_len + i) * kv_dim, kv_dim);
             weight_gemv(gpu, &layer.wk, &x_row, &k_row)
                 .map_err(|e| format!("dspark_qwen3 l{layer_idx}: k_proj[{i}]: {e:?}"))?;
         }
 
-        // Context V at slot 0 of all_v.
-        let ctx_v = scratch.all_v.sub_offset(0, kv_dim);
-        weight_gemv(gpu, &layer.wv, main_x, &ctx_v)
-            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: v_proj(ctx): {e:?}"))?;
+        // Context V at slots 0..ctx_len of all_v.
+        for j in 0..ctx_len {
+            let mx_row = main_x.sub_offset(j * dim, dim);
+            let v_row = scratch.all_v.sub_offset(j * kv_dim, kv_dim);
+            weight_gemv(gpu, &layer.wv, &mx_row, &v_row)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: v_proj(ctx[{j}]): {e:?}"))?;
+        }
 
-        // Block V at slots 1..=block of all_v (offset in ELEMENTS for F32).
+        // Block V at slots ctx_len..ctx_len+block of all_v.
         for i in 0..block {
             let x_row = scratch.pbs.x_rot_batch.sub_offset(i * dim, dim);
-            let v_row = scratch.all_v.sub_offset((1 + i) * kv_dim, kv_dim);
+            let v_row = scratch.all_v.sub_offset((ctx_len + i) * kv_dim, kv_dim);
             weight_gemv(gpu, &layer.wv, &x_row, &v_row)
                 .map_err(|e| format!("dspark_qwen3 l{layer_idx}: v_proj[{i}]: {e:?}"))?;
         }
 
         // ── 2e. k_norm(all_k) — on concatenated [ctx ++ block] K, BEFORE RoPE ─
         // modeling.py:113  `k = self.k_norm(k).transpose(1, 2)`
-        // all_k is [kv_cap × kv_dim] = [(1+block) × kv_dim] laid out as
-        // [(1+block)*n_kv_heads] rows of [head_dim] each → rmsnorm_batched treats
-        // it as (kv_cap * n_kv_heads) rows, each of head_dim floats.
+        // all_k is [kv_cap × kv_dim] laid out as [kv_cap*n_kv_heads] rows of
+        // [head_dim] each → rmsnorm_batched treats it as that many rows.
         if let Some(ref kn) = layer.k_norm {
             gpu.rmsnorm_batched(
                 &scratch.all_k,
@@ -787,91 +814,76 @@ pub fn dspark_qwen3_block_forward(
         // ── 2f. RoPE on Q (block positions) and K (all kv_cap positions)  ──────
         // modeling.py:116  `q, k = apply_rotary_pos_emb(q, k, cos, sin)`
         // apply_rotary_pos_emb (modeling.py:34–40):
-        //   q uses cos[..., -q_len:, :]  → block positions seed_pos+1..=+block
-        //   k uses full cos              → ctx(seed_pos) + block(seed_pos+1..=+block)
-        //
-        // Implementation: two rope_batched_f32 calls sharing the same K buffer,
-        // one for Q (positions_q_block, n_heads_k=0 trick not available → pass
-        // a zero-length sub-tensor for k), one for K (positions_kv_all, n_heads_q=0).
-        //
-        // rope_batched_f32 signature: (q, k, positions, n_heads_q, n_heads_k, head_dim, freq, batch)
-        // Setting n_heads_q=0 rotates only K; n_heads_k=0 rotates only Q.
-        // This is the same trick used by the deepseek4 dspark (`n_heads=0` for kv-only RoPE).
+        //   q uses cos[..., -q_len:, :]  → block_positions (last block entries)
+        //   k uses full cos              → [ctx_positions ++ block_positions]
 
-        // RoPE on Q (only): pass all_k as a dummy k with n_heads_k=0.
+        // RoPE on Q (only): n_heads_k=0 skips K rotation.
         gpu.rope_batched_f32(
             &scratch.pbs.fa_q_batch,
-            &scratch.all_k, // dummy k (n_heads_k=0 means it is not modified)
+            &scratch.all_k, // dummy k (n_heads_k=0 → not modified)
             &scratch.positions_q_block,
             config.n_heads,
-            0, // n_heads_k=0 → skip K rotation (modeling.py:38 q uses last q_len entries)
+            0, // n_heads_k=0 → skip K
             config.head_dim,
             config.rope_freq_base,
             block,
         )
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope Q: {e:?}"))?;
 
-        // RoPE on K (only): pass fa_q_batch as dummy q with n_heads_q=0.
+        // RoPE on K (only): n_heads_q=0 skips Q rotation.
         gpu.rope_batched_f32(
-            &scratch.pbs.fa_q_batch, // dummy q (n_heads_q=0 → skip Q rotation)
+            &scratch.pbs.fa_q_batch, // dummy q (n_heads_q=0 → not modified)
             &scratch.all_k,
             &scratch.positions_kv_all,
-            0, // n_heads_q=0 → skip Q rotation
+            0, // n_heads_q=0 → skip Q
             config.n_kv_heads,
             config.head_dim,
             config.rope_freq_base,
-            kv_cap, // batch = 1+block (ctx + block rows)
+            kv_cap, // batch = ctx_len + block
         )
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope K: {e:?}"))?;
 
-        // ── 2g. Write K and V to Q8 KV cache at compact slots 0..=block  ───────
-        // Compact positions 0..=block (from positions_kv_all used as 0-based compact
-        // slots): BUT positions_kv_all holds ABSOLUTE positions (seed_pos+0..+block).
-        // We need a separate compact positions [0, 1, ..., block] for the kv write.
-        //
-        // We use the approach of writing context K/V (slot 0) then block K/V
-        // (slots 1..=block) with the compact positions_compact + a context position=0
-        // uploaded per-layer. To avoid per-layer host uploads, we use:
-        //   - positions_compact for the block rows (slots 1..=block)
-        //   - a single kv_cache_write call for the context row at slot 0
-        //
-        // Context K at compact slot 0 via single-token kv_cache_write_q8_0.
-        // We upload a single i32(0) into scratch.pbs.positions slot 0 for the
-        // context write (positions buffer reuse is safe here: we re-upload below).
+        // ── 2g. Write K and V to Q8 KV cache at compact slots 0..kv_cap  ───────
+        // Write context K/V (slots 0..ctx_len) first, then block K/V
+        // (slots ctx_len..ctx_len+block) using positions_compact.
+
+        // Context K/V: compact slots 0..ctx_len.
+        // Upload compact positions [0, 1, ..., ctx_len-1] into pbs.positions.
         {
-            let ctx_pos_bytes = 0i32.to_le_bytes();
+            let ctx_compact: Vec<i32> = (0..ctx_len as i32).collect();
+            let ctx_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(ctx_compact.as_ptr() as *const u8, ctx_len * 4)
+            };
             gpu.hip
-                .memcpy_htod_offset(&scratch.pbs.positions.buf, 0, &ctx_pos_bytes)
-                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: htod ctx pos0: {e:?}"))?;
-            // sub_offset(0, kv_dim): slot 0, length kv_dim elements (F32).
-            let ctx_k = scratch.all_k.sub_offset(0, kv_dim);
-            let ctx_v = scratch.all_v.sub_offset(0, kv_dim);
+                .memcpy_htod_offset(&scratch.pbs.positions.buf, 0, ctx_bytes)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: htod ctx compact pos: {e:?}"))?;
+
+            let ctx_k_slice = scratch.all_k.sub_offset(0, ctx_len * kv_dim);
+            let ctx_v_slice = scratch.all_v.sub_offset(0, ctx_len * kv_dim);
             gpu.kv_cache_write_q8_0_batched(
                 &scratch.kv.k_gpu[layer_idx],
-                &ctx_k,
+                &ctx_k_slice,
                 &scratch.pbs.positions,
                 config.n_kv_heads,
                 config.head_dim,
-                1,
+                ctx_len,
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: kv_write_k_ctx: {e:?}"))?;
             gpu.kv_cache_write_q8_0_batched(
                 &scratch.kv.v_gpu[layer_idx],
-                &ctx_v,
+                &ctx_v_slice,
                 &scratch.pbs.positions,
                 config.n_kv_heads,
                 config.head_dim,
-                1,
+                ctx_len,
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: kv_write_v_ctx: {e:?}"))?;
         }
 
-        // Block K at compact slots 1..=block.
+        // Block K/V: compact slots ctx_len..ctx_len+block.
         {
-            // all_k[kv_dim..] holds the block K rows at byte offset kv_dim*4.
-            // sub_offset(kv_dim, block*kv_dim): skip ctx slot (kv_dim elems), take block slots.
-            let blk_k = scratch.all_k.sub_offset(kv_dim, block * kv_dim);
-            let blk_v = scratch.all_v.sub_offset(kv_dim, block * kv_dim);
+            let blk_k = scratch.all_k.sub_offset(ctx_len * kv_dim, block * kv_dim);
+            let blk_v = scratch.all_v.sub_offset(ctx_len * kv_dim, block * kv_dim);
             gpu.kv_cache_write_q8_0_batched(
                 &scratch.kv.k_gpu[layer_idx],
                 &blk_k,
@@ -893,10 +905,10 @@ pub fn dspark_qwen3_block_forward(
         }
 
         // ── 2h. Bidirectional masked GQA attention  ────────────────────────────
-        // positions_compact = [1, 2, ..., block] (each block query is at its compact slot).
-        // block_start=1, block_cols=block, bias=zeros → all block queries see all block keys.
-        // Slot 0 (context) is before block_start → always visible (never masked by the kernel).
-        // modeling.py:58 `self.is_causal = False`; modeling.py:137 `attn_is_causal = False`.
+        // positions_compact = [ctx_len..ctx_len+block] (block query compact slots).
+        // block_start=ctx_len, block_cols=block → all block queries see all block keys.
+        // Slots 0..ctx_len (context) are before block_start → always visible.
+        // modeling.py:58 `self.is_causal = False`.
         gpu.attention_q8_0_kv_batched_masked(
             &scratch.pbs.fa_q_batch,
             &scratch.kv.k_gpu[layer_idx],
@@ -906,11 +918,11 @@ pub fn dspark_qwen3_block_forward(
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
-            scratch.kv.physical_cap, // max_seq = kv_cap = 1+block
-            kv_cap,                  // max_ctx_len = 1+block (all keys visible)
+            scratch.kv.physical_cap, // max_seq = kv_cap
+            kv_cap,                  // max_ctx_len = ctx_len + block (all keys visible)
             block,                   // batch_size = block query rows
             Some(&scratch.bias),     // zero bias → bidirectional in-block
-            1,                       // block_start = 1 (ctx slot 0 always visible)
+            ctx_len,                 // block_start = ctx_len
             block,                   // block_cols = block
         )
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: attn: {e:?}"))?;
@@ -1118,8 +1130,8 @@ impl DsparkBody for Qwen3DsparkBody {
         let dim = self.assets.config.dim;
 
         // ── 1. main_proj_ingest: fc(main_hidden) + main_norm → main_x [dim] ───
-        // modeling.py:373  `target_hidden_states = self.hidden_norm(self.fc(...))`
-        // main_x is one context vector shared across all 5 layers.
+        // Single-slot (ctx_len=1): Stage 1 loop unchanged.  Stage 2 will pass
+        // ctx_len accepted positions instead.
         let main_x = gpu
             .alloc_tensor(&[dim], DType::F32)
             .map_err(|e| format!("Qwen3DsparkBody: alloc main_x: {e:?}"))?;
@@ -1128,14 +1140,18 @@ impl DsparkBody for Qwen3DsparkBody {
         // ── 2. block_ids = [seed, noise, noise, ...] ──────────────────────────
         let block_ids = noise_block_ids(&weights.cfg, seed);
 
-        // ── 3. Block-attention forward → x_head_out ───────────────────────────
+        // ── 3. Block-attention forward (ctx_len=1) → x_head_out ──────────────
+        // ctx_positions = [position] (single seed position).
+        // block_positions = [position, position+1, ..., position+block-1].
+        let block_positions: Vec<usize> = (0..block).map(|i| position + i).collect();
         dspark_qwen3_block_forward(
             gpu,
             &self.assets.weights,
             &self.assets.config,
             &main_x,
+            &[position], // ctx_positions (1 slot)
             &block_ids,
-            position,
+            &block_positions,
             block,
             &self.scratch,
             x_head_out,
@@ -1179,7 +1195,9 @@ pub fn build_qwen3_dspark_body(
     cfg: &DsparkConfig,
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
-    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size)
+    // Stage 1: single-slot context (max_ctx_len=1). Stage 2 will increase this
+    // to the accepted-window length once the loop passes multi-slot context.
+    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, 1)
         .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }

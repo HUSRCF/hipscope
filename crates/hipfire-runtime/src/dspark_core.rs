@@ -467,6 +467,94 @@ pub fn main_proj_ingest(
     Ok(())
 }
 
+/// Multi-slot variant of [`main_proj_ingest`]: applies `hidden_norm(fc(·))` to
+/// `ctx_len` independent rows, writing `[ctx_len, dim]` F32 into `out`.
+///
+/// `main_hidden` is `[ctx_len * concat_w]` where `concat_w = n_targets * dim`.
+/// `out` is `[ctx_len * dim]` (shape `[ctx_len * dim]` — 1D flat storage).
+/// `ctx_len=1` produces the same result as the single-slot [`main_proj_ingest`].
+///
+/// `dim` must equal the hidden dimension (e.g. 4096 for Qwen3-8B drafter).
+/// It cannot be inferred from `out.shape` because `out` is stored as a flat
+/// `[ctx_len * dim]` 1D tensor.
+///
+/// This matches `modeling.py:373`
+/// `target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))`
+/// where `target_hidden_states` is `[B, ctx_len, n_targets*hidden]`.
+pub fn main_proj_ingest_batched(
+    gpu: &mut Gpu,
+    weights: &DsparkWeights,
+    main_hidden: &GpuTensor, // [ctx_len * concat_w]
+    out: &GpuTensor,         // [ctx_len * dim]
+    ctx_len: usize,
+    dim: usize,
+) -> Result<(), String> {
+    if ctx_len == 0 {
+        return Err("main_proj_ingest_batched: ctx_len=0".to_string());
+    }
+    if dim == 0 {
+        return Err("main_proj_ingest_batched: dim=0".to_string());
+    }
+    let main_proj = weights
+        .main_proj
+        .as_ref()
+        .ok_or("main_proj_ingest_batched: main_proj missing")?;
+    let main_norm = weights
+        .main_norm
+        .as_ref()
+        .ok_or("main_proj_ingest_batched: main_norm missing")?;
+
+    let n_targets = weights.cfg.target_layer_ids.len();
+    let concat_w = n_targets * dim;
+    let needs_fwht = weight_needs_fwht(main_proj);
+
+    // FWHT scratch (only needed when main_proj is MQ4/Raw).
+    let rot_buf = if needs_fwht {
+        Some(
+            gpu.alloc_tensor(&[concat_w], DType::F32)
+                .map_err(|e| format!("main_proj_ingest_batched alloc rot: {e:?}"))?,
+        )
+    } else {
+        None
+    };
+
+    // Allocate a per-row output scratch [dim] F32. We use a full independent
+    // allocation per GEMV call to avoid sub-offset output tensors: some GPU
+    // GEMV implementations (gemm_f16_batched_lmhead → mw16 WMMA path on gfx1151)
+    // pre-zero the output buffer and may behave incorrectly when `y.buf` is a
+    // sub-offset (non-base-pointer) view. After each GEMV we d2d copy the row
+    // into the correct position of `out`.
+    let row_scratch = gpu
+        .alloc_tensor(&[dim], DType::F32)
+        .map_err(|e| format!("main_proj_ingest_batched alloc row_scratch: {e:?}"))?;
+
+    for j in 0..ctx_len {
+        let h_row = main_hidden.sub_offset(j * concat_w, concat_w);
+        if let Some(ref rot) = rot_buf {
+            gpu.rotate_x_mq(&h_row, rot, concat_w)
+                .map_err(|e| format!("main_proj_ingest_batched rotate row {j}: {e:?}"))?;
+            gemv_auto(gpu, main_proj, rot, &h_row, &row_scratch, dim, concat_w)?;
+        } else {
+            gemv_auto(gpu, main_proj, &h_row, &h_row, &row_scratch, dim, concat_w)?;
+        }
+        // Copy row_scratch → out[j*dim .. (j+1)*dim] using offset-aware D2D.
+        gpu.memcpy_dtod_at_auto(&out.buf, j * dim * 4, &row_scratch.buf, 0, dim * 4)
+            .map_err(|e| format!("main_proj_ingest_batched d2d row {j}: {e:?}"))?;
+    }
+
+    let _ = gpu.free_tensor(row_scratch);
+    if let Some(rot) = rot_buf {
+        let _ = gpu.free_tensor(rot);
+    }
+
+    // Apply main_norm RMSNorm to all ctx_len rows in one batched call.
+    // rmsnorm_batched treats out as [ctx_len * dim] → [ctx_len] rows of [dim].
+    gpu.rmsnorm_batched(out, main_norm, out, ctx_len, dim, weights.cfg.rms_norm_eps)
+        .map_err(|e| format!("main_proj_ingest_batched rmsnorm: {e:?}"))?;
+
+    Ok(())
+}
+
 /// Build the noise token id block for one DSpark window:
 /// `[seed, noise_token_id, noise_token_id, ...]` of length `cfg.block_size`.
 pub fn noise_block_ids(cfg: &DsparkConfig, seed: u32) -> Vec<u32> {
