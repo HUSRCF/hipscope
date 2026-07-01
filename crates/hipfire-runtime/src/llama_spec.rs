@@ -14,7 +14,7 @@ use crate::llama::{
     KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Per-position greedy verify: run the target over `block` (length `n`) at
 /// positions `[start_pos, start_pos + n)`, advancing `kv_cache` by `n`, and
@@ -164,9 +164,10 @@ struct VerifyOut {
 }
 
 /// Shared body for [`verify_block_argmax`] / [`verify_block_logits`]: one batched
-/// forward over `block`, then per-row `rmsnorm + lm_head`. When `want_logits` the
-/// full per-row logits are collected; the argmax is always returned (cheap CPU
-/// scan over the already-downloaded row).
+/// forward over `block`, then per-row `rmsnorm + lm_head + argmax`. For the greedy
+/// path (`!want_logits`) argmax is computed on GPU and only 4 bytes per position
+/// are downloaded; for `want_logits=true` the full logit row is downloaded for
+/// SWOR / temperature sampling.
 #[allow(clippy::too_many_arguments)]
 fn verify_block_logits_or_argmax(
     gpu: &mut Gpu,
@@ -233,6 +234,26 @@ fn verify_block_logits_or_argmax(
             Some(pbs),
             capture,
         )?;
+
+        // Per-row lm_head loop.  For the greedy path (!want_logits) we run the
+        // argmax on-GPU and download only 4 bytes per position instead of the
+        // full vocab × 4 (≈607 KB for Qwen3-8B vocab=151936).  The logit matrix
+        // is never materialised to GPU memory, keeping the L2 cache clean for
+        // the subsequent draft pass.
+        //
+        // Argmax tie-break identity: `argmax_f32_batched` uses strict `>` in
+        // both the per-thread scan and the shared-memory reduction (see
+        // `kernels/src/argmax_batched.hip`), so the lowest vocab index wins on a
+        // tie — identical to the CPU `argmax()` which also uses strict `>`.
+        //
+        // For want_logits=true (SWOR / temp>0 sampling) we still download the
+        // full logit row and do CPU argmax (caller needs the distribution).
+        let argmax_one = if !want_logits {
+            // 4-byte scratch; pool-resident (256-byte bucket) after the first use.
+            Some(gpu.alloc_tensor(&[1], DType::F32)?)
+        } else {
+            None
+        };
         for i in 0..n {
             let off_bytes = i * dim * 4;
             gpu.hip
@@ -244,11 +265,22 @@ fn verify_block_logits_or_argmax(
                 config.norm_eps,
             )?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-            let row = gpu.download_f32(&scratch.logits)?;
-            out.push(argmax(&row));
-            if want_logits {
+            if let Some(ref ab) = argmax_one {
+                // GPU argmax → 4-byte D2H (avoids 607 KB download per position).
+                gpu.argmax_f32_batched(&scratch.logits, ab, vocab, 1)?;
+                let mut raw = 0i32;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts_mut(&mut raw as *mut i32 as *mut u8, 4) };
+                gpu.hip.memcpy_dtoh(bytes, &ab.buf)?;
+                out.push(raw as u32);
+            } else {
+                let row = gpu.download_f32(&scratch.logits)?;
+                out.push(argmax(&row));
                 logits_out.extend_from_slice(&row);
             }
+        }
+        if let Some(ab) = argmax_one {
+            let _ = gpu.free_tensor(ab);
         }
     } else {
         for (i, &tok) in block.iter().enumerate() {
@@ -313,4 +345,32 @@ pub fn lm_head_logits_n_rows(
         out.extend_from_slice(&gpu.download_f32(&scratch.logits)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the CPU `argmax` and the GPU `argmax_f32_batched` kernel
+    /// share the same tie-break rule (first/lower index on a tie).
+    ///
+    /// The GPU kernel (`kernels/src/argmax_batched.hip`) uses strict `>` in
+    /// both the per-thread scan (`if (v > lmax)`) and the tree-reduction
+    /// (`if (s[i+sz] > s[i])`), so ties resolve to the lowest vocabulary index.
+    /// This is identical to the CPU `argmax()` which uses the same strict `>`
+    /// with a fold over the slice. The tests below exercise the CPU half;
+    /// the GPU half is structurally identical (verified by code inspection).
+    #[test]
+    fn argmax_tiebreak_first_index_wins() {
+        // Unambiguous max at index 1
+        assert_eq!(argmax(&[1.0, 5.0, 3.0]), 1);
+        // Tie between index 0 and 2: first (lower) index wins
+        assert_eq!(argmax(&[5.0, 3.0, 5.0]), 0);
+        // Tie at end: earlier index wins
+        assert_eq!(argmax(&[1.0, 5.0, 5.0]), 1);
+        // All equal: index 0 wins (both GPU seed = −1e30, CPU seed = NEG_INFINITY)
+        assert_eq!(argmax(&[2.0, 2.0, 2.0]), 0);
+        // Single element
+        assert_eq!(argmax(&[7.0]), 0);
+    }
 }
