@@ -385,6 +385,15 @@ fn gemv_auto_batched_wmma(
             gpu.gemm_q8_0_batched_chunked(weight, x_plain_batch, y, m, k, batch_size)
                 .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
         }
+        // F16 lm-head: arch-dispatch to avoid polluting the shared ensure_fp16_x
+        // cache (which is keyed on the F32 source pointer and is used by trunk
+        // GEMMs in the verify pass — cache poisoning by run_heads causes +18ms
+        // verify regression per window).
+        //
+        // gfx12 (RDNA4): gemm_f16_wmma_mb8 takes F32 x directly.
+        // RDNA3 with WMMA (gfx11xx, gfx1151, …): K2-pipelined mw16 residual
+        //   using the caller-owned x_f16_scratch (bypasses ensure_fp16_x entirely).
+        // Non-WMMA: gemm_f16_x_f16_wmma on the external scratch (baseline path).
         DType::F16 => {
             if gpu.arch_caps.has_wmma_w32_gfx12() {
                 return gpu
@@ -395,8 +404,15 @@ fn gemv_auto_batched_wmma(
                 let n = (batch_size * k) as i64;
                 gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                     .map_err(|e| format!("convert_f32_to_f16 (F16 weight): {e:?}"))?;
-                gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
-                    .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
+                if gpu.arch_caps.has_wmma_w32() && k % 32 == 0 {
+                    // K2-pipelined path: uses caller-owned F16 scratch, skips
+                    // ensure_fp16_x to preserve the trunk's fp16_x cache state.
+                    gpu.gemm_mw16_residual_wmma_f16x(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_mw16_residual_wmma_f16x: {e:?}"))
+                } else {
+                    gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
+                }
             } else {
                 Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
             }
