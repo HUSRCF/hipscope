@@ -62,11 +62,15 @@ all b positions. You don't. Lazy fixes it.
 
 ## deepseek4 (Stage 2, 3fe37f27) — verify_block_sampled_capture_gpu +
 `final_norm_and_sample_all_batched_lazy` (per-position fused sampler + lazy stop).
-Measured (warm): CODE AR 10.19 / greedy 6.12 / temp0.7-lazy **11.40** (temp>0
-beats both — ds4 greedy on code is head-bound, all 5 lm_heads at τ1.36; lazy runs
-~τ, τ↑1.84). PROSE (natural-EOS, noisy) AR 12.48 / greedy ~14 / temp>0 8.9-11.7
-(competitive-to-losing; ds4's prose win is greedy's high accept 0.32, eroded by
-temp>0 sampling). Serving still gated (supports_temp=false); bench-enabled.
+CLEAN same-session CODE (max160, warm, 2-run stable): AR 11.32 / greedy 8.94
+(τ1.35) / temp0.7 **11.40** (τ1.84, accept0.18 — HIGHER than greedy!) / temp1.0
+9.58 (τ1.46). So on code temp0.7 ~TIES AR and beats greedy; temp1.0 loses to AR,
+beats greedy. (temp0.7 fastest because the markov draft aligns with the SAMPLED
+target better than the argmax target here.) PROSE (natural-EOS, noisy) AR 12.5 /
+greedy ~14 / temp>0 8.9-11.7 — loses to both (ds4's prose win is greedy's high
+accept 0.32, eroded by sampling). Net: ds4 temp>0 is coherent but ~break-even to
+losing (no clear win like qwen3) → serving stays gated (supports_temp=false);
+bench-enabled. Note greedy code here is 8.94 = post greedy-lazy (was 6.12).
 
 ## serving-enable DONE (af6e7ff5) — qwen3 temp>0 ON
 Carrier supports_temp=true (qwen3); daemon `llama_dflash_route` (arch 0/1) now
