@@ -204,7 +204,16 @@ pub fn build_deepseek4_dspark_body(
 /// `bundle.weights.free_gpu(gpu)` on unload.
 ///
 /// Confidence threshold ladder: `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` env
-/// > `conf_threshold` arg > 0.5.
+/// > `conf_threshold` arg > 0.3. Default 0.3 (was 0.5): with the lazy verify a
+/// higher drafter budget (less confidence truncation) is a net GREEDY win —
+/// admitting the drafts 0.5 was cutting recovers correct tokens at ~no per-head
+/// verify cost. Measured (fixed-len, warm): code 8.95→9.47 (+5.8%), fiction
+/// prose 10.09→12.13 (+20%); 0.3 is the sweet spot (0.1 over-proposes → prose
+/// 11.27 < 12.13, and the verify *forward* still scales with proposals). Greedy
+/// output is unchanged (conf is a pure speed knob — committed tokens are the
+/// target argmax regardless of how many drafts were proposed). NB temp>0 wants
+/// the OPPOSITE (more truncation): at temp0.7 conf 0.5 > 0.1; but ds4 temp>0 is
+/// gated off in serving, so the greedy optimum governs the default.
 #[allow(clippy::too_many_arguments)]
 pub fn build_deepseek4_dspark_speculator(
     config: &DeepseekV4Config,
@@ -239,7 +248,7 @@ pub fn build_deepseek4_dspark_speculator(
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)
-        .unwrap_or(0.5);
+        .unwrap_or(0.3);
 
     // Build arch-agnostic CoreDsparkWeights from sidecar globals (shallow clones).
     let core_weights = CoreDsparkWeights {

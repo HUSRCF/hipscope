@@ -280,7 +280,7 @@ export interface HipfireConfig {
   // heavy trunk verify. Applies to BOTH DSpark arches (qwen3 + deepseek4).
   //
   // `null` = unset ⇒ each arch's tuned carrier default applies (qwen3 0.1,
-  // deepseek4 0.5); a number OVERRIDES that default. Forwarded as a load param
+  // deepseek4 0.3); a number OVERRIDES that default. Forwarded as a load param
   // ONLY when non-null, so an unset CLI never shadows the per-arch default
   // (env HIPFIRE_{QWEN3,DEEPSEEK4}_DSPARK_CONF_THRESHOLD still wins in the
   // loader). Consulted only when speculation runs dspark.
@@ -422,7 +422,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // prior behavior (dflash off, mtp auto, n-gram off).
   speculation: "auto",
   // Unset by default: the per-arch carrier default applies (qwen3 0.1,
-  // deepseek4 0.5). A user value (config or --dspark-conf-threshold) overrides.
+  // deepseek4 0.3). A user value (config or --dspark-conf-threshold) overrides.
   dspark_conf_threshold: null,
   ngram_mode: "off",
   ngram_k: 12,
@@ -1041,7 +1041,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.dspark_mode = effDsparkMode;
   // Forward ONLY when explicitly set (config or --dspark-conf-threshold). Unset
   // (null) ⇒ omit, so the loader's per-arch carrier default applies (qwen3 0.1,
-  // deepseek4 0.5) instead of a global CLI default clobbering it.
+  // deepseek4 0.3) instead of a global CLI default clobbering it.
   if (resolved.dspark_conf_threshold !== null && resolved.dspark_conf_threshold !== undefined) {
     params.dspark_conf_threshold = resolved.dspark_conf_threshold;
   }
@@ -6803,7 +6803,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     dspark_conf_threshold: {
       label: "dspark_conf_threshold",
-      desc: "DSpark confidence-truncation cutoff (qwen3 + deepseek4). Draft block is cut to the prefix where sigmoid(confidence) >= this before verify. Unset = per-arch tuned default (qwen3 0.1, deepseek4 0.5); lower keeps more drafts (higher accept), higher truncates harder. Sweep-tuned: qwen3 optimum ~0.1.",
+      desc: "DSpark confidence-truncation cutoff (qwen3 + deepseek4). Draft block is cut to the prefix where sigmoid(confidence) >= this before verify. Unset = per-arch tuned default (qwen3 0.1, deepseek4 0.3); lower keeps more drafts (higher accept), higher truncates harder. Sweep-tuned: qwen3 optimum ~0.1.",
       range: [0, 1], step: 0.05,
     },
     ngram_mode: {
@@ -7741,7 +7741,7 @@ switch (cmd) {
     const dsparkConfVal = takeFlagValue(rest, "--dspark-conf-threshold");
     const model = rest[0];
     if (wantHelp || !model) {
-      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp|dspark (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  --dspark-conf-threshold <f> DSpark confidence-truncation cutoff 0-1 (qwen3 + deepseek4; unset = per-arch default qwen3 0.1 / deepseek4 0.5)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp|dspark (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  --dspark-conf-threshold <f> DSpark confidence-truncation cutoff 0-1 (qwen3 + deepseek4; unset = per-arch default qwen3 0.1 / deepseek4 0.3)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
       process.exit(wantHelp ? 0 : EXIT.USAGE);
     }
     // Validate --kv-mode against the same allowlist config validation uses.

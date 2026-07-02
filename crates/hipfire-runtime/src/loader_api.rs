@@ -104,7 +104,7 @@ pub struct SpecLoadCfg {
     pub dspark: Option<bool>,
     /// DSpark confidence-truncation threshold (`--dspark-conf-threshold`),
     /// forwarded ONLY when the user set it. `None` = use the per-arch carrier
-    /// default (qwen3 0.1, deepseek4 0.5) — the CLI no longer imposes a global
+    /// default (qwen3 0.1, deepseek4 0.3) — the CLI no longer imposes a global
     /// default that would shadow those. Env `HIPFIRE_{QWEN3,DEEPSEEK4}_DSPARK_CONF_THRESHOLD`
     /// still wins over this in the builder.
     pub dspark_conf_threshold: Option<f32>,
