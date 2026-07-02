@@ -80,6 +80,18 @@ impl BlockController {
     }
 }
 
+/// Break-even full-accept rate from a live-measured, thermal-invariant timing ratio.
+/// `t_ar_ms` = one single-position forward; `t_verify_ms` = a batched verify over
+/// `n_verify` positions. Both measured in the same thermal state, so the ratio is
+/// stable under DPM/thermal scaling. Returns the 0.18 prior for degenerate input.
+pub(crate) fn calibrate_p_star(t_ar_ms: f32, t_verify_ms: f32, n_verify: usize) -> f32 {
+    if n_verify < 2 || t_ar_ms <= 0.0 {
+        return 0.18;
+    }
+    let dt_position = (t_verify_ms - t_ar_ms) / (n_verify as f32 - 1.0);
+    (dt_position / t_ar_ms).clamp(0.05, 0.5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +158,35 @@ mod tests {
             c.observe(0, 0);
         }
         assert!(c.block() >= 1 && c.block() <= 5);
+    }
+
+    // gfx1151-mq2lloyd shape: t_AR≈84ms, verify of 6 positions≈149ms => Δt≈13ms/pos,
+    // p* ≈ 13/84 ≈ 0.155. Must land near the offline 0.18 and inside the clamp.
+    #[test]
+    fn calibrate_matches_gfx1151_prior() {
+        let p = calibrate_p_star(84.0, 149.0, 6);
+        assert!((0.10..0.25).contains(&p), "p*={p} not near the 0.18 prior");
+    }
+
+    // Cheap-marginal arch (verify barely grows with n) => small p* (favor big blocks),
+    // clamped at the floor.
+    #[test]
+    fn calibrate_clamps_low() {
+        let p = calibrate_p_star(84.0, 88.0, 6); // Δt≈0.8ms/pos => ~0.01, clamp 0.05
+        assert_eq!(p, 0.05);
+    }
+
+    // Expensive-marginal arch (verify grows steeply) => large p* (favor small blocks),
+    // clamped at the ceiling.
+    #[test]
+    fn calibrate_clamps_high() {
+        let p = calibrate_p_star(84.0, 84.0 + 84.0 * 5.0, 6); // Δt≈t_ar/pos => 1.0, clamp 0.5
+        assert_eq!(p, 0.5);
+    }
+
+    // Degenerate n_verify<2 falls back to the prior (no division by zero).
+    #[test]
+    fn calibrate_degenerate_returns_prior() {
+        assert_eq!(calibrate_p_star(84.0, 84.0, 1), 0.18);
     }
 }
