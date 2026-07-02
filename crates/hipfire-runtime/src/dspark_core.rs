@@ -286,6 +286,44 @@ fn dspark_embed_one(
     }
 }
 
+/// True when `table`'s dtype has a device-token-indexed batched embedding
+/// lookup — i.e. the markov chain can stay GPU-resident (token id read straight
+/// from a device buffer, no per-slot D2H+H2D). Covers the dtypes DSpark markov
+/// heads actually ship as (F16, Q8_0, and Raw==HFQ4-G256); anything else falls
+/// back to the host-token path in `dspark_embed_one`.
+fn markov_w1_device_embeddable(table: &GpuTensor) -> bool {
+    matches!(table.dtype, DType::F16 | DType::Q8_0 | DType::Raw)
+}
+
+/// Single-token embedding lookup where the token id is read from a device
+/// buffer `token_slot` (`[1]` i32) rather than a host `u32`, keeping the markov
+/// sampling loop free of per-slot host round-trips. Byte-identical to
+/// [`dspark_embed_one`]: the batched kernels dequantize/widen the same way, and
+/// the F16 path's `(float)_Float16` widening matches host `f16_to_f32` exactly.
+/// Only the dtypes accepted by [`markov_w1_device_embeddable`] are supported.
+fn dspark_embed_one_device(
+    gpu: &mut Gpu,
+    table: &GpuTensor,
+    out: &GpuTensor,
+    token_slot: &GpuTensor,
+    dim: usize,
+) -> Result<(), String> {
+    match table.dtype {
+        DType::F16 => gpu
+            .embedding_lookup_f16_batched(table, out, token_slot, 1, dim)
+            .map_err(|e| format!("dspark embed f16 device: {e:?}")),
+        DType::Q8_0 => gpu
+            .embedding_lookup_q8_batched(table, out, token_slot, 1, dim)
+            .map_err(|e| format!("dspark embed q8 device: {e:?}")),
+        DType::Raw => gpu
+            .embedding_lookup_hfq4g256_batched(table, out, token_slot, 1, dim)
+            .map_err(|e| format!("dspark embed hfq4g256 device: {e:?}")),
+        other => Err(format!(
+            "dspark embed device: unsupported table dtype {other:?}"
+        )),
+    }
+}
+
 /// 1-row GEMV dispatched by weight dtype. `x_rotated` is the FWHT-rotated
 /// activation (used for Raw/MQ4 weights); `x_plain` is used for all others.
 /// Ported from deepseek4::forward `gemv_auto`.
@@ -693,6 +731,34 @@ pub fn run_heads(
     // out_ids[0] = prev_token; out_ids[i+1] = argmax(logits[i] + markov_bias).
     let mut out_ids = vec![prev_token; block + 1];
 
+    // Device-resident token chain: when markov_w1 supports a device-token-indexed
+    // lookup, keep the whole sequential loop on the GPU — the previous slot's
+    // argmax lands in `chain[i+1]` (via `argmax_token_chain_f32`) and the next
+    // embed reads `chain[i]` straight from device memory. This removes the
+    // per-slot embed D2H+H2D and per-slot argmax D2H (each ~free on UMA, but a
+    // full pipeline drain on a discrete-VRAM GPU); the block's token ids come
+    // back in a single D2H after the loop. `chain` is a 4-byte-per-elem F32-typed
+    // buffer holding i32 ids (same convention as qwen35's `mtp_token_chain`);
+    // `argmax_scratch` is the throwaway index sink `argmax_token_chain_f32` also
+    // writes. `None` ⇒ host-token fallback (byte-identical).
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1) {
+        let chain = gpu
+            .alloc_tensor(&[block + 1], DType::F32)
+            .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+        let seed_i32 = prev_token as i32;
+        let seed_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
+        gpu.hip
+            .memcpy_htod(&chain.buf, seed_bytes)
+            .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
+        let argmax_scratch = gpu
+            .alloc_tensor(&[1], DType::F32)
+            .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
+        Some((chain, argmax_scratch))
+    } else {
+        None
+    };
+
     // Confidence head buffers (ON GPU per slot inside the loop):
     // `conf_batch[block]` holds the per-slot confidence logit.
     // `concat_dev` stages `[x_head[i] ++ markov_embed[i]]` for the 1-row
@@ -720,8 +786,15 @@ pub fn run_heads(
         None
     };
     for i in 0..block {
-        // markov_w1 lookup of out_ids[i] → emb_dev [markov_rank] (unrotated).
-        dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
+        // markov_w1 lookup → emb_dev [markov_rank] (unrotated). Device chain reads
+        // the previous slot's token id straight from GPU (`chain[i]`); the host
+        // fallback uses the argmax'd host id (`out_ids[i]`).
+        if let Some((chain, _)) = chain_bufs.as_ref() {
+            let token_slot = chain.sub_offset(i, 1);
+            dspark_embed_one_device(gpu, markov_w1, &emb_dev, &token_slot, markov_rank)?;
+        } else {
+            dspark_embed_one(gpu, markov_w1, &emb_dev, out_ids[i], markov_rank)?;
+        }
 
         // Confidence slot i ON GPU: stage [hidden_i ++ markov_embed[i]] then
         // a 1-row `confidence_proj` gemv → conf_batch[i]. Uses the UNROTATED
@@ -781,9 +854,31 @@ pub fn run_heads(
         let row = logits_dev.sub_offset(i * vocab, vocab);
         gpu.add_inplace_f32(&row, &bias_dev)
             .map_err(|e| format!("run_heads markov bias add {i}: {e:?}"))?;
-        out_ids[i + 1] = gpu
-            .argmax_f32(&row, vocab)
-            .map_err(|e| format!("run_heads markov argmax {i}: {e:?}"))?;
+        if let Some((chain, argmax_scratch)) = chain_bufs.as_ref() {
+            // argmax → chain[i+1] (device), feeding the next slot's embed without
+            // a host round-trip. `argmax_token_chain_f32`'s reduction is identical
+            // to `argmax_f32` (strict `>`, lowest-index tie-break).
+            gpu.argmax_token_chain_f32(&row, argmax_scratch, chain, None, vocab, i + 1)
+                .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
+        } else {
+            out_ids[i + 1] = gpu
+                .argmax_f32(&row, vocab)
+                .map_err(|e| format!("run_heads markov argmax {i}: {e:?}"))?;
+        }
+    }
+    // Device chain: pull the whole block's token ids back in one D2H (vs one per
+    // slot in the host path).
+    if let Some((chain, _)) = chain_bufs.as_ref() {
+        let mut ids_i32 = vec![0i32; block + 1];
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(ids_i32.as_mut_ptr() as *mut u8, (block + 1) * 4)
+        };
+        gpu.hip
+            .memcpy_dtoh(bytes, &chain.buf)
+            .map_err(|e| format!("run_heads d2h token chain: {e:?}"))?;
+        for i in 1..=block {
+            out_ids[i] = ids_i32[i] as u32;
+        }
     }
     let _ = gpu.free_tensor(emb_dev);
     let _ = gpu.free_tensor(bias_dev);
@@ -791,6 +886,10 @@ pub fn run_heads(
     let _ = gpu.free_tensor(normed);
     if let Some(r) = emb_rot {
         let _ = gpu.free_tensor(r);
+    }
+    if let Some((chain, argmax_scratch)) = chain_bufs {
+        let _ = gpu.free_tensor(chain);
+        let _ = gpu.free_tensor(argmax_scratch);
     }
 
     // ── Confidence download ───────────────────────────────────────────────

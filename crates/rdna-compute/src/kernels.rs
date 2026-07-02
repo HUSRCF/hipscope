@@ -3331,6 +3331,13 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
 
+/// Batched F16 embedding: copies N rows of an F16 table into `[N × dim]` F32,
+/// reading token ids from a device buffer. Keeps the DSpark markov head chain
+/// GPU-resident (no per-slot D2H+H2D). The F16→F32 widening is exact, so this
+/// is byte-identical to the host `f16_to_f32` fallback it replaces.
+pub const EMBEDDING_F16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_f16_batched.hip");
+
 /// DSpark bidirectional staging assembly. Builds the per-stage attention
 /// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the
 /// committed main_kv ring + the block KV, replacing a host d2h+assemble+h2d
@@ -3395,8 +3402,7 @@ pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
 /// tgt_probs[b*vocab], dft_probs[b*vocab], draft_tokens[b], draft_p_at_token[b],
 /// tau/z arrays for both sides, rng_seed, cactus_delta; outputs
 /// {accept_len, bonus_token, rejected_at, new_rng} in a 16-byte int[4].
-pub const CHAIN_ACCEPT_SPEC_SRC: &str =
-    include_str!("../../../kernels/src/chain_accept_spec.hip");
+pub const CHAIN_ACCEPT_SPEC_SRC: &str = include_str!("../../../kernels/src/chain_accept_spec.hip");
 
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
