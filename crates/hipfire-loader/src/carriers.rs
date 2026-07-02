@@ -971,6 +971,11 @@ impl Carrier for Deepseek4Carrier {
                     block,
                     ctx_capacity,
                     ctx.spec.dspark_conf_threshold,
+                    // Serving stays greedy-only: ds4 DSpark temp>0 (sampled verify)
+                    // works but only wins on short/predictable prose — it loses to
+                    // AR on code (greedy ds4 already does). Gate off; temp>0 → AR.
+                    // The bench exercises it via supports_temp=true.
+                    false,
                 )
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )

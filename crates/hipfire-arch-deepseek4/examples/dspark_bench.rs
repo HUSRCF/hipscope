@@ -54,6 +54,9 @@ fn decode_loop(
     max: usize,
     eos: u32,
     raw: bool,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
 ) -> Result<(Vec<u32>, u64, u64, u64), String> {
     let mut generated: Vec<u32> = Vec::with_capacity(max);
     let mut position = start_pos;
@@ -61,6 +64,8 @@ fn decode_loop(
     let mut windows: u64 = 0;
     let mut proposed: u64 = 0;
     let mut accepted: u64 = 0;
+
+    spec.set_sampling(temp, top_p, top_k, 0.0);
 
     // The first token is the prefill's argmax; it is emitted as the seed of the
     // first window's continuation (the daemon emits it before stepping).
@@ -70,7 +75,7 @@ fn decode_loop(
     generated.push(first_token);
 
     while generated.len() < max {
-        let step = spec.step(gpu, bundle, position, seed, &generated, None, 0.0)?;
+        let step = spec.step(gpu, bundle, position, seed, &generated, None, temp)?;
         windows += 1;
         proposed += step.proposed as u64;
         accepted += step.accepted as u64;
@@ -115,6 +120,19 @@ fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
     let raw = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_RAW").ok().as_deref() == Some("1");
+    // temp=0 (default) → greedy verify; temp>0 → DSpark sampled (lazy) verify.
+    let temp: f32 = std::env::var("HIPFIRE_DEEPSEEK4_TEMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let top_p: f32 = std::env::var("HIPFIRE_DEEPSEEK4_TOP_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
@@ -162,7 +180,14 @@ fn main() -> Result<(), String> {
 
     let ctx_cap = cfg.max_position_embeddings;
     let mut spec: Box<dyn Speculator> = if dspark_enabled {
-        build_deepseek4_dspark_speculator(&bundle.config, &bundle.weights, block, ctx_cap, None)?
+        build_deepseek4_dspark_speculator(
+            &bundle.config,
+            &bundle.weights,
+            block,
+            ctx_cap,
+            None,
+            true, // enable temp>0 sampled verify for benchmarking
+        )?
     } else {
         let k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
             .ok()
@@ -296,6 +321,9 @@ fn main() -> Result<(), String> {
             warmup,
             eos_tok,
             raw,
+            temp,
+            top_p,
+            top_k,
         )?;
         gpu.hip
             .device_synchronize()
@@ -344,6 +372,9 @@ fn main() -> Result<(), String> {
         max,
         eos_tok,
         raw,
+        temp,
+        top_p,
+        top_k,
     )?;
     gpu.hip
         .device_synchronize()
@@ -367,7 +398,7 @@ fn main() -> Result<(), String> {
     let text = tokenizer.decode(&generated);
     println!("=== dspark_bench ===");
     println!(
-        "drafter={} block={} prompt_md5={} prompt_tokens={}",
+        "drafter={} block={} temp={temp:.2} top_p={top_p:.2} top_k={top_k} prompt_md5={} prompt_tokens={}",
         if dspark_enabled { "DSpark" } else { "MTP" },
         block,
         prompt_md5,

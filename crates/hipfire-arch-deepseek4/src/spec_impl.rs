@@ -21,7 +21,7 @@
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
     self, dspark_assemble_main_hidden, final_norm_and_argmax_all_batched,
-    forward_prefill_batch_chunk, PrefillBatchScratch,
+    final_norm_and_sample_all_batched_lazy, forward_prefill_batch_chunk, PrefillBatchScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{Gpu, GpuTensor};
@@ -121,6 +121,47 @@ impl Deepseek4Bundle {
         );
         self.state.dspark_verify_pbs = Some(pbs);
         argmax_result.map_err(|e| format!("Deepseek4Bundle::verify_block head+argmax: {e}"))
+    }
+
+    /// temp>0 twin of `dspark_verify_argmax`: fused GPU sample per position with
+    /// LAZY prefix stop against the drafted `block` (samples ~τ heads/window, not
+    /// all n). Advances `rng_state`.
+    fn dspark_verify_sample_lazy(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+    ) -> Result<Vec<u32>, String> {
+        let result_buf = gpu
+            .alloc_tensor(&[2], rdna_compute::DType::F32)
+            .map_err(|e| format!("dspark_verify_sample_lazy result_buf: {e:?}"))?;
+        let repeat_buf = gpu
+            .alloc_tensor(&[1], rdna_compute::DType::F32)
+            .map_err(|e| format!("dspark_verify_sample_lazy repeat_buf: {e:?}"))?;
+        let mut rng32 = *rng_state as u32;
+        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let res = final_norm_and_sample_all_batched_lazy(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &pbs,
+            gpu,
+            block,
+            temp,
+            top_p,
+            top_k,
+            &mut rng32,
+            &result_buf,
+            &repeat_buf,
+        );
+        self.state.dspark_verify_pbs = Some(pbs);
+        *rng_state = rng32 as u64;
+        let _ = gpu.free_tensor(result_buf);
+        let _ = gpu.free_tensor(repeat_buf);
+        res.map_err(|e| format!("Deepseek4Bundle::verify_block head+sample: {e}"))
     }
 }
 
@@ -298,6 +339,44 @@ impl SpecTarget for Deepseek4Bundle {
         }
 
         let picks = self.dspark_verify_argmax(gpu, n_verify)?;
+        Ok((picks, captured))
+    }
+
+    /// temp>0 twin of [`verify_block_capture_gpu`]: same batched forward + GPU
+    /// hidden capture, but draws each position with the fused GPU sampler and
+    /// LAZY prefix stop (distribution-identical to AR temp-T decoding).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        _scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let n_verify = block.len();
+        self.dspark_verify_forward(gpu, block, position, true)?;
+
+        let n_targets = self.state.dspark_target_layers.len();
+        let hidden = self.config.hidden_size;
+        let captured = n_targets > 0;
+        if captured {
+            let n_floats = n_verify * n_targets * hidden;
+            if let Some(caps) = self.state.dspark_caps.as_ref() {
+                gpu.memcpy_dtod_auto(&hidden_gpu.buf, &caps.buf, n_floats * 4)
+                    .map_err(|e| {
+                        format!(
+                            "Deepseek4Bundle::verify_block_sampled_capture_gpu caps dtod: {e:?}"
+                        )
+                    })?;
+            }
+        }
+
+        let picks = self.dspark_verify_sample_lazy(gpu, block, temp, top_p, top_k, rng_state)?;
         Ok((picks, captured))
     }
 

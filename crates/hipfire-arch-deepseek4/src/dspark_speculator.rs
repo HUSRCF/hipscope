@@ -205,12 +205,14 @@ pub fn build_deepseek4_dspark_body(
 ///
 /// Confidence threshold ladder: `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` env
 /// > `conf_threshold` arg > 0.5.
+#[allow(clippy::too_many_arguments)]
 pub fn build_deepseek4_dspark_speculator(
     config: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     block: usize,
     ctx_capacity: usize,
     conf_threshold: Option<f32>,
+    supports_temp: bool,
 ) -> Result<Box<dyn Speculator>, String> {
     let dspark = weights
         .dspark
@@ -268,6 +270,6 @@ pub fn build_deepseek4_dspark_speculator(
         block,
         ctx_capacity,
         conf_threshold,
-        false, // deepseek4 sampled verify (verify_block_sampled_capture_gpu) not yet impl'd → greedy-only; temp>0 falls back to AR
+        supports_temp,
     ))
 }

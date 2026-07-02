@@ -7860,6 +7860,83 @@ pub fn final_norm_and_argmax_all_batched(
     Ok(host_idx.into_iter().map(|i| i as u32).collect())
 }
 
+/// Sampled + LAZY twin of [`final_norm_and_argmax_all_batched`] for temp>0 DSpark
+/// verify. Per position: final-norm + head → logits → fused GPU `sample_top_p_pf`
+/// draw (same sampler AR uses → distribution-identical). LAZY: acceptance is a
+/// prefix, so once a position's sample differs from its drafted token
+/// (`block[i+1]`) every later position is rejected — stop and pad (the caller's
+/// `accept_greedy_prefix` only reads up to the mismatch). Uses the per-position
+/// head path (works for both FWHT and non-FWHT heads); lazy samples ~τ positions
+/// so the batched-head optimization isn't needed here. `rng` advances per draw.
+#[allow(clippy::too_many_arguments)]
+pub fn final_norm_and_sample_all_batched_lazy(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    block: &[u32],
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng: &mut u32,
+    result_buf: &GpuTensor,
+    repeat_buf: &GpuTensor,
+) -> Result<Vec<u32>, String> {
+    let n = block.len();
+    if n == 0 {
+        return Err("final_norm_and_sample_all_batched_lazy: empty batch".to_string());
+    }
+    let vocab = cfg.vocab_size;
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+    let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+    let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
+
+    let orig = state.residual_streams.take();
+    let mut ids: Vec<u32> = Vec::with_capacity(n);
+    let result: Result<(), String> = (|| {
+        for i in 0..n {
+            let off = i * stream_len;
+            state.residual_streams = Some(pbs.streams_batch.sub_offset(off, stream_len));
+            final_norm_and_head(cfg, weights, state, gpu)?;
+            let logits_tensor = state
+                .logits
+                .as_ref()
+                .ok_or_else(|| "logits not allocated".to_string())?;
+            let (tok, new_rng) = gpu
+                .sample_top_p_pf(
+                    logits_tensor,
+                    result_buf,
+                    repeat_buf,
+                    vocab,
+                    temp,
+                    top_p_eff,
+                    *rng,
+                    0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    top_k_opt,
+                    None,
+                )
+                .map_err(|e| format!("sample_top_p_pf @pos {i}: {e:?}"))?;
+            *rng = new_rng;
+            ids.push(tok);
+            // LAZY prefix stop: draft for position i is block[i+1] (i<n-1).
+            if i + 1 < n && block[i + 1] != tok {
+                while ids.len() < n {
+                    ids.push(u32::MAX);
+                }
+                break;
+            }
+        }
+        Ok(())
+    })();
+    state.residual_streams = orig;
+    result?;
+    Ok(ids)
+}
+
 /// Batched twin of `hc_ffn_mix`. Same shape as `hc_attn_mix_batched`
 /// but mixes the FFN-side post/comb (produced by the second
 /// mhc_pre_batched call with is_attn=false) and the FFN's transform
@@ -9486,15 +9563,7 @@ pub fn dspark_run_body_and_hc_gate(
             let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
             for (j, &ctx_pos) in ctx_positions.iter().enumerate() {
                 let mx_row = main_x_batch.sub_offset(j * hidden, hidden);
-                dspark_stage_main_kv_to_ring(
-                    cfg,
-                    layer,
-                    gpu,
-                    &mx_row,
-                    &ring,
-                    s,
-                    ctx_pos as u32,
-                )?;
+                dspark_stage_main_kv_to_ring(cfg, layer, gpu, &mx_row, &ring, s, ctx_pos as u32)?;
             }
         }
         {
