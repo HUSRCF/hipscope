@@ -27,6 +27,124 @@
 use rdna_compute::{Gpu, GpuTensor};
 use smallvec::SmallVec;
 
+// ── Host-side sampling helpers (shared by the temp>0 verify paths) ───────────
+// Small, arch-agnostic; mirror the qwen35 `speculative.rs` copies so llama_spec
+// and deepseek4 can draw distribution-preserving samples without depending on
+// the qwen35 crate. (qwen35 keeps its own copy; dedup is a follow-up.)
+
+/// Categorical draw from a normalized `probs` row given a uniform `u` in [0,1).
+pub fn sample_categorical(probs: &[f32], u: f32) -> u32 {
+    let mut acc = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if u < acc {
+            return i as u32;
+        }
+    }
+    (probs.len() - 1) as u32
+}
+
+/// xorshift64 → uniform float in [0,1) (top 24 bits / 2^24). Advances `state`.
+pub fn xorshift_next_unit(state: &mut u64) -> f32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    *state = s;
+    ((s >> 40) as f32) * (1.0 / 16_777_216.0)
+}
+
+/// Draw one token from a raw logit row at temperature `temp` with optional
+/// `top_k` (0 = off) and `top_p` nucleus (`<=0` or `>=1` = off), advancing `rng`.
+/// Standard pipeline: temp-scale → softmax → top_k → top_p (sort/cumulative cut,
+/// inclusive crossing token) → renormalize kept set → categorical draw. `temp`
+/// `<= 1e-6` returns the argmax (defensive; callers route greedy elsewhere).
+pub fn sample_logits_row(
+    logits: &[f32],
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng: &mut u64,
+) -> u32 {
+    let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
+    let argmax = |xs: &[f32]| -> u32 {
+        let mut bi = 0usize;
+        let mut bv = xs[0];
+        for (i, &v) in xs.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        bi as u32
+    };
+    if temp <= 1e-6 {
+        return argmax(logits);
+    }
+    // softmax(logits / temp), max-shifted for stability.
+    let inv_t = 1.0f32 / temp;
+    let mut mx = f32::NEG_INFINITY;
+    for &v in logits {
+        let s = v * inv_t;
+        if s > mx {
+            mx = s;
+        }
+    }
+    let mut probs: Vec<f32> = logits.iter().map(|&v| (v * inv_t - mx).exp()).collect();
+    let z: f32 = probs.iter().sum();
+    if !(z > 0.0) {
+        return argmax(logits);
+    }
+    for p in probs.iter_mut() {
+        *p /= z;
+    }
+    let need_topk = top_k > 0 && top_k < n;
+    let need_topp = top_p > 0.0 && top_p < 1.0;
+    if need_topk || need_topp {
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_unstable_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut keep = n;
+        if need_topk {
+            keep = keep.min(top_k);
+        }
+        if need_topp {
+            let mut cum = 0.0f32;
+            let mut cut = keep;
+            for (rank, &i) in idx.iter().enumerate().take(keep) {
+                cum += probs[i];
+                if cum >= top_p {
+                    cut = rank + 1;
+                    break;
+                }
+            }
+            keep = keep.min(cut);
+        }
+        keep = keep.max(1);
+        let mut kept_z = 0.0f32;
+        for (rank, &i) in idx.iter().enumerate() {
+            if rank < keep {
+                kept_z += probs[i];
+            } else {
+                probs[i] = 0.0;
+            }
+        }
+        if kept_z > 0.0 {
+            for &i in idx.iter().take(keep) {
+                probs[i] /= kept_z;
+            }
+        }
+    }
+    let u = xorshift_next_unit(rng);
+    sample_categorical(&probs, u)
+}
+
 /// Outcome of one speculative-decode acceptance window, drafter-agnostic.
 ///
 /// The daemon advances by `emit.len()` and reseeds from `next_seed` without
@@ -372,6 +490,32 @@ pub trait SpecTarget {
         _hidden_gpu: &GpuTensor,
     ) -> Result<(Vec<u32>, bool), String> {
         Err("target does not expose verify_block_capture_gpu".into())
+    }
+
+    /// Sampled (temp>0) counterpart of
+    /// [`verify_block_capture_gpu`](Self::verify_block_capture_gpu): the target
+    /// SAMPLES `t_i ~ p_T(temp, top_p, top_k)` per position (advancing `rng`)
+    /// instead of taking argmax, still capturing the per-position hidden into
+    /// `hidden_gpu`. Returns `(per-position sampled tokens, captured)`.
+    ///
+    /// For a point-mass drafter, `accept_greedy_prefix(drafts, picks)` on these
+    /// sampled `picks` is exactly distribution-preserving temp-T speculation (the
+    /// committed token is always the target sample). Same contract/`captured`
+    /// semantics as the greedy variant. Returns `Err` by default.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled_capture_gpu(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _temp: f32,
+        _top_p: f32,
+        _top_k: usize,
+        _rng_state: &mut u64,
+        _hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        Err("target does not expose verify_block_sampled_capture_gpu".into())
     }
 
     /// Single-pass TREE-masked verify: run the target over a linearized draft tree
@@ -753,6 +897,18 @@ pub trait MtpDrafter {
 
     /// Whether verification is greedy-only (temp≈0). qwen35 MTP → `true`.
     fn requires_greedy(&self) -> bool;
+
+    /// Stash the request sampling params for the next `mtp_step`. The
+    /// [`MtpSpeculator`] forwards `set_sampling` + the per-step `temp` here so a
+    /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default no-op
+    /// (greedy-only drafters ignore it). `top_p==0` means "disabled" (→ 1.0).
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize) {}
+
+    /// Whether this drafter's verify is distribution-correct at temp>0 (so the
+    /// daemon may route temp>0 requests through it). Default `false`.
+    fn supports_temp_verify(&self) -> bool {
+        false
+    }
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -760,11 +916,21 @@ pub trait MtpDrafter {
 /// `MtpDrafter` (+ `SpecTarget`) impl in the arch crate.
 pub struct MtpSpeculator<A: MtpDrafter> {
     arch: A,
+    /// Request sampling (top_p/top_k from `set_sampling`, temp from `step`).
+    /// Forwarded to the drafter via `arch.set_sampling` before each `mtp_step`
+    /// so a temp>0-capable drafter (DSpark) can sample its verify. `top_p==0`
+    /// means disabled; greedy drafters ignore all three.
+    top_p: f32,
+    top_k: usize,
 }
 
 impl<A: MtpDrafter> MtpSpeculator<A> {
     pub fn new(arch: A) -> Self {
-        Self { arch }
+        Self {
+            arch,
+            top_p: 1.0,
+            top_k: 0,
+        }
     }
 }
 
@@ -820,10 +986,14 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         seed: u32,
         _emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
-        _temp: f32, // MTP/chain verify is greedy-only
+        temp: f32,
     ) -> Result<SpecStep, String> {
         let k = self.arch.k();
         let eos = target.eos_token();
+        // Forward the per-step temp + the request top_p/top_k (stashed by
+        // `set_sampling`) to the drafter. Greedy-only drafters ignore it; a
+        // temp>0-capable one (DSpark) uses it to sample its verify.
+        self.arch.set_sampling(temp, self.top_p, self.top_k);
         let window = self
             .arch
             .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
@@ -849,6 +1019,17 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn requires_greedy(&self) -> bool {
         self.arch.requires_greedy()
+    }
+
+    fn supports_temp_verify(&self) -> bool {
+        self.arch.supports_temp_verify()
+    }
+
+    fn set_sampling(&mut self, _temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+        // Stash top_p/top_k; temp arrives per-step via `step`. Forwarded to the
+        // drafter inside `step` (before `mtp_step`).
+        self.top_p = top_p;
+        self.top_k = top_k;
     }
 }
 

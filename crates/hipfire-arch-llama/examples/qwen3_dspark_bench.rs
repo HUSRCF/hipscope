@@ -45,6 +45,7 @@ fn no_abort() -> bool {
 
 /// Run the generic spec loop for `max` tokens, returns
 /// (generated_tokens, windows, drafts_proposed, drafts_accepted).
+#[allow(clippy::too_many_arguments)]
 fn decode_loop(
     spec: &mut dyn Speculator,
     bundle: &mut LlamaBundle,
@@ -54,6 +55,9 @@ fn decode_loop(
     max: usize,
     eos: u32,
     raw: bool,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
 ) -> Result<(Vec<u32>, u64, u64, u64), String> {
     let mut generated: Vec<u32> = Vec::with_capacity(max);
     let mut position = start_pos;
@@ -62,13 +66,16 @@ fn decode_loop(
     let mut proposed: u64 = 0;
     let mut accepted: u64 = 0;
 
+    // Stash sampling on the speculator (top_p/top_k); temp also rides each step.
+    spec.set_sampling(temp, top_p, top_k, 0.0);
+
     if !raw && first_token == eos {
         return Ok((generated, windows, proposed, accepted));
     }
     generated.push(first_token);
 
     while generated.len() < max {
-        let step = spec.step(gpu, bundle, position, seed, &generated, None, 0.0)?;
+        let step = spec.step(gpu, bundle, position, seed, &generated, None, temp)?;
         windows += 1;
         proposed += step.proposed as u64;
         accepted += step.accepted as u64;
@@ -110,6 +117,19 @@ fn main() -> Result<(), String> {
         .unwrap_or(128);
     let raw = std::env::var("HIPFIRE_QWEN3_RAW").ok().as_deref() == Some("1");
     let mode = std::env::var("HIPFIRE_QWEN3_BENCH_MODE").unwrap_or_else(|_| "dspark".to_string());
+    // Sampling: temp=0 (default) → greedy verify; temp>0 → DSpark sampled verify.
+    let temp: f32 = std::env::var("HIPFIRE_QWEN3_TEMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let top_p: f32 = std::env::var("HIPFIRE_QWEN3_TOP_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let top_k: usize = std::env::var("HIPFIRE_QWEN3_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let max_seq = 4096usize;
 
     eprintln!("Loading Qwen3-8B trunk from {path}...");
@@ -363,6 +383,7 @@ fn main() -> Result<(), String> {
             block,
             max_seq,
             conf_threshold,
+            true, // llama supports sampled verify → temp>0 testable
         )
     } else {
         // n-gram (or DSpark fallback when sidecar absent).
@@ -412,6 +433,9 @@ fn main() -> Result<(), String> {
             warmup,
             eos_tok,
             raw,
+            temp,
+            top_p,
+            top_k,
         )?;
         ctx.gpu
             .hip
@@ -457,6 +481,9 @@ fn main() -> Result<(), String> {
         max,
         eos_tok,
         raw,
+        temp,
+        top_p,
+        top_k,
     )?;
     ctx.gpu
         .hip
@@ -481,7 +508,7 @@ fn main() -> Result<(), String> {
     let text = tokenizer.decode(&generated);
     println!("=== qwen3_dspark_bench ===");
     println!(
-        "drafter={mode}  prompt_md5={prompt_md5:016x}  prompt_tokens={}",
+        "drafter={mode}  temp={temp:.2} top_p={top_p:.2} top_k={top_k}  prompt_md5={prompt_md5:016x}  prompt_tokens={}",
         prompt_tokens.len()
     );
     println!(

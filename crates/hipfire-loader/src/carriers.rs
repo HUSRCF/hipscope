@@ -696,6 +696,13 @@ impl Carrier for LlamaCarrier {
                 block,
                 ctx.max_seq,
                 conf_threshold,
+                // Sampled verify is implemented + coherent, but the naive host-softmax
+                // path measures SLOWER than AR at temp>0 (17-19 vs 23.8 tok/s on gfx1151
+                // code) — so serving stays greedy-only (temp>0 → AR fallback) until the
+                // GPU-softmax optimization lands. The capability is exercised via the
+                // bench (which passes supports_temp=true directly). See
+                // docs/superpowers/plans/2026-07-02-dspark-temp-verify.md.
+                false,
             ))
         } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder

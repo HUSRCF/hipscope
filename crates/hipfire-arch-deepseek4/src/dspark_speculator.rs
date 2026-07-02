@@ -268,5 +268,6 @@ pub fn build_deepseek4_dspark_speculator(
         block,
         ctx_capacity,
         conf_threshold,
+        false, // deepseek4 sampled verify (verify_block_sampled_capture_gpu) not yet impl'd → greedy-only; temp>0 falls back to AR
     ))
 }

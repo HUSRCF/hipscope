@@ -970,6 +970,20 @@ pub struct DsparkDrafter {
     conf_threshold: f32,
     block: usize,
     ctx_capacity: usize,
+    /// Whether the target supports distribution-preserving sampled verify
+    /// ([`SpecTarget::verify_block_sampled_capture_gpu`]). Set per-arch at build
+    /// time (llama/qwen3: true; deepseek4: false until its sampled head lands).
+    /// Drives `requires_greedy()`/`supports_temp_verify()`: when false, temp>0
+    /// requests never reach this drafter (the daemon routes them to AR).
+    supports_temp: bool,
+    /// Request sampling params, stashed by `set_sampling` before each `mtp_step`.
+    /// `temp <= 1e-6` selects the greedy (argmax) verify; else the sampled verify.
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    /// RNG for the sampled verify's categorical draw. Fixed seed per drafter
+    /// (mirrors the DFlash speculator) so a warm run is reproducible.
+    rng_state: u64,
     /// GPU tensor holding the multi-slot context main_hidden for `ctx_positions`.
     /// `[ctx_len * n_targets * dim]` F32 (flat).  `None` ⇒ must bootstrap on
     /// next `mtp_step` (initial window or after reset/prefill).
@@ -1149,13 +1163,30 @@ impl MtpDrafter for DsparkDrafter {
             .alloc_tensor(&[n_verify * expected_hidden_per_pos], DType::F32)
             .map_err(|e| format!("DsparkDrafter: alloc capture_buf: {e:?}"))?;
         let t_verify = self.profiler.sync_start(gpu);
-        let (target_pick, captured) = target.verify_block_capture_gpu(
-            gpu,
-            &verify_tokens,
-            position,
-            scratch.as_mut(),
-            &capture_buf,
-        )?;
+        // temp<=eps → greedy argmax verify (byte-identical to the pre-temp path);
+        // temp>0 → distribution-preserving sampled verify (target samples the
+        // token, drafts accepted iff they match). Both capture hidden GPU-resident.
+        let (target_pick, captured) = if self.temp <= 1e-6 {
+            target.verify_block_capture_gpu(
+                gpu,
+                &verify_tokens,
+                position,
+                scratch.as_mut(),
+                &capture_buf,
+            )?
+        } else {
+            target.verify_block_sampled_capture_gpu(
+                gpu,
+                &verify_tokens,
+                position,
+                scratch.as_mut(),
+                self.temp,
+                self.top_p,
+                self.top_k,
+                &mut self.rng_state,
+                &capture_buf,
+            )?
+        };
         self.profiler.sync_end(gpu, t_verify, 3);
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
@@ -1253,13 +1284,28 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn requires_greedy(&self) -> bool {
-        true
+        // Greedy-only unless the target supports sampled verify. When false, the
+        // daemon may route temp>0 requests here (→ sampled verify in mtp_step).
+        !self.supports_temp
+    }
+
+    fn supports_temp_verify(&self) -> bool {
+        self.supports_temp
+    }
+
+    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize) {
+        self.temp = temp;
+        self.top_p = top_p;
+        self.top_k = top_k;
     }
 }
 
 /// Build the generic DSpark speculator wrapping any [`DsparkBody`]. The
 /// `stage_norm` is the per-stage final RMSNorm weight (deepseek4:
 /// `mtp_final_norm`; qwen3: drafter `norm`); `lm_head` is `[vocab, hidden]`.
+/// `supports_temp` enables distribution-preserving sampled verify at temp>0
+/// (requires the target to implement `verify_block_sampled_capture_gpu`).
+#[allow(clippy::too_many_arguments)]
 pub fn build_dspark_speculator(
     body: Box<dyn DsparkBody>,
     weights: DsparkWeights,
@@ -1268,6 +1314,7 @@ pub fn build_dspark_speculator(
     block: usize,
     ctx_capacity: usize,
     conf_threshold: f32,
+    supports_temp: bool,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     Box::new(MtpSpeculator::new(DsparkDrafter {
@@ -1276,6 +1323,11 @@ pub fn build_dspark_speculator(
         stage_norm,
         lm_head,
         conf_threshold,
+        supports_temp,
+        temp: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        rng_state: 0x13579BDF,
         block,
         ctx_capacity,
         main_hidden_dev: None,

@@ -158,6 +158,68 @@ pub fn verify_block_argmax_capture_gpu(
     Ok((argmax, captured))
 }
 
+/// Sampled (temp>0) counterpart of [`verify_block_argmax_capture_gpu`]: runs the
+/// SAME batched forward + GPU-resident hidden capture, but draws each position's
+/// token `t_i ~ p_T(temp, top_p, top_k)` (advancing `rng`) instead of argmax.
+/// Returns `(per-position sampled tokens, captured)` with the same `captured`
+/// semantics (false ⇒ per-token fallback ran, `hidden_gpu` untouched).
+///
+/// Reuses the shared verify body with `want_logits=true`, then samples host-side
+/// from the per-position logits (a `block.len() × vocab` D2H — fine for the small
+/// temp>0 blocks). At `temp <= 1e-6` the draw collapses to argmax.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_block_sampled_capture_gpu(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    block: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    extract_layers: &[usize],
+    hidden_gpu: &GpuTensor,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+) -> HipResult<(Vec<u32>, bool)> {
+    let captured = !extract_layers.is_empty()
+        && batched_verify_eligible(gpu, weights, kv_cache, block.len(), pbs);
+    let mut empty: Vec<f32> = Vec::new();
+    let mut sink = if captured {
+        Some(HiddenCaptureSink {
+            extract_layers,
+            hidden: &mut empty,
+            hidden_gpu: Some(hidden_gpu),
+        })
+    } else {
+        None
+    };
+    let out = verify_block_logits_or_argmax(
+        gpu,
+        weights,
+        config,
+        block,
+        start_pos,
+        kv_cache,
+        scratch,
+        pbs,
+        sink.as_mut(),
+        true, // want_logits: need the full per-position distribution to sample
+    )?;
+    let vocab = config.vocab_size;
+    let n = block.len();
+    let mut picks = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = &out.logits[i * vocab..(i + 1) * vocab];
+        picks.push(crate::spec::sample_logits_row(
+            row, temp, top_p, top_k, rng_state,
+        ));
+    }
+    Ok((picks, captured))
+}
+
 /// One single-pass TREE-masked verify, returning the FULL per-node target
 /// logits (`tokens.len() × vocab_size`, row-major).
 ///

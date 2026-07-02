@@ -193,6 +193,43 @@ impl SpecTarget for LlamaBundle {
         .map_err(|e| format!("{e:?}"))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let extract = self.dflash_extract_layers.clone();
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<LlamaSpecScratch>()
+            .ok_or("verify_block_sampled_capture_gpu: scratch is not LlamaSpecScratch")?;
+        hipfire_runtime::llama_spec::verify_block_sampled_capture_gpu(
+            gpu,
+            &self.weights,
+            &self.config,
+            block,
+            position,
+            &mut self.kv,
+            &self.scratch,
+            &s.pbs,
+            &extract,
+            hidden_gpu,
+            temp,
+            top_p,
+            top_k,
+            rng_state,
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
+
     fn verify_block_logits(
         &mut self,
         gpu: &mut Gpu,
