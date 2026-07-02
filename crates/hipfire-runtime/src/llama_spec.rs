@@ -34,6 +34,37 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// The eligibility test mirrors `forward_prefill_batch`'s own (so the batched
 /// call actually populates `pbs.x_batch` rather than silently taking its
 /// per-token fallback); keep the two in sync.
+/// Whether a block of `n` tokens takes the batched verify forward (vs the
+/// per-token fallback) — the path that populates `pbs.x_batch` and drives the
+/// [`HiddenCaptureSink`]. Mirrors `forward_prefill_batch`'s own eligibility so
+/// a capture request is only made when the batched call will actually run.
+fn batched_verify_eligible(
+    gpu: &Gpu,
+    weights: &LlamaWeights,
+    kv_cache: &KvCache,
+    n: usize,
+    pbs: &PrefillBatchScratch,
+) -> bool {
+    const MIN_BATCH: usize = 4;
+    let arch = gpu.arch.as_str();
+    let kv_ok =
+        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
+    let weights_ok = weights.layers.iter().all(|l| {
+        is_batchable_la(l.wq.gpu_dtype, arch)
+            && is_batchable_la(l.wk.gpu_dtype, arch)
+            && is_batchable_la(l.wv.gpu_dtype, arch)
+            && is_batchable_la(l.wo.gpu_dtype, arch)
+            && is_batchable_la(l.w_gate.gpu_dtype, arch)
+            && is_batchable_la(l.w_up.gpu_dtype, arch)
+            && is_batchable_la(l.w_down.gpu_dtype, arch)
+    });
+    crate::config::get().prefill_batched
+        && n >= MIN_BATCH
+        && n <= pbs.max_batch
+        && kv_ok
+        && weights_ok
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_argmax(
     gpu: &mut Gpu,
@@ -73,6 +104,58 @@ pub fn verify_block_logits(
         gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true,
     )
     .map(|VerifyOut { logits, .. }| logits)
+}
+
+/// Like [`verify_block_argmax`] but captures the per-position extract-layer
+/// residual hidden into the caller-owned GPU buffer `hidden_gpu`
+/// (position-major `[n × extract_layers.len() × dim]` F32) instead of a host
+/// `Vec` — the DSpark accepted-prefix-hidden reuse then stays entirely on-device
+/// (no D2H+H2D per window).
+///
+/// Returns `(per-position argmax, captured)`. `captured` is `true` iff the
+/// batched path ran (so all `block.len()` positions' hidden were written); the
+/// per-token fallback (`block.len() < 4`, or ineligible dtypes/KV) captures
+/// nothing and returns `false`, matching the host sink's empty-capture signal.
+/// When `false`, `hidden_gpu` is left untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_block_argmax_capture_gpu(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    block: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    extract_layers: &[usize],
+    hidden_gpu: &GpuTensor,
+) -> HipResult<(Vec<u32>, bool)> {
+    let captured = !extract_layers.is_empty()
+        && batched_verify_eligible(gpu, weights, kv_cache, block.len(), pbs);
+    let mut empty: Vec<f32> = Vec::new();
+    let mut sink = if captured {
+        Some(HiddenCaptureSink {
+            extract_layers,
+            hidden: &mut empty,
+            hidden_gpu: Some(hidden_gpu),
+        })
+    } else {
+        None
+    };
+    let argmax = verify_block_logits_or_argmax(
+        gpu,
+        weights,
+        config,
+        block,
+        start_pos,
+        kv_cache,
+        scratch,
+        pbs,
+        sink.as_mut(),
+        false,
+    )
+    .map(|VerifyOut { argmax, .. }| argmax)?;
+    Ok((argmax, captured))
 }
 
 /// One single-pass TREE-masked verify, returning the FULL per-node target
@@ -191,24 +274,7 @@ fn verify_block_logits_or_argmax(
         Vec::new()
     };
 
-    const MIN_BATCH: usize = 4;
-    let arch = gpu.arch.as_str();
-    let kv_ok =
-        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
-    let weights_ok = weights.layers.iter().all(|l| {
-        is_batchable_la(l.wq.gpu_dtype, arch)
-            && is_batchable_la(l.wk.gpu_dtype, arch)
-            && is_batchable_la(l.wv.gpu_dtype, arch)
-            && is_batchable_la(l.wo.gpu_dtype, arch)
-            && is_batchable_la(l.w_gate.gpu_dtype, arch)
-            && is_batchable_la(l.w_up.gpu_dtype, arch)
-            && is_batchable_la(l.w_down.gpu_dtype, arch)
-    });
-    let eligible = crate::config::get().prefill_batched
-        && n >= MIN_BATCH
-        && n <= pbs.max_batch
-        && kv_ok
-        && weights_ok;
+    let eligible = batched_verify_eligible(gpu, weights, kv_cache, n, pbs);
 
     // DFlash hidden capture only flows through the batched path; the per-token
     // fallback below does not run the capturing per-layer loop.

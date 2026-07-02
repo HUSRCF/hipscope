@@ -1136,19 +1136,25 @@ impl MtpDrafter for DsparkDrafter {
         let n_verify = verify_tokens.len(); // seed + n_proposed drafts
 
         let mut scratch = target.new_spec_scratch(gpu, n_verify)?;
-        // Always pass `hidden_out = Some` and let each arch's `verify_block` impl
-        // decide whether to populate it (arch-specific minimum-batch constraints).
-        // For deepseek4, every batch size is eligible; for llama/qwen3, the batched
-        // path requires n_verify >= 4 — that impl leaves hidden_capture empty for
-        // smaller batches, and the context-update check below handles that gracefully.
-        let mut hidden_capture: Vec<f32> = Vec::new();
+        // Capture the accepted-prefix hidden GPU-resident: verify writes the
+        // per-position extract-layer hidden straight into `capture_buf`, and the
+        // context update below slices the accepted prefix out of it GPU→GPU — so
+        // the reuse never round-trips through host memory (a D2H+H2D per window,
+        // ~free on UMA but a real cost on a discrete-VRAM GPU). `captured` is
+        // false when the target's batched capture path can't run for this block
+        // (llama with n_verify < 4); the update then re-bootstraps, matching the
+        // old host path's empty-capture branch. deepseek4 captures every size.
+        let expected_hidden_per_pos = n_targets * hidden;
+        let capture_buf = gpu
+            .alloc_tensor(&[n_verify * expected_hidden_per_pos], DType::F32)
+            .map_err(|e| format!("DsparkDrafter: alloc capture_buf: {e:?}"))?;
         let t_verify = self.profiler.sync_start(gpu);
-        let target_pick = target.verify_block(
+        let (target_pick, captured) = target.verify_block_capture_gpu(
             gpu,
             &verify_tokens,
             position,
             scratch.as_mut(),
-            Some(&mut hidden_capture),
+            &capture_buf,
         )?;
         self.profiler.sync_end(gpu, t_verify, 3);
 
@@ -1175,18 +1181,20 @@ impl MtpDrafter for DsparkDrafter {
         // Cap ctx_len to block+1 (the scratch `max_ctx_len` in the qwen3 body).
         let new_ctx_len_raw = accept_len + 1; // seed + accepted drafts
         let new_ctx_len = new_ctx_len_raw.min(block + 1);
-        let expected_hidden_per_pos = n_targets * hidden;
-        let expected_total = n_verify * expected_hidden_per_pos;
-        if !hidden_capture.is_empty() && hidden_capture.len() == expected_total {
-            // Slice the first new_ctx_len positions from the captured hidden.
-            // We take the LAST new_ctx_len slots of the accepted prefix when
-            // the full ctx_len_raw > block+1 (cap); in practice block+1 is
-            // usually ≥ accepted+1, so no truncation.
+        if captured {
+            // Slice the accepted prefix (new_ctx_len slots) out of the GPU capture
+            // buffer into a fresh drafter-owned buffer — all on-device, no D2H+H2D.
+            // We take the LAST new_ctx_len slots of the accepted prefix when the
+            // full ctx_len_raw > block+1 (cap); in practice block+1 is usually
+            // ≥ accepted+1, so start_slot is 0.
             let start_slot = new_ctx_len_raw - new_ctx_len; // 0 in normal case
             let n_floats = new_ctx_len * expected_hidden_per_pos;
             let src_offset = start_slot * expected_hidden_per_pos;
-            let slice = &hidden_capture[src_offset..src_offset + n_floats];
-            let dev = upload_f32(gpu, slice)?;
+            let dev = gpu
+                .alloc_tensor(&[n_floats], DType::F32)
+                .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
+            gpu.memcpy_dtod_at_auto(&dev.buf, 0, &capture_buf.buf, src_offset * 4, n_floats * 4)
+                .map_err(|e| format!("DsparkDrafter: d2d ctx hidden: {e:?}"))?;
             if let Some(old) = self.main_hidden_dev.take() {
                 let _ = gpu.free_tensor(old);
             }
@@ -1196,7 +1204,7 @@ impl MtpDrafter for DsparkDrafter {
                 .map(|s| position + s)
                 .collect();
         } else {
-            // Hidden capture not available (n_verify < 4 or deepseek4): clear the
+            // Hidden capture not available (n_verify < 4 on llama): clear the
             // context so the NEXT window bootstraps via `capture_seed_main_hidden`
             // with the bonus token as seed.  That bootstrap is KV-correct (the
             // commit_prefix leaves KV at the committed prefix; the next
@@ -1209,6 +1217,7 @@ impl MtpDrafter for DsparkDrafter {
             }
             self.ctx_positions.clear();
         }
+        let _ = gpu.free_tensor(capture_buf);
         self.profiler.sync_end(gpu, t_rest, 4);
         self.profiler.end_window();
 

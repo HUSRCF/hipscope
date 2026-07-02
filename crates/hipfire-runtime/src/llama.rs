@@ -1921,8 +1921,16 @@ pub fn upload_prefill_batch_inputs(
 pub struct HiddenCaptureSink<'a> {
     /// Decoder-layer indices to capture, ascending order.
     pub extract_layers: &'a [usize],
-    /// Output sink: appended `[n_pos × num_extract × dim]` row-major.
+    /// Host output sink: appended `[n_pos × num_extract × dim]` row-major.
+    /// Used only when `hidden_gpu` is `None`.
     pub hidden: &'a mut Vec<f32>,
+    /// Optional GPU-resident destination (`[n_pos × num_extract × dim]` F32,
+    /// position-major). When `Some`, captured extract-layer rows are copied
+    /// GPU→GPU straight into this buffer and the host `hidden` Vec is left
+    /// untouched — the DSpark accepted-prefix-hidden reuse then stays entirely
+    /// on-device (no D2H+H2D per window; ~free on UMA, a real win on a discrete
+    /// GPU). The buffer must be `≥ n_pos × extract_layers.len() × dim` F32.
+    pub hidden_gpu: Option<&'a GpuTensor>,
 }
 
 /// Tree-attention mask reference for a single batched verify forward
@@ -3019,36 +3027,58 @@ fn forward_prefill_chunk(
             )?;
         }
 
-        // DFlash capture: if this layer is an extract layer, download its
-        // post-FFN residual rows (`pbs.x_batch[..n]`) to host. The residual
-        // stream here is the layer output BEFORE the next layer's attn_norm —
-        // exactly the conditioning the draft model's cross-attention consumes.
+        // DFlash / DSpark capture: if this layer is an extract layer, collect its
+        // post-FFN residual rows (`pbs.x_batch[..n]`). The residual stream here is
+        // the layer output BEFORE the next layer's attn_norm — exactly the
+        // conditioning the draft model's cross-attention consumes.
+        //
+        // GPU-resident sink (`hidden_gpu` Some): copy each position's row straight
+        // into its position-major slot on-device — `dst[(p·L + l_idx)·dim ..]` —
+        // so the whole capture never leaves VRAM. Host sink (default): download
+        // the rows and interleave after the loop.
         if let Some(cap) = capture.as_deref() {
-            if cap.extract_layers.contains(&layer_idx) {
-                let rows = pbs.x_batch.sub_offset(0, n * dim);
-                cap_rows.push(gpu.download_f32(&rows)?);
+            if let Some(l_idx) = cap.extract_layers.iter().position(|&x| x == layer_idx) {
+                if let Some(dst) = cap.hidden_gpu {
+                    let num_extract = cap.extract_layers.len();
+                    for p in 0..n {
+                        let dst_off = (p * num_extract + l_idx) * dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &dst.buf,
+                            dst_off,
+                            &pbs.x_batch.buf,
+                            p * dim * 4,
+                            dim * 4,
+                        )?;
+                    }
+                } else {
+                    let rows = pbs.x_batch.sub_offset(0, n * dim);
+                    cap_rows.push(gpu.download_f32(&rows)?);
+                }
             }
         }
 
         let _ = kv_dim;
     }
 
-    // Interleave the captured per-extract-layer rows into the sink in
-    // position-major order: for each position p, concat layer 0..L at p.
+    // Interleave the captured per-extract-layer rows into the HOST sink in
+    // position-major order: for each position p, concat layer 0..L at p. The
+    // GPU-resident sink already wrote position-major slots inline above.
     if let Some(cap) = capture.as_deref_mut() {
-        debug_assert_eq!(
-            cap_rows.len(),
-            cap.extract_layers.len(),
-            "captured {} layers but extract_layers has {}",
-            cap_rows.len(),
-            cap.extract_layers.len()
-        );
-        let num_extract = cap_rows.len();
-        cap.hidden.reserve(n * num_extract * dim);
-        for p in 0..n {
-            for layer_rows in cap_rows.iter() {
-                cap.hidden
-                    .extend_from_slice(&layer_rows[p * dim..(p + 1) * dim]);
+        if cap.hidden_gpu.is_none() {
+            debug_assert_eq!(
+                cap_rows.len(),
+                cap.extract_layers.len(),
+                "captured {} layers but extract_layers has {}",
+                cap_rows.len(),
+                cap.extract_layers.len()
+            );
+            let num_extract = cap_rows.len();
+            cap.hidden.reserve(n * num_extract * dim);
+            for p in 0..n {
+                for layer_rows in cap_rows.iter() {
+                    cap.hidden
+                        .extend_from_slice(&layer_rows[p * dim..(p + 1) * dim]);
+                }
             }
         }
     }

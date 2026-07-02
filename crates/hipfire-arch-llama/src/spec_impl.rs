@@ -102,6 +102,7 @@ impl SpecTarget for LlamaBundle {
                 Some(llama::HiddenCaptureSink {
                     extract_layers: &extract,
                     hidden: hidden_out.as_deref_mut().unwrap(),
+                    hidden_gpu: None,
                 })
             } else {
                 None
@@ -146,6 +147,7 @@ impl SpecTarget for LlamaBundle {
             Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
                 extract_layers: extract,
                 hidden: h,
+                hidden_gpu: None,
             }),
             _ => None,
         };
@@ -159,6 +161,34 @@ impl SpecTarget for LlamaBundle {
             &self.scratch,
             &s.pbs,
             sink.as_mut(),
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
+
+    fn verify_block_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let extract = self.dflash_extract_layers.clone();
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<LlamaSpecScratch>()
+            .ok_or("verify_block_capture_gpu: scratch is not LlamaSpecScratch")?;
+        hipfire_runtime::llama_spec::verify_block_argmax_capture_gpu(
+            gpu,
+            &self.weights,
+            &self.config,
+            block,
+            position,
+            &mut self.kv,
+            &self.scratch,
+            &s.pbs,
+            &extract,
+            hidden_gpu,
         )
         .map_err(|e| format!("{e:?}"))
     }
@@ -180,6 +210,7 @@ impl SpecTarget for LlamaBundle {
             Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
                 extract_layers: extract,
                 hidden: h,
+                hidden_gpu: None,
             }),
             _ => None,
         };
@@ -216,6 +247,7 @@ impl SpecTarget for LlamaBundle {
             Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
                 extract_layers: extract,
                 hidden: h,
+                hidden_gpu: None,
             }),
             _ => None,
         };
@@ -323,6 +355,7 @@ impl SpecTarget for LlamaBundle {
         let mut sink = llama::HiddenCaptureSink {
             extract_layers: layers,
             hidden: &mut hidden_out,
+            hidden_gpu: None,
         };
         llama::forward_scratch_embed(
             gpu,

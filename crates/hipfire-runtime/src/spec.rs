@@ -346,6 +346,34 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
+    /// Like [`verify_block`](Self::verify_block), but captures the per-position
+    /// extract-layer residual hidden into the caller-owned GPU buffer
+    /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
+    /// dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
+    /// hidden reuse entirely on-device (no D2H+H2D per window; ~free on UMA, a
+    /// real saving on a discrete-VRAM GPU).
+    ///
+    /// Returns `(per-position argmax, captured)`. `captured` is `true` iff all
+    /// `block.len()` positions' hidden were written to `hidden_gpu`; a target
+    /// whose batched capture path can't run for this block (e.g. llama with
+    /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
+    /// the caller re-bootstraps the next window. `hidden_gpu` must be
+    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    ///
+    /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
+    /// Returns `Err` by default (target has no GPU-resident hidden capture).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_capture_gpu(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        Err("target does not expose verify_block_capture_gpu".into())
+    }
+
     /// Single-pass TREE-masked verify: run the target over a linearized draft tree
     /// in ONE batched forward and return the FULL per-node target logits
     /// (`tokens.len() × vocab`, row-major).

@@ -24,7 +24,7 @@ use crate::forward::{
     forward_prefill_batch_chunk, PrefillBatchScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Owned deepseek4 model state — the future `ModelState::Deepseek4` payload and
 /// the spec-decode target. Bundles config + weights + recurrent state + eos so
@@ -58,6 +58,70 @@ fn dspark_verify_pbs_max_batch() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
+}
+
+impl Deepseek4Bundle {
+    /// Shared verify forward for `verify_block` / `verify_block_capture_gpu`:
+    /// arms hidden capture into `state.dspark_caps`, runs one batched trunk
+    /// forward over `block` at `position`, and leaves the head unapplied. When
+    /// `refresh_layers`, re-reads the extract-layer ids from the sidecar (needed
+    /// on steady-state windows that never called `capture_seed_main_hidden`).
+    fn dspark_verify_forward(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        refresh_layers: bool,
+    ) -> Result<(), String> {
+        let n_verify = block.len();
+        {
+            let pbs_ref = self.state.dspark_verify_pbs.as_ref().ok_or(
+                "Deepseek4Bundle::verify_block: dspark_verify_pbs not allocated (call new_spec_scratch first)",
+            )?;
+            if pbs_ref.max_batch < n_verify {
+                return Err(format!(
+                    "Deepseek4Bundle::verify_block: PBS max_batch ({}) < block len ({})",
+                    pbs_ref.max_batch, n_verify
+                ));
+            }
+        }
+        if refresh_layers {
+            if let Some(ref dspark) = self.weights.dspark {
+                self.state.dspark_target_layers = dspark.cfg.target_layer_ids.clone();
+            }
+        }
+        self.state.dspark_capture_active = true;
+        // Take the PBS out of state to avoid immutable + mutable borrow collision.
+        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let fwd_result = forward_prefill_batch_chunk(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            gpu,
+            &pbs,
+            block,
+            position as u32,
+        );
+        // Restore the PBS before propagating any error so state stays consistent.
+        self.state.dspark_verify_pbs = Some(pbs);
+        fwd_result.map_err(|e| format!("Deepseek4Bundle::verify_block forward: {e}"))
+    }
+
+    /// Apply the trunk final-norm + lm_head + per-position argmax over the
+    /// `n_verify` hidden rows left in the verify PBS by `dspark_verify_forward`.
+    fn dspark_verify_argmax(&mut self, gpu: &mut Gpu, n_verify: usize) -> Result<Vec<u32>, String> {
+        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let argmax_result = final_norm_and_argmax_all_batched(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &pbs,
+            gpu,
+            n_verify,
+        );
+        self.state.dspark_verify_pbs = Some(pbs);
+        argmax_result.map_err(|e| format!("Deepseek4Bundle::verify_block head+argmax: {e}"))
+    }
 }
 
 impl SpecTarget for Deepseek4Bundle {
@@ -176,48 +240,13 @@ impl SpecTarget for Deepseek4Bundle {
         hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let n_verify = block.len();
-        {
-            let pbs_ref = self
-                .state
-                .dspark_verify_pbs
-                .as_ref()
-                .ok_or("Deepseek4Bundle::verify_block: dspark_verify_pbs not allocated (call new_spec_scratch first)")?;
-            if pbs_ref.max_batch < n_verify {
-                return Err(format!(
-                    "Deepseek4Bundle::verify_block: PBS max_batch ({}) < block len ({})",
-                    pbs_ref.max_batch, n_verify
-                ));
-            }
-        }
-        // Arm capture. When hidden_out is Some, also (re-)set dspark_target_layers
-        // from the sidecar config so the capture is valid on steady-state windows
-        // that never called capture_seed_main_hidden.
-        if hidden_out.is_some() {
-            if let Some(ref dspark) = self.weights.dspark {
-                self.state.dspark_target_layers = dspark.cfg.target_layer_ids.clone();
-            }
-        }
-        self.state.dspark_capture_active = true;
-        // Take the PBS out of state to avoid immutable + mutable borrow collision.
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
-        let fwd_result = forward_prefill_batch_chunk(
-            &self.config,
-            &self.weights,
-            &mut self.state,
-            gpu,
-            &pbs,
-            block,
-            position as u32,
-        );
-        // Restore the PBS before propagating any error so the state is
-        // always consistent on exit.
-        self.state.dspark_verify_pbs = Some(pbs);
-        fwd_result.map_err(|e| format!("Deepseek4Bundle::verify_block forward: {e}"))?;
+        // Arm capture + run the trunk forward. refresh_layers when hidden_out is
+        // Some (steady-state windows re-read the sidecar extract layers).
+        self.dspark_verify_forward(gpu, block, position, hidden_out.is_some())?;
 
         // ── Stage 3: download captured hidden for multi-slot context update ──
-        // dspark_caps layout: [max_batch, n_targets, hidden] flat.
-        // Positions 0..n_verify are contiguous at offset 0, so a single d2h
-        // of n_verify * n_targets * hidden floats suffices.
+        // dspark_caps layout: [max_batch, n_targets, hidden] flat. Positions
+        // 0..n_verify are contiguous at offset 0, so a single d2h suffices.
         if let Some(out) = hidden_out {
             let n_targets = self.state.dspark_target_layers.len();
             let hidden = self.config.hidden_size;
@@ -236,17 +265,40 @@ impl SpecTarget for Deepseek4Bundle {
             }
         }
 
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
-        let argmax_result = final_norm_and_argmax_all_batched(
-            &self.config,
-            &self.weights,
-            &mut self.state,
-            &pbs,
-            gpu,
-            n_verify,
-        );
-        self.state.dspark_verify_pbs = Some(pbs);
-        argmax_result.map_err(|e| format!("Deepseek4Bundle::verify_block head+argmax: {e}"))
+        self.dspark_verify_argmax(gpu, n_verify)
+    }
+
+    /// GPU-resident variant of [`verify_block`]: captures the accepted-prefix
+    /// hidden straight into the caller-owned `hidden_gpu` (GPU→GPU) instead of
+    /// downloading it to a host `Vec` and re-uploading. deepseek4's batched
+    /// forward captures every position, so `captured` is always true once the
+    /// drafter has extract layers configured.
+    fn verify_block_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        _scratch: &mut dyn SpecScratch,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let n_verify = block.len();
+        self.dspark_verify_forward(gpu, block, position, true)?;
+
+        let n_targets = self.state.dspark_target_layers.len();
+        let hidden = self.config.hidden_size;
+        let captured = n_targets > 0;
+        if captured {
+            let n_floats = n_verify * n_targets * hidden;
+            if let Some(caps) = self.state.dspark_caps.as_ref() {
+                gpu.memcpy_dtod_auto(&hidden_gpu.buf, &caps.buf, n_floats * 4)
+                    .map_err(|e| {
+                        format!("Deepseek4Bundle::verify_block_capture_gpu caps dtod: {e:?}")
+                    })?;
+            }
+        }
+
+        let picks = self.dspark_verify_argmax(gpu, n_verify)?;
+        Ok((picks, captured))
     }
 
     /// Advance `state.n_tokens` to reflect the committed prefix. DeepSeek
