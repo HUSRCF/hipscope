@@ -1285,13 +1285,17 @@ impl MtpDrafter for DsparkDrafter {
 
     fn requires_greedy(&self) -> bool {
         // Greedy-only unless the target supports sampled verify. When false, the
-        // daemon may route temp>0 requests here (→ sampled verify in mtp_step).
+        // daemon's `spec_can_sample` admits temp>0 through the CHAIN-style route
+        // (→ sampled verify in mtp_step, honoring temp+top_p+top_k).
         !self.supports_temp
     }
 
-    fn supports_temp_verify(&self) -> bool {
-        self.supports_temp
-    }
+    // `supports_temp_verify()` stays the trait default (false): in the daemon it
+    // flags a ddtree-SWOR *temperature-only* verify. DSpark is NOT that — its
+    // sampled verify honors temp+top_p+top_k (fused `sample_top_p_pf`), i.e. it's
+    // the "chain" kind. Sampling capability is signaled by `requires_greedy()`
+    // ==false; returning true here would mislabel DSpark as SWOR and drop the
+    // nucleus controls.
 
     fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize) {
         self.temp = temp;

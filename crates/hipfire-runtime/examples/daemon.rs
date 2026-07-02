@@ -7142,10 +7142,13 @@ fn generate(
     let qwen_dflash_route = (m.arch_id == 5 || m.arch_id == 6)
         && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     // llama (arch 0/1): #483 built + validated dense DFlash with ddtree tree-SWOR, so
-    // temp>0 engages ddtree-SWOR here too (bare temp). Chain-mode llama temp>0 stays on
-    // AR (no validated sampled-llama chain path — matches master's caution).
-    let llama_dflash_route =
-        (m.arch_id == 0 || m.arch_id == 1) && (temp <= 1e-6 || ddtree_swor_route);
+    // temp>0 engages ddtree-SWOR here (bare temp). DSpark (qwen3) adds a validated
+    // sampled-llama CHAIN path — its fused sample_top_p_pf verify honors
+    // temp+top_p+top_k and beats AR at temp>0 — so `chain_sample_route` now engages
+    // llama temp>0 too. (Non-DSpark chain-mode llama has no such path and stays on
+    // AR via `spec_can_sample`/`supports_temp_swor` gating.)
+    let llama_dflash_route = (m.arch_id == 0 || m.arch_id == 1)
+        && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     // Operator visibility: a temp>0 request on a DFlash-capable arch that did NOT
     // qualify for spec silently runs AR (correct, but slower). Name the reason.
     if temp > 1e-6

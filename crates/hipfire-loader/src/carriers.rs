@@ -696,13 +696,12 @@ impl Carrier for LlamaCarrier {
                 block,
                 ctx.max_seq,
                 conf_threshold,
-                // Sampled verify is implemented + coherent, but the naive host-softmax
-                // path measures SLOWER than AR at temp>0 (17-19 vs 23.8 tok/s on gfx1151
-                // code) — so serving stays greedy-only (temp>0 → AR fallback) until the
-                // GPU-softmax optimization lands. The capability is exercised via the
-                // bench (which passes supports_temp=true directly). See
-                // docs/superpowers/plans/2026-07-02-dspark-temp-verify.md.
-                false,
+                // temp>0 sampled verify ENABLED: with lazy prefix sampling (only ~τ
+                // lm_heads/window) qwen3 DSpark at temp>0 beats AR by ~+24% (29.6 vs
+                // 23.8 tok/s on gfx1151 code) and stays distribution-identical to AR
+                // (fused sample_top_p_pf, honors temp+top_p+top_k). The daemon routes
+                // temp>0 llama through the chain path (requires_greedy()==false).
+                true,
             ))
         } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder
