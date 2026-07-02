@@ -68,17 +68,30 @@ beats both — ds4 greedy on code is head-bound, all 5 lm_heads at τ1.36; lazy 
 (competitive-to-losing; ds4's prose win is greedy's high accept 0.32, eroded by
 temp>0 sampling). Serving still gated (supports_temp=false); bench-enabled.
 
-## serving-enable DECISION (open)
-qwen3 temp>0 now clearly wins → worth flipping carrier supports_temp=true + the
-llama daemon gate (route temp>0 to the spec loop like the arch-7 gate at
-daemon.rs:~6646; call speculator.set_sampling with request top_p/top_k). NOT done
-yet — serving-behavior change. ds4 stays gated (prose-loses/code-wins is murky).
+## serving-enable DONE (af6e7ff5) — qwen3 temp>0 ON
+Carrier supports_temp=true (qwen3); daemon `llama_dflash_route` (arch 0/1) now
+also engages on `chain_sample_route`, so temp>0 routes to the spec loop. KEY
+semantic: the daemon's `supports_temp_verify()` flag means "ddtree-SWOR,
+TEMPERATURE-ONLY" — DSpark is chain-like (honors temp+top_p+top_k via
+sample_top_p_pf), so DsparkDrafter keeps supports_temp_verify()=**false** and
+signals sampling via requires_greedy()==false (→ `spec_can_sample` →
+chain_sample_route). Validated: daemon temp=0.7 → "dflash":true (routed, not AR),
+coherent, conf 0.10. ds4 stays gated (supports_temp=false: prose-loses/code-murky).
 
-## BONUS opportunity (not done): apply the lazy prefix-stop to the GREEDY argmax
-path too → ds4 greedy code 6.12 is head-bound; lazy would speed it up
-(output-identical). BUT verify_block_argmax has MULTIPLE consumers (n-gram,
-DFlash chain/tree) — must audit each does prefix-accept before blanket-lazy;
-safest as a DSpark-only greedy variant.
+## GREEDY lazy prefix-stop DONE (0709898e) — both arches, byte-identical
+Applied the lazy prefix-stop to the greedy argmax verify too, gated behind a
+`lazy` bool on the shared llama body so ONLY the DSpark capture paths take it
+(verify_block_argmax/logits stay eager — n-gram/DFlash-chain/tree consumers read
+all picks). deepseek4 got final_norm_and_argmax_all_batched_lazy +
+dspark_verify_argmax_lazy. Measured: qwen3 greedy 26.72→31.04 (+16%, A/B decoded
+output byte-IDENTICAL); ds4 greedy code 6.12→8.92 (+46%, parity PASS; still <AR
+10.19 — head-bound at τ1.35). Committed output byte-identical (accept reads only
+to the mismatch; rejected picks padded u32::MAX).
+
+TRAP: greedy-lazy lives in llama_spec's shared body (qwen3); deepseek4 has a
+SEPARATE head (final_norm_and_argmax_all_batched) — must lazy each arch's head
+independently. ds4 greedy has pre-existing run variance (mq2lloyd/Q8) so use
+parity + by-construction identity, not a raw-stats A/B.
 
 ## traps
 - AR decode speed is temp-invariant (per-token sampler cost ≈ forward-bound), so
