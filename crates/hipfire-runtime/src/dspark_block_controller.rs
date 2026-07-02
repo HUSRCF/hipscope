@@ -2,7 +2,7 @@
 //! Marginal-accept hill-climb: grow the block while the whole drafted block keeps
 //! being accepted (headroom), shrink when it doesn't (over-drafting). The decision
 //! threshold `p*` is the break-even full-accept rate; it is a live-measured,
-//! thermal-invariant cost ratio (see `calibrate_p_star`), seeded with a prior.
+//! thermal-invariant cost ratio fitted from the verify-curve slope, seeded with a prior.
 
 /// Marginal-accept hill-climb over the DSpark draft block cap.
 pub(crate) struct BlockController {
@@ -16,8 +16,8 @@ pub(crate) struct BlockController {
     p_star: f32,
     windows_seen: u32,
     // ── live p* calibration (hardware cost ratio; stable across requests) ──
-    /// EMA of single-position (bootstrap) forward time in ms.
-    t_ar_ema: f32,
+    /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
+    timing_samples: u32,
     /// Per-n EMA of verify wall-time in ms (indexed by n_verify, slots 2..8).
     t_verify_by_n: [f32; 8],
     /// True once p* has been measured from live timing; preserved across reset().
@@ -35,6 +35,9 @@ const HYSTERESIS: f32 = 0.06;
 /// is enough to establish a trend — this is a short guard, not the full EMA
 /// settling time.
 const WARMUP_WINDOWS: u32 = 6;
+/// Minimum timing samples before attempting verify-curve calibration.
+/// Gives the GPU time to warm up and collects samples at ≥2 distinct n values.
+const TIMING_WARMUP: u32 = 16;
 
 impl BlockController {
     pub(crate) fn new(
@@ -51,7 +54,7 @@ impl BlockController {
             full_accept_ema: p_star, // neutral start: no initial bias to grow/shrink
             p_star,
             windows_seen: 0,
-            t_ar_ema: 0.0,
+            timing_samples: 0,
             t_verify_by_n: [0.0f32; 8],
             calibrated: false,
         }
@@ -66,7 +69,7 @@ impl BlockController {
     }
 
     pub(crate) fn reset(&mut self) {
-        // Reset only request-specific state. Calibration fields (t_ar_ema,
+        // Reset only request-specific state. Calibration fields (timing_samples,
         // t_verify_by_n, calibrated, p_star) are thermal-invariant hardware
         // cost ratios — calibrate once, reuse across requests.
         self.block = self.default_block;
@@ -74,48 +77,49 @@ impl BlockController {
         self.windows_seen = 0;
     }
 
-    /// Observe wall-clock timing for a spec window. `t_ar_ms` is the
-    /// single-position bootstrap forward time (Some only on bootstrap windows);
-    /// `t_verify_ms` is the verify wall time; `n_verify` is the number of
-    /// positions verified. Fires `calibrate_p_star` once we have both an AR
-    /// sample and a high-n verify sample, then leaves calibration in place
-    /// across subsequent reset() calls.
-    pub(crate) fn observe_timing(
-        &mut self,
-        t_ar_ms: Option<f32>,
-        t_verify_ms: f32,
-        n_verify: usize,
-    ) {
-        if let Some(ar) = t_ar_ms {
-            self.t_ar_ema = if self.t_ar_ema == 0.0 {
-                ar
-            } else {
-                0.7 * self.t_ar_ema + 0.3 * ar
-            };
-        }
-        if (2..8).contains(&n_verify) {
+    /// Observe verify timing. Accumulates per-n EMAs and fits a line
+    /// `t_verify(n) ≈ t_AR + (n−1)·Δt` once TIMING_WARMUP samples have been
+    /// collected, deriving `p* = Δt / t_AR` from two distinct n points on the
+    /// verify curve. Both terms come from the same kernel at the same thermal
+    /// phase, so the ratio is stable under DPM scaling. Calibration is preserved
+    /// across reset() calls.
+    pub(crate) fn observe_timing(&mut self, t_verify_ms: f32, n_verify: usize) {
+        if (2..8).contains(&n_verify) && t_verify_ms > 0.0 {
             let slot = &mut self.t_verify_by_n[n_verify];
             *slot = if *slot == 0.0 {
                 t_verify_ms
             } else {
-                0.7 * (*slot) + 0.3 * t_verify_ms
+                0.7 * *slot + 0.3 * t_verify_ms
             };
         }
-        if !self.calibrated && self.t_ar_ema > 0.0 {
-            if let Some(n) = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0) {
-                let p = calibrate_p_star(self.t_ar_ema, self.t_verify_by_n[n], n);
-                self.p_star = p;
-                self.calibrated = true;
-                eprintln!(
-                    "[dspark] block-controller live p*={:.3} (t_ar={:.1}ms, t_verify[n={}]={:.1}ms)",
-                    p, self.t_ar_ema, n, self.t_verify_by_n[n]
-                );
+        self.timing_samples = self.timing_samples.saturating_add(1);
+        if self.calibrated || self.timing_samples < TIMING_WARMUP {
+            return;
+        }
+        let lo = (2..8).find(|&n| self.t_verify_by_n[n] > 0.0);
+        let hi = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
+        if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
+            if n_hi > n_lo {
+                let dt =
+                    (self.t_verify_by_n[n_hi] - self.t_verify_by_n[n_lo]) / (n_hi - n_lo) as f32;
+                let t_ar = self.t_verify_by_n[n_lo] - dt * (n_lo as f32 - 1.0);
+                if dt > 0.0 && t_ar > 0.0 {
+                    let raw = dt / t_ar;
+                    if (0.05..=0.5).contains(&raw) {
+                        self.p_star = raw;
+                        self.calibrated = true;
+                        eprintln!(
+                            "[dspark] live p*={:.3} (verify-curve fit: n{}={:.1}ms n{}={:.1}ms dt={:.2} t_ar={:.1})",
+                            raw, n_lo, self.t_verify_by_n[n_lo], n_hi, self.t_verify_by_n[n_hi], dt, t_ar
+                        );
+                    }
+                }
             }
         }
     }
 
     #[cfg(test)]
-    fn p_star(&self) -> f32 {
+    fn p_star_for_test(&self) -> f32 {
         self.p_star
     }
 
@@ -136,18 +140,6 @@ impl BlockController {
             self.block = self.block.saturating_sub(1).max(self.min_block);
         }
     }
-}
-
-/// Break-even full-accept rate from a live-measured, thermal-invariant timing ratio.
-/// `t_ar_ms` = one single-position forward; `t_verify_ms` = a batched verify over
-/// `n_verify` positions. Both measured in the same thermal state, so the ratio is
-/// stable under DPM/thermal scaling. Returns the 0.18 prior for degenerate input.
-pub(crate) fn calibrate_p_star(t_ar_ms: f32, t_verify_ms: f32, n_verify: usize) -> f32 {
-    if n_verify < 2 || t_ar_ms <= 0.0 {
-        return 0.18;
-    }
-    let dt_position = (t_verify_ms - t_ar_ms) / (n_verify as f32 - 1.0);
-    (dt_position / t_ar_ms).clamp(0.05, 0.5)
 }
 
 #[cfg(test)]
@@ -218,70 +210,40 @@ mod tests {
         assert!(c.block() >= 1 && c.block() <= 5);
     }
 
-    // gfx1151-mq2lloyd shape: t_AR≈84ms, verify of 6 positions≈149ms => Δt≈13ms/pos,
-    // p* ≈ 13/84 ≈ 0.155. Must land near the offline 0.18 and inside the clamp.
+    // Fit p* from the verify curve: t_verify(n) ≈ t_AR + (n-1)·Δt.
+    // n=2 → 90ms, n=6 → 150ms: dt=(150-90)/4=15, t_ar=90-15=75, p*=15/75=0.2.
     #[test]
-    fn calibrate_matches_gfx1151_prior() {
-        let p = calibrate_p_star(84.0, 149.0, 6);
-        assert!((0.10..0.25).contains(&p), "p*={p} not near the 0.18 prior");
-    }
-
-    // Cheap-marginal arch (verify barely grows with n) => small p* (favor big blocks),
-    // clamped at the floor.
-    #[test]
-    fn calibrate_clamps_low() {
-        let p = calibrate_p_star(84.0, 88.0, 6); // Δt≈0.8ms/pos => ~0.01, clamp 0.05
-        assert_eq!(p, 0.05);
-    }
-
-    // Expensive-marginal arch (verify grows steeply) => large p* (favor small blocks),
-    // clamped at the ceiling.
-    #[test]
-    fn calibrate_clamps_high() {
-        let p = calibrate_p_star(84.0, 84.0 + 84.0 * 5.0, 6); // Δt≈t_ar/pos => 1.0, clamp 0.5
-        assert_eq!(p, 0.5);
-    }
-
-    // Degenerate n_verify<2 falls back to the prior (no division by zero).
-    #[test]
-    fn calibrate_degenerate_returns_prior() {
-        assert_eq!(calibrate_p_star(84.0, 84.0, 1), 0.18);
-    }
-
-    // observe_timing fires calibrate_p_star on the first window that has both
-    // t_ar and a valid t_verify. gfx1151-mq2lloyd shape: t_ar≈84ms, verify of
-    // 6 positions≈149ms => Δt≈13ms/pos, p*≈0.155. The prior (0.18) is replaced.
-    #[test]
-    fn observe_timing_calibrates_live_p_star() {
+    fn calibrates_from_verify_curve() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        // Bootstrap window: t_ar=84ms, verify n=6 at 149ms.
-        c.observe_timing(Some(84.0), 149.0, 6);
-        let p = c.p_star();
+        for _ in 0..30 {
+            c.observe_timing(90.0, 2);
+            c.observe_timing(150.0, 6);
+        }
+        // dt=(150-90)/4=15, t_ar=90-15*(2-1)=75, p*=15/75=0.2
         assert!(
-            (0.10..0.25).contains(&p),
-            "live p*={p} not near the expected ≈0.155"
-        );
-        // Calibrated p* should be close to calibrate_p_star(84,149,6).
-        let expected = calibrate_p_star(84.0, 149.0, 6);
-        assert!(
-            (p - expected).abs() < 1e-5,
-            "p*={p} != calibrate_p_star result {expected}"
+            (c.p_star_for_test() - 0.2).abs() < 0.01,
+            "p*={}",
+            c.p_star_for_test()
         );
     }
 
     // reset() preserves the calibrated p* (thermal-invariant hardware ratio).
+    // gfx1151 shape: n=2→97ms, n=6→149ms: dt=13, t_ar=84, p*≈0.155 < 0.175.
     #[test]
     fn reset_preserves_calibrated_p_star() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        c.observe_timing(Some(84.0), 149.0, 6);
-        let calibrated_p = c.p_star();
+        for _ in 0..30 {
+            c.observe_timing(97.0, 2);
+            c.observe_timing(149.0, 6);
+        }
+        let calibrated_p = c.p_star_for_test();
         assert!(
             calibrated_p < 0.18 - 0.005,
             "p* should have moved from prior"
         );
         c.reset();
         assert_eq!(
-            c.p_star(),
+            c.p_star_for_test(),
             calibrated_p,
             "reset() must preserve calibrated p*"
         );

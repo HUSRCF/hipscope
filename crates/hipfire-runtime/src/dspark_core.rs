@@ -1078,15 +1078,10 @@ impl MtpDrafter for DsparkDrafter {
         // via `capture_seed_main_hidden` — matches the reference `_init_context`.
         // STEADY-STATE: ctx_hidden_dev/ctx_positions were populated by the
         // previous window's verify; skip `capture_seed_main_hidden` entirely.
-        let mut t_bootstrap_ms: Option<f32> = None;
         let t_bootstrap = self.profiler.sync_start(gpu);
         if self.ctx_positions.is_empty() {
             // Initial window: bootstrap with a 1-token capture-armed forward.
-            // Time this call: the returned Vec<f32> forces D2H completion, so
-            // elapsed() is real wall time (= t_AR, the single-position cost).
-            let _t_bs = std::time::Instant::now();
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
-            t_bootstrap_ms = Some(_t_bs.elapsed().as_secs_f32() * 1000.0);
             let dev = upload_f32(gpu, &hidden_host)?;
             if let Some(old) = self.main_hidden_dev.take() {
                 let _ = gpu.free_tensor(old);
@@ -1273,7 +1268,7 @@ impl MtpDrafter for DsparkDrafter {
         let _ = gpu.free_tensor(capture_buf);
         self.profiler.sync_end(gpu, t_rest, 4);
         if let Some(c) = self.block_controller.as_mut() {
-            c.observe_timing(t_bootstrap_ms, t_verify_ms, n_verify);
+            c.observe_timing(t_verify_ms, n_verify);
             c.observe(accept_len, n_proposed);
             if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
                 eprintln!(
