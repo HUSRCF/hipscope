@@ -78,7 +78,7 @@ pub fn verify_block_argmax(
     capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<u32>> {
     verify_block_logits_or_argmax(
-        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, false,
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, false, None,
     )
     .map(|VerifyOut { argmax, .. }| argmax)
 }
@@ -101,7 +101,7 @@ pub fn verify_block_logits(
     capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<f32>> {
     verify_block_logits_or_argmax(
-        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true,
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true, None,
     )
     .map(|VerifyOut { logits, .. }| logits)
 }
@@ -153,6 +153,7 @@ pub fn verify_block_argmax_capture_gpu(
         pbs,
         sink.as_mut(),
         false,
+        None,
     )
     .map(|VerifyOut { argmax, .. }| argmax)?;
     Ok((argmax, captured))
@@ -164,9 +165,11 @@ pub fn verify_block_argmax_capture_gpu(
 /// Returns `(per-position sampled tokens, captured)` with the same `captured`
 /// semantics (false ⇒ per-token fallback ran, `hidden_gpu` untouched).
 ///
-/// Reuses the shared verify body with `want_logits=true`, then samples host-side
-/// from the per-position logits (a `block.len() × vocab` D2H — fine for the small
-/// temp>0 blocks). At `temp <= 1e-6` the draw collapses to argmax.
+/// Each position is drawn on-GPU via the fused `sample_top_p_pf` kernel (softmax
+/// + nucleus + top_k + categorical in ONE launch, 4-byte D2H) — no b×vocab
+/// download, no host softmax. It is the SAME sampler AR decode uses, so the
+/// committed tokens are distribution-identical to AR temp-T decoding. At
+/// `temp <= 1e-6` the kernel collapses to argmax.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_sampled_capture_gpu(
     gpu: &mut Gpu,
@@ -196,6 +199,10 @@ pub fn verify_block_sampled_capture_gpu(
     } else {
         None
     };
+    // Sampler scratch, allocated once for the whole block (freed below).
+    let result_buf = gpu.alloc_tensor(&[2], DType::F32)?;
+    let repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+    let mut rng32 = *rng_state as u32;
     let out = verify_block_logits_or_argmax(
         gpu,
         weights,
@@ -206,18 +213,20 @@ pub fn verify_block_sampled_capture_gpu(
         scratch,
         pbs,
         sink.as_mut(),
-        true, // want_logits: need the full per-position distribution to sample
-    )?;
-    let vocab = config.vocab_size;
-    let n = block.len();
-    let mut picks = Vec::with_capacity(n);
-    for i in 0..n {
-        let row = &out.logits[i * vocab..(i + 1) * vocab];
-        picks.push(crate::spec::sample_logits_row(
-            row, temp, top_p, top_k, rng_state,
-        ));
-    }
-    Ok((picks, captured))
+        false, // no full-logit download; the GPU sampler returns picks directly
+        Some(SampleCfg {
+            temp,
+            top_p,
+            top_k,
+            rng: &mut rng32,
+            result_buf: &result_buf,
+            repeat_buf: &repeat_buf,
+        }),
+    );
+    *rng_state = rng32 as u64;
+    let _ = gpu.free_tensor(result_buf);
+    let _ = gpu.free_tensor(repeat_buf);
+    Ok((out?.argmax, captured))
 }
 
 /// One single-pass TREE-masked verify, returning the FULL per-node target
@@ -301,11 +310,29 @@ pub fn verify_tree_logits(
     Ok(logits_out)
 }
 
-/// Output of the shared verify forward: per-position argmax always; full logits
-/// only when `want_logits` was set (else empty).
+/// Output of the shared verify forward: per-position pick (argmax, or a sampled
+/// token when `SampleCfg` was supplied); full logits only when `want_logits`.
 struct VerifyOut {
     argmax: Vec<u32>,
     logits: Vec<f32>,
+}
+
+/// Per-position GPU sampling for the temp>0 verify. When supplied to
+/// [`verify_block_logits_or_argmax`], each position's pick is drawn on-GPU via
+/// the fused `sample_top_p_pf` kernel (softmax + nucleus + top_k/min_p +
+/// categorical in ONE launch, 4-byte D2H) — the SAME sampler the AR decode uses,
+/// so the committed tokens are distribution-identical to AR. This replaces the
+/// host-softmax path (b×vocab D2H + host exp) entirely.
+struct SampleCfg<'a> {
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    /// xorshift/LCG state (u32, as the sampler kernel expects); advanced per draw.
+    rng: &'a mut u32,
+    /// Sampler scratch: `result_buf` `[2]` F32, `repeat_buf` `[1]` F32 (unused
+    /// with `repeat_window=0`). Caller-owned so the loop allocates once.
+    result_buf: &'a GpuTensor,
+    repeat_buf: &'a GpuTensor,
 }
 
 /// Shared body for [`verify_block_argmax`] / [`verify_block_logits`]: one batched
@@ -325,6 +352,7 @@ fn verify_block_logits_or_argmax(
     pbs: &PrefillBatchScratch,
     capture: Option<&mut HiddenCaptureSink>,
     want_logits: bool,
+    mut sample: Option<SampleCfg>,
 ) -> HipResult<VerifyOut> {
     let n = block.len();
     let dim = config.dim;
@@ -376,7 +404,7 @@ fn verify_block_logits_or_argmax(
         //
         // For want_logits=true (SWOR / temp>0 sampling) we still download the
         // full logit row and do CPU argmax (caller needs the distribution).
-        let argmax_one = if !want_logits {
+        let argmax_one = if !want_logits && sample.is_none() {
             // 4-byte scratch; pool-resident (256-byte bucket) after the first use.
             Some(gpu.alloc_tensor(&[1], DType::F32)?)
         } else {
@@ -393,7 +421,10 @@ fn verify_block_logits_or_argmax(
                 config.norm_eps,
             )?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-            if let Some(ref ab) = argmax_one {
+            if let Some(sc) = sample.as_mut() {
+                // temp>0: fused GPU sample (softmax+nucleus+draw) → 4-byte D2H.
+                out.push(sample_one(gpu, &scratch.logits, vocab, sc)?);
+            } else if let Some(ref ab) = argmax_one {
                 // GPU argmax → 4-byte D2H (avoids 607 KB download per position).
                 gpu.argmax_f32_batched(&scratch.logits, ab, vocab, 1)?;
                 let mut raw = 0i32;
@@ -414,10 +445,14 @@ fn verify_block_logits_or_argmax(
         for (i, &tok) in block.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
-            let row = gpu.download_f32(&scratch.logits)?;
-            out.push(argmax(&row));
-            if want_logits {
-                logits_out.extend_from_slice(&row);
+            if let Some(sc) = sample.as_mut() {
+                out.push(sample_one(gpu, &scratch.logits, vocab, sc)?);
+            } else {
+                let row = gpu.download_f32(&scratch.logits)?;
+                out.push(argmax(&row));
+                if want_logits {
+                    logits_out.extend_from_slice(&row);
+                }
             }
         }
     }
@@ -425,6 +460,45 @@ fn verify_block_logits_or_argmax(
         argmax: out,
         logits: logits_out,
     })
+}
+
+/// One fused GPU sample from `logits` (`[vocab]` F32) via `sample_top_p_pf` — the
+/// same kernel AR decode uses, so DSpark's committed tokens match the AR temp-T
+/// distribution. No repeat/presence/frequency penalty here (verify is
+/// distribution-only; the emission layer owns penalties). Advances `sc.rng`.
+fn sample_one(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    vocab: usize,
+    sc: &mut SampleCfg,
+) -> HipResult<u32> {
+    let top_p_eff = if sc.top_p > 0.0 {
+        sc.top_p.min(1.0)
+    } else {
+        1.0
+    };
+    let top_k = if sc.top_k > 0 {
+        Some(sc.top_k as u32)
+    } else {
+        None
+    };
+    let (tok, new_rng) = gpu.sample_top_p_pf(
+        logits,
+        sc.result_buf,
+        sc.repeat_buf,
+        vocab,
+        sc.temp,
+        top_p_eff,
+        *sc.rng,
+        0,   // repeat_window (no penalty in verify)
+        1.0, // repeat_penalty
+        0.0, // presence_penalty
+        0.0, // frequency_penalty
+        top_k,
+        None, // min_p
+    )?;
+    *sc.rng = new_rng;
+    Ok(tok)
 }
 
 /// Apply the target lm_head (final-norm + output projection) to `n` rows of
