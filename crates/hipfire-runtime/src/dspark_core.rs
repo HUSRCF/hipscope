@@ -1265,6 +1265,14 @@ impl MtpDrafter for DsparkDrafter {
         self.profiler.sync_end(gpu, t_rest, 4);
         if let Some(c) = self.block_controller.as_mut() {
             c.observe(accept_len, n_proposed);
+            if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "[dspark-block] block={} accept={}/{}",
+                    c.block(),
+                    accept_len,
+                    n_proposed
+                );
+            }
         }
         self.profiler.end_window();
 
@@ -1343,8 +1351,11 @@ pub fn build_dspark_speculator(
         .as_deref()
         != Some("0");
     let block_controller = adaptive.then(|| {
-        // Prior p*=0.18 (gfx1151-mq2lloyd); Task 4 replaces it with a live estimate.
-        crate::dspark_block_controller::BlockController::new(block, 1, block, 0.18)
+        // Start at a MID block so the hill-climb can grow (high-accept content) or
+        // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
+        // p*=0.18 prior (a later task measures it live).
+        let start_block = 3.min(block).max(1);
+        crate::dspark_block_controller::BlockController::new(start_block, 1, block, 0.18)
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
