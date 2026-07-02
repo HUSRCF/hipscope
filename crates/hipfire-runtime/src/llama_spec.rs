@@ -423,7 +423,19 @@ fn verify_block_logits_or_argmax(
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
             if let Some(sc) = sample.as_mut() {
                 // temp>0: fused GPU sample (softmax+nucleus+draw) → 4-byte D2H.
-                out.push(sample_one(gpu, &scratch.logits, vocab, sc)?);
+                let tok = sample_one(gpu, &scratch.logits, vocab, sc)?;
+                out.push(tok);
+                // LAZY: acceptance is a prefix — once a position's sample differs
+                // from its drafted token (`block[i+1]`), every later position is
+                // rejected, so skip their (expensive) head+sample entirely. `tok`
+                // is the committed correction; pad the tail so the pick vector is
+                // full length (accept_greedy_prefix only reads up to this mismatch).
+                if i + 1 < n && block[i + 1] != tok {
+                    while out.len() < n {
+                        out.push(u32::MAX);
+                    }
+                    break;
+                }
             } else if let Some(ref ab) = argmax_one {
                 // GPU argmax → 4-byte D2H (avoids 607 KB download per position).
                 gpu.argmax_f32_batched(&scratch.logits, ab, vocab, 1)?;
@@ -446,7 +458,15 @@ fn verify_block_logits_or_argmax(
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
             if let Some(sc) = sample.as_mut() {
-                out.push(sample_one(gpu, &scratch.logits, vocab, sc)?);
+                let pick = sample_one(gpu, &scratch.logits, vocab, sc)?;
+                out.push(pick);
+                // LAZY prefix stop (see the batched branch above).
+                if i + 1 < n && block[i + 1] != pick {
+                    while out.len() < n {
+                        out.push(u32::MAX);
+                    }
+                    break;
+                }
             } else {
                 let row = gpu.download_f32(&scratch.logits)?;
                 out.push(argmax(&row));
