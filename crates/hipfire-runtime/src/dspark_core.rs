@@ -993,6 +993,9 @@ pub struct DsparkDrafter {
     ctx_positions: Vec<usize>,
     /// Per-window phase profiler; active only when `HIPFIRE_DSPARK_PROFILE=1`.
     profiler: DsparkProfiler,
+    /// Adaptive block-size controller. `None` when `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`
+    /// (opt-out; fixed block == pre-change behaviour).
+    block_controller: Option<crate::dspark_block_controller::BlockController>,
 }
 
 impl MtpDrafter for DsparkDrafter {
@@ -1020,6 +1023,9 @@ impl MtpDrafter for DsparkDrafter {
             let _ = gpu.free_tensor(dev);
         }
         self.ctx_positions.clear();
+        if let Some(c) = self.block_controller.as_mut() {
+            c.reset();
+        }
 
         if fill_tokens.is_empty() {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
@@ -1053,7 +1059,14 @@ impl MtpDrafter for DsparkDrafter {
 
         let layers = self.weights.cfg.target_layer_ids.clone();
         let n_targets = layers.len();
-        let block = self.weights.cfg.block_size.min(k).max(1);
+        // Adaptive path overrides the caller's k with the controller's current cap;
+        // fixed path (opt-out) keeps the old behaviour exactly.
+        let effective_k = self
+            .block_controller
+            .as_ref()
+            .map(|c| c.block())
+            .unwrap_or(k);
+        let block = self.weights.cfg.block_size.min(effective_k).max(1);
         let vocab = self.lm_head.shape[0];
         let hidden = {
             // Infer hidden from stage_norm shape (it's [hidden]).
@@ -1250,6 +1263,9 @@ impl MtpDrafter for DsparkDrafter {
         }
         let _ = gpu.free_tensor(capture_buf);
         self.profiler.sync_end(gpu, t_rest, 4);
+        if let Some(c) = self.block_controller.as_mut() {
+            c.observe(accept_len, n_proposed);
+        }
         self.profiler.end_window();
 
         Ok(MtpWindow {
@@ -1321,6 +1337,15 @@ pub fn build_dspark_speculator(
     supports_temp: bool,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
+    // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
+    let adaptive = std::env::var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let block_controller = adaptive.then(|| {
+        // Prior p*=0.18 (gfx1151-mq2lloyd); Task 4 replaces it with a live estimate.
+        crate::dspark_block_controller::BlockController::new(block, 1, block, 0.18)
+    });
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
         weights,
@@ -1337,5 +1362,6 @@ pub fn build_dspark_speculator(
         main_hidden_dev: None,
         ctx_positions: Vec::new(),
         profiler: DsparkProfiler::new(),
+        block_controller,
     }))
 }
