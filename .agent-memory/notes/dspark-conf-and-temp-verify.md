@@ -97,6 +97,24 @@ SEPARATE head (final_norm_and_argmax_all_batched) — must lazy each arch's head
 independently. ds4 greedy has pre-existing run variance (mq2lloyd/Q8) so use
 parity + by-construction identity, not a raw-stats A/B.
 
+## ds4 conf budget with lazy verify (a85a072d) — default 0.5→0.3
+With the cheaper (lazy) verify, does a higher drafter budget (lower conf → less
+truncation) pay off? The drafter always drafts all block_size(=5); conf truncates
+how many reach verify. Lazy skips per-position HEADS after the first mismatch, but
+the verify TRUNK FORWARD still scales with #proposed — so extra drafts are ~free
+only if they get ACCEPTED. Result is prompt- AND temp-dependent:
+- GREEDY (fixed-len, warm): 0.3 is the sweet spot. code 0.5→8.95 / 0.3→9.47 /
+  0.1→9.45; fiction-prose 0.5→10.09 / 0.3→**12.13** / 0.1→11.27. 0.5 was cutting
+  correct drafts; 0.1 over-proposes wrong ones (forward cost, no accept). → default 0.3.
+- temp>0: OPPOSITE — higher budget LOSES. temp0.7 code 0.5→11.41 / 0.1→10.31
+  (−10%): sampled target less predictable → extra drafts wrong. temp>0 wants MORE
+  truncation. (Moot for serving — ds4 temp>0 gated off; greedy optimum governs.)
+- TRAP: the FIRST short-factual-prose test (natural EOS) falsely showed 0.1
+  regressing (14.25→10.70) — an EOS/non-determinism artifact (token count 81 vs
+  71). RAW fixed-length is the clean way; it flipped the verdict (0.3 wins prose).
+  High-acceptance prompts genuinely prefer higher conf, low-accept prefer ~0.3.
+- Greedy conf is a PURE SPEED knob (output = target argmax regardless of #proposed).
+
 ## traps
 - AR decode speed is temp-invariant (per-token sampler cost ≈ forward-bound), so
   AR greedy tok/s is a fair temp>0 baseline.
