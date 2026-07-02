@@ -99,6 +99,10 @@ impl BlockController {
         let lo = (2..8).find(|&n| self.t_verify_by_n[n] > 0.0);
         let hi = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
         if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
+            // Note: if the hill-climb never visits ≥2 distinct n_verify values
+            // (e.g. block pinned at a fixed cap), n_hi > n_lo never holds and
+            // calibration silently stays on the 0.18 prior for the process
+            // lifetime — acceptable, since the prior is a safe gfx1151 default.
             if n_hi > n_lo {
                 let dt =
                     (self.t_verify_by_n[n_hi] - self.t_verify_by_n[n_lo]) / (n_hi - n_lo) as f32;
@@ -223,6 +227,38 @@ mod tests {
         assert!(
             (c.p_star_for_test() - 0.2).abs() < 0.01,
             "p*={}",
+            c.p_star_for_test()
+        );
+    }
+
+    // A fit that computes p* > 0.5 must be REJECTED (not clamped): keep the prior.
+    #[test]
+    fn rejects_high_fit_keeps_prior() {
+        let mut c = BlockController::new(3, 1, 5, 0.18);
+        // t_v[2]=100, t_v[6]=300 → dt=50, t_ar=100-50=50, raw=1.0 > 0.5 → reject
+        for _ in 0..30 {
+            c.observe_timing(100.0, 2);
+            c.observe_timing(300.0, 6);
+        }
+        assert!(
+            (c.p_star_for_test() - 0.18).abs() < 1e-6,
+            "should keep prior on out-of-range fit, got {}",
+            c.p_star_for_test()
+        );
+    }
+
+    // A fit that computes p* < 0.05 must be REJECTED: keep the prior.
+    #[test]
+    fn rejects_low_fit_keeps_prior() {
+        let mut c = BlockController::new(3, 1, 5, 0.18);
+        // t_v[2]=100, t_v[6]=101 → dt=0.25, t_ar=99.75, raw≈0.0025 < 0.05 → reject
+        for _ in 0..30 {
+            c.observe_timing(100.0, 2);
+            c.observe_timing(101.0, 6);
+        }
+        assert!(
+            (c.p_star_for_test() - 0.18).abs() < 1e-6,
+            "should keep prior on tiny-ratio fit, got {}",
             c.p_star_for_test()
         );
     }

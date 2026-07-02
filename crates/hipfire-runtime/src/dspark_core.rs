@@ -1181,7 +1181,10 @@ impl MtpDrafter for DsparkDrafter {
         // token, drafts accepted iff they match). Both capture hidden GPU-resident.
         // Time the call: the returned Vec<u32> (via argmax_f32 / sample D2H) forces
         // GPU completion, so elapsed() is real wall time with no added sync.
-        let _t_ver = std::time::Instant::now();
+        let _t_ver = self
+            .block_controller
+            .is_some()
+            .then(std::time::Instant::now);
         let (target_pick, captured) = if self.temp <= 1e-6 {
             target.verify_block_capture_gpu(
                 gpu,
@@ -1203,7 +1206,7 @@ impl MtpDrafter for DsparkDrafter {
                 &capture_buf,
             )?
         };
-        let t_verify_ms = _t_ver.elapsed().as_secs_f32() * 1000.0;
+        let t_verify_ms = _t_ver.map(|t| t.elapsed().as_secs_f32() * 1000.0);
         self.profiler.sync_end(gpu, t_verify, 3);
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
@@ -1268,7 +1271,9 @@ impl MtpDrafter for DsparkDrafter {
         let _ = gpu.free_tensor(capture_buf);
         self.profiler.sync_end(gpu, t_rest, 4);
         if let Some(c) = self.block_controller.as_mut() {
-            c.observe_timing(t_verify_ms, n_verify);
+            if let Some(tv) = t_verify_ms {
+                c.observe_timing(tv, n_verify);
+            }
             c.observe(accept_len, n_proposed);
             if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
                 eprintln!(
