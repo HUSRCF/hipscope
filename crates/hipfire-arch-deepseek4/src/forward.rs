@@ -7860,6 +7860,55 @@ pub fn final_norm_and_argmax_all_batched(
     Ok(host_idx.into_iter().map(|i| i as u32).collect())
 }
 
+/// LAZY greedy twin of [`final_norm_and_argmax_all_batched`]: per position,
+/// final-norm + head → logits → GPU argmax, with a prefix stop against the
+/// drafted `block` (once a position's argmax != its draft `block[i+1]`, all later
+/// positions reject — skip their heads). Byte-identical committed output vs the
+/// eager argmax (the caller's `accept_greedy_prefix` reads only up to the
+/// mismatch), just fewer (152k-vocab) head GEMVs. Rejected picks are padded.
+pub fn final_norm_and_argmax_all_batched_lazy(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    block: &[u32],
+) -> Result<Vec<u32>, String> {
+    let n = block.len();
+    if n == 0 {
+        return Err("final_norm_and_argmax_all_batched_lazy: empty batch".to_string());
+    }
+    let vocab = cfg.vocab_size;
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+    let orig = state.residual_streams.take();
+    let mut ids: Vec<u32> = Vec::with_capacity(n);
+    let result: Result<(), String> = (|| {
+        for i in 0..n {
+            let off = i * stream_len;
+            state.residual_streams = Some(pbs.streams_batch.sub_offset(off, stream_len));
+            final_norm_and_head(cfg, weights, state, gpu)?;
+            let logits_tensor = state
+                .logits
+                .as_ref()
+                .ok_or_else(|| "logits not allocated".to_string())?;
+            let tok = gpu
+                .argmax_f32(logits_tensor, vocab)
+                .map_err(|e| format!("argmax @pos {i}: {e:?}"))?;
+            ids.push(tok);
+            if i + 1 < n && block[i + 1] != tok {
+                while ids.len() < n {
+                    ids.push(u32::MAX);
+                }
+                break;
+            }
+        }
+        Ok(())
+    })();
+    state.residual_streams = orig;
+    result?;
+    Ok(ids)
+}
+
 /// Sampled + LAZY twin of [`final_norm_and_argmax_all_batched`] for temp>0 DSpark
 /// verify. Per position: final-norm + head → logits → fused GPU `sample_top_p_pf`
 /// draw (same sampler AR uses → distribution-identical). LAZY: acceptance is a

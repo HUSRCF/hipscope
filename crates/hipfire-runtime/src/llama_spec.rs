@@ -78,7 +78,7 @@ pub fn verify_block_argmax(
     capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<u32>> {
     verify_block_logits_or_argmax(
-        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, false, None,
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, false, None, false,
     )
     .map(|VerifyOut { argmax, .. }| argmax)
 }
@@ -101,7 +101,7 @@ pub fn verify_block_logits(
     capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<Vec<f32>> {
     verify_block_logits_or_argmax(
-        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true, None,
+        gpu, weights, config, block, start_pos, kv_cache, scratch, pbs, capture, true, None, false,
     )
     .map(|VerifyOut { logits, .. }| logits)
 }
@@ -154,6 +154,7 @@ pub fn verify_block_argmax_capture_gpu(
         sink.as_mut(),
         false,
         None,
+        true, // DSpark greedy: lazy prefix-stop (byte-identical committed, fewer lm_heads)
     )
     .map(|VerifyOut { argmax, .. }| argmax)?;
     Ok((argmax, captured))
@@ -222,6 +223,7 @@ pub fn verify_block_sampled_capture_gpu(
             result_buf: &result_buf,
             repeat_buf: &repeat_buf,
         }),
+        true, // DSpark sampled verify: lazy prefix-stop
     );
     *rng_state = rng32 as u64;
     let _ = gpu.free_tensor(result_buf);
@@ -353,6 +355,13 @@ fn verify_block_logits_or_argmax(
     capture: Option<&mut HiddenCaptureSink>,
     want_logits: bool,
     mut sample: Option<SampleCfg>,
+    // LAZY prefix stop: skip the per-row head for positions after the first
+    // draft/pick mismatch (acceptance is a prefix). Committed output is
+    // identical (accept_greedy_prefix only reads up to the mismatch), just fewer
+    // lm_head GEMVs. Only safe for callers whose picks feed accept_greedy_prefix
+    // (the DSpark capture paths) — the plain verify_block_argmax/logits have
+    // consumers that read every pick, so they pass `false`.
+    lazy: bool,
 ) -> HipResult<VerifyOut> {
     let n = block.len();
     let dim = config.dim;
@@ -430,7 +439,7 @@ fn verify_block_logits_or_argmax(
                 // rejected, so skip their (expensive) head+sample entirely. `tok`
                 // is the committed correction; pad the tail so the pick vector is
                 // full length (accept_greedy_prefix only reads up to this mismatch).
-                if i + 1 < n && block[i + 1] != tok {
+                if lazy && i + 1 < n && block[i + 1] != tok {
                     while out.len() < n {
                         out.push(u32::MAX);
                     }
@@ -443,7 +452,17 @@ fn verify_block_logits_or_argmax(
                 let bytes =
                     unsafe { std::slice::from_raw_parts_mut(&mut raw as *mut i32 as *mut u8, 4) };
                 gpu.hip.memcpy_dtoh(bytes, &ab.buf)?;
-                out.push(raw as u32);
+                let tok = raw as u32;
+                out.push(tok);
+                // LAZY prefix stop (greedy): same reasoning as the sample branch —
+                // skip lm_head for positions after the first mismatch. Output is
+                // byte-identical (accept reads only up to the mismatch).
+                if lazy && i + 1 < n && block[i + 1] != tok {
+                    while out.len() < n {
+                        out.push(u32::MAX);
+                    }
+                    break;
+                }
             } else {
                 let row = gpu.download_f32(&scratch.logits)?;
                 out.push(argmax(&row));
@@ -461,7 +480,7 @@ fn verify_block_logits_or_argmax(
                 let pick = sample_one(gpu, &scratch.logits, vocab, sc)?;
                 out.push(pick);
                 // LAZY prefix stop (see the batched branch above).
-                if i + 1 < n && block[i + 1] != pick {
+                if lazy && i + 1 < n && block[i + 1] != pick {
                     while out.len() < n {
                         out.push(u32::MAX);
                     }

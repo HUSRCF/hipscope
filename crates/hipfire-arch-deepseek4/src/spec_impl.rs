@@ -21,7 +21,8 @@
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
     self, dspark_assemble_main_hidden, final_norm_and_argmax_all_batched,
-    final_norm_and_sample_all_batched_lazy, forward_prefill_batch_chunk, PrefillBatchScratch,
+    final_norm_and_argmax_all_batched_lazy, final_norm_and_sample_all_batched_lazy,
+    forward_prefill_batch_chunk, PrefillBatchScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{Gpu, GpuTensor};
@@ -121,6 +122,27 @@ impl Deepseek4Bundle {
         );
         self.state.dspark_verify_pbs = Some(pbs);
         argmax_result.map_err(|e| format!("Deepseek4Bundle::verify_block head+argmax: {e}"))
+    }
+
+    /// LAZY twin of `dspark_verify_argmax`: greedy argmax per position with a
+    /// prefix stop against the drafted `block` (skips heads after the first
+    /// mismatch). Byte-identical committed output, fewer lm_head GEMVs.
+    fn dspark_verify_argmax_lazy(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let res = final_norm_and_argmax_all_batched_lazy(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &pbs,
+            gpu,
+            block,
+        );
+        self.state.dspark_verify_pbs = Some(pbs);
+        res.map_err(|e| format!("Deepseek4Bundle::verify_block head+argmax(lazy): {e}"))
     }
 
     /// temp>0 twin of `dspark_verify_argmax`: fused GPU sample per position with
@@ -338,7 +360,7 @@ impl SpecTarget for Deepseek4Bundle {
             }
         }
 
-        let picks = self.dspark_verify_argmax(gpu, n_verify)?;
+        let picks = self.dspark_verify_argmax_lazy(gpu, block)?;
         Ok((picks, captured))
     }
 
