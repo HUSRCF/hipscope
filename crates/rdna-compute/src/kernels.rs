@@ -3417,6 +3417,16 @@ pub const ARGMAX_TOKEN_CHAIN_SRC: &str =
 /// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
 pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
 
+/// Fused on-GPU sample+accept for DSpark temp>0 verify. Over resident target
+/// logits `[n × vocab]` (batched lm-head), replays the single-block
+/// `sample_top_p` draw per position, threads xorshift32 RNG, and lazily
+/// early-exits on the first mismatch vs `draft[pos+1]` — replacing the
+/// per-position `sample_top_p_pf` host loop (one 8-byte D2H/position) with one
+/// launch + one `(n+1)×4`-byte D2H. Byte-identical token sequence to the
+/// per-position single-block sampler.
+pub const DSPARK_SAMPLE_ACCEPT_LAZY_SRC: &str =
+    include_str!("../../../kernels/src/dspark_sample_accept_lazy.hip");
+
 pub const DDTREE_SWOR_WALK_SRC: &str = include_str!("../../../kernels/src/ddtree_swor_walk.hip");
 
 pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =

@@ -7910,13 +7910,20 @@ pub fn final_norm_and_argmax_all_batched_lazy(
 }
 
 /// Sampled + LAZY twin of [`final_norm_and_argmax_all_batched`] for temp>0 DSpark
-/// verify. Per position: final-norm + head → logits → fused GPU `sample_top_p_pf`
-/// draw (same sampler AR uses → distribution-identical). LAZY: acceptance is a
-/// prefix, so once a position's sample differs from its drafted token
-/// (`block[i+1]`) every later position is rejected — stop and pad (the caller's
-/// `accept_greedy_prefix` only reads up to the mismatch). Uses the per-position
-/// head path (works for both FWHT and non-FWHT heads); lazy samples ~τ positions
-/// so the batched-head optimization isn't needed here. `rng` advances per draw.
+/// verify. Mirrors the greedy sibling's architecture: **one** batched lm-head
+/// read (`compute_batched_head_logits` → resident `[n × vocab]` logits) followed
+/// by a single fused on-GPU kernel (`sample_accept_lazy_f32`) that samples every
+/// position on the device, threads the xorshift32 RNG, and LAZILY early-exits on
+/// the first token that differs from its drafted successor (`block[i+1]`) —
+/// padding the rejected tail with `u32::MAX` (the caller's `accept_greedy_prefix`
+/// reads only up to the mismatch). This replaces the previous per-position host
+/// loop (which re-read the ~565 MB lm-head τ times and paid an 8-byte D2H +
+/// stream sync per position) with one head read + one `(n+1)×4`-byte D2H; the
+/// sampled token sequence stays distribution-identical to the AR sampler.
+///
+/// FWHT heads (no batched GEMV path) and `HIPFIRE_DEEPSEEK4_BATCH_HEAD=0` fall
+/// back to the original per-position `sample_top_p_pf` loop. `rng` advances per
+/// draw in both paths.
 #[allow(clippy::too_many_arguments)]
 pub fn final_norm_and_sample_all_batched_lazy(
     cfg: &DeepseekV4Config,
@@ -7941,48 +7948,102 @@ pub fn final_norm_and_sample_all_batched_lazy(
     let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
 
-    let orig = state.residual_streams.take();
-    let mut ids: Vec<u32> = Vec::with_capacity(n);
-    let result: Result<(), String> = (|| {
-        for i in 0..n {
-            let off = i * stream_len;
-            state.residual_streams = Some(pbs.streams_batch.sub_offset(off, stream_len));
-            final_norm_and_head(cfg, weights, state, gpu)?;
-            let logits_tensor = state
-                .logits
-                .as_ref()
-                .ok_or_else(|| "logits not allocated".to_string())?;
-            let (tok, new_rng) = gpu
-                .sample_top_p_pf(
-                    logits_tensor,
-                    result_buf,
-                    repeat_buf,
-                    vocab,
-                    temp,
-                    top_p_eff,
-                    *rng,
-                    0,
-                    1.0,
-                    0.0,
-                    0.0,
-                    top_k_opt,
-                    None,
-                )
-                .map_err(|e| format!("sample_top_p_pf @pos {i}: {e:?}"))?;
-            *rng = new_rng;
-            ids.push(tok);
-            // LAZY prefix stop: draft for position i is block[i+1] (i<n-1).
-            if i + 1 < n && block[i + 1] != tok {
-                while ids.len() < n {
-                    ids.push(u32::MAX);
+    // FWHT-head fallback (no batched GEMV path) or batched head disabled: the
+    // original per-position head + host `sample_top_p_pf` loop. Mirrors the
+    // `weight_needs_fwht || !batch_head` branch in `final_norm_and_argmax_all_batched`.
+    let head_needs_fwht = {
+        let head = weights
+            .head
+            .as_ref()
+            .ok_or_else(|| "head not uploaded".to_string())?;
+        weight_needs_fwht(head)
+    };
+    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    if head_needs_fwht || !batch_head {
+        let orig = state.residual_streams.take();
+        let mut ids: Vec<u32> = Vec::with_capacity(n);
+        let result: Result<(), String> = (|| {
+            for i in 0..n {
+                let off = i * stream_len;
+                state.residual_streams = Some(pbs.streams_batch.sub_offset(off, stream_len));
+                final_norm_and_head(cfg, weights, state, gpu)?;
+                let logits_tensor = state
+                    .logits
+                    .as_ref()
+                    .ok_or_else(|| "logits not allocated".to_string())?;
+                let (tok, new_rng) = gpu
+                    .sample_top_p_pf(
+                        logits_tensor,
+                        result_buf,
+                        repeat_buf,
+                        vocab,
+                        temp,
+                        top_p_eff,
+                        *rng,
+                        0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        top_k_opt,
+                        None,
+                    )
+                    .map_err(|e| format!("sample_top_p_pf @pos {i}: {e:?}"))?;
+                *rng = new_rng;
+                ids.push(tok);
+                // LAZY prefix stop: draft for position i is block[i+1] (i<n-1).
+                if i + 1 < n && block[i + 1] != tok {
+                    while ids.len() < n {
+                        ids.push(u32::MAX);
+                    }
+                    break;
                 }
-                break;
             }
-        }
-        Ok(())
-    })();
-    state.residual_streams = orig;
-    result?;
+            Ok(())
+        })();
+        state.residual_streams = orig;
+        result?;
+        return Ok(ids);
+    }
+
+    // Batched path: one lm-head read fills resident `[n × vocab]` logits, then
+    // the fused on-GPU sample+accept kernel does the lazy per-position draw and
+    // early-exit entirely on the device (one `(n+1)×4`-byte D2H). `result_buf` /
+    // `repeat_buf` are unused here (they feed only the FWHT fallback above).
+    compute_batched_head_logits(cfg, weights, state, pbs, gpu, n)?;
+    let logits_batch = state.head_logits_batch.as_ref().unwrap();
+
+    // Upload the drafted block (n u32) and allocate the (n+1)-u32 result buffer.
+    // Tiny per-window allocs, matching `final_norm_and_argmax_all_batched`'s
+    // per-call `argmax_buf`. Stored in F32 tensors (4 bytes/elem = one u32).
+    let draft_buf = gpu
+        .alloc_tensor(&[n], DType::F32)
+        .map_err(|e| format!("alloc draft buf: {e:?}"))?;
+    let draft_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(block.as_ptr() as *const u8, n * 4) };
+    gpu.memcpy_htod_auto(&draft_buf.buf, draft_bytes)
+        .map_err(|e| format!("upload draft block: {e:?}"))?;
+    let out_buf = gpu
+        .alloc_tensor(&[n + 1], DType::F32)
+        .map_err(|e| format!("alloc sample-accept out: {e:?}"))?;
+
+    let (ids, new_rng) = gpu
+        .sample_accept_lazy_f32(
+            logits_batch,
+            &draft_buf,
+            &out_buf,
+            n,
+            vocab,
+            temp,
+            top_p_eff,
+            top_k_opt,
+            *rng,
+        )
+        .map_err(|e| format!("sample_accept_lazy_f32: {e:?}"))?;
+    *rng = new_rng;
+    let _ = gpu.free_tensor(draft_buf);
+    let _ = gpu.free_tensor(out_buf);
     Ok(ids)
 }
 

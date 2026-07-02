@@ -735,6 +735,104 @@ impl Gpu {
         )
     }
 
+    /// Fused on-GPU sample+accept for DSpark (deepseek4) temp>0 spec-decode
+    /// verify. Over the resident batched target logits `[n × vocab]` (produced
+    /// by one batched lm-head weight read), samples every verify position on the
+    /// device — replaying the single-block `sample_top_p` draw per row, threading
+    /// the xorshift32 RNG across positions, and LAZILY early-exiting on the first
+    /// token that mismatches its drafted successor (`draft[pos+1]`). Replaces the
+    /// per-position `sample_top_p_pf` host loop (one 8-byte D2H + stream sync per
+    /// position) with one launch and one `(n+1)×4`-byte D2H.
+    ///
+    /// `out_buf` must hold at least `n + 1` u32. Returns `(ids, new_rng)` where
+    /// `ids` has length `n` (sampled tokens, `u32::MAX` after the first mismatch —
+    /// the same vector the per-position path produced) and `new_rng` is the
+    /// advanced RNG state to thread into the next window. `top_k = None` maps to
+    /// the legacy nucleus (20), byte-identical to `sample_top_p_pf(.., None, ..)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_accept_lazy_f32(
+        &mut self,
+        logits_batch: &GpuTensor, // [n × vocab] resident target logits
+        draft: &GpuTensor,        // [n] u32 drafted block tokens
+        out_buf: &GpuTensor,      // [n + 1] u32 scratch (ids + new rng)
+        n: usize,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        rng_state: u32,
+    ) -> HipResult<(Vec<u32>, u32)> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dspark_sample_accept_lazy_f32",
+            kernels::DSPARK_SAMPLE_ACCEPT_LAZY_SRC,
+            "dspark_sample_accept_lazy_f32",
+        )?;
+        // None preserves legacy behavior: top_k → 20 (kernel TOP_K, no extra cut).
+        let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
+
+        let mut lp = logits_batch.buf.as_ptr();
+        let mut dp = draft.buf.as_ptr();
+        let mut op = out_buf.buf.as_ptr();
+        let mut nn = n as i32;
+        let mut vs = vocab_size as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut tk = top_k_req;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut rng as *mut _ as *mut c_void,
+            &mut tk as *mut _ as *mut c_void,
+        ];
+
+        // 1 block × 64 threads; LDS = 64 * 64 * 8 = 32 KiB. The single-block
+        // sample_top_p uses 128 threads / 64 KiB, but gfx1151's usable dynamic
+        // LDS is < 64 KiB (its parallel sampler tops out at 40 KiB), so 128 here
+        // aborts with INVALID_ALLOCATION. 64 threads keeps us well under that and
+        // is byte-identical: the top-K gather + tree reduction pick the same
+        // global top-64 regardless of thread count (the RNG draw is thread-0
+        // only). TOP_K stays 64 to honor top_k up to 40.
+        let block_size = 64u32;
+        let shared_mem = block_size * 64 * 4 * 2;
+        self.launch_maybe_blob(
+            "dspark_sample_accept_lazy_f32",
+            [1, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(dp);
+                b.push_ptr(op);
+                b.push_i32(nn);
+                b.push_i32(vs);
+                b.push_f32(temp);
+                b.push_f32(tp);
+                b.push_u32(rng);
+                b.push_i32(tk);
+                b
+            },
+        )?;
+
+        // One D2H: (n+1) u32 — sampled ids [0..n) then the advanced rng at [n].
+        let mut host = vec![0u32; n + 1];
+        let bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, (n + 1) * 4) };
+        self.hip.memcpy_dtoh(bytes, &out_buf.buf)?;
+        let new_rng = host[n];
+        host.truncate(n);
+        Ok((host, new_rng))
+    }
+
     /// Per-row Gumbel-top-k SWOR sampler: draws `k` tokens WITHOUT replacement
     /// from `softmax(logits/temp)` per row of `[batch × vocab]`, returning the
     /// draw-ordered token ids (`top_idx`) and their true log-probs (`top_logp`),
