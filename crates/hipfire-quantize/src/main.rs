@@ -6316,7 +6316,7 @@ fn main() {
     //   fc.weight           → main_proj.weight   (the `[hidden, 5*hidden]` concat)
     //   hidden_norm.weight  → main_norm.weight    (RMSNorm after fc)
     //   all others          → kept as-is
-    if format == "qwen3-dspark-q8" {
+    if format == "qwen3-dspark-q8" || format == "qwen35-dspark-q8" {
         let input_dir = Path::new(input_dir.as_str());
         let output_path = Path::new(output_path.as_str());
 
@@ -6337,49 +6337,98 @@ fn main() {
         // Verify architecture
         let archs = config.get("architectures").and_then(|v| v.as_array());
         let is_dspark = archs
-            .map(|a| a.iter().any(|v| v.as_str() == Some("Qwen3DSparkModel")))
+            .map(|a| {
+                a.iter().any(|v| {
+                    matches!(
+                        v.as_str(),
+                        Some("Qwen3DSparkModel" | "DSparkDraftModel" | "DSparkSpeculator")
+                    )
+                })
+            })
             .unwrap_or(false);
         if !is_dspark {
             eprintln!(
-                "qwen3-dspark-q8: architectures does not contain Qwen3DSparkModel (got {:?})",
+                "dspark-q8: architectures is not a DSpark drafter \
+                 (Qwen3DSparkModel / DSparkDraftModel / DSparkSpeculator); got {:?}",
                 archs
             );
             std::process::exit(1);
         }
 
-        // Read DSpark config fields (from config.json directly)
-        let block_size = config
-            .get("block_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(7) as usize;
+        // Read DSpark config fields. speculators v0.6.0 (DSparkDraftModel) nests
+        // the body dims under `transformer_layer_config` and names the target
+        // taps `aux_hidden_state_layer_ids`; the legacy Qwen3DSparkModel puts
+        // dims / `target_layer_ids` at the top level. Handle both.
+        let tlc = config.get("transformer_layer_config");
+        let cfg_u64 = |k: &str, d: u64| -> u64 {
+            config
+                .get(k)
+                .or_else(|| tlc.and_then(|t| t.get(k)))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(d)
+        };
+        let block_size = config.get("block_size").and_then(|v| v.as_u64()).unwrap_or(7) as usize;
         let target_layer_ids: Vec<u64> = config
             .get("target_layer_ids")
+            .or_else(|| config.get("aux_hidden_state_layer_ids"))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config
-            .get("markov_rank")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(256) as usize;
-        let noise_token_id = config
-            .get("mask_token_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(151669) as u32;
+        let markov_rank = config.get("markov_rank").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+        let noise_token_id =
+            config.get("mask_token_id").and_then(|v| v.as_u64()).unwrap_or(151669) as u32;
+        let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
+        let confidence_with_markov = config
+            .get("confidence_head_with_markov")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let hidden_size = cfg_u64("hidden_size", 2048);
+        let head_dim = cfg_u64("head_dim", 128);
+        let num_hidden_layers = cfg_u64("num_hidden_layers", 0);
+        let num_attention_heads = cfg_u64("num_attention_heads", 0);
+        let num_key_value_heads = cfg_u64("num_key_value_heads", 0);
+        let intermediate_size = cfg_u64("intermediate_size", 0);
+        let vocab_size = cfg_u64("vocab_size", 0);
+        // rope params nest under transformer_layer_config.rope_parameters in v0.6.0.
+        let rope = tlc
+            .and_then(|t| t.get("rope_parameters"))
+            .or_else(|| config.get("rope_parameters"));
+        let partial_rotary_factor = rope
+            .and_then(|r| r.get("partial_rotary_factor"))
+            .or_else(|| config.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        let rope_theta = rope
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10000000.0);
 
         eprintln!(
             "qwen3-dspark-q8: block_size={block_size} target_layer_ids={target_layer_ids:?} \
              markov_rank={markov_rank} noise_token_id={noise_token_id}"
         );
 
-        // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads
+        // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
         let metadata = serde_json::json!({
             "architecture": "qwen3",
             "config": {
                 "dspark_block_size": block_size,
                 "dspark_target_layer_ids": target_layer_ids,
+                "dspark_num_targets": target_layer_ids.len(),
                 "dspark_markov_rank": markov_rank,
                 "dspark_noise_token_id": noise_token_id,
                 "dspark_enable_confidence": true,
+                "dspark_confidence_with_markov": confidence_with_markov,
+                "dspark_draft_vocab_size": draft_vocab_size,
+                "dspark_hidden_size": hidden_size,
+                "dspark_head_dim": head_dim,
+                "dspark_num_hidden_layers": num_hidden_layers,
+                "dspark_num_attention_heads": num_attention_heads,
+                "dspark_num_key_value_heads": num_key_value_heads,
+                "dspark_intermediate_size": intermediate_size,
+                "dspark_vocab_size": vocab_size,
+                "dspark_partial_rotary_factor": partial_rotary_factor,
+                "dspark_rope_theta": rope_theta,
             },
         });
         let metadata_json = serde_json::to_string(&metadata).unwrap();
@@ -6446,6 +6495,38 @@ fn main() {
             };
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+
+            // Reduced-vocab maps: `d2t` (draft→target token id, I64) and `t2d`
+            // (target→draft membership, BOOL). Store as F32 — token indices are
+            // < 2^24 so exact; the DSpark loader casts d2t→u32, t2d→bool. The
+            // float `to_f32` path can't read I64/BOOL.
+            if *name == "d2t" || *name == "t2d" {
+                let f32_data: Vec<f32> = if meta.dtype == "I64" {
+                    raw_data
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect()
+                } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
+                    raw_data.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect()
+                } else {
+                    to_f32(raw_data, &meta.dtype)
+                };
+                let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elems) [reduced-vocab map]",
+                    "F32", sidecar_name, meta.shape, n_elements
+                );
+                f16_params += n_elements as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F32,
+                    shape,
+                    group_size: 0,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+                continue;
+            }
 
             if is_dspark_matmul_weight(name) && n_elements >= 32 {
                 // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
