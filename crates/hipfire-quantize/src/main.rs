@@ -7675,6 +7675,12 @@ fn main() {
     let mut bake_rename: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
+    // Task A0: original gate_proj name → fused `experts.{N}.gate_up_proj.weight`,
+    // for ORNITH-class Qwen3.5-MoE checkpoints that ship experts un-stacked.
+    // Applied as an UNCONDITIONAL post-loop rename pass (see below).
+    let mut expert_fuse_rename: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
     // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
@@ -7830,6 +7836,10 @@ fn main() {
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
         std::collections::HashMap::new();
     let mut mm_awq_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Task A0: name → shard index, so the pre-split expert fusion can fetch a
+    // gate_proj's up_proj sibling (which may live in a different shard).
+    let name_to_file: std::collections::HashMap<&str, usize> =
+        all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(ref p) = include_prefix {
@@ -7866,7 +7876,7 @@ fn main() {
         }
 
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
-        let n_elements: usize = meta.shape.iter().product();
+        let mut n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
 
         // ── SP4b: bake prune hook ──────────────────────────────────────────────
@@ -8015,6 +8025,68 @@ fn main() {
                     maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
                 }
                 continue;
+            }
+        }
+
+        // ── Task A0: Qwen3.5-MoE pre-split routed-expert fusion (arch_id 6) ──
+        // Canonical Qwen3.5-MoE ships routed experts stacked-3D as
+        // `mlp.experts.gate_up_proj` (the paths below split it per-expert).
+        // ORNITH-class finetunes instead ship them UN-stacked as separate 2D
+        // `mlp.experts.{N}.{gate,up,down}_proj.weight` (DeepSeek-V4 layout). The
+        // qwen35 loader only knows the fused per-expert
+        // `mlp.experts.{N}.gate_up_proj.weight` ([2*inter, hidden], gate||up), so
+        // fuse gate+up here and rename the output post-loop; the normal quant
+        // path below encodes the [2*inter, hidden] tensor (k-map still selects
+        // the level by the gate_proj name). `down_proj` already matches the
+        // loader name and takes the normal path unchanged; `shared_expert` (kept
+        // un-fused by the loader) is excluded by the `.mlp.experts.` guard.
+        let _fused_meta: TensorMeta;
+        let _fused_bytes: Vec<u8>;
+        if is_moe && meta.shape.len() == 2 && name.contains(".mlp.experts.") {
+            if name.ends_with(".up_proj.weight") {
+                // Consumed by its gate_proj sibling (fused below).
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".gate_proj.weight") {
+                let up_name = format!("{stem}.up_proj.weight");
+                let up_fi = match name_to_file.get(up_name.as_str()) {
+                    Some(fi) => *fi,
+                    None => {
+                        eprintln!("qwen35 expert fusion: missing sibling {up_name} for {name}");
+                        std::process::exit(2);
+                    }
+                };
+                let (up_meta, up_raw) = st_files[up_fi].tensor_data(&up_name).unwrap();
+                if up_meta.shape != meta.shape || up_meta.dtype != meta.dtype {
+                    eprintln!(
+                        "qwen35 expert fusion: gate {:?}/{} vs up {:?}/{} mismatch at {name}",
+                        meta.shape, meta.dtype, up_meta.shape, up_meta.dtype
+                    );
+                    std::process::exit(2);
+                }
+                // gate rows first, then up rows → [2*inter, hidden]. Same source
+                // dtype ⇒ a raw byte concat is lossless. Order is load-bearing:
+                // loader stores gate_up = gate||up; forward is silu(gate)*up.
+                let mut fused = Vec::with_capacity(raw_data.len() + up_raw.len());
+                fused.extend_from_slice(raw_data);
+                fused.extend_from_slice(up_raw);
+                _fused_bytes = fused;
+                _fused_meta = TensorMeta {
+                    dtype: meta.dtype.clone(),
+                    shape: vec![meta.shape[0] * 2, meta.shape[1]],
+                    data_offsets: meta.data_offsets,
+                };
+                n_elements *= 2; // fused tensor carries gate + up params
+                meta = &_fused_meta;
+                raw_data = &_fused_bytes;
+                expert_fuse_rename
+                    .insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
+                st_files[up_fi].drop_tensor_pages(&up_name);
+                eprintln!(
+                    "  {:>8}: {name} + up_proj → {stem}.gate_up_proj.weight {:?}",
+                    "FUSE", _fused_meta.shape
+                );
             }
         }
 
@@ -10951,6 +11023,25 @@ fn main() {
     // load-time keep-map). Spill preserves `.name`, so rename order vs. spill is
     // irrelevant. (Qwen3.5 stacked experts + all routers/biases were already
     // pruned/gathered in-loop.)
+    // Task A0: apply Qwen3.5-MoE pre-split expert fusion renames. Unconditional
+    // (unlike the bake rename below, which is gated on `bake_keep_active`):
+    // rewrite each fused gate_proj output tensor to the loader's
+    // `experts.{N}.gate_up_proj.weight`. The in-loop quant path kept the original
+    // gate_proj name so k-map/encoding used it. Spill preserves `.name`, so this
+    // works regardless of spill order. No-op (byte-identical) for every model
+    // that isn't a pre-split Qwen3.5-MoE.
+    if !expert_fuse_rename.is_empty() {
+        for t in hfq_tensors.iter_mut() {
+            if let Some(new_name) = expert_fuse_rename.get(&t.name) {
+                t.name = new_name.clone();
+            }
+        }
+        eprintln!(
+            "qwen35 expert fusion: renamed {} fused gate_up_proj tensors",
+            expert_fuse_rename.len()
+        );
+    }
+
     if bake_keep_active {
         let plan = reap_bake_plan.as_ref().unwrap();
         if !bake_rename.is_empty() {
