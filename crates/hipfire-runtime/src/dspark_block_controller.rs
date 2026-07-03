@@ -14,12 +14,11 @@
 //!   • Qwen3 (cheap dense verify): survival stays deep and Δt is tiny → argmax
 //!     climbs toward the drafter's true acceptance depth (≈7).
 //!
-//! Cap-trap exploration: accept_len is capped at the current draft block, so S(k)
-//! is unobservable for k > block. When the argmax pins at `max_tried` (the optimum
-//! wants to go deeper than we've ever drafted) we probe one block deeper and HOLD
-//! it for PROBE_HOLD windows to collect survival samples at the new depth, then let
-//! the argmax keep or revert it. This climbs 2→7 on qwen3 but stops at 2 on DS4
-//! (where a probe to 3 reveals S(3)≈0 and the argmax immediately reverts).
+//! Ramp phase (breaks the calibration deadlock): after WARMUP, each request runs a
+//! linear sweep from min_block to max_block (RAMP_HOLD windows per step). The sweep
+//! records verify timing at ≥2 distinct n_verify so the cost curve can be calibrated,
+//! and populates the survival histogram at every depth so the argmax has real signal.
+//! After the ramp the argmax takes over for the remainder of the request.
 
 /// Cost-model draft-block controller for the DSpark drafter.
 pub(crate) struct BlockController {
@@ -27,21 +26,18 @@ pub(crate) struct BlockController {
     default_block: usize,
     min_block: usize,
     max_block: usize,
-    /// Deepest block ever drafted; upper bound of the argmax search. Grows only
-    /// via cap-trap probes, never shrinks — S(k) above it is unobservable.
+    /// Deepest block ever drafted; upper bound of the argmax search. Grows during
+    /// the ramp phase to max_block, then stays fixed — S(k) above it is unobservable
+    /// (but after the ramp all depths have been tried).
     max_tried: usize,
     /// EMA of the accept_len distribution: hist[i] ≈ P(accept_len == i), i ∈ 0..=8.
     hist: [f32; 9],
     windows_seen: u32,
-    /// Post-warmup, post-hold windows since the last probe; reset to 0 on each probe.
-    explore_timer: u32,
-    /// Remaining windows in the current probe hold; 0 = not holding.
-    probe_hold: u32,
     // ── live verify-cost calibration (hardware cost; stable across requests) ──
     /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
     timing_samples: u32,
-    /// Per-n EMA of verify wall-time in ms (indexed by n_verify, slots 2..8).
-    t_verify_by_n: [f32; 8],
+    /// Per-n EMA of verify wall-time in ms (indexed by n_verify, slots 2..9).
+    t_verify_by_n: [f32; 10],
     /// True once the verify curve has been fit; preserved across reset().
     calibrated: bool,
     /// Marginal per-position verify cost (ms) = slope of the verify curve.
@@ -60,11 +56,9 @@ const HIST_ALPHA: f32 = 0.05;
 const WARMUP_WINDOWS: u32 = 6;
 /// Minimum timing samples before attempting verify-curve calibration.
 const TIMING_WARMUP: u32 = 16;
-/// Post-warmup, post-hold windows between cap-trap probe-up attempts.
-const EXPLORE_INTERVAL: u32 = 40;
-/// Windows to hold a probed (deeper) block so the histogram can collect survival
-/// samples at the new depth before the argmax keeps or reverts it.
-const PROBE_HOLD: u32 = 15;
+/// Windows each ramp block is held so the histogram can collect survival samples
+/// at that depth; after ramp_end the argmax takes over.
+const RAMP_HOLD: u32 = 2;
 
 impl BlockController {
     pub(crate) fn new(
@@ -74,22 +68,16 @@ impl BlockController {
         p_star: f32,
     ) -> Self {
         let default_block = default_block.clamp(min_block, max_block);
-        let mut hist = [0.0f32; 9];
-        // Seed the histogram at the default depth so the first argmax (once cost is
-        // ready) picks ≈default_block.
-        hist[default_block.min(8)] = 1.0;
         Self {
             block: default_block,
             default_block,
             min_block,
             max_block,
             max_tried: default_block,
-            hist,
+            hist: [0.0f32; 9],
             windows_seen: 0,
-            explore_timer: 0,
-            probe_hold: 0,
             timing_samples: 0,
-            t_verify_by_n: [0.0f32; 8],
+            t_verify_by_n: [0.0f32; 10],
             calibrated: false,
             // Dormant cost prior: only the dt/t_ar RATIO drives the argmax, and it
             // stays disabled (cost_ready=false) until live verify timing refines
@@ -112,10 +100,7 @@ impl BlockController {
         self.block = self.default_block;
         self.max_tried = self.default_block;
         self.windows_seen = 0;
-        self.explore_timer = 0;
-        self.probe_hold = 0;
         self.hist = [0.0f32; 9];
-        self.hist[self.default_block.min(8)] = 1.0;
     }
 
     /// Observe verify timing. Accumulates per-n EMAs and fits the line
@@ -123,7 +108,7 @@ impl BlockController {
     /// collected across ≥2 distinct n. On a sane fit (ratio Δt/t_ar in [0.05,0.5])
     /// stores Δt and t_ar and flips `cost_ready`. Preserved across reset().
     pub(crate) fn observe_timing(&mut self, t_verify_ms: f32, n_verify: usize) {
-        if (2..8).contains(&n_verify) && t_verify_ms > 0.0 {
+        if (2..10).contains(&n_verify) && t_verify_ms > 0.0 {
             let slot = &mut self.t_verify_by_n[n_verify];
             *slot = if *slot == 0.0 {
                 t_verify_ms
@@ -135,8 +120,8 @@ impl BlockController {
         if self.calibrated || self.timing_samples < TIMING_WARMUP {
             return;
         }
-        let lo = (2..8).find(|&n| self.t_verify_by_n[n] > 0.0);
-        let hi = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
+        let lo = (2..10).find(|&n| self.t_verify_by_n[n] > 0.0);
+        let hi = (2..10).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
         if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
             // If the controller never visits ≥2 distinct n_verify (block pinned),
             // n_hi > n_lo never holds and cost_ready stays false — the block then
@@ -163,39 +148,34 @@ impl BlockController {
     }
 
     /// Observe one spec window's acceptance depth and re-decide the block via the
-    /// cost-model argmax (+ cap-trap probing). `_n_proposed` is unused; the block is
-    /// chosen from the survival histogram and the calibrated verify cost.
+    /// cost-model argmax. During the ramp phase (post-warmup, pre-ramp_end) the block
+    /// sweeps min→max to seed the verify-curve calibration and survival histogram.
+    /// After ramp_end the argmax drives the block for the remainder of the request.
     pub(crate) fn observe(&mut self, accept_len: usize, _n_proposed: usize) {
         let a = accept_len.min(8);
-        for slot in self.hist.iter_mut() {
-            *slot *= 1.0 - HIST_ALPHA; // decay all buckets
+        for k in 0..9 {
+            self.hist[k] *= 1.0 - HIST_ALPHA;
         }
-        self.hist[a] += HIST_ALPHA; // bump the observed depth
+        self.hist[a] += HIST_ALPHA;
         self.windows_seen += 1;
-        if self.windows_seen < WARMUP_WINDOWS || !self.cost_ready {
+        if self.windows_seen < WARMUP_WINDOWS {
             return;
         }
-        // Hold a freshly probed (deeper) block so the histogram can measure survival
-        // at that depth before the argmax judges it.
-        if self.probe_hold > 0 {
-            self.probe_hold -= 1;
+        let ramp_end = WARMUP_WINDOWS + 2 * self.max_block as u32;
+        if self.windows_seen < ramp_end {
+            // Sweep block min→max to seed calibration (≥2 distinct n_verify) AND survival
+            // at every depth. Without this the block never varies and calibration deadlocks.
+            let step = (self.windows_seen - WARMUP_WINDOWS) / RAMP_HOLD;
+            self.block = (self.min_block + step as usize).min(self.max_block);
+            self.max_tried = self.block.max(self.max_tried);
             return;
         }
-        let n_star = self.argmax_block();
-        self.explore_timer += 1;
-        // Cap-trap probe: the argmax wants the deepest depth we've drafted, but S(k)
-        // beyond it is unobservable. Draft one deeper and hold to reveal it.
-        if n_star == self.max_tried
-            && self.max_tried < self.max_block
-            && self.explore_timer >= EXPLORE_INTERVAL
-        {
-            self.max_tried += 1;
-            self.block = self.max_tried;
-            self.explore_timer = 0;
-            self.probe_hold = PROBE_HOLD;
-            return;
+        // Settle at the cost-model optimum (calibration completed during the ramp).
+        if self.cost_ready {
+            self.block = self.argmax_block();
+        } else {
+            self.block = self.default_block; // fallback if calibration never completed
         }
-        self.block = n_star;
     }
 
     /// argmax over N ∈ [1, max_tried] of τ(N)/(t_ar + (N-1)·Δt), clamped to
@@ -240,27 +220,28 @@ mod tests {
     use super::*;
 
     // DS4-like: expensive verify (dt large) + survival that SATURATES at 2
-    // (accept_len ∈ {0,1,2}). τ stops growing past 2, so the argmax settles low and
-    // a probe to 3 (S(3)=0) is immediately reverted.
+    // (accept_len ∈ {0,1,2}). τ stops growing past 2, so the argmax settles low.
+    // Run well past ramp_end (ramp sweeps min→max in 2*max_block=14 post-warmup
+    // windows; we run 200 total so the argmax has long settled).
     #[test]
     fn settles_low_when_survival_saturates_and_verify_expensive() {
         let mut c = BlockController::new(2, 1, 7, 0.0);
         c.set_cost_for_test(15.0, 85.0); // DS4-like
-        for i in 0..600 {
+        for i in 0..200 {
             c.observe([0, 1, 2, 2][i % 4], 5); // depth ~1.5, never > 2
         }
         assert!((1..=2).contains(&c.block()), "got {}", c.block());
     }
 
     // qwen3-like: cheap verify (dt small) + a drafter that accepts the whole drafted
-    // block (survival deep, cap always hit). The cost model rewards over-drafting and
-    // cap-trap exploration must climb the block upward.
+    // block (survival deep, cap always hit). The ramp seeds survival at all depths;
+    // after ramp_end the cost model rewards over-drafting and settles high.
     #[test]
     fn climbs_high_when_survival_deep_and_verify_cheap() {
         let mut c = BlockController::new(2, 1, 7, 0.0);
         c.set_cost_for_test(4.0, 33.0); // qwen3-like
-                                        // Always accept the whole drafted block, so the cap is always hit -> climb.
-        for _ in 0..2000 {
+                                        // Always accept the whole drafted block, so all depths are rewarded.
+        for _ in 0..200 {
             let b = c.block();
             c.observe(b.min(7), b);
         }
@@ -272,24 +253,25 @@ mod tests {
     }
 
     // Cost sensitivity: SAME (deep) survival, cheap vs expensive verify -> the
-    // cheaper verify justifies a larger block. Expensive verify reverts the first
-    // probe (half-populated deeper bucket doesn't pay for its cost).
+    // cheaper verify justifies a larger block.
     #[test]
     fn cheaper_verify_picks_larger_block() {
         let mk = |dt: f32| {
             let mut c = BlockController::new(2, 1, 7, 0.0);
             c.set_cost_for_test(dt, 50.0);
-            for _ in 0..2000 {
+            for _ in 0..200 {
                 let b = c.block();
                 c.observe(b.min(7), b);
             }
             c.block()
         };
+        let cheap = mk(2.0);
+        let expensive = mk(20.0);
         assert!(
-            mk(2.0) > mk(20.0),
+            cheap > expensive,
             "cheap {} should exceed expensive {}",
-            mk(2.0),
-            mk(20.0)
+            cheap,
+            expensive
         );
     }
 
