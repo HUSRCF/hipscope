@@ -1066,6 +1066,14 @@ impl MtpDrafter for DsparkDrafter {
             .as_ref()
             .map(|c| c.block())
             .unwrap_or(k);
+        // block==0 is the controller's spec→AR fallback: it decided speculation is
+        // not repaying its drafter overhead this window (e.g. qwen3 prose, where the
+        // drafter is accepted but too rarely to beat plain AR). Do one plain target
+        // forward instead of drafting. The fixed/opt-out path (unwrap_or k) never
+        // yields 0, so this only fires under the adaptive controller.
+        if effective_k == 0 {
+            return self.ar_step(gpu, target, position, seed, eos);
+        }
         let block = self.weights.cfg.block_size.min(effective_k).max(1);
         let vocab = self.lm_head.shape[0];
         let hidden = {
@@ -1345,6 +1353,96 @@ impl MtpDrafter for DsparkDrafter {
     }
 }
 
+impl DsparkDrafter {
+    /// Spec→AR fallback window: one plain target forward on `seed` (NO draft), commit
+    /// one token. The block controller selects this (block()==0) when the cost model
+    /// finds AR throughput beats the best draft block — i.e. the drafter's forward
+    /// overhead isn't repaid by its acceptance (e.g. qwen3 prose at temp>0, where the
+    /// drafter IS accepted but too rarely to beat plain AR). `verify_block(&[seed])`
+    /// consumes the seed (state→position+1) and returns the argmax after it (the AR
+    /// token); `commit_prefix(accept_len=0)` is the full-accept no-op case but is
+    /// called to honour the verify/commit contract. We then clear the DSpark multi-slot
+    /// context (same invalidation as mtp_step's captured=false branch) so a subsequent
+    /// spec window re-bootstraps KV-correctly and no stale hidden bleeds across the step.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        eos: u32,
+    ) -> Result<MtpWindow, String> {
+        let verify_tokens = [seed];
+        let mut scratch = target.new_spec_scratch(gpu, 1)?;
+        // Time the full AR window (a single target forward). verify_block returns a Vec
+        // (D2H), forcing GPU completion, so elapsed() is real wall time. This records at
+        // t_window_by_n[1] (n_verify=1) — the AR cost the controller compares against the
+        // spec blocks; it is genuinely cheaper (no drafter/heads forward).
+        let _t_win = self
+            .block_controller
+            .is_some()
+            .then(std::time::Instant::now);
+        let picks = if self.temp <= 1e-6 {
+            // Greedy: lean non-capture verify (we discard hidden anyway).
+            target.verify_block(gpu, &verify_tokens, position, scratch.as_mut(), None)?
+        } else {
+            // temp>0: only the capture variant implements sampled verify, so run it
+            // with a throwaway 1-slot capture buffer (the captured hidden is unused —
+            // an AR step carries no accepted-prefix context forward).
+            let n_targets = self.weights.cfg.target_layer_ids.len();
+            let hidden = self.stage_norm.shape[0];
+            let capture_buf = gpu
+                .alloc_tensor(&[n_targets * hidden], DType::F32)
+                .map_err(|e| format!("DsparkDrafter::ar_step: alloc capture_buf: {e:?}"))?;
+            let (target_pick, _captured) = target.verify_block_sampled_capture_gpu(
+                gpu,
+                &verify_tokens,
+                position,
+                scratch.as_mut(),
+                self.temp,
+                self.top_p,
+                self.top_k,
+                &mut self.rng_state,
+                &capture_buf,
+            )?;
+            let _ = gpu.free_tensor(capture_buf);
+            target_pick
+        };
+        let t_window_ms = _t_win.map(|t| t.elapsed().as_secs_f32() * 1000.0);
+        let ar_token = *picks.first().ok_or("DsparkDrafter::ar_step: empty picks")?;
+        target.commit_prefix(gpu, &verify_tokens, 0, position, scratch.as_mut())?;
+        scratch.free(gpu);
+
+        // Invalidate the DSpark steady-state context: an AR step drafted nothing, so
+        // there is no accepted-prefix hidden to carry — the next spec window must
+        // re-bootstrap from the committed KV (identical to the captured=false path).
+        if let Some(old) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(old);
+        }
+        self.ctx_positions.clear();
+
+        if let Some(c) = self.block_controller.as_mut() {
+            if let Some(tw) = t_window_ms {
+                c.observe_timing(tw, 1); // n_verify=1: the AR-window cost
+            }
+            c.observe(0, 0); // accept_len=0, n_proposed=0 (no draft this window)
+            if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
+                eprintln!("[dspark-block] block=0(AR) accept=0/0");
+            }
+        }
+        self.profiler.end_window();
+
+        // Emit the single AR token (may be EOS; the caller's decode loop terminates on
+        // it exactly as it does for a spec window's bonus token).
+        let _ = eos;
+        Ok(MtpWindow {
+            committed: vec![ar_token],
+            accepted: 0,
+            drafts_generated: 0,
+        })
+    }
+}
+
 /// Build the generic DSpark speculator wrapping any [`DsparkBody`]. The
 /// `stage_norm` is the per-stage final RMSNorm weight (deepseek4:
 /// `mtp_final_norm`; qwen3: drafter `norm`); `lm_head` is `[vocab, hidden]`.
@@ -1368,11 +1466,12 @@ pub fn build_dspark_speculator(
         .as_deref()
         != Some("0");
     let block_controller = adaptive.then(|| {
-        // Start at a MID block so the hill-climb can grow (high-accept content) or
-        // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
-        // p*=0.18 prior (a later task measures it live).
+        // Start at a MID block so the cost model can grow (high-accept content) or
+        // shrink (low-accept content) from a neutral point. min=0 (block 0 = the
+        // spec→AR fallback: pure target forward when the drafter isn't repaid),
+        // max=cfg.block_size. p*=0.18 prior (refined live by the window-cost fit).
         let start_block = 2.min(block).max(1);
-        crate::dspark_block_controller::BlockController::new(start_block, 1, block, 0.18)
+        crate::dspark_block_controller::BlockController::new(start_block, 0, block, 0.18)
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
