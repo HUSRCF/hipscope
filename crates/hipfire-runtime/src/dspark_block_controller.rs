@@ -22,14 +22,21 @@ pub(crate) struct BlockController {
     t_verify_by_n: [f32; 8],
     /// True once p* has been measured from live timing; preserved across reset().
     calibrated: bool,
+    /// Windows remaining before another block move is allowed (temporal debounce).
+    cooldown: u32,
 }
 
 // Small alpha: the full-accept signal is binary {0,1}, so one window bumps the
-// EMA by alpha. Keep it well below the hysteresis band (0.06) so a single impulse
+// EMA by alpha. Keep it well below the hysteresis band so a single impulse
 // can't cross it — a STABLE acceptance rate near p* must hold; only a sustained
-// shift should move the block. Provisional; tuned empirically in a later GPU task.
-const EMA_ALPHA: f32 = 0.05;
-const HYSTERESIS: f32 = 0.06;
+// shift should move the block.
+const EMA_ALPHA: f32 = 0.03;
+const HYSTERESIS: f32 = 0.07;
+/// After any block move, suppress further moves for this many windows.
+/// Prevents the continuous hill-climb from oscillating (e.g. 3→1→2→3→4→5→1)
+/// when the signal is near p* ± H — the EMA needs time to re-settle before
+/// the next decision is valid.
+const COOLDOWN_WINDOWS: u32 = 12;
 /// Skip the first few windows so the block doesn't react to early bootstrap
 /// noise. The EMA is seeded at `p*` (neutral), so a handful of real observations
 /// is enough to establish a trend — this is a short guard, not the full EMA
@@ -57,6 +64,7 @@ impl BlockController {
             timing_samples: 0,
             t_verify_by_n: [0.0f32; 8],
             calibrated: false,
+            cooldown: 0,
         }
     }
 
@@ -75,6 +83,7 @@ impl BlockController {
         self.block = self.default_block;
         self.full_accept_ema = self.p_star;
         self.windows_seen = 0;
+        self.cooldown = 0;
     }
 
     /// Observe verify timing. Accumulates per-n EMAs and fits a line
@@ -138,10 +147,25 @@ impl BlockController {
         if self.windows_seen < WARMUP_WINDOWS {
             return;
         }
-        if self.full_accept_ema > self.p_star + HYSTERESIS {
-            self.block = (self.block + 1).min(self.max_block);
+        if self.cooldown > 0 {
+            self.cooldown -= 1;
+            return;
+        } // debounce: hold after a move
+        let moved = if self.full_accept_ema > self.p_star + HYSTERESIS {
+            let new = (self.block + 1).min(self.max_block);
+            let m = new != self.block;
+            self.block = new;
+            m
         } else if self.full_accept_ema < self.p_star - HYSTERESIS {
-            self.block = self.block.saturating_sub(1).max(self.min_block);
+            let new = self.block.saturating_sub(1).max(self.min_block);
+            let m = new != self.block;
+            self.block = new;
+            m
+        } else {
+            false
+        };
+        if moved {
+            self.cooldown = COOLDOWN_WINDOWS;
         }
     }
 }
@@ -151,20 +175,24 @@ mod tests {
     use super::*;
 
     // A run of fully-accepted windows must push the block up to max.
+    // With slower alpha (0.03) + 12-window cooldown each move, reaching max from
+    // default=3 takes more windows (need EMA to climb above p*+H = 0.25 after
+    // cooldown, then repeat for each step): ~200 windows is sufficient.
     #[test]
     fn grows_to_max_on_full_accept() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..50 {
+        for _ in 0..200 {
             c.observe(4, 4); // accept_len == n_proposed => full accept
         }
         assert_eq!(c.block(), 5);
     }
 
     // A run of zero-accept windows must push the block down to min.
+    // Same reasoning: ~200 windows to drain EMA below p*-H = 0.11 after cooldown.
     #[test]
     fn shrinks_to_min_on_no_accept() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..50 {
+        for _ in 0..200 {
             c.observe(0, 4); // accepted nothing we drafted
         }
         assert_eq!(c.block(), 1);
