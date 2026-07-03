@@ -1,8 +1,9 @@
 //! Pure (no-GPU) draft-block-size controller for DSpark spec-decode.
-//! Direct target from smoothed mean accept-length: block = ceil(EMA(accept_len)).
-//! This directly measures acceptance depth and matches sweep optima
-//! (code depth 1.75 → block 2; prose depth 0.63 → block 1) without a
-//! hill-climb, hysteresis band, or cooldown.
+//! Direct target from smoothed mean accept-length: block = ceil(EMA(accept_len)),
+//! plus periodic probe-up exploration to escape the block-1 cap-trap: at block=1
+//! accept_len ∈ {0,1} so the EMA can never reveal that a higher block is profitable.
+//! A probe bumps block by +1 every EXPLORE_INTERVAL windows, then holds for PROBE_HOLD
+//! windows so accept_ema has time to measure the new depth before reverting/keeping.
 
 /// Accept-length EMA controller for the DSpark draft block cap.
 pub(crate) struct BlockController {
@@ -13,6 +14,10 @@ pub(crate) struct BlockController {
     /// EMA of accept_len (acceptance depth); direct signal for block sizing.
     accept_ema: f32,
     windows_seen: u32,
+    /// Counts post-warmup, post-hold windows since the last probe. Resets to 0 after each probe.
+    explore_timer: u32,
+    /// Remaining windows in the current probe hold; 0 = not holding.
+    probe_hold: u32,
     // ── live p* calibration (hardware cost ratio; stable across requests) ──
     /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
     timing_samples: u32,
@@ -34,6 +39,11 @@ const WARMUP_WINDOWS: u32 = 6;
 /// Minimum timing samples before attempting verify-curve calibration.
 /// Gives the GPU time to warm up and collects samples at ≥2 distinct n values.
 const TIMING_WARMUP: u32 = 16;
+/// How many post-warmup, post-hold windows between probe-up attempts.
+const EXPLORE_INTERVAL: u32 = 50;
+/// How many windows to hold the probed (higher) block so accept_ema can
+/// measure acceptance depth there before the settle branch reverts or keeps it.
+const PROBE_HOLD: u32 = 12;
 
 impl BlockController {
     pub(crate) fn new(
@@ -51,6 +61,8 @@ impl BlockController {
             // Seed so ceil(accept_ema) == default_block: e.g. default=3 → seed 2.5 → ceil 3.
             accept_ema: default_block as f32 - 0.5,
             windows_seen: 0,
+            explore_timer: 0,
+            probe_hold: 0,
             timing_samples: 0,
             t_verify_by_n: [0.0f32; 8],
             calibrated: false,
@@ -73,6 +85,8 @@ impl BlockController {
         self.block = self.default_block;
         self.accept_ema = self.default_block as f32 - 0.5;
         self.windows_seen = 0;
+        self.explore_timer = 0;
+        self.probe_hold = 0;
     }
 
     /// Observe verify timing. Accumulates per-n EMAs and fits a line
@@ -131,9 +145,24 @@ impl BlockController {
         if self.windows_seen < WARMUP_WINDOWS {
             return;
         }
-        // Draft ~one deeper than the observed acceptance depth. ceil(mean) lands at the
-        // sweep optima (code depth 1.75 -> block 2; prose depth 0.63 -> block 1) and is a
-        // DIRECT target: no hill-climb, so no cascade/flapping/ramp-overshoot.
+        // Hold the probed (higher) block so accept_ema can actually MEASURE acceptance
+        // depth there before ceil(accept_ema) decides to keep or revert it.
+        if self.probe_hold > 0 {
+            self.probe_hold -= 1;
+            return;
+        }
+        // Periodically probe one block deeper to escape the low-block cap-trap: at a small
+        // block accept_len is capped and can't reveal deeper depth. After the hold,
+        // ceil(accept_ema) keeps the probe (code discovers a deeper block is sustainable)
+        // or reverts it (prose falls back to 1).
+        self.explore_timer += 1;
+        if self.explore_timer >= EXPLORE_INTERVAL && self.block < self.max_block {
+            self.block += 1;
+            self.explore_timer = 0;
+            self.probe_hold = PROBE_HOLD;
+            return;
+        }
+        // Settle at the observed acceptance depth.
         self.block = (self.accept_ema.ceil() as usize).clamp(self.min_block, self.max_block);
     }
 }
@@ -142,27 +171,27 @@ impl BlockController {
 mod tests {
     use super::*;
 
-    // Deep acceptance (mean ~4) drives block to 4.
+    // Deep acceptance (mean ~4) drives block to ≥4; allow periodic +1 probe.
     #[test]
     fn tracks_high_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
         for _ in 0..50 {
             c.observe(4, 5); // mean depth 4 -> ceil = 4
         }
-        assert_eq!(c.block(), 4);
+        assert!(c.block() >= 4, "expected block ≥ 4, got {}", c.block());
     }
 
-    // Zero acceptance (mean → 0) clamps block to min=1.
+    // Zero acceptance (mean → 0) clamps block to 1; allow periodic +1 probe (≤2).
     #[test]
     fn tracks_low_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..50 {
+        for _ in 0..100 {
             c.observe(0, 5); // depth 0 -> ceil(0)=0 -> clamp 1
         }
-        assert_eq!(c.block(), 1);
+        assert!(c.block() <= 2, "expected block ≤ 2, got {}", c.block());
     }
 
-    // Mean depth ~1.75 (the measured code case) drives block to 2.
+    // Mean depth ~1.75 (the measured code case) settles in region 2..=3.
     #[test]
     fn tracks_mid_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
@@ -170,7 +199,11 @@ mod tests {
         for i in 0..200 {
             c.observe(if i % 4 == 0 { 4 } else { 1 }, 5);
         }
-        assert_eq!(c.block(), 2);
+        assert!(
+            (2..=3).contains(&c.block()),
+            "expected block in 2..=3, got {}",
+            c.block()
+        );
     }
 
     // reset() restores the default block and clears history.
@@ -241,6 +274,23 @@ mod tests {
             (c.p_star_for_test() - 0.18).abs() < 1e-6,
             "should keep prior on tiny-ratio fit, got {}",
             c.p_star_for_test()
+        );
+    }
+
+    // Exploration escapes the block-1 cap-trap: always accepting exactly what's drafted
+    // keeps EMA capped at 1, but periodic probes let accept_ema discover higher depth.
+    #[test]
+    fn exploration_escapes_cap_trap() {
+        let mut c = BlockController::new(1, 1, 5, 0.18); // start pinned at min
+                                                         // Always accept exactly what's drafted (capped) — true depth is really deep.
+        for _ in 0..400 {
+            let b = c.block();
+            c.observe(b, b);
+        }
+        assert!(
+            c.block() >= 3,
+            "exploration should climb out of the block-1 trap, got {}",
+            c.block()
         );
     }
 
