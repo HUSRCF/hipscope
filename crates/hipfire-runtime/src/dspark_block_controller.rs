@@ -1,19 +1,17 @@
 //! Pure (no-GPU) draft-block-size controller for DSpark spec-decode.
-//! Marginal-accept hill-climb: grow the block while the whole drafted block keeps
-//! being accepted (headroom), shrink when it doesn't (over-drafting). The decision
-//! threshold `p*` is the break-even full-accept rate; it is a live-measured,
-//! thermal-invariant cost ratio fitted from the verify-curve slope, seeded with a prior.
+//! Direct target from smoothed mean accept-length: block = ceil(EMA(accept_len)).
+//! This directly measures acceptance depth and matches sweep optima
+//! (code depth 1.75 → block 2; prose depth 0.63 → block 1) without a
+//! hill-climb, hysteresis band, or cooldown.
 
-/// Marginal-accept hill-climb over the DSpark draft block cap.
+/// Accept-length EMA controller for the DSpark draft block cap.
 pub(crate) struct BlockController {
     block: usize,
     default_block: usize,
     min_block: usize,
     max_block: usize,
-    /// EMA of the per-window full-accept indicator (accept_len == n_proposed).
-    full_accept_ema: f32,
-    /// Break-even full-accept rate; grow above p*+H, shrink below p*-H.
-    p_star: f32,
+    /// EMA of accept_len (acceptance depth); direct signal for block sizing.
+    accept_ema: f32,
     windows_seen: u32,
     // ── live p* calibration (hardware cost ratio; stable across requests) ──
     /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
@@ -22,25 +20,16 @@ pub(crate) struct BlockController {
     t_verify_by_n: [f32; 8],
     /// True once p* has been measured from live timing; preserved across reset().
     calibrated: bool,
-    /// Windows remaining before another block move is allowed (temporal debounce).
-    cooldown: u32,
+    /// Cost-ratio break-even; reserved: cost-ratio margin, see accept-length redesign.
+    #[allow(dead_code)]
+    p_star: f32,
 }
 
-// Small alpha: the full-accept signal is binary {0,1}, so one window bumps the
-// EMA by alpha. Keep it well below the hysteresis band so a single impulse
-// can't cross it — a STABLE acceptance rate near p* must hold; only a sustained
-// shift should move the block.
-const EMA_ALPHA: f32 = 0.03;
-const HYSTERESIS: f32 = 0.07;
-/// After any block move, suppress further moves for this many windows.
-/// Prevents the continuous hill-climb from oscillating (e.g. 3→1→2→3→4→5→1)
-/// when the signal is near p* ± H — the EMA needs time to re-settle before
-/// the next decision is valid.
-const COOLDOWN_WINDOWS: u32 = 12;
+// accept_len is a real-valued depth signal (not binary), so alpha can be
+// moderately fast — one window moves the EMA by ~10% toward the new sample.
+const ACCEPT_ALPHA: f32 = 0.1;
 /// Skip the first few windows so the block doesn't react to early bootstrap
-/// noise. The EMA is seeded at `p*` (neutral), so a handful of real observations
-/// is enough to establish a trend — this is a short guard, not the full EMA
-/// settling time.
+/// noise before the EMA has seen enough real samples.
 const WARMUP_WINDOWS: u32 = 6;
 /// Minimum timing samples before attempting verify-curve calibration.
 /// Gives the GPU time to warm up and collects samples at ≥2 distinct n values.
@@ -53,18 +42,19 @@ impl BlockController {
         max_block: usize,
         p_star: f32,
     ) -> Self {
+        let default_block = default_block.clamp(min_block, max_block);
         Self {
-            block: default_block.clamp(min_block, max_block),
-            default_block: default_block.clamp(min_block, max_block),
+            block: default_block,
+            default_block,
             min_block,
             max_block,
-            full_accept_ema: p_star, // neutral start: no initial bias to grow/shrink
-            p_star,
+            // Seed so ceil(accept_ema) == default_block: e.g. default=3 → seed 2.5 → ceil 3.
+            accept_ema: default_block as f32 - 0.5,
             windows_seen: 0,
             timing_samples: 0,
             t_verify_by_n: [0.0f32; 8],
             calibrated: false,
-            cooldown: 0,
+            p_star,
         }
     }
 
@@ -81,9 +71,8 @@ impl BlockController {
         // t_verify_by_n, calibrated, p_star) are thermal-invariant hardware
         // cost ratios — calibrate once, reuse across requests.
         self.block = self.default_block;
-        self.full_accept_ema = self.p_star;
+        self.accept_ema = self.default_block as f32 - 0.5;
         self.windows_seen = 0;
-        self.cooldown = 0;
     }
 
     /// Observe verify timing. Accumulates per-n EMAs and fits a line
@@ -108,7 +97,7 @@ impl BlockController {
         let lo = (2..8).find(|&n| self.t_verify_by_n[n] > 0.0);
         let hi = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
         if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
-            // Note: if the hill-climb never visits ≥2 distinct n_verify values
+            // Note: if the controller never visits ≥2 distinct n_verify values
             // (e.g. block pinned at a fixed cap), n_hi > n_lo never holds and
             // calibration silently stays on the 0.18 prior for the process
             // lifetime — acceptable, since the prior is a safe gfx1151 default.
@@ -136,37 +125,16 @@ impl BlockController {
         self.p_star
     }
 
-    pub(crate) fn observe(&mut self, accept_len: usize, n_proposed: usize) {
-        let full_accept = if n_proposed > 0 && accept_len >= n_proposed {
-            1.0
-        } else {
-            0.0
-        };
-        self.full_accept_ema = (1.0 - EMA_ALPHA) * self.full_accept_ema + EMA_ALPHA * full_accept;
+    pub(crate) fn observe(&mut self, accept_len: usize, _n_proposed: usize) {
+        self.accept_ema = (1.0 - ACCEPT_ALPHA) * self.accept_ema + ACCEPT_ALPHA * accept_len as f32;
         self.windows_seen += 1;
         if self.windows_seen < WARMUP_WINDOWS {
             return;
         }
-        if self.cooldown > 0 {
-            self.cooldown -= 1;
-            return;
-        } // debounce: hold after a move
-        let moved = if self.full_accept_ema > self.p_star + HYSTERESIS {
-            let new = (self.block + 1).min(self.max_block);
-            let m = new != self.block;
-            self.block = new;
-            m
-        } else if self.full_accept_ema < self.p_star - HYSTERESIS {
-            let new = self.block.saturating_sub(1).max(self.min_block);
-            let m = new != self.block;
-            self.block = new;
-            m
-        } else {
-            false
-        };
-        if moved {
-            self.cooldown = COOLDOWN_WINDOWS;
-        }
+        // Draft ~one deeper than the observed acceptance depth. ceil(mean) lands at the
+        // sweep optima (code depth 1.75 -> block 2; prose depth 0.63 -> block 1) and is a
+        // DIRECT target: no hill-climb, so no cascade/flapping/ramp-overshoot.
+        self.block = (self.accept_ema.ceil() as usize).clamp(self.min_block, self.max_block);
     }
 }
 
@@ -174,50 +142,35 @@ impl BlockController {
 mod tests {
     use super::*;
 
-    // A run of fully-accepted windows must push the block up to max.
-    // With slower alpha (0.03) + 12-window cooldown each move, reaching max from
-    // default=3 takes more windows (need EMA to climb above p*+H = 0.25 after
-    // cooldown, then repeat for each step): ~200 windows is sufficient.
+    // Deep acceptance (mean ~4) drives block to 4.
     #[test]
-    fn grows_to_max_on_full_accept() {
+    fn tracks_high_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..200 {
-            c.observe(4, 4); // accept_len == n_proposed => full accept
+        for _ in 0..50 {
+            c.observe(4, 5); // mean depth 4 -> ceil = 4
         }
-        assert_eq!(c.block(), 5);
+        assert_eq!(c.block(), 4);
     }
 
-    // A run of zero-accept windows must push the block down to min.
-    // Same reasoning: ~200 windows to drain EMA below p*-H = 0.11 after cooldown.
+    // Zero acceptance (mean → 0) clamps block to min=1.
     #[test]
-    fn shrinks_to_min_on_no_accept() {
+    fn tracks_low_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..200 {
-            c.observe(0, 4); // accepted nothing we drafted
+        for _ in 0..50 {
+            c.observe(0, 5); // depth 0 -> ceil(0)=0 -> clamp 1
         }
         assert_eq!(c.block(), 1);
     }
 
-    // At a STATIONARY full-accept rate ≈ p* (evenly spread, not lumpy), the block
-    // must not drift to an extreme. An EMA tracks the *local* rate, so a stationary
-    // near-p* input keeps it inside the hysteresis band. (A lumpy input — long full
-    // runs then long zero runs — legitimately moves the block: that is the
-    // controller working, not a bug.)
+    // Mean depth ~1.75 (the measured code case) drives block to 2.
     #[test]
-    fn holds_near_default_at_stationary_p_star() {
+    fn tracks_mid_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for i in 0..600 {
-            if i % 6 == 0 {
-                c.observe(4, 4); // rate 1/6 ≈ 0.167 ≈ p*
-            } else {
-                c.observe(2, 4);
-            }
+        // 25% chance of 4, 75% chance of 1: mean = 0.25*4 + 0.75*1 = 1.75
+        for i in 0..200 {
+            c.observe(if i % 4 == 0 { 4 } else { 1 }, 5);
         }
-        assert!(
-            (2..=4).contains(&c.block()),
-            "block={} drifted to an extreme at a stationary p* rate",
-            c.block()
-        );
+        assert_eq!(c.block(), 2);
     }
 
     // reset() restores the default block and clears history.
@@ -232,7 +185,7 @@ mod tests {
         assert_eq!(c.block(), 3);
     }
 
-    // n_proposed == 0 (degenerate window) must not panic or count as full-accept.
+    // n_proposed == 0 (degenerate window) must not panic.
     #[test]
     fn zero_proposed_is_safe() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
