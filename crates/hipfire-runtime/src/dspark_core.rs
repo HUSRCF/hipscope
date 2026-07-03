@@ -1364,7 +1364,7 @@ pub fn build_dspark_speculator(
         // Start at a MID block so the hill-climb can grow (high-accept content) or
         // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
         // p*=0.18 prior (a later task measures it live).
-        let start_block = 3.min(block).max(1);
+        let start_block = 2.min(block).max(1);
         crate::dspark_block_controller::BlockController::new(start_block, 1, block, 0.18)
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {

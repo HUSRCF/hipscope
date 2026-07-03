@@ -213,13 +213,13 @@ mod tests {
     // reset() restores the default block and clears history.
     #[test]
     fn reset_restores_default() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
+        let mut c = BlockController::new(2, 1, 5, 0.18);
         for _ in 0..50 {
             c.observe(0, 4);
         }
         assert_eq!(c.block(), 1);
         c.reset();
-        assert_eq!(c.block(), 3);
+        assert_eq!(c.block(), 2);
     }
 
     // n_proposed == 0 (degenerate window) must not panic.
