@@ -1,8 +1,22 @@
 ---
-title: DSpark→qwen35 (ORNITH-35B) port scoped + BLOCKER — arch-6 quantizer can't fuse ORNITH's un-stacked MoE experts; target mq6 quantized-but-unloadable
+title: DSpark→qwen35 (ORNITH-35B) — QUANTIZATION DONE (A0 expert-fusion + drafter sidecar committed; target runs coherently); engine port B/C/D/E/F remains
 date: 2026-07-03
 tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,blocker,feature-dspark-qwen35]
 ---
+
+## STATUS 2026-07-03 — quantization COMPLETE, engine port NOT started
+- **A0 (expert fusion) DONE + committed `54e99d9d`**: arch-6 quantizer now fuses pre-split
+  `experts.{N}.gate_proj`+`up_proj`→`gate_up_proj` (gate||up, [1024,2048]). `ornith-35b-aeon.mq6`
+  (27.7GB, text-only, 10240 experts fused) LOADS + coherence probe 0-hard/0-soft 8/8.
+- **A (drafter sidecar) DONE + committed `eb66c4f1`**: `qwen3-dspark-q8` generalized to
+  DSparkDraftModel/speculators-v0.6.0 (nested `transformer_layer_config`, `aux_hidden_state_layer_ids`,
+  d2t/t2d→F32, full `dspark_*` metadata). `ornith-35b-aeon-dspark.mq6` (1.5GB, 44 tensors).
+  Alias `--format qwen35-dspark-q8`. Both models on disk under `~/.hipfire/models/`.
+- **REMAINS (engine, none started, coupled — none independently testable):**
+  D (qwen35 SpecTarget capture hooks — the crux, DeltaNet state + EAGLE-3 hidden capture, #462 hazard),
+  B (dspark_core reduced-vocab d2t remap), C (drafter forward config-driven dims hd256/pr0.25/2048/3L/3-target),
+  E (qwen35 carrier DSpark arm, precedence DSpark>DFlash>MTP>ngram), F (parity + coherence + serve-multiturn gates).
+  Sidecar discovery name = `<target-stem>-dspark.<ext>` (⇒ `ornith-35b-aeon-dspark.mq6`).
 
 ## Scope (branch feature/dspark-qwen35, off feature/dspark-qwen3/PR#492)
 Port DSpark spec-decode to **qwen35 MoE arch_id 6** (the DeltaNet-hybrid crate), target =

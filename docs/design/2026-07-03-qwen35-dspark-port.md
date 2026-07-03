@@ -170,9 +170,13 @@ kernels, no daemon changes.
   disk freed (pruned re-downloadable `Qwen3.5-27B` base cache, 52 GB).
 - **Drafter precision:** Q8/F16 (decided). Target = mq6. The drafter *sidecar* itself is deferred to
   task A (it needs the quantizer + loader arms; nothing consumes it until then). Raw BF16 on disk.
-- **Target mq6:** quantized (`~/.hipfire/models/ornith-35b-aeon.mq6`, 27.7 GB, text-only — vision
-  tower skipped, fine for dspark) but **NOT loadable** → **Task A0** above is now the first thing to
-  build. Re-quant with `--include-vision` if multimodal is ever wanted.
+- **Target mq6 — DONE** (`~/.hipfire/models/ornith-35b-aeon.mq6`, 27.7 GB, text-only; re-quant with
+  `--include-vision` for multimodal). Task **A0 landed** (commit `54e99d9d`): loads + coherence 0/0.
+- **Drafter sidecar — DONE** (`~/.hipfire/models/ornith-35b-aeon-dspark.mq6`, 1.5 GB, Q8/F16). Task
+  **A landed** (commit `eb66c4f1`): `--format qwen35-dspark-q8`, metadata complete.
+- **Remaining = the engine** (none started, coupled — not testable until all land): **D** (qwen35
+  capture hooks, the crux) · **B** (reduced-vocab remap) · **C** (drafter dims) · **E** (carrier) ·
+  **F** (gates).
 
 ## Task order (revised)
 
