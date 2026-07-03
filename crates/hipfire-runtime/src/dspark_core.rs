@@ -1126,6 +1126,16 @@ impl MtpDrafter for DsparkDrafter {
         if self.ctx_positions.is_empty() {
             // Initial window: bootstrap with a 1-token capture-armed forward.
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
+            if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+                let n = hidden_host.len();
+                let mean = hidden_host.iter().sum::<f32>() / n.max(1) as f32;
+                let rms = (hidden_host.iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32).sqrt();
+                let nz = hidden_host.iter().filter(|&&x| x != 0.0).count();
+                eprintln!(
+                    "[dspark] capture_seed hidden len={n} nonzero={nz} mean={mean:.4} rms={rms:.4} first4={:?}",
+                    &hidden_host[..n.min(4)]
+                );
+            }
             let dev = upload_f32(gpu, &hidden_host)?;
             if let Some(old) = self.main_hidden_dev.take() {
                 let _ = gpu.free_tensor(old);
@@ -1262,6 +1272,14 @@ impl MtpDrafter for DsparkDrafter {
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
         let t_rest = self.profiler.sync_start(gpu);
+        if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[dspark] pos={position} seed={seed} n_prop={n_proposed} drafts={:?} target_pick={:?} conf={:?}",
+                &drafts,
+                &target_pick[..target_pick.len().min(drafts.len() + 1)],
+                &draft.confidence[..draft.confidence.len().min(4)]
+            );
+        }
         let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
         let committed = acc.committed;
         let n_accepted = acc.accepted;
