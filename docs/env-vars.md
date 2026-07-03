@@ -70,6 +70,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_DDTREE_TAPE_DUMP` | DDTREE-RESEARCH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:4090` |
 | `HIPFIRE_DDTREE_TOPK` | DDTREE-RESEARCH | — | `crates/hipfire-runtime/examples/daemon.rs:1774` |
 | `HIPFIRE_DDTREE_TREE_LA` | DDTREE-RESEARCH | — | `crates/hipfire-arch-qwen35/src/speculative.rs:3968` |
+| `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DRAFT/SPEC | env tier of the DSpark conf ladder; unset → deepseek4 default 0.3 | `crates/hipfire-arch-deepseek4/src/dspark_speculator.rs:206` |
 | `HIPFIRE_DETERMINISTIC` | MISC-USER | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:7380` |
 | `HIPFIRE_DEVICES` | MULTI-GPU | — | `crates/hipfire-runtime/src/multi_gpu.rs:351` |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | DFLASH-CKPT | on (`0` disables; also off when CASK eviction active) | `crates/hipfire-arch-qwen35/src/dflash_spec.rs:build_dflash_speculator` |
@@ -87,6 +88,11 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_DRAFT_F16` | DRAFT/SPEC | — | `crates/hipfire-runtime/src/dflash.rs:193` |
 | `HIPFIRE_DRAFT_GEMM_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:571` |
 | `HIPFIRE_DRAFT_SUBPHASE` | DRAFT/SPEC | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:805` |
+| `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | DRAFT/SPEC | on (`0` disables the τ-adaptive block controller → fixed draft block) | `crates/hipfire-runtime/src/dspark_core.rs:build_dspark_speculator` |
+| `HIPFIRE_DSPARK_HFQ4_WMMA` | DSPARK-KERNEL | on (`0` disables the HFQ4 WMMA drafter GEMM path) | `crates/hipfire-runtime/src/dspark_core.rs:459` |
+| `HIPFIRE_DSPARK_PROFILE` | PERF-DIAG | "" (set to "1" for per-window phase timing) | `crates/hipfire-runtime/src/dspark_core.rs:DsparkProfiler::new` |
+| `HIPFIRE_DSPARK_Q8_4W` | DSPARK-KERNEL | on (`0` disables the Q8 WMMA 4-wide path) | `crates/hipfire-runtime/src/dspark_core.rs:391` |
+| `HIPFIRE_DSPARK_Q8_WMMA` | DSPARK-KERNEL | on (`0` disables the Q8 WMMA drafter GEMM path) | `crates/hipfire-runtime/src/dspark_core.rs:383` |
 | `HIPFIRE_DTOH_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hip-bridge/src/ffi.rs:594` |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | MISC-USER | — | `cli/index.ts:808` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | ATTN | — | `crates/hipfire-arch-qwen35/src/qwen35.rs:2750` |
@@ -151,6 +157,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | EXAMPLE | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/daemon.rs:719` |
 | `HIPFIRE_QA_KV_MODES` | TEST-HARNESS | — | `crates/hipfire-runtime/examples/test_inferenceQA.rs:606` |
 | `HIPFIRE_QUANT_THREADS` | LIB | — | `crates/hipfire-quantize/src/main.rs:2053` |
+| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | DRAFT/SPEC | env tier of the DSpark conf ladder; unset → qwen3 default 0.1 | `crates/hipfire-loader/src/carriers.rs:675` |
 | `HIPFIRE_RDNA2_VARIANT` | KERNEL-SELECTOR | — | `cli/index.ts:2593` |
 | `HIPFIRE_REPLAY_GRAPH` | GRAPH-DIAG | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:630` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:690` |

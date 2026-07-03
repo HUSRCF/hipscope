@@ -1282,14 +1282,6 @@ impl MtpDrafter for DsparkDrafter {
                 c.observe_timing(tw, n_verify);
             }
             c.observe(accept_len, n_proposed);
-            if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
-                eprintln!(
-                    "[dspark-block] block={} accept={}/{}",
-                    c.block(),
-                    accept_len,
-                    n_proposed
-                );
-            }
         }
         self.profiler.end_window();
 

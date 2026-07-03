@@ -9243,11 +9243,6 @@ pub fn dspark_forward(
         gpu.rmsnorm_f32(&main_x, main_norm, &main_x, cfg.rms_norm_eps)
             .map_err(|e| format!("dspark main_norm: {e:?}"))?;
     }
-    dspark_nan_dbg(gpu, "main_hidden", main_hidden, 6);
-    if let Some(mx) = state.dspark_main_x.as_ref() {
-        dspark_nan_dbg(gpu, "main_x", &mx.shallow_clone(), 6);
-    }
-
     // noise block ids: [prev_token, noise, noise, ...] (block_size slots).
     let mut block_ids = vec![dspark.cfg.noise_token_id; block];
     block_ids[0] = prev_token;
@@ -9304,25 +9299,9 @@ pub fn dspark_forward(
         // 1. attn-side HC pre + per-stream input map → hc_x_in_batch.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            if s == 0 {
-                dspark_nan_dbg(
-                    gpu,
-                    "s0 streams ENTRY",
-                    &pbs.streams_batch.shallow_clone(),
-                    6,
-                );
-            }
             mhc_pre_batched(
                 cfg, layer, pbs, gpu, /*layer_idx=*/ s, /*is_attn=*/ true, block,
             )?;
-            if s == 0 {
-                dspark_nan_dbg(
-                    gpu,
-                    "s0 hc_x_in (post-mhc_pre)",
-                    &pbs.hc_x_in_batch.shallow_clone(),
-                    6,
-                );
-            }
         }
         // 2. block q from attn_norm(hc_x_in): writes pbs.tmp/tmp_plain + q_batch.
         {
@@ -9359,8 +9338,7 @@ pub fn dspark_forward(
         //    (block cols) | zero tail]. All block rows identical (bidirectional).
         //    The prior host path (d2h ring + d2h block_kv + host assemble + h2d)
         //    forced ~2 stream syncs per stage; the kernel keeps everything on
-        //    the active stream so the 3 stages pipeline. `HIPFIRE_DSPARK_VERIFY_STAGE=1`
-        //    cross-checks the GPU buffer against the host assembly bit-for-bit.
+        //    the active stream so the 3 stages pipeline.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
             let ring = state.dspark_swa_k[s].as_ref().unwrap().shallow_clone();
@@ -9377,46 +9355,6 @@ pub fn dspark_forward(
                 stage_w,
             )
             .map_err(|e| format!("dspark stage_kv[{s}]: {e:?}"))?;
-
-            if std::env::var("HIPFIRE_DSPARK_VERIFY_STAGE").as_deref() == Ok("1") {
-                let ring_host = gpu
-                    .download_f32(&ring)
-                    .map_err(|e| format!("dspark verify d2h ring[{s}]: {e:?}"))?;
-                let block_kv_host = gpu
-                    .download_f32(&block_kv)
-                    .map_err(|e| format!("dspark verify d2h block kv: {e:?}"))?;
-                let mut staged_ref = vec![0.0f32; block * head_dim * stage_w];
-                for b in 0..block {
-                    for d in 0..head_dim {
-                        let dst_base = (b * head_dim + d) * stage_w;
-                        for c in 0..n_committed {
-                            staged_ref[dst_base + c] = ring_host[d * win + c];
-                        }
-                        for j in 0..block {
-                            staged_ref[dst_base + n_committed + j] = block_kv_host[j * kv_dim + d];
-                        }
-                    }
-                }
-                let staged_gpu = gpu
-                    .download_f32(&staged)
-                    .map_err(|e| format!("dspark verify d2h staged[{s}]: {e:?}"))?;
-                let mut max_abs = 0.0f32;
-                let mut n_mismatch = 0usize;
-                for (g, r) in staged_gpu.iter().zip(staged_ref.iter()) {
-                    let diff = (g - r).abs();
-                    if diff > max_abs {
-                        max_abs = diff;
-                    }
-                    if diff != 0.0 {
-                        n_mismatch += 1;
-                    }
-                }
-                eprintln!(
-                    "[dspark verify_stage] stage={s} n_committed={n_committed} max_abs_diff={max_abs:.3e} n_mismatch={n_mismatch}/{}",
-                    staged_gpu.len()
-                );
-                assert_eq!(n_mismatch, 0, "dspark stage_kv GPU != host (stage {s})");
-            }
         }
 
         // 7. Dense (bidirectional) attention over staged keys + attn_sink.
@@ -9441,41 +9379,13 @@ pub fn dspark_forward(
             )
             .map_err(|e| format!("dspark attn[{s}]: {e:?}"))?;
         }
-        if s == 0 {
-            let pbs = state.dspark_pbs.as_ref().unwrap();
-            dspark_nan_dbg(gpu, "s0 q_batch", &pbs.q_batch.shallow_clone(), 6);
-            dspark_nan_dbg(gpu, "s0 kv_batch", &pbs.kv_batch.shallow_clone(), 6);
-            dspark_nan_dbg(
-                gpu,
-                "s0 attn_out_raw",
-                &pbs.attn_out_raw_batch.shallow_clone(),
-                6,
-            );
-        }
-
         // 8. inverse RoPE on attn_out, then wo_a + wo_b → attn_out_batch.
         dspark_wo_project(cfg, layer, state, gpu, s, block)?;
 
         // 9. hc_attn_mix.
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            if s == 0 {
-                dspark_nan_dbg(
-                    gpu,
-                    "s0 attn_out (post-wo)",
-                    &pbs.attn_out_batch.shallow_clone(),
-                    6,
-                );
-            }
             hc_attn_mix_batched(cfg, pbs, gpu, block)?;
-            if s == 0 {
-                dspark_nan_dbg(
-                    gpu,
-                    "s0 streams post-attn-mix",
-                    &pbs.streams_batch.shallow_clone(),
-                    6,
-                );
-            }
         }
 
         // 10. FFN side: mhc_pre(ffn) + ffn(score-routed) + hc_ffn_mix.
@@ -9493,15 +9403,6 @@ pub fn dspark_forward(
                 &[],
             )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
-        }
-        {
-            let pbs = state.dspark_pbs.as_ref().unwrap();
-            dspark_nan_dbg(
-                gpu,
-                &format!("streams after stage {s}"),
-                &pbs.streams_batch,
-                6,
-            );
         }
     }
     let _ = gpu.free_tensor(staged);
@@ -9767,29 +9668,6 @@ pub fn dspark_run_body_and_hc_gate(
     let _ = gpu.free_tensor(hc_pre);
 
     Ok(())
-}
-
-/// Gated NaN/range diagnostic for DSpark forward bring-up. Downloads an F32
-/// tensor and prints len/nan/inf/head; no-op unless HIPFIRE_DSPARK_DEBUG=1.
-fn dspark_nan_dbg(gpu: &Gpu, label: &str, t: &GpuTensor, n: usize) {
-    if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() != Ok("1") {
-        return;
-    }
-    match gpu.download_f32(t) {
-        Ok(v) => {
-            let nan = v.iter().filter(|x| x.is_nan()).count();
-            let inf = v.iter().filter(|x| x.is_infinite()).count();
-            let h = n.min(v.len());
-            eprintln!(
-                "[dspark-dbg] {label}: len={} nan={} inf={} head={:?}",
-                v.len(),
-                nan,
-                inf,
-                &v[..h]
-            );
-        }
-        Err(e) => eprintln!("[dspark-dbg] {label}: download failed {e:?}"),
-    }
 }
 
 /// Steps 6d–6e of the per-stage attention block (inverse RoPE + O-LoRA
@@ -10302,7 +10180,7 @@ fn dspark_parity_stats(name: &'static str, gpu_v: &[f32], cpu_v: &[f32]) -> Dspa
 /// as "DSpark is just slow" rather than "the port is wrong". Coverage boundary:
 ///   - main_proj gemv, main_norm RMS, markov embed, markov bias gemv → HERE.
 ///   - MLA / MoE / HC kernels → reused from the trunk, covered by its gates.
-///   - bidirectional KV staging → `HIPFIRE_DSPARK_VERIFY_STAGE=1` bit-check.
+///   - bidirectional KV staging.
 ///   - hc_head sigmoid gate, confidence dot → host/coherence-covered (the
 ///     confidence dot already IS a CPU computation; no GPU kernel to diff).
 pub fn dspark_head_parity(

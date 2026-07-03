@@ -8,8 +8,7 @@
 //! full fp8 `inference/model.py` reference cannot run on an RDNA box (fp8
 //! kernels + 167 GB trunk), so we validate the novel linear heads against CPU
 //! references derived from `model.py`, on the real quantized sidecar weights.
-//! Reused MLA/MoE/HC kernels are covered by the trunk gates; the bidirectional
-//! KV staging by `HIPFIRE_DSPARK_VERIFY_STAGE=1`.
+//! Reused MLA/MoE/HC kernels are covered by the trunk gates.
 //!
 //! Loads ONLY the ~5.6 GB sidecar (not the 83 GB trunk) and runs no inference.
 //!
