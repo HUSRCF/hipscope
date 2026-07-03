@@ -1,53 +1,70 @@
 //! Pure (no-GPU) draft-block-size controller for DSpark spec-decode.
-//! Direct target from smoothed mean accept-length: block = ceil(EMA(accept_len)),
-//! plus periodic probe-up exploration to escape the block-1 cap-trap: at block=1
-//! accept_len ∈ {0,1} so the EMA can never reveal that a higher block is profitable.
-//! A probe bumps block by +1 every EXPLORE_INTERVAL windows, then holds for PROBE_HOLD
-//! windows so accept_ema has time to measure the new depth before reverting/keeping.
+//!
+//! Picks the block that maximizes decode throughput via a cost-model argmax:
+//!   block = argmax_N  τ(N) / (t_ar + (N-1)·Δt)
+//! where τ(N) = 1 + Σ_{k=1..N} S(k) is the expected committed tokens per window
+//! (S(k) = P(accept_len ≥ k), the acceptance-depth survival), Δt is the marginal
+//! per-position verify cost (ms) and t_ar the single-forward (AR) cost (ms). Both
+//! costs come from the live verify-curve calibration (slope = Δt, intercept = t_ar),
+//! so the argmax directly maximizes committed-tokens ÷ window-wall-time = tok/s.
+//!
+//! This auto-adapts across architectures without per-arch tuning:
+//!   • DeepSeek4 (expensive MoE verify): survival saturates early (S(3+)≈0) so τ
+//!     stops growing → argmax settles at 2 despite the large Δt.
+//!   • Qwen3 (cheap dense verify): survival stays deep and Δt is tiny → argmax
+//!     climbs toward the drafter's true acceptance depth (≈7).
+//!
+//! Cap-trap exploration: accept_len is capped at the current draft block, so S(k)
+//! is unobservable for k > block. When the argmax pins at `max_tried` (the optimum
+//! wants to go deeper than we've ever drafted) we probe one block deeper and HOLD
+//! it for PROBE_HOLD windows to collect survival samples at the new depth, then let
+//! the argmax keep or revert it. This climbs 2→7 on qwen3 but stops at 2 on DS4
+//! (where a probe to 3 reveals S(3)≈0 and the argmax immediately reverts).
 
-/// Accept-length EMA controller for the DSpark draft block cap.
+/// Cost-model draft-block controller for the DSpark drafter.
 pub(crate) struct BlockController {
     block: usize,
     default_block: usize,
     min_block: usize,
     max_block: usize,
-    /// EMA of accept_len (acceptance depth); direct signal for block sizing.
-    accept_ema: f32,
+    /// Deepest block ever drafted; upper bound of the argmax search. Grows only
+    /// via cap-trap probes, never shrinks — S(k) above it is unobservable.
+    max_tried: usize,
+    /// EMA of the accept_len distribution: hist[i] ≈ P(accept_len == i), i ∈ 0..=8.
+    hist: [f32; 9],
     windows_seen: u32,
-    /// Counts post-warmup, post-hold windows since the last probe. Resets to 0 after each probe.
+    /// Post-warmup, post-hold windows since the last probe; reset to 0 on each probe.
     explore_timer: u32,
     /// Remaining windows in the current probe hold; 0 = not holding.
     probe_hold: u32,
-    // ── live p* calibration (hardware cost ratio; stable across requests) ──
+    // ── live verify-cost calibration (hardware cost; stable across requests) ──
     /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
     timing_samples: u32,
     /// Per-n EMA of verify wall-time in ms (indexed by n_verify, slots 2..8).
     t_verify_by_n: [f32; 8],
-    /// True once p* has been measured from live timing; preserved across reset().
+    /// True once the verify curve has been fit; preserved across reset().
     calibrated: bool,
-    /// Cost-ratio break-even; reserved: cost-ratio margin, see accept-length redesign.
-    #[allow(dead_code)]
-    p_star: f32,
+    /// Marginal per-position verify cost (ms) = slope of the verify curve.
+    dt: f32,
+    /// Single-forward (AR) verify cost (ms) = intercept of the verify curve.
+    t_ar: f32,
+    /// True once dt/t_ar are usable (live-calibrated or test-seeded). Until then
+    /// the argmax is disabled and the block stays at default_block.
+    cost_ready: bool,
 }
 
-// accept_len is a real-valued depth signal (not binary). Alpha is kept slow
-// so the EMA tracks the true mean depth rather than per-window bursts — at
-// temp>0 code, frequent zero-accept windows otherwise yank EMA below 1.0
-// and flip ceil back to block=1. ~4% move per window → ~25 windows to halve.
-const ACCEPT_ALPHA: f32 = 0.04;
-/// Skip the first few windows so the block doesn't react to early bootstrap
-/// noise before the EMA has seen enough real samples.
+/// EMA rate for the accept_len histogram. Slow so the survival estimate tracks the
+/// true distribution rather than per-window bursts (~1/α ≈ 20 windows to halve).
+const HIST_ALPHA: f32 = 0.05;
+/// Skip the first few windows so the block doesn't react to bootstrap noise.
 const WARMUP_WINDOWS: u32 = 6;
 /// Minimum timing samples before attempting verify-curve calibration.
-/// Gives the GPU time to warm up and collects samples at ≥2 distinct n values.
 const TIMING_WARMUP: u32 = 16;
-/// How many post-warmup, post-hold windows between probe-up attempts.
-const EXPLORE_INTERVAL: u32 = 50;
-/// How many windows to hold the probed (higher) block so accept_ema can
-/// measure acceptance depth there before the settle branch reverts or keeps it.
-/// Matched to the slower alpha: 1/ACCEPT_ALPHA ≈ 25 windows to halve; hold
-/// ~20 so the EMA has time to reveal the true depth at the probed block.
-const PROBE_HOLD: u32 = 20;
+/// Post-warmup, post-hold windows between cap-trap probe-up attempts.
+const EXPLORE_INTERVAL: u32 = 40;
+/// Windows to hold a probed (deeper) block so the histogram can collect survival
+/// samples at the new depth before the argmax keeps or reverts it.
+const PROBE_HOLD: u32 = 15;
 
 impl BlockController {
     pub(crate) fn new(
@@ -57,20 +74,30 @@ impl BlockController {
         p_star: f32,
     ) -> Self {
         let default_block = default_block.clamp(min_block, max_block);
+        let mut hist = [0.0f32; 9];
+        // Seed the histogram at the default depth so the first argmax (once cost is
+        // ready) picks ≈default_block.
+        hist[default_block.min(8)] = 1.0;
         Self {
             block: default_block,
             default_block,
             min_block,
             max_block,
-            // Seed so ceil(accept_ema) == default_block: e.g. default=3 → seed 2.5 → ceil 3.
-            accept_ema: default_block as f32 - 0.5,
+            max_tried: default_block,
+            hist,
             windows_seen: 0,
             explore_timer: 0,
             probe_hold: 0,
             timing_samples: 0,
             t_verify_by_n: [0.0f32; 8],
             calibrated: false,
-            p_star,
+            // Dormant cost prior: only the dt/t_ar RATIO drives the argmax, and it
+            // stays disabled (cost_ready=false) until live verify timing refines
+            // these into real milliseconds. Seeded from the caller's p* prior so the
+            // ratio is sane if ever consulted before calibration (assume ~100ms AR).
+            t_ar: 100.0,
+            dt: p_star * 100.0,
+            cost_ready: false,
         }
     }
 
@@ -78,27 +105,23 @@ impl BlockController {
         self.block
     }
 
-    pub(crate) fn set_p_star(&mut self, p_star: f32) {
-        self.p_star = p_star;
-    }
-
     pub(crate) fn reset(&mut self) {
-        // Reset only request-specific state. Calibration fields (timing_samples,
-        // t_verify_by_n, calibrated, p_star) are thermal-invariant hardware
-        // cost ratios — calibrate once, reuse across requests.
+        // Reset only request-specific state. Calibration (dt, t_ar, cost_ready,
+        // timing_samples, t_verify_by_n, calibrated) is a thermal-invariant hardware
+        // cost — calibrate once, reuse across requests.
         self.block = self.default_block;
-        self.accept_ema = self.default_block as f32 - 0.5;
+        self.max_tried = self.default_block;
         self.windows_seen = 0;
         self.explore_timer = 0;
         self.probe_hold = 0;
+        self.hist = [0.0f32; 9];
+        self.hist[self.default_block.min(8)] = 1.0;
     }
 
-    /// Observe verify timing. Accumulates per-n EMAs and fits a line
-    /// `t_verify(n) ≈ t_AR + (n−1)·Δt` once TIMING_WARMUP samples have been
-    /// collected, deriving `p* = Δt / t_AR` from two distinct n points on the
-    /// verify curve. Both terms come from the same kernel at the same thermal
-    /// phase, so the ratio is stable under DPM scaling. Calibration is preserved
-    /// across reset() calls.
+    /// Observe verify timing. Accumulates per-n EMAs and fits the line
+    /// `t_verify(n) ≈ t_ar + (n−1)·Δt` once TIMING_WARMUP samples have been
+    /// collected across ≥2 distinct n. On a sane fit (ratio Δt/t_ar in [0.05,0.5])
+    /// stores Δt and t_ar and flips `cost_ready`. Preserved across reset().
     pub(crate) fn observe_timing(&mut self, t_verify_ms: f32, n_verify: usize) {
         if (2..8).contains(&n_verify) && t_verify_ms > 0.0 {
             let slot = &mut self.t_verify_by_n[n_verify];
@@ -115,22 +138,23 @@ impl BlockController {
         let lo = (2..8).find(|&n| self.t_verify_by_n[n] > 0.0);
         let hi = (2..8).rev().find(|&n| self.t_verify_by_n[n] > 0.0);
         if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
-            // Note: if the controller never visits ≥2 distinct n_verify values
-            // (e.g. block pinned at a fixed cap), n_hi > n_lo never holds and
-            // calibration silently stays on the 0.18 prior for the process
-            // lifetime — acceptable, since the prior is a safe gfx1151 default.
+            // If the controller never visits ≥2 distinct n_verify (block pinned),
+            // n_hi > n_lo never holds and cost_ready stays false — the block then
+            // safely stays at default_block for the process lifetime.
             if n_hi > n_lo {
                 let dt =
                     (self.t_verify_by_n[n_hi] - self.t_verify_by_n[n_lo]) / (n_hi - n_lo) as f32;
                 let t_ar = self.t_verify_by_n[n_lo] - dt * (n_lo as f32 - 1.0);
                 if dt > 0.0 && t_ar > 0.0 {
-                    let raw = dt / t_ar;
-                    if (0.05..=0.5).contains(&raw) {
-                        self.p_star = raw;
+                    let ratio = dt / t_ar;
+                    if (0.05..=0.5).contains(&ratio) {
+                        self.dt = dt;
+                        self.t_ar = t_ar;
+                        self.cost_ready = true;
                         self.calibrated = true;
                         eprintln!(
-                            "[dspark] live p*={:.3} (verify-curve fit: n{}={:.1}ms n{}={:.1}ms dt={:.2} t_ar={:.1})",
-                            raw, n_lo, self.t_verify_by_n[n_lo], n_hi, self.t_verify_by_n[n_hi], dt, t_ar
+                            "[dspark] cost calibrated: dt={:.2}ms t_ar={:.1}ms (ratio={:.3}, n{}={:.1}ms n{}={:.1}ms)",
+                            dt, t_ar, ratio, n_lo, self.t_verify_by_n[n_lo], n_hi, self.t_verify_by_n[n_hi]
                         );
                     }
                 }
@@ -138,36 +162,76 @@ impl BlockController {
         }
     }
 
-    #[cfg(test)]
-    fn p_star_for_test(&self) -> f32 {
-        self.p_star
-    }
-
+    /// Observe one spec window's acceptance depth and re-decide the block via the
+    /// cost-model argmax (+ cap-trap probing). `_n_proposed` is unused; the block is
+    /// chosen from the survival histogram and the calibrated verify cost.
     pub(crate) fn observe(&mut self, accept_len: usize, _n_proposed: usize) {
-        self.accept_ema = (1.0 - ACCEPT_ALPHA) * self.accept_ema + ACCEPT_ALPHA * accept_len as f32;
+        let a = accept_len.min(8);
+        for slot in self.hist.iter_mut() {
+            *slot *= 1.0 - HIST_ALPHA; // decay all buckets
+        }
+        self.hist[a] += HIST_ALPHA; // bump the observed depth
         self.windows_seen += 1;
-        if self.windows_seen < WARMUP_WINDOWS {
+        if self.windows_seen < WARMUP_WINDOWS || !self.cost_ready {
             return;
         }
-        // Hold the probed (higher) block so accept_ema can actually MEASURE acceptance
-        // depth there before ceil(accept_ema) decides to keep or revert it.
+        // Hold a freshly probed (deeper) block so the histogram can measure survival
+        // at that depth before the argmax judges it.
         if self.probe_hold > 0 {
             self.probe_hold -= 1;
             return;
         }
-        // Periodically probe one block deeper to escape the low-block cap-trap: at a small
-        // block accept_len is capped and can't reveal deeper depth. After the hold,
-        // ceil(accept_ema) keeps the probe (code discovers a deeper block is sustainable)
-        // or reverts it (prose falls back to 1).
+        let n_star = self.argmax_block();
         self.explore_timer += 1;
-        if self.explore_timer >= EXPLORE_INTERVAL && self.block < self.max_block {
-            self.block += 1;
+        // Cap-trap probe: the argmax wants the deepest depth we've drafted, but S(k)
+        // beyond it is unobservable. Draft one deeper and hold to reveal it.
+        if n_star == self.max_tried
+            && self.max_tried < self.max_block
+            && self.explore_timer >= EXPLORE_INTERVAL
+        {
+            self.max_tried += 1;
+            self.block = self.max_tried;
             self.explore_timer = 0;
             self.probe_hold = PROBE_HOLD;
             return;
         }
-        // Settle at the observed acceptance depth.
-        self.block = (self.accept_ema.ceil() as usize).clamp(self.min_block, self.max_block);
+        self.block = n_star;
+    }
+
+    /// argmax over N ∈ [1, max_tried] of τ(N)/(t_ar + (N-1)·Δt), clamped to
+    /// [min_block, max_block]. τ(N) = 1 + Σ_{k=1..N} S(k), S(k)=P(accept_len≥k).
+    fn argmax_block(&self) -> usize {
+        let total: f32 = self.hist.iter().sum();
+        if total <= 0.0 || self.t_ar <= 0.0 || self.dt < 0.0 {
+            return self.default_block;
+        }
+        let mut tau = 1.0f32;
+        let mut best_n = 1usize;
+        let mut best_score = f32::MIN;
+        for n in 1..=self.max_tried.min(8) {
+            // S(n) = P(accept_len ≥ n) = (Σ_{j≥n} hist[j]) / total.
+            let survival: f32 = self.hist[n..].iter().sum::<f32>() / total;
+            tau += survival;
+            let window_ms = self.t_ar + (n as f32 - 1.0) * self.dt; // > 0 by the guard above
+            let score = tau / window_ms;
+            if score > best_score {
+                best_score = score;
+                best_n = n;
+            }
+        }
+        best_n.clamp(self.min_block, self.max_block)
+    }
+
+    #[cfg(test)]
+    fn set_cost_for_test(&mut self, dt: f32, t_ar: f32) {
+        self.dt = dt;
+        self.t_ar = t_ar;
+        self.cost_ready = true;
+    }
+
+    #[cfg(test)]
+    fn cost_for_test(&self) -> (f32, f32, bool) {
+        (self.dt, self.t_ar, self.cost_ready)
     }
 }
 
@@ -175,149 +239,124 @@ impl BlockController {
 mod tests {
     use super::*;
 
-    // Deep acceptance (mean ~4) drives block to ≥4; allow periodic +1 probe.
+    // DS4-like: expensive verify (dt large) + survival that SATURATES at 2
+    // (accept_len ∈ {0,1,2}). τ stops growing past 2, so the argmax settles low and
+    // a probe to 3 (S(3)=0) is immediately reverted.
     #[test]
-    fn tracks_high_accept_depth() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..300 {
-            c.observe(4, 5); // mean depth 4 -> ceil = 4
+    fn settles_low_when_survival_saturates_and_verify_expensive() {
+        let mut c = BlockController::new(2, 1, 7, 0.0);
+        c.set_cost_for_test(15.0, 85.0); // DS4-like
+        for i in 0..600 {
+            c.observe([0, 1, 2, 2][i % 4], 5); // depth ~1.5, never > 2
         }
-        assert!(c.block() >= 4, "expected block ≥ 4, got {}", c.block());
+        assert!((1..=2).contains(&c.block()), "got {}", c.block());
     }
 
-    // Zero acceptance (mean → 0) clamps block to 1; allow periodic +1 probe (≤2).
+    // qwen3-like: cheap verify (dt small) + a drafter that accepts the whole drafted
+    // block (survival deep, cap always hit). The cost model rewards over-drafting and
+    // cap-trap exploration must climb the block upward.
     #[test]
-    fn tracks_low_accept_depth() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..300 {
-            c.observe(0, 5); // depth 0 -> ceil(0)=0 -> clamp 1
-        }
-        assert!(c.block() <= 2, "expected block ≤ 2, got {}", c.block());
-    }
-
-    // Mean depth ~1.75 (the measured code case) settles in region 2..=3.
-    #[test]
-    fn tracks_mid_accept_depth() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        // 25% chance of 4, 75% chance of 1: mean = 0.25*4 + 0.75*1 = 1.75
-        for i in 0..300 {
-            c.observe(if i % 4 == 0 { 4 } else { 1 }, 5);
+    fn climbs_high_when_survival_deep_and_verify_cheap() {
+        let mut c = BlockController::new(2, 1, 7, 0.0);
+        c.set_cost_for_test(4.0, 33.0); // qwen3-like
+                                        // Always accept the whole drafted block, so the cap is always hit -> climb.
+        for _ in 0..2000 {
+            let b = c.block();
+            c.observe(b.min(7), b);
         }
         assert!(
-            (2..=3).contains(&c.block()),
-            "expected block in 2..=3, got {}",
+            c.block() >= 5,
+            "cheap verify + deep accept should climb high, got {}",
             c.block()
         );
     }
 
-    // reset() restores the default block and clears history.
+    // Cost sensitivity: SAME (deep) survival, cheap vs expensive verify -> the
+    // cheaper verify justifies a larger block. Expensive verify reverts the first
+    // probe (half-populated deeper bucket doesn't pay for its cost).
     #[test]
-    fn reset_restores_default() {
-        let mut c = BlockController::new(2, 1, 5, 0.18);
-        for _ in 0..50 {
-            c.observe(0, 4);
-        }
-        assert_eq!(c.block(), 1);
-        c.reset();
-        assert_eq!(c.block(), 2);
+    fn cheaper_verify_picks_larger_block() {
+        let mk = |dt: f32| {
+            let mut c = BlockController::new(2, 1, 7, 0.0);
+            c.set_cost_for_test(dt, 50.0);
+            for _ in 0..2000 {
+                let b = c.block();
+                c.observe(b.min(7), b);
+            }
+            c.block()
+        };
+        assert!(
+            mk(2.0) > mk(20.0),
+            "cheap {} should exceed expensive {}",
+            mk(2.0),
+            mk(20.0)
+        );
     }
 
-    // n_proposed == 0 (degenerate window) must not panic.
+    // Fit dt/t_ar from the verify curve: t_verify(n) ≈ t_ar + (n-1)·Δt.
+    // n=2 → 90ms, n=6 → 150ms: dt=(150-90)/4=15, t_ar=90-15=75; flips cost_ready.
     #[test]
-    fn zero_proposed_is_safe() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..50 {
-            c.observe(0, 0);
-        }
-        assert!(c.block() >= 1 && c.block() <= 5);
-    }
-
-    // Fit p* from the verify curve: t_verify(n) ≈ t_AR + (n-1)·Δt.
-    // n=2 → 90ms, n=6 → 150ms: dt=(150-90)/4=15, t_ar=90-15=75, p*=15/75=0.2.
-    #[test]
-    fn calibrates_from_verify_curve() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
+    fn calibrates_dt_t_ar_from_verify_curve() {
+        let mut c = BlockController::new(3, 1, 7, 0.18);
         for _ in 0..30 {
             c.observe_timing(90.0, 2);
             c.observe_timing(150.0, 6);
         }
-        // dt=(150-90)/4=15, t_ar=90-15*(2-1)=75, p*=15/75=0.2
-        assert!(
-            (c.p_star_for_test() - 0.2).abs() < 0.01,
-            "p*={}",
-            c.p_star_for_test()
-        );
+        let (dt, t_ar, ready) = c.cost_for_test();
+        assert!(ready, "verify-curve fit should flip cost_ready");
+        assert!((dt - 15.0).abs() < 0.5, "dt={}", dt);
+        assert!((t_ar - 75.0).abs() < 1.0, "t_ar={}", t_ar);
     }
 
-    // A fit that computes p* > 0.5 must be REJECTED (not clamped): keep the prior.
+    // A fit whose ratio Δt/t_ar is out of [0.05,0.5] must be REJECTED: cost_ready
+    // stays false (the block then safely stays at default).
     #[test]
-    fn rejects_high_fit_keeps_prior() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        // t_v[2]=100, t_v[6]=300 → dt=50, t_ar=100-50=50, raw=1.0 > 0.5 → reject
+    fn rejects_out_of_range_fit() {
+        let mut c = BlockController::new(3, 1, 7, 0.18);
+        // t_v[2]=100, t_v[6]=300 → dt=50, t_ar=50, ratio=1.0 > 0.5 → reject.
         for _ in 0..30 {
             c.observe_timing(100.0, 2);
             c.observe_timing(300.0, 6);
         }
         assert!(
-            (c.p_star_for_test() - 0.18).abs() < 1e-6,
-            "should keep prior on out-of-range fit, got {}",
-            c.p_star_for_test()
+            !c.cost_for_test().2,
+            "out-of-range fit must not flip cost_ready"
         );
     }
 
-    // A fit that computes p* < 0.05 must be REJECTED: keep the prior.
+    // reset() restores request state (block, histogram) but PRESERVES the calibrated
+    // verify cost (thermal-invariant hardware ratio).
     #[test]
-    fn rejects_low_fit_keeps_prior() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        // t_v[2]=100, t_v[6]=101 → dt=0.25, t_ar=99.75, raw≈0.0025 < 0.05 → reject
+    fn reset_preserves_calibration() {
+        let mut c = BlockController::new(3, 1, 7, 0.18);
         for _ in 0..30 {
-            c.observe_timing(100.0, 2);
-            c.observe_timing(101.0, 6);
+            c.observe_timing(90.0, 2);
+            c.observe_timing(150.0, 6);
         }
-        assert!(
-            (c.p_star_for_test() - 0.18).abs() < 1e-6,
-            "should keep prior on tiny-ratio fit, got {}",
-            c.p_star_for_test()
-        );
-    }
-
-    // Exploration escapes the block-1 cap-trap: always accepting exactly what's drafted
-    // keeps EMA capped at 1, but periodic probes let accept_ema discover higher depth.
-    #[test]
-    fn exploration_escapes_cap_trap() {
-        let mut c = BlockController::new(1, 1, 5, 0.18); // start pinned at min
-                                                         // Always accept exactly what's drafted (capped) — true depth is really deep.
-        for _ in 0..600 {
-            let b = c.block();
-            c.observe(b, b);
+        let cost = c.cost_for_test();
+        assert!(cost.2, "should be calibrated");
+        // Pollute request-specific state.
+        for _ in 0..80 {
+            c.observe(0, 4);
         }
-        assert!(
-            c.block() >= 3,
-            "exploration should climb out of the block-1 trap, got {}",
-            c.block()
-        );
-    }
-
-    // reset() preserves the calibrated p* (thermal-invariant hardware ratio).
-    // gfx1151 shape: n=2→97ms, n=6→149ms: dt=13, t_ar=84, p*≈0.155 < 0.175.
-    #[test]
-    fn reset_preserves_calibrated_p_star() {
-        let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..30 {
-            c.observe_timing(97.0, 2);
-            c.observe_timing(149.0, 6);
-        }
-        let calibrated_p = c.p_star_for_test();
-        assert!(
-            calibrated_p < 0.18 - 0.005,
-            "p* should have moved from prior"
-        );
         c.reset();
         assert_eq!(
-            c.p_star_for_test(),
-            calibrated_p,
-            "reset() must preserve calibrated p*"
+            c.cost_for_test(),
+            cost,
+            "reset() must preserve dt/t_ar/cost_ready"
         );
         assert_eq!(c.block(), 3, "block returns to default after reset");
+    }
+
+    // n_proposed == 0 (degenerate window) must not panic, and all-reject settles the
+    // block to the minimum without indexing OOB.
+    #[test]
+    fn zero_proposed_is_safe() {
+        let mut c = BlockController::new(3, 1, 7, 0.18);
+        c.set_cost_for_test(10.0, 50.0);
+        for _ in 0..50 {
+            c.observe(0, 0); // n_proposed=0; all-reject
+        }
+        assert!((1..=7).contains(&c.block()), "got {}", c.block());
     }
 }
