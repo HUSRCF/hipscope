@@ -1093,6 +1093,17 @@ impl MtpDrafter for DsparkDrafter {
         // the previous window's accepted-prefix capture.
         self.profiler.sync_end(gpu, t_bootstrap, 0);
 
+        // Start the FULL-window cost timer (adaptive path only). It spans draft +
+        // heads + verify — the whole per-window GPU cost, not just verify. Both
+        // run_heads (tokens/confidence) and verify (target_pick) force a D2H, so the
+        // elapsed at the verify D2H is real wall time with no added sync. Timing the
+        // whole window (vs verify only) is what lets the argmax see that a larger
+        // block barely raises the per-window wall time on cheap-verify arches.
+        let _t_win = self
+            .block_controller
+            .is_some()
+            .then(std::time::Instant::now);
+
         let ctx_positions = self.ctx_positions.clone();
         let main_hidden = self
             .main_hidden_dev
@@ -1179,12 +1190,6 @@ impl MtpDrafter for DsparkDrafter {
         // temp<=eps → greedy argmax verify (byte-identical to the pre-temp path);
         // temp>0 → distribution-preserving sampled verify (target samples the
         // token, drafts accepted iff they match). Both capture hidden GPU-resident.
-        // Time the call: the returned Vec<u32> (via argmax_f32 / sample D2H) forces
-        // GPU completion, so elapsed() is real wall time with no added sync.
-        let _t_ver = self
-            .block_controller
-            .is_some()
-            .then(std::time::Instant::now);
         let (target_pick, captured) = if self.temp <= 1e-6 {
             target.verify_block_capture_gpu(
                 gpu,
@@ -1206,7 +1211,9 @@ impl MtpDrafter for DsparkDrafter {
                 &capture_buf,
             )?
         };
-        let t_verify_ms = _t_ver.map(|t| t.elapsed().as_secs_f32() * 1000.0);
+        // Close the full-window timer here: the verify's D2H (target_pick) has just
+        // forced GPU completion of draft + heads + verify, so this is real wall time.
+        let t_window_ms = _t_win.map(|t| t.elapsed().as_secs_f32() * 1000.0);
         self.profiler.sync_end(gpu, t_verify, 3);
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
@@ -1271,8 +1278,8 @@ impl MtpDrafter for DsparkDrafter {
         let _ = gpu.free_tensor(capture_buf);
         self.profiler.sync_end(gpu, t_rest, 4);
         if let Some(c) = self.block_controller.as_mut() {
-            if let Some(tv) = t_verify_ms {
-                c.observe_timing(tv, n_verify);
+            if let Some(tw) = t_window_ms {
+                c.observe_timing(tw, n_verify);
             }
             c.observe(accept_len, n_proposed);
             if std::env::var("HIPFIRE_DSPARK_BLOCK_LOG").ok().as_deref() == Some("1") {
