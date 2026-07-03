@@ -30,9 +30,11 @@ pub(crate) struct BlockController {
     p_star: f32,
 }
 
-// accept_len is a real-valued depth signal (not binary), so alpha can be
-// moderately fast — one window moves the EMA by ~10% toward the new sample.
-const ACCEPT_ALPHA: f32 = 0.1;
+// accept_len is a real-valued depth signal (not binary). Alpha is kept slow
+// so the EMA tracks the true mean depth rather than per-window bursts — at
+// temp>0 code, frequent zero-accept windows otherwise yank EMA below 1.0
+// and flip ceil back to block=1. ~4% move per window → ~25 windows to halve.
+const ACCEPT_ALPHA: f32 = 0.04;
 /// Skip the first few windows so the block doesn't react to early bootstrap
 /// noise before the EMA has seen enough real samples.
 const WARMUP_WINDOWS: u32 = 6;
@@ -43,7 +45,9 @@ const TIMING_WARMUP: u32 = 16;
 const EXPLORE_INTERVAL: u32 = 50;
 /// How many windows to hold the probed (higher) block so accept_ema can
 /// measure acceptance depth there before the settle branch reverts or keeps it.
-const PROBE_HOLD: u32 = 12;
+/// Matched to the slower alpha: 1/ACCEPT_ALPHA ≈ 25 windows to halve; hold
+/// ~20 so the EMA has time to reveal the true depth at the probed block.
+const PROBE_HOLD: u32 = 20;
 
 impl BlockController {
     pub(crate) fn new(
@@ -175,7 +179,7 @@ mod tests {
     #[test]
     fn tracks_high_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..50 {
+        for _ in 0..300 {
             c.observe(4, 5); // mean depth 4 -> ceil = 4
         }
         assert!(c.block() >= 4, "expected block ≥ 4, got {}", c.block());
@@ -185,7 +189,7 @@ mod tests {
     #[test]
     fn tracks_low_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
-        for _ in 0..100 {
+        for _ in 0..300 {
             c.observe(0, 5); // depth 0 -> ceil(0)=0 -> clamp 1
         }
         assert!(c.block() <= 2, "expected block ≤ 2, got {}", c.block());
@@ -196,7 +200,7 @@ mod tests {
     fn tracks_mid_accept_depth() {
         let mut c = BlockController::new(3, 1, 5, 0.18);
         // 25% chance of 4, 75% chance of 1: mean = 0.25*4 + 0.75*1 = 1.75
-        for i in 0..200 {
+        for i in 0..300 {
             c.observe(if i % 4 == 0 { 4 } else { 1 }, 5);
         }
         assert!(
@@ -283,7 +287,7 @@ mod tests {
     fn exploration_escapes_cap_trap() {
         let mut c = BlockController::new(1, 1, 5, 0.18); // start pinned at min
                                                          // Always accept exactly what's drafted (capped) — true depth is really deep.
-        for _ in 0..400 {
+        for _ in 0..600 {
             let b = c.block();
             c.observe(b, b);
         }
