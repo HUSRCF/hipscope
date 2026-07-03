@@ -182,6 +182,7 @@ fn main() -> Result<(), String> {
         BLOCK,
         &scratch1,
         &x_head_dev1,
+        1.0, // qwen3-8B: full rotary (byte-identical to the pre-partial-rotary signature)
     )?;
     // Apply output_norm once to compare with cpu x_head_out (= model.norm(hidden)).
     let x_head_normed_dev1 = gpu
@@ -297,6 +298,7 @@ fn main() -> Result<(), String> {
         BLOCK,
         &scratch3,
         &x_head_dev3,
+        1.0, // qwen3-8B: full rotary
     )?;
     // Apply output_norm once.
     let x_head_normed_dev3 = gpu

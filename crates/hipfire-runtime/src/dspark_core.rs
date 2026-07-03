@@ -129,6 +129,16 @@ pub struct DsparkConfig {
     /// Both DeepSeek V4 and Qwen3 use 1e-6; set per-arch at construction time
     /// so callers can plumb the model's actual config value.
     pub rms_norm_eps: f32,
+    /// Reduced draft-vocabulary size. 0 ⇒ no reduction (drafter shares the
+    /// target vocab). When >0 the drafter's lm_head + markov_w2 emit
+    /// `draft_vocab_size` logits and [`DsparkWeights::d2t`] maps each draft id
+    /// back to a target token id (EAGLE-3 compressed vocab, e.g. qwen35 ORNITH).
+    pub draft_vocab_size: usize,
+    /// Fraction of `head_dim` that RoPE rotates in the drafter body. 1.0 ⇒ full
+    /// rotary (qwen3-8B); Qwen3.5 uses 0.25 (partial-interleaved, 64/256 dims).
+    pub partial_rotary_factor: f32,
+    /// RoPE theta (base) for the drafter body. qwen3-8B = 1e6, Qwen3.5 = 1e7.
+    pub rope_theta: f32,
 }
 
 impl DsparkConfig {
@@ -173,6 +183,20 @@ impl DsparkConfig {
             .and_then(|v| v.as_f64())
             .map(|v| v as f32)
             .unwrap_or(1e-6f32);
+        let draft_vocab_size = cfg
+            .get("dspark_draft_vocab_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let partial_rotary_factor = cfg
+            .get("dspark_partial_rotary_factor")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1.0);
+        let rope_theta = cfg
+            .get("dspark_rope_theta")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1_000_000.0);
         Some(Self {
             block_size,
             target_layer_ids,
@@ -181,6 +205,9 @@ impl DsparkConfig {
             enable_confidence,
             confidence_uses_normed,
             rms_norm_eps,
+            draft_vocab_size,
+            partial_rotary_factor,
+            rope_theta,
         })
     }
 }
@@ -193,6 +220,10 @@ pub struct DsparkWeights {
     pub markov_w2: Option<GpuTensor>, // [vocab, rank]
     pub confidence_proj: Option<GpuTensor>, // [1, dim+rank]; None when !enable_confidence
     pub confidence_bias: Option<GpuTensor>, // [1]; qwen3 has bias, deepseek4 None
+    /// Reduced-vocab draft→target token map (host). `Some` ⇒ [`run_heads`]
+    /// remaps each argmaxed draft id through this before it enters the markov
+    /// chain / verify. `len() == cfg.draft_vocab_size`. `None` ⇒ shared vocab.
+    pub d2t: Option<Vec<u32>>,
 }
 
 /// The arch-specific seam: draft one window's block given the assembled
@@ -741,7 +772,12 @@ pub fn run_heads(
     // buffer holding i32 ids (same convention as qwen35's `mtp_token_chain`);
     // `argmax_scratch` is the throwaway index sink `argmax_token_chain_f32` also
     // writes. `None` ⇒ host-token fallback (byte-identical).
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1) {
+    // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
+    // that must be d2t-remapped to a TARGET id before it can index the
+    // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1)
+        && weights.d2t.is_none()
+    {
         let chain = gpu
             .alloc_tensor(&[block + 1], DType::F32)
             .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
@@ -861,9 +897,17 @@ pub fn run_heads(
             gpu.argmax_token_chain_f32(&row, argmax_scratch, chain, None, vocab, i + 1)
                 .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
         } else {
-            out_ids[i + 1] = gpu
+            let draft_id = gpu
                 .argmax_f32(&row, vocab)
                 .map_err(|e| format!("run_heads markov argmax {i}: {e:?}"))?;
+            // Reduced-vocab: argmax is a DRAFT id over `vocab` (=draft_vocab_size)
+            // logits; map it to a target token id so it feeds the full-vocab markov
+            // chain (out_ids[i] indexes markov_w1 over target vocab) and verify.
+            // Shared vocab (d2t None) passes through unchanged.
+            out_ids[i + 1] = match weights.d2t.as_ref() {
+                Some(d2t) => d2t.get(draft_id as usize).copied().unwrap_or(draft_id),
+                None => draft_id,
+            };
         }
     }
     // Device chain: pull the whole block's token ids back in one D2H (vs one per

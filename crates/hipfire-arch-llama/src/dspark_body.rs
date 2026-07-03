@@ -123,8 +123,12 @@ pub fn load_qwen3_dspark(
     //    The sidecar metadata only carries dspark_* keys (no model_type /
     //    hidden_size etc.), so config_from_hfq would fail on a missing
     //    `model_type` field.  Derive the config from tensor shapes instead.
-    let cfg = config_from_sidecar_tensors(source)
+    let mut cfg = config_from_sidecar_tensors(source)
         .map_err(|e| format!("qwen3_dspark: derive config: {e}"))?;
+    // config_from_sidecar_tensors hardcodes rope θ=1e6 (qwen3-8B). Qwen3.5's
+    // drafter uses 1e7 — take it from the sidecar metadata (defaults to 1e6 for
+    // legacy sidecars, so qwen3-8B stays byte-identical).
+    cfg.rope_freq_base = dspark_cfg.rope_theta;
 
     let q_out_dim = cfg.n_heads * cfg.head_dim;
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -155,8 +159,15 @@ pub fn load_qwen3_dspark(
             .map_err(|e| format!("qwen3_dspark: norm.weight: {e:?}"))?
     };
 
-    // 6. lm_head.weight (qt=1 F16, used as WeightTensor for logit projection)
-    let lm_head = load_global_proj(source, gpu, "lm_head.weight", cfg.vocab_size, cfg.dim)?;
+    // 6. lm_head.weight (qt=1 F16). Reduced-vocab drafters (EAGLE-3, e.g. qwen35
+    //    ORNITH) emit a compressed draft vocab, so the lm_head has
+    //    draft_vocab_size rows, not the full embed vocab. 0 ⇒ shared full vocab.
+    let draft_vocab = if dspark_cfg.draft_vocab_size > 0 {
+        dspark_cfg.draft_vocab_size
+    } else {
+        cfg.vocab_size
+    };
+    let lm_head = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
 
     let weights = LlamaWeights {
         token_embd,
@@ -219,6 +230,23 @@ pub fn load_qwen3_dspark(
         None
     };
 
+    //    d2t: reduced-vocab draft→target token map, stored by the quantizer as
+    //    F32 (exact for token ids < 2^24). None ⇒ shared full vocab (qwen3-8B).
+    let d2t: Option<Vec<u32>> = if dspark_cfg.draft_vocab_size > 0 {
+        let (di, dd) = source
+            .tensor_data_pread("d2t")
+            .ok_or_else(|| "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string())?;
+        let dev = dequant_f32(gpu, di.quant_type, &dd, dspark_cfg.draft_vocab_size)
+            .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
+        let host = gpu
+            .download_f32(&dev)
+            .map_err(|e| format!("qwen3_dspark: d2t download: {e:?}"))?;
+        let _ = gpu.free_tensor(dev);
+        Some(host.iter().map(|&v| v as u32).collect())
+    } else {
+        None
+    };
+
     // qwen3 reference modeling.py feeds once-normed hidden (self.norm(hidden))
     // to predict_confidence_step; set the flag so run_heads uses normed[i].
     // Also pin rms_norm_eps from the derived drafter config (1e-6 for qwen3).
@@ -234,6 +262,7 @@ pub fn load_qwen3_dspark(
         markov_w2,
         confidence_proj,
         confidence_bias,
+        d2t,
     };
 
     // 8. Allocate drafter KvCache (block-only: cap = block_size tokens)
@@ -642,6 +671,9 @@ pub fn dspark_qwen3_block_forward(
     block: usize,
     scratch: &Qwen3DsparkScratch,
     x_head_out: &GpuTensor,
+    // <1.0 ⇒ partial-interleaved RoPE (Qwen3.5, n_rot = head_dim·factor);
+    // 1.0 ⇒ full rotary (qwen3-8B, byte-identical rope_batched_f32).
+    partial_rotary_factor: f32,
 ) -> Result<(), String> {
     let ctx_len = ctx_positions.len();
     debug_assert_eq!(block_ids.len(), block);
@@ -818,30 +850,67 @@ pub fn dspark_qwen3_block_forward(
         //   q uses cos[..., -q_len:, :]  → block_positions (last block entries)
         //   k uses full cos              → [ctx_positions ++ block_positions]
 
+        // Qwen3.5 rotates only n_rot = head_dim·partial_rotary_factor dims
+        // (partial-interleaved/halfsplit, matching the qwen35 target forward);
+        // qwen3-8B rotates the full head_dim (factor 1.0 → rope_batched_f32,
+        // byte-identical). pos_offset=0: the drafter's block-only KV never compacts.
+        let use_partial = partial_rotary_factor < 1.0;
+        let n_rot = (config.head_dim as f32 * partial_rotary_factor) as usize;
+
         // RoPE on Q (only): n_heads_k=0 skips K rotation.
-        gpu.rope_batched_f32(
-            &scratch.pbs.fa_q_batch,
-            &scratch.all_k, // dummy k (n_heads_k=0 → not modified)
-            &scratch.positions_q_block,
-            config.n_heads,
-            0, // n_heads_k=0 → skip K
-            config.head_dim,
-            config.rope_freq_base,
-            block,
-        )
+        if use_partial {
+            gpu.rope_partial_interleaved_f32_batched(
+                &scratch.pbs.fa_q_batch,
+                &scratch.all_k,
+                &scratch.positions_q_block,
+                config.n_heads,
+                0,
+                config.head_dim,
+                n_rot,
+                config.rope_freq_base,
+                block,
+                0,
+            )
+        } else {
+            gpu.rope_batched_f32(
+                &scratch.pbs.fa_q_batch,
+                &scratch.all_k, // dummy k (n_heads_k=0 → not modified)
+                &scratch.positions_q_block,
+                config.n_heads,
+                0, // n_heads_k=0 → skip K
+                config.head_dim,
+                config.rope_freq_base,
+                block,
+            )
+        }
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope Q: {e:?}"))?;
 
         // RoPE on K (only): n_heads_q=0 skips Q rotation.
-        gpu.rope_batched_f32(
-            &scratch.pbs.fa_q_batch, // dummy q (n_heads_q=0 → not modified)
-            &scratch.all_k,
-            &scratch.positions_kv_all,
-            0, // n_heads_q=0 → skip Q
-            config.n_kv_heads,
-            config.head_dim,
-            config.rope_freq_base,
-            kv_cap, // batch = ctx_len + block
-        )
+        if use_partial {
+            gpu.rope_partial_interleaved_f32_batched(
+                &scratch.pbs.fa_q_batch,
+                &scratch.all_k,
+                &scratch.positions_kv_all,
+                0,
+                config.n_kv_heads,
+                config.head_dim,
+                n_rot,
+                config.rope_freq_base,
+                kv_cap,
+                0,
+            )
+        } else {
+            gpu.rope_batched_f32(
+                &scratch.pbs.fa_q_batch, // dummy q (n_heads_q=0 → not modified)
+                &scratch.all_k,
+                &scratch.positions_kv_all,
+                0, // n_heads_q=0 → skip Q
+                config.n_kv_heads,
+                config.head_dim,
+                config.rope_freq_base,
+                kv_cap, // batch = ctx_len + block
+            )
+        }
         .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope K: {e:?}"))?;
 
         // ── 2g. Write K and V to Q8 KV cache at compact slots 0..kv_cap  ───────
@@ -1163,6 +1232,7 @@ impl DsparkBody for Qwen3DsparkBody {
             block,
             &self.scratch,
             x_head_out,
+            weights.cfg.partial_rotary_factor,
         )?;
 
         let _ = gpu.free_tensor(main_x);

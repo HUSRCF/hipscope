@@ -522,6 +522,13 @@ pub struct ModelSlot {
     pub dn_state: DeltaNetState,
     pub scratch: Qwen35Scratch,
     pub slot_config: ModelSlotConfig,
+    /// DSpark (EAGLE-3) residual-hidden extract-layer ids. Empty for every
+    /// non-DSpark path (AR / n-gram / DFlash / MTP), which keeps `new_spec_scratch`
+    /// building a `num_extract = 0` no-op hidden ring — byte-identical to the
+    /// pre-DSpark behaviour. A DSpark drafter populates this via
+    /// `set_dflash_extract_layers` / `capture_seed_main_hidden` so the per-window
+    /// verify captures hidden at exactly the sidecar's layer ids.
+    pub dspark_extract_layers: Vec<usize>,
 }
 
 impl ModelSlot {
@@ -557,6 +564,7 @@ impl ModelSlot {
             dn_state,
             scratch,
             slot_config: ModelSlotConfig::default(),
+            dspark_extract_layers: Vec::new(),
         })
     }
 
@@ -685,6 +693,7 @@ impl ModelSlot {
             dn_state,
             scratch,
             slot_config,
+            dspark_extract_layers: Vec::new(),
         })
     }
 

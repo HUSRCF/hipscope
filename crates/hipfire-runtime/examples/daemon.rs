@@ -5074,6 +5074,7 @@ fn generate_qwen35_mtp(
         dn_state,
         scratch,
         slot_config: ModelSlotConfig::default(),
+        dspark_extract_layers: Vec::new(),
     };
 
     // Helper closure analog: every early return must put the bundle back. We

@@ -260,6 +260,11 @@ pub fn build_deepseek4_dspark_speculator(
             enable_confidence: true, // deepseek4 always has a confidence head
             confidence_uses_normed: false, // deepseek4 uses pre-norm x_head (byte-identical to task-5)
             rms_norm_eps: config.rms_norm_eps, // 1e-6 from deepseek4 config (byte-identical)
+            // deepseek4's body ignores these drafter-only fields (no reduced vocab,
+            // no qwen3 partial-rotary path) — defaults keep it byte-identical.
+            draft_vocab_size: 0,
+            partial_rotary_factor: 1.0,
+            rope_theta: 1_000_000.0,
         },
         main_proj: dspark.main_proj.as_ref().map(|t| t.shallow_clone()),
         main_norm: dspark.main_norm.as_ref().map(|t| t.shallow_clone()),
@@ -267,6 +272,7 @@ pub fn build_deepseek4_dspark_speculator(
         markov_w2: dspark.markov_w2.as_ref().map(|t| t.shallow_clone()),
         confidence_proj: dspark.confidence_proj.as_ref().map(|t| t.shallow_clone()),
         confidence_bias: None, // deepseek4 has no bias on the confidence head
+        d2t: None,             // deepseek4 shares the target vocab (no d2t map)
     };
 
     let body = build_deepseek4_dspark_body(config, dspark, token_embd)?;
