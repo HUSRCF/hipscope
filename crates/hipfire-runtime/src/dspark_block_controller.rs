@@ -1,32 +1,27 @@
-//! Pure (no-GPU) draft-block-size + spec↔AR controller for DSpark spec-decode.
+//! Pure (no-GPU) draft-block-size controller for DSpark spec-decode.
 //!
-//! Scores each choice by throughput = committed tokens ÷ window wall-time:
-//!   • spec block N (≥1): τ(N) / (t_ar + N·Δt), where τ(N)=1+Σ_{k=1..N} S(k) is the
-//!     expected committed tokens/window (S(k)=P(accept_len≥k), the acceptance-depth
-//!     survival), Δt is the marginal per-position window cost and t_ar the n_verify=1
-//!     intercept — a block-N window verifies N+1 positions so it costs t_ar + N·Δt.
-//!   • AR (block 0): 1 committed token per plain target forward (no drafter), at the
-//!     measured AR-window cost — the spec→AR fallback for when speculation isn't repaid.
-//! Δt and t_ar come from the live window-cost calibration: the FULL per-window wall-time
-//! (draft+heads+verify) measured vs block, NOT verify alone (verify-only omits the fixed
-//! drafter/launch overhead and over-charges large blocks).
+//! Picks the block that maximizes decode throughput via a cost-model argmax:
+//!   block = argmax_N  τ(N) / (t_ar + (N-1)·Δt)
+//! where τ(N) = 1 + Σ_{k=1..N} S(k) is the expected committed tokens per window
+//! (S(k) = P(accept_len ≥ k), the acceptance-depth survival), Δt is the marginal
+//! per-position window cost (ms) and t_ar the single-block window cost (ms). Both
+//! come from the live window-cost calibration — the FULL per-window wall-time
+//! (draft+heads+verify) measured vs block, NOT verify alone (verify-only omits the
+//! fixed drafter/launch overhead and so over-charges large blocks). The argmax thus
+//! directly maximizes committed-tokens ÷ window-wall-time = tok/s.
 //!
 //! This auto-adapts across architectures without per-arch tuning:
-//!   • DeepSeek4 (expensive MoE verify, spec ≫ AR): Δt large AND survival saturates
-//!     early (S(3+)≈0) → the best spec block is small (2) and AR loses → stays on spec.
-//!   • Qwen3 (cheap verify): a spec window barely out-commits a plain AR forward but
-//!     costs the drafter overhead, so at temp>0 AR beats every spec block → falls to AR.
+//!   • DeepSeek4 (expensive MoE verify): Δt is large AND survival saturates early
+//!     (S(3+)≈0) so τ stops growing → argmax settles at 2.
+//!   • Qwen3 (cheap verify, fixed per-window overhead dominates): the window cost is
+//!     ~flat in block (Δt≈0, clamped) so the argmax climbs toward the drafter's true
+//!     acceptance depth (≈7), capped only by where survival runs out.
 //!
-//! Stability: the choice is held with SWITCH-HYSTERESIS (a candidate must beat the
-//! CURRENT choice's throughput by SWITCH_MARGIN to displace it), because spec block
-//! scores can sit within a few % of each other and the AR/spec estimates are noisy — a
-//! bare argmax would chatter and the churn (an AR window clears the drafter context)
-//! degrades acceptance. See `observe`.
-//!
-//! Ramp phase (breaks the calibration deadlock): after WARMUP, each request sweeps
-//! min_block→max_block (RAMP_HOLD windows/step, starting at an AR window when min_block=0)
-//! to record window timing at ≥2 distinct n_verify (calibration) and seed the survival
-//! counts at every depth. After the ramp the hysteretic decision runs.
+//! Ramp phase (breaks the calibration deadlock): after WARMUP, each request runs a
+//! linear sweep from min_block to max_block (RAMP_HOLD windows per step). The sweep
+//! records window timing at ≥2 distinct n_verify so the cost curve can be calibrated,
+//! and seeds the survival counts at every depth so the argmax has real signal. After
+//! the ramp the argmax takes over for the remainder of the request.
 
 /// Cost-model draft-block controller for the DSpark drafter.
 pub(crate) struct BlockController {
@@ -64,7 +59,7 @@ pub(crate) struct BlockController {
     /// Single-block window cost (ms) = intercept of the window-cost curve.
     t_ar: f32,
     /// True once dt/t_ar are usable (live-calibrated or test-seeded). Until then
-    /// the cost decision is disabled and the block stays at default_block.
+    /// the argmax is disabled and the block stays at default_block.
     cost_ready: bool,
 }
 
@@ -75,14 +70,6 @@ const TIMING_WARMUP: u32 = 16;
 /// Windows each ramp block is held so the histogram can collect survival samples
 /// at that depth; after ramp_end the argmax takes over.
 const RAMP_HOLD: u32 = 2;
-/// Switch-hysteresis margin: the controller only MOVES off its current block/AR choice
-/// when a candidate beats the CURRENT choice's throughput by more than this. The
-/// current choice is sticky, so the controller commits to one decision per genre
-/// instead of chattering between close-scoring candidates (DS4 blocks 1/2/3 are within
-/// ~5%; the AR/spec boundary is noisy from the 2-sample ramp AR-cost estimate and an
-/// AR window's context-clear). This is what keeps DS4 pinned to its optimum and qwen3
-/// pinned to AR once each is reached, instead of flip-flopping on estimate noise.
-const SWITCH_MARGIN: f32 = 0.10;
 
 impl BlockController {
     pub(crate) fn new(
@@ -138,11 +125,7 @@ impl BlockController {
     /// rather than be blocked by phantom marginal cost. Only a clearly-too-steep fit
     /// (Δt > t_ar/2, i.e. a thermal spike) is rejected. Preserved across reset().
     pub(crate) fn observe_timing(&mut self, t_window_ms: f32, n_verify: usize) {
-        // Record n_verify=1 too — that's the AR-window cost (block 0, no draft), which
-        // the argmax needs as the spec→AR fallback candidate. The linear SPEC-line fit
-        // below still spans only (2..10): AR is off that line (no drafter overhead), so
-        // including it would flatten the slope wrongly.
-        if (1..10).contains(&n_verify) && t_window_ms > 0.0 {
+        if (2..10).contains(&n_verify) && t_window_ms > 0.0 {
             let slot = &mut self.t_window_by_n[n_verify];
             *slot = if *slot == 0.0 {
                 t_window_ms
@@ -183,10 +166,10 @@ impl BlockController {
         }
     }
 
-    /// Observe one spec window's acceptance depth and re-decide the block (or AR) via the
-    /// hysteretic cost comparison below. During the ramp phase (post-warmup, pre-ramp_end)
-    /// the block sweeps min→max to seed the window-cost calibration and the survival
-    /// counts; after ramp_end the switch-hysteresis decision drives the choice.
+    /// Observe one spec window's acceptance depth and re-decide the block via the
+    /// cost-model argmax. During the ramp phase (post-warmup, pre-ramp_end) the block
+    /// sweeps min→max to seed the window-cost calibration and the survival estimate.
+    /// After ramp_end the argmax drives the block for the remainder of the request.
     pub(crate) fn observe(&mut self, accept_len: usize, n_proposed: usize) {
         // Accumulate survival counts ONLY for depths we actually drafted (k ≤
         // n_proposed): for those k, `accept_len ≥ k` is a real observation. Depths above
@@ -205,106 +188,48 @@ impl BlockController {
         if self.windows_seen < WARMUP_WINDOWS {
             return;
         }
-        let ramp_end = WARMUP_WINDOWS + RAMP_HOLD * (self.max_block - self.min_block + 1) as u32;
+        let ramp_end = WARMUP_WINDOWS + 2 * self.max_block as u32;
         if self.windows_seen < ramp_end {
             // Sweep block min→max to seed calibration (≥2 distinct n_verify) AND survival
-            // at every depth. With min_block=0 the sweep starts at an AR window (block 0),
-            // measuring the AR-window cost so the argmax can compare spec vs AR. Without
-            // the sweep the block never varies and calibration deadlocks.
+            // at every depth. Without this the block never varies and calibration deadlocks.
             let step = (self.windows_seen - WARMUP_WINDOWS) / RAMP_HOLD;
             self.block = (self.min_block + step as usize).min(self.max_block);
             self.max_tried = self.block.max(self.max_tried);
             return;
         }
-        // Post-ramp decision with switch-hysteresis. The ramp left the block at max_block,
-        // so restart from the default (a good spec block) on the first post-ramp window.
-        // Then, each window, two sticky comparisons keep the controller committed to one
-        // choice per genre instead of chattering on estimate noise:
-        //   • AR↔spec has a DEADBAND: enter AR only if it clearly (by SWITCH_MARGIN) beats
-        //     the best spec block; once on AR, leave only if the best spec block clearly
-        //     beats AR. (Same-threshold enter/leave would flip-flop at the boundary.)
-        //   • spec block size is sticky: adopt a different spec block only if it clearly
-        //     beats the CURRENT one (DS4's 1/2/3 scores are within ~5%, so a bare argmax
-        //     would chatter; the deadband pins it to the true optimum).
-        if !self.cost_ready {
-            self.block = self.default_block; // fallback if calibration never completed
-            return;
-        }
-        if self.windows_seen == ramp_end {
-            self.block = self.default_block;
-            return;
-        }
-        let (best_spec, best_spec_score) = self.best_spec();
-        let ar_score = if self.min_block == 0 {
-            self.score_of(0)
+        // Settle at the cost-model optimum (calibration completed during the ramp).
+        if self.cost_ready {
+            self.block = self.argmax_block();
         } else {
-            f32::MIN
-        };
-        if self.block == 0 {
-            // Currently AR: return to spec only if the best spec block clearly beats AR.
-            if best_spec_score > ar_score * (1.0 + SWITCH_MARGIN) {
-                self.block = best_spec;
-            }
-        } else if ar_score > best_spec_score * (1.0 + SWITCH_MARGIN) {
-            // Currently spec: fall to AR only if it clearly beats the best spec block.
-            self.block = 0;
-        } else if best_spec != self.block
-            && best_spec_score > self.score_of(self.block) * (1.0 + SWITCH_MARGIN)
-        {
-            // Stay in spec, but move to a different block only on a clear win.
-            self.block = best_spec;
+            self.block = self.default_block; // fallback if calibration never completed
         }
     }
 
-    /// Throughput score (committed tokens ÷ window-ms) of one choice. Block 0 is the AR
-    /// fallback: 1 committed token at the MEASURED AR-window cost t_window_by_n[1] (a
-    /// single target forward, no drafter). Block n≥1 is a spec block: τ(n)=1+Σ_{k=1..n}
-    /// S[k] over the fitted window t_ar + n·Δt — block n verifies n+1 positions, i.e. the
-    /// point n+1 on the line whose n_verify=1 intercept is t_ar (using (n-1)·Δt would
-    /// price block-1 spec at the bare intercept, i.e. as cheap as an AR window, breaking
-    /// the AR-vs-spec comparison).
-    fn score_of(&self, n: usize) -> f32 {
-        if n == 0 {
-            let ar_cost = self.t_window_by_n[1];
-            return if ar_cost > 0.0 {
-                1.0 / ar_cost
-            } else {
-                f32::MIN
-            };
+    /// argmax over N ∈ [1, max_tried] of τ(N)/(t_ar + (N-1)·Δt), clamped to
+    /// [min_block, max_block]. τ(N) = 1 + Σ_{k=1..N} S[k], S[k]=P(accept_len≥k).
+    fn argmax_block(&self) -> usize {
+        if self.t_ar <= 0.0 || self.dt < 0.0 {
+            return self.default_block;
         }
         let mut tau = 1.0f32;
-        for k in 1..=n.min(8) {
-            // S(k)=P(accept_len≥k) from the counts; 0 for a never-drafted depth.
-            tau += if self.s_tot[k] > 0.0 {
-                self.s_hit[k] / self.s_tot[k]
+        let mut best_n = 1usize;
+        let mut best_score = f32::MIN;
+        for n in 1..=self.max_tried.min(8) {
+            // S(n)=P(accept_len≥n) from the counts; 0 for a never-drafted depth.
+            let survival = if self.s_tot[n] > 0.0 {
+                self.s_hit[n] / self.s_tot[n]
             } else {
                 0.0
             };
-        }
-        let window_ms = self.t_ar + n as f32 * self.dt;
-        if window_ms > 0.0 {
-            tau / window_ms
-        } else {
-            f32::MIN
-        }
-    }
-
-    /// The highest-scoring SPEC block (≥1) over 1..=max_tried, as (block, score). AR
-    /// (block 0) is compared against this separately in `observe`, with a deadband.
-    fn best_spec(&self) -> (usize, f32) {
-        if self.t_ar <= 0.0 || self.dt < 0.0 {
-            return (self.default_block.max(1), f32::MIN);
-        }
-        let mut best = self.default_block.max(1);
-        let mut best_score = f32::MIN;
-        for n in 1..=self.max_tried.min(8) {
-            let s = self.score_of(n);
-            if s > best_score {
-                best_score = s;
-                best = n;
+            tau += survival;
+            let window_ms = self.t_ar + (n as f32 - 1.0) * self.dt; // > 0 by the guard above
+            let score = tau / window_ms;
+            if score > best_score {
+                best_score = score;
+                best_n = n;
             }
         }
-        (best, best_score)
+        best_n.clamp(self.min_block, self.max_block)
     }
 
     #[cfg(test)]
@@ -317,11 +242,6 @@ impl BlockController {
     #[cfg(test)]
     fn cost_for_test(&self) -> (f32, f32, bool) {
         (self.dt, self.t_ar, self.cost_ready)
-    }
-
-    #[cfg(test)]
-    fn set_ar_cost_for_test(&mut self, ar_cost_ms: f32) {
-        self.t_window_by_n[1] = ar_cost_ms; // n_verify=1 = AR-window cost
     }
 }
 
@@ -436,63 +356,6 @@ mod tests {
             "flat/negative slope must clamp to 0, got dt={dt}"
         );
         assert!((t_ar - 80.0).abs() < 1.0, "t_ar={t_ar}");
-    }
-
-    // Spec→AR fallback: cheap AR window (27ms → 37 tok/s) + a drafter that IS accepted
-    // but only shallowly (S(1)=0.25, S(2+)=0) so the best spec block tops out ~1.25
-    // committed / 40ms = 31 tok/s < AR. The argmax must pick block 0 (AR). This is the
-    // qwen3-prose-at-temp>0 case: speculation works but doesn't beat plain AR.
-    #[test]
-    fn falls_back_to_ar_when_spec_not_repaid() {
-        let mut c = BlockController::new(2, 0, 7, 0.18);
-        c.set_cost_for_test(1.0, 40.0); // cheap dense spec line
-        c.set_ar_cost_for_test(27.0); // AR forward faster than any spec window here
-        for i in 0..200 {
-            let b = c.block();
-            c.observe([0, 0, 0, 1][i % 4], b); // ~25% shallow accept, never ≥2
-        }
-        assert_eq!(
-            c.block(),
-            0,
-            "cheap AR must beat weak spec, got {}",
-            c.block()
-        );
-    }
-
-    // The opposite: expensive AR (85ms → 12 tok/s) and a drafter that pays (S(1)=1,
-    // S(2)=0.75 → τ(2)=2.75 / 100ms = 27 tok/s). Spec dominates, so even with AR
-    // available (min_block=0) the argmax stays on a spec block. DS4-at-greedy case.
-    #[test]
-    fn keeps_spec_when_it_beats_ar() {
-        let mut c = BlockController::new(2, 0, 7, 0.18);
-        c.set_cost_for_test(15.0, 85.0); // expensive MoE spec line
-        c.set_ar_cost_for_test(85.0); // AR forward ~ one target pass, no draft
-        for i in 0..200 {
-            let b = c.block().max(1);
-            c.observe([1, 2, 2, 2][i % 4], b); // deep accept, spec pays
-        }
-        assert!(c.block() >= 1, "spec must beat AR here, got {}", c.block());
-    }
-
-    // Hysteresis: AR is only ~5% faster than the best spec block — inside AR_MARGIN
-    // (10%) — so the controller must NOT flip to AR (avoids the churn that regressed
-    // DS4 code, where noisy borderline AR windows kept clearing the drafter context).
-    // Deterministic full-accept-at-1 (S(1)=1, S(2+)=0) so the spec score is robust:
-    // best spec = τ(1)=2 / 40ms = 0.0500; AR = 1/19ms = 0.0526 (5.3% > spec, < margin).
-    #[test]
-    fn keeps_spec_when_ar_within_margin() {
-        let mut c = BlockController::new(2, 0, 7, 0.18);
-        c.set_cost_for_test(1.0, 40.0);
-        c.set_ar_cost_for_test(19.0); // only ~5% faster than best spec → within margin
-        for _ in 0..200 {
-            let b = c.block();
-            c.observe(1, b); // full-accept at depth 1: S(1)=1, S(2+)=0
-        }
-        assert!(
-            c.block() >= 1,
-            "AR within margin must not displace spec, got {}",
-            c.block()
-        );
     }
 
     // reset() restores request state (block, histogram) but PRESERVES the calibrated
