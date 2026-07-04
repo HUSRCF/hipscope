@@ -1159,10 +1159,20 @@ impl MtpDrafter for DsparkDrafter {
             .then(std::time::Instant::now);
 
         let ctx_positions = self.ctx_positions.clone();
-        let main_hidden = self
+        let main_hidden_real = self
             .main_hidden_dev
             .as_ref()
             .ok_or("DsparkDrafter: main_hidden_dev missing")?;
+        // DEBUG: HIPFIRE_DSPARK_ZERO_CTX=1 zeros the context main_hidden to test
+        // whether the drafter attends to it at all (identical drafts ⇒ ctx unused).
+        let _zero_ctx_holder;
+        let main_hidden = if std::env::var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
+            let n: usize = main_hidden_real.shape.iter().product();
+            _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
+            &_zero_ctx_holder
+        } else {
+            main_hidden_real
+        };
 
         // ── 2. Draft the block with DsparkBody ──────────────────────────────
         let x_head_out = gpu
