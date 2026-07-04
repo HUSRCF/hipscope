@@ -479,6 +479,9 @@ impl SpecTarget for ModelSlot {
         temp: f32,
         top_p: f32,
         top_k: usize,
+        // qwen35 DFlash's sampled verify runs the per-position draw path, which
+        // does not implement the CACTUS boost — ignored here (deepseek4-only).
+        _cactus_delta: f32,
         rng_state: &mut u64,
         hidden_gpu: &GpuTensor,
     ) -> Result<(Vec<u32>, bool), String> {
