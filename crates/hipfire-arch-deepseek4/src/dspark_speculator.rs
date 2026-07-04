@@ -213,7 +213,11 @@ pub fn build_deepseek4_dspark_body(
 /// output is unchanged (conf is a pure speed knob — committed tokens are the
 /// target argmax regardless of how many drafts were proposed). NB temp>0 wants
 /// the OPPOSITE (more truncation): at temp0.7 conf 0.5 > 0.1; but ds4 temp>0 is
-/// gated off in serving, so the greedy optimum governs the default.
+/// gated off in serving, so the greedy optimum governs the default. The resolved
+/// value is clamped to `[0, 1]` — it is a survival-sigmoid cutoff, so the
+/// env/JSON paths (which bypass the CLI's TS validation) can't push it out of
+/// range and silently degrade (`>1` ⇒ block always trims to 1 ≈ AR; `<0` ⇒
+/// truncation never fires).
 #[allow(clippy::too_many_arguments)]
 pub fn build_deepseek4_dspark_speculator(
     config: &DeepseekV4Config,
@@ -248,7 +252,8 @@ pub fn build_deepseek4_dspark_speculator(
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)
-        .unwrap_or(0.3);
+        .unwrap_or(0.3)
+        .clamp(0.0, 1.0);
 
     // Build arch-agnostic CoreDsparkWeights from sidecar globals (shallow clones).
     let core_weights = CoreDsparkWeights {
