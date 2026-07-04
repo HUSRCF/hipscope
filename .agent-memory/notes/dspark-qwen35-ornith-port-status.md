@@ -1,5 +1,5 @@
 ---
-title: DSpark→qwen35 (ORNITH-35B) — QUANTIZATION DONE (A0 expert-fusion + drafter sidecar committed; target runs coherently); engine port B/C/D/E/F remains
+title: DSpark→qwen35 (ORNITH-35B) — QUANT + ENGINE INTEGRATED (B/C/D/E committed @3d42af18, runs coherently, DSpark engages) but τ=0 (degenerate drafts; needs x_head parity harness)
 date: 2026-07-03
 tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,blocker,feature-dspark-qwen35]
 ---
@@ -12,11 +12,31 @@ tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,b
   DSparkDraftModel/speculators-v0.6.0 (nested `transformer_layer_config`, `aux_hidden_state_layer_ids`,
   d2t/t2d→F32, full `dspark_*` metadata). `ornith-35b-aeon-dspark.mq6` (1.5GB, 44 tensors).
   Alias `--format qwen35-dspark-q8`. Both models on disk under `~/.hipfire/models/`.
-- **REMAINS (engine, none started, coupled — none independently testable):**
-  D (qwen35 SpecTarget capture hooks — the crux, DeltaNet state + EAGLE-3 hidden capture, #462 hazard),
-  B (dspark_core reduced-vocab d2t remap), C (drafter forward config-driven dims hd256/pr0.25/2048/3L/3-target),
-  E (qwen35 carrier DSpark arm, precedence DSpark>DFlash>MTP>ngram), F (parity + coherence + serve-multiturn gates).
-  Sidecar discovery name = `<target-stem>-dspark.<ext>` (⇒ `ornith-35b-aeon-dspark.mq6`).
+- **ENGINE INTEGRATED (commit 3d42af18) + debug aid (b451ee8b):** B (dspark_core reduced-vocab d2t remap),
+  C (llama drafter: rope_theta 1e7 + reduced 32k lm_head + d2t load + partial-interleaved RoPE n_rot=64),
+  D (qwen35 SpecTarget hooks verify_block_capture_gpu/_sampled/capture_seed_main_hidden over DeltaNet;
+  capture_seed side-effect-free snapshot→forward→restore; ModelSlot.dspark_extract_layers field),
+  E (qwen35 carrier arm in lib.rs finish_qwen35_load, DSpark>DFlash>MTP>ngram), F (coherence-gate-qwen35-dspark.sh).
+  Daemon compiles + runs; DSpark engages (block=8, layers=[9,19,29], draft_vocab=32000); output COHERENT.
+- **BLOCKER τ=0.00** (exact, even on trivial predictable seq w/ closed_think — NOT thinking-OOD): drafter accepts
+  ZERO drafts. HIPFIRE_DSPARK_DEBUG=1 shows drafts DEGENERATE (low/repetitive/markov-dominated, non-contextual:
+  100,0,108) vs correct target picks; capture_seed main_hidden non-zero but rms≈0.05 (residual usually ~1-10 →
+  suspect). Bug in drafter path: capture point/scale/layer-order (D) OR partial-rotary halfsplit/n_rot (C) OR a
+  #492-class numeric convention. d2t verified lossless (NOT it). **NEXT: x_head parity harness vs DeepSpec ref
+  (~/dspark-work/DeepSpec modeling.py) — the tool #492 used for double-norm/RoPE-offset/confidence.**
+  Sidecar discovery = `<target-stem>-dspark.<ext>` (⇒ ornith-35b-aeon-dspark.mq6).
+- **SYSTEMATIC DEBUG (2026-07-04) — RULED OUT (all τ still 0.00):** (1) layers off-by-one — swept
+  HIPFIRE_DSPARK_LAYER_OFFSET -1/0/+1, all τ=0; reference `extract_context_feature` (DeepSpec
+  common.py:52) = raw concat of `hidden_states[layer_id+1]` (OUTPUT of layers [9,19,29]) matches
+  hipfire post-layer capture. (2) hidden scale (rms 0.05) — RED HERRING: fc→hidden_norm is RMSNorm,
+  scale-invariant. (3) thinking-OOD — τ=0 exact even w/ closed_think + predictable seq. (4) d2t —
+  lossless F32 round-trip. (5) dims — all derive correctly from tensor shapes (hd256/16h/2kv/6144/3L).
+  (6) rope style — halfsplit, SAME kernel the coherent TARGET uses (rope_partial_interleaved_f32_batched
+  n_rot=64). Drafts DEGENERATE/markov-dominated ⇒ x_head not encoding context ⇒ subtle drafter-FORWARD
+  numeric bug (block-attn ctx handling / fc ingest / a #492-class convention). **BLOCKED on x_head parity:
+  `speculators` lib NOT installed; DeepSpec dspark/qwen3/modeling.py is FULL-rotary (needs Qwen3.5
+  partial-rotary adaptation). Parity ex template = crates/hipfire-arch-llama/examples/qwen3_dspark_parity.rs.**
+  Debug: HIPFIRE_DSPARK_DEBUG=1 (drafts vs picks + capture hidden stats).
 
 ## Scope (branch feature/dspark-qwen35, off feature/dspark-qwen3/PR#492)
 Port DSpark spec-decode to **qwen35 MoE arch_id 6** (the DeltaNet-hybrid crate), target =
