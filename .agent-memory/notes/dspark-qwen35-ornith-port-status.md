@@ -37,6 +37,11 @@ tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,b
   `speculators` lib NOT installed; DeepSpec dspark/qwen3/modeling.py is FULL-rotary (needs Qwen3.5
   partial-rotary adaptation). Parity ex template = crates/hipfire-arch-llama/examples/qwen3_dspark_parity.rs.**
   Debug: HIPFIRE_DSPARK_DEBUG=1 (drafts vs picks + capture hidden stats).
+- **ZERO-CTX PROBE (HIPFIRE_DSPARK_ZERO_CTX=1, commit 4d874c1b):** drafts DIFFER real-vs-zeroed ctx ⇒
+  drafter IS wired to + attends the context, but output stays DEGENERATE/low-id (frequent-token) either
+  way. Not a disconnected context — a subtle FORWARD under-conditioning (weak x_head → lm_head defaults
+  to frequent tokens). Suspects: attention phase (partial-rotary halfsplit/positions), a norm, or fc.
+  Commits this session: 54e99d9d eb66c4f1 3d7848f5 3d42af18 b451ee8b fad6ae04 4d874c1b.
 
 ## Scope (branch feature/dspark-qwen35, off feature/dspark-qwen3/PR#492)
 Port DSpark spec-decode to **qwen35 MoE arch_id 6** (the DeltaNet-hybrid crate), target =
