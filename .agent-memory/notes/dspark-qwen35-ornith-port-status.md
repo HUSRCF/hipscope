@@ -1,5 +1,5 @@
 ---
-title: DSpark→qwen35 (ORNITH-35B) — QUANT + ENGINE INTEGRATED (B/C/D/E committed @3d42af18, runs coherently, DSpark engages) but τ=0 (degenerate drafts; needs x_head parity harness)
+title: DSpark→qwen35 (ORNITH-35B) — PORT PROVEN CORRECT (fwd+heads parity byte-match DeepSpec); τ=0 ROOT-CAUSED = BROKEN drafter ckpt (all-ones untrained norms), NOT hipfire
 date: 2026-07-03
 tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,blocker,feature-dspark-qwen35]
 ---
@@ -42,6 +42,21 @@ tags: [dspark,spec-decode,qwen35,arch6,moe,quantize,gate_up_proj,eagle3,ornith,b
   way. Not a disconnected context — a subtle FORWARD under-conditioning (weak x_head → lm_head defaults
   to frequent tokens). Suspects: attention phase (partial-rotary halfsplit/positions), a norm, or fc.
   Commits this session: 54e99d9d eb66c4f1 3d7848f5 3d42af18 b451ee8b fad6ae04 4d874c1b.
+- **ROOT CAUSE FOUND (2026-07-04, x_head parity harness, commit 07e7556a) — NOT a hipfire bug.**
+  Built torch parity: `crates/hipfire-arch-llama/examples/qwen35_dspark_parity.rs` (GPU side) +
+  `~/dspark-work/ornith_dspark_cpu_ref.py` (DeepSpec Qwen3DSparkModel + FAITHFUL partial-rotary,
+  byte-exact vs transformers qwen3_5 rope; strict=False forward-weights-only load). Torch env:
+  `.venv` + `nix develop` + LD_LIBRARY_PATH `/nix/store/si4q3...gcc-15.2.0-lib/lib` (+ zlib for numpy)
+  + PYTHONPATH=~/dspark-work/DeepSpec. RESULTS: (a) main_x cosine **1.000000**, (b) x_head cosine
+  **0.999873**, and run_heads (lm_head+markov+d2t) **byte-identical** to ref on the same x_head
+  (`[0,74,0,...]`). ⇒ entire hipfire drafter MATH (fc/partial-rotary attn/heads/d2t) is CORRECT.
+  **The drafter CHECKPOINT is broken:** every learnable RMSNorm weight (norm/hidden_norm/all layer
+  norms/QK-norms) is EXACTLY 1.0 std=0.0 (untrained/unexported) while matmuls (q_proj/fc/lm_head
+  std~0.02) are trained. Contrast the WORKING qwen3-8B DSpark drafter (~/dspark-work/qwen3/ckpt):
+  norm mean 1.52/std 0.14, q_norm mean 1.39/std 0.17 (TRAINED). Trained matmuls w/o their learned
+  norm scaling ⇒ drafter can't predict ⇒ τ=0. **FIX = re-export the drafter with trained norms
+  (pablogrant/author-side), NOT engine code.** (all-ones norms could theoretically be folded-into-
+  matmuls, but the same DeepSpec pipeline exported qwen3-8B with UNFOLDED trained norms ⇒ broken.)
 
 ## Scope (branch feature/dspark-qwen35, off feature/dspark-qwen3/PR#492)
 Port DSpark spec-decode to **qwen35 MoE arch_id 6** (the DeltaNet-hybrid crate), target =
