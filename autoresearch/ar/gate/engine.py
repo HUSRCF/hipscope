@@ -63,10 +63,14 @@ def gate_cell(runner, *, base_daemon, var_daemon, arch, model, base_ref, kv, max
 
 def run_gate(*, arch, changed_kernel_files, models, base_ref, head_ref, repo, cfg,
              runner_factory, cross_arch_fn=None, kv="q8", maxtok=128, prompt_md5="",
-             rerun_on_regression=True) -> dict:
+             rerun_on_regression=True, base_daemon="base", var_daemon="var") -> dict:
     """Certify a PR on one arch: cross-arch isolation + every fitting (model,arch)
     cell. REJECT on any cross-arch leak, parity/coherence fail, or replicated perf
-    regression; PASS otherwise (empty models => N/A PASS)."""
+    regression; PASS otherwise (empty models => N/A PASS).
+
+    ``base_daemon`` / ``var_daemon`` are the daemon identities the runner drives — in
+    production the REAL built binary PATHS for base_ref and head_ref (``gate.build``);
+    the defaults keep the mock-runner unit tests handle-agnostic."""
     cross = cross_arch_fn or cross_arch.check_cross_arch
     reasons: list[str] = []
     leaks: list[dict] = []
@@ -84,7 +88,7 @@ def run_gate(*, arch, changed_kernel_files, models, base_ref, head_ref, repo, cf
         reasons.append("no-fitting-model")
 
     for model in models:
-        cell = gate_cell(runner_factory(model), base_daemon="base", var_daemon="var",
+        cell = gate_cell(runner_factory(model), base_daemon=base_daemon, var_daemon=var_daemon,
                          arch=arch, model=model, base_ref=base_ref, kv=kv, maxtok=maxtok,
                          prompt_md5=prompt_md5)
         # NOTE: base_daemon/var_daemon are the opaque daemon identities the runner

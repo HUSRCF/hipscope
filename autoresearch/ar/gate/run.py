@@ -117,40 +117,93 @@ def interpret_results(*, results_dir, base, head, repo, author, is_draft, helpfu
             "outcome": outcome, "comment": format_pr_comment(outcome, arch_results)}
 
 
-def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=0, card=0, model=None) -> dict:
-    """REAL per-arch gate (GPU) — runs on a self-hosted runner only. Builds the
-    base + head daemons, runs the Phase-1 run_gate over a LiveServeRunner, then the
-    Phase-2 gate4 non-clobber merge. Imports the GPU adapter lazily so this module
-    stays GPU-free at import time.
+def daemon_touched(files) -> bool:
+    """True iff the diff changes code COMPILED INTO the daemon (so the daemon binary
+    can differ base-vs-head). Changes under autoresearch/, docs/, .github/, cli/,
+    scripts/ etc. do NOT touch the daemon — base≡head there, so every arch defers."""
+    return any(f.startswith("crates/") or f.startswith("kernels/") or f.startswith("Cargo.")
+               for f in files)
 
-    NOTE: requires the runner environment (ROCm, cargo, a built daemon, the GPU) and
-    the Phase-0 runners; it cannot execute on the zero-validation dev box. The daemon
-    build + LiveServeRunner construction are wired here; the workflow (gpu-gates.yml)
-    supplies dev/card and the built daemon paths per arch."""
-    from .engine import run_gate                    # lazy: keep this module import-light
-    from .merge import gate4, trial_merge
+
+def affected_archs(files, cfg) -> list:
+    """The archs whose GPU battery must actually run (§4.1 arch→box deferral). A
+    daemon-relevant change conservatively affects ALL fitting archs (narrowing to the
+    specific gfxNNNN a kernel #if-gates is a later optimization); a non-daemon change
+    (docs/ar/CI-only) affects NONE — every box defers to a no-op PASS."""
+    return list(cfg.archs) if daemon_touched(files) else []
+
+
+def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, model=None) -> dict:
+    """REAL per-arch gate (GPU) — runs on a self-hosted runner only. BUILDS the base +
+    head daemon binaries (``gate.build``, cached by sha), resolves the arch's HIP
+    device (``gate.device`` — by gfxNNNN, never a fixed index), then runs the Phase-1
+    ``run_gate`` over a ``LiveServeRunner`` driving those two REAL binaries (the fix for
+    the ``subprocess.run("base")`` scaffold), then the Phase-2 ``gate4`` non-clobber
+    merge. GPU adapter imported lazily so this module stays GPU-free at import time.
+
+    Requires the runner environment (ROCm, cargo, the models under
+    ``$HIPFIRE_MODELS_DIR`` (default ~/.hipfire/models), the GPU). Cannot execute on
+    the zero-validation dev box."""
+    from .build import build_daemon                 # lazy: cargo/git, prod-only
+    from .device import resolve_device
+    from .engine import run_gate
+    from .merge import gate4
     from ..certify.serve_runner import LiveServeRunner
 
     kernel_files = [f for f in files if f.startswith("kernels/") and f.endswith(".hip")]
-    sku = model or (cfg.canonical_models[0] if cfg.canonical_models else "qwen3.6-a3b")
+
+    # Arch→box deferral (§4.1): a box only runs archs the diff actually affects; an
+    # unaffected arch is a no-op PASS (no build, no GPU) so it can never spuriously
+    # parity-fail. A docs/ar-only PR (base≡head daemon) defers on every arch.
+    if arch not in affected_archs(files, cfg):
+        return {"arch": arch, "verdict": "PASS", "reasons": ["deferred"], "bod": None,
+                "tok_delta_pct": 0.0}
+
+    dev = resolve_device(arch, default=dev if dev is not None else 0)
+    card = card if card is not None else dev
+    kv = getattr(cfg, "kv_mode", None) or "q8"
+    models_dir = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
+
+    # Build the two daemons FIRST — a head build failure = the PR doesn't compile at
+    # this ref => REJECT (not a crash); a base build failure is an infra error.
+    try:
+        base_bin = build_daemon(base, repo)
+    except RuntimeError as e:
+        return {"arch": arch, "verdict": "ERROR", "reasons": [f"base_build:{e}"], "bod": None}
+    try:
+        head_bin = build_daemon(head, repo)
+    except RuntimeError as e:
+        return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"],
+                "bod": None, "detail": str(e)}
 
     def factory(m):
-        return LiveServeRunner(model=m, arch=arch, dev=dev, card=card, kv=cfg.kv_mode
-                               if hasattr(cfg, "kv_mode") else "q8")
+        # m is the SKU name (label); the runner drives the resolved model PATH.
+        return LiveServeRunner(model=os.path.join(models_dir, m), arch=arch, dev=dev,
+                               card=card, kv=kv)
 
     models = cfg.models_for(arch)
-    gate = run_gate(arch=arch, changed_kernel_files=kernel_files, models=models,
-                    base_ref=base, head_ref=head, repo=repo, cfg=cfg,
-                    runner_factory=factory)
-    if gate["verdict"] == "REJECT":
-        return {"arch": arch, "verdict": "REJECT", "reasons": gate["reasons"], "bod": None}
 
-    # Non-clobber merge: gate the merged tree vs the staging tip (here: base).
+    def _gate(bd, vd):
+        return run_gate(arch=arch, changed_kernel_files=kernel_files, models=models,
+                        base_ref=base, head_ref=head, repo=repo, cfg=cfg,
+                        runner_factory=factory, base_daemon=bd, var_daemon=vd)
+
+    gate = _gate(base_bin, head_bin)
+    if gate["verdict"] == "REJECT":
+        return {"arch": arch, "verdict": "REJECT", "reasons": gate["reasons"],
+                "bod": None, "tok_delta_pct": _tok_delta(gate)}
+
+    # Non-clobber merge: gate the merged tree vs the staging tip (here: base). The
+    # merged daemon is built from the trial-merge result inside gate4's run_merged_gate.
     g4 = gate4(base_ref=base, head_ref=head, staging_ref=base, repo=repo,
-               run_merged_gate=lambda: run_gate(
-                   arch=arch, changed_kernel_files=kernel_files, models=models,
-                   base_ref=base, head_ref=head, repo=repo, cfg=cfg, runner_factory=factory),
-               merge_fix=None)
+               run_merged_gate=lambda: _gate(base_bin, head_bin), merge_fix=None)
     if g4["verdict"] == "BOD":
         return {"arch": arch, "verdict": "BOD", "reasons": [], "bod": g4["bod"]}
-    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None}
+    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None,
+            "tok_delta_pct": _tok_delta(gate)}
+
+
+def _tok_delta(gate) -> float:
+    """Surface the worst (most negative) per-cell tok/s delta for the sweep/BOD."""
+    deltas = [c.get("tok_delta_pct") for c in gate.get("cells", []) if c.get("tok_delta_pct") is not None]
+    return min(deltas) if deltas else 0.0

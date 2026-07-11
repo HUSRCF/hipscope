@@ -38,13 +38,28 @@ Completes the pipeline `ci.yml` and `claude-review.yml` already reference:
 | 2 | `claude-review.yml` | ubuntu | **dispatcher + interpreter** (GPU-free): read diff → select tests → trigger Tier 3 → interpret results → verdict/merge/BOD | exists (re-enable + elevate) |
 | **3** | **`gpu-gates.yml`** | **self-hosted matrix** | **deterministic `ar gate`**: fit → cross-arch → parity → perf → coherence → non-clobber merge | **new** |
 
-**Division of labor:** Claude (Tier 2) is the *brain* — it decides what to test,
-triggers Tier 3, and interprets the machine verdict into a human/contributor
-recommendation and a merge action. Tier 3 is the *instrument* — a deterministic
-`ar gate` per arch that renders parity/perf/coherence verdicts. codex/grok stay
-on-box as the executors that run `ar gate` and perform agentic sub-tasks
-(behavior tests, merge-fix, offender bisect). **Claude orchestrates; the engine
-decides the raw verdict.**
+**Division of labor (agentic-first).** Claude is the *brain*; **codex on the
+owning box is the hands**; the deterministic `gate_cell` math is the *ruler*. The
+per-PR flow, actor by actor:
+
+```
+CLAUDE classify + route (§8)  →  CLAUDE writes codex directions (§8)
+  →  codex exec -p "[directions]"  on the box that OWNS the affected arch:
+       cargo build --release --features deltanet -p hipfire-runtime --example daemon
+         @base_ref AND @head_ref  (cache by sha),
+       run scripts/serve_harness.py parity/perf/coherence per (model, arch),
+       invoke the deterministic gate_cell to GRADE the measurements  →  results/<arch>.json
+  →  CLAUDE decide_pr (§8/§12)  →  CLAUDE PR comment (§9)
+  →  codex exec  Gate-4 non-clobber merge + merge-fix (§10)  →  staging train (§11)
+  →  CLAUDE automerge (§12, Kaden-only, behind GATE_AUTOMERGE)
+```
+
+Two things that keep this honest: **codex RUNS `gate_cell`, it never *judges*
+parity** — the parity/perf/coherence math is deterministic (`certify/verdict.py`,
+reused from the loop), so codex reports token-ids / tok-s / detector output and the
+math decides PASS/FAIL. And **serve_harness is `scripts/serve_harness.py`
+(committed) — codex does NOT build it**; the only on-box build is the daemon,
+per ref. **Claude orchestrates; the deterministic core decides the raw verdict.**
 
 ## 4. The gate pipeline (per eligible arch, cheapest-first, short-circuiting)
 
@@ -59,6 +74,23 @@ decides the raw verdict.**
 
 Gate 0 is per `(model, arch)` cell; a cell that does not fit is skipped as N/A,
 never a failure. "If any *eligible* arch regresses → reject."
+
+### 4.1 Arch → box deferral (neither box parity-fails on an arch it can't run)
+
+The GPU fleet is **two** boxes: **hipx owns {gfx1100, gfx1151}**, **hiptrx owns
+{gfx1201}**. Claude's `decide` step computes the PR's **affected archs** from the
+diff. Each box gates only `affected_archs ∩ box_archs`:
+
+- Non-empty → the box builds + runs the real gate for those archs.
+- **Empty → the box DEFERS: a no-op PASS, not a run.** hipx defers a gfx1201-only
+  change to hiptrx; hiptrx defers a gfx1100/1151 change to hipx. A box never spawns a
+  daemon for an arch its GPUs don't provide, so it can **never spuriously parity-fail**
+  on a non-owned arch (the 70 ms empty-output REJECT the scaffold produced).
+
+The **cross-arch leak** check (Gate 1) is orthogonal and still fires everywhere: a
+gfx1201 change that alters the gfx1100 device codegen is a *real* REJECT on hipx —
+that is arch-bleed, not a deferral. Deferral skips the *battery* for a non-owned
+arch; it never skips the isolation check for an owned one.
 
 ## 5. Model × arch fit map (config-driven)
 
@@ -310,11 +342,15 @@ commits become master ancestors; each folded PR is closed with a
 `landed via staging stack → <master-sha>` comment + link. Where GitHub detects
 the ancestry it shows "merged"; otherwise "closed (landed via stack)".
 
-### 11.1 Backlog sweep
+### 11.1 Backlog sweep — COLD START ONLY
 
-`ar gate --sweep` (and a scheduled job) drains the open-PR backlog in one pass onto
-a **collection branch** — `feat/rdna-kernel-oracle` for the current batch — then lands
-the whole non-clobbering stack on master together. For each open eligible PR:
+The sweep is a **one-time cold-start** to clear the *standing* open-PR backlog that
+accumulated before the gate existed — **not** a steady-state pipeline component. Once
+the backlog is drained, the pipeline is per-PR (classify → codex gate → decide →
+codex Gate-4 → staging → automerge); no recurring/scheduled sweep runs. `ar gate
+--sweep` (via `gate-sweep.yml`, `workflow_dispatch`) drains the backlog in one pass
+onto a **collection branch** — `feat/rdna-kernel-oracle` for this batch — which a
+maintainer then lands as one non-clobbering stack. For each open eligible PR:
 
 - **Gate it. A REJECT is *punted, not resolved*.** In particular a **perf regression
   is skipped and the sweep moves to the next PR** — perf is never auto-fixed. Only
