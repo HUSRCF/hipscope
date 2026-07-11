@@ -21,7 +21,7 @@ def codex_merge_fix(pr_ref, staging_ref, repo, *, model="gpt-5.6-sol", effort="x
     codex rebases the PR onto the staging tip and resolves conflicts; on success we
     return the new staging commit. Never pushes to the PR's own branch — the fix lives
     on staging, so it works for fork PRs too. Returns {resolved: bool, staging_ref: str}."""
-    from ..agent_exec import run_round
+    from ..agent_exec import run_round_resilient
 
     prompt = (
         f"On the git repo at {repo}, the branch/ref `{staging_ref}` is the staging tip and "
@@ -32,7 +32,9 @@ def codex_merge_fix(pr_ref, staging_ref, repo, *, model="gpt-5.6-sol", effort="x
         f"tree is clean and committed, print the resulting commit sha on a line by itself as "
         f"`RESOLVED <sha>`; if you cannot resolve it, print `UNRESOLVED`."
     )
-    run_round(harness="codex", model=model, effort=effort, prompt=prompt, cwd=repo)
+    # gpt-5.6-sol => sol-class: on a codex usage-limit this WAITS for reset (no grok
+    # downgrade) — a merge-conflict resolution needs the top tier.
+    run_round_resilient(harness="codex", model=model, effort=effort, prompt=prompt, cwd=repo)
     # The resolution's new staging tip = staging's HEAD after codex committed.
     code, out = default_run_git(repo, "rev-parse", staging_ref)
     new_ref = out.strip() if code == 0 else staging_ref
@@ -84,6 +86,53 @@ def stage_train(*, approved_prs, master_ref, repo, arch_gate_fn, recorded_by_pr,
         )
 
     return staging.stack_train(approved_prs=approved_prs, master_ref=master_ref, repo=repo, fold_fn=fold_fn)
+
+
+def sweep_backlog(*, open_prs, collection_ref, repo, arch, dev=0, card=0,
+                  recorded_by_pr=None, gate_config=None):
+    """LIVE: sweep the open PRs onto the collection branch (spec §11.1). Binds the
+    sweep's gate_fn (run the live gate per PR vs the collection tip → verdict +
+    perf_delta) and fold_fn (fold_pr with real trial-merge + codex merge-fix +
+    recall-reproduce). Perf regressions punt; conflicts resolve; a fold that loses a
+    perf gain triggers the perf-preserving supersede. Returns sweep()'s result. This is
+    LIVE-VALIDATED glue over the tested sweep/staging cores."""
+    import os
+
+    from . import run, staging
+    from .config import load_gate_config
+    from .sweep import sweep as _sweep_run  # the fn; `gate.sweep` re-exports it, not the module
+
+    cfg = load_gate_config(gate_config or os.path.join(repo, "autoresearch", "config", "pr_gate.toml"))
+    recorded_by_pr = recorded_by_pr or {}
+
+    # Fetch each PR's head into a stable local ref (works for forks via refs/pull/N/head).
+    pr_ref = {}
+    for pr in open_prs:
+        ref = f"refs/sweep/pr-{pr}"
+        default_run_git(repo, "fetch", "-q", "origin", f"pull/{pr}/head:{ref}")
+        pr_ref[pr] = ref
+
+    def _arch_gate(ref, recorded=None):
+        r = run.live_arch_gate(arch, [], collection_ref, ref, repo, cfg, dev=dev, card=card)
+        return {"failures": [] if r["verdict"] == "PASS" else list(r.get("reasons", []))}
+
+    def gate_fn(pr):
+        r = run.live_arch_gate(arch, [], collection_ref, pr_ref[pr], repo, cfg, dev=dev, card=card)
+        return {"verdict": "PASS" if r["verdict"] == "PASS" else "REJECT",
+                "reasons": list(r.get("reasons", [])),
+                "perf_delta": float(r.get("tok_delta_pct") or 0.0)}
+
+    def fold_fn(pr, staging_ref):
+        return staging.fold_pr(
+            pr_ref=pr_ref[pr], staging_ref=staging_ref, master_ref=collection_ref, repo=repo,
+            recorded=recorded_by_pr.get(pr, []),
+            trial_merge_fn=lambda b, h, r: trial_merge(b, h, r),
+            merge_fix_fn=lambda p, s, r: codex_merge_fix(p, s, r),
+            reproduce_fn=lambda p, merged, rec, r: reproduce_recorded(p, merged, rec, r, arch_gate_fn=_arch_gate),
+        )
+
+    return _sweep_run(open_prs=open_prs, base_ref=collection_ref, repo=repo,
+                      gate_fn=gate_fn, fold_fn=fold_fn)
 
 
 def land(*, train, staging_ref, master_ref, repo, arch_gate_fn, recorded_all, run_git=None):

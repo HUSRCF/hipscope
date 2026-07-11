@@ -343,6 +343,27 @@ def cmd_gate(a) -> int:
     cfg = load_gate_config(path)
     repo = _repo()
 
+    if getattr(a, "sweep", False):
+        # Backlog sweep (spec §11.1): gate all open eligible PRs, punt regressions,
+        # stack the approved onto the collection branch. LIVE (GPU / codex / git).
+        import subprocess as _sp
+
+        from .gate.staging_prod import sweep_backlog
+
+        prs = [p for p in (a.prs.split(",") if a.prs else []) if p]
+        if not prs:
+            r = _sp.run(
+                ["gh", "pr", "list", "--state", "open", "--limit", "80",
+                 "--json", "number,isDraft,baseRefName",
+                 "--jq", '.[] | select(.isDraft==false and .baseRefName=="master") | .number'],
+                capture_output=True, text=True, cwd=repo,
+            )
+            prs = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        res = sweep_backlog(open_prs=prs, collection_ref=(a.collection or "feat/rdna-kernel-oracle"),
+                            repo=repo, arch=(a.arch or "gfx1201"), dev=a.dev, card=a.card)
+        print(json.dumps(res, indent=2))
+        return 0
+
     if getattr(a, "behavior_tests", None):
         # Run the bespoke codex behavior tests from Claude's plan.json (spec §8) —
         # tests behaviors serve_harness can't reach. Emits the behavior_results JSON.
@@ -575,6 +596,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="behavior_results JSON to fold into --interpret")
     s.add_argument("--verdict-dir", dest="verdict_dir", default=None,
                    help="dir for codex behavior-test verdict files (--behavior-tests)")
+    s.add_argument("--sweep", action="store_true",
+                   help="backlog sweep: gate all open PRs, stack the approved onto --collection (spec §11.1)")
+    s.add_argument("--collection", default=None,
+                   help="collection branch for --sweep (default feat/rdna-kernel-oracle)")
+    s.add_argument("--prs", default=None,
+                   help="comma PR numbers for --sweep (default: all open non-draft base=master)")
     s.add_argument("--base", default="origin/master", help="base ref the PR merges into")
     s.add_argument("--head", default="HEAD", help="head ref (the PR)")
     s.add_argument("--pr", default=None, help="PR number (label only)")

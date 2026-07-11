@@ -26,10 +26,31 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 
 # grok agent-turn cap default (codex is bounded by its per-round wall timeout,
 # not a turn count — it ignores this).
 DEFAULT_MAX_TURNS = 120
+
+# Substrings that mark a codex USAGE-LIMIT / rate-limit refusal (not a task
+# failure). Matched case-insensitively against the codex round's combined
+# stdout+stderr, and ONLY when the round also exited non-zero — so a codex
+# answer that merely *mentions* "usage limit" while succeeding never trips it.
+# Broad on purpose (codex's exact wording drifts between releases); the
+# nonzero-exit gate is what keeps it from false-positiving on task content.
+CODEX_USAGE_LIMIT_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "rate-limit",
+    "quota",
+    "429",
+    "too many requests",
+    "you've reached your",
+    "you have reached your",
+    "resets at",
+    "try again later",
+    "resource_exhausted",
+)
 
 # stdin sentinel: codex/grok read the prompt from stdin when the positional
 # prompt slot is ``-`` (the driver always pipes the prompt via :func:`run_round`).
@@ -124,3 +145,102 @@ def run_round(
         argv = build_argv(harness, model, effort, STDIN, cwd, max_turns)
         proc = subprocess.run(argv, input=prompt, text=True)
     return proc.returncode
+
+
+def _run_capture(harness, model, effort, prompt, cwd, max_turns):
+    """One round like :func:`run_round`, but capturing combined stdout+stderr so the
+    caller can scan it for a usage-limit marker. Echoes the output back so CI logs
+    still show the round. Returns ``(returncode, combined_output)``."""
+    h = (harness or "codex").lower()
+    if h == "grok":
+        argv = build_argv(harness, model, effort, prompt, cwd, max_turns)
+        proc = subprocess.run(argv, text=True, capture_output=True)
+    else:
+        argv = build_argv(harness, model, effort, STDIN, cwd, max_turns)
+        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if out:
+        print(out, end="" if out.endswith("\n") else "\n")
+    return proc.returncode, out
+
+
+def is_sol_class(model: str) -> bool:
+    """A 'sol-class' round needs the top intelligence tier (gpt-5.6-sol). We DON'T
+    silently degrade these to grok — when codex is usage-limited we wait for it to
+    reset instead. luna/terra rounds are grok-substitutable."""
+    return "sol" in (model or "").lower()
+
+
+def _is_codex_usage_limit(rc: int, output: str) -> bool:
+    if rc == 0:
+        return False
+    low = (output or "").lower()
+    return any(m in low for m in CODEX_USAGE_LIMIT_MARKERS)
+
+
+def run_round_resilient(
+    harness: str,
+    model: str,
+    effort: str,
+    prompt: str,
+    cwd: str,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    *,
+    require_sol: bool | None = None,
+    grok_model: str | None = None,
+    grok_effort: str | None = None,
+    run_fn=None,
+    sleep_fn=None,
+    reset_poll_secs: int | None = None,
+    max_codex_waits: int | None = None,
+) -> int:
+    """Run one round, resilient to a codex USAGE-LIMIT refusal (a drop-in for
+    :func:`run_round`, same positional signature, returns the exit code).
+
+    Policy (per operator directive): a codex round that fails **because codex is out
+    of usage** either falls back to grok or waits for codex to reset —
+
+    * **sol-class** round (``require_sol``; defaults to ``is_sol_class(model)``): the
+      top intelligence tier is *required*, so we DON'T degrade to grok. We wait
+      ``reset_poll_secs`` and retry codex, up to ``max_codex_waits`` times, until it
+      recovers; if the wait budget is exhausted we return codex's failing rc (the
+      caller punts — never a silent sol→grok downgrade).
+    * **non-sol** round (luna/terra): fall back to grok immediately with the SAME
+      prompt (``grok_model``, default ``$GATE_GROK_MODEL`` or ``grok-4.5``).
+
+    Only a usage-limit refusal triggers this — a genuine codex error (nonzero exit
+    without a usage marker) is returned as-is (never masked by a model swap), and a
+    non-codex harness runs exactly once. ``run_fn(harness,model,effort,prompt,cwd,
+    max_turns)->(rc,output)`` and ``sleep_fn(secs)`` are injected for testing."""
+    run_fn = run_fn or _run_capture
+    h = (harness or "codex").lower()
+    if h != "codex":
+        rc, _ = run_fn(harness, model, effort, prompt, cwd, max_turns)
+        return rc
+
+    if require_sol is None:
+        require_sol = is_sol_class(model)
+
+    rc, out = run_fn("codex", model, effort, prompt, cwd, max_turns)
+    if not _is_codex_usage_limit(rc, out):
+        return rc  # success, or a real (non-usage) failure — return as-is
+
+    if not require_sol:
+        gm = grok_model or os.environ.get("GATE_GROK_MODEL", "grok-4.5")
+        ge = grok_effort if grok_effort is not None else effort
+        print(f"[agent_exec] codex usage-limited on non-sol '{model}' -> grok fallback ({gm})")
+        rc2, _ = run_fn("grok", gm, ge, prompt, cwd, max_turns)
+        return rc2
+
+    # sol-class: wait for codex to reset, then retry (no grok downgrade).
+    sleep_fn = sleep_fn or time.sleep
+    poll = reset_poll_secs if reset_poll_secs is not None else int(os.environ.get("CODEX_RESET_POLL_SECS", "900"))
+    waits = max_codex_waits if max_codex_waits is not None else int(os.environ.get("CODEX_MAX_WAITS", "8"))
+    for i in range(waits):
+        print(f"[agent_exec] codex usage-limited on sol '{model}'; waiting {poll}s for reset ({i + 1}/{waits})")
+        sleep_fn(poll)
+        rc, out = run_fn("codex", model, effort, prompt, cwd, max_turns)
+        if not _is_codex_usage_limit(rc, out):
+            return rc
+    print(f"[agent_exec] codex still usage-limited on sol '{model}' after {waits} waits — punting (no grok downgrade)")
+    return rc

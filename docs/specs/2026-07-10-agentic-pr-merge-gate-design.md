@@ -195,6 +195,26 @@ false-pass/false-reject rates:
 codex authenticates **box-local** on hipx/hiptrx (not a GitHub secret). pi.dev
 slots in as a fourth harness when added (§Phase 6).
 
+**Codex usage-limit resilience.** codex exec can refuse a round when the box's
+codex account is out of usage. `agent_exec.run_round_resilient` (the seam every
+gate codex round runs through — behavior tests §8 *and* the Gate-4 merge-fix §11)
+distinguishes that refusal (nonzero exit **plus** a usage-limit marker in codex's
+output) from a genuine task failure and reacts by tier:
+
+- **non-sol** (luna/terra) round → **fall back to grok** immediately with the
+  identical prompt (grok is a fine substitute at these tiers; `$GATE_GROK_MODEL`,
+  default `grok-4.5`). grok exists on hiptrx; on a box without grok the fallback
+  round simply fails and the PR punts — never a false pass.
+- **sol** (`gpt-5.6-sol`, high-risk / merge-conflict) round → the top
+  intelligence tier is *required*, so we do **not** degrade to grok. We **wait**
+  `CODEX_RESET_POLL_SECS` (default 900s) and retry codex, up to `CODEX_MAX_WAITS`
+  (default 8) times, until codex resets. Exhausting the wait budget returns
+  codex's failing rc (the PR punts) — a sol requirement is never silently
+  downgraded to a lower tier.
+
+A genuine codex error (nonzero exit **without** a usage marker) is returned as-is
+and never masked by a model swap.
+
 ## 9. Offender location → contributor recommendation
 
 `certify` runs per kernel, so a regression is attributed to the specific kernel
