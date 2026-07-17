@@ -6157,8 +6157,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
         needs_last_token_logits,
-        None, // max_layer: single-chunk captured path always runs the full stack
-        None, // routed_out: non-EP single-GPU path
+        None,  // max_layer: single-chunk captured path always runs the full stack
+        false, // split-tail is request-scoped; captured callers do not carry the full request
+        None,  // routed_out: non-EP single-GPU path
     )
 }
 
@@ -6473,6 +6474,27 @@ pub fn forward_prefill_batch_with_pbs_opts(
         );
     }
 
+    // Classify the complete uncached request before splitting it into
+    // PREFILL_MAX_BATCH chunks. A per-chunk batch-size gate cannot distinguish
+    // a fresh 4K prompt from a cached 256-token suffix.
+    let allow_qkvza_split_tail = gpu.arch_caps.is_rdna3_dgpu()
+        && tree_verify.is_none()
+        && mask_override.is_none()
+        && max_layer.is_none()
+        && gpu
+            .flags
+            .qkvza_split_tail_for_uncached_prefill(start_pos, n);
+    if gpu.flags.qkvza_split_tail_diag {
+        eprintln!(
+            "hipfire qkvza_split_tail request eligible={} arch={} start_pos={} uncached_tokens={} min_tokens={}",
+            allow_qkvza_split_tail,
+            gpu.arch,
+            start_pos,
+            n,
+            gpu.flags.qkvza_split_tail_min_prefill_tokens,
+        );
+    }
+
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
@@ -6551,6 +6573,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 mo_for_chunk,
                 needs_last_token_logits,
                 max_layer,
+                allow_qkvza_split_tail,
                 None, // routed_out: non-EP single-GPU path
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
@@ -7364,6 +7387,7 @@ fn run_fused_gate_up_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        allow_qkvza_split_tail: false,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
@@ -7413,6 +7437,7 @@ fn run_fused_qkv_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        allow_qkvza_split_tail: false,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
@@ -7448,6 +7473,7 @@ fn run_fused_qkvza_key(
     alpha_m: usize,
     k: usize,
     n: usize,
+    allow_qkvza_split_tail: bool,
 ) -> HipResult<()> {
     use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
     let ctx = DispatchCtx::new(gpu);
@@ -7460,6 +7486,7 @@ fn run_fused_qkvza_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        allow_qkvza_split_tail,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
@@ -8229,6 +8256,7 @@ fn forward_prefill_chunk(
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
+    allow_qkvza_split_tail: bool,
     // EP (Ship 6 substrate-EP prefill): per-MoE-layer routed partial. ONLY set
     // by the EP driver, which calls this with a SINGLE-layer band so the routed
     // combine of that one MoE layer lands in the zeroed partial (all-reduced by
@@ -8570,6 +8598,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_q8 && q8_wmma_arch {
                     // `is_q8` only inspects `wqkv` (the routing anchor). The fused
@@ -8600,6 +8629,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_q8 {
                     // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
@@ -8670,6 +8700,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_mq3 {
                     // 104 B/group HFQ3-stride; X is already FWHT-rotated by
@@ -8695,6 +8726,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_fp4 {
                     // HFP4G32: 17-B blocks (vs HFQ4's 136-B groups), per-row 16-B header.
@@ -8719,6 +8751,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else {
                     run_fused_qkvza_key(
@@ -8739,6 +8772,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 }
 
@@ -10468,6 +10502,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_q8 && q8_wmma_arch {
                     // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
@@ -10499,6 +10534,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 } else if is_q8 {
                     // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
@@ -10566,6 +10602,7 @@ fn forward_prefill_chunk(
                         layer.w_alpha.m,
                         layer.wqkv.k,
                         n,
+                        allow_qkvza_split_tail,
                     )?;
                 }
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -15055,6 +15092,7 @@ pub fn forward_prefill_batch_ep(
                 None,  // mask_override
                 false, // needs_last_token_logits (no lm_head in band)
                 None,  // max_layer
+                false, // split-tail is currently single-GPU only
                 routed_out,
             )?;
         }
@@ -16773,10 +16811,11 @@ pub fn forward_prefill_batch_multi(
                         None,  // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
-                        None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
-                        true, // needs_last_token_logits: preserve multi-GPU post-condition
-                        None, // max_layer: multi-GPU PP path runs full stack
-                        None, // routed_out: PP bands are multi-layer, not EP
+                        None,  // mask_override: multi-GPU PP path doesn't use the MTP probe hook
+                        true,  // needs_last_token_logits: preserve multi-GPU post-condition
+                        None,  // max_layer: multi-GPU PP path runs full stack
+                        false, // split-tail is currently single-GPU only
+                        None,  // routed_out: PP bands are multi-layer, not EP
                     )?;
                 }
 

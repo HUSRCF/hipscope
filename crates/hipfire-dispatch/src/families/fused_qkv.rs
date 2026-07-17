@@ -29,6 +29,9 @@ pub struct FusedQkvParams<'a> {
     /// method's internal arch routing byte-for-byte. Only the gate+up arms read
     /// this field; QKV / QKVZA / Paro arms ignore it.
     pub batch_size: Option<usize>,
+    /// Request-level eligibility for the RDNA3 HFQ4 QKVZA split-tail route.
+    /// Only `FusedQkvzaHfq4G256` reads this hint; all other variants ignore it.
+    pub allow_qkvza_split_tail: bool,
 }
 
 /// Qwen2-only decode parameters for the Q/K/V-bias fold. This is deliberately
@@ -265,9 +268,23 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
             match params.batch_size {
-                Some(n) => hip!(gpu.gemm_qkvza_hfq4g256(
-                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
-                    n
+                Some(n) => hip!(gpu.gemm_qkvza_hfq4g256_with_split_tail(
+                    wqkv,
+                    wz,
+                    w_beta,
+                    w_alpha,
+                    x,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    mqkv,
+                    mz,
+                    mbeta,
+                    malpha,
+                    k,
+                    n,
+                    params.allow_qkvza_split_tail
                 )),
                 None => hip!(gpu.fused_qkvza_hfq4g256(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k

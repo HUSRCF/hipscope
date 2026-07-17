@@ -1000,6 +1000,7 @@ fn launch_fused(
                     k: wq.k,
                     rot_scratch: &[],
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }
@@ -1024,6 +1025,7 @@ fn launch_fused(
                     k: wg.k,
                     rot_scratch: &[],
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }
@@ -1050,6 +1052,7 @@ fn launch_fused(
                     k: wqkv.k,
                     rot_scratch: &[],
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }
@@ -1108,6 +1111,7 @@ fn launch_fused(
                     k,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }
@@ -1148,6 +1152,7 @@ fn launch_fused(
                     k,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }
@@ -1187,6 +1192,7 @@ fn launch_fused(
                     k: kk,
                     rot_scratch: &rot_aliases,
                     batch_size: None,
+                    allow_qkvza_split_tail: false,
                 },
             )
         }

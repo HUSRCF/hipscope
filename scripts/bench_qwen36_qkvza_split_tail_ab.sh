@@ -20,6 +20,8 @@ GEN="${GEN:-1}"
 WARMUP="${WARMUP:-0}"
 KV_MODE="${KV_MODE:-q8}"
 DPM_WARMUP_SECS="${DPM_WARMUP_SECS:-5}"
+MIN_PREFILL_TOKENS="${MIN_PREFILL_TOKENS:-4096}"
+DIAG="${DIAG:-0}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-360}"
 MODE_SEQUENCE="${MODE_SEQUENCE:-off on}"
 RESULT_DIR="${RESULT_DIR:-benchmarks/results/qkvza_split_tail_rdna3_$(date +%Y%m%d_%H%M%S)}"
@@ -29,9 +31,12 @@ mkdir -p "$RESULT_DIR"
 export HIP_VISIBLE_DEVICES="$GPU_ID"
 export HIPFIRE_KV_MODE="$KV_MODE"
 export HIPFIRE_DPM_WARMUP_SECS="$DPM_WARMUP_SECS"
+export HIPFIRE_QKVZA_SPLIT_TAIL_MIN_PREFILL_TOKENS="$MIN_PREFILL_TOKENS"
+export HIPFIRE_QKVZA_SPLIT_TAIL_DIAG="$DIAG"
 
 summary_tsv="$RESULT_DIR/summary.tsv"
 meta_txt="$RESULT_DIR/meta.txt"
+route_summary_txt="$RESULT_DIR/route_summary.txt"
 
 {
     echo "git_head=$(git rev-parse HEAD 2>/dev/null || true)"
@@ -46,6 +51,8 @@ meta_txt="$RESULT_DIR/meta.txt"
     echo "warmup=$WARMUP"
     echo "kv_mode=$KV_MODE"
     echo "dpm_warmup_secs=$DPM_WARMUP_SECS"
+    echo "min_prefill_tokens=$MIN_PREFILL_TOKENS"
+    echo "diag=$DIAG"
     echo "timeout_secs=$TIMEOUT_SECS"
     echo "mode_sequence=$MODE_SEQUENCE"
     echo
@@ -57,6 +64,7 @@ meta_txt="$RESULT_DIR/meta.txt"
 } >"$meta_txt"
 
 printf "seq\tmode\trun\tprefill_ms\tprefill_tok_s\n" >"$summary_tsv"
+: >"$route_summary_txt"
 
 run_mode() {
     local seq="$1"
@@ -104,6 +112,12 @@ run_mode() {
             }
         }
     ' "$log" >>"$summary_tsv"
+
+    local eligible route_hits
+    eligible=$(grep -c 'qkvza_split_tail request eligible=true' "$log" || true)
+    route_hits=$(grep -c 'qkvza_split_tail route=hit' "$log" || true)
+    printf 'mode=%s eligible_events=%s route_hit_events=%s\n' \
+        "$mode" "$eligible" "$route_hits" | tee -a "$route_summary_txt"
 }
 
 seq=1

@@ -114,6 +114,12 @@ pub struct FeatureFlags {
     /// MMQ while sending the narrow beta/alpha tails through dot2.
     /// Opt in with HIPFIRE_QKVZA_SPLIT_TAIL=1.
     pub qkvza_split_tail: bool,
+    /// Minimum uncached request-level prefill length for the split-tail route.
+    /// The request must also start at position zero; individual 256-token
+    /// chunks are not sufficient to qualify on their own.
+    pub qkvza_split_tail_min_prefill_tokens: usize,
+    /// Emit request eligibility and first-route diagnostics.
+    pub qkvza_split_tail_diag: bool,
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
@@ -434,6 +440,11 @@ impl FeatureFlags {
             gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
             gate_up_nosync: std::env::var("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
+            qkvza_split_tail_min_prefill_tokens: parse_usize(
+                "HIPFIRE_QKVZA_SPLIT_TAIL_MIN_PREFILL_TOKENS",
+            )
+            .unwrap_or(4096),
+            qkvza_split_tail_diag: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL_DIAG").unwrap_or(false),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
@@ -672,6 +683,8 @@ impl FeatureFlags {
             gate_up_variant: None,
             gate_up_nosync: false,
             qkvza_split_tail: false,
+            qkvza_split_tail_min_prefill_tokens: 4096,
+            qkvza_split_tail_diag: false,
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
@@ -722,6 +735,19 @@ impl FeatureFlags {
             fuse_qkv_bias_debug: false,
         }
     }
+
+    /// Conservative request-level gate for the RDNA3 QKVZA split-tail route.
+    /// `uncached_tokens` is the complete suffix passed to prefill before it is
+    /// split into `PREFILL_MAX_BATCH` chunks.
+    pub fn qkvza_split_tail_for_uncached_prefill(
+        &self,
+        start_pos: usize,
+        uncached_tokens: usize,
+    ) -> bool {
+        self.qkvza_split_tail
+            && start_pos == 0
+            && uncached_tokens >= self.qkvza_split_tail_min_prefill_tokens
+    }
 }
 
 #[cfg(test)]
@@ -731,15 +757,28 @@ mod tests {
     use std::sync::Mutex;
 
     const QKVZA_SPLIT_TAIL_ENV: &str = "HIPFIRE_QKVZA_SPLIT_TAIL";
+    const QKVZA_SPLIT_TAIL_MIN_ENV: &str = "HIPFIRE_QKVZA_SPLIT_TAIL_MIN_PREFILL_TOKENS";
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    struct EnvRestore(Option<OsString>);
+    struct EnvRestore {
+        name: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                value: std::env::var_os(name),
+            }
+        }
+    }
 
     impl Drop for EnvRestore {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var(QKVZA_SPLIT_TAIL_ENV, value),
-                None => std::env::remove_var(QKVZA_SPLIT_TAIL_ENV),
+            match self.value.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
             }
         }
     }
@@ -760,17 +799,35 @@ mod tests {
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
+        assert_eq!(f.qkvza_split_tail_min_prefill_tokens, 4096);
+        assert!(!f.qkvza_split_tail_diag);
     }
 
     #[test]
     fn qkvza_split_tail_is_resolved_from_env() {
         let _lock = ENV_LOCK.lock().expect("feature flag env lock poisoned");
-        let _restore = EnvRestore(std::env::var_os(QKVZA_SPLIT_TAIL_ENV));
+        let _restore = EnvRestore::new(QKVZA_SPLIT_TAIL_ENV);
 
         std::env::remove_var(QKVZA_SPLIT_TAIL_ENV);
         assert!(!FeatureFlags::from_env("gfx1100").qkvza_split_tail);
 
         std::env::set_var(QKVZA_SPLIT_TAIL_ENV, "1");
         assert!(FeatureFlags::from_env("gfx1100").qkvza_split_tail);
+    }
+
+    #[test]
+    fn qkvza_split_tail_requires_long_position_zero_prefill() {
+        let _lock = ENV_LOCK.lock().expect("feature flag env lock poisoned");
+        let _restore_flag = EnvRestore::new(QKVZA_SPLIT_TAIL_ENV);
+        let _restore_min = EnvRestore::new(QKVZA_SPLIT_TAIL_MIN_ENV);
+
+        std::env::set_var(QKVZA_SPLIT_TAIL_ENV, "1");
+        std::env::set_var(QKVZA_SPLIT_TAIL_MIN_ENV, "2048");
+        let flags = FeatureFlags::from_env("gfx1100");
+
+        assert_eq!(flags.qkvza_split_tail_min_prefill_tokens, 2048);
+        assert!(!flags.qkvza_split_tail_for_uncached_prefill(0, 2047));
+        assert!(flags.qkvza_split_tail_for_uncached_prefill(0, 2048));
+        assert!(!flags.qkvza_split_tail_for_uncached_prefill(1, 4096));
     }
 }

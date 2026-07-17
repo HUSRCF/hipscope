@@ -3499,6 +3499,35 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.gemm_qkvza_hfq4g256_with_split_tail(
+            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+            alpha_m, k, batch_size, false,
+        )
+    }
+
+    /// Request-scoped sibling of [`Self::gemm_qkvza_hfq4g256`]. The caller
+    /// may allow the RDNA3 split-tail route after classifying the complete
+    /// uncached prefill, before that request is divided into smaller chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_with_split_tail(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+        allow_split_tail: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         // CDNA3 MFMA path — 4 back-to-back rocBLAS calls. The last two
         // matrices (beta, alpha) are tiny (n_v_heads = 128 on A3B) so we
@@ -3673,11 +3702,21 @@ impl Gpu {
                     // are tiny LA tails that waste most of a 128-row MMQ tile.
                     // Keep this off by default and do not widen it to gfx12 or
                     // gfx10; their MMQ/dot2 tradeoffs and source families differ.
-                    if self.flags.qkvza_split_tail
+                    if allow_split_tail
+                        && self.flags.qkvza_split_tail
                         && self.arch_caps.is_rdna3_dgpu()
                         && qkv_m % 128 == 0
                         && z_m % 128 == 0
                     {
+                        if self.flags.qkvza_split_tail_diag {
+                            static FIRST_HIT: OnceLock<()> = OnceLock::new();
+                            FIRST_HIT.get_or_init(|| {
+                                eprintln!(
+                                    "hipfire qkvza_split_tail route=hit arch={} batch_size={batch_size}",
+                                    self.arch
+                                );
+                            });
+                        }
                         let r1 = self
                             .gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
                         let r2 = if r1.is_ok() {
