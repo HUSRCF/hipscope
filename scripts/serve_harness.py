@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, json, os, re, signal, subprocess, sys, time, urllib.request
+import argparse, atexit, json, os, re, shutil, signal, subprocess, sys, time, urllib.request
 
 # Mirror of cli/index.ts THINKING_BUDGET (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -108,7 +108,8 @@ def build_config(args):
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
-        "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
+        "mode": args.mode, "port": args.port, "bun": args.bun,
+        "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
     }
 
@@ -128,6 +129,7 @@ def show_config(cfg):
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
+    print(f"  bun           : {cfg['bun']}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
     print("  sampling (what IS set):")
@@ -186,7 +188,7 @@ def spawn_serve(cfg, home, log):
         _kill_serve(); time.sleep(3)
         open(log, "w").close()
         _serve_proc = subprocess.Popen(
-            ["/home/kaden/.bun/bin/bun", "cli/index.ts", "serve", "127.0.0.1", str(cfg["port"])],
+            [cfg["bun"], "cli/index.ts", "serve", "127.0.0.1", str(cfg["port"])],
             cwd=REPO, env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT,
             start_new_session=True)   # own process group so _kill_serve's group-kill is exact + scoped
         for _ in range(90):
@@ -337,6 +339,11 @@ def main():
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
     ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
     ap.add_argument("--port", type=int, default=11520)
+    ap.add_argument(
+        "--bun",
+        default=os.environ.get("BUN_BIN") or shutil.which("bun") or "/home/kaden/.bun/bin/bun",
+        help="Bun executable used to spawn the user-facing serve process",
+    )
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
     ap.add_argument("--out", default=None, help="write per-turn json")

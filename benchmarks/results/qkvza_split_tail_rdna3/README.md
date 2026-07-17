@@ -43,3 +43,45 @@ Files:
 - `summary.tsv`: median off/on throughput and delta by model.
 - `raw_prefill.tsv`: per-run raw prefill timings used to compute the medians.
 - `system_info.txt`: ROCm device inventory for the benchmark host.
+
+## Beta Follow-up: Long Uncached Prefill Gate
+
+The follow-up was rebased on upstream `beta`, where the default-off intent lane
+is carried at marker `3020dcff`. The candidate is now limited to a resident,
+uncached request beginning at position zero whose full request length is at
+least 4096 tokens. Cache-hit continuation, eviction, speculative/captured,
+pipeline-parallel, expert-parallel, and other nonstandard paths retain the
+existing route.
+
+Fresh-process synthetic prefill uses five counterbalanced process pairs per
+length, q8 KV, MTP off, and a five-second DPM warmup per process:
+
+| Prefill tokens | Off median tok/s | Active median tok/s | Delta | Paired median | Positive pairs |
+|---:|---:|---:|---:|---:|---:|
+| 4096 | 595.5 | 614.1 | +3.12% | +3.04% | 5/5 |
+| 8192 | 469.8 | 491.1 | +4.53% | +4.64% | 5/5 |
+| 16384 | 231.4 | 236.2 | +2.07% | +2.33% | 5/5 |
+
+The official `scripts/serve_harness.py` user-facing path was then run with a
+fresh daemon for every mode, q8 KV, MTP off, and the canonical long-prose NIAH
+prompt. Tokenization produced 8147 uncached input tokens. All ten samples
+reported `cached=0`; every active process reported one eligible request and one
+split-tail route hit, while every off process reported zero:
+
+| Pair | Order | Off tok/s | Active tok/s | Paired delta |
+|---:|:---:|---:|---:|---:|
+| 1 | off-on | 431.0 | 441.8 | +2.51% |
+| 2 | on-off | 422.6 | 439.7 | +4.05% |
+| 3 | off-on | 423.9 | 437.5 | +3.21% |
+| 4 | on-off | 422.6 | 437.8 | +3.60% |
+| 5 | off-on | 422.2 | 436.7 | +3.43% |
+
+The user-facing medians are 422.6 tok/s off and 437.8 tok/s active
+(`+3.60%` cross-sample, `+3.43%` paired median, 5/5 positive pairs). The
+paired-delta range is `+2.51%` to `+4.05%` (IQR `+3.21%` to `+3.60%`).
+`long_uncached_beta_summary.tsv` and `cold_serve_beta_raw.tsv` retain the
+machine-readable values.
+
+This remains workload-specific evidence from five process pairs for a
+default-off long, cold prefill route on one W7900. It does not promote a broad
+serving or decode-throughput claim.

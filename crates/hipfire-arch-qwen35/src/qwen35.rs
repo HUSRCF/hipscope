@@ -6163,6 +6163,33 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     )
 }
 
+/// Request-level context retained when a user-facing prefill is divided into
+/// multiple calls before it reaches [`forward_prefill_batch`].
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillRequestScope {
+    start_pos: usize,
+    uncached_tokens: usize,
+    allow_qkvza_split_tail: bool,
+}
+
+impl PrefillRequestScope {
+    pub fn new(start_pos: usize, uncached_tokens: usize) -> Self {
+        Self {
+            start_pos,
+            uncached_tokens,
+            allow_qkvza_split_tail: true,
+        }
+    }
+
+    pub fn without_qkvza_split_tail(start_pos: usize, uncached_tokens: usize) -> Self {
+        Self {
+            start_pos,
+            uncached_tokens,
+            allow_qkvza_split_tail: false,
+        }
+    }
+}
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -6193,6 +6220,41 @@ pub fn forward_prefill_batch(
         scratch.prefill_batch.as_ref(),
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: pflash uses this; non-pflash default is full stack
+    )
+}
+
+/// Process one daemon-level chunk while retaining the complete request scope
+/// used by request-level prefill routing. This is intentionally narrower than
+/// the general PBS/spec entry points.
+pub fn forward_prefill_batch_request_chunk(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    request_scope: PrefillRequestScope,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_impl(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        None,
+        None,
+        None,
+        scratch.prefill_batch.as_ref(),
+        None,
+        None,
+        true,
+        Some(request_scope),
     )
 }
 
@@ -6256,6 +6318,45 @@ pub fn forward_prefill_batch_with_pbs_opts(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_impl(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        needs_last_token_logits,
+        None,
+    )
+}
+
+fn forward_prefill_batch_with_pbs_opts_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
@@ -6264,6 +6365,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
+    request_scope: Option<PrefillRequestScope>,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -6477,18 +6579,29 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // Classify the complete uncached request before splitting it into
     // PREFILL_MAX_BATCH chunks. A per-chunk batch-size gate cannot distinguish
     // a fresh 4K prompt from a cached 256-token suffix.
+    let explicit_request_scope = request_scope.is_some();
+    let request_scope = request_scope.unwrap_or(PrefillRequestScope::new(start_pos, n));
     let allow_qkvza_split_tail = gpu.arch_caps.is_rdna3_dgpu()
+        && request_scope.allow_qkvza_split_tail
+        && hidden_rb.is_none()
+        && per_token_hidden_out.is_none()
+        && gdn_tape.is_none()
         && tree_verify.is_none()
         && mask_override.is_none()
         && max_layer.is_none()
-        && gpu
-            .flags
-            .qkvza_split_tail_for_uncached_prefill(start_pos, n);
-    if gpu.flags.qkvza_split_tail_diag {
+        && gpu.flags.qkvza_split_tail_for_uncached_prefill(
+            request_scope.start_pos,
+            request_scope.uncached_tokens,
+        );
+    if gpu.flags.qkvza_split_tail_diag
+        && (!explicit_request_scope || start_pos == request_scope.start_pos)
+    {
         eprintln!(
-            "hipfire qkvza_split_tail request eligible={} arch={} start_pos={} uncached_tokens={} min_tokens={}",
+            "hipfire qkvza_split_tail request eligible={} arch={} request_start_pos={} request_uncached_tokens={} call_start_pos={} call_tokens={} min_tokens={}",
             allow_qkvza_split_tail,
             gpu.arch,
+            request_scope.start_pos,
+            request_scope.uncached_tokens,
             start_pos,
             n,
             gpu.flags.qkvza_split_tail_min_prefill_tokens,
@@ -12374,17 +12487,9 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let fused_epilogue =
-                    kv_cache_attention_dispatch(
-                        &ctx,
-                        gpu,
-                        kv_cache,
-                        s,
-                        config,
-                        &layer.wo,
-                        layer_idx,
-                        pos,
-                    )?;
+                let fused_epilogue = kv_cache_attention_dispatch(
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -12680,17 +12785,9 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let fused_epilogue =
-                    kv_cache_attention_dispatch(
-                        &ctx,
-                        gpu,
-                        kv_cache,
-                        s,
-                        config,
-                        &layer.wo,
-                        layer_idx,
-                        pos,
-                    )?;
+                let fused_epilogue = kv_cache_attention_dispatch(
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                )?;
 
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -14145,12 +14242,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     w_alpha,
                 );
                 let conv_scalar_prep = !qkvza_scalar_prep
-                    && conv_scalar_prep_enabled(
-                        gpu,
-                        config,
-                        self.n_v_heads,
-                        self.dn_state.quant,
-                    );
+                    && conv_scalar_prep_enabled(gpu, config, self.n_v_heads, self.dn_state.quant);
                 if !qkvza_scalar_prep && !conv_scalar_prep {
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
@@ -14487,12 +14579,8 @@ fn gated_norm_mq_rotate_enabled(
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE")
-            .ok()
-            .as_deref()
-            != Some("0")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_QWEN35_FA_PREP_FUSE").ok().as_deref() != Some("0"));
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
     enabled
         && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
@@ -14538,12 +14626,8 @@ fn qkvza_scalar_prep_enabled(
     w_alpha: &WeightTensor,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_QKVZA_SCALAR_PREP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_QKVZA_SCALAR_PREP").ok().as_deref() == Some("1"));
     let dtype = wqkv.gpu_dtype;
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -14567,12 +14651,8 @@ fn conv_scalar_prep_enabled(
     quant: StateQuant,
 ) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_CONV_SCALAR_PREP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("HIPFIRE_CONV_SCALAR_PREP").ok().as_deref() == Some("1"));
     let shape = std::env::var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
         && gpu.arch_caps.is_gfx1100()
@@ -14694,15 +14774,7 @@ fn forward_scratch_layers_lowered(
                 config.num_experts_per_tok,
                 config.norm_eps,
             )?;
-            dump_hidden_localize(
-                gpu,
-                &s.x,
-                1,
-                pos,
-                config.dim,
-                layer_idx - 1,
-                "pertoken",
-            );
+            dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx - 1, "pertoken");
         }
         let program = lower_variant(variant_of(layer));
         {
@@ -16899,6 +16971,19 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_request_scope_distinguishes_resident_and_excluded_routes() {
+        let resident = PrefillRequestScope::new(0, 4096);
+        assert_eq!(resident.start_pos, 0);
+        assert_eq!(resident.uncached_tokens, 4096);
+        assert!(resident.allow_qkvza_split_tail);
+
+        let excluded = PrefillRequestScope::without_qkvza_split_tail(0, 4096);
+        assert_eq!(excluded.start_pos, 0);
+        assert_eq!(excluded.uncached_tokens, 4096);
+        assert!(!excluded.allow_qkvza_split_tail);
+    }
 
     // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
     // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:

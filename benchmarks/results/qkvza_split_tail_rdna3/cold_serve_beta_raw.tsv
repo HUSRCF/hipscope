@@ -1,0 +1,11 @@
+pair	order	mode	ctx	cached	prefill_ms	prefill_tok_s	eligible_events	route_hit_events
+1	off-on	off	8147	0	18902.3	431.0	0	0
+1	off-on	on	8147	0	18442.0	441.8	1	1
+2	on-off	on	8147	0	18527.5	439.7	1	1
+2	on-off	off	8147	0	19276.5	422.6	0	0
+3	off-on	off	8147	0	19221.1	423.9	0	0
+3	off-on	on	8147	0	18621.8	437.5	1	1
+4	on-off	on	8147	0	18610.0	437.8	1	1
+4	on-off	off	8147	0	19277.9	422.6	0	0
+5	off-on	off	8147	0	19296.4	422.2	0	0
+5	off-on	on	8147	0	18655.4	436.7	1	1

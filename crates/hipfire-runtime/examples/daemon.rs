@@ -2923,7 +2923,9 @@ fn main() {
                     let weights = m.dots_ocr_weights.as_ref().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok).is_err() {
+                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok)
+                            .is_err()
+                        {
                             ok = false;
                             break;
                         }
@@ -3514,9 +3516,7 @@ fn main() {
                     // resident model/cache state warm. It is timing-only: exact
                     // shadow remains a separate mandatory harness gate.
                     if steady_state {
-                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(
-                            frame_checkpoint,
-                        );
+                        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
                         let loaded = model.as_mut().expect("eligibility checked");
                         let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
                             unreachable!()
@@ -9508,6 +9508,13 @@ fn generate(
     if m.arch_id == 5 || m.arch_id == 6 {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
+        let prefill_request_scope = if m.eviction.is_none() {
+            qwen35::PrefillRequestScope::new(m.seq_pos, new_tokens.len())
+        } else {
+            // The split-tail route is validated only for resident cold prefill;
+            // eviction-window execution remains on the established path.
+            qwen35::PrefillRequestScope::without_qkvza_split_tail(m.seq_pos, new_tokens.len())
+        };
         let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
             unreachable!()
         };
@@ -9563,8 +9570,16 @@ fn generate(
                 let space = window.saturating_sub(m.seq_pos).max(1);
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
-                qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                qwen35::forward_prefill_batch_request_chunk(
+                    gpu,
+                    weights,
+                    config,
+                    chunk,
+                    m.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                    prefill_request_scope,
                 )
                 .unwrap();
                 m.seq_pos += chunk_len;
@@ -9591,8 +9606,16 @@ fn generate(
                 }
                 let end = (start + chunk_max).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
-                qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                qwen35::forward_prefill_batch_request_chunk(
+                    gpu,
+                    weights,
+                    config,
+                    chunk,
+                    m.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                    prefill_request_scope,
                 )
                 .unwrap();
                 m.seq_pos += chunk.len();
