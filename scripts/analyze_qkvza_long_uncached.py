@@ -26,6 +26,16 @@ def percentile(values, q):
     return values[lo] + (values[hi] - values[lo]) * (pos - lo)
 
 
+def process_key(row):
+    """Identify one fresh process while allowing multiple timed samples."""
+    return (
+        int(row["length"]),
+        row.get("pair") or "",
+        row.get("order") or "",
+        row["mode"],
+    )
+
+
 def collect_pairs(result_dir: pathlib.Path, rows):
     if rows and all(row.get("pair") for row in rows):
         grouped = {}
@@ -95,33 +105,51 @@ def main():
     rows = read_tsv(result_dir / "raw.tsv")
     route_rows = read_tsv(result_dir / "routes.tsv")
 
-    if len(rows) != len(route_rows):
-        raise SystemExit(
-            f"raw/routes row count mismatch: {len(rows)} performance rows, "
-            f"{len(route_rows)} route rows"
-        )
-
+    # raw.tsv has one row per timed prefill sample, while routes.tsv has one
+    # row per fresh process. Modern results carry pair identity and can be
+    # joined strictly. Legacy artifacts can only be validated at cell level.
+    has_process_identity = rows and route_rows and all(
+        row.get("pair") for row in rows + route_rows
+    )
     route_by_cell = {}
-    for sample_index, (perf_row, route_row) in enumerate(zip(rows, route_rows), start=1):
-        perf_key = (int(perf_row["length"]), perf_row["mode"])
-        route_key = (int(route_row["length"]), route_row["mode"])
-        if perf_key != route_key:
-            raise SystemExit(
-                f"raw/routes identity mismatch at sample {sample_index}: "
-                f"{perf_key} != {route_key}"
-            )
+    route_processes = set()
+    for route_index, route_row in enumerate(route_rows, start=1):
+        key = process_key(route_row)
+        if has_process_identity and key in route_processes:
+            raise SystemExit(f"duplicate route diagnostics for process {key}")
+        mode = route_row["mode"]
         eligible = int(route_row["eligible_events"])
         hits = int(route_row["route_hit_events"])
-        if perf_row["mode"] == "off" and (eligible != 0 or hits != 0):
-            raise SystemExit(f"off sample {sample_index} unexpectedly eligible/hit")
-        if perf_row["mode"] == "on" and (eligible == 0 or hits == 0):
-            raise SystemExit(f"active sample {sample_index} missed eligibility/route")
-
-        key = perf_key
-        total_eligible, total_hits = route_by_cell.get(key, (0, 0))
-        route_by_cell[key] = (
+        if mode == "off" and (eligible != 0 or hits != 0):
+            raise SystemExit(f"off route {route_index} unexpectedly eligible/hit")
+        if mode == "on" and (eligible == 0 or hits == 0):
+            raise SystemExit(f"active route {route_index} missed eligibility/route")
+        if mode not in ("off", "on"):
+            raise SystemExit(f"unknown route mode at row {route_index}: {mode}")
+        route_processes.add(key)
+        cell = (key[0], key[3])
+        total_eligible, total_hits = route_by_cell.get(cell, (0, 0))
+        route_by_cell[cell] = (
             total_eligible + eligible,
             total_hits + hits,
+        )
+
+    if has_process_identity:
+        perf_processes = {process_key(row) for row in rows}
+        missing_routes = perf_processes - route_processes
+        extra_routes = route_processes - perf_processes
+        mismatch_label = "process identity"
+    else:
+        perf_cells = {(int(row["length"]), row["mode"]) for row in rows}
+        route_cells = set(route_by_cell)
+        missing_routes = perf_cells - route_cells
+        extra_routes = route_cells - perf_cells
+        mismatch_label = "legacy cell identity"
+    if missing_routes or extra_routes:
+        raise SystemExit(
+            f"raw/routes {mismatch_label} mismatch: "
+            f"missing_routes={sorted(missing_routes)} "
+            f"extra_routes={sorted(extra_routes)}"
         )
 
     by_cell = {}
@@ -133,6 +161,10 @@ def main():
     pairs_by_length = {}
     for pair in pairs:
         pairs_by_length.setdefault(pair["length"], []).append(pair)
+    pair_ids_by_length = {}
+    for row in rows:
+        if row.get("pair"):
+            pair_ids_by_length.setdefault(int(row["length"]), set()).add(int(row["pair"]))
 
     with (result_dir / "paired_summary.tsv").open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -174,7 +206,7 @@ def main():
         if on_eligible == 0 or on_hits == 0:
             raise SystemExit(f"active route did not report eligibility/hit at prefill={length}")
         length_pairs = pairs_by_length.get(length, [])
-        expected_pairs = min(len(off), len(on))
+        expected_pairs = len(pair_ids_by_length.get(length, ())) or len(length_pairs)
         if len(length_pairs) != expected_pairs:
             raise SystemExit(
                 f"paired artifacts incomplete at prefill={length}: "
