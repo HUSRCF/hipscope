@@ -1,0 +1,6 @@
+model	prompt_tokens	off_median_tok_s	on_median_tok_s	cross_sample_delta_pct	paired_deltas_pct	paired_median_delta_pct	linear_attention_layers	baseline_mmq	split_tail_only	qkvz_rejected
+Qwen3.5-0.8B-MQ4	3361	8812.3	9172.2	4.08	3.48,4.24,2.68	3.48	18	11	0	7
+Qwen3.5-4B-MQ4	3361	2718.3	2879.7	5.94	4.15,5.74,5.94	5.74	24	21	0	3
+Qwen3.5-9B-MQ4	3361	1755.3	1794.8	2.25	-0.75,2.25,1.11	1.11	24	4	1	19
+Qwen3.6-27B-MQ4	3361	530.6	551.5	3.94	3.18,4.11,3.98	3.98	48	33	3	12
+Qwen3.6-35B-A3B-MQ4R	3361	1928.0	1960.1	1.66	-0.20,1.86,0.81	0.81	30	7	0	23

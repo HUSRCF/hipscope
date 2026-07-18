@@ -8,7 +8,83 @@
 //! via an explicit warmup phase, and reports per-token latency stats plus
 //! an effective memory bandwidth estimate (weights_bytes × gen_tok/s).
 //!
-//! Usage: bench_qwen35_mq4 <model.hfq> [--prefill <N>] [--prefill-runs <N>] [--gen <N>] [--warmup <N>]
+//! Usage: bench_qwen35_mq4 <model.hfq> [--prefill <N>] [--prompt-file <PATH>] [--prefill-runs <N>] [--gen <N>] [--warmup <N>]
+
+#[cfg(feature = "deltanet")]
+/// Run the benchmark's cold (`start_pos=0`) prefill either as one public call
+/// or as the daemon's repeated request-chunk calls. This diagnostic does not
+/// model cached-prefix or checkpoint-resume suffixes.
+fn run_prefill(
+    gpu: &mut rdna_compute::Gpu,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+    tokens: &[u32],
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    dn_state: &mut hipfire_arch_qwen35::qwen35::DeltaNetState,
+    scratch: &hipfire_arch_qwen35::qwen35::Qwen35Scratch,
+    outer_chunked: bool,
+) -> hip_bridge::HipResult<()> {
+    use hipfire_arch_qwen35::qwen35::{self, PREFILL_MAX_BATCH, PrefillRequestScope};
+
+    if !outer_chunked {
+        return qwen35::forward_prefill_batch(
+            gpu, weights, config, tokens, 0, kv_cache, dn_state, scratch, None, None, None, None,
+        );
+    }
+
+    let request_scope = PrefillRequestScope::new(0, tokens.len());
+    for (chunk_idx, chunk) in tokens.chunks(PREFILL_MAX_BATCH).enumerate() {
+        qwen35::forward_prefill_batch_request_chunk(
+            gpu,
+            weights,
+            config,
+            chunk,
+            chunk_idx * PREFILL_MAX_BATCH,
+            kv_cache,
+            dn_state,
+            scratch,
+            request_scope,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "deltanet")]
+fn report_qkvza_screen_proxy(
+    gpu: &mut rdna_compute::Gpu,
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+) {
+    use hipfire_arch_qwen35::qwen35::LayerWeights;
+
+    if !gpu.mmq_screen.enabled {
+        return;
+    }
+
+    let mut baseline_mmq = 0usize;
+    let mut split_tail_only = 0usize;
+    let mut qkvz_rejected = 0usize;
+    for layer in &weights.layers {
+        let (wqkv, wz, w_beta, w_alpha) = match layer {
+            LayerWeights::DeltaNet(w) => (&w.wqkv, &w.wz, &w.w_beta, &w.w_alpha),
+            LayerWeights::DeltaNetMoe(w) => (&w.wqkv, &w.wz, &w.w_beta, &w.w_alpha),
+            LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => continue,
+        };
+        let qkv_safe = gpu.mmq_screen_weight(&wqkv.buf, wqkv.m, wqkv.k);
+        let z_safe = gpu.mmq_screen_weight(&wz.buf, wz.m, wz.k);
+        let beta_safe = gpu.mmq_screen_weight(&w_beta.buf, w_beta.m, w_beta.k);
+        let alpha_safe = gpu.mmq_screen_weight(&w_alpha.buf, w_alpha.m, w_alpha.k);
+        if qkv_safe && z_safe && beta_safe && alpha_safe {
+            baseline_mmq += 1;
+        } else if qkv_safe && z_safe {
+            split_tail_only += 1;
+        } else {
+            qkvz_rejected += 1;
+        }
+    }
+    eprintln!(
+        "  QKVZA MMQ screen proxy: baseline_mmq={baseline_mmq} split_tail_only={split_tail_only} qkvz_rejected={qkvz_rejected}"
+    );
+}
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -25,7 +101,9 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
+        eprintln!(
+            "Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prompt-file PATH] [--prefill-runs N] [--gen N] [--warmup N] [--outer-chunked] [--emit-atlas <path.jsonl>]"
+        );
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -35,6 +113,8 @@ fn main() {
     let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
+    let mut outer_chunked = false;
+    let mut prompt_file: Option<String> = None;
     // Optional kernel-atlas emission: when set, write one typed AtlasRow
     // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
     // stdout-scraping by external collectors like scripts/kernel_atlas.py.
@@ -50,6 +130,10 @@ fn main() {
                 prefill_runs = args[i + 1].parse::<usize>().unwrap().max(1);
                 i += 2;
             }
+            "--prompt-file" => {
+                prompt_file = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--gen" => {
                 gen_len = args[i + 1].parse().unwrap();
                 i += 2;
@@ -57,6 +141,12 @@ fn main() {
             "--warmup" => {
                 warmup_len = args[i + 1].parse().unwrap();
                 i += 2;
+            }
+            "--outer-chunked" => {
+                // Diagnostic cold-prefill mode; run_prefill documents the
+                // narrower start_pos=0 contract.
+                outer_chunked = true;
+                i += 1;
             }
             "--emit-atlas" => {
                 atlas_out = Some(args[i + 1].clone());
@@ -71,7 +161,9 @@ fn main() {
 
     eprintln!("=== bench_qwen35_mq4 ===");
     eprintln!("Model: {model_path}");
-    eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
+    eprintln!(
+        "Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len} outer_chunked={outer_chunked}"
+    );
 
     let model_path_buf = Path::new(model_path);
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -134,6 +226,31 @@ fn main() {
         (config, weights, bytes)
     };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+    // Match the production loader when HIPFIRE_MMQ_SCREEN=1. This is a no-op
+    // under the benchmark's default feature configuration.
+    hipfire_runtime::maybe_screen_mmq(&weights, &mut gpu);
+    report_qkvza_screen_proxy(&mut gpu, &weights);
+
+    let prompt_tokens: Vec<u32> = if let Some(path) = prompt_file.as_deref() {
+        assert!(
+            !model_path_buf.is_dir(),
+            "--prompt-file currently requires an HFQ/MQ4 model file with embedded tokenizer metadata"
+        );
+        let tokenizer_hfq = HfqFile::open(model_path_buf).expect("reopen model tokenizer metadata");
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&tokenizer_hfq.metadata_json)
+                .expect("load tokenizer from model metadata");
+        let prompt_text = std::fs::read_to_string(path).expect("read prompt file");
+        let tokens = tokenizer.encode(&prompt_text);
+        assert!(!tokens.is_empty(), "prompt file encoded to zero tokens");
+        prefill_len = tokens.len();
+        eprintln!("Prompt file: {path} ({prefill_len} tokens)");
+        tokens
+    } else {
+        // Deterministic fake prompt keeps the default benchmark independent of
+        // tokenizer and chat-template behavior.
+        (0..prefill_len as u32).collect()
+    };
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via HIPFIRE_KV_MODE env var:
@@ -178,10 +295,6 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
-    // Deterministic fake-prompt: token 0, 1, 2, ... prefill_len-1. Keeps the
-    // benchmark independent of tokenizer / chat template behaviour.
-    let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
-
     // DPM warmup BEFORE prefill (issue #65). The default `HIPFIRE_DPM_WARMUP_SECS`
     // hook fires AFTER the warmup tokens, before the timed gen — useless for
     // prefill measurement when the GPU is in DPM step 0/1 from idle. This
@@ -210,19 +323,15 @@ fn main() {
     // then reset state and profile the second pass.
     if do_profile {
         eprintln!("\n=== warm-up prefill (JIT kernels) ===");
-        qwen35::forward_prefill_batch(
+        run_prefill(
             &mut gpu,
             &weights,
             &config,
             &prompt_tokens,
-            0,
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
-            None,
-            None,
-            None,
+            outer_chunked,
         )
         .expect("warmup prefill failed");
         // Reset DeltaNet state for the profiled run
@@ -447,19 +556,15 @@ fn main() {
                 };
             }
             let t_prefill = Instant::now();
-            qwen35::forward_prefill_batch(
+            run_prefill(
                 &mut gpu,
                 &weights,
                 &config,
                 &prompt_tokens,
-                0,
                 &mut kv_cache,
                 &mut dn_state,
                 &scratch,
-                None,
-                None,
-                None,
-                None,
+                outer_chunked,
             )
             .expect("prefill forward failed");
             gpu.hip.device_synchronize().expect("sync after prefill");
