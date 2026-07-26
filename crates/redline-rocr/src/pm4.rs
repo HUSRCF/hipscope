@@ -13,21 +13,24 @@ use crate::{Kernel, LaunchGeometry};
 
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+const PACKET3_NOP: u32 = 0x10;
 const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
+const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
+const CACHE_RELEASE_BARRIER_MARKER: u32 = 0x4846_5242;
 
-// GFX12 SET_SH_REG offsets. The gfx12 register headers number COMPUTE
-// registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0; SET_SH_REG retains the
-// architectural 0x200 COMPUTE window used by ROCr's PM4 builders.
+// GC 12.0.x SET_SH_REG offsets used by gfx1200/gfx1201. The register headers
+// number COMPUTE registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0;
+// SET_SH_REG retains the architectural 0x200 COMPUTE window used by ROCr's
+// PM4 builders. GC 12.1.0 relocates these registers and requires a distinct
+// map rather than reusing this encoder.
 const COMPUTE_NUM_THREAD_X: u32 = 0x207;
 const COMPUTE_PGM_LO: u32 = 0x20c;
 const COMPUTE_PGM_RSRC1: u32 = 0x212;
 const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
-const COMPUTE_TMPRING_SIZE: u32 = 0x216;
-const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x223;
-const COMPUTE_STATIC_THREAD_MGMT_SE0: u32 = 0x230;
+const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x228;
 const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const LDS_SIZE_MASK: u32 = 0x00ff_8000;
@@ -119,6 +122,35 @@ impl Gfx12Pm4CommandBuffer {
         timed
     }
 
+    /// Resolve cache-release markers into an architected bottom-of-pipe
+    /// memory fence and a command-processor wait for that fence.
+    ///
+    /// A monotonically increasing value prevents a later replay from
+    /// satisfying a boundary with a stale fence word; the owner must reset the
+    /// word to zero before each submission.
+    pub fn with_release_wait_barriers(&self, fence_address: u64) -> Self {
+        debug_assert_ne!(fence_address, 0);
+        debug_assert_eq!(fence_address & 3, 0);
+        let marker = [packet3(PACKET3_NOP, 1, false), CACHE_RELEASE_BARRIER_MARKER];
+        let mut fenced = Self::new();
+        let mut cursor = 0;
+        let mut value = 0_u32;
+        while cursor < self.dwords.len() {
+            if self.dwords[cursor..].starts_with(&marker) {
+                value = value
+                    .checked_add(1)
+                    .expect("a PM4 indirect buffer cannot contain u32::MAX barriers");
+                fenced.release_memory_value(fence_address, value);
+                fenced.wait_memory_value(fence_address, value);
+                cursor += marker.len();
+            } else {
+                fenced.dwords.push(self.dwords[cursor]);
+                cursor += 1;
+            }
+        }
+        fenced
+    }
+
     fn copy_gpu_timestamp(&mut self, address: u64) {
         const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
         self.dwords.extend_from_slice(&[
@@ -146,11 +178,48 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
+    fn release_memory_value(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        // Rebuild the per-dispatch System release lost when AQL packets are
+        // collapsed into one vendor IB: publish GL2 writes and invalidate the
+        // vector L0 read cache before the following consumer can run.
+        const BOTTOM_OF_PIPE_TS_EVENT_WITH_GL0_INVALIDATE: u32 =
+            40 | (5 << 8) | ((1 << 2 | 1 << 9) << 12);
+        const VALUE_32_TO_L2_AFTER_WRITE_CONFIRM: u32 = (1 << 16) | (3 << 24) | (1 << 29);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_RELEASE_MEM, 7, false),
+            BOTTOM_OF_PIPE_TS_EVENT_WITH_GL0_INVALIDATE,
+            VALUE_32_TO_L2_AFTER_WRITE_CONFIRM,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+            0,
+            0,
+        ]);
+    }
+
+    fn wait_memory_value(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        const MEMORY_SPACE_EQUAL: u32 = (1 << 4) | 3;
+        const POLL_INTERVAL_WITH_ACE_OFFLOAD: u32 = (1 << 31) | 10;
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_WAIT_REG_MEM, 6, false),
+            MEMORY_SPACE_EQUAL,
+            address as u32,
+            (address >> 32) as u32,
+            value,
+            u32::MAX,
+            POLL_INTERVAL_WITH_ACE_OFFLOAD,
+        ]);
+    }
+
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
-    /// caches plus forward sequencing are invalidated.
+    /// caches are invalidated.
     pub fn acquire_inter_node_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x10180);
+        self.emit_acquire_gcr(0x180);
     }
 
     fn emit_acquire_gcr(&mut self, gcr_cntl: u32) {
@@ -204,14 +273,12 @@ impl Gfx12Pm4CommandBuffer {
             return Err(Pm4BuildError::GroupSegmentTooLarge(total_group_bytes));
         }
         let rsrc2 = (pm4.compute_pgm_rsrc2 & !LDS_SIZE_MASK) | (lds_blocks << LDS_SIZE_SHIFT);
-
         self.set_sh_regs(
             COMPUTE_PGM_LO,
             &[(pm4.code_entry >> 8) as u32, (pm4.code_entry >> 40) as u32],
         );
         self.set_sh_regs(COMPUTE_PGM_RSRC1, &[pm4.compute_pgm_rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX12, &[pm4.compute_pgm_rsrc3]);
-        self.set_sh_regs(COMPUTE_TMPRING_SIZE, &[0]);
         self.set_sh_regs(
             COMPUTE_NUM_THREAD_X,
             &[
@@ -220,10 +287,11 @@ impl Gfx12Pm4CommandBuffer {
                 u32::from(geometry.workgroup[2]),
             ],
         );
-        // Match ROCr's direct-dispatch template: all waves per SH are allowed
-        // and every shader engine remains eligible.
+        // Match ROCr's direct-dispatch template: all waves per SH are allowed.
+        // Leave STATIC_THREAD_MGMT untouched so the dispatch inherits KFD's
+        // queue CU-affinity state, including hsa_amd_queue_cu_set_mask and
+        // debugger restrictions.
         self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
-        self.set_sh_regs(COMPUTE_STATIC_THREAD_MGMT_SE0, &[u32::MAX; 4]);
         if needs_kernarg {
             let address = kernarg_address as usize as u64;
             self.set_sh_regs(
@@ -245,7 +313,12 @@ impl Gfx12Pm4CommandBuffer {
     /// itself completes and its enclosing AQL packet publishes its signal.
     pub fn wait_compute_idle(&mut self) {
         self.dwords.push(packet3(PACKET3_EVENT_WRITE, 1, false));
-        self.dwords.push(0x407); // CS_PARTIAL_FLUSH, event-index 4.
+        self.dwords.push(0x8000_0407); // ACE-offloaded CS_PARTIAL_FLUSH, event-index 4.
+    }
+
+    pub fn wait_compute_idle_with_cache_release(&mut self) {
+        self.dwords.push(packet3(PACKET3_NOP, 1, false));
+        self.dwords.push(CACHE_RELEASE_BARRIER_MARKER);
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -269,10 +342,7 @@ impl Gfx12Pm4CommandBuffer {
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
         debug_assert!(!values.is_empty());
-        let static_registers = matches!(
-            first,
-            COMPUTE_TMPRING_SIZE | COMPUTE_RESOURCE_LIMITS | COMPUTE_STATIC_THREAD_MGMT_SE0
-        );
+        let static_registers = first == COMPUTE_RESOURCE_LIMITS;
         if !self.cache_dynamic_registers && !static_registers {
             self.emit_set_sh_regs(first, values);
             return;
@@ -382,12 +452,18 @@ mod tests {
         assert_eq!(packet3(PACKET3_DISPATCH_DIRECT, 4, true), 0xc003_1502);
         assert_eq!(packet3(PACKET3_EVENT_WRITE, 1, false), 0xc000_4600);
         assert_eq!(packet3(PACKET3_ACQUIRE_MEM, 7, false), 0xc006_5800);
+        assert_eq!(packet3(PACKET3_WAIT_REG_MEM, 6, false), 0xc005_3c00);
     }
 
     #[test]
     fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
         assert_eq!(dispatch_initiator(false), 0x25);
         assert_eq!(dispatch_initiator(true), 0x8025);
+    }
+
+    #[test]
+    fn gfx120x_program_resource_offset_matches_gc_12_0_headers() {
+        assert_eq!(COMPUTE_PGM_RSRC3_GFX12, 0x228);
     }
 
     #[test]
@@ -402,8 +478,52 @@ mod tests {
         assert_eq!(commands.dwords()[8], 0xc006_5800);
         assert_eq!(commands.dwords()[15], 0x1c1d1);
         assert_eq!(commands.dwords()[16], 0xc006_5800);
-        assert_eq!(commands.dwords()[23], 0x10180);
-        assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
+        assert_eq!(commands.dwords()[23], 0x180);
+        assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x8000_0407]);
+    }
+
+    #[test]
+    fn compute_idle_markers_expand_to_gc12_release_wait_barriers() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx12Pm4CommandBuffer::new();
+        commands.wait_compute_idle_with_cache_release();
+        commands.wait_compute_idle_with_cache_release();
+        let fenced = commands.with_release_wait_barriers(address);
+        assert_eq!(
+            fenced.dwords(),
+            &[
+                0xc006_4900,
+                0x204528,
+                0x2301_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                1,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def0,
+                0x1234_5678,
+                1,
+                u32::MAX,
+                0x8000_000a,
+                0xc006_4900,
+                0x204528,
+                0x2301_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                2,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def0,
+                0x1234_5678,
+                2,
+                u32::MAX,
+                0x8000_000a,
+            ]
+        );
     }
 
     #[test]

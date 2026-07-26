@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use redline_rocr::abi;
 use redline_rocr::packet::{
-    BARRIER_DEPENDENCY_CAPACITY, BarrierAndPacket, KernelDispatchPacket, LaunchGeometry,
-    PacketError, PacketImage,
+    BarrierAndPacket, KernelDispatchPacket, LaunchGeometry, PacketError, PacketImage,
+    BARRIER_DEPENDENCY_CAPACITY,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet,
-    RuntimeError,
+    CompletionSignal, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet, RuntimeError,
+    DEFAULT_WAIT_TIMEOUT,
 };
 
 fn retained_queue_size(
@@ -75,6 +75,7 @@ pub struct SingleQueuePm4Ib {
     completion: CompletionSignal,
     indirect: KernargBuffer,
     batch: Vec<PacketImage>,
+    barrier_fence: Option<KernargBuffer>,
     timestamps: Option<KernargBuffer>,
     timestamp_frequency_hz: Option<u64>,
     dispatch_workgroup_offsets: Vec<usize>,
@@ -87,11 +88,13 @@ impl SingleQueuePm4Ib {
         pool: &KernargPool,
         commands: &Gfx12Pm4CommandBuffer,
     ) -> Result<Self, ReplayError> {
+        let (commands, barrier_fence) = Self::resolve_gfx12_barriers(pool, commands)?;
         Self::create_encoded(
             device,
             pool,
             &commands.as_bytes(),
             commands.len_dwords(),
+            Some(barrier_fence),
             None,
             None,
         )
@@ -108,6 +111,7 @@ impl SingleQueuePm4Ib {
             pool,
             &commands.as_bytes(),
             commands.len_dwords(),
+            None,
             None,
             None,
         )
@@ -127,6 +131,7 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
+            None,
         )
     }
 
@@ -141,6 +146,7 @@ impl SingleQueuePm4Ib {
         let mut timestamps = pool.allocate_executable_bytes(16)?;
         timestamps.as_mut_bytes().fill(0);
         let start = timestamps.address() as usize as u64;
+        let (commands, barrier_fence) = Self::resolve_gfx12_barriers(pool, commands)?;
         let timed = commands.with_gpu_timestamps(start, start + 8);
         let frequency_hz = device.gpu_timestamp_frequency_hz()?;
         Self::create_encoded(
@@ -148,6 +154,7 @@ impl SingleQueuePm4Ib {
             pool,
             &timed.as_bytes(),
             timed.len_dwords(),
+            Some(barrier_fence),
             Some(timestamps),
             Some(frequency_hz),
         )
@@ -187,9 +194,20 @@ impl SingleQueuePm4Ib {
             pool,
             &timed.as_bytes(),
             timed.len_dwords(),
+            None,
             Some(timestamps),
             Some(frequency_hz),
         )
+    }
+
+    fn resolve_gfx12_barriers(
+        pool: &KernargPool,
+        commands: &Gfx12Pm4CommandBuffer,
+    ) -> Result<(Gfx12Pm4CommandBuffer, KernargBuffer), ReplayError> {
+        let mut fence = pool.allocate_executable_bytes(4)?;
+        fence.as_mut_bytes().fill(0);
+        let address = fence.address() as usize as u64;
+        Ok((commands.with_release_wait_barriers(address), fence))
     }
 
     fn create_encoded(
@@ -197,6 +215,7 @@ impl SingleQueuePm4Ib {
         pool: &KernargPool,
         bytes: &[u8],
         dwords: u32,
+        barrier_fence: Option<KernargBuffer>,
         timestamps: Option<KernargBuffer>,
         timestamp_frequency_hz: Option<u64>,
     ) -> Result<Self, ReplayError> {
@@ -216,6 +235,7 @@ impl SingleQueuePm4Ib {
             completion,
             indirect,
             batch: vec![packet],
+            barrier_fence,
             timestamps,
             timestamp_frequency_hz,
             dispatch_workgroup_offsets,
@@ -322,6 +342,9 @@ impl SingleQueuePm4Ib {
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
         if !self.usable {
             return Err(ReplayError::GraphInactive);
+        }
+        if let Some(fence) = self.barrier_fence.as_mut() {
+            fence.as_mut_bytes().fill(0);
         }
         self.completion.reset();
         if let Err(error) = self
@@ -512,8 +535,9 @@ impl PhasedMultiQueuePm4Ib {
             .any(|commands| !commands.ends_with_compute_idle())
         {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 semaphore publication requires every phase lane to end compute-idle"
-                    .to_owned(),
+                detail:
+                    "native PM4 semaphore publication requires every phase lane to end compute-idle"
+                        .to_owned(),
             });
         }
         let queue_count = phases.iter().map(Vec::len).max().unwrap();
@@ -525,15 +549,19 @@ impl PhasedMultiQueuePm4Ib {
         let parallel_phase_count = phases.iter().filter(|phase| phase.len() > 1).count();
         if parallel_phase_count == 1 {
             return Err(ReplayError::PolicyShapeMismatch {
-                detail: "native PM4 retained epochs require either zero or at least two parallel phases"
-                    .to_owned(),
+                detail:
+                    "native PM4 retained epochs require either zero or at least two parallel phases"
+                        .to_owned(),
             });
         }
-        let semaphore_bytes = (queue_count - 1)
-            .checked_mul(8)
-            .ok_or_else(|| ReplayError::PolicyShapeMismatch {
-                detail: format!("native PM4 semaphore count for {queue_count} queues overflowed"),
-            })?;
+        let semaphore_bytes =
+            (queue_count - 1)
+                .checked_mul(8)
+                .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "native PM4 semaphore count for {queue_count} queues overflowed"
+                    ),
+                })?;
         let mut semaphores = pool.allocate_executable_bytes(semaphore_bytes)?;
         semaphores.as_mut_bytes().fill(0);
         let semaphore_base = semaphores.address() as usize as u64;
@@ -549,11 +577,12 @@ impl PhasedMultiQueuePm4Ib {
                 streams[0].append_stream(&phase[0]);
                 continue;
             }
-            parallel_epoch = parallel_epoch.checked_add(1).ok_or_else(|| {
-                ReplayError::PolicyShapeMismatch {
-                    detail: "native PM4 parallel phase count exceeds u32".to_owned(),
-                }
-            })?;
+            parallel_epoch =
+                parallel_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::PolicyShapeMismatch {
+                        detail: "native PM4 parallel phase count exceeds u32".to_owned(),
+                    })?;
             for lane in 1..phase.len() {
                 let (start, _) = semaphore_addresses(lane);
                 streams[lane].wait_memory_value(start, parallel_epoch);
@@ -601,11 +630,8 @@ impl PhasedMultiQueuePm4Ib {
             let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
             indirect.write_exact(&bytes)?;
             let completion = CompletionSignal::new(device)?;
-            let packet = PacketImage::pm4_indirect_buffer(
-                indirect.address(),
-                dwords,
-                completion.raw(),
-            )?;
+            let packet =
+                PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
             timestamps.push(timestamp);
             indirects.push(indirect);
             completions.push(completion);
