@@ -14,7 +14,8 @@
 
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && git rev-parse --show-toplevel)"
+cd "$ROOT"
 A_REF="origin/beta"
 B_REF="HEAD"
 MODEL="$HOME/.hipfire/models/qwen3.6-35b-a3b.mq4r"
