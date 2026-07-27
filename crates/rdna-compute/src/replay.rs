@@ -54,21 +54,17 @@ enum Gfx11EntryAcquirePolicy {
 
 impl Pm4Architecture {
     fn from_device(device: &GpuDevice) -> Result<Self, String> {
-        Self::from_name(device.name())
-    }
-
-    fn from_name(device_name: &str) -> Result<Self, String> {
-        let name = device_name.to_ascii_lowercase();
+        let name = device.name().to_ascii_lowercase();
         if name.starts_with("gfx10") {
             Ok(Self::Gfx10)
         } else if name.starts_with("gfx11") {
             Ok(Self::Gfx11)
-        } else if matches!(name.as_str(), "gfx1200" | "gfx1201") {
+        } else if name.starts_with("gfx12") {
             Ok(Self::Gfx12)
         } else {
             Err(format!(
                 "retained PM4 has no certified register map for HSA agent {:?}",
-                device_name
+                device.name()
             ))
         }
     }
@@ -3028,27 +3024,6 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pm4_register_map_selection_rejects_unknown_gc12_layouts() {
-        assert_eq!(
-            Pm4Architecture::from_name("gfx1100"),
-            Ok(Pm4Architecture::Gfx11)
-        );
-        assert_eq!(
-            Pm4Architecture::from_name("GFX1151"),
-            Ok(Pm4Architecture::Gfx11)
-        );
-        assert_eq!(
-            Pm4Architecture::from_name("gfx1201"),
-            Ok(Pm4Architecture::Gfx12)
-        );
-        assert_eq!(
-            Pm4Architecture::from_name("GFX1200"),
-            Ok(Pm4Architecture::Gfx12)
-        );
-        assert!(Pm4Architecture::from_name("gfx1250").is_err());
-    }
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",

@@ -20,8 +20,30 @@ A_REF="origin/beta"
 B_REF="HEAD"
 MODEL="$HOME/.hipfire/models/qwen3.6-35b-a3b.mq4r"
 DEVICE=0
-PERF_PASSES=1
+PERF_PASSES=2
 OUT=""
+PM4_VARS=(
+    HIPFIRE_REPLAY_PM4_QUEUES
+    HIPFIRE_REPLAY_PM4_STATEFUL
+    HIPFIRE_REPLAY_PM4_WAIT_POLICY
+    HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY
+    HIPFIRE_REPLAY_PM4_GCR_TRIM
+    HIPFIRE_REPLAY_PM4_NATIVE_PHASES
+    HIPFIRE_REPLAY_PM4_DYNAMIC_GRID
+)
+CLEAN_ENV=(
+    env
+    -u ROCM_PATH
+    -u HIP_PATH
+    -u LD_LIBRARY_PATH
+    -u "${PM4_VARS[0]}"
+    -u "${PM4_VARS[1]}"
+    -u "${PM4_VARS[2]}"
+    -u "${PM4_VARS[3]}"
+    -u "${PM4_VARS[4]}"
+    -u "${PM4_VARS[5]}"
+    -u "${PM4_VARS[6]}"
+)
 
 usage() {
     cat <<'EOF'
@@ -39,10 +61,10 @@ Options:
   --b-ref REF          register-map candidate (default: HEAD)
   --model PATH         exact MQ4R model
   --device N           physical ROCr device (default: 0)
-  --perf-passes N      stationary product passes per arm (default: 1)
+  --perf-passes N      stationary product passes per arm (default: 2)
   --out DIR            new artifact directory (default: /tmp with UTC stamp)
 
-PERF_PASSES=2 runs A,B,B,A to reduce order bias. Each product pass already
+The default runs A,B,B,A to reduce order bias. Each product pass already
 contains 10 measured rows after the stationarity gate.
 
 Exit status describes experiment execution, not whether the hypothesis won.
@@ -104,8 +126,31 @@ mkdir -p "$CACHE" "$OUT/environment" "$OUT/correctness" "$OUT/performance"
 git -C "$ROOT" worktree add --detach "$A_TREE" "$A_SHA"
 git -C "$ROOT" worktree add --detach "$B_TREE" "$B_SHA"
 
+git -C "$ROOT" diff --name-only "$A_SHA" "$B_SHA" \
+    >"$OUT/environment/source-diff.txt"
+sed '\#^scripts/gfx1201-register-ab\.sh$#d' \
+    "$OUT/environment/source-diff.txt" \
+    >"$OUT/environment/runtime-source-diff.txt"
+printf '%s\n' crates/redline-rocr/src/pm4.rs \
+    >"$OUT/environment/expected-source-diff.txt"
+if ! cmp "$OUT/environment/expected-source-diff.txt" \
+    "$OUT/environment/runtime-source-diff.txt"; then
+    echo "A/B runtime source difference is not the register-map whitelist" >&2
+    exit 2
+fi
+sha256sum \
+    "$A_TREE/scripts/redline_daemon_harness.py" \
+    "$B_TREE/scripts/redline_daemon_harness.py" \
+    >"$OUT/environment/harness-sha256.txt"
+cmp "$A_TREE/scripts/redline_daemon_harness.py" \
+    "$B_TREE/scripts/redline_daemon_harness.py" || {
+        echo "A and B use different correctness harnesses" >&2
+        exit 2
+    }
+
 ARCH="$(
-    ROCR_VISIBLE_DEVICES="$DEVICE" HIP_VISIBLE_DEVICES=0 \
+    "${CLEAN_ENV[@]}" \
+        ROCR_VISIBLE_DEVICES="$DEVICE" HIP_VISIBLE_DEVICES=0 \
         rocminfo 2>/dev/null |
         sed -nE 's/.*Name:[[:space:]]*(gfx[0-9]+).*/\1/p' |
         sort -u
@@ -119,11 +164,20 @@ ARCH="$(
 # lower DPM state and depress both HIP and PM4 by roughly the same amount.
 # This script verifies rather than mutates machine policy; changing it may
 # require sudo and must be an explicit operator action.
-rocm-smi --showperflevel >"$OUT/environment/perf-level.txt" 2>&1
-grep -qi 'auto' "$OUT/environment/perf-level.txt" || {
-    echo "GPU performance level is not auto; run 'sudo rocm-smi --setperflevel auto' first" >&2
-    exit 2
-}
+rocm-smi --showperflevel --json >"$OUT/environment/perf-level.json" 2>&1
+python3 - "$OUT/environment/perf-level.json" "$DEVICE" <<'PY'
+import json
+import pathlib
+import sys
+
+row = json.loads(pathlib.Path(sys.argv[1]).read_text())
+card = row.get(f"card{int(sys.argv[2])}", {})
+if card.get("Performance Level") != "auto":
+    raise SystemExit(
+        "target GPU performance level is not auto; run "
+        "'sudo rocm-smi --setperflevel auto' first"
+    )
+PY
 
 {
     echo "created_at_utc=$STAMP"
@@ -141,8 +195,10 @@ grep -qi 'auto' "$OUT/environment/perf-level.txt" || {
     echo "perf_passes=$PERF_PASSES"
 } >"$OUT/environment/contract.txt"
 
-hipcc --version >"$OUT/environment/hipcc.txt" 2>&1 || true
-rocminfo >"$OUT/environment/rocminfo.txt" 2>&1
+"${CLEAN_ENV[@]}" hipcc --version >"$OUT/environment/hipcc.txt" 2>&1 || true
+"${CLEAN_ENV[@]}" rocminfo >"$OUT/environment/rocminfo.txt" 2>&1
+rustc --version --verbose >"$OUT/environment/rustc.txt"
+cargo --version --verbose >"$OUT/environment/cargo.txt"
 uname -a >"$OUT/environment/uname.txt"
 ldconfig -p >"$OUT/environment/ldconfig.txt"
 modinfo amdgpu >"$OUT/environment/amdgpu-modinfo.txt" 2>&1 || true
@@ -150,13 +206,47 @@ dkms status >"$OUT/environment/dkms.txt" 2>&1 || true
 amd-smi static --vbios --ras --limit >"$OUT/environment/amd-smi-static.txt" 2>&1 || true
 rocm-smi --showallinfo >"$OUT/environment/rocm-smi.txt" 2>&1 || true
 
-# Confirm the libraries selected by bare dlopen, which is how redline-rocr's
-# first candidates are resolved. This catches stale ld.so cache entries after
+build_arm() {
+    local label="$1" tree="$2"
+    echo "building $label ($tree)"
+    CARGO_TARGET_DIR="$OUT/target-$label" \
+        cargo build \
+        --manifest-path "$tree/Cargo.toml" \
+        --release \
+        --locked \
+        --example daemon \
+        -p hipfire-runtime
+    cp "$OUT/target-$label/release/examples/daemon" "$OUT/daemon-$label"
+    sha256sum "$OUT/daemon-$label" >"$OUT/daemon-$label.sha256"
+}
+
+build_arm a "$A_TREE"
+build_arm b "$B_TREE"
+
+run_clean() {
+    local tree="$1"
+    shift
+    "${CLEAN_ENV[@]}" \
+        ROCR_VISIBLE_DEVICES="$DEVICE" \
+        HIP_VISIBLE_DEVICES=0 \
+        HIPFIRE_KERNEL_CACHE="$CACHE" \
+        HIPFIRE_REPLAY_PM4_QUEUES=1 \
+        HIPFIRE_REPLAY_PM4_STATEFUL=static \
+        HIPFIRE_REPLAY_PM4_WAIT_POLICY=resource \
+        HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY=required-only \
+        HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
+        HIPFIRE_REPLAY_PM4_NATIVE_PHASES=0 \
+        HIPFIRE_REPLAY_PM4_DYNAMIC_GRID=0 \
+        "$@"
+}
+
+# Confirm the libraries selected by bare dlopen under the exact cleaned
+# environment used by both arms. This catches stale ld.so cache entries after
 # a side-by-side ROCm upgrade.
-python3 - "$OUT/environment/runtime-libraries.json" <<'PY'
+run_clean "$ROOT" \
+    python3 - "$OUT/environment/runtime-libraries.json" <<'PY'
 import ctypes
 import json
-import os
 import pathlib
 import sys
 
@@ -176,52 +266,6 @@ for soname in libs:
 pathlib.Path(sys.argv[1]).write_text(json.dumps(libs, indent=2) + "\n")
 PY
 
-build_arm() {
-    local label="$1" tree="$2"
-    echo "building $label ($tree)"
-    CARGO_TARGET_DIR="$OUT/target-$label" \
-        cargo build \
-        --manifest-path "$tree/Cargo.toml" \
-        --release \
-        --example daemon \
-        -p hipfire-runtime
-    cp "$OUT/target-$label/release/examples/daemon" "$OUT/daemon-$label"
-    sha256sum "$OUT/daemon-$label" >"$OUT/daemon-$label.sha256"
-}
-
-build_arm a "$A_TREE"
-build_arm b "$B_TREE"
-
-PM4_VARS=(
-    HIPFIRE_REPLAY_PM4_QUEUES
-    HIPFIRE_REPLAY_PM4_STATEFUL
-    HIPFIRE_REPLAY_PM4_WAIT_POLICY
-    HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY
-    HIPFIRE_REPLAY_PM4_GCR_TRIM
-    HIPFIRE_REPLAY_PM4_NATIVE_PHASES
-    HIPFIRE_REPLAY_PM4_DYNAMIC_GRID
-)
-
-run_clean() {
-    local tree="$1"
-    shift
-    env \
-        -u ROCM_PATH \
-        -u HIP_PATH \
-        -u LD_LIBRARY_PATH \
-        -u "${PM4_VARS[0]}" \
-        -u "${PM4_VARS[1]}" \
-        -u "${PM4_VARS[2]}" \
-        -u "${PM4_VARS[3]}" \
-        -u "${PM4_VARS[4]}" \
-        -u "${PM4_VARS[5]}" \
-        -u "${PM4_VARS[6]}" \
-        ROCR_VISIBLE_DEVICES="$DEVICE" \
-        HIP_VISIBLE_DEVICES=0 \
-        HIPFIRE_KERNEL_CACHE="$CACHE" \
-        "$@"
-}
-
 kernel_manifest() {
     local output="$1"
     (
@@ -231,6 +275,30 @@ kernel_manifest() {
             xargs -0 sha256sum
     ) >"$output"
 }
+
+source "$ROOT/scripts/gpu-lock.sh"
+gpu_acquire "gfx1201-register-ab"
+
+METRIC_PID=""
+monitor_metrics() {
+    while true; do
+        date -u +%FT%TZ
+        amd-smi metric --clock || true
+        amd-smi metric --power || true
+        sleep 2
+    done
+}
+monitor_metrics >"$OUT/environment/load-metrics.txt" 2>&1 &
+METRIC_PID=$!
+
+cleanup() {
+    if [ -n "$METRIC_PID" ] && kill -0 "$METRIC_PID" 2>/dev/null; then
+        kill "$METRIC_PID" 2>/dev/null || true
+        wait "$METRIC_PID" 2>/dev/null || true
+    fi
+    gpu_release
+}
+trap cleanup EXIT
 
 run_correctness() {
     local label="$1" tree="$2"
@@ -260,6 +328,7 @@ kernel_manifest "$OUT/kernel-manifest-after-a.sha256"
     echo "A produced no gfx1201 GPU code objects in $CACHE" >&2
     exit 2
 }
+chmod -R a-w "$CACHE"
 run_correctness b "$B_TREE"
 kernel_manifest "$OUT/kernel-manifest-after-b.sha256"
 
@@ -297,6 +366,7 @@ run_product() {
         --work-dir "$OUT/performance/$label-$pass-work" \
         --out "$OUT/performance/$label-$pass.json" || rc=$?
     echo "$rc" >"$OUT/performance/$label-$pass.exit"
+    kernel_manifest "$OUT/performance/$label-$pass-kernels.sha256"
 }
 
 for pass in $(seq 1 "$PERF_PASSES"); do
@@ -329,12 +399,49 @@ correctness = {
     for label in ("a", "b")
 }
 
-def correctness_pass(label):
+def setup_pass(label):
     row = correctness[label]
     if not row:
         return False
     shadow = row.get("aql_shadow") or {}
-    return bool(row.get("pass")) and shadow.get("bit_exact") is True
+    decode = row.get("decode") or {}
+    probe = row.get("aql_contract_probe") or {}
+    return (
+        decode.get("sequence_stable") is True
+        and isinstance(probe.get("kernels"), int)
+        and probe["kernels"] > 0
+        and isinstance(shadow.get("bit_exact"), bool)
+        and isinstance(shadow.get("blob_bit_exact"), bool)
+        and isinstance(shadow.get("hip"), dict)
+        and isinstance(shadow.get("blob"), dict)
+    )
+
+def bit_exact(label):
+    row = correctness[label] or {}
+    return (row.get("aql_shadow") or {}).get("bit_exact")
+
+def blob_bit_exact(label):
+    row = correctness[label] or {}
+    return (row.get("aql_shadow") or {}).get("blob_bit_exact")
+
+def hip_blob_exact(label):
+    row = correctness[label] or {}
+    shadow = row.get("aql_shadow") or {}
+    hip = shadow.get("hip")
+    blob = shadow.get("blob")
+    return isinstance(hip, dict) and hip == blob
+
+def route(label):
+    row = correctness[label] or {}
+    captures = (row.get("decode") or {}).get("captures") or []
+    if not captures:
+        return None
+    capture = captures[0].get("redline_capture") or {}
+    return [
+        capture.get("launches"),
+        capture.get("unique_kernels"),
+        capture.get("sequence_hash"),
+    ]
 
 perf = {"a": [], "b": []}
 for label in perf:
@@ -361,20 +468,86 @@ def perf_summary(rows):
         "routes": routes,
     }
 
-a_ok = correctness_pass("a")
-b_ok = correctness_pass("b")
-if not a_ok and b_ok:
+all_perf_valid = (
+    len(perf["a"]) == passes
+    and len(perf["b"]) == passes
+    and all(row.get("valid") is True for row in perf["a"] + perf["b"])
+)
+perf_sequences = [
+    row.get("auto", {}).get("route_proof", {}).get("sequences")
+    for row in perf["a"] + perf["b"]
+]
+same_perf_route = (
+    all_perf_valid
+    and bool(perf_sequences)
+    and all(sequence == perf_sequences[0] for sequence in perf_sequences[1:])
+)
+
+a_setup = setup_pass("a")
+b_setup = setup_pass("b")
+a_exact = bit_exact("a")
+b_exact = bit_exact("b")
+a_blob_exact = blob_bit_exact("a")
+b_blob_exact = blob_bit_exact("b")
+a_hip_blob_exact = hip_blob_exact("a")
+b_hip_blob_exact = hip_blob_exact("b")
+same_route = route("a") is not None and route("a") == route("b")
+kernel_manifests = [root / "kernel-manifest-after-a.sha256"]
+kernel_manifests += [root / "kernel-manifest-after-b.sha256"]
+kernel_manifests += sorted((root / "performance").glob("*-kernels.sha256"))
+same_kernels = (
+    len(kernel_manifests) == 2 + 2 * passes
+    and all(
+        path.read_bytes() == kernel_manifests[0].read_bytes()
+        for path in kernel_manifests[1:]
+    )
+)
+source_diff_ok = (
+    (root / "environment" / "runtime-source-diff.txt").read_bytes()
+    == (root / "environment" / "expected-source-diff.txt").read_bytes()
+)
+
+supported = (
+    a_setup
+    and b_setup
+    and a_exact is False
+    and a_blob_exact is False
+    and a_hip_blob_exact
+    and b_exact is True
+    and b_blob_exact is True
+    and b_hip_blob_exact
+    and same_route
+    and same_kernels
+    and source_diff_ok
+)
+if supported:
     verdict = "A fails and B passes bit-exact parity: runtime defect hypothesis supported"
-    supported = True
-elif a_ok and b_ok:
+elif (
+    a_setup
+    and b_setup
+    and a_exact is True
+    and a_blob_exact is True
+    and a_hip_blob_exact
+    and b_exact is True
+    and b_blob_exact is True
+    and b_hip_blob_exact
+    and same_route
+):
     verdict = "A and B both pass bit-exact parity: no runtime correctness defect demonstrated"
-    supported = False
-elif a_ok and not b_ok:
+elif (
+    a_setup
+    and b_setup
+    and a_exact is True
+    and a_blob_exact is True
+    and a_hip_blob_exact
+    and b_exact is False
+    and b_blob_exact is False
+    and b_hip_blob_exact
+    and same_route
+):
     verdict = "A passes and B fails bit-exact parity: candidate is a correctness regression"
-    supported = False
 else:
-    verdict = "A and B both fail or lack reports: experiment is inconclusive"
-    supported = False
+    verdict = "setup, route, or reports are incomplete/mismatched: experiment is inconclusive"
 
 summary = {
     "schema": "hipfire.gfx1201-register-ab.v1",
@@ -384,13 +557,36 @@ summary = {
     ),
     "supported": supported,
     "verdict": verdict,
-    "same_gpu_code_objects": (
-        (root / "kernel-manifest-after-a.sha256").read_bytes()
-        == (root / "kernel-manifest-after-b.sha256").read_bytes()
+    "same_gpu_code_objects": same_kernels,
+    "same_logical_route": same_route,
+    "all_performance_passes_valid": all_perf_valid,
+    "same_performance_route": same_perf_route,
+    "performance_compares_correct_outputs": (
+        a_exact is True
+        and a_blob_exact is True
+        and a_hip_blob_exact
+        and b_exact is True
+        and b_blob_exact is True
+        and b_hip_blob_exact
     ),
+    "source_diff_whitelisted": source_diff_ok,
     "correctness": {
-        "a": {"pass": a_ok, "report": "correctness/a.json"},
-        "b": {"pass": b_ok, "report": "correctness/b.json"},
+        "a": {
+            "setup_pass": a_setup,
+            "bit_exact": a_exact,
+            "blob_bit_exact": a_blob_exact,
+            "hip_blob_exact": a_hip_blob_exact,
+            "route": route("a"),
+            "report": "correctness/a.json",
+        },
+        "b": {
+            "setup_pass": b_setup,
+            "bit_exact": b_exact,
+            "blob_bit_exact": b_blob_exact,
+            "hip_blob_exact": b_hip_blob_exact,
+            "route": route("b"),
+            "report": "correctness/b.json",
+        },
     },
     "performance": {
         "a": perf_summary(perf["a"]),
