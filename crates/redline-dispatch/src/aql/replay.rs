@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use redline_rocr::abi;
 use redline_rocr::packet::{
-    BarrierAndPacket, KernelDispatchPacket, LaunchGeometry, PacketError, PacketImage,
-    BARRIER_DEPENDENCY_CAPACITY,
+    BARRIER_DEPENDENCY_CAPACITY, BarrierAndPacket, KernelDispatchPacket, LaunchGeometry,
+    PacketError, PacketImage,
 };
 use redline_rocr::{
     CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
@@ -75,7 +75,6 @@ pub struct SingleQueuePm4Ib {
     completion: CompletionSignal,
     indirect: KernargBuffer,
     batch: Vec<PacketImage>,
-    barrier_fence: Option<KernargBuffer>,
     timestamps: Option<KernargBuffer>,
     timestamp_frequency_hz: Option<u64>,
     dispatch_workgroup_offsets: Vec<usize>,
@@ -88,13 +87,11 @@ impl SingleQueuePm4Ib {
         pool: &KernargPool,
         commands: &Gfx12Pm4CommandBuffer,
     ) -> Result<Self, ReplayError> {
-        let (commands, barrier_fence) = Self::resolve_gfx12_barriers(pool, commands)?;
         Self::create_encoded(
             device,
             pool,
             &commands.as_bytes(),
             commands.len_dwords(),
-            Some(barrier_fence),
             None,
             None,
         )
@@ -113,7 +110,6 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
-            None,
         )
     }
 
@@ -129,7 +125,6 @@ impl SingleQueuePm4Ib {
             pool,
             &commands.as_bytes(),
             commands.len_dwords(),
-            None,
             None,
             None,
         )
@@ -180,7 +175,6 @@ impl SingleQueuePm4Ib {
         let mut timestamps = pool.allocate_executable_bytes(16)?;
         timestamps.as_mut_bytes().fill(0);
         let start = timestamps.address() as usize as u64;
-        let (commands, barrier_fence) = Self::resolve_gfx12_barriers(pool, commands)?;
         let timed = commands.with_gpu_timestamps(start, start + 8);
         let frequency_hz = device.gpu_timestamp_frequency_hz()?;
         Self::create_encoded(
@@ -188,7 +182,6 @@ impl SingleQueuePm4Ib {
             pool,
             &timed.as_bytes(),
             timed.len_dwords(),
-            Some(barrier_fence),
             Some(timestamps),
             Some(frequency_hz),
         )
@@ -228,20 +221,9 @@ impl SingleQueuePm4Ib {
             pool,
             &timed.as_bytes(),
             timed.len_dwords(),
-            None,
             Some(timestamps),
             Some(frequency_hz),
         )
-    }
-
-    fn resolve_gfx12_barriers(
-        pool: &KernargPool,
-        commands: &Gfx12Pm4CommandBuffer,
-    ) -> Result<(Gfx12Pm4CommandBuffer, KernargBuffer), ReplayError> {
-        let mut fence = pool.allocate_executable_bytes(4)?;
-        fence.as_mut_bytes().fill(0);
-        let address = fence.address() as usize as u64;
-        Ok((commands.with_release_wait_barriers(address), fence))
     }
 
     fn create_encoded(
@@ -249,7 +231,6 @@ impl SingleQueuePm4Ib {
         pool: &KernargPool,
         bytes: &[u8],
         dwords: u32,
-        barrier_fence: Option<KernargBuffer>,
         timestamps: Option<KernargBuffer>,
         timestamp_frequency_hz: Option<u64>,
     ) -> Result<Self, ReplayError> {
@@ -269,7 +250,6 @@ impl SingleQueuePm4Ib {
             completion,
             indirect,
             batch: vec![packet],
-            barrier_fence,
             timestamps,
             timestamp_frequency_hz,
             dispatch_workgroup_offsets,
@@ -417,9 +397,6 @@ impl SingleQueuePm4Ib {
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
         if !self.usable {
             return Err(ReplayError::GraphInactive);
-        }
-        if let Some(fence) = self.barrier_fence.as_mut() {
-            fence.as_mut_bytes().fill(0);
         }
         self.completion.reset();
         if let Err(error) = self

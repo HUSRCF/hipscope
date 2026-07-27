@@ -217,15 +217,6 @@ impl Pm4Commands {
         }
     }
 
-    fn wait_compute_idle_with_cache_release(&mut self) {
-        match self {
-            Self::Legacy { architecture, .. } => {
-                unreachable!("gfx12 cache release selected for {architecture:?}")
-            }
-            Self::Gfx12(commands) => commands.wait_compute_idle_with_cache_release(),
-        }
-    }
-
     fn dispatch(
         &mut self,
         kernel: &Kernel,
@@ -1484,23 +1475,6 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
-fn required_gfx12_mid_release(previous: &str, current: &str) -> bool {
-    // Full-attention Qwen A3B has two consecutive VMEM RAW edges here.
-    // CS_PARTIAL_FLUSH orders waves but does not publish/invalidate the gfx12
-    // vector cache across all four shader engines, so these producers need a
-    // confirmed release. Other architectures retain their existing policy.
-    (previous == "sigmoid_mul_f32" && current == "mq_rotate_x")
-        || (previous == "mq_rotate_x" && current.starts_with("gemv_hfq4g256_residual"))
-}
-
-fn required_mid_cache_release(
-    architecture: Pm4Architecture,
-    previous: &str,
-    current: &str,
-) -> bool {
-    architecture == Pm4Architecture::Gfx12 && required_gfx12_mid_release(previous, current)
-}
-
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
@@ -2505,19 +2479,14 @@ impl ReplayController {
                         }
                         Pm4WaitPolicy::Resource => resources_independent,
                     };
-                    let needs_mid_acquire = self
-                        .pm4_mid_acquire_policy
-                        .acquire_between(previous, current);
-                    let needs_gfx12_mid_release =
-                        required_mid_cache_release(pm4_architecture, previous, current);
-                    if needs_gfx12_mid_release {
-                        commands.wait_compute_idle_with_cache_release();
-                    } else if !independent {
+                    if !independent {
                         commands.wait_compute_idle();
                     }
                     resource_frontier.advance(current_launch, resources_independent);
                     if (!independent && commands.requires_dependency_acquire())
-                        || (needs_mid_acquire && !needs_gfx12_mid_release)
+                        || self
+                            .pm4_mid_acquire_policy
+                            .acquire_between(previous, current)
                     {
                         commands.acquire_inter_node(
                             gfx12_gcr_trim,
@@ -3392,30 +3361,6 @@ mod tests {
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
-        ));
-        assert!(required_gfx12_mid_release("sigmoid_mul_f32", "mq_rotate_x"));
-        assert!(required_gfx12_mid_release(
-            "mq_rotate_x",
-            "gemv_hfq4g256_residual"
-        ));
-        assert!(!required_gfx12_mid_release(
-            "sigmoid_mul_f32",
-            "gemv_hfq4g256_residual"
-        ));
-        assert!(required_mid_cache_release(
-            Pm4Architecture::Gfx12,
-            "mq_rotate_x",
-            "gemv_hfq4g256_residual"
-        ));
-        assert!(!required_mid_cache_release(
-            Pm4Architecture::Gfx11,
-            "mq_rotate_x",
-            "gemv_hfq4g256_residual"
-        ));
-        assert!(!required_mid_cache_release(
-            Pm4Architecture::Gfx10,
-            "mq_rotate_x",
-            "gemv_hfq4g256_residual"
         ));
         assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));

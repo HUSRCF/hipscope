@@ -13,13 +13,10 @@ use crate::{Kernel, LaunchGeometry};
 
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
-const PACKET3_NOP: u32 = 0x10;
 const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
-const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
-const CACHE_RELEASE_BARRIER_MARKER: u32 = 0x4846_5242;
 
 // GC 12.0.x SET_SH_REG offsets used by gfx1200/gfx1201. The register headers
 // number COMPUTE registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0;
@@ -214,48 +211,11 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
-    fn release_memory_value(&mut self, address: u64, value: u32) {
-        debug_assert_ne!(address, 0);
-        debug_assert_eq!(address & 3, 0);
-        // Rebuild the per-dispatch System release lost when AQL packets are
-        // collapsed into one vendor IB: publish GL2 writes and invalidate the
-        // vector L0 read cache before the following consumer can run.
-        const BOTTOM_OF_PIPE_TS_EVENT_WITH_GL0_INVALIDATE: u32 =
-            40 | (5 << 8) | ((1 << 2 | 1 << 9) << 12);
-        const VALUE_32_TO_L2_AFTER_WRITE_CONFIRM: u32 = (1 << 16) | (3 << 24) | (1 << 29);
-        self.dwords.extend_from_slice(&[
-            packet3(PACKET3_RELEASE_MEM, 7, false),
-            BOTTOM_OF_PIPE_TS_EVENT_WITH_GL0_INVALIDATE,
-            VALUE_32_TO_L2_AFTER_WRITE_CONFIRM,
-            address as u32,
-            (address >> 32) as u32,
-            value,
-            0,
-            0,
-        ]);
-    }
-
-    fn wait_memory_value(&mut self, address: u64, value: u32) {
-        debug_assert_ne!(address, 0);
-        debug_assert_eq!(address & 3, 0);
-        const MEMORY_SPACE_EQUAL: u32 = (1 << 4) | 3;
-        const POLL_INTERVAL_WITH_ACE_OFFLOAD: u32 = (1 << 31) | 10;
-        self.dwords.extend_from_slice(&[
-            packet3(PACKET3_WAIT_REG_MEM, 6, false),
-            MEMORY_SPACE_EQUAL,
-            address as u32,
-            (address >> 32) as u32,
-            value,
-            u32::MAX,
-            POLL_INTERVAL_WITH_ACE_OFFLOAD,
-        ]);
-    }
-
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
-    /// caches are invalidated.
+    /// caches plus forward sequencing are invalidated.
     pub fn acquire_inter_node_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x180);
+        self.emit_acquire_gcr(0x10180);
     }
 
     fn emit_acquire_gcr(&mut self, gcr_cntl: u32) {
@@ -349,12 +309,7 @@ impl Gfx12Pm4CommandBuffer {
     /// itself completes and its enclosing AQL packet publishes its signal.
     pub fn wait_compute_idle(&mut self) {
         self.dwords.push(packet3(PACKET3_EVENT_WRITE, 1, false));
-        self.dwords.push(0x8000_0407); // ACE-offloaded CS_PARTIAL_FLUSH, event-index 4.
-    }
-
-    pub fn wait_compute_idle_with_cache_release(&mut self) {
-        self.dwords.push(packet3(PACKET3_NOP, 1, false));
-        self.dwords.push(CACHE_RELEASE_BARRIER_MARKER);
+        self.dwords.push(0x407); // CS_PARTIAL_FLUSH, event-index 4.
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -561,7 +516,6 @@ mod tests {
         assert_eq!(packet3(PACKET3_DISPATCH_DIRECT, 4, true), 0xc003_1502);
         assert_eq!(packet3(PACKET3_EVENT_WRITE, 1, false), 0xc000_4600);
         assert_eq!(packet3(PACKET3_ACQUIRE_MEM, 7, false), 0xc006_5800);
-        assert_eq!(packet3(PACKET3_WAIT_REG_MEM, 6, false), 0xc005_3c00);
     }
 
     #[test]
@@ -587,52 +541,8 @@ mod tests {
         assert_eq!(commands.dwords()[8], 0xc006_5800);
         assert_eq!(commands.dwords()[15], 0x1c1d1);
         assert_eq!(commands.dwords()[16], 0xc006_5800);
-        assert_eq!(commands.dwords()[23], 0x180);
-        assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x8000_0407]);
-    }
-
-    #[test]
-    fn compute_idle_markers_expand_to_gc12_release_wait_barriers() {
-        let address = 0x1234_5678_9abc_def0;
-        let mut commands = Gfx12Pm4CommandBuffer::new();
-        commands.wait_compute_idle_with_cache_release();
-        commands.wait_compute_idle_with_cache_release();
-        let fenced = commands.with_release_wait_barriers(address);
-        assert_eq!(
-            fenced.dwords(),
-            &[
-                0xc006_4900,
-                0x204528,
-                0x2301_0000,
-                0x9abc_def0,
-                0x1234_5678,
-                1,
-                0,
-                0,
-                0xc005_3c00,
-                0x13,
-                0x9abc_def0,
-                0x1234_5678,
-                1,
-                u32::MAX,
-                0x8000_000a,
-                0xc006_4900,
-                0x204528,
-                0x2301_0000,
-                0x9abc_def0,
-                0x1234_5678,
-                2,
-                0,
-                0,
-                0xc005_3c00,
-                0x13,
-                0x9abc_def0,
-                0x1234_5678,
-                2,
-                u32::MAX,
-                0x8000_000a,
-            ]
-        );
+        assert_eq!(commands.dwords()[23], 0x10180);
+        assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
     }
 
     #[test]
