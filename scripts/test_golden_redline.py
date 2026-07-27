@@ -33,6 +33,14 @@ class GoldenRegistryTests(unittest.TestCase):
             {"gfx1100", "gfx1151", "gfx1201"},
         )
 
+    def test_gfx1201_fixture_pins_corrected_gc12_command_identity(self):
+        fixture = next(
+            fixture
+            for fixture in self.registry["fixtures"]
+            if fixture["architecture"] == "gfx1201"
+        )
+        self.assertEqual(fixture["route"]["command_dwords"], 20502)
+
     def test_device_visibility_uses_physical_rocr_and_logical_hip(self):
         env = golden_redline.visible_environment(3)
         self.assertEqual(env["ROCR_VISIBLE_DEVICES"], "3")

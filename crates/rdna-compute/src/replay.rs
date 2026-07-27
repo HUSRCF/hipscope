@@ -54,17 +54,21 @@ enum Gfx11EntryAcquirePolicy {
 
 impl Pm4Architecture {
     fn from_device(device: &GpuDevice) -> Result<Self, String> {
-        let name = device.name().to_ascii_lowercase();
+        Self::from_name(device.name())
+    }
+
+    fn from_name(device_name: &str) -> Result<Self, String> {
+        let name = device_name.to_ascii_lowercase();
         if name.starts_with("gfx10") {
             Ok(Self::Gfx10)
         } else if name.starts_with("gfx11") {
             Ok(Self::Gfx11)
-        } else if name.starts_with("gfx12") {
+        } else if matches!(name.as_str(), "gfx1200" | "gfx1201") {
             Ok(Self::Gfx12)
         } else {
             Err(format!(
                 "retained PM4 has no certified register map for HSA agent {:?}",
-                device.name()
+                device_name
             ))
         }
     }
@@ -210,6 +214,15 @@ impl Pm4Commands {
         match self {
             Self::Legacy { commands, .. } => commands.wait_compute_idle(),
             Self::Gfx12(commands) => commands.wait_compute_idle(),
+        }
+    }
+
+    fn wait_compute_idle_with_cache_release(&mut self) {
+        match self {
+            Self::Legacy { architecture, .. } => {
+                unreachable!("gfx12 cache release selected for {architecture:?}")
+            }
+            Self::Gfx12(commands) => commands.wait_compute_idle_with_cache_release(),
         }
     }
 
@@ -1471,6 +1484,23 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
+fn required_gfx12_mid_release(previous: &str, current: &str) -> bool {
+    // Full-attention Qwen A3B has two consecutive VMEM RAW edges here.
+    // CS_PARTIAL_FLUSH orders waves but does not publish/invalidate the gfx12
+    // vector cache across all four shader engines, so these producers need a
+    // confirmed release. Other architectures retain their existing policy.
+    (previous == "sigmoid_mul_f32" && current == "mq_rotate_x")
+        || (previous == "mq_rotate_x" && current.starts_with("gemv_hfq4g256_residual"))
+}
+
+fn required_mid_cache_release(
+    architecture: Pm4Architecture,
+    previous: &str,
+    current: &str,
+) -> bool {
+    architecture == Pm4Architecture::Gfx12 && required_gfx12_mid_release(previous, current)
+}
+
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
@@ -2475,14 +2505,19 @@ impl ReplayController {
                         }
                         Pm4WaitPolicy::Resource => resources_independent,
                     };
-                    if !independent {
+                    let needs_mid_acquire = self
+                        .pm4_mid_acquire_policy
+                        .acquire_between(previous, current);
+                    let needs_gfx12_mid_release =
+                        required_mid_cache_release(pm4_architecture, previous, current);
+                    if needs_gfx12_mid_release {
+                        commands.wait_compute_idle_with_cache_release();
+                    } else if !independent {
                         commands.wait_compute_idle();
                     }
                     resource_frontier.advance(current_launch, resources_independent);
                     if (!independent && commands.requires_dependency_acquire())
-                        || self
-                            .pm4_mid_acquire_policy
-                            .acquire_between(previous, current)
+                        || (needs_mid_acquire && !needs_gfx12_mid_release)
                     {
                         commands.acquire_inter_node(
                             gfx12_gcr_trim,
@@ -3025,6 +3060,27 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pm4_register_map_selection_rejects_unknown_gc12_layouts() {
+        assert_eq!(
+            Pm4Architecture::from_name("gfx1100"),
+            Ok(Pm4Architecture::Gfx11)
+        );
+        assert_eq!(
+            Pm4Architecture::from_name("GFX1151"),
+            Ok(Pm4Architecture::Gfx11)
+        );
+        assert_eq!(
+            Pm4Architecture::from_name("gfx1201"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert_eq!(
+            Pm4Architecture::from_name("GFX1200"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert!(Pm4Architecture::from_name("gfx1250").is_err());
+    }
+
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
@@ -3336,6 +3392,30 @@ mod tests {
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
+        ));
+        assert!(required_gfx12_mid_release("sigmoid_mul_f32", "mq_rotate_x"));
+        assert!(required_gfx12_mid_release(
+            "mq_rotate_x",
+            "gemv_hfq4g256_residual"
+        ));
+        assert!(!required_gfx12_mid_release(
+            "sigmoid_mul_f32",
+            "gemv_hfq4g256_residual"
+        ));
+        assert!(required_mid_cache_release(
+            Pm4Architecture::Gfx12,
+            "mq_rotate_x",
+            "gemv_hfq4g256_residual"
+        ));
+        assert!(!required_mid_cache_release(
+            Pm4Architecture::Gfx11,
+            "mq_rotate_x",
+            "gemv_hfq4g256_residual"
+        ));
+        assert!(!required_mid_cache_release(
+            Pm4Architecture::Gfx10,
+            "mq_rotate_x",
+            "gemv_hfq4g256_residual"
         ));
         assert!(!Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
