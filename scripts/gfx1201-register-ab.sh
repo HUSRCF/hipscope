@@ -117,10 +117,11 @@ ARCH="$(
 
 # The author reference uses automatic clocks. On R9700, "high" can pin a
 # lower DPM state and depress both HIP and PM4 by roughly the same amount.
-rocm-smi --setperflevel auto >"$OUT/environment/set-perf-auto.txt" 2>&1
+# This script verifies rather than mutates machine policy; changing it may
+# require sudo and must be an explicit operator action.
 rocm-smi --showperflevel >"$OUT/environment/perf-level.txt" 2>&1
 grep -qi 'auto' "$OUT/environment/perf-level.txt" || {
-    echo "GPU performance level did not report auto" >&2
+    echo "GPU performance level is not auto; run 'sudo rocm-smi --setperflevel auto' first" >&2
     exit 2
 }
 
