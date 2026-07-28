@@ -4825,6 +4825,8 @@ fn forward_from_x_gpu(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<GpuTensor> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_from_x_gpu")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
 
     // Allocate a temporary scratch bundle. repeat_window=1 (unused in this path).
@@ -5277,6 +5279,15 @@ impl Qwen35ScratchSet {
     }
 }
 
+fn checked_kv_end(start_pos: usize, token_count: usize, site: &str) -> HipResult<usize> {
+    start_pos.checked_add(token_count).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("{site}: KV token range overflow ({start_pos} + {token_count})"),
+        )
+    })
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -5289,6 +5300,10 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
+    // Grow before any possible AR graph capture/replay. Stable virtual
+    // addresses keep existing graph pointer arguments valid.
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     // hipGraph capture for MoE was previously gated off-by-default behind
     // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
@@ -6188,6 +6203,10 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         n,
         pbs.max_batch
     );
+    let required_tokens = checked_kv_end(start_pos, n, "captured prefill")?;
+    // This entry may already be inside graph capture, so it must only validate
+    // capacity preflighted by its caller.
+    kv_cache.require_mapped_capacity(required_tokens)?;
 
     // Defense-in-depth: this entry point bypasses the eligibility check
     // in `forward_prefill_batch_with_pbs`, so the caller is responsible
@@ -6514,6 +6533,8 @@ pub fn forward_prefill_batch_with_pbs_opts(
     if n == 0 {
         return Ok(());
     }
+    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
 
     // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
     // layer (attention OR FFN), mirroring the captured-path guard at
@@ -8478,6 +8499,8 @@ fn forward_prefill_chunk(
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
+    kv_cache.require_mapped_capacity(required_tokens)?;
     debug_assert!(
         routed_out.is_none()
             || band
@@ -12136,6 +12159,8 @@ pub fn forward_scratch_with_hidden(
     scratch: &Qwen35Scratch,
     hidden_rb: &mut HiddenStateRingBuffer,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     let pos_i32 = pos as i32;
     gpu.hip
@@ -12182,6 +12207,8 @@ pub fn forward_scratch_embed(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let pos_i32 = pos as i32;
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;

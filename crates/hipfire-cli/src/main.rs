@@ -309,6 +309,9 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    /// One-shot KV storage backend override for this model load.
+    kv_backend: Option<String>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -387,6 +390,8 @@ struct BenchArgs {
     warmups: usize,
     #[arg(long)]
     kv_mode: Option<String>,
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
     /// Prompt words for the standard benchmark.
@@ -472,6 +477,9 @@ struct ServeArgs {
     /// KV cache mode for models loaded by this service.
     #[arg(long)]
     kv_mode: Option<String>,
+    /// KV storage backend for models loaded by this service.
+    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    kv_backend: Option<String>,
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
@@ -1806,6 +1814,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let force_local = process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
+        || args.kv_backend.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
         || args.draft_max.is_some()
@@ -1843,6 +1852,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         &model_path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     let selector = args
         .speculation
@@ -2059,6 +2069,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             detach: true,
             no_prewarm: true,
             kv_mode: None,
+            kv_backend: None,
             idle_timeout: None,
             tp: None,
             foreground_child: false,
@@ -2164,6 +2175,7 @@ struct ServeRuntime {
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
+    kv_backend_override: Option<String>,
     tp: Option<u64>,
 }
 
@@ -2629,6 +2641,9 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(mode) = &args.kv_mode {
         command.arg("--kv-mode").arg(mode);
     }
+    if let Some(backend) = &args.kv_backend {
+        command.arg("--kv-backend").arg(backend);
+    }
     if let Some(seconds) = args.idle_timeout {
         command.arg("--idle-timeout").arg(seconds.to_string());
     }
@@ -2717,6 +2732,7 @@ fn serve_foreground(
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
+            kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
         }),
         meta: Mutex::new(ServeMeta {
@@ -3336,6 +3352,7 @@ impl ServeRuntime {
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
+                self.kv_backend_override.as_deref(),
             )?;
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
@@ -4064,6 +4081,7 @@ fn load_params(
     model_path: &Path,
     max_tokens: u64,
     kv_override: Option<&str>,
+    kv_backend_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
@@ -4077,6 +4095,14 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let kv_backend = kv_backend_override
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "contiguous".into())
+        .to_ascii_lowercase();
+    if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
+        bail!("--kv-backend must be contiguous or vmm");
+    }
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -4092,6 +4118,7 @@ fn load_params(
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "kv_mode": kv_mode,
+        "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
@@ -4669,6 +4696,7 @@ fn open_bench_engine(
         &path,
         max_tokens,
         args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
     )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
@@ -4899,6 +4927,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_backend: None,
             redline: false,
             prompt: Vec::new(),
         };
@@ -6216,7 +6245,7 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
@@ -6230,11 +6259,20 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None).unwrap();
+        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn load_params_forwards_explicit_vmm_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params =
+            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
+        assert_eq!(params["kv_backend"], "vmm");
     }
 
     #[test]
@@ -6834,6 +6872,8 @@ mod tests {
             "11520",
             "--kv-mode",
             "q8",
+            "--kv-backend",
+            "vmm",
             "--idle-timeout",
             "0",
             "--tp",
@@ -6845,6 +6885,7 @@ mod tests {
         };
         assert_eq!(args.positionals.len(), 3);
         assert_eq!(args.kv_mode.as_deref(), Some("q8"));
+        assert_eq!(args.kv_backend.as_deref(), Some("vmm"));
         assert_eq!(args.idle_timeout, Some(0));
         assert_eq!(args.tp, Some(2));
     }

@@ -1434,6 +1434,12 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                let kv_backend_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_backend"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
                 // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
                 // advanced:k=..,v=.. — resolved in load_model (param > env > off).
@@ -1766,14 +1772,29 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                let requested_kv_backend = kv_backend_override
+                    .as_deref()
+                    .unwrap_or("contiguous")
+                    .to_ascii_lowercase();
+                if tp > 1 && requested_kv_backend != "contiguous" {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"KV backend '{}' requires tp=1"}}"#,
+                        requested_kv_backend
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
                 let loaded = if tp > 1 {
                     hipfire_loader::load_model_ep(path, max_seq, tp)
                 } else {
-                    hipfire_loader::load_model(
+                    hipfire_loader::load_model_with_kv_backend(
                         path,
                         max_seq,
                         draft_path.as_deref(),
                         kv_mode_override.as_deref(),
+                        kv_backend_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,

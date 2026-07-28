@@ -24,6 +24,7 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
@@ -1006,7 +1007,39 @@ pub fn load_model(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    load_model_with_kv_backend(
+        path,
+        max_seq,
+        draft_path,
+        kv_mode_override,
+        None,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
+    )
+}
+
+/// Load a model with an optional per-load KV storage backend override.
+#[allow(clippy::too_many_arguments)]
+pub fn load_model_with_kv_backend(
+    path: &str,
+    max_seq: usize,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
+    let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 
     // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
     // `generation_config`). Extract HERE, from the already-open source, BEFORE the
@@ -1098,6 +1131,7 @@ pub fn load_model(
         max_seq,
         draft_path,
         kv_mode_override,
+        kv_backend,
         kv_adaptive_override,
         state_quant_override,
         cask,
@@ -1119,6 +1153,12 @@ pub fn load_model(
             src.describe(),
             carrier.name(),
             other.name()
+        ));
+    }
+    if kv_backend == KvBackend::Vmm && carrier.name() != "qwen35" {
+        return Err(format!(
+            "KV backend 'vmm' currently supports qwen3.5 only (selected carrier: {})",
+            carrier.name()
         ));
     }
     let mut result = carrier.load(src, &mut ctx)?;

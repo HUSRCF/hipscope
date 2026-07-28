@@ -8,7 +8,7 @@
 use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, HipRuntime, Rocblas, VmmArena};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
@@ -133,10 +133,23 @@ impl GpuTensor {
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
     pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
-        let byte_off = offset_elems * self.dtype.size();
+        let element_size = self.dtype.size();
+        let byte_off = offset_elems
+            .checked_mul(element_size)
+            .expect("tensor sub-view offset overflow");
+        let byte_len = len_elems
+            .checked_mul(element_size)
+            .expect("tensor sub-view length overflow");
+        let byte_end = byte_off
+            .checked_add(byte_len)
+            .expect("tensor sub-view range overflow");
+        assert!(
+            byte_end <= self.buf.size(),
+            "tensor sub-view exceeds accessible buffer prefix"
+        );
         let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len_elems * self.dtype.size()) },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
         }
@@ -406,6 +419,12 @@ pub struct Gpu {
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
     pub(crate) pool: crate::pool::GpuPool,
+    /// VMM owners keyed by their base virtual address. VMM-backed tensors use
+    /// non-owning DeviceBuffer views and must bypass GpuPool/hipFree teardown.
+    vmm_arenas: HashMap<usize, VmmArena>,
+    /// Arenas whose cleanup failed before they could enter the owner map.
+    /// They have no tensor owner and are retried during explicit/Gpu teardown.
+    orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
@@ -821,6 +840,8 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            vmm_arenas: HashMap::new(),
+            orphan_vmm_arenas: Vec::new(),
             active_stream: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
@@ -1772,6 +1793,174 @@ impl Gpu {
         })
     }
 
+    /// Reserve a dense virtual tensor and optionally map its initial prefix.
+    /// The returned tensor follows the normal kernel ABI, but its ownership is
+    /// registered separately so `free_tensor` releases VMM handles instead of
+    /// routing the address through `hipFree`.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor describes its full reserved shape. The caller must
+    /// keep every operation within the prefix reported by `vmm_mapped_bytes`,
+    /// growing the mapping before any wider access.
+    pub unsafe fn alloc_vmm_tensor(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        initial_mapped_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        if initial_mapped_bytes > 0 {
+            if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        }
+        let buf = match arena.owner_buffer(byte_size) {
+            Ok(buf) => buf,
+            Err(err) => {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        };
+        let key = buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            let duplicate =
+                HipError::new(0, &format!("duplicate VMM tensor base address 0x{key:x}"));
+            return Err(self.retain_failed_vmm_arena(arena, duplicate));
+        }
+        self.vmm_arenas.insert(key, arena);
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    fn retain_failed_vmm_arena(
+        &mut self,
+        mut arena: VmmArena,
+        operation_error: HipError,
+    ) -> HipError {
+        let cleanup_error = arena.release(&self.hip).err();
+        if !arena.is_released() {
+            let key = arena.base_address();
+            match self.vmm_arenas.entry(key) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    self.orphan_vmm_arenas.push(arena);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(arena);
+                }
+            }
+        }
+        match cleanup_error {
+            Some(cleanup) => HipError::new(
+                0,
+                &format!(
+                    "{operation_error}; cleanup also failed: {cleanup}; arena retained for retry"
+                ),
+            ),
+            None => operation_error,
+        }
+    }
+
+    /// Grow the mapped prefix of a VMM-backed tensor by page-aligned bytes.
+    pub fn grow_vmm_tensor(
+        &mut self,
+        tensor: &mut GpuTensor,
+        additional_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<usize> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let logical_bytes = tensor.byte_size();
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        let mapped_bytes = arena.mapped_bytes();
+        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
+        Ok(mapped_bytes)
+    }
+
+    pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::mapped_bytes)
+    }
+
+    /// Return the physical allocation granularity for a registered VMM tensor.
+    pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::granularity)
+    }
+
+    pub fn vmm_allocation_count(&self) -> usize {
+        self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
+    }
+
+    /// Retry teardown for VMM arenas retained after an earlier cleanup error.
+    /// Returns the number of arenas still pending cleanup.
+    pub fn retry_vmm_cleanup(&mut self) -> HipResult<usize> {
+        self.bind_thread()?;
+        self.release_registered_vmm()
+    }
+
+    fn release_registered_vmm(&mut self) -> HipResult<usize> {
+        let keys: Vec<usize> = self.vmm_arenas.keys().copied().collect();
+        let mut first_error = None;
+        for key in keys {
+            let (result, released) = {
+                let arena = self.vmm_arenas.get_mut(&key).unwrap();
+                let result = arena.release(&self.hip);
+                (result, arena.is_released())
+            };
+            if released {
+                self.vmm_arenas.remove(&key);
+            }
+            if let Err(err) = result {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        let mut orphan_index = 0;
+        while orphan_index < self.orphan_vmm_arenas.len() {
+            let (result, released) = {
+                let arena = &mut self.orphan_vmm_arenas[orphan_index];
+                let result = arena.release(&self.hip);
+                (result, arena.is_released())
+            };
+            if released {
+                let released_arena = self.orphan_vmm_arenas.swap_remove(orphan_index);
+                debug_assert!(released_arena.is_released());
+            } else {
+                orphan_index += 1;
+            }
+            if let Err(err) = result {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(self.vmm_allocation_count()),
+        }
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, DType::F32)?;
@@ -1842,8 +2031,39 @@ impl Gpu {
 
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.pool.free(tensor.buf);
-        Ok(())
+        let key = tensor.buf.as_ptr() as usize;
+        if let Some(arena) = self.vmm_arenas.get_mut(&key) {
+            if !tensor.buf.is_vmm_owner() {
+                return Err(HipError::new(
+                    0,
+                    &format!("refusing to free borrowed VMM view at 0x{key:x}"),
+                ));
+            }
+            let result = match arena.release(&self.hip) {
+                Err(first) if !arena.is_released() => match arena.release(&self.hip) {
+                    Ok(()) => Ok(()),
+                    Err(retry) => Err(HipError::new(
+                        retry.code,
+                        &format!(
+                            "VMM tensor cleanup failed, then retry failed: {first}; retry: {retry}"
+                        ),
+                    )),
+                },
+                result => result,
+            };
+            if arena.is_released() {
+                self.vmm_arenas.remove(&key);
+            }
+            result
+        } else if tensor.buf.is_borrowed() || tensor.buf.is_vmm_owner() {
+            Err(HipError::new(
+                0,
+                &format!("refusing to pool non-owning tensor at 0x{key:x}"),
+            ))
+        } else {
+            self.pool.free(tensor.buf);
+            Ok(())
+        }
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
@@ -2698,10 +2918,13 @@ impl Drop for Gpu {
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() && self.vmm_allocation_count() == 0 {
             return;
         }
         self.bind_thread_or_warn();
+        if let Err(err) = self.release_registered_vmm() {
+            eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
+        }
     }
 }
 

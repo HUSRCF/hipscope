@@ -53,7 +53,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         physical_cap: Some(ctx.max_seq),
     };
     let mut kv =
-        KvCache::from_mode(mode, KvTarget::Single(ctx.gpu), &dims).map_err(|e| format!("{e}"))?;
+        KvCache::from_mode_with_backend(mode, ctx.kv_backend, KvTarget::Single(ctx.gpu), &dims)
+            .map_err(|e| format!("{e}"))?;
 
     // ── V-mode override via env ──────────────────────────────
     let kv_v_env = hipfire_config::developer_var("HIPFIRE_KV_V").unwrap_or_default();

@@ -11,6 +11,7 @@ use crate::{
     ModelState,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
@@ -328,6 +329,18 @@ impl Carrier for Qwen35Carrier {
         matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+            return Err(
+                "qwen35: KV backend 'vmm' currently requires pp=1; use 'contiguous' for pipeline parallelism"
+                    .into(),
+            );
+        }
+        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
+            return Err(
+                "qwen35: KV backend 'vmm' does not yet support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                    .into(),
+            );
+        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -432,8 +445,9 @@ impl Carrier for Qwen35Carrier {
                     max_seq: ctx.max_seq,
                     physical_cap: Some(ctx.max_seq),
                 };
-                let kv_cache = hipfire_runtime::llama::KvCache::from_mode(
+                let kv_cache = hipfire_runtime::llama::KvCache::from_mode_with_backend(
                     mode,
+                    ctx.kv_backend,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
                     &dims,
                 )

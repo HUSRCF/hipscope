@@ -2208,6 +2208,16 @@ fn verify_dflash_block_inner(
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
+    let required_tokens = start_pos.checked_add(b).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("DFlash verify KV token range overflow ({start_pos} + {b})"),
+        )
+    })?;
+    // Verify replay bypasses the regular qwen35 forward wrappers.
+    target
+        .kv_cache
+        .ensure_mapped_capacity(gpu, required_tokens)?;
 
     assert!(
         b <= verify_scratch.max_n,
