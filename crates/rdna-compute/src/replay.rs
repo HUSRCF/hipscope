@@ -21,11 +21,13 @@ use std::sync::Arc;
 
 use hip_bridge::HipRuntime;
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    load_symbols, BatchFencePolicy, DispatchTimestampMemory, Executable,
+    Gfx10DispatchInitiatorPolicy, Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy,
+    Gfx11DispatchInterleave, Gfx12CopyDataDstScope, Gfx12DispatchTimestampConfig,
     Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
     HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
-    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Pm4DispatchProfileConfig, QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph,
+    SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,7 +273,7 @@ impl Pm4Commands {
         device: &GpuDevice,
         pool: &KernargPool,
         cu_mask: Option<&[u32; 2]>,
-        dispatch_profile: bool,
+        dispatch_profile: Option<Pm4DispatchProfileConfig>,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
             Self::Legacy {
@@ -294,8 +296,15 @@ impl Pm4Commands {
                 // different dword count and sequence hash, so such a run cannot
                 // satisfy a golden fixture — it is a diagnostic, not a
                 // certification.
-                if dispatch_profile || dispatch_profile_enabled() {
-                    SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands)
+                if let Some(config) = dispatch_profile {
+                    SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands, config)
+                } else if dispatch_profile_enabled() {
+                    SingleQueuePm4Ib::create_dispatch_profiled(
+                        device,
+                        pool,
+                        commands,
+                        Pm4DispatchProfileConfig::default(),
+                    )
                 } else {
                     SingleQueuePm4Ib::create_profiled(device, pool, commands)
                 }
@@ -1906,6 +1915,79 @@ pub struct Pm4DispatchProfile {
     pub spans_nanoseconds: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Pm4DispatchProfileArm {
+    #[default]
+    HostLegacyConfirm,
+    HostSystemConfirm,
+    DeviceConfirm,
+    HostSystemTailConfirm,
+}
+
+impl Pm4DispatchProfileArm {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "host-legacy-confirm" => Some(Self::HostLegacyConfirm),
+            "host-system-confirm" => Some(Self::HostSystemConfirm),
+            "device-confirm" => Some(Self::DeviceConfirm),
+            "host-system-tail-confirm" => Some(Self::HostSystemTailConfirm),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostLegacyConfirm => "host-legacy-confirm",
+            Self::HostSystemConfirm => "host-system-confirm",
+            Self::DeviceConfirm => "device-confirm",
+            Self::HostSystemTailConfirm => "host-system-tail-confirm",
+        }
+    }
+
+    pub const fn timestamp_memory(self) -> &'static str {
+        match self {
+            Self::DeviceConfirm => "device-local",
+            _ => "host-fine-grained",
+        }
+    }
+
+    pub const fn dst_scope(self) -> &'static str {
+        match self {
+            Self::HostLegacyConfirm => "legacy-cu",
+            Self::DeviceConfirm => "device",
+            Self::HostSystemConfirm | Self::HostSystemTailConfirm => "system",
+        }
+    }
+
+    pub const fn per_write_confirm(self) -> bool {
+        !matches!(self, Self::HostSystemTailConfirm)
+    }
+
+    pub const fn tail_release(self) -> bool {
+        matches!(self, Self::HostSystemTailConfirm)
+    }
+
+    fn config(self) -> Pm4DispatchProfileConfig {
+        let memory = match self {
+            Self::DeviceConfirm => DispatchTimestampMemory::DeviceLocal,
+            _ => DispatchTimestampMemory::HostFineGrained,
+        };
+        let dst_scope = match self {
+            Self::HostLegacyConfirm => Gfx12CopyDataDstScope::Legacy,
+            Self::DeviceConfirm => Gfx12CopyDataDstScope::Device,
+            Self::HostSystemConfirm | Self::HostSystemTailConfirm => Gfx12CopyDataDstScope::System,
+        };
+        Pm4DispatchProfileConfig {
+            memory,
+            packet: Gfx12DispatchTimestampConfig {
+                dst_scope,
+                per_write_confirm: self.per_write_confirm(),
+                tail_release: self.tail_release(),
+            },
+        }
+    }
+}
+
 pub struct PreparedPm4Replay {
     graph: PreparedPm4Graph,
     // Kernels retain their HSA executables and kernargs retain every pointer
@@ -2520,7 +2602,7 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false)
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, None)
     }
 
     /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
@@ -2528,16 +2610,18 @@ impl ReplayController {
         &mut self,
         device_ordinal: usize,
         prefix: usize,
+        arm: Pm4DispatchProfileArm,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true)
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, Some(arm.config()))
     }
 
     fn prepare_pm4_prefix_inner(
         &mut self,
         device_ordinal: usize,
         prefix: usize,
-        dispatch_profile: bool,
+        dispatch_profile_config: Option<Pm4DispatchProfileConfig>,
     ) -> Result<(usize, u32, u64), String> {
+        let dispatch_profile = dispatch_profile_config.is_some();
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
         }
@@ -2737,7 +2821,7 @@ impl ReplayController {
             }
             let command_dwords = commands.len_dwords();
             let graph =
-                commands.create_graph(&device, &pool, cu_mask.as_ref(), dispatch_profile)?;
+                commands.create_graph(&device, &pool, cu_mask.as_ref(), dispatch_profile_config)?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_config();
@@ -4324,5 +4408,23 @@ mod tests {
 
         controller.set_forward_eligible(false);
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn dispatch_profile_arms_map_to_one_variable_at_a_time() {
+        let legacy = Pm4DispatchProfileArm::parse("host-legacy-confirm").unwrap();
+        let system = Pm4DispatchProfileArm::parse("host-system-confirm").unwrap();
+        let device = Pm4DispatchProfileArm::parse("device-confirm").unwrap();
+        let tail = Pm4DispatchProfileArm::parse("host-system-tail-confirm").unwrap();
+
+        assert_eq!(legacy.timestamp_memory(), "host-fine-grained");
+        assert_eq!(legacy.dst_scope(), "legacy-cu");
+        assert_eq!(system.timestamp_memory(), legacy.timestamp_memory());
+        assert_eq!(system.dst_scope(), "system");
+        assert_eq!(device.timestamp_memory(), "device-local");
+        assert_eq!(device.dst_scope(), "device");
+        assert!(!tail.per_write_confirm());
+        assert!(tail.tail_release());
+        assert!(Pm4DispatchProfileArm::parse("unknown").is_none());
     }
 }

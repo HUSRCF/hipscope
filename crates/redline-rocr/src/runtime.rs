@@ -1424,6 +1424,7 @@ struct KernargPoolInner {
     runtime: Arc<RuntimeInner>,
     pool: abi::MemoryPool,
     gpu: abi::Agent,
+    access_agent: abi::Agent,
     granule: usize,
     alignment: usize,
 }
@@ -1544,12 +1545,104 @@ impl KernargPool {
                     runtime: device.runtime.clone(),
                     pool,
                     gpu: device.gpu_agent(),
+                    access_agent: device.gpu_agent(),
                     granule,
                     alignment,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
+    }
+
+    /// Allocate a CPU-readable diagnostic buffer from the GPU agent's
+    /// coarse-grained device-local pool.
+    ///
+    /// This is intentionally separate from the retained IB/kernarg pool. It is
+    /// used only to distinguish confirmed host writes from CP packet cost in
+    /// the per-dispatch timestamp diagnostic.
+    pub fn allocate_device_local_bytes(
+        device: &GpuDevice,
+        length: usize,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        let cpu = device.cpu.as_ref().ok_or(RuntimeError::NoCpuAgent)?;
+        unsafe extern "C" fn collect(pool: abi::MemoryPool, data: *mut c_void) -> abi::Status {
+            // SAFETY: context is a live vector for synchronous iteration.
+            unsafe { &mut *data.cast::<Vec<abi::MemoryPool>>() }.push(pool);
+            abi::STATUS_SUCCESS
+        }
+        let mut pools = Vec::new();
+        // SAFETY: callback and context satisfy the synchronous iteration contract.
+        let status = unsafe {
+            (device.runtime.symbols.agent_iterate_memory_pools)(
+                device.gpu_agent(),
+                Some(collect),
+                (&mut pools as *mut Vec<abi::MemoryPool>).cast(),
+            )
+        };
+        check_status(
+            &device.runtime.symbols,
+            "hsa_amd_agent_iterate_memory_pools",
+            status,
+        )?;
+
+        for pool in pools {
+            let mut segment = 0_u32;
+            let mut flags = 0_u32;
+            let mut allowed = false;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_SEGMENT,
+                (&mut segment as *mut u32).cast(),
+            )?;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+                (&mut flags as *mut u32).cast(),
+            )?;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED,
+                (&mut allowed as *mut bool).cast(),
+            )?;
+            if segment != abi::AMD_SEGMENT_GLOBAL
+                || !allowed
+                || flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED == 0
+            {
+                continue;
+            }
+            let mut granule = 0_usize;
+            let mut alignment = 0_usize;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE,
+                (&mut granule as *mut usize).cast(),
+            )?;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT,
+                (&mut alignment as *mut usize).cast(),
+            )?;
+            if granule == 0 || !alignment.is_power_of_two() {
+                continue;
+            }
+            let diagnostic_pool = Self {
+                inner: Arc::new(KernargPoolInner {
+                    runtime: device.runtime.clone(),
+                    pool,
+                    gpu: device.gpu_agent(),
+                    access_agent: cpu.handle,
+                    granule,
+                    alignment,
+                }),
+            };
+            return diagnostic_pool.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_STANDARD_FLAG);
+        }
+        Err(RuntimeError::NoDeviceLocalPool)
     }
 
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
@@ -1639,7 +1732,7 @@ impl KernargPool {
         let status = unsafe {
             (self.inner.runtime.symbols.agents_allow_access)(
                 1,
-                &self.inner.gpu,
+                &self.inner.access_agent,
                 ptr::null(),
                 pointer.as_ptr().cast(),
             )
@@ -2243,6 +2336,7 @@ pub enum RuntimeError {
     InvalidCuMask(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
+    NoDeviceLocalPool,
     InvalidKernargAlignment(usize),
     KernargAlignmentNotMet {
         required: usize,
@@ -2339,6 +2433,12 @@ impl fmt::Display for RuntimeError {
                 f,
                 "no allocatable fine-grained host pool with KERNARG_INIT was found"
             ),
+            Self::NoDeviceLocalPool => {
+                write!(
+                    f,
+                    "no CPU-readable device-local coarse-grained pool was found"
+                )
+            }
             Self::InvalidKernargAlignment(alignment) => {
                 write!(f, "kernel reported invalid kernarg alignment {alignment}")
             }

@@ -21,6 +21,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1
+ARMS = (
+    "host-legacy-confirm",
+    "host-system-confirm",
+    "device-confirm",
+    "host-system-tail-confirm",
+)
 
 
 class Daemon:
@@ -100,6 +106,14 @@ def validate_profile(profile):
         raise ValueError("unsupported RPC schema version")
     if not profile.get("steady_state") or not profile.get("exactly_once_per_sample"):
         raise ValueError("RPC did not guarantee steady-state exactly-once samples")
+    if profile.get("arm") not in ARMS:
+        raise ValueError("RPC returned an unknown diagnostic arm")
+    timestamp_validation = profile.get("timestamp_validation")
+    if not isinstance(timestamp_validation, dict) or not all(
+        timestamp_validation.get(key)
+        for key in ("sentinels_overwritten", "monotonic", "complete")
+    ):
+        raise ValueError("RPC did not prove timestamp completeness and monotonicity")
 
     dispatches = profile.get("dispatches")
     samples = profile.get("samples")
@@ -174,6 +188,25 @@ def analyze(profile):
 
     medians = [row["median_ns"] for row in dispatches]
     tail_count = max(1, math.ceil(len(medians) * 0.05))
+    boundary_groups = {}
+    for name, has_wait in (
+        ("wait_compute_idle", True),
+        ("no_wait_compute_idle", False),
+    ):
+        rows = [
+            row
+            for row in dispatches
+            if row["boundary"]["wait_compute_idle"] is has_wait
+        ]
+        total = sum(row["median_ns"] for row in rows)
+        boundary_groups[name] = {
+            "count": len(rows),
+            "total_median_ns": total,
+            "share_pct": 100.0 * total / dispatch_total,
+            "span_median_ns": statistics.median(
+                [row["median_ns"] for row in rows]
+            ),
+        }
     return {
         "dispatches": dispatches,
         "kernels": kernels,
@@ -188,6 +221,7 @@ def analyze(profile):
             "slowest_5pct_share_pct": (
                 100.0 * sum(sorted(medians)[-tail_count:]) / dispatch_total
             ),
+            "boundary_groups": boundary_groups,
         },
     }
 
@@ -205,10 +239,17 @@ def print_summary(report, top):
     summary = report["summary"]
     gpu = summary["gpu_total"]
     print(
-        f"route={route['sequence_hash']} launches={route['launches']} "
+        f"arm={report['arm']} route={route['sequence_hash']} launches={route['launches']} "
         f"samples={report['request']['sample_replays']} "
         f"gpu_median={gpu['median_ns'] / 1_000:.3f}us "
         f"slowest5%={summary['slowest_5pct_share_pct']:.1f}%"
+    )
+    waits = summary["boundary_groups"]["wait_compute_idle"]
+    no_waits = summary["boundary_groups"]["no_wait_compute_idle"]
+    print(
+        f"boundary totals: wait={waits['total_median_ns'] / 1_000:.3f}us/"
+        f"{waits['count']} no-wait={no_waits['total_median_ns'] / 1_000:.3f}us/"
+        f"{no_waits['count']}"
     )
     correctness = report["correctness"]
     if correctness.get("performed"):
@@ -230,6 +271,33 @@ def print_summary(report, top):
             f"{row['p90_ns'] / 1_000:7.3f}  "
             f"{row['share_pct']:6.2f}  {flags:8s}  {row['kernel']}"
         )
+
+
+def build_report(profile, model_info, args, run_index=None):
+    analysis = analyze(profile)
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "type": "hipfire_redline_dispatch_profile_report",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "arm": profile["arm"],
+        "model": model_info,
+        "request": {
+            "context_tokens": args.context,
+            "warmup_replays": args.warmup_replays,
+            "sample_replays": args.sample_replays,
+            "max_seq": args.max_seq,
+            "kv_mode": args.kv_mode,
+        },
+        "route": profile["route"],
+        "timestamp_validation": profile["timestamp_validation"],
+        "timestamp_semantics": profile["timestamp_semantics"],
+        "correctness": profile["correctness"],
+        "samples": profile["samples"],
+        **analysis,
+    }
+    if run_index is not None:
+        report["run_index"] = run_index
+    return report
 
 
 def main():
@@ -254,6 +322,17 @@ def main():
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--arm", choices=ARMS, default=ARMS[0])
+    parser.add_argument(
+        "--matrix",
+        action="store_true",
+        help="alternate baseline with host-system and device-local arms",
+    )
+    parser.add_argument(
+        "--include-no-confirm",
+        action="store_true",
+        help="append the higher-risk no-per-write-confirm arm to --matrix",
+    )
     args = parser.parse_args()
     if args.context <= 0 or args.warmup_replays < 0 or args.sample_replays <= 0:
         parser.error("invalid context/warmup/sample count")
@@ -265,6 +344,25 @@ def main():
     if not model.is_file() or not daemon_path.is_file():
         parser.error("model and daemon must exist")
 
+    arm_order = [args.arm]
+    if args.matrix:
+        arm_order = [
+            "host-legacy-confirm",
+            "host-system-confirm",
+            "host-legacy-confirm",
+            "device-confirm",
+            "host-legacy-confirm",
+        ]
+        if args.include_no_confirm:
+            arm_order.extend(
+                ["host-system-tail-confirm", "host-legacy-confirm"]
+            )
+
+    model_info = {
+        "path": str(model),
+        "bytes": model.stat().st_size,
+        "sha256": sha256_file(model),
+    }
     daemon = Daemon(daemon_path, log_path, args.timeout, args.kv_mode)
     try:
         daemon.request(
@@ -287,48 +385,49 @@ def main():
                 "redline_detail": True,
             }
         )["redline_capture"]
-        profile = daemon.request(
-            {
-                "type": "redline_dispatch_profile",
-                "context_tokens": args.context,
-                "warmup_replays": args.warmup_replays,
-                "sample_replays": args.sample_replays,
-                "validate_correctness": not args.skip_correctness,
-            }
-        )
+        profiles = []
+        for arm in arm_order:
+            profile = daemon.request(
+                {
+                    "type": "redline_dispatch_profile",
+                    "context_tokens": args.context,
+                    "warmup_replays": args.warmup_replays,
+                    "sample_replays": args.sample_replays,
+                    "validate_correctness": not args.skip_correctness,
+                    "arm": arm,
+                }
+            )
+            validate_capture(capture, profile)
+            profiles.append(profile)
     finally:
         daemon.close()
 
-    validate_capture(capture, profile)
-    analysis = analyze(profile)
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "type": "hipfire_redline_dispatch_profile_report",
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "model": {
-            "path": str(model),
-            "bytes": model.stat().st_size,
-            "sha256": sha256_file(model),
-        },
-        "request": {
-            "context_tokens": args.context,
-            "warmup_replays": args.warmup_replays,
-            "sample_replays": args.sample_replays,
-            "max_seq": args.max_seq,
-            "kv_mode": args.kv_mode,
-        },
-        "route": profile["route"],
-        "timestamp_semantics": profile["timestamp_semantics"],
-        "correctness": profile["correctness"],
-        "samples": profile["samples"],
-        **analysis,
-    }
+    reports = [
+        build_report(profile, model_info, args, index)
+        for index, profile in enumerate(profiles)
+    ]
+    if args.matrix:
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "type": "hipfire_redline_dispatch_profile_matrix_report",
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": model_info,
+            "request": reports[0]["request"],
+            "arm_order": arm_order,
+            "runs": reports,
+        }
+    else:
+        report = reports[0]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n")
-    print_summary(report, args.top)
+    for arm_report in reports:
+        print_summary(arm_report, args.top)
     print(f"report={output}")
     print(f"daemon_log={log_path}")
-    if report["correctness"].get("bit_exact") is False:
+    if any(
+        arm_report["correctness"].get("bit_exact") is False
+        for arm_report in reports
+    ):
         print("FAIL: instrumented PM4 shadow is not bit-exact", file=sys.stderr)
         return 1
     return 0

@@ -10,10 +10,33 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport,
-    QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12DispatchTimestampConfig,
+    Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    Pm4BuildError, QueueDepthReport, QueueSet, RuntimeError,
 };
+
+const DISPATCH_TIMESTAMP_SENTINEL: u64 = 0xd1a6_7057_dead_beef;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchTimestampMemory {
+    HostFineGrained,
+    DeviceLocal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pm4DispatchProfileConfig {
+    pub memory: DispatchTimestampMemory,
+    pub packet: Gfx12DispatchTimestampConfig,
+}
+
+impl Default for Pm4DispatchProfileConfig {
+    fn default() -> Self {
+        Self {
+            memory: DispatchTimestampMemory::HostFineGrained,
+            packet: Gfx12DispatchTimestampConfig::default(),
+        }
+    }
+}
 
 fn retained_queue_size(
     required_packets: usize,
@@ -77,6 +100,8 @@ pub struct SingleQueuePm4Ib {
     batch: Vec<PacketImage>,
     timestamps: Option<KernargBuffer>,
     timestamp_frequency_hz: Option<u64>,
+    dispatch_timestamp_slots: Option<usize>,
+    tail_fence_slot: Option<usize>,
     dispatch_workgroup_offsets: Vec<usize>,
     usable: bool,
 }
@@ -142,6 +167,7 @@ impl SingleQueuePm4Ib {
         device: &GpuDevice,
         pool: &KernargPool,
         commands: &Gfx12Pm4CommandBuffer,
+        config: Pm4DispatchProfileConfig,
     ) -> Result<Self, ReplayError> {
         if commands.is_empty() {
             return Err(ReplayError::EmptyGraph);
@@ -149,21 +175,39 @@ impl SingleQueuePm4Ib {
         let slots = commands
             .timestamp_slot_count()
             .map_err(ReplayError::Pm4Build)?;
-        let mut timestamps = pool.allocate_executable_bytes(slots * 8)?;
-        timestamps.as_mut_bytes().fill(0);
+        let total_slots = slots + usize::from(config.packet.tail_release);
+        let mut timestamps = match config.memory {
+            DispatchTimestampMemory::HostFineGrained => {
+                pool.allocate_executable_bytes(total_slots * 8)?
+            }
+            DispatchTimestampMemory::DeviceLocal => {
+                KernargPool::allocate_device_local_bytes(device, total_slots * 8)?
+            }
+        };
+        for word in timestamps.as_mut_bytes().chunks_exact_mut(8) {
+            word.copy_from_slice(&DISPATCH_TIMESTAMP_SENTINEL.to_le_bytes());
+        }
         let base = timestamps.address() as usize as u64;
+        let tail_fence_slot = config.packet.tail_release.then_some(slots);
         let timed = commands
-            .with_per_dispatch_timestamps(base)
+            .with_per_dispatch_timestamps(
+                base,
+                config.packet,
+                tail_fence_slot.map(|slot| base + slot as u64 * 8),
+            )
             .map_err(ReplayError::Pm4Build)?;
         let frequency_hz = device.gpu_timestamp_frequency_hz()?;
-        Self::create_encoded(
+        let mut graph = Self::create_encoded(
             device,
             pool,
             &timed.as_bytes(),
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
-        )
+        )?;
+        graph.dispatch_timestamp_slots = Some(slots);
+        graph.tail_fence_slot = tail_fence_slot;
+        Ok(graph)
     }
 
     pub fn create_profiled(
@@ -254,6 +298,8 @@ impl SingleQueuePm4Ib {
             batch: vec![packet],
             timestamps,
             timestamp_frequency_hz,
+            dispatch_timestamp_slots: None,
+            tail_fence_slot: None,
             dispatch_workgroup_offsets,
             usable: true,
         })
@@ -422,12 +468,29 @@ impl SingleQueuePm4Ib {
             .as_mut()
             .ok_or(ReplayError::ProfilingUnavailable)?
             .as_mut_bytes();
-        let ticks = bytes
+        let all_ticks = bytes
             .chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
             .collect::<Vec<_>>();
+        let slots = self.dispatch_timestamp_slots.unwrap_or(all_ticks.len());
+        let ticks = all_ticks
+            .get(..slots)
+            .ok_or(ReplayError::ProfilingUnavailable)?;
         if ticks.len() < 2 {
             return Err(ReplayError::ProfilingUnavailable);
+        }
+        let missing = ticks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, value)| (*value == DISPATCH_TIMESTAMP_SENTINEL).then_some(slot))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ReplayError::IncompleteGpuTimestamps { missing });
+        }
+        if let Some(slot) = self.tail_fence_slot {
+            if all_ticks.get(slot) == Some(&DISPATCH_TIMESTAMP_SENTINEL) {
+                return Err(ReplayError::IncompleteGpuTimestampFence { slot });
+            }
         }
         let mut spans_nanoseconds = Vec::with_capacity(ticks.len() - 1);
         for pair in ticks.windows(2) {
@@ -3060,6 +3123,12 @@ pub enum ReplayError {
         start: u64,
         end: u64,
     },
+    IncompleteGpuTimestamps {
+        missing: Vec<usize>,
+    },
+    IncompleteGpuTimestampFence {
+        slot: usize,
+    },
     MalformedPm4IndirectBuffer {
         dword: usize,
     },
@@ -3172,6 +3241,14 @@ impl fmt::Display for ReplayError {
             Self::InvalidGpuTimestamp { start, end } => write!(
                 f,
                 "retained PM4 GPU timestamp bracket is invalid: start={start}, end={end}"
+            ),
+            Self::IncompleteGpuTimestamps { missing } => write!(
+                f,
+                "retained PM4 timestamp sentinels were not overwritten at slots {missing:?}"
+            ),
+            Self::IncompleteGpuTimestampFence { slot } => write!(
+                f,
+                "retained PM4 tail-fence sentinel was not overwritten at slot {slot}"
             ),
             Self::MalformedPm4IndirectBuffer { dword } => write!(
                 f,

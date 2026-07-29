@@ -40,6 +40,45 @@ const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABL
 const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
+/// GFX12 `COPY_DATA.DST_SCOPE` used by the diagnostic timestamp writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx12CopyDataDstScope {
+    /// Preserve the original packet encoding (`DST_SCOPE=CU`/zero).
+    #[default]
+    Legacy,
+    Device,
+    System,
+}
+
+impl Gfx12CopyDataDstScope {
+    const fn bits(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Device => 2,
+            Self::System => 3,
+        }
+    }
+}
+
+/// Packet-only controls for one diagnostic per-dispatch timestamp tape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gfx12DispatchTimestampConfig {
+    pub dst_scope: Gfx12CopyDataDstScope,
+    pub per_write_confirm: bool,
+    /// Append one confirmed bottom-of-pipe timestamp to `tail_fence_address`.
+    pub tail_release: bool,
+}
+
+impl Default for Gfx12DispatchTimestampConfig {
+    fn default() -> Self {
+        Self {
+            dst_scope: Gfx12CopyDataDstScope::Legacy,
+            per_write_confirm: true,
+            tail_release: false,
+        }
+    }
+}
+
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx12Pm4CommandBuffer {
@@ -113,7 +152,7 @@ impl Gfx12Pm4CommandBuffer {
     /// timestamp form.
     pub fn with_gpu_timestamps(&self, start_address: u64, end_address: u64) -> Self {
         let mut timed = Self::new();
-        timed.copy_gpu_timestamp(start_address);
+        timed.copy_gpu_timestamp(start_address, Gfx12DispatchTimestampConfig::default());
         timed.dwords.extend_from_slice(&self.dwords);
         timed.release_gpu_timestamp(end_address);
         timed
@@ -134,10 +173,18 @@ impl Gfx12Pm4CommandBuffer {
     /// It answers a question end-to-end throughput cannot: whether a deficit is
     /// spread evenly across dispatches (per-dispatch overhead) or concentrated
     /// in a few (a barrier or cache-release stall).
-    pub fn with_per_dispatch_timestamps(&self, base_address: u64) -> Result<Self, Pm4BuildError> {
+    pub fn with_per_dispatch_timestamps(
+        &self,
+        base_address: u64,
+        config: Gfx12DispatchTimestampConfig,
+        tail_fence_address: Option<u64>,
+    ) -> Result<Self, Pm4BuildError> {
+        if config.tail_release != tail_fence_address.is_some() {
+            return Err(Pm4BuildError::InvalidTimestampConfiguration);
+        }
         let mut timed = Self::new();
         let mut slot = 0_u64;
-        timed.copy_gpu_timestamp(base_address);
+        timed.copy_gpu_timestamp(base_address, config);
         slot += 1;
 
         let mut cursor = 0_usize;
@@ -153,10 +200,13 @@ impl Gfx12Pm4CommandBuffer {
                 .ok_or(Pm4BuildError::MalformedStream { dword: cursor })?;
             timed.dwords.extend_from_slice(&self.dwords[cursor..next]);
             if (header >> 8) & 0xff == PACKET3_DISPATCH_DIRECT {
-                timed.copy_gpu_timestamp(base_address + slot * 8);
+                timed.copy_gpu_timestamp(base_address + slot * 8, config);
                 slot += 1;
             }
             cursor = next;
+        }
+        if let Some(address) = tail_fence_address {
+            timed.release_gpu_timestamp(address);
         }
         Ok(timed)
     }
@@ -222,11 +272,24 @@ impl Gfx12Pm4CommandBuffer {
         Ok(attributions)
     }
 
-    fn copy_gpu_timestamp(&mut self, address: u64) {
-        const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
+    fn copy_gpu_timestamp(&mut self, address: u64, config: Gfx12DispatchTimestampConfig) {
+        const GPU_CLOCK_COUNT: u32 = 9;
+        const TC_L2_OBSOLETE: u32 = 5 << 8;
+        const COUNT_64_BITS: u32 = 1 << 16;
+        const WR_CONFIRM: u32 = 1 << 20;
+        const DST_SCOPE_SHIFT: u32 = 27;
+        let control = GPU_CLOCK_COUNT
+            | TC_L2_OBSOLETE
+            | COUNT_64_BITS
+            | if config.per_write_confirm {
+                WR_CONFIRM
+            } else {
+                0
+            }
+            | (config.dst_scope.bits() << DST_SCOPE_SHIFT);
         self.dwords.extend_from_slice(&[
             packet3(PACKET3_COPY_DATA, 5, false),
-            COPY_DATA_TIMESTAMP_TO_MEMORY_64,
+            control,
             0,
             0,
             address as u32,
@@ -447,6 +510,7 @@ pub enum Pm4BuildError {
     MalformedStream {
         dword: usize,
     },
+    InvalidTimestampConfiguration,
 }
 
 /// Boundary commands attributed to one per-dispatch timestamp span.
@@ -487,6 +551,10 @@ impl fmt::Display for Pm4BuildError {
             Self::MalformedStream { dword } => {
                 write!(formatter, "malformed PM4 stream at dword {dword}")
             }
+            Self::InvalidTimestampConfiguration => write!(
+                formatter,
+                "timestamp tail-release setting and fence address disagree"
+            ),
         }
     }
 }
@@ -519,7 +587,9 @@ mod tests {
         for n in [1_usize, 3, 8] {
             let plain = synthetic_stream(n);
             assert_eq!(plain.timestamp_slot_count().unwrap(), n + 1);
-            let timed = plain.with_per_dispatch_timestamps(0x1000).unwrap();
+            let timed = plain
+                .with_per_dispatch_timestamps(0x1000, Gfx12DispatchTimestampConfig::default(), None)
+                .unwrap();
 
             // Every original dword survives, in order, as a subsequence.
             let mut it = timed.dwords().iter();
@@ -546,11 +616,83 @@ mod tests {
     }
 
     #[test]
+    fn gfx12_copy_data_scope_and_confirmation_bits_are_explicit() {
+        let plain = synthetic_stream(1);
+        let cases = [
+            (
+                Gfx12DispatchTimestampConfig::default(),
+                9 | (5 << 8) | (1 << 16) | (1 << 20),
+            ),
+            (
+                Gfx12DispatchTimestampConfig {
+                    dst_scope: Gfx12CopyDataDstScope::System,
+                    ..Gfx12DispatchTimestampConfig::default()
+                },
+                9 | (5 << 8) | (1 << 16) | (1 << 20) | (3 << 27),
+            ),
+            (
+                Gfx12DispatchTimestampConfig {
+                    dst_scope: Gfx12CopyDataDstScope::Device,
+                    ..Gfx12DispatchTimestampConfig::default()
+                },
+                9 | (5 << 8) | (1 << 16) | (1 << 20) | (2 << 27),
+            ),
+            (
+                Gfx12DispatchTimestampConfig {
+                    dst_scope: Gfx12CopyDataDstScope::System,
+                    per_write_confirm: false,
+                    tail_release: true,
+                },
+                9 | (5 << 8) | (1 << 16) | (3 << 27),
+            ),
+        ];
+        for (config, expected_control) in cases {
+            let fence = config.tail_release.then_some(0x2000);
+            let timed = plain
+                .with_per_dispatch_timestamps(0x1000, config, fence)
+                .unwrap();
+            assert_eq!(timed.dwords()[1], expected_control);
+            let release_count = timed
+                .dwords()
+                .iter()
+                .filter(|word| **word == packet3(PACKET3_RELEASE_MEM, 7, false))
+                .count();
+            assert_eq!(release_count, usize::from(config.tail_release));
+        }
+    }
+
+    #[test]
+    fn tail_release_requires_a_matching_fence_address() {
+        let plain = synthetic_stream(1);
+        let tail = Gfx12DispatchTimestampConfig {
+            dst_scope: Gfx12CopyDataDstScope::System,
+            per_write_confirm: false,
+            tail_release: true,
+        };
+        assert_eq!(
+            plain.with_per_dispatch_timestamps(0x1000, tail, None),
+            Err(Pm4BuildError::InvalidTimestampConfiguration)
+        );
+        assert_eq!(
+            plain.with_per_dispatch_timestamps(
+                0x1000,
+                Gfx12DispatchTimestampConfig::default(),
+                Some(0x2000),
+            ),
+            Err(Pm4BuildError::InvalidTimestampConfiguration)
+        );
+    }
+
+    #[test]
     fn per_dispatch_timestamps_reject_a_malformed_stream() {
         let mut bad = Gfx12Pm4CommandBuffer::new();
         bad.dwords.push(0x0000_0000); // not a PACKET3 header
         assert!(matches!(
-            bad.with_per_dispatch_timestamps(0x1000),
+            bad.with_per_dispatch_timestamps(
+                0x1000,
+                Gfx12DispatchTimestampConfig::default(),
+                None,
+            ),
             Err(Pm4BuildError::MalformedStream { dword: 0 })
         ));
         // A length running past the end must be rejected, not truncated.
@@ -558,7 +700,15 @@ mod tests {
         overrun
             .dwords
             .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
-        assert!(overrun.with_per_dispatch_timestamps(0x1000).is_err());
+        assert!(
+            overrun
+                .with_per_dispatch_timestamps(
+                    0x1000,
+                    Gfx12DispatchTimestampConfig::default(),
+                    None,
+                )
+                .is_err()
+        );
     }
     use super::*;
 
@@ -614,7 +764,9 @@ mod tests {
         // each subsequent stamp immediately after its DISPATCH_DIRECT so span 0
         // covers entry acquire → dispatch 0, span 1 covers wait+acquire →
         // dispatch 1, etc.
-        let timed = plain.with_per_dispatch_timestamps(0x2000).unwrap();
+        let timed = plain
+            .with_per_dispatch_timestamps(0x2000, Gfx12DispatchTimestampConfig::default(), None)
+            .unwrap();
         let copies: Vec<usize> = timed
             .dwords()
             .iter()

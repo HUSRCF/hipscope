@@ -4056,6 +4056,22 @@ fn main() {
                     .get("validate_correctness")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(true);
+                let arm_name = msg
+                    .get("arm")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("host-legacy-confirm");
+                let Some(arm) = rdna_compute::replay::Pm4DispatchProfileArm::parse(arm_name) else {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": format!("unknown redline dispatch-profile arm {arm_name:?}"),
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                };
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -4076,10 +4092,11 @@ fn main() {
                 }
 
                 let route = gpu.replay.capture_summary();
-                let prepared = match gpu
-                    .replay
-                    .prepare_pm4_dispatch_profile(gpu.device_id as usize, launch_count)
-                {
+                let prepared = match gpu.replay.prepare_pm4_dispatch_profile(
+                    gpu.device_id as usize,
+                    launch_count,
+                    arm,
+                ) {
                     Ok(summary) => summary,
                     Err(reason) => {
                         let _ = writeln!(
@@ -4245,8 +4262,18 @@ fn main() {
                                 "context_tokens": context,
                                 "warmup_replays": warmup_replays,
                                 "sample_replays": sample_replays,
+                                "arm": arm.as_str(),
                                 "steady_state": true,
                                 "exactly_once_per_sample": true,
+                                "timestamp_validation": {
+                                    "memory": arm.timestamp_memory(),
+                                    "dst_scope": arm.dst_scope(),
+                                    "per_write_confirm": arm.per_write_confirm(),
+                                    "tail_release": arm.tail_release(),
+                                    "sentinels_overwritten": true,
+                                    "monotonic": true,
+                                    "complete": true,
+                                },
                                 "timestamp_semantics": "baseline before stream plus post-dispatch stamps; span i is PM4 after timestamp i through dispatch i (entry acquire in span 0; later spans include intervening boundary packets)",
                                 "route": {
                                     "launches": route.launch_count,
@@ -4254,6 +4281,7 @@ fn main() {
                                     "sequence_hash": format!("{:016x}", route.sequence_hash),
                                     "command_dwords": prepared.1,
                                     "timestamp_slots": route.launch_count + 1,
+                                    "tail_fence_slots": usize::from(arm.tail_release()),
                                     "queue_id": prepared.2,
                                 },
                                 "dispatches": dispatches,

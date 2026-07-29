@@ -43,8 +43,18 @@ def synthetic_profile():
         "context_tokens": 128,
         "warmup_replays": 10,
         "sample_replays": len(spans),
+        "arm": "host-legacy-confirm",
         "steady_state": True,
         "exactly_once_per_sample": True,
+        "timestamp_validation": {
+            "memory": "host-fine-grained",
+            "dst_scope": "legacy-cu",
+            "per_write_confirm": True,
+            "tail_release": False,
+            "sentinels_overwritten": True,
+            "monotonic": True,
+            "complete": True,
+        },
         "timestamp_semantics": "baseline before stream plus post-dispatch stamps; span i is PM4 after timestamp i through dispatch i",
         "route": {
             "launches": len(dispatches),
@@ -90,6 +100,18 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "total"):
             profile_tool.validate_profile(profile)
 
+    def test_rejects_unknown_arm_or_incomplete_timestamps(self):
+        profile = synthetic_profile()
+        profile["arm"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "unknown diagnostic arm"):
+            profile_tool.validate_profile(profile)
+
+        for field in ("sentinels_overwritten", "monotonic", "complete"):
+            profile = synthetic_profile()
+            profile["timestamp_validation"][field] = False
+            with self.assertRaisesRegex(ValueError, "timestamp completeness"):
+                profile_tool.validate_profile(profile)
+
     def test_capture_must_match_profile_route(self):
         profile = synthetic_profile()
         capture = {
@@ -117,6 +139,11 @@ class ProfileTests(unittest.TestCase):
         gemv = [row for row in analysis["kernels"] if row["kernel"] == "gemv"]
         self.assertEqual(gemv[0]["dispatch_indices"], [1, 2])
         self.assertEqual(gemv[0]["total_median_ns"], 3_000)
+        groups = analysis["summary"]["boundary_groups"]
+        self.assertEqual(groups["wait_compute_idle"]["count"], 1)
+        self.assertEqual(groups["wait_compute_idle"]["total_median_ns"], 400)
+        self.assertEqual(groups["no_wait_compute_idle"]["count"], 3)
+        self.assertEqual(groups["no_wait_compute_idle"]["total_median_ns"], 3_100)
 
 
 if __name__ == "__main__":

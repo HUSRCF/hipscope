@@ -429,6 +429,15 @@ Reasons it cannot prove those claims:
 Use product bench / Golden for certification evidence. Use this profiler only
 to attribute relative stall shape across dispatches under the instrumented tape.
 
+For confirmed-write diagnostics, `--matrix` alternates the original
+host-fine-grained/legacy-scope arm with explicit system-scope host writes and
+device-local/device-scope writes. `--include-no-confirm` additionally tests
+unconfirmed per-dispatch host writes followed by one confirmed system-scope
+tail release. Every arm fails closed unless timestamp sentinels are overwritten
+and complete and monotonic, and the default run checks the instrumented shadow
+bit-exactly. The JSON keeps every run and reports time grouped by whether its
+span contains a `wait_compute_idle` boundary.
+
 
 ## 6. PM4 lowering and hazard policy
 

@@ -36,7 +36,10 @@ pub use packet::{
     BARRIER_DEPENDENCY_CAPACITY, FenceScope, HeaderPolicy, KernelMetadata, LaunchGeometry,
     PacketError,
 };
-pub use pm4::{Gfx12Pm4CommandBuffer, Pm4BuildError, Pm4DispatchSpanAttribution};
+pub use pm4::{
+    Gfx12CopyDataDstScope, Gfx12DispatchTimestampConfig, Gfx12Pm4CommandBuffer, Pm4BuildError,
+    Pm4DispatchSpanAttribution,
+};
 pub use pm4_gfx10::{
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
     Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave, Gfx11Pm4CommandBuffer,
