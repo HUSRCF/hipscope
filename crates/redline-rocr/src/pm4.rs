@@ -13,6 +13,7 @@ use crate::{Kernel, LaunchGeometry};
 
 const PACKET3_SET_SH_REG: u32 = 0x76;
 const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+const PACKET3_NOP: u32 = 0x10;
 const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
@@ -312,6 +313,31 @@ impl Gfx12Pm4CommandBuffer {
         ]);
     }
 
+    /// Append one packet-isolation diagnostic cell after a dispatch.
+    ///
+    /// Every combination occupies exactly eight DWORDs: either a six-DWORD
+    /// `COPY_DATA(GPU_CLOCK)` or equal-sized NOP, followed by either the
+    /// two-DWORD `CS_PARTIAL_FLUSH` event or equal-sized NOP. This keeps IB
+    /// length and parser work fixed while a diagnostic runner measures the
+    /// two packet factors and their interaction.
+    pub fn diagnostic_packet_isolation_cell(
+        &mut self,
+        timestamp_address: Option<u64>,
+        wait_compute_idle: bool,
+        timestamp_config: Gfx12DispatchTimestampConfig,
+    ) {
+        if let Some(address) = timestamp_address {
+            self.copy_gpu_timestamp(address, timestamp_config);
+        } else {
+            self.nop_dwords(6);
+        }
+        if wait_compute_idle {
+            self.wait_compute_idle();
+        } else {
+            self.nop_dwords(2);
+        }
+    }
+
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
     /// caches plus forward sequencing are invalidated.
@@ -412,6 +438,13 @@ impl Gfx12Pm4CommandBuffer {
     pub fn wait_compute_idle(&mut self) {
         self.dwords.push(packet3(PACKET3_EVENT_WRITE, 1, false));
         self.dwords.push(0x407); // CS_PARTIAL_FLUSH, event-index 4.
+    }
+
+    fn nop_dwords(&mut self, dwords: u32) {
+        debug_assert!(dwords >= 2);
+        self.dwords.push(packet3(PACKET3_NOP, dwords - 1, false));
+        self.dwords
+            .resize(self.dwords.len() + dwords as usize - 1, 0);
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -658,6 +691,47 @@ mod tests {
                 .filter(|word| **word == packet3(PACKET3_RELEASE_MEM, 7, false))
                 .count();
             assert_eq!(release_count, usize::from(config.tail_release));
+        }
+    }
+
+    #[test]
+    fn packet_isolation_cells_hold_dword_count_constant_across_two_by_two() {
+        let config = Gfx12DispatchTimestampConfig {
+            dst_scope: Gfx12CopyDataDstScope::System,
+            per_write_confirm: true,
+            tail_release: false,
+        };
+        let mut cells = Vec::new();
+        for copy in [false, true] {
+            for wait in [false, true] {
+                let mut commands = Gfx12Pm4CommandBuffer::new();
+                commands.diagnostic_packet_isolation_cell(
+                    copy.then_some(0x1234_5678),
+                    wait,
+                    config,
+                );
+                assert_eq!(commands.len_dwords(), 8);
+                cells.push((copy, wait, commands.dwords().to_vec()));
+            }
+        }
+
+        for (copy, wait, words) in cells {
+            let first_opcode = (words[0] >> 8) & 0xff;
+            let second_opcode = (words[6] >> 8) & 0xff;
+            assert_eq!(
+                first_opcode,
+                if copy { PACKET3_COPY_DATA } else { PACKET3_NOP }
+            );
+            assert_eq!(
+                second_opcode,
+                if wait {
+                    PACKET3_EVENT_WRITE
+                } else {
+                    PACKET3_NOP
+                }
+            );
+            assert_eq!((words[0] >> 16) & 0x3fff, 4);
+            assert_eq!((words[6] >> 16) & 0x3fff, 0);
         }
     }
 
