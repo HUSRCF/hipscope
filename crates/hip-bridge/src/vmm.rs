@@ -9,7 +9,66 @@ use crate::{
     DeviceBuffer, HipError, HipMemAccessDesc, HipMemAllocationProp, HipMemGenericAllocationHandle,
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
+use std::cell::Cell;
 use std::ffi::c_void;
+
+/// Deterministic, test-only fault injection for VMM teardown/access stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmFaultKind {
+    /// Fail the next `hipMemSetAccess` call(s).
+    AccessReset,
+    /// Fail the next `hipMemUnmap` call(s).
+    Unmap,
+    /// Fail the next physical-handle `hipMemRelease` call(s).
+    Release,
+}
+
+thread_local! {
+    static FAULT_ACCESS: Cell<u32> = const { Cell::new(0) };
+    static FAULT_UNMAP: Cell<u32> = const { Cell::new(0) };
+    static FAULT_RELEASE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Queue `count` deterministic failures for `kind`. Test-only; real HIP is
+/// unchanged when the counter is zero.
+pub fn inject_vmm_fault(kind: VmmFaultKind, count: u32) {
+    match kind {
+        VmmFaultKind::AccessReset => FAULT_ACCESS.with(|c| c.set(count)),
+        VmmFaultKind::Unmap => FAULT_UNMAP.with(|c| c.set(count)),
+        VmmFaultKind::Release => FAULT_RELEASE.with(|c| c.set(count)),
+    }
+}
+
+/// Clear every pending injected VMM fault.
+pub fn clear_vmm_faults() {
+    FAULT_ACCESS.with(|c| c.set(0));
+    FAULT_UNMAP.with(|c| c.set(0));
+    FAULT_RELEASE.with(|c| c.set(0));
+}
+
+fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
+    let cell = match kind {
+        VmmFaultKind::AccessReset => &FAULT_ACCESS,
+        VmmFaultKind::Unmap => &FAULT_UNMAP,
+        VmmFaultKind::Release => &FAULT_RELEASE,
+    };
+    cell.with(|c| {
+        let left = c.get();
+        if left == 0 {
+            return None;
+        }
+        c.set(left - 1);
+        let label = match kind {
+            VmmFaultKind::AccessReset => "access-reset",
+            VmmFaultKind::Unmap => "unmap",
+            VmmFaultKind::Release => "release",
+        };
+        Some(HipError::new(
+            0x564D_4D46, // 'VMMF'
+            &format!("injected VMM {label} failure"),
+        ))
+    })
+}
 
 #[derive(Debug)]
 struct VmmSegment {
@@ -194,7 +253,10 @@ impl VmmArena {
         // 4 KiB offsets (for example base+16 KiB). Reapplying access from the
         // reservation base over the contiguous mapped prefix is accepted and
         // also ensures newly-added peer devices gain access to older segments.
-        if let Err(err) = unsafe { hip.mem_set_access(self.base, next_mapped, &access) } {
+        if let Err(err) = take_fault(VmmFaultKind::AccessReset).map_or_else(
+            || unsafe { hip.mem_set_access(self.base, next_mapped, &access) },
+            Err,
+        ) {
             let err = HipError {
                 code: err.code,
                 message: format!(
@@ -318,8 +380,18 @@ impl VmmArena {
         let base = self.base;
         let mut first_error = cleanup_segments(
             &mut self.segments,
-            |offset, size| unsafe { hip.mem_unmap(offset_ptr(base, offset), size) },
-            |handle| unsafe { hip.mem_release(handle) },
+            |offset, size| {
+                if let Some(err) = take_fault(VmmFaultKind::Unmap) {
+                    return Err(err);
+                }
+                unsafe { hip.mem_unmap(offset_ptr(base, offset), size) }
+            },
+            |handle| {
+                if let Some(err) = take_fault(VmmFaultKind::Release) {
+                    return Err(err);
+                }
+                unsafe { hip.mem_release(handle) }
+            },
         )
         .err();
 
@@ -456,5 +528,39 @@ mod tests {
 
         cleanup_segments(&mut segments, |_, _| Ok(()), |_| Ok(())).unwrap();
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn inject_vmm_fault_counters_are_consumed_once_each() {
+        clear_vmm_faults();
+        inject_vmm_fault(VmmFaultKind::Unmap, 2);
+        inject_vmm_fault(VmmFaultKind::Release, 1);
+        inject_vmm_fault(VmmFaultKind::AccessReset, 1);
+
+        let u1 = take_fault(VmmFaultKind::Unmap).unwrap();
+        let u2 = take_fault(VmmFaultKind::Unmap).unwrap();
+        assert!(take_fault(VmmFaultKind::Unmap).is_none());
+        assert!(u1.to_string().contains("unmap"));
+        assert!(u2.to_string().contains("unmap"));
+
+        let r = take_fault(VmmFaultKind::Release).unwrap();
+        assert!(r.to_string().contains("release"));
+        assert!(take_fault(VmmFaultKind::Release).is_none());
+
+        let a = take_fault(VmmFaultKind::AccessReset).unwrap();
+        assert!(a.to_string().contains("access-reset"));
+        assert!(take_fault(VmmFaultKind::AccessReset).is_none());
+        clear_vmm_faults();
+    }
+
+    #[test]
+    fn clear_vmm_faults_drops_pending_injections() {
+        inject_vmm_fault(VmmFaultKind::Unmap, 5);
+        inject_vmm_fault(VmmFaultKind::Release, 5);
+        inject_vmm_fault(VmmFaultKind::AccessReset, 5);
+        clear_vmm_faults();
+        assert!(take_fault(VmmFaultKind::Unmap).is_none());
+        assert!(take_fault(VmmFaultKind::Release).is_none());
+        assert!(take_fault(VmmFaultKind::AccessReset).is_none());
     }
 }

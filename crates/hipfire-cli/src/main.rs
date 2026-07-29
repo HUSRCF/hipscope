@@ -1859,6 +1859,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         .clone()
         .unwrap_or(config_string(&resolved, "speculation.mode")?);
     apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled (config-off + `run --spec dflash` must still carry draft).
+    project_dflash_draft(&mut params);
     if let Some(draft) = &args.model_draft {
         params["draft"] = serde_json::json!(draft.display().to_string());
         if args.speculation.is_none() {
@@ -3652,7 +3655,8 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
-        "dflash": done.get("dflash").or_else(|| done.get("mtp")),
+        "dflash": done.get("dflash"),
+        "mtp": done.get("mtp"),
     })
 }
 
@@ -4150,7 +4154,26 @@ fn load_params(
     });
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
+    project_dflash_draft(&mut params);
     Ok(params)
+}
+
+/// Project inherited `HIPFIRE_DFLASH_DRAFT` after the effective speculation selector.
+///
+/// Call only once final `dflash_mode` is known. Config-off must not carry a draft;
+/// a later CLI selector (e.g. `run --spec dflash`) can opt back in here.
+fn project_dflash_draft(params: &mut serde_json::Value) {
+    if params["dflash_mode"].as_str() == Some("off") {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("draft");
+        }
+        return;
+    }
+    if let Ok(draft) = env::var("HIPFIRE_DFLASH_DRAFT") {
+        if !draft.is_empty() {
+            params["draft"] = serde_json::json!(draft);
+        }
+    }
 }
 
 fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
@@ -6273,6 +6296,123 @@ mod tests {
         let params =
             load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
         assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_forwards_dflash_draft_from_environment() {
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "dflash").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=dflash".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["draft"], draft);
+    }
+
+    #[test]
+    fn run_spec_dflash_projects_inherited_draft_after_config_off() {
+        // Reviewer case: resolved config leaves DFlash off, but an inherited
+        // HIPFIRE_DFLASH_DRAFT is present and `run --spec dflash` re-enables
+        // DFlash after load_params. Draft must land on the final load params.
+        struct EnvRestore(Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HIPFIRE_DFLASH_DRAFT", value),
+                    None => env::remove_var("HIPFIRE_DFLASH_DRAFT"),
+                }
+            }
+        }
+
+        let _restore = EnvRestore(env::var_os("HIPFIRE_DFLASH_DRAFT"));
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+        env::set_var("HIPFIRE_DFLASH_DRAFT", draft);
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "off").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=off".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        // load_params alone must not carry the draft while config mode is off.
+        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "config-off load_params must not project HIPFIRE_DFLASH_DRAFT"
+        );
+
+        // Final run-path selector: CLI `--spec dflash` then project inherited draft.
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "on");
+        assert_eq!(params["draft"], draft);
+
+        // Final off must clear any previously projected draft.
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params);
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop projected HIPFIRE_DFLASH_DRAFT"
+        );
+    }
+
+    #[test]
+    fn completion_timings_preserves_speculator_identity() {
+        let completion = |done| Completion {
+            id: "req-test".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done,
+        };
+
+        let dflash = completion_timings(&completion(serde_json::json!({
+            "dflash": true,
+            "tau": 3.5,
+            "cycles": 4,
+        })));
+        assert_eq!(dflash["dflash"], true);
+        assert!(dflash["mtp"].is_null());
+
+        let mtp = completion_timings(&completion(serde_json::json!({
+            "mtp": true,
+            "tau": 2.0,
+            "cycles": 6,
+        })));
+        assert!(mtp["dflash"].is_null());
+        assert_eq!(mtp["mtp"], true);
     }
 
     #[test]
