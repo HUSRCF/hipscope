@@ -66,9 +66,9 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         set_error(error, error_capacity, "batch, sequence lengths, and head counts must be positive");
         return 1;
     }
-    if(p->head_dim != 64)
+    if(p->head_dim != 64 && p->head_dim != 128 && p->head_dim != 256)
     {
-        set_error(error, error_capacity, "this optional build supports head_dim=64 only");
+        set_error(error, error_capacity, "this optional build supports head_dim=64, 128, or 256");
         return 1;
     }
     if(p->nhead_q % p->nhead_k != 0)
