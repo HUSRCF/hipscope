@@ -1972,6 +1972,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "radiowave",
+ "libloading",
  "rayon",
  "redline-dispatch",
  "redline-rocr",
