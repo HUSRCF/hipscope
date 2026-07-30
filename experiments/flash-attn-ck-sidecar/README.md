@@ -153,14 +153,25 @@ iterations per trial. The table reports synchronized wall-clock medians:
 
 | Q | K | Hq/Hkv | native F32 ms | CK F16 ms | Q/O bridge ms | full-F32 bridge ms | direct FP16 | Q/O bridge | full-F32 bridge |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 512 | 8/8 | 0.0329 | 0.0276 | 0.0390 | 0.0545 | 1.19x | 0.85x | 0.60x |
-| 64 | 2048 | 8/8 | 0.1152 | 0.0898 | 0.0983 | 0.1220 | 1.28x | 1.17x | 0.95x |
-| 256 | 2048 | 8/8 | 0.4425 | 0.1007 | 0.1121 | 0.1345 | 4.39x | 3.95x | 3.29x |
-| 512 | 4096 | 8/8 | 2.2907 | 0.2333 | 0.2190 | 0.2567 | 9.82x | 10.46x | 8.93x |
-| 256 | 2048 | 8/2 | 0.3223 | 0.1028 | 0.1058 | 0.1161 | 3.13x | 3.05x | 2.78x |
+| 64 | 512 | 8/8 | 0.0329 | 0.0280 | 0.0389 | 0.0546 | 1.17x | 0.84x | 0.60x |
+| 64 | 1024 | 8/8 | 0.0573 | 0.0485 | 0.0596 | 0.0816 | 1.18x | 0.96x | 0.70x |
+| 64 | 2048 | 8/8 | 0.1140 | 0.0888 | 0.0974 | 0.1210 | 1.28x | 1.17x | 0.94x |
+| 64 | 4096 | 8/8 | 0.2245 | 0.1927 | 0.1850 | 0.2100 | 1.17x | 1.21x | 1.07x |
+| 96 | 1024 | 8/8 | 0.0768 | 0.0514 | 0.0597 | 0.0744 | 1.49x | 1.29x | 1.03x |
+| 96 | 2048 | 8/8 | 0.1497 | 0.0974 | 0.1047 | 0.1277 | 1.54x | 1.43x | 1.17x |
+| 128 | 512 | 8/8 | 0.0534 | 0.0268 | 0.0346 | 0.0459 | 1.99x | 1.54x | 1.16x |
+| 128 | 1024 | 8/8 | 0.1006 | 0.0470 | 0.0558 | 0.0706 | 2.14x | 1.80x | 1.43x |
+| 128 | 2048 | 8/8 | 0.2015 | 0.0970 | 0.1000 | 0.1215 | 2.08x | 2.01x | 1.66x |
+| 192 | 1024 | 8/8 | 0.1519 | 0.0482 | 0.0808 | 0.0939 | 3.15x | 1.88x | 1.62x |
+| 192 | 2048 | 8/8 | 0.3264 | 0.0998 | 0.1216 | 0.1439 | 3.27x | 2.68x | 2.27x |
+| 256 | 512 | 8/8 | 0.1062 | 0.0280 | 0.0385 | 0.0495 | 3.80x | 2.76x | 2.15x |
+| 256 | 1024 | 8/8 | 0.2043 | 0.0492 | 0.0607 | 0.0744 | 4.15x | 3.37x | 2.74x |
+| 256 | 2048 | 8/8 | 0.4477 | 0.1052 | 0.1045 | 0.1241 | 4.25x | 4.28x | 3.61x |
+| 512 | 4096 | 8/8 | 2.2773 | 0.2427 | 0.2199 | 0.2589 | 9.38x | 10.36x | 8.80x |
+| 256 | 2048 | 8/2 | 0.3183 | 0.1021 | 0.1025 | 0.1125 | 3.12x | 3.11x | 2.83x |
 
 The maximum output difference against the native FP32 kernel was
-`1.32e-6`. GPU-event and synchronized wall-clock medians were close, showing
+`1.49e-6`. GPU-event and synchronized wall-clock medians were close, showing
 that host dispatch is not the dominant cost in these batched measurements.
 Direct, Q/O-bridge, and full-FP32 paths use separate FP16 working sets. The Q/O
 bridge appearing faster than direct CK in one large case reflects the
@@ -172,3 +183,34 @@ overhead loses on the smallest Q tile, while Q=256--512 dense prefill shapes
 show a clear net win over the current D64 scalar kernel. This benchmark does
 not compare against hipfire's D128 WMMA path and therefore does not establish
 a production-backend speedup for that route.
+
+For this exact D64 dense layout, a conservative experimental gate is
+`seqlen_q >= 128 && seqlen_k >= 512`. Every measured Q/O-bridge point in that
+region was at least 1.54x faster. `seqlen_q >= 96 && seqlen_k >= 1024` is an
+aggressive profile; Q=64 remains marginal even at long K and should stay on
+the native path by default. This is a prefill/cross-attention gate on query
+chunk length, not a decode-context gate: Q=1 decode is outside the measured
+profitable region.
+
+## gfx1201 default-path regression check
+
+The optional sidecar and its Cargo feature are default-off. To verify that the
+change does not affect the existing gfx1201 path, commit `a2fcd552` was compared
+with its base `b69b28c2` on an AMD Radeon AI PRO R9700 (gfx1201, ROCm 7.14).
+Both isolated trees passed `cargo check -p rdna-compute`; the feature tree also
+passed with `--features flash-attn-ck`. The existing
+`test_dots_ocr_wmma_gfx12` correctness example passed with maximum absolute
+errors `1.948e-5` for GEMM and `6.038e-6` for attention.
+
+For performance, the already-built base and feature binaries alternated over
+five rounds of `bench_attention_vision --iters 20`. The production gfx12
+DotsOCR v5 path was unchanged:
+
+| build | per-run ms/iter | median ms/iter |
+| --- | --- | ---: |
+| base `b69b28c2` | 112.7, 113.2, 113.2, 113.4, 113.5 | 113.2 |
+| feature `a2fcd552` | 112.8, 113.1, 113.4, 113.5, 113.6 | 113.4 |
+
+The median difference was `+0.18%`, within the observed run-to-run variation.
+No measurable regression was observed in the default gfx1201 DotsOCR attention
+path; this is not a FlashAttention CK performance result on gfx1201.
