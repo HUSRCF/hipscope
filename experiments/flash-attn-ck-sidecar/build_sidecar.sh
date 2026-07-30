@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLASH_ATTN_ROOT="${FLASH_ATTN_ROOT:?set FLASH_ATTN_ROOT to a flash-attention checkout containing composable_kernel}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
+HEAD_DIMS="${HEAD_DIMS:-64,128,256}"
 MAX_JOBS="${MAX_JOBS:-8}"
 OUT="${OUT:-${ROOT}/build/libhipfire_flash_attn_ck.so}"
 BUILD_DIR="$(dirname "${OUT}")"
@@ -19,16 +20,28 @@ CK_ROOT="${BUILD_DIR}/ck-source"
 case "${GPU_ARCH}" in
     gfx11*)
         CK_TARGET="gfx11"
-        EXPECTED_GENERATED_SOURCES=9
         APPLY_GFX11_RECIPE=1
         ;;
     gfx12*)
         CK_TARGET="gfx12"
-        EXPECTED_GENERATED_SOURCES=5
         APPLY_GFX11_RECIPE=0
         ;;
     *)
         echo "unsupported GPU_ARCH ${GPU_ARCH}; expected gfx11* or gfx12*" >&2
+        exit 2
+        ;;
+esac
+
+case "${CK_TARGET}:${HEAD_DIMS}" in
+    gfx11:64) EXPECTED_GENERATED_SOURCES=9 ;;
+    gfx11:128 | gfx11:256) EXPECTED_GENERATED_SOURCES=5 ;;
+    gfx11:64,128) EXPECTED_GENERATED_SOURCES=13 ;;
+    gfx11:64,128,256) EXPECTED_GENERATED_SOURCES=17 ;;
+    gfx12:64 | gfx12:128 | gfx12:256) EXPECTED_GENERATED_SOURCES=5 ;;
+    gfx12:64,128) EXPECTED_GENERATED_SOURCES=9 ;;
+    gfx12:64,128,256) EXPECTED_GENERATED_SOURCES=13 ;;
+    *)
+        echo "unsupported HEAD_DIMS ${HEAD_DIMS}; expected 64, 128, 256, 64,128, or 64,128,256" >&2
         exit 2
         ;;
 esac
@@ -81,18 +94,18 @@ if [[ ! -f "${FMHA_DIR}/fmha_fwd.hpp" || ! -f "${GENERATOR}" ]]; then
 fi
 
 LIST="${BUILD_DIR}/sources.list"
-FILTER="*d64_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
+FILTER="*d*_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
 
 python3 "${GENERATOR}" \
     --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --list_blobs "${LIST}"
 
 if [[ "$(wc -l < "${LIST}")" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
-    echo "expected ${EXPECTED_GENERATED_SOURCES} ${CK_TARGET} FP16/D64 generated sources" >&2
+    echo "expected ${EXPECTED_GENERATED_SOURCES} ${CK_TARGET} FP16/D${HEAD_DIMS} generated sources" >&2
     echo "the supplied FlashAttention tree does not carry the validated CK recipe" >&2
     exit 2
 fi
@@ -101,7 +114,7 @@ python3 "${GENERATOR}" \
     --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --output_dir "${BUILD_DIR}/generated"
 

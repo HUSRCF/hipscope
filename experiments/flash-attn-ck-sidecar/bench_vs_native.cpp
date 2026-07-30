@@ -3,6 +3,14 @@
 #include "hipfire_flash_attn_ck.h"
 
 #include "../../kernels/src/attention_dflash.hip"
+#include "../../kernels/src/attention_causal_batched.hip"
+#if HIPFIRE_BENCH_GFX12
+#include "../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.gfx12.hip"
+#include "../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.gfx12.hip"
+#else
+#include "../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.hip"
+#include "../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip"
+#endif
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -135,9 +143,13 @@ float time_wall_launches(Launch&& launch, int iterations)
            static_cast<float>(iterations);
 }
 
-void run_case(const Case& benchmark_case, int warmup, int trials, int iterations)
+void run_case(const Case& benchmark_case,
+              int head_dim,
+              bool causal,
+              int warmup,
+              int trials,
+              int iterations)
 {
-    constexpr int head_dim = 64;
     constexpr int batch = 1;
     const int b = benchmark_case.seqlen_q;
     const int l = benchmark_case.seqlen_k;
@@ -259,7 +271,7 @@ void run_case(const Case& benchmark_case, int warmup, int trials, int iterations
         params.nhead_q = nhead_q;
         params.nhead_k = nhead_k;
         params.head_dim = head_dim;
-        params.causal = 0;
+        params.causal = causal ? 1 : 0;
         params.softmax_scale = scale;
         params.stride_q = nhead_q * head_dim;
         params.stride_k = nhead_k * head_dim;
@@ -286,23 +298,97 @@ void run_case(const Case& benchmark_case, int warmup, int trials, int iterations
         error);
 
     const auto launch_native = [&]() {
-        hipLaunchKernelGGL(
-            attention_dflash_f32,
-            dim3(nhead_q, b, 1),
-            dim3(block_size, 1, 1),
-            shared_bytes,
-            nullptr,
-            q_f32,
-            k_f32,
-            v_f32,
-            out_f32,
-            b,
-            l,
-            nhead_q,
-            nhead_k,
-            head_dim,
-            scale,
-            tile_size);
+        if(causal && head_dim == 256)
+        {
+            const unsigned causal_block_size =
+                std::min(128u, next_power_of_two(std::max(b, head_dim)));
+            const size_t causal_shared_bytes =
+                static_cast<size_t>(b + causal_block_size) * sizeof(float);
+            hipLaunchKernelGGL(
+                attention_causal_batched,
+                dim3(nhead_q, b, 1),
+                dim3(causal_block_size, 1, 1),
+                causal_shared_bytes,
+                nullptr,
+                q_f32,
+                k_f32,
+                v_f32,
+                out_f32,
+                b,
+                nhead_q,
+                nhead_k,
+                head_dim,
+                scale);
+        }
+        else if(head_dim == 128)
+        {
+            if(causal)
+            {
+                constexpr size_t shared_bytes_d128_causal = 50176;
+                hipLaunchKernelGGL(
+                    attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32,
+                    dim3(nhead_q, (b + 63) / 64, 1),
+                    dim3(128, 1, 1),
+                    shared_bytes_d128_causal,
+                    nullptr,
+                    q_f32,
+                    reinterpret_cast<const _Float16*>(direct_buffers.k),
+                    reinterpret_cast<const _Float16*>(direct_buffers.v),
+                    out_f32,
+                    b,
+                    l,
+                    nhead_q,
+                    nhead_k,
+                    head_dim,
+                    scale,
+                    1);
+            }
+            else
+            {
+                constexpr size_t shared_bytes_d128_noncausal = 25600;
+#if HIPFIRE_BENCH_GFX12
+                hipLaunchKernelGGL(
+                    attention_dflash_wmma_m64_n32_f16kv_v5_f32_gfx12,
+#else
+                hipLaunchKernelGGL(
+                    attention_dflash_wmma_m64_n32_f16kv_v5_f32,
+#endif
+                    dim3(nhead_q, (b + 63) / 64, 1),
+                    dim3(128, 1, 1),
+                    shared_bytes_d128_noncausal,
+                    nullptr,
+                    q_f32,
+                    reinterpret_cast<const _Float16*>(direct_buffers.k),
+                    reinterpret_cast<const _Float16*>(direct_buffers.v),
+                    out_f32,
+                    b,
+                    l,
+                    nhead_q,
+                    nhead_k,
+                    head_dim,
+                    scale);
+            }
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                attention_dflash_f32,
+                dim3(nhead_q, b, 1),
+                dim3(block_size, 1, 1),
+                shared_bytes,
+                nullptr,
+                q_f32,
+                k_f32,
+                v_f32,
+                out_f32,
+                b,
+                l,
+                nhead_q,
+                nhead_k,
+                head_dim,
+                scale,
+                tile_size);
+        }
     };
     const auto launch_ck = [&](const hipfire_flash_attn_ck_fwd_params& params) {
         error[0] = '\0';
@@ -469,7 +555,7 @@ void run_case(const Case& benchmark_case, int warmup, int trials, int iterations
     const float qo_bridge_wall_ms = median(qo_bridge_wall_samples);
     const float full_f32_bridge_wall_ms = median(full_f32_bridge_wall_samples);
     std::printf(
-        "%d,%d,%d,%d,%d,"
+        "%d,%d,%d,%d,%d,%d,"
         "%.6f,%.6f,%.6f,%.6f,"
         "%.6f,%.6f,%.6f,%.6f,"
         "%.3f,%.3f,%.3f,"
@@ -480,6 +566,7 @@ void run_case(const Case& benchmark_case, int warmup, int trials, int iterations
         nhead_q,
         nhead_k,
         head_dim,
+        causal ? 1 : 0,
         native_ms,
         ck_ms,
         qo_bridge_ms,
@@ -534,6 +621,8 @@ int main(int argc, char** argv)
     int warmup = 3;
     int trials = 9;
     int iterations = 5;
+    int head_dim = 64;
+    bool causal = false;
     for(int index = 1; index < argc; ++index)
     {
         const std::string option = argv[index];
@@ -559,14 +648,38 @@ int main(int argc, char** argv)
         {
             iterations = parse_positive(argv[++index], "--iterations");
         }
+        else if(option == "--head-dim")
+        {
+            head_dim = parse_positive(argv[++index], "--head-dim");
+            if(head_dim != 64 && head_dim != 128 && head_dim != 256)
+            {
+                std::fprintf(stderr, "--head-dim must be 64, 128, or 256\n");
+                return 2;
+            }
+        }
+        else if(option == "--causal")
+        {
+            const int value = std::atoi(argv[++index]);
+            if(value != 0 && value != 1)
+            {
+                std::fprintf(stderr, "--causal must be 0 or 1\n");
+                return 2;
+            }
+            causal = value != 0;
+        }
         else
         {
             std::fprintf(stderr, "unknown option: %s\n", option.c_str());
             return 2;
         }
     }
+    if(causal && head_dim == 64)
+    {
+        std::fprintf(stderr, "the native causal comparison currently requires --head-dim 128 or 256\n");
+        return 2;
+    }
 
-    const std::vector<Case> cases = {
+    const std::vector<Case> noncausal_cases = {
         {64, 512, 8, 8},
         {64, 1024, 8, 8},
         {64, 2048, 8, 8},
@@ -584,8 +697,19 @@ int main(int argc, char** argv)
         {512, 4096, 8, 8},
         {256, 2048, 8, 2},
     };
+    const std::vector<Case> causal_cases = {
+        {64, 64, 8, 8},
+        {128, 128, 8, 8},
+        {256, 256, 8, 8},
+        {512, 512, 8, 8},
+        {1024, 1024, 8, 8},
+        {2048, 2048, 8, 8},
+        {4096, 4096, 8, 8},
+        {2048, 2048, 8, 2},
+    };
+    const auto& cases = causal ? causal_cases : noncausal_cases;
     std::puts(
-        "seqlen_q,seqlen_k,nhead_q,nhead_k,head_dim,native_f32_ms,ck_f16_ms,"
+        "seqlen_q,seqlen_k,nhead_q,nhead_k,head_dim,causal,native_f32_ms,ck_f16_ms,"
         "ck_qo_bridge_ms,ck_full_f32_bridge_ms,"
         "native_f32_wall_ms,ck_f16_wall_ms,ck_qo_bridge_wall_ms,"
         "ck_full_f32_bridge_wall_ms,"
@@ -595,7 +719,7 @@ int main(int argc, char** argv)
         "ck_full_f32_bridge_wall_speedup,max_abs,mean_abs");
     for(const Case& benchmark_case : cases)
     {
-        run_case(benchmark_case, warmup, trials, iterations);
+        run_case(benchmark_case, head_dim, causal, warmup, trials, iterations);
     }
     return 0;
 }

@@ -41,13 +41,17 @@ float load(const std::vector<__half>& values,
     return __half2float(values[offset(b, s, h, d, seqlen, heads, hdim)]);
 }
 
-void run_case(const char* name, int nhead_q, int nhead_k, bool causal, bool non_default_stream)
+void run_case(const char* name,
+              int hdim,
+              int nhead_q,
+              int nhead_k,
+              bool causal,
+              bool non_default_stream)
 {
     constexpr int batch = 1;
     constexpr int seqlen_q = 64;
     constexpr int seqlen_k = 96;
-    constexpr int hdim = 64;
-    constexpr float scale = 1.0f / 8.0f;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
     const int groups = nhead_q / nhead_k;
 
     const size_t q_count = static_cast<size_t>(batch) * seqlen_q * nhead_q * hdim;
@@ -196,9 +200,10 @@ void run_case(const char* name, int nhead_q, int nhead_k, bool causal, bool non_
         mean_abs += delta;
     }
     mean_abs /= q_count;
-    std::printf("case=%s dtype=fp16 q_heads=%d kv_heads=%d causal=%d stream=%s "
+    std::printf("case=%s dtype=fp16 head_dim=%d q_heads=%d kv_heads=%d causal=%d stream=%s "
                 "max_abs=%.7g mean_abs=%.7g\n",
                 name,
+                hdim,
                 nhead_q,
                 nhead_k,
                 causal ? 1 : 0,
@@ -229,9 +234,15 @@ int main()
         std::fprintf(stderr, "sidecar ABI mismatch\n");
         return 1;
     }
-    run_case("gqa-noncausal", 4, 2, false, false);
-    run_case("gqa-causal", 4, 2, true, true);
-    run_case("mha-noncausal", 2, 2, false, false);
-    run_case("mqa-noncausal", 4, 1, false, false);
+    run_case("d64-gqa-noncausal", 64, 4, 2, false, false);
+    run_case("d64-gqa-causal", 64, 4, 2, true, true);
+    run_case("d64-mha-noncausal", 64, 2, 2, false, false);
+    run_case("d64-mqa-noncausal", 64, 4, 1, false, false);
+    run_case("d128-gqa-noncausal", 128, 4, 2, false, false);
+    run_case("d128-gqa-causal", 128, 4, 2, true, true);
+    run_case("d128-mha-noncausal", 128, 2, 2, false, false);
+    run_case("d128-mqa-noncausal", 128, 4, 1, false, false);
+    run_case("d256-gqa-noncausal", 256, 4, 2, false, false);
+    run_case("d256-gqa-causal", 256, 4, 2, true, true);
     return 0;
 }
