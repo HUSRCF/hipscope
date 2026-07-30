@@ -7,9 +7,11 @@ description = "Compute kernel dispatch for RDNA GPUs"
 
 [features]
 deltanet = []
+flash-attn-ck = ["dep:libloading"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
+libloading = { workspace = true, optional = true }
 rayon = "1"
