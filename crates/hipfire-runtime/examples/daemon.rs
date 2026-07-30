@@ -1728,9 +1728,7 @@ fn main() {
                 };
                 let draft_path = if dflash_mode == "off" {
                     if let Some(d) = raw_draft {
-                        eprintln!(
-                            "[hipfire-daemon] dflash_mode=off — skipping draft load ({d})"
-                        );
+                        eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
                     }
                     None
                 } else {
@@ -6175,8 +6173,7 @@ fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled =
-        std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -6995,8 +6992,15 @@ fn generate_spec(
                         if handled {
                             Ok(())
                         } else {
-                            slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
-                                .map(|_| ())
+                            slot.spec_advance(
+                                gpu,
+                                &[ft],
+                                position,
+                                false,
+                                &|| check_abort(id),
+                                None,
+                            )
+                            .map(|_| ())
                         }
                     });
                 if let Err(e) = forced_res {
@@ -9811,21 +9815,10 @@ fn generate(
         }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
+        // Use the canonical reset so newly added recurrent buffers (notably the
+        // Q8 error-feedback residual) cannot leak across rollover boundaries.
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.dn_state.reset(gpu);
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
