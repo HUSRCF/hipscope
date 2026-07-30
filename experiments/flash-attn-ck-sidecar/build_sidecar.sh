@@ -16,6 +16,23 @@ RECIPE_PATCH="${ROOT}/gfx11_ck_recipe.patch"
 REQUIRED_RECIPE_SHA256="b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765"
 CK_ROOT="${BUILD_DIR}/ck-source"
 
+case "${GPU_ARCH}" in
+    gfx11*)
+        CK_TARGET="gfx11"
+        EXPECTED_GENERATED_SOURCES=9
+        APPLY_GFX11_RECIPE=1
+        ;;
+    gfx12*)
+        CK_TARGET="gfx12"
+        EXPECTED_GENERATED_SOURCES=5
+        APPLY_GFX11_RECIPE=0
+        ;;
+    *)
+        echo "unsupported GPU_ARCH ${GPU_ARCH}; expected gfx11* or gfx12*" >&2
+        exit 2
+        ;;
+esac
+
 if [[ ! -f "${HIP_LIB_DIR}/libamdhip64.so" ]]; then
     echo "missing HIP runtime under ${HIP_LIB_DIR}" >&2
     exit 2
@@ -29,14 +46,16 @@ if ! git -C "${EXTERNAL_CK_ROOT}" cat-file -e "${REQUIRED_CK_REV}^{commit}"; the
     echo "composable_kernel checkout does not contain required revision ${REQUIRED_CK_REV}" >&2
     exit 2
 fi
-if [[ ! -f "${RECIPE_PATCH}" ]]; then
-    echo "missing bundled gfx11 CK recipe ${RECIPE_PATCH}" >&2
-    exit 2
-fi
-RECIPE_SHA256="$(sha256sum "${RECIPE_PATCH}" | cut -d' ' -f1)"
-if [[ "${RECIPE_SHA256}" != "${REQUIRED_RECIPE_SHA256}" ]]; then
-    echo "gfx11 CK recipe SHA256 mismatch: ${RECIPE_SHA256}" >&2
-    exit 2
+if (( APPLY_GFX11_RECIPE )); then
+    if [[ ! -f "${RECIPE_PATCH}" ]]; then
+        echo "missing bundled gfx11 CK recipe ${RECIPE_PATCH}" >&2
+        exit 2
+    fi
+    RECIPE_SHA256="$(sha256sum "${RECIPE_PATCH}" | cut -d' ' -f1)"
+    if [[ "${RECIPE_SHA256}" != "${REQUIRED_RECIPE_SHA256}" ]]; then
+        echo "gfx11 CK recipe SHA256 mismatch: ${RECIPE_SHA256}" >&2
+        exit 2
+    fi
 fi
 
 reset_dir() {
@@ -50,7 +69,9 @@ reset_dir "${BUILD_DIR}/objects"
 reset_dir "${CK_ROOT}"
 
 git -C "${EXTERNAL_CK_ROOT}" archive "${REQUIRED_CK_REV}" | tar -x -C "${CK_ROOT}"
-patch -d "${CK_ROOT}" -p1 < "${RECIPE_PATCH}"
+if (( APPLY_GFX11_RECIPE )); then
+    patch -d "${CK_ROOT}" -p1 < "${RECIPE_PATCH}"
+fi
 
 FMHA_DIR="${CK_ROOT}/example/ck_tile/01_fmha"
 GENERATOR="${FMHA_DIR}/generate.py"
@@ -63,21 +84,21 @@ LIST="${BUILD_DIR}/sources.list"
 FILTER="*d64_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
     --optdim 64 \
     --filter "${FILTER}" \
     --list_blobs "${LIST}"
 
-if [[ "$(wc -l < "${LIST}")" -ne 9 ]]; then
-    echo "expected 8 gfx11 FP16/D64 kernels plus one API source" >&2
-    echo "the supplied FlashAttention tree does not carry the validated gfx11 recipe" >&2
+if [[ "$(wc -l < "${LIST}")" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
+    echo "expected ${EXPECTED_GENERATED_SOURCES} ${CK_TARGET} FP16/D64 generated sources" >&2
+    echo "the supplied FlashAttention tree does not carry the validated CK recipe" >&2
     exit 2
 fi
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
     --optdim 64 \
@@ -111,8 +132,8 @@ COMMON_FLAGS=(
 )
 
 mapfile -t GENERATED_SOURCES < <(find "${BUILD_DIR}/generated" -maxdepth 2 -type f -name 'fmha_fwd*.cpp' | sort)
-if [[ "${#GENERATED_SOURCES[@]}" -ne 9 ]]; then
-    echo "generated ${#GENERATED_SOURCES[@]} sources, expected 9" >&2
+if [[ "${#GENERATED_SOURCES[@]}" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
+    echo "generated ${#GENERATED_SOURCES[@]} sources, expected ${EXPECTED_GENERATED_SOURCES}" >&2
     exit 2
 fi
 
