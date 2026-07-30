@@ -107,3 +107,68 @@ HIPFIRE_FLASH_ATTN_CK_TEST_LIB="$PWD/experiments/flash-attn-ck-sidecar/build/lib
 The current hipfire `AttnFullF16` contract still uses FP32 Q and output tensors,
 so it is not routed to this all-FP16 sidecar. A production route requires
 preallocated conversion scratch owned outside the attention hot path.
+
+## Performance probe
+
+`bench_vs_native.sh` compares four paths at the same D64 shape and attention
+semantics:
+
+- hipfire's current scalar `attention_dflash_f32` kernel;
+- direct all-FP16 CK attention;
+- an `AttnFullF16`-style bridge that casts FP32 Q to FP16 and output back to
+  FP32 while consuming already-FP16 K/V;
+- a conservative full-FP32 bridge that also casts K/V on every invocation.
+
+GPU-event columns isolate submitted stream work. Synchronized wall-clock
+columns also include the sidecar's host dispatch and kernel enqueue cost and
+are the primary integration metric. The direct number compares all-FP16 CK
+against the native FP32 scalar kernel; it is a mixed-precision reference, not a
+strict upper bound because producer/conversion kernels can change cache state.
+The Q/O bridge estimates the conversion tax at hipfire's `AttnFullF16`
+boundary; the full-FP32 bridge measures the cost of adapting the scalar
+fallback ABI. None is a production `AttnFullF16` replacement claim: that path
+is D128, whereas this validated CK instance set is D64.
+
+Check that the selected GPU is idle before running:
+
+```bash
+rocm-smi --showuse --showmemuse --showpids
+
+GPU_ID=1 \
+GPU_ARCH=gfx1100 \
+ROCM_PATH=/opt/rocm \
+WARMUP=3 \
+TRIALS=9 \
+ITERATIONS=20 \
+  experiments/flash-attn-ck-sidecar/bench_vs_native.sh
+```
+
+The script writes a CSV to
+`experiments/flash-attn-ck-sidecar/build/bench_vs_native.csv`.
+
+### W7900 result
+
+Radeon Pro W7900 / gfx1100, ROCm 7.14, three warmups, nine trials, twenty
+iterations per trial. The table reports synchronized wall-clock medians:
+
+| Q | K | Hq/Hkv | native F32 ms | CK F16 ms | Q/O bridge ms | full-F32 bridge ms | direct FP16 | Q/O bridge | full-F32 bridge |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 512 | 8/8 | 0.0329 | 0.0276 | 0.0390 | 0.0545 | 1.19x | 0.85x | 0.60x |
+| 64 | 2048 | 8/8 | 0.1152 | 0.0898 | 0.0983 | 0.1220 | 1.28x | 1.17x | 0.95x |
+| 256 | 2048 | 8/8 | 0.4425 | 0.1007 | 0.1121 | 0.1345 | 4.39x | 3.95x | 3.29x |
+| 512 | 4096 | 8/8 | 2.2907 | 0.2333 | 0.2190 | 0.2567 | 9.82x | 10.46x | 8.93x |
+| 256 | 2048 | 8/2 | 0.3223 | 0.1028 | 0.1058 | 0.1161 | 3.13x | 3.05x | 2.78x |
+
+The maximum output difference against the native FP32 kernel was
+`1.32e-6`. GPU-event and synchronized wall-clock medians were close, showing
+that host dispatch is not the dominant cost in these batched measurements.
+Direct, Q/O-bridge, and full-FP32 paths use separate FP16 working sets. The Q/O
+bridge appearing faster than direct CK in one large case reflects the
+conversion kernel warming the FP16 query; it is not evidence that conversion
+is free.
+
+The useful boundary is the result, not a single peak number: conversion
+overhead loses on the smallest Q tile, while Q=256--512 dense prefill shapes
+show a clear net win over the current D64 scalar kernel. This benchmark does
+not compare against hipfire's D128 WMMA path and therefore does not establish
+a production-backend speedup for that route.
