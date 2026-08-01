@@ -17,7 +17,7 @@
 pub enum LayerType {
     /// Sliding-window causal attention.
     Sliding,
-    /// Full (global) causal attention (head_dim = 512, K=V sharing).
+    /// Full (global) causal attention (head_dim = 512 for supported E-series).
     Full,
 }
 
@@ -98,14 +98,17 @@ pub struct Gemma4Config {
     pub layer_types: Vec<LayerType>,
 
     /// When set (via `HIPFIRE_GEMMA4_NORM_PLUS_ONE=1`), all RMSNorm weights are
-    /// baked with the Gemma-2/3 `x * (1 + w)` convention at load time. Gemma 4
-    /// (per the old branch's `load_gemma4_norm` + modeling_gemma4.py) uses plain
-    /// `x * w`, so this is OFF by default; the toggle lets us flip if the 12B
-    /// turns out to differ.
+    /// baked with the Gemma-2/3 `x * (1 + w)` convention at load time. The
+    /// supported Gemma4 E-series checkpoints use plain `x * w`, so this is OFF
+    /// by default and remains a developer diagnostic only.
     pub norm_plus_one: bool,
 }
 
 impl Gemma4Config {
+    pub fn from_hfq(hfq: &hipfire_runtime::hfq::HfqFile) -> Result<Self, String> {
+        Self::from_metadata_json(&hfq.metadata_json)
+    }
+
     /// Parse the HFQ metadata envelope without opening an HFQ payload.
     ///
     /// Quantization and loader tests use this entry point so config admission

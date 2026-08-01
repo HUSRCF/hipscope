@@ -8,6 +8,13 @@ Current scope:
 - recognize the exact E2B and E4B text topologies;
 - reject unknown E-series shapes and malformed attention metadata;
 
+Runtime bring-up scope:
+
+- E-series weight/state and eager/batched forward types are being adapted to
+  the current `beta` runtime API;
+- these types remain unreachable from serving until loader and quantizer
+  support land atomically.
+
 Current non-scope:
 
 - no quantizer route, loader `Carrier`, or serving dispatch is registered yet;
@@ -15,6 +22,6 @@ Current non-scope:
 - no speculative assistant for E4B;
 - no Dense12B or MoE26B execution contract.
 
-The next increment must land text-tower quantization together with the Carrier
-and runtime types so no intermediate revision emits an unloadable `arch_id=13`
-artifact.
+The next externally reachable increment must land text-tower quantization
+together with the Carrier so no intermediate revision emits an unloadable
+`arch_id=13` artifact.

@@ -4320,6 +4320,16 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
 
+/// Gemma 4 proportional RoPE pairs dimension `i` with `i + head_dim/2`
+/// while rotating only the first `n_rot_pairs` pairs.
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved_batched.hip");
+
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
 /// out[c] = w[0]*x[c] + w[1]*state[c][0] + w[2]*state[c][1] + w[3]*state[c][2]
@@ -4751,6 +4761,9 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
+
+/// Gemma final-logit soft cap: `x = tanh(x / cap) * cap`.
+pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
 
 /// Transpose: out[c, r] = in[r, c]. Converts [rows, cols] → [cols, rows].
 pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip");

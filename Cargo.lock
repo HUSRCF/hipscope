@@ -795,6 +795,9 @@ dependencies = [
 name = "hipfire-arch-gemma4"
 version = "0.3.0"
 dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
  "serde_json",
 ]
 
