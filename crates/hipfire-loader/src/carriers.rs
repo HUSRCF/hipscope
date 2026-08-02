@@ -80,9 +80,17 @@ fn tokenizer_from_dir(
 /// Returns the first candidate string that tokenizes to exactly one token, or 1.
 fn resolve_eos_tok(tokenizer: &hipfire_runtime::tokenizer::Tokenizer, candidates: &[&str]) -> u32 {
     for s in candidates {
+        if let Some(id) = tokenizer.special_token_id(s) {
+            return id;
+        }
         let ids = tokenizer.encode(s);
-        if ids.len() == 1 {
-            return ids[0];
+        let ids = if tokenizer.add_bos && ids.first() == Some(&tokenizer.bos_id) {
+            &ids[1..]
+        } else {
+            &ids[..]
+        };
+        if let [id] = ids {
+            return *id;
         }
     }
     1
@@ -188,7 +196,74 @@ fn arch_default_template(arch_id: u32) -> Option<String> {
     match arch_id {
         5 | 6 => Some(super::FROGGERIC_QWEN35_TEMPLATE.to_string()),
         11 => Some(super::LFM2_TEMPLATE.to_string()),
+        13 => Some(super::GEMMA4_DEFAULT_TEMPLATE.to_string()),
         _ => None,
+    }
+}
+
+// ─── Gemma4Carrier ──────────────────────────────────────────────────
+
+pub struct Gemma4Carrier;
+
+impl Carrier for Gemma4Carrier {
+    fn name(&self) -> &'static str {
+        "gemma4"
+    }
+
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        // The first production lane consumes packed HFQ tensors only.
+        !is_dir && arch_id == hipfire_arch_gemma4::ARCH_ID
+    }
+
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        use hipfire_runtime::arch::Architecture;
+
+        if ctx.pp > 1 {
+            return Err("gemma4: pipeline-parallel (pp>1) unsupported".into());
+        }
+        let ModelSource::Hfq(mut hfq) = src else {
+            return Err(
+                "gemma4: safetensors directory source unsupported; quantize to HFQ first".into(),
+            );
+        };
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|error| format!("gemma4: tokenizer not found: {error}"))?;
+        let chat_template = resolve_chat_template(&hfq, ctx.path);
+        let config = <hipfire_arch_gemma4::Gemma4 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <hipfire_arch_gemma4::Gemma4 as Architecture>::load_weights(
+            &mut hfq, &config, ctx.gpu,
+        )?;
+        let physical_cap = hipfire_arch_gemma4::Gemma4State::capped_max_seq(&config, ctx.max_seq);
+        let state = match hipfire_arch_gemma4::Gemma4State::new_with_max_seq(
+            ctx.gpu,
+            &config,
+            physical_cap,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                weights.free_gpu(ctx.gpu);
+                return Err(format!("gemma4: state allocation failed: {error}"));
+            }
+        };
+        let eos_tok = resolve_eos_tok(&tokenizer, &["<end_of_turn>", "<turn|>", "</s>"]);
+
+        Ok(LoadedModel {
+            state: Some(ModelState::Gemma4(crate::Gemma4Bundle {
+                config,
+                weights,
+                state,
+                eos_tok,
+            })),
+            ..LoadedModel::skeleton(
+                hipfire_arch_gemma4::ARCH_ID,
+                tokenizer,
+                physical_cap,
+                physical_cap,
+                ctx.path.to_string(),
+                chat_template,
+            )
+        })
     }
 }
 
@@ -1406,5 +1481,32 @@ impl Carrier for Cohere2MoeCarrier {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_eos_tok;
+    use hipfire_runtime::tokenizer::Tokenizer;
+
+    #[test]
+    fn eos_resolution_ignores_automatic_bos() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "x": 1, "<bos>": 2, "<turn|>": 3},
+                "merges": []
+            },
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}},
+            "added_tokens": [
+                {"id": 2, "content": "<bos>", "special": true},
+                {"id": 3, "content": "<turn|>", "special": true}
+            ]
+        });
+        let mut tokenizer = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        tokenizer.bos_id = 2;
+        tokenizer.add_bos = true;
+        assert_eq!(tokenizer.encode("<turn|>"), vec![2, 3]);
+        assert_eq!(resolve_eos_tok(&tokenizer, &["<turn|>"]), 3);
     }
 }

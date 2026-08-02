@@ -1,0 +1,12 @@
+{#
+  Built-in best-effort fallback for Gemma4 checkpoints missing chat_template.
+  This is not an official upstream template. Checkpoint-provided and user
+  overrides take precedence.
+#}
+{%- for message in messages %}
+<|turn>{{ message['role'] }}
+{{ message['content'] | trim }}<turn|>
+{%- endfor %}
+{%- if add_generation_prompt %}
+<|turn>assistant
+{%- endif %}

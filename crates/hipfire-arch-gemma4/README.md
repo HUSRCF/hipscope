@@ -2,26 +2,35 @@
 
 This crate is the staged home for Gemma 4 text inference (`arch_id = 13`).
 
-Current scope:
+Implemented scope:
 
-- parse Gemma 4 text configuration from an HFQ metadata envelope;
-- recognize the exact E2B and E4B text topologies;
-- reject unknown E-series shapes and malformed attention metadata;
+- strict E2B/E4B text-topology recognition from HFQ metadata;
+- text-tower quantization for flat and unified checkpoints, excluding non-text
+  towers from unified exports;
+- HFQ loader/Carrier registration and unload cleanup for `arch_id = 13`;
+- single-GPU Q8-KV autoregressive prefill/decode with bounded batched prefill;
+- attempt/commit/abort serving protocol integration;
+- embedded chat templates when present, otherwise a built-in best-effort
+  fallback for checkpoints missing `chat_template`.
 
-Runtime bring-up scope:
+Validation status:
 
-- E-series weight/state and eager/batched forward types are being adapted to
-  the current `beta` runtime API;
-- these types remain unreachable from serving until loader and quantizer
-  support land atomically.
+- E2B has passed real HFQ load, short prefill/decode, multi-chunk prefill,
+  terminal commit, unload, and gfx1100 GPU smoke tests;
+- E4B has config and loader contract coverage but has not yet received a real
+  checkpoint GPU validation run;
+- gfx1100 flash-attention partial workspace sizing follows the runtime-selected
+  tile geometry rather than assuming a fixed 128-token tile.
 
 Current non-scope:
 
-- no quantizer route, loader `Carrier`, or serving dispatch is registered yet;
 - no vision or audio tower execution;
-- no speculative assistant for E4B;
+- no tool calls, prefix cache, DFlash, or PFlash route;
+- no speculative assistant for E2B or E4B;
+- no pipeline parallelism or raw safetensors-directory serving;
 - no Dense12B or MoE26B execution contract.
 
-The next externally reachable increment must land text-tower quantization
-together with the Carrier so no intermediate revision emits an unloadable
-`arch_id=13` artifact.
+Use `scripts/gemma4-e-series-smoke.sh` for the reproducible GPU smoke. The
+fallback template is intentionally not presented as an instruction-tuning
+contract: checkpoints without an embedded template may echo the prompt or stop
+early even when tokenization and model execution are correct.

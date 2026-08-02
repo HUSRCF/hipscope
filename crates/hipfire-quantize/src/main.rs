@@ -4786,6 +4786,26 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn gemma4_is_learned_router_scale(name: &str) -> bool {
+    name.ends_with("router.scale")
+}
+
+fn gemma4_text_tensor_prefix<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+    let mut has_model_language = false;
+    let mut has_language = false;
+    for name in names {
+        has_model_language |= name.starts_with("model.language_model.");
+        has_language |= name.starts_with("language_model.");
+    }
+    if has_model_language {
+        Some("model.language_model.")
+    } else if has_language {
+        Some("language_model.")
+    } else {
+        None
+    }
+}
+
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
     // Vision encoder weights stay FP16 (only ~500M params, run once per image).
@@ -7329,6 +7349,13 @@ fn main() {
         // Per-expert pre-split tensors (mlp.experts.{j}.{gate,up,down}_proj) like
         // lfm2/deepseek. Crate hipfire-arch-cohere2moe (arch_id 12).
         "cohere2_moe" => 12,
+        // Gemma4 unified checkpoints carry non-text towers; the arch_id=13
+        // lane below packs only their language_model subtree.
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => 13,
+        "gemma4_unified_assistant" => {
+            eprintln!("Error: gemma4_unified_assistant is not a Gemma4 E-series target checkpoint");
+            std::process::exit(2);
+        }
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -7388,6 +7415,11 @@ fn main() {
     }
     if is_cohere2moe {
         eprintln!("  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16.");
+    }
+    if arch_id == 13 {
+        eprintln!(
+            "  Gemma4 detected — strict E2B/E4B text-tower quantization; non-text towers are skipped."
+        );
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -7489,6 +7521,18 @@ fn main() {
     // the kept count before write_hfq (so the baked model loads with the compact
     // count and NO env var). Untouched in every non-prune path.
     let mut metadata_json = serde_json::to_string(&metadata).unwrap();
+    if arch_id == 13 {
+        let config = hipfire_arch_gemma4::Gemma4Config::from_metadata_json(&metadata_json)
+            .and_then(|config| config.e_series_variant().map(|_| config))
+            .unwrap_or_else(|error| {
+                eprintln!("Error: unsupported Gemma4 checkpoint: {error}");
+                std::process::exit(2);
+            });
+        eprintln!(
+            "  Gemma4 contract: {:?}",
+            config.e_series_variant().unwrap()
+        );
+    }
 
     // Load all safetensors files
     let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
@@ -7519,9 +7563,14 @@ fn main() {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".scale") {
-                // Sibling weight name (drop `.scale`, add `.weight`).
-                let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                // Gemma4 router.scale is a learned model tensor, not an FP8
+                // side scale. Preserve it in the normal tensor stream.
+                if arch_id == 13 && gemma4_is_learned_router_scale(name) {
+                    all_tensors.push((name, fi));
+                } else {
+                    let w_name = format!("{stem}.weight");
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                }
                 continue;
             }
             all_tensors.push((name, fi));
@@ -7847,6 +7896,14 @@ fn main() {
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
     }
+    // Unified checkpoints prefix the text tower. Keep flat text-only exports
+    // unchanged, but exclude vision/audio/projector tensors when a distinct
+    // language_model root exists.
+    let gemma4_text_prefix = if arch_id == 13 {
+        gemma4_text_tensor_prefix(all_tensors.iter().map(|(name, _)| *name))
+    } else {
+        None
+    };
     let mut skipped_params = 0u64;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
@@ -7860,6 +7917,14 @@ fn main() {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(p) = include_prefix {
             if !name.starts_with(p) {
+                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+                let n: usize = meta.shape.iter().product();
+                skipped_params += n as u64;
+                continue;
+            }
+        }
+        if let Some(prefix) = gemma4_text_prefix {
+            if !name.starts_with(prefix) {
                 let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
                 let n: usize = meta.shape.iter().product();
                 skipped_params += n as u64;
@@ -13006,6 +13071,38 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemma4_text_filter_prefers_unified_model_root() {
+        let names = [
+            "model.vision_tower.patch_embed.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.decoy.weight",
+        ];
+        assert_eq!(
+            gemma4_text_tensor_prefix(names),
+            Some("model.language_model.")
+        );
+    }
+
+    #[test]
+    fn gemma4_text_filter_keeps_flat_text_only_checkpoints() {
+        let names = [
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.up_proj.weight",
+        ];
+        assert_eq!(gemma4_text_tensor_prefix(names), None);
+    }
+
+    #[test]
+    fn gemma4_router_scale_is_not_an_fp8_sidecar() {
+        assert!(gemma4_is_learned_router_scale(
+            "model.language_model.router.scale"
+        ));
+        assert!(!gemma4_is_learned_router_scale(
+            "model.language_model.layers.0.mlp.up_proj.scale"
+        ));
+    }
 
     #[test]
     fn e2m1_lookup_matches_ocp_spec() {

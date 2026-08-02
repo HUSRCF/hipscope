@@ -757,6 +757,46 @@ pub struct Gemma4State {
     pub logits: GpuTensor, // [vocab]
 }
 
+fn flash_partial_max_tiles_for_arch(
+    arch: &str,
+    n_heads: usize,
+    sliding_n_kv_heads: usize,
+    sliding_head_dim: usize,
+    full_n_kv_heads: usize,
+    full_head_dim: usize,
+    max_seq: usize,
+) -> usize {
+    let sliding_tile = rdna_compute::attention::q8_flash_tile_size(
+        arch,
+        n_heads,
+        sliding_n_kv_heads,
+        sliding_head_dim,
+        max_seq,
+    );
+    let full_tile = rdna_compute::attention::q8_flash_tile_size(
+        arch,
+        n_heads,
+        full_n_kv_heads,
+        full_head_dim,
+        max_seq,
+    );
+    max_seq
+        .div_ceil(sliding_tile)
+        .max(max_seq.div_ceil(full_tile))
+}
+
+fn flash_partial_max_tiles(gpu: &Gpu, cfg: &Gemma4Config, max_seq: usize) -> usize {
+    flash_partial_max_tiles_for_arch(
+        &gpu.arch,
+        cfg.n_heads,
+        cfg.sliding_n_kv_heads,
+        cfg.sliding_head_dim,
+        cfg.full_n_kv_heads,
+        cfg.full_head_dim,
+        max_seq,
+    )
+}
+
 impl Gemma4State {
     pub const STAGE1_MAX_SEQ_CAP: usize = 8192;
 
@@ -836,7 +876,7 @@ impl Gemma4State {
         let max_q = cfg.max_q_dim();
         let max_kv = cfg.max_kv_dim();
         let max_hd = cfg.max_head_dim();
-        let max_tiles = max_seq.div_ceil(128);
+        let max_tiles = flash_partial_max_tiles(gpu, cfg, max_seq);
         let ple_dim = cfg.hidden_size_per_layer_input;
         let ple_packed = cfg.n_layers * ple_dim;
 
@@ -977,7 +1017,7 @@ impl Gemma4State {
         let max_q = cfg.max_q_dim();
         let max_kv = cfg.max_kv_dim();
         let max_hd = cfg.max_head_dim();
-        let max_tiles = max_seq.div_ceil(128);
+        let max_tiles = flash_partial_max_tiles(gpu, cfg, max_seq);
         let ple_dim = cfg.hidden_size_per_layer_input;
         let ple_packed = cfg.n_layers * ple_dim;
 
@@ -1089,5 +1129,28 @@ impl Gemma4State {
                 let _ = gpu.free_tensor(t);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flash_partial_max_tiles_for_arch;
+
+    #[test]
+    fn gfx1100_flash_partials_follow_runtime_tile_geometry() {
+        assert_eq!(
+            flash_partial_max_tiles_for_arch("gfx1100", 8, 1, 256, 1, 256, 512),
+            16
+        );
+    }
+
+    #[test]
+    fn flash_partials_use_larger_of_asymmetric_attention_geometries() {
+        // gfx12's certified 8/2/256 shape uses tile16, while the full
+        // 8/1/512 shape retains tile128. The shared workspace must fit both.
+        assert_eq!(
+            flash_partial_max_tiles_for_arch("gfx1200", 8, 2, 256, 1, 512, 512),
+            32
+        );
     }
 }

@@ -157,6 +157,9 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// SentencePiece-family pipelines commonly synthesize a leading `▁`, but
+    /// Gemma4's explicit Replace/Split pipeline only transforms real spaces.
+    prepend_sp_marker: bool,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -235,6 +238,50 @@ fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], To
         out[b as usize] = id;
     }
     Ok(out)
+}
+
+/// Return whether a tokenizer component tree contains a node with the given
+/// `type`. HuggingFace wraps pre-tokenizers in `Sequence` nodes, so checking
+/// only the top-level object is insufficient.
+fn component_contains_type(value: Option<&serde_json::Value>, expected: &str) -> bool {
+    match value {
+        Some(serde_json::Value::Object(object)) => {
+            object.get("type").and_then(|value| value.as_str()) == Some(expected)
+                || object
+                    .values()
+                    .any(|value| component_contains_type(Some(value), expected))
+        }
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|value| component_contains_type(Some(value), expected)),
+        _ => false,
+    }
+}
+
+fn uses_explicit_space_to_sp_pipeline(tok: &serde_json::Value) -> bool {
+    let Some(normalizer) = tok.get("normalizer").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let Some(pre_tokenizer) = tok.get("pre_tokenizer").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    normalizer.get("type").and_then(|value| value.as_str()) == Some("Replace")
+        && normalizer
+            .get("pattern")
+            .and_then(|value| value.get("String"))
+            .and_then(|value| value.as_str())
+            == Some(" ")
+        && normalizer.get("content").and_then(|value| value.as_str()) == Some("▁")
+        && pre_tokenizer.get("type").and_then(|value| value.as_str()) == Some("Split")
+        && pre_tokenizer
+            .get("pattern")
+            .and_then(|value| value.get("String"))
+            .and_then(|value| value.as_str())
+            == Some(" ")
+        && pre_tokenizer
+            .get("behavior")
+            .and_then(|value| value.as_str())
+            == Some("MergedWithPrevious")
 }
 
 impl Tokenizer {
@@ -337,6 +384,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            prepend_sp_marker: true,
         })
     }
 
@@ -441,7 +489,23 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // Detect the tokenizer pipeline, not incidental vocabulary entries.
+        // Gemma4 uses a SentencePiece-style Split/▁ pipeline but its large
+        // multilingual vocabulary contains `Ġ`; the old vocab heuristic
+        // therefore misclassified it as GPT-2 byte-level BPE and required a
+        // byte alphabet the tokenizer intentionally does not provide.
+        let pre_tokenizer = tok.get("pre_tokenizer").filter(|value| !value.is_null());
+        let is_gpt2_bpe = if component_contains_type(pre_tokenizer, "ByteLevel") {
+            true
+        } else if pre_tokenizer.is_some() {
+            false
+        } else {
+            // Older/custom exports may omit pipeline metadata. Preserve the
+            // historical vocabulary fallback rather than silently switching
+            // byte-level BPE checkpoints to SentencePiece behavior.
+            token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ")
+        };
+        let gemma_style_split = uses_explicit_space_to_sp_pipeline(&tok);
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -462,6 +526,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            prepend_sp_marker: !gemma_style_split,
         })
     }
 
@@ -620,6 +685,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            prepend_sp_marker: true,
         })
     }
 
@@ -783,7 +849,9 @@ impl Tokenizer {
         // inputs fit in the lower-bound hint and the String grows only
         // if needed.
         let mut sp_text = String::with_capacity(text.len() + 3);
-        sp_text.push('\u{2581}');
+        if self.prepend_sp_marker {
+            sp_text.push('\u{2581}');
+        }
         for ch in text.chars() {
             sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
         }
@@ -1617,6 +1685,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            prepend_sp_marker: false,
         }
     }
 
@@ -1847,6 +1916,71 @@ mod consistency_tests {
     }
 
     #[test]
+    fn hf_split_bpe_with_incidental_gpt2_marker_stays_sentencepiece() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "▁": 1, "hello": 2, "Ġ": 3},
+                "merges": []
+            },
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious"
+            },
+            "normalizer": {
+                "type": "Sequence",
+                "normalizers": [{
+                    "type": "Replace",
+                    "pattern": {"String": " "},
+                    "content": "▁"
+                }]
+            },
+            "added_tokens": []
+        });
+        let tokenizer = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        assert!(!tokenizer.is_gpt2_bpe);
+        assert!(tokenizer.byte_to_id.is_none());
+        assert_eq!(tokenizer.encode("hello"), vec![2]);
+    }
+
+    #[test]
+    fn hf_nested_bytelevel_pre_tokenizer_selects_gpt2_validation() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"A": 0},
+                "merges": []
+            },
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [{"type": "ByteLevel"}]
+            },
+            "added_tokens": []
+        });
+        assert!(matches!(
+            Tokenizer::from_hf_json(&json.to_string()),
+            Err(TokenizerError::MissingByteSymbol { .. })
+        ));
+    }
+
+    #[test]
+    fn hf_missing_pre_tokenizer_keeps_gpt2_vocab_fallback() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"Ġ": 0},
+                "merges": []
+            },
+            "added_tokens": []
+        });
+        assert!(matches!(
+            Tokenizer::from_hf_json(&json.to_string()),
+            Err(TokenizerError::MissingByteSymbol { .. })
+        ));
+    }
+
+    #[test]
     fn skips_byte_check_for_sp() {
         // SP tokenizers (model != "gpt2") don't have byte-coverage
         // requirement — minimal vocab + no merges should succeed.
@@ -1925,6 +2059,7 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            prepend_sp_marker: true,
         }
     }
 

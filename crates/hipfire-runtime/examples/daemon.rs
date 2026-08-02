@@ -25,6 +25,7 @@ use base64::Engine;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -2242,6 +2243,9 @@ fn fail_closed_reset_target_and_spec(
                 push_reset_err(&mut first_err, "cohere2moe.reset", e);
             }
         }
+        if let Some(b) = m.gemma4_mut() {
+            b.state.reset();
+        }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
@@ -2331,6 +2335,7 @@ fn reset_core_arch_key(arch_id: u32) -> &'static str {
         10 => "minimax",
         11 => "lfm2moe",
         12 => "cohere2moe",
+        13 => "gemma4",
         _ => "unknown",
     }
 }
@@ -5637,6 +5642,7 @@ fn main() {
                             10 => "minimax_m2",
                             11 => "lfm2moe",
                             12 => "north_mini_code",
+                            13 => "gemma4",
                             _ => "qwen3",
                         };
                         let redline_default =
@@ -5666,6 +5672,9 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
+                            Some(ModelState::Gemma4(b)) => {
+                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
+                            }
                             _ => {
                                 if let Some(ref c) = m.dots_ocr_config {
                                     (
@@ -6678,6 +6687,7 @@ fn main() {
                         10 => "minimax_m2",
                         11 => "lfm2moe",
                         12 => "north_mini_code",
+                        13 => "gemma4",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -13640,6 +13650,7 @@ enum GenerationRoute {
     LlamaSpec,
     PipelineParallel,
     DotsOcr,
+    GemmaAr,
     Unknown,
 }
 
@@ -13666,6 +13677,7 @@ impl GenerationRoute {
         Self::LlamaSpec,
         Self::PipelineParallel,
         Self::DotsOcr,
+        Self::GemmaAr,
         Self::Unknown,
     ];
 
@@ -13703,6 +13715,7 @@ impl GenerationRoute {
             Self::LlamaSpec => "llama_spec",
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
+            Self::GemmaAr => "gemma_ar",
             Self::Unknown => "unknown",
         }
     }
@@ -13787,6 +13800,7 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             };
         }
         8 => return GenerationRoute::DotsOcr,
+        13 => return GenerationRoute::GemmaAr,
         _ => {}
     }
 
@@ -14384,6 +14398,51 @@ fn generate(
                 temp,
                 top_p,
                 max_tokens,
+            );
+            return;
+        }
+        GenerationRoute::GemmaAr => {
+            let unsupported_sampling = min_p.is_some_and(|value| value > 0.0)
+                || (repeat_penalty - 1.0).abs() > f32::EPSILON
+                || presence_penalty.abs() > f32::EPSILON
+                || frequency_penalty.abs() > f32::EPSILON
+                || cactus_delta.abs() > f32::EPSILON;
+            if unsupported_sampling {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "gemma4 basic AR currently supports temperature, top_p, and top_k only",
+                    "unsupported",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+            let _ = (
+                user_explicit_sampling,
+                repeat_window,
+                budget_alert_at_tok,
+                budget_alert_text,
+                max_think_tokens,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+            );
+            generate_gemma4(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k.unwrap_or(0) as usize,
+                max_tokens,
+                messages_history,
+                stop,
             );
             return;
         }
@@ -19743,6 +19802,303 @@ fn generate_cohere2moe(
 /// `state.next_pos` inside `Qwen2State`. On context overflow we hard
 /// reset (no CASK eviction on arch_id=7) — same fallback the
 /// llama path uses.
+/// Gemma4 E-series basic autoregressive serving path.
+///
+/// This first lane is intentionally narrow: single-GPU HFQ, no tools, no
+/// prefix reuse, no speculative decode. Every request resets its two KV caches,
+/// prefills in bounded batches, then decodes against the real E-series state.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    max_tokens: usize,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+) {
+    let Some(tokenizer) = m.tokenizer.as_ref() else {
+        emit_error_with_id(stdout, id, "gemma4: tokenizer not loaded");
+        return;
+    };
+    let Some(bundle) = m.gemma4() else {
+        emit_error_with_id(stdout, id, "gemma4: model state missing");
+        return;
+    };
+    if messages_history.is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message.role == hipfire_runtime::prompt_frame::Role::Tool
+                || !message.tool_calls.is_empty()
+        })
+    }) {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma4: tools are not supported in the basic AR lane",
+        );
+        return;
+    }
+
+    let raw_prompt = match system_prompt {
+        Some(system) if !system.is_empty() => format!("{system}\n\n{prompt}"),
+        _ => prompt.to_string(),
+    };
+    let mut prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+        let synthesized;
+        let messages = match messages_history {
+            Some(messages) => messages,
+            None => {
+                let mut owned = Vec::new();
+                if let Some(system) = system_prompt.filter(|text| !text.is_empty()) {
+                    owned.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::System,
+                        content: system.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                }
+                owned.push(hipfire_runtime::prompt_frame::Message {
+                    role: hipfire_runtime::prompt_frame::Role::User,
+                    content: prompt.to_string(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    tool_plan: String::new(),
+                });
+                synthesized = owned;
+                &synthesized
+            }
+        };
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: false,
+            // Tokenizer::encode applies Gemma's add_bos_token contract.
+            bos_token: None,
+        };
+        match frame.render_messages(messages, None, None) {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(error) => {
+                eprintln!("[gemma4] chat template failed ({error}); using raw prompt");
+                tokenizer.encode(&raw_prompt)
+            }
+        }
+    } else {
+        tokenizer.encode(&raw_prompt)
+    };
+    let bos = bundle.config.bos_token;
+    if prompt_ids.first() != Some(&bos) {
+        prompt_ids.insert(0, bos);
+    }
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "gemma4: empty prompt after tokenization");
+        return;
+    }
+    let capacity = bundle.state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > capacity {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4: prompt {} + max_tokens {} exceeds stage-1 capacity {}",
+                prompt_ids.len(),
+                max_tokens,
+                capacity
+            ),
+        );
+        return;
+    }
+
+    emit_gen_start(stdout, id, false, None);
+
+    m.gemma4_mut().unwrap().state.reset();
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let started = Instant::now();
+    let mut logits = Vec::new();
+    for (chunk_index, chunk) in prompt_ids.chunks(64).enumerate() {
+        if check_abort(id) {
+            let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, 0, &epilogue);
+            return;
+        }
+        let start_pos = chunk_index * 64;
+        let result = {
+            let bundle = m.gemma4_mut().unwrap();
+            gemma4::forward::forward_batch(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                chunk,
+                start_pos,
+            )
+        };
+        logits = match result {
+            Ok(logits) => logits,
+            Err(error) => {
+                let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("gemma4 prefill: {error}"),
+                    "internal",
+                    false,
+                    &epilogue,
+                );
+                return;
+            }
+        };
+    }
+    let prefill_elapsed = started.elapsed();
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let (eos, turn_eos) = {
+        let bundle = m.gemma4().unwrap();
+        (bundle.config.eos_token, bundle.eos_tok)
+    };
+    let decode_started = Instant::now();
+    let mut generated = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut stopped = false;
+
+    while generated.len() < max_tokens {
+        if check_abort(id) {
+            m.gemma4_mut().unwrap().state.reset();
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            fail_closed_invalidate_graphs_and_replay(gpu);
+            let epilogue = fail_closed_device_sync(gpu);
+            if epilogue.rolled_back {
+                gpu.replay.begin_replay_observation_window();
+            }
+            emit_spec_cancel_after_rollback(stdout, id, generated.len(), &epilogue);
+            return;
+        }
+        let token = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+        if token == eos || token == turn_eos {
+            stopped = true;
+            break;
+        }
+
+        // Commit model state before exposing the token to the client.
+        let step = {
+            let bundle = m.gemma4_mut().unwrap();
+            let position = bundle.state.n_tokens as u32;
+            gemma4::forward::decode_step_with_graph(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                position,
+            )
+        };
+        logits = match step {
+            Ok(logits) => logits,
+            Err(error) => {
+                let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("gemma4 decode: {error}"),
+                    "internal",
+                    false,
+                    &epilogue,
+                );
+                return;
+            }
+        };
+        generated.push(token);
+        m.conversation_tokens.push(token);
+        emit_committed_event(
+            stdout,
+            id,
+            token,
+            generated.len() - 1,
+            decode_started.elapsed().as_millis() as u64,
+        );
+
+        let decoded = m.tokenizer.as_ref().unwrap().decode_bytes(&generated);
+        let valid_end = match std::str::from_utf8(&decoded) {
+            Ok(_) => decoded.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        let valid_text = std::str::from_utf8(&decoded[..valid_end]).unwrap();
+        let stop_at = stop
+            .iter()
+            .filter_map(|needle| valid_text.find(needle))
+            .min();
+        let visible_end = stop_at.unwrap_or(valid_text.len());
+        if visible_end > emitted_bytes {
+            let Some(fragment) = valid_text.get(emitted_bytes..visible_end) else {
+                emit_error_with_id(stdout, id, "gemma4: invalid incremental UTF-8 boundary");
+                return;
+            };
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": fragment,
+                    "attempt_id": active_attempt_id(),
+                })
+            );
+            let _ = stdout.flush();
+            emitted_bytes = visible_end;
+        }
+        if stop_at.is_some() {
+            stopped = true;
+            break;
+        }
+    }
+
+    m.seq_pos = m.gemma4().unwrap().state.n_tokens;
+    let decode_s = decode_started.elapsed().as_secs_f64();
+    let total_s = started.elapsed().as_secs_f64();
+    let decode_tok_s = if decode_s > 0.0 {
+        generated.len() as f64 / decode_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_elapsed.as_secs_f64() > 0.0 {
+        prompt_ids.len() as f64 / prefill_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    let finish_reason = if stopped { "stop" } else { "length" };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated.len(),
+        "tok_s": decode_tok_s,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": prefill_elapsed.as_secs_f64() * 1000.0,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "total_ms": total_s * 1000.0,
+        "cached_tokens": 0,
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    });
+    if await_client_terminal_commit(stdout, id, &pending_done) == ClientTerminalDecision::Commit {
+        emit_staged_terminal_done(stdout, &pending_done);
+    }
+}
+
 fn generate_qwen2(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -27410,6 +27766,13 @@ mod generation_route_matrix_tests {
                 },
             ),
             (
+                GenerationRoute::GemmaAr,
+                GenerationRouteInputs {
+                    arch_id: 13,
+                    ..base()
+                },
+            ),
+            (
                 GenerationRoute::Unknown,
                 GenerationRouteInputs {
                     arch_id: 99,
@@ -27865,10 +28228,10 @@ mod generation_route_matrix_tests {
     }
 
     #[test]
-    fn all_variant_count_is_twenty() {
+    fn all_variant_count_is_twenty_one() {
         // Pin count so accidental ALL edits surface here too.
-        assert_eq!(GenerationRoute::ALL.len(), 20);
-        assert_eq!(capability_rows().len(), 20);
+        assert_eq!(GenerationRoute::ALL.len(), 21);
+        assert_eq!(capability_rows().len(), 21);
     }
 }
 

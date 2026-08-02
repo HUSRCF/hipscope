@@ -15,6 +15,7 @@ pub mod spec_build;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -101,6 +102,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
+    &Gemma4Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -113,6 +115,11 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
 /// Built-in LFM2.5 chat template.
 const LFM2_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/lfm2-liquidai.jinja");
+
+/// Built-in best-effort fallback for checkpoints missing `chat_template`.
+/// Embedded and user-provided templates always take precedence.
+const GEMMA4_DEFAULT_TEMPLATE: &str =
+    include_str!("../../hipfire-runtime/templates/eval/gemma4-default.jinja");
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
@@ -260,6 +267,7 @@ pub enum ModelState {
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
+    Gemma4(Gemma4Bundle),
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
@@ -280,6 +288,14 @@ pub use minimax::MiniMaxBundle;
 /// n-gram verify seam) lives next to the forward it drives (orphan rule).
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
+
+/// Gemma 4 E-series dense text (arch_id=13) GPU bundle.
+pub struct Gemma4Bundle {
+    pub config: gemma4::Gemma4Config,
+    pub weights: gemma4::Gemma4Weights,
+    pub state: gemma4::Gemma4State,
+    pub eos_tok: u32,
+}
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
@@ -491,6 +507,20 @@ impl LoadedModel {
         }
     }
 
+    pub fn gemma4(&self) -> Option<&Gemma4Bundle> {
+        match &self.state {
+            Some(ModelState::Gemma4(bundle)) => Some(bundle),
+            _ => None,
+        }
+    }
+
+    pub fn gemma4_mut(&mut self) -> Option<&mut Gemma4Bundle> {
+        match &mut self.state {
+            Some(ModelState::Gemma4(bundle)) => Some(bundle),
+            _ => None,
+        }
+    }
+
     /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
     /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
@@ -602,6 +632,15 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
                 return Some(t);
             }
             return Some(LFM2_TEMPLATE.to_string());
+        }
+        13 => {
+            if let Some(template) = hfq.chat_template() {
+                return Some(template);
+            }
+            eprintln!(
+                "[chat_template] Gemma4 checkpoint has no embedded chat_template; using built-in best-effort fallback"
+            );
+            return Some(GEMMA4_DEFAULT_TEMPLATE.to_string());
         }
         12 => {
             if let Some(t) = hfq.chat_template_named("tool_use") {
@@ -1856,6 +1895,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
             | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::Gemma4(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1933,6 +1973,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::Gemma4(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
         }
     }
     // Non-core arch weights
@@ -1967,7 +2011,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod registry_tests {
-    use super::REGISTRY;
+    use super::{GEMMA4_DEFAULT_TEMPLATE, REGISTRY};
+
+    #[test]
+    fn gemma4_fallback_uses_checkpoint_turn_tokens_and_no_literal_bos() {
+        assert!(GEMMA4_DEFAULT_TEMPLATE.contains("<|turn>"));
+        assert!(GEMMA4_DEFAULT_TEMPLATE.contains("<turn|>"));
+        assert!(!GEMMA4_DEFAULT_TEMPLATE.contains("<start_of_turn>"));
+        assert!(!GEMMA4_DEFAULT_TEMPLATE.contains("{{ bos_token }}"));
+    }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both
     /// source namespaces (HFQ header ids and `derive_arch_id` dir ids). This
@@ -2017,6 +2069,7 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (13, false, "gemma4"),
         ];
         for &(id, is_dir, want) in cases {
             let got: Vec<&str> = REGISTRY
@@ -2030,6 +2083,12 @@ mod registry_tests {
                 "arch_id={id} is_dir={is_dir} should route to exactly [{want}]"
             );
         }
+        assert!(
+            REGISTRY
+                .iter()
+                .all(|carrier| !carrier.claims_arch_id(13, true)),
+            "Gemma4 stage-1 must reject raw directory sources"
+        );
     }
 
     /// The unassigned HFQ ids 2..=4 must reach NO carrier — this is the

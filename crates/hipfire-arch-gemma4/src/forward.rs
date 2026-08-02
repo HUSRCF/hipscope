@@ -793,7 +793,6 @@ fn sliding_layer_decode(
             eps,
             "sliding",
         )?;
-
         // Weight-less V RMSNorm (ones). V is independent of q/k here (own
         // v_proj), so it normalizes outside the fused q/k path either way.
         gpu.rmsnorm_batched(&state.v, &state.v_norm_ones, &state.v, n_kv, head_dim, eps)
@@ -943,7 +942,6 @@ fn full_layer_decode(
         gpu.rmsnorm_batched(&state.v, &state.v_norm_ones, &state.v, n_kv, head_dim, eps)
             .map_err(|e| format!("gemma4 full: v_norm: {e:?}"))?;
     }
-
     // Proportional / partial RoPE: rotate the first `partial_rotary_factor ×
     // head_dim` dims; theta = full_rope_theta. n_rot_pairs = factor*head_dim/2.
     let n_rot_pairs = match cfg.full_rope_type {
@@ -1987,6 +1985,14 @@ fn forward_batch_impl(
     if cfg.final_logit_softcapping > 0.0 {
         gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
             .map_err(|e| format!("gemma4 forward_batch logit softcap: {e:?}"))?;
+    }
+    // The batched kernels may be queued on an explicit stream, while the
+    // synchronous D2H copy below uses the legacy stream. Finish the producer
+    // stream before reading logits or returning scratch to the reusable pool.
+    if let Some(stream) = gpu.active_stream.as_ref() {
+        gpu.hip
+            .stream_synchronize(stream)
+            .map_err(|e| format!("gemma4 forward_batch scratch sync: {e:?}"))?;
     }
     let logits = gpu
         .download_f32(&state.logits)
