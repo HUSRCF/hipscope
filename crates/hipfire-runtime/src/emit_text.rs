@@ -37,6 +37,8 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
 
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const GEMMA4_TOOL_CALL_OPEN: &str = "<|tool_call>";
+const GEMMA4_TOOL_CALL_CLOSE: &str = "<tool_call|>";
 
 /// Fail-closed terminal from the single-pass tool-output router.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,129 @@ pub enum ToolRouteEvent {
     VisibleText(crate::semantic::VisibleText),
     /// One complete structured tool call (still subject to terminal gating upstream).
     ToolCall(crate::prompt_frame::ToolCall),
+}
+
+/// Strict whole-output router for Gemma 4's native
+/// `<|tool_call>call:NAME{...}<tool_call|>` protocol.
+///
+/// Gemma's schema uses identifier keys and the atomic `<|"|>` quote token,
+/// rather than JSON spelling. Protocol bytes are never returned as visible
+/// text, and malformed or truncated spans fail closed.
+pub fn route_gemma4_tool_output(output: &str) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+    let mut events = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < output.len() {
+        let next_open = output[cursor..]
+            .find(GEMMA4_TOOL_CALL_OPEN)
+            .map(|offset| cursor + offset);
+        let next_close = output[cursor..]
+            .find(GEMMA4_TOOL_CALL_CLOSE)
+            .map(|offset| cursor + offset);
+        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
+            return Err(ToolRouteError::malformed(
+                "stray Gemma 4 tool-call closer without open span",
+            ));
+        }
+        let Some(open) = next_open else {
+            if cursor < output.len() {
+                events.push(visible_event(output[cursor..].to_string()));
+            }
+            break;
+        };
+        if open > cursor {
+            events.push(visible_event(output[cursor..open].to_string()));
+        }
+        let body_start = open + GEMMA4_TOOL_CALL_OPEN.len();
+        let Some(close_offset) = output[body_start..].find(GEMMA4_TOOL_CALL_CLOSE) else {
+            return Err(ToolRouteError::malformed(
+                "unclosed Gemma 4 tool-call span at end of output",
+            ));
+        };
+        let close = body_start + close_offset;
+        let body = &output[body_start..close];
+        if body.contains(GEMMA4_TOOL_CALL_OPEN) {
+            return Err(ToolRouteError::malformed("nested Gemma 4 tool-call opener"));
+        }
+        let call = parse_gemma4_tool_call_body(body).ok_or_else(|| {
+            ToolRouteError::malformed("invalid Gemma 4 call:NAME{arguments} body")
+        })?;
+        events.push(ToolRouteEvent::ToolCall(call));
+        cursor = close + GEMMA4_TOOL_CALL_CLOSE.len();
+    }
+    Ok(events)
+}
+
+fn parse_gemma4_tool_call_body(body: &str) -> Option<crate::prompt_frame::ToolCall> {
+    let body = body.trim();
+    let rest = body.strip_prefix("call:")?;
+    let object_at = rest.find('{')?;
+    let name = rest[..object_at].trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let object = rest[object_at..].trim();
+    let json = gemma4_arguments_to_json(object)?;
+    let arguments = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    if !arguments.is_object() {
+        return None;
+    }
+    Some(crate::prompt_frame::ToolCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn gemma4_arguments_to_json(input: &str) -> Option<String> {
+    if !input.starts_with('{') || !input.ends_with('}') {
+        return None;
+    }
+    let normalized = input.replace("<|\"|>", "\"");
+    let mut out = String::with_capacity(normalized.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = normalized.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push('"');
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let mut end = start + c.len_utf8();
+                while let Some(&(index, next)) = chars.peek() {
+                    if !(next.is_ascii_alphanumeric() || matches!(next, '_' | '-' | '.')) {
+                        break;
+                    }
+                    chars.next();
+                    end = index + next.len_utf8();
+                }
+                if normalized[end..].trim_start().starts_with(':') {
+                    out.push('"');
+                    out.push_str(&normalized[start..end]);
+                    out.push('"');
+                } else {
+                    out.push_str(&normalized[start..end]);
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    (!in_string).then_some(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -849,8 +974,8 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
-        TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+        extract_tool_calls_from_text, route_gemma4_tool_output, ToolOutputRouter, ToolRouteError,
+        ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
     };
     use crate::prompt_frame::ToolCall;
 
@@ -1433,5 +1558,68 @@ mod tests {
         assert!(matches!(err, ToolRouteError::MalformedToolProtocol { .. }));
         let err2 = r.push("more").expect_err("latched");
         assert_eq!(err2.detail(), err.detail());
+    }
+
+    #[test]
+    fn gemma4_router_extracts_native_call_and_hides_protocol() {
+        let events = route_gemma4_tool_output(
+            "Before<|tool_call>call:get_weather{city:<|\"|>Taipei<|\"|>,units:<|\"|>c<|\"|>}<tool_call|>After",
+        )
+        .expect("valid Gemma tool call");
+        assert_eq!(events.len(), 3);
+        match &events[0] {
+            ToolRouteEvent::VisibleText(text) => assert_eq!(text.as_str(), "Before"),
+            _ => panic!("expected visible prefix"),
+        }
+        match &events[1] {
+            ToolRouteEvent::ToolCall(call) => {
+                assert_eq!(call.name, "get_weather");
+                assert_eq!(call.arguments["city"], "Taipei");
+                assert_eq!(call.arguments["units"], "c");
+            }
+            _ => panic!("expected tool call"),
+        }
+        match &events[2] {
+            ToolRouteEvent::VisibleText(text) => assert_eq!(text.as_str(), "After"),
+            _ => panic!("expected visible suffix"),
+        }
+    }
+
+    #[test]
+    fn gemma4_router_parses_nested_arguments_and_json_literals() {
+        let events = route_gemma4_tool_output(
+            "<|tool_call>call:search{filters:{active:true,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]},limit:2}<tool_call|>",
+        )
+        .expect("nested Gemma arguments");
+        let ToolRouteEvent::ToolCall(call) = &events[0] else {
+            panic!("expected call");
+        };
+        assert_eq!(call.arguments["filters"]["active"], true);
+        assert_eq!(call.arguments["filters"]["tags"][1], "b");
+        assert_eq!(call.arguments["limit"], 2);
+    }
+
+    #[test]
+    fn gemma4_router_preserves_non_ascii_argument_text() {
+        let events = route_gemma4_tool_output(
+            "<|tool_call>call:get_weather{city:<|\"|>台北<|\"|>}<tool_call|>",
+        )
+        .expect("non-ASCII Gemma arguments");
+        let ToolRouteEvent::ToolCall(call) = &events[0] else {
+            panic!("expected call");
+        };
+        assert_eq!(call.arguments["city"], "台北");
+    }
+
+    #[test]
+    fn gemma4_router_fails_closed_on_truncated_or_stray_protocol() {
+        assert!(route_gemma4_tool_output("<|tool_call>call:x{}")
+            .expect_err("unclosed")
+            .detail()
+            .contains("unclosed"));
+        assert!(route_gemma4_tool_output("visible<tool_call|>")
+            .expect_err("stray closer")
+            .detail()
+            .contains("stray"));
     }
 }

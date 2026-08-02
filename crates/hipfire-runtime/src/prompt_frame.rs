@@ -920,6 +920,7 @@ impl<'a> JinjaChatFrame<'a> {
                 .iter()
                 .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
                 .collect();
+            add_openai_tool_call_view(&mut arr);
             if let Some(serde_json::Value::Object(map)) = arr.first_mut() {
                 let is_system = matches!(
                     map.get("role"),
@@ -953,6 +954,61 @@ impl<'a> JinjaChatFrame<'a> {
         };
         tmpl.render(ctx)
             .map_err(|e| format!("template render: {e}"))
+    }
+}
+
+/// Keep hipfire's compact `{name, arguments}` tool-call ABI while also exposing
+/// the OpenAI-compatible `{id, type, function:{name, arguments}}` view expected
+/// by templates such as Gemma 4. Existing templates continue to read the flat
+/// fields; no public message type or wire contract changes.
+fn add_openai_tool_call_view(messages: &mut [serde_json::Value]) {
+    let response_ids: Vec<Vec<Option<String>>> = (0..messages.len())
+        .map(|index| {
+            messages[index + 1..]
+                .iter()
+                .take_while(|message| message.get("role").and_then(|v| v.as_str()) == Some("tool"))
+                .map(|message| {
+                    message
+                        .get("tool_call_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .collect();
+
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let Some(calls) = message
+            .get_mut("tool_calls")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (call_index, call) in calls.iter_mut().enumerate() {
+            let Some(call) = call.as_object_mut() else {
+                continue;
+            };
+            let Some(name) = call.get("name").cloned() else {
+                continue;
+            };
+            let arguments = call
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            call.entry("type".to_string())
+                .or_insert_with(|| serde_json::Value::String("function".to_string()));
+            call.entry("id".to_string()).or_insert_with(|| {
+                response_ids[message_index]
+                    .get(call_index)
+                    .and_then(Clone::clone)
+                    .map(serde_json::Value::String)
+                    .unwrap_or_else(|| {
+                        serde_json::Value::String(format!("call_{message_index}_{call_index}"))
+                    })
+            });
+            call.entry("function".to_string())
+                .or_insert_with(|| serde_json::json!({"name": name, "arguments": arguments}));
+        }
     }
 }
 
@@ -1736,6 +1792,47 @@ mod tests {
         assert!(
             out.contains("tool:72F[id=call_1];"),
             "tool response w/ tool_call_id rendered: {out:?}",
+        );
+    }
+
+    #[test]
+    fn render_messages_exposes_openai_tool_call_view_without_losing_flat_view() {
+        let t = make_tokenizer();
+        let template = "{% for m in messages %}{% for tc in m.tool_calls %}flat={{ tc.name }}:{{ tc.arguments.city }};openai={{ tc.type }}:{{ tc.id }}:{{ tc.function.name }}:{{ tc.function.arguments.city }};{% endfor %}{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "weather".to_string(),
+                    arguments: serde_json::json!({"city": "Taipei"}),
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "sunny".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_weather_1".to_string()),
+                tool_plan: String::new(),
+            },
+        ];
+        let rendered = frame
+            .render_messages(&messages, None, None)
+            .expect("dual tool-call view renders");
+        assert!(rendered.contains("flat=weather:Taipei;"), "{rendered:?}");
+        assert!(
+            rendered.contains("openai=function:call_weather_1:weather:Taipei;"),
+            "{rendered:?}"
         );
     }
 

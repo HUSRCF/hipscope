@@ -37,8 +37,8 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
-    currently_in_think, extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError,
-    ToolRouteEvent,
+    currently_in_think, extract_tool_calls_from_text, route_gemma4_tool_output, ToolOutputRouter,
+    ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
@@ -2622,10 +2622,10 @@ fn ds4_gen_start_contract_version() -> Option<u32> {
     gen_start_contract_version_for_arch(9)
 }
 
-/// Pure `gen_start.contract_version` selection used by the live generate path.
-/// Qwen AR (5/6) advertises v2; DS4 (9) and every other arch stay unset.
+/// Pure `gen_start.contract_version` selection used by live semantic-safe AR
+/// producers. Qwen (5/6) and Gemma 4 (13) advertise v2; DS4 (9) stays unset.
 fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
-    if arch_id == 5 || arch_id == 6 {
+    if arch_id == 5 || arch_id == 6 || arch_id == 13 {
         Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION)
     } else {
         None
@@ -13682,7 +13682,7 @@ impl GenerationRoute {
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec.
+    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Gemma AR.
     const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -13691,6 +13691,7 @@ impl GenerationRoute {
                 | Self::Deepseek4Ar
                 | Self::Deepseek4Ep
                 | Self::Deepseek4Spec
+                | Self::GemmaAr
         )
     }
 
@@ -13928,7 +13929,7 @@ fn generate(
             stdout,
             Some(id),
             &format!(
-                "tools are not supported on producer route {} (semantic-safe producers: qwen_ar, qwen_dflash, deepseek4_ar, deepseek4_ep, deepseek4_spec)",
+                "tools are not supported on producer route {} (semantic-safe producers: qwen_ar, qwen_dflash, deepseek4_ar, deepseek4_ep, deepseek4_spec, gemma_ar)",
                 selected_route.name()
             ),
             "unsupported",
@@ -14441,6 +14442,7 @@ fn generate(
                 top_p,
                 top_k.unwrap_or(0) as usize,
                 max_tokens,
+                tools,
                 messages_history,
                 stop,
             );
@@ -19804,9 +19806,8 @@ fn generate_cohere2moe(
 /// llama path uses.
 /// Gemma4 E-series basic autoregressive serving path.
 ///
-/// This first lane is intentionally narrow: single-GPU HFQ, no tools, no
-/// prefix reuse, no speculative decode. Every request resets its two KV caches,
-/// prefills in bounded batches, then decodes against the real E-series state.
+/// Single-GPU HFQ autoregressive lane with Gemma-native tools and strict
+/// forward-extension prefix reuse. Speculative decode remains out of scope.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4(
     m: &mut LoadedModel,
@@ -19819,6 +19820,7 @@ fn generate_gemma4(
     top_p: f32,
     top_k: usize,
     max_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
 ) {
@@ -19830,25 +19832,13 @@ fn generate_gemma4(
         emit_error_with_id(stdout, id, "gemma4: model state missing");
         return;
     };
-    if messages_history.is_some_and(|messages| {
-        messages.iter().any(|message| {
-            message.role == hipfire_runtime::prompt_frame::Role::Tool
-                || !message.tool_calls.is_empty()
-        })
-    }) {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4: tools are not supported in the basic AR lane",
-        );
-        return;
-    }
-
+    let bos = bundle.config.bos_token;
+    let capacity = bundle.state.max_seq;
     let raw_prompt = match system_prompt {
         Some(system) if !system.is_empty() => format!("{system}\n\n{prompt}"),
         _ => prompt.to_string(),
     };
-    let mut prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+    let mut rendered_prompt_ids = if let Some(template) = m.chat_template.as_ref() {
         let synthesized;
         let messages = match messages_history {
             Some(messages) => messages,
@@ -19883,9 +19873,36 @@ fn generate_gemma4(
             // Tokenizer::encode applies Gemma's add_bos_token contract.
             bos_token: None,
         };
-        match frame.render_messages(messages, None, None) {
-            Ok(rendered) => tokenizer.encode(&rendered),
+        let rendered = if messages_history.is_some()
+            && std::env::var("HIPFIRE_GEMMA4_PROMPT_CACHE").ok().as_deref() != Some("0")
+        {
+            let cache_ref = &mut m.asst_turn_cache;
+            hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                &frame,
+                messages,
+                tools,
+                |message| {
+                    let normalized = normalize_asst_turn_for_fingerprint(&message.content);
+                    let fingerprint = asst_turn_fingerprint(&normalized, &message.tool_calls);
+                    cache_ref.get(&fingerprint).cloned()
+                },
+            )
+        } else {
+            frame
+                .render_messages(messages, tools, None)
+                .map(|rendered| tokenizer.encode(&rendered))
+        };
+        match rendered {
+            Ok(tokens) => tokens,
             Err(error) => {
+                if tools.is_some_and(|items| !items.is_empty()) {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("gemma4: tool-aware chat template failed: {error}"),
+                    );
+                    return;
+                }
                 eprintln!("[gemma4] chat template failed ({error}); using raw prompt");
                 tokenizer.encode(&raw_prompt)
             }
@@ -19893,22 +19910,33 @@ fn generate_gemma4(
     } else {
         tokenizer.encode(&raw_prompt)
     };
-    let bos = bundle.config.bos_token;
-    if prompt_ids.first() != Some(&bos) {
-        prompt_ids.insert(0, bos);
+    if rendered_prompt_ids.first() != Some(&bos) {
+        rendered_prompt_ids.insert(0, bos);
     }
-    if prompt_ids.is_empty() {
+    if rendered_prompt_ids.is_empty() {
         emit_error_with_id(stdout, id, "gemma4: empty prompt after tokenization");
         return;
     }
-    let capacity = bundle.state.max_seq;
-    if prompt_ids.len().saturating_add(max_tokens) > capacity {
+    let cache_eligible = messages_history.is_some()
+        && std::env::var("HIPFIRE_GEMMA4_PROMPT_CACHE").ok().as_deref() != Some("0")
+        && !m.conversation_tokens.is_empty()
+        && m.seq_pos == m.conversation_tokens.len()
+        && m.gemma4().unwrap().state.n_tokens == m.conversation_tokens.len();
+    let prompt_plan = plan_from_rendered(
+        &m.conversation_tokens,
+        rendered_prompt_ids,
+        cache_eligible,
+        &[],
+        false,
+        "gemma4",
+    );
+    if prompt_plan.rendered.len().saturating_add(max_tokens) > capacity {
         emit_error_with_id(
             stdout,
             id,
             format!(
                 "gemma4: prompt {} + max_tokens {} exceeds stage-1 capacity {}",
-                prompt_ids.len(),
+                prompt_plan.rendered.len(),
                 max_tokens,
                 capacity
             ),
@@ -19916,11 +19944,22 @@ fn generate_gemma4(
         return;
     }
 
-    emit_gen_start(stdout, id, false, None);
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
 
-    m.gemma4_mut().unwrap().state.reset();
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    if !prompt_plan.cache_hit {
+        m.gemma4_mut().unwrap().state.reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    let prompt_ids = prompt_plan.new_tokens;
+    let prompt_start = prompt_plan.start_pos;
+    let cached_tokens_count = prompt_plan.cached_tokens;
+    let canonical_prompt = prompt_plan.rendered;
     let started = Instant::now();
     let mut logits = Vec::new();
     for (chunk_index, chunk) in prompt_ids.chunks(64).enumerate() {
@@ -19929,7 +19968,7 @@ fn generate_gemma4(
             emit_spec_cancel_after_rollback(stdout, id, 0, &epilogue);
             return;
         }
-        let start_pos = chunk_index * 64;
+        let start_pos = prompt_start + chunk_index * 64;
         let result = {
             let bundle = m.gemma4_mut().unwrap();
             gemma4::forward::forward_batch(
@@ -19958,7 +19997,7 @@ fn generate_gemma4(
         };
     }
     let prefill_elapsed = started.elapsed();
-    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.conversation_tokens = canonical_prompt;
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -19973,6 +20012,7 @@ fn generate_gemma4(
     let mut generated = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut stopped = false;
+    let tool_mode = tools.is_some_and(|items| !items.is_empty());
 
     while generated.len() < max_tokens {
         if check_abort(id) {
@@ -20042,7 +20082,7 @@ fn generate_gemma4(
             .filter_map(|needle| valid_text.find(needle))
             .min();
         let visible_end = stop_at.unwrap_or(valid_text.len());
-        if visible_end > emitted_bytes {
+        if !tool_mode && visible_end > emitted_bytes {
             let Some(fragment) = valid_text.get(emitted_bytes..visible_end) else {
                 emit_error_with_id(stdout, id, "gemma4: invalid incremental UTF-8 boundary");
                 return;
@@ -20067,6 +20107,49 @@ fn generate_gemma4(
     }
 
     m.seq_pos = m.gemma4().unwrap().state.n_tokens;
+    let decoded = m.tokenizer.as_ref().unwrap().decode_bytes(&generated);
+    let valid_end = match std::str::from_utf8(&decoded) {
+        Ok(_) => decoded.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let decoded_text = std::str::from_utf8(&decoded[..valid_end]).unwrap();
+    let visible_end = stop
+        .iter()
+        .filter_map(|needle| decoded_text.find(needle))
+        .min()
+        .unwrap_or(decoded_text.len());
+    let routed_text = &decoded_text[..visible_end];
+    let mut visible_for_cache = routed_text.to_string();
+    let mut wire_tool_calls = Vec::new();
+    if tool_mode {
+        let events = match route_gemma4_tool_output(routed_text) {
+            Ok(events) => events,
+            Err(error) => {
+                let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("gemma4 tool output: {error}"),
+                    "malformed_tool_protocol",
+                    false,
+                    &epilogue,
+                );
+                return;
+            }
+        };
+        visible_for_cache.clear();
+        for event in events {
+            match event {
+                ToolRouteEvent::VisibleText(text) => {
+                    visible_for_cache.push_str(text.as_str());
+                    if !text.as_str().is_empty() {
+                        emit_visible_token(stdout, id, text.as_str());
+                    }
+                }
+                ToolRouteEvent::ToolCall(call) => wire_tool_calls.push(call),
+            }
+        }
+    }
     let decode_s = decode_started.elapsed().as_secs_f64();
     let total_s = started.elapsed().as_secs_f64();
     let decode_tok_s = if decode_s > 0.0 {
@@ -20079,8 +20162,14 @@ fn generate_gemma4(
     } else {
         0.0
     };
-    let finish_reason = if stopped { "stop" } else { "length" };
-    let pending_done = serde_json::json!({
+    let finish_reason = if stopped && !wire_tool_calls.is_empty() {
+        "tool_calls"
+    } else if stopped {
+        "stop"
+    } else {
+        "length"
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated.len(),
@@ -20090,12 +20179,27 @@ fn generate_gemma4(
         "prefill_tok_s": prefill_tok_s,
         "decode_tok_s": decode_tok_s,
         "total_ms": total_s * 1000.0,
-        "cached_tokens": 0,
+        "cached_tokens": cached_tokens_count,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
-    if await_client_terminal_commit(stdout, id, &pending_done) == ClientTerminalDecision::Commit {
-        emit_staged_terminal_done(stdout, &pending_done);
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            if finish_reason == "tool_calls" {
+                emit_tool_calls_event(stdout, id, &wire_tool_calls);
+            }
+            if finish_reason != "length" && !generated.is_empty() {
+                let normalized = normalize_asst_turn_for_fingerprint(&visible_for_cache);
+                let fingerprint = asst_turn_fingerprint(&normalized, &wire_tool_calls);
+                m.asst_turn_cache.insert(fingerprint, generated);
+            }
+            emit_staged_terminal_done(stdout, &pending_done);
+        }
+        ClientTerminalDecision::Abort => {
+            let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated.len(), &epilogue);
+        }
     }
 }
 
@@ -23917,6 +24021,7 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(ds4_gen_start_contract_version(), None);
         assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
         assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
+        assert_eq!(gen_start_contract_version_for_arch(13), Some(2));
         assert_eq!(super::QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
     }
 
@@ -27789,6 +27894,7 @@ mod generation_route_matrix_tests {
         GenerationRoute::Deepseek4Ar,
         GenerationRoute::Deepseek4Ep,
         GenerationRoute::Deepseek4Spec,
+        GenerationRoute::GemmaAr,
     ];
 
     /// Pure gate model mirroring generate()'s tools preflight:
@@ -27894,7 +28000,7 @@ mod generation_route_matrix_tests {
     }
 
     #[test]
-    fn exact_safe_set_is_qwen_ar_dflash_and_ds4_ar_ep_spec() {
+    fn exact_safe_set_includes_gemma_ar() {
         let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
             .iter()
             .copied()
@@ -27904,7 +28010,7 @@ mod generation_route_matrix_tests {
         let mut expected = SAFE_ROUTES.to_vec();
         expected.sort_by_key(|r| r.name());
         assert_eq!(from_all, expected);
-        assert_eq!(from_all.len(), 5);
+        assert_eq!(from_all.len(), 6);
         // Negative: every other ALL member is denied for tools.
         for &r in GenerationRoute::ALL {
             if !SAFE_ROUTES.contains(&r) {
