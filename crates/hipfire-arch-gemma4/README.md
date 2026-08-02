@@ -17,8 +17,8 @@ Validation status:
 
 - E2B has passed real HFQ load, short prefill/decode, multi-chunk prefill,
   terminal commit, unload, and gfx1100 GPU smoke tests;
-- E4B has config and loader contract coverage but has not yet received a real
-  checkpoint GPU validation run;
+- E4B has passed the same real-checkpoint GPU path on gfx1100 using the
+  `google/gemma-4-E4B-it` BF16 checkpoint converted to text-only Q8 HFQ;
 - gfx1100 flash-attention partial workspace sizing follows the runtime-selected
   tile geometry rather than assuming a fixed 128-token tile.
 
@@ -34,3 +34,23 @@ Use `scripts/gemma4-e-series-smoke.sh` for the reproducible GPU smoke. The
 fallback template is intentionally not presented as an instruction-tuning
 contract: checkpoints without an embedded template may echo the prompt or stop
 early even when tokenization and model execution are correct.
+
+The E4B validation used source SHA-256
+`cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503`:
+
+```bash
+target/release/hipfire-quantize \
+  --input /path/to/gemma-4-E4B-it \
+  --output artifacts/gemma4-e4b-q8f16.hfq \
+  --format q8
+
+MODEL=artifacts/gemma4-e4b-q8f16.hfq \
+GPU_ID=1 \
+OUT=/tmp/hipfire-gemma4-e4b-smoke.log \
+scripts/gemma4-e-series-smoke.sh
+```
+
+On a Radeon Pro W7900, the smoke completed both attempt/commit requests: the
+106-token multi-chunk case measured `878.9660 prefill tok/s` and `68.2805
+decode tok/s`. These numbers are smoke evidence for the E4B execution contract,
+not a formal performance baseline.
