@@ -290,12 +290,14 @@ _Z22gemm_hfq4g256_residual_kd,200,100000000,500000,20.0,480000,520000,8000
             ProfileEntry {
                 category: "linear",
                 kernel: "gemm_q8_0_batched",
+                shape: None,
                 time_us: 100_000.0, // internal sees less because batch has no timer
                 bytes: 1024,
             },
             ProfileEntry {
                 category: "norm",
                 kernel: "rmsnorm",
+                shape: None,
                 time_us: 40_000.0,
                 bytes: 512,
             },
