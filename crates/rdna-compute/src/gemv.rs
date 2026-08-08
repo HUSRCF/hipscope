@@ -3027,6 +3027,82 @@ impl Gpu {
         result
     }
 
+    /// gfx11 production probe: fuse SwiGLU, FWHT rotation, and group128 Q8
+    /// packing into the MMQ activation scratch. The returned pointer is valid
+    /// until the next MMQ activation producer reuses that scratch buffer.
+    pub fn fused_silu_mul_rotate_mq_q8_group128_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused group128 SwiGLU pack requires gfx11 dGPU and K%256=0",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "fused_silu_mul_mq_rotate_q8_group128";
+        self.ensure_kernel(
+            MODULE,
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC,
+            MODULE,
+        )?;
+
+        let out_ptr = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut signs1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut signs2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut q8_ptr = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut q8_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = batch_size * (2 * k * 4 + (k / 128) * 144);
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "fused",
+            MODULE,
+            [k, batch_size, 0],
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            MODULE,
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_ptr(q8_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|_| out_ptr)
+    }
+
     /// Phase A Stage A — F2 AWQ-aware variant of `fused_silu_mul_rotate_mq`.
     ///
     /// After computing silu(gate)*up, divides element-wise by `awq_scale[i]`
