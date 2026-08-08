@@ -285,6 +285,7 @@ static __device__ __forceinline__ void load_hfq4_tile(
     }
 }
 
+template <bool APPLY_ZERO>
 static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     const int* __restrict__ x,
     const int* __restrict__ y,
@@ -332,8 +333,54 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                     const int i = i0 + n * tile_A::I + tile_C::get_i(l);
                     const float2 dmA = __half22float2(x_dm[i * MMQ_TILE_X_K + k0 / QI8_1]);
                     sum[(j0 / tile_C::J + n) * tile_C::ne + l] += dmA.x * dsB.x * (float)C_frag.x[l];
-                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] += dmA.y * dsB.y;
+                    if constexpr (APPLY_ZERO) {
+                        sum[(j0 / tile_C::J + n) * tile_C::ne + l] += dmA.y * dsB.y;
+                    }
                 }
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ void collect_q8_1_sums(
+    const int* __restrict__ tile_y,
+    float* __restrict__ zero_sums,
+    bool reset
+) {
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    if (tid < MMQ_X) {
+        const half2* y_dm = (const half2*)tile_y;
+        float value = 0.0f;
+        #pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            value += __half22float2(y_dm[tid * MMQ_TILE_Y_K + k01 / QI8_1]).y;
+        }
+        zero_sums[tid] = reset ? value : zero_sums[tid] + value;
+    }
+}
+
+static __device__ __forceinline__ void add_group_zero_correction(
+    const int* __restrict__ tile_x,
+    const float* __restrict__ zero_sums,
+    float* __restrict__ sum
+) {
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int rows_per_warp = 32;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    const half2* x_dm = (const half2*)(tile_x + 2 * MMQ_TILE_NE_K);
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
+        const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(0);
+        const float activation_sum = zero_sums[j];
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                const float zero = __half22float2(x_dm[i * MMQ_TILE_X_K]).y;
+                sum[(j0 / tile_C::J + n) * tile_C::ne + l] += zero * activation_sum;
             }
         }
     }
@@ -372,7 +419,7 @@ void gemm_hfq4g256_residual_mmq(
             tile_y[l] = (col0 + j < N) ? by0[l] : 0;
         }
         __syncthreads();
-        vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
+        vec_dot_q8_1_q8_1_mma<true>(tile_x, tile_y, sum, 0);
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -383,7 +430,7 @@ void gemm_hfq4g256_residual_mmq(
                 tile_y[l] = (col0 + j < N) ? by1[l] : 0;
             }
             __syncthreads();
-            vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            vec_dot_q8_1_q8_1_mma<true>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
             __syncthreads();
         }
     }
@@ -415,7 +462,10 @@ void gemm_hfq4g256_residual_mmq(
     }
 }
 
-template <bool ADD>
+// COMBINE_ZERO folds the eight Q8_1 activation sums covered by one HFQ4-G256
+// group into one zero-point correction. The scale-dependent WMMA terms remain
+// unchanged; only repeated affine zero-point work is removed.
+template <bool ADD, bool COMBINE_ZERO = false>
 static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
@@ -433,6 +483,7 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
     extern __shared__ int smem[];
     int* tile_y = smem;
     int* tile_x = tile_y + MMQ_X * MMQ_TILE_Y_K;
+    float* zero_sums = (float*)(tile_x + MMQ_Y * MMQ_TILE_X_K);
 
     float sum[MMQ_X * MMQ_Y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
 
@@ -445,7 +496,10 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
             tile_y[l] = by0[l];
         }
         __syncthreads();
-        vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
+        if constexpr (COMBINE_ZERO) {
+            collect_q8_1_sums(tile_y, zero_sums, true);
+        }
+        vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO>(tile_x, tile_y, sum, 0);
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -455,7 +509,16 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
                 tile_y[l] = by1[l];
             }
             __syncthreads();
-            vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            if constexpr (COMBINE_ZERO) {
+                collect_q8_1_sums(tile_y, zero_sums, false);
+            }
+            vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            __syncthreads();
+        }
+        if constexpr (COMBINE_ZERO) {
+            add_group_zero_correction(tile_x, zero_sums, sum);
+            // All waves must finish consuming this group's LDS before the
+            // next iteration overwrites tile_x and zero_sums.
             __syncthreads();
         }
     }
@@ -495,7 +558,7 @@ void gemm_hfq4g256_residual_mmq_full_add(
     int N,
     int
 ) {
-    gemm_hfq4g256_residual_mmq_full_body<true>(A, Xq, Y, M, K, N);
+    gemm_hfq4g256_residual_mmq_full_body<true, true>(A, Xq, Y, M, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
@@ -508,7 +571,7 @@ void gemm_hfq4g256_residual_mmq_full_set(
     int N,
     int
 ) {
-    gemm_hfq4g256_residual_mmq_full_body<false>(A, Xq, Y, M, K, N);
+    gemm_hfq4g256_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N);
 }
 
 #endif

@@ -15384,6 +15384,7 @@ impl Gpu {
         // gfx12 (RDNA4) uses a separate single-wave 16-row-tile MMQ port; the
         // RDNA3 LDS-tile source #if-excludes gfx12 (empty stub -> garbage).
         let is_gfx12 = self.arch_caps.is_rdna4();
+        let combine_zero = !is_gfx12 && m % 128 == 0 && batch_size % 128 == 0;
         let kernel_name = if is_gfx12 {
             // gfx12 port: full_add when the tile is exactly filled (M and N
             // multiples of 16), else the bounds-clamped residual kernel.
@@ -15392,7 +15393,7 @@ impl Gpu {
             } else {
                 "gemm_hfq4g256_residual_mmq"
             }
-        } else if m % 128 == 0 && batch_size % 128 == 0 {
+        } else if combine_zero {
             "gemm_hfq4g256_residual_mmq_full_add"
         } else {
             "gemm_hfq4g256_residual_mmq"
@@ -15447,8 +15448,11 @@ impl Gpu {
             const MMQ_TILE_X_K: usize = 76;
             let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
             let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-            let shared_mem =
+            let mut shared_mem =
                 ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            if combine_zero {
+                shared_mem += (MMQ_X * std::mem::size_of::<f32>()) as u32;
+            }
             (
                 [row_tiles as u32, batch_tiles as u32, 1],
                 [32u32, 8, 1],
@@ -16115,6 +16119,7 @@ impl Gpu {
         self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let is_gfx12 = self.arch_caps.is_rdna4();
+        let combine_zero = !is_gfx12 && m % 128 == 0 && batch_size % 128 == 0;
         let kernel_name = if is_gfx12 {
             if m % 16 == 0 && batch_size % 16 == 0 {
                 "gemm_hfq4g256_residual_mmq_full_set"
@@ -16172,8 +16177,11 @@ impl Gpu {
             const MMQ_TILE_X_K: usize = 76;
             let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
             let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-            let shared_mem =
+            let mut shared_mem =
                 ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            if combine_zero {
+                shared_mem += (MMQ_X * std::mem::size_of::<f32>()) as u32;
+            }
             (
                 [row_tiles as u32, batch_tiles as u32, 1],
                 [32u32, 8, 1],
@@ -16222,6 +16230,7 @@ impl Gpu {
             ));
         }
         let is_gfx12 = self.arch_caps.is_rdna4();
+        let combine_zero = !is_gfx12 && m % 128 == 0 && batch_size % 128 == 0;
         let kernel_name = if is_gfx12 {
             if m % 16 == 0 && batch_size % 16 == 0 {
                 "gemm_hfq4g256_residual_mmq_full_set"
@@ -16287,6 +16296,12 @@ impl Gpu {
             )
         };
 
+        let shared_mem = shared_mem
+            + if combine_zero {
+                (128 * std::mem::size_of::<f32>()) as u32
+            } else {
+                0
+            };
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
         let result =
