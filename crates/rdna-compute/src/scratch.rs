@@ -628,18 +628,11 @@ impl ScratchState {
             quantize_kernel,
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
-        if self.q8_1_mmq_x_scratch_bytes < needed {
-            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
-            self.q8_1_mmq_x_scratch_bytes = needed;
-        }
+        let out_ptr = self.ensure_q8_1_mmq_x_scratch(hip, batch_size, k)?;
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
         if must_convert {
-            let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
             let mut xp = src_ptr;
             let mut yp = out_ptr;
             let mut k_val = k as i32;
@@ -675,6 +668,24 @@ impl ScratchState {
             )?;
         }
 
+        Ok(out_ptr)
+    }
+
+    /// Ensure capacity for a k-major block_q8_1_mmq activation matrix without
+    /// launching the standalone quantizer. Fused producers use this to write
+    /// the MMQ input directly.
+    pub fn ensure_q8_1_mmq_x_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let blocks_k = (k + 127) / 128;
+        let needed = blocks_k * batch_size * 144usize;
+        if self.q8_1_mmq_x_scratch_bytes < needed {
+            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
+            self.q8_1_mmq_x_scratch_bytes = needed;
+        }
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 

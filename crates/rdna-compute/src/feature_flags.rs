@@ -68,6 +68,9 @@ pub struct FeatureFlags {
     /// retaining four independent sums. Only the matching gfx11 X256/Y64
     /// kernels exploit the reduced scale work; default dispatch is unchanged.
     pub rdna3_q8_group128: bool,
+    /// Fuse dense FFN SwiGLU, FWHT rotation, and group128 Q8 packing directly
+    /// into MMQ scratch. Requires rdna3_q8_group128 and remains opt-in.
+    pub rdna3_fused_swiglu_q8_group128: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -402,6 +405,9 @@ impl FeatureFlags {
                 .as_deref()
                 == Ok("1"),
             rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
+            rdna3_fused_swiglu_q8_group128: value("HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128")
+                .as_deref()
+                == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -668,6 +674,7 @@ impl FeatureFlags {
             rdna3_hfq4_perm_nibble: false,
             rdna3_hfq4_meta_single_loader: false,
             rdna3_q8_group128: false,
+            rdna3_fused_swiglu_q8_group128: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,

@@ -12834,6 +12834,43 @@ fn run_residual_gemm_key(
         .map_err(HipError::from)
 }
 
+/// Produce the gfx11 group128 MMQ input directly from gate/up and execute the
+/// dense HFQ4 down projection. Returns false without side effects for every
+/// unsupported dtype, shape, architecture, or AWQ-scaled weight.
+#[inline]
+fn try_run_hfq4_group128_swiglu_down(
+    gpu: &mut Gpu,
+    w_down: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    residual: &GpuTensor,
+    n: usize,
+) -> HipResult<bool> {
+    if !gpu.flags.rdna3_q8_group128
+        || !gpu.flags.rdna3_fused_swiglu_q8_group128
+        || !gpu.flags.rdna3_hfq4_residual_x256y64
+        || !gpu.flags.rdna3_hfq4_perm_nibble
+        || !gpu.arch_caps.is_rdna3_dgpu()
+        || w_down.gpu_dtype != DType::MQ4G256
+        || w_down.awq_scale.is_some()
+        || w_down.m != 5_120
+        || w_down.k != 17_408
+        || n % 256 != 0
+    {
+        return Ok(false);
+    }
+    let xq = gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?;
+    gpu.gemm_hfq4g256_mmq_add_prequant_x256y64_perm_group128(
+        &w_down.buf,
+        xq,
+        residual,
+        w_down.m,
+        w_down.k,
+        n,
+    )?;
+    Ok(true)
+}
+
 /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
 /// through [`FusedQkvFamily`] against an explicit `FusedGateUp*` [`KernelKey`].
 ///
@@ -15125,7 +15162,15 @@ fn forward_batch_chunk_impl(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-                if w_down_is_mq {
+                let direct_group128_down = try_run_hfq4_group128_swiglu_down(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.x_batch,
+                    n,
+                )?;
+                if !direct_group128_down && w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
                         gpu,
@@ -15136,12 +15181,15 @@ fn forward_batch_chunk_impl(
                         hidden_dim,
                         n,
                     )?;
-                } else {
+                } else if !direct_group128_down {
                     gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
                 }
 
                 // Batched w_down + residual.
-                if w_down_is_6bit {
+                if direct_group128_down {
+                    // The fused producer and prequantized residual GEMM above
+                    // completed the entire down-projection stage.
+                } else if w_down_is_6bit {
                     run_residual_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
@@ -15956,7 +16004,15 @@ fn forward_batch_chunk_impl(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-                if fa_w_down_is_mq {
+                let direct_group128_down = try_run_hfq4_group128_swiglu_down(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.x_batch,
+                    n,
+                )?;
+                if !direct_group128_down && fa_w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
                         gpu,
@@ -15967,10 +16023,13 @@ fn forward_batch_chunk_impl(
                         hidden_dim,
                         n,
                     )?;
-                } else {
+                } else if !direct_group128_down {
                     gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
                 }
-                if fa_w_down_is_6bit {
+                if direct_group128_down {
+                    // The fused producer and prequantized residual GEMM above
+                    // completed the entire down-projection stage.
+                } else if fa_w_down_is_6bit {
                     run_residual_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
