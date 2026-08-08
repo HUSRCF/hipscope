@@ -22,9 +22,25 @@
 #define HIPFIRE_RDNA3 0
 #endif
 
+#ifndef MMQ_X
 #define MMQ_X 128
+#endif
+#ifndef MMQ_Y
 #define MMQ_Y 128
+#endif
+#ifndef MMQ_NWARPS
 #define MMQ_NWARPS 8
+#endif
+#ifndef MMQ_ROW_FRAGS
+#define MMQ_ROW_FRAGS 2
+#endif
+#ifndef MMQ_COL_GROUPS
+#define MMQ_COL_GROUPS 2
+#endif
+#ifndef MMQ_PERM_NIBBLE
+#define MMQ_PERM_NIBBLE 0
+#endif
+#define HFQ4_GROUP_BYTES 136
 #define WARP_SIZE 32
 #define QK8_1 32
 #define QI8_1 8
@@ -252,9 +268,15 @@ static __device__ __forceinline__ void load_hfq4_tile(
     for (int i0 = 0; i0 < MMQ_Y; i0 += rows_per_warp * MMQ_NWARPS) {
         const int i = i0 + threadIdx.y;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
-        const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+        const char* gp = A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
         const unsigned int qs0 = *(const unsigned int*)(gp + 8 + txi * 4);
 
+        #if MMQ_PERM_NIBBLE
+        const unsigned int lo = qs0 & 0x0F0F0F0Fu;
+        const unsigned int hi = (qs0 >> 4) & 0x0F0F0F0Fu;
+        const int int_a = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
+        const int int_b = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        #else
         const unsigned int q0 = (qs0 >>  0) & 0xFu;
         const unsigned int q1 = (qs0 >>  4) & 0xFu;
         const unsigned int q2 = (qs0 >>  8) & 0xFu;
@@ -263,8 +285,11 @@ static __device__ __forceinline__ void load_hfq4_tile(
         const unsigned int q5 = (qs0 >> 20) & 0xFu;
         const unsigned int q6 = (qs0 >> 24) & 0xFu;
         const unsigned int q7 = (qs0 >> 28) & 0xFu;
-        x_qs[i * MMQ_TILE_X_K + 2 * txi + 0] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
-        x_qs[i * MMQ_TILE_X_K + 2 * txi + 1] = q4 | (q5 << 8) | (q6 << 16) | (q7 << 24);
+        const int int_a = (int)(q0 | (q1 << 8) | (q2 << 16) | (q3 << 24));
+        const int int_b = (int)(q4 | (q5 << 8) | (q6 << 16) | (q7 << 24));
+        #endif
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 0] = int_a;
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 1] = int_b;
     }
 
     constexpr int rows_per_warp_meta = 16;
@@ -272,7 +297,7 @@ static __device__ __forceinline__ void load_hfq4_tile(
         const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
         if (i < MMQ_Y) {
             const int row = FULL ? row0 + i : min(row0 + i, M - 1);
-            const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+            const char* gp = A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
             const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
             const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
             const int ksc = threadIdx.x & 1;
@@ -296,35 +321,36 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     using tile_B = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
 
-    constexpr int rows_per_warp = 32;
-    constexpr int ntx = rows_per_warp / tile_C::I;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    static_assert(MMQ_Y == (MMQ_NWARPS / col_groups) * row_frags * tile_C::I, "bad row topology");
 
-    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+    y += (threadIdx.y % col_groups) * (tile_C::J * MMQ_TILE_Y_K);
 
     const int* x_qs = x;
     const half2* x_dm = (const half2*)(x_qs + 2 * MMQ_TILE_NE_K);
     const int* y_qs = y + 4;
     const half2* y_dm = (const half2*)y;
 
-    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
 
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
         const int k0 = k00 + k01;
-        tile_A A_frag[ntx];
+        tile_A A_frag[row_frags];
         #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
+        for (int n = 0; n < row_frags; ++n) {
             load_ldmatrix_16x8(A_frag[n], x_qs + (i0 + n * tile_A::I) * MMQ_TILE_X_K + k0, MMQ_TILE_X_K);
         }
 
         #pragma unroll
-        for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
+        for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
             tile_B B_frag;
             load_ldmatrix_16x8(B_frag, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
             const int j = j0 + tile_C::get_j(0);
             const float2 dsB = __half22float2(y_dm[j * MMQ_TILE_Y_K + k01 / QI8_1]);
 
             #pragma unroll
-            for (int n = 0; n < ntx; ++n) {
+            for (int n = 0; n < row_frags; ++n) {
                 tile_C C_frag;
                 mma_i8(C_frag, A_frag[n], B_frag);
 
@@ -332,9 +358,10 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n * tile_A::I + tile_C::get_i(l);
                     const float2 dmA = __half22float2(x_dm[i * MMQ_TILE_X_K + k0 / QI8_1]);
-                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] += dmA.x * dsB.x * (float)C_frag.x[l];
+                    const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                    sum[acc * tile_C::ne + l] += dmA.x * dsB.x * (float)C_frag.x[l];
                     if constexpr (APPLY_ZERO) {
-                        sum[(j0 / tile_C::J + n) * tile_C::ne + l] += dmA.y * dsB.y;
+                        sum[acc * tile_C::ne + l] += dmA.y * dsB.y;
                     }
                 }
             }
@@ -365,22 +392,23 @@ static __device__ __forceinline__ void add_group_zero_correction(
     float* __restrict__ sum
 ) {
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
-    constexpr int rows_per_warp = 32;
-    constexpr int ntx = rows_per_warp / tile_C::I;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
     const half2* x_dm = (const half2*)(tile_x + 2 * MMQ_TILE_NE_K);
-    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
 
     #pragma unroll
-    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
-        const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(0);
+    for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
+        const int j = j0 + (threadIdx.y % col_groups) * tile_C::J + tile_C::get_j(0);
         const float activation_sum = zero_sums[j];
         #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
+        for (int n = 0; n < row_frags; ++n) {
             #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
                 const float zero = __half22float2(x_dm[i * MMQ_TILE_X_K]).y;
-                sum[(j0 / tile_C::J + n) * tile_C::ne + l] += zero * activation_sum;
+                const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                sum[acc * tile_C::ne + l] += zero * activation_sum;
             }
         }
     }
@@ -436,21 +464,22 @@ void gemm_hfq4g256_residual_mmq(
     }
 
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
-    constexpr int rows_per_warp = 32;
-    constexpr int ntx = rows_per_warp / tile_C::I;
-    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
 
     #pragma unroll
-    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
+    for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
         #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
+        for (int n = 0; n < row_frags; ++n) {
             #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = j0 + (threadIdx.y % col_groups) * tile_C::J + tile_C::get_j(l);
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
                 if (row0 + i < M && col0 + j < N) {
                     float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
-                    const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
+                    const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                    const float v = sum[acc * tile_C::ne + l];
                     if (add) {
                         *yp += v;
                     } else {
@@ -524,20 +553,21 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
     }
 
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
-    constexpr int rows_per_warp = 32;
-    constexpr int ntx = rows_per_warp / tile_C::I;
-    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
 
     #pragma unroll
-    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
+    for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
         #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
+        for (int n = 0; n < row_frags; ++n) {
             #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = j0 + (threadIdx.y % col_groups) * tile_C::J + tile_C::get_j(l);
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
                 float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
-                const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
+                const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                const float v = sum[acc * tile_C::ne + l];
                 if constexpr (ADD) {
                     *yp += v;
                 } else {
