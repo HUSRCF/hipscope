@@ -40,6 +40,12 @@
 #ifndef MMQ_PERM_NIBBLE
 #define MMQ_PERM_NIBBLE 0
 #endif
+#ifndef MMQ_META_SINGLE_LOADER
+#define MMQ_META_SINGLE_LOADER 0
+#endif
+#ifndef MMQ_Q8_GROUP128
+#define MMQ_Q8_GROUP128 0
+#endif
 #define HFQ4_GROUP_BYTES 136
 #define WARP_SIZE 32
 #define QK8_1 32
@@ -105,6 +111,49 @@ extern "C" __global__ void quantize_q8_1_mmq_ds4(
     }
 }
 
+// Diagnostic activation format retaining the block_q8_1_mmq wire layout but
+// sharing one scale across each 128-value block. The four ds4 entries retain
+// independent 32-value sums for the affine zero-point correction.
+extern "C" __global__ void quantize_q8_1_mmq_ds4_group128(
+    const float* __restrict__ X,
+    block_q8_1_mmq* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int token = blockIdx.y;
+    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (token >= N || i0 >= K) return;
+
+    const float4 xi = (i0 + 3 < K)
+        ? *(const float4*)(X + (long long)token * K + i0)
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)),
+                       fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, WARP_SIZE));
+    }
+
+    float sum = xi.x + xi.y + xi.z + xi.w;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        sum += __shfl_xor(sum, offset, WARP_SIZE);
+    }
+    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    char4 q;
+    q.x = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.x * id)));
+    q.y = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.y * id)));
+    q.z = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.z * id)));
+    q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.w * id)));
+
+    const int kblock = i0 / 128;
+    const int iqs = i0 & 127;
+    block_q8_1_mmq* out = Y + (long long)kblock * N + token;
+    ((char4*)out->qs)[iqs / 4] = q;
+    if ((iqs & 31) == 0) {
+        out->ds4[iqs / 32] = make_half2((_Float16)d, (_Float16)sum);
+    }
+}
+
 #if !HIPFIRE_RDNA3
 
 // MMQ compute kernels — RDNA3 only (use WMMA i8 builtin). gfx906 dp4a
@@ -138,6 +187,15 @@ extern "C" __global__ void gemm_hfq4g256_residual_mmq_full_set(
     int,
     int
 ) {}
+
+extern "C" __global__ void gemm_hfq4g256_residual_mmq_full_add_regzero(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int) {}
+
+extern "C" __global__ void gemm_hfq4g256_residual_mmq_full_set_regzero(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int) {}
+
+extern "C" __global__ void gemm_hfq4g256_residual_mmq_gate_up_full_set(
+    const char*, const char*, const block_q8_1_mmq*, float*, float*, int, int, int) {}
 
 #else
 
@@ -296,6 +354,19 @@ static __device__ __forceinline__ void load_hfq4_tile(
     for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * rows_per_warp_meta) {
         const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
         if (i < MMQ_Y) {
+#if MMQ_META_SINGLE_LOADER
+            if ((threadIdx.x & 1) != 0) continue;
+            const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+            const char* gp = A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
+            const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
+            const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+            const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
+            const unsigned int dm_bits = __builtin_bit_cast(unsigned int, dm);
+            const uint4 repeated = make_uint4(dm_bits, dm_bits, dm_bits, dm_bits);
+            uint4* dst = reinterpret_cast<uint4*>(x_dm + i * MMQ_TILE_X_K);
+            dst[0] = repeated;
+            dst[1] = repeated;
+#else
             const int row = FULL ? row0 + i : min(row0 + i, M - 1);
             const char* gp = A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
             const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
@@ -306,16 +377,18 @@ static __device__ __forceinline__ void load_hfq4_tile(
             for (int l = 0; l < 4; ++l) {
                 x_dm[i * MMQ_TILE_X_K + 4 * ksc + l] = dm;
             }
+#endif
         }
     }
 }
 
-template <bool APPLY_ZERO>
+template <bool APPLY_ZERO, bool COLLECT_SUMS = false>
 static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     const int* __restrict__ x,
     const int* __restrict__ y,
     float* __restrict__ sum,
-    int k00
+    int k00,
+    float* __restrict__ activation_sums = nullptr
 ) {
     using tile_A = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
     using tile_B = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
@@ -348,6 +421,10 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
             load_ldmatrix_16x8(B_frag, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
             const int j = j0 + tile_C::get_j(0);
             const float2 dsB = __half22float2(y_dm[j * MMQ_TILE_Y_K + k01 / QI8_1]);
+            if constexpr (COLLECT_SUMS) {
+                const int zero_acc = j0 / (col_groups * tile_C::J);
+                activation_sums[zero_acc] += dsB.y;
+            }
 
             #pragma unroll
             for (int n = 0; n < row_frags; ++n) {
@@ -364,6 +441,110 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                         sum[acc * tile_C::ne + l] += dmA.y * dsB.y;
                     }
                 }
+            }
+        }
+    }
+}
+
+// Q8-group128 sibling: four 32-K i8 WMMA fragments share one activation
+// scale, so accumulate them in int32 and apply the FP32 scale once.
+static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
+    const int* __restrict__ x,
+    const int* __restrict__ y,
+    float* __restrict__ sum,
+    int k00
+) {
+    using tile_A = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using tile_B = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    y += (threadIdx.y % col_groups) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int* x_qs = x;
+    const half2* x_dm = (const half2*)(x_qs + 2 * MMQ_TILE_NE_K);
+    const int* y_qs = y + 4;
+    const half2* y_dm = (const half2*)y;
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
+        tile_C c_acc[row_frags];
+        #pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            const int k0 = k00 + k01;
+            tile_B b_frag;
+            load_ldmatrix_16x8(
+                b_frag, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+            #pragma unroll
+            for (int n = 0; n < row_frags; ++n) {
+                tile_A a_frag;
+                load_ldmatrix_16x8(
+                    a_frag,
+                    x_qs + (i0 + n * tile_A::I) * MMQ_TILE_X_K + k0,
+                    MMQ_TILE_X_K);
+                mma_i8(c_acc[n], a_frag, b_frag);
+            }
+        }
+
+        const int j = j0 + tile_C::get_j(0);
+        const float d_x = __half22float2(y_dm[j * MMQ_TILE_Y_K]).x;
+        #pragma unroll
+        for (int n = 0; n < row_frags; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n * tile_A::I + tile_C::get_i(l);
+                const float scale_w =
+                    __half22float2(x_dm[i * MMQ_TILE_X_K + k00 / QI8_1]).x;
+                const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                sum[acc * tile_C::ne + l] +=
+                    scale_w * d_x * (float)c_acc[n].x[l];
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ void load_group_row_zeros(
+    const int* __restrict__ tile_x,
+    float* __restrict__ row_zeros
+) {
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    const half2* x_dm = (const half2*)(tile_x + 2 * MMQ_TILE_NE_K);
+    const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
+
+    #pragma unroll
+    for (int n = 0; n < row_frags; ++n) {
+        #pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+            row_zeros[n * tile_C::ne + l] =
+                __half22float2(x_dm[i * MMQ_TILE_X_K]).y;
+        }
+    }
+}
+
+static __device__ __forceinline__ void add_group_zero_correction_regs(
+    const float* __restrict__ row_zeros,
+    const float* __restrict__ activation_sums,
+    float* __restrict__ sum
+) {
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
+        const int zero_acc = j0 / (col_groups * tile_C::J);
+        const float activation_sum = activation_sums[zero_acc];
+        #pragma unroll
+        for (int n = 0; n < row_frags; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int acc = zero_acc * row_frags + n;
+                sum[acc * tile_C::ne + l] +=
+                    row_zeros[n * tile_C::ne + l] * activation_sum;
             }
         }
     }
@@ -494,7 +675,7 @@ void gemm_hfq4g256_residual_mmq(
 // COMBINE_ZERO folds the eight Q8_1 activation sums covered by one HFQ4-G256
 // group into one zero-point correction. The scale-dependent WMMA terms remain
 // unchanged; only repeated affine zero-point work is removed.
-template <bool ADD, bool COMBINE_ZERO = false>
+template <bool ADD, bool COMBINE_ZERO = false, bool REG_ZERO = false>
 static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
@@ -515,8 +696,18 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
     float* zero_sums = (float*)(tile_x + MMQ_Y * MMQ_TILE_X_K);
 
     float sum[MMQ_X * MMQ_Y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int row_frags = MMQ_ROW_FRAGS;
+    constexpr int col_groups = MMQ_COL_GROUPS;
+    constexpr int zero_groups = MMQ_X / (col_groups * tile_C::J);
+    float activation_sums[zero_groups] = {};
+    float row_zeros[row_frags * tile_C::ne] = {};
 
     for (int kb = 0; kb < groups_per_row; ++kb) {
+        if constexpr (REG_ZERO) {
+            #pragma unroll
+            for (int z = 0; z < zero_groups; ++z) activation_sums[z] = 0.0f;
+        }
         load_hfq4_tile<true>(A, tile_x, row0, kb, M, groups_per_row);
 
         const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
@@ -525,10 +716,17 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
             tile_y[l] = by0[l];
         }
         __syncthreads();
-        if constexpr (COMBINE_ZERO) {
+        if constexpr (REG_ZERO) {
+            load_group_row_zeros(tile_x, row_zeros);
+        } else if constexpr (COMBINE_ZERO) {
             collect_q8_1_sums(tile_y, zero_sums, true);
         }
-        vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO>(tile_x, tile_y, sum, 0);
+        if constexpr (MMQ_Q8_GROUP128) {
+            vec_dot_q8_1_group128_mma(tile_x, tile_y, sum, 0);
+        } else {
+            vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
+                tile_x, tile_y, sum, 0, activation_sums);
+        }
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -538,13 +736,21 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
                 tile_y[l] = by1[l];
             }
             __syncthreads();
-            if constexpr (COMBINE_ZERO) {
+            if constexpr (COMBINE_ZERO && !REG_ZERO) {
                 collect_q8_1_sums(tile_y, zero_sums, false);
             }
-            vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            if constexpr (MMQ_Q8_GROUP128) {
+                vec_dot_q8_1_group128_mma(
+                    tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            } else {
+                vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
+                    tile_x, tile_y, sum, MMQ_TILE_NE_K, activation_sums);
+            }
             __syncthreads();
         }
-        if constexpr (COMBINE_ZERO) {
+        if constexpr (REG_ZERO) {
+            add_group_zero_correction_regs(row_zeros, activation_sums, sum);
+        } else if constexpr (COMBINE_ZERO) {
             add_group_zero_correction(tile_x, zero_sums, sum);
             // All waves must finish consuming this group's LDS before the
             // next iteration overwrites tile_x and zero_sums.
@@ -552,9 +758,6 @@ static __device__ __forceinline__ void gemm_hfq4g256_residual_mmq_full_body(
         }
     }
 
-    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
-    constexpr int row_frags = MMQ_ROW_FRAGS;
-    constexpr int col_groups = MMQ_COL_GROUPS;
     const int i0 = (threadIdx.y / col_groups) * row_frags * tile_C::I;
 
     #pragma unroll
@@ -601,6 +804,52 @@ void gemm_hfq4g256_residual_mmq_full_set(
     int N,
     int
 ) {
+    gemm_hfq4g256_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_hfq4g256_residual_mmq_full_add_regzero(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int
+) {
+    gemm_hfq4g256_residual_mmq_full_body<true, true, true>(A, Xq, Y, M, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_hfq4g256_residual_mmq_full_set_regzero(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int
+) {
+    gemm_hfq4g256_residual_mmq_full_body<false, true, true>(A, Xq, Y, M, K, N);
+}
+
+// Dispatch gate and up as two planes of one grid while retaining the exact
+// single-output kernel body. This removes one host/kernel boundary without
+// extending accumulator live ranges or changing arithmetic order.
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_hfq4g256_residual_mmq_gate_up_full_set(
+    const char* __restrict__ A_gate,
+    const char* __restrict__ A_up,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y_gate,
+    float* __restrict__ Y_up,
+    int M,
+    int K,
+    int N
+) {
+    const bool is_up = blockIdx.z != 0;
+    const char* A = is_up ? A_up : A_gate;
+    float* Y = is_up ? Y_up : Y_gate;
     gemm_hfq4g256_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N);
 }
 

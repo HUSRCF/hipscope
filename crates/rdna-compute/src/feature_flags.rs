@@ -57,6 +57,13 @@ pub struct FeatureFlags {
     /// Use gfx11 `v_perm_b32` nibble widening inside certified X256/Y64
     /// shapes. Independent so production A/B can isolate decode changes.
     pub rdna3_hfq4_perm_nibble: bool,
+    /// Let one lane load each repeated HFQ4 scale/zero pair for the gfx11
+    /// X256/Y64 permutation path. Opt-in pending full-model prefill A/B.
+    pub rdna3_hfq4_meta_single_loader: bool,
+    /// Quantize each 128-value activation group with one shared scale while
+    /// retaining four independent sums. Only the matching gfx11 X256/Y64
+    /// kernels exploit the reduced scale work; default dispatch is unchanged.
+    pub rdna3_q8_group128: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -386,6 +393,10 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_aux_x256y64: value("HIPFIRE_RDNA3_HFQ4_AUX_X256Y64").as_deref() == Ok("1"),
             rdna3_hfq4_perm_nibble: value("HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE").as_deref() == Ok("1"),
+            rdna3_hfq4_meta_single_loader: value("HIPFIRE_RDNA3_HFQ4_META_SINGLE_LOADER")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -649,6 +660,8 @@ impl FeatureFlags {
             rdna3_hfq4_residual_x256y64: false,
             rdna3_hfq4_aux_x256y64: false,
             rdna3_hfq4_perm_nibble: false,
+            rdna3_hfq4_meta_single_loader: false,
+            rdna3_q8_group128: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,

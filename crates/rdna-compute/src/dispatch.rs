@@ -1561,6 +1561,7 @@ impl Gpu {
             x,
             batch_size,
             k,
+            self.flags.rdna3_q8_group128 && self.arch_caps.is_rdna3_dgpu(),
         )
     }
 

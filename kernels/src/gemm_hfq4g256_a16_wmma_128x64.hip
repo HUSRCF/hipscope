@@ -9,7 +9,22 @@
 // all eight waves reuse it for independent 16-row activation slices.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float __attribute__((ext_vector_type(16))) float16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
+
+template <bool ACTIVATION_F32>
+static __device__ __forceinline__ half16_t load_activation_16(
+    const void* __restrict__ activations, long long offset) {
+    if constexpr (ACTIVATION_F32) {
+        const float16_t values =
+            *reinterpret_cast<const float16_t*>(
+                static_cast<const float*>(activations) + offset);
+        return __builtin_convertvector(values, half16_t);
+    } else {
+        return *reinterpret_cast<const half16_t*>(
+            static_cast<const _Float16*>(activations) + offset);
+    }
+}
 
 static __device__ __forceinline__ half16_t load_hfq4_16(
     const char* __restrict__ group, int packed_offset, _Float16 scale,
@@ -152,11 +167,11 @@ gemm_hfq4g256_a16_wmma_128x64_set(const char* __restrict__ weights,
 // K32 sibling: all eight waves decode one half of a 32K x 64N tile. The
 // padded K stride avoids the power-of-two LDS row stride used by the K16
 // probe and halves the number of block barriers.
-template <bool ADD_RESIDUAL>
+template <bool ADD_RESIDUAL, bool ACTIVATION_F32 = false>
 static __device__ __forceinline__ void
 gemm_hfq4g256_a16_wmma_128x64_k32_impl(
     const char* __restrict__ weights,
-    const _Float16* __restrict__ activations, float* __restrict__ output,
+    const void* __restrict__ activations, float* __restrict__ output,
     int output_dim, int k_dim, int tokens) {
     const int output_tile = blockIdx.x * 64;
     const int token_tile = blockIdx.y * 128;
@@ -207,9 +222,8 @@ gemm_hfq4g256_a16_wmma_128x64_k32_impl(
     __syncthreads();
 
     const int token_row = token_tile + wave * 16 + lane_lo;
-    const _Float16* activation_row = token_row < tokens
-        ? activations + (long long)token_row * k_dim
-        : nullptr;
+    const long long activation_offset = (long long)token_row * k_dim;
+    const bool valid_token = token_row < tokens;
     int current = 0;
     for (int k_tile = 0; k_tile < k_dim; k_tile += 32) {
         const int next = current ^ 1;
@@ -217,10 +231,11 @@ gemm_hfq4g256_a16_wmma_128x64_k32_impl(
 
         half16_t a_lo;
         half16_t a_hi;
-        if (activation_row) {
-            a_lo = *reinterpret_cast<const half16_t*>(activation_row + k_tile);
-            a_hi =
-                *reinterpret_cast<const half16_t*>(activation_row + k_tile + 16);
+        if (valid_token) {
+            a_lo = load_activation_16<ACTIVATION_F32>(
+                activations, activation_offset + k_tile);
+            a_hi = load_activation_16<ACTIVATION_F32>(
+                activations, activation_offset + k_tile + 16);
         } else {
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -299,6 +314,24 @@ gemm_hfq4g256_a16_wmma_128x64_k32_add(
     gemm_hfq4g256_a16_wmma_128x64_k32_impl<true>(
         weights, activations, output, output_dim, k_dim, tokens);
 }
+
+__launch_bounds__(256, 1) extern "C" __global__ void
+gemm_hfq4g256_f32a_wmma_128x64_k32_set(
+    const char* __restrict__ weights,
+    const float* __restrict__ activations, float* __restrict__ output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_a16_wmma_128x64_k32_impl<false, true>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
+
+__launch_bounds__(256, 1) extern "C" __global__ void
+gemm_hfq4g256_f32a_wmma_128x64_k32_add(
+    const char* __restrict__ weights,
+    const float* __restrict__ activations, float* __restrict__ output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_a16_wmma_128x64_k32_impl<true, true>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
 #else
 extern "C" __global__ void gemm_hfq4g256_a16_wmma_128x64_set(
     const char*, const _Float16*, float*, int, int, int) {}
@@ -306,4 +339,8 @@ extern "C" __global__ void gemm_hfq4g256_a16_wmma_128x64_k32_set(
     const char*, const _Float16*, float*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_a16_wmma_128x64_k32_add(
     const char*, const _Float16*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_f32a_wmma_128x64_k32_set(
+    const char*, const float*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_f32a_wmma_128x64_k32_add(
+    const char*, const float*, float*, int, int, int) {}
 #endif
