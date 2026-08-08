@@ -3696,6 +3696,44 @@ impl Gpu {
                     true
                 };
                 if use_mmq {
+                    if self.flags.rdna3_hfq4_set_a16_k32
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && qkv_m % 64 == 0
+                        && z_m % 64 == 0
+                        && k == 5_120
+                        && batch_size % 128 == 0
+                    {
+                        // Keep the existing Q8 tail representation for the
+                        // narrow beta/alpha projections. The two large A16
+                        // projections share one fresh FP16 conversion.
+                        let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                        let x_f16_ptr = self.convert_fp16_x_uncached(x, batch_size * k)?;
+                        let r1 = self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                            a_qkv, x_f16_ptr, y_qkv, qkv_m, k, batch_size,
+                        );
+                        let r2 = if r1.is_ok() {
+                            self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                                a_z, x_f16_ptr, y_z, z_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        let r3 = if r2.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_prequant(
+                                a_beta, xq, y_beta, beta_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        let r4 = if r3.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_prequant(
+                                a_alpha, xq, y_alpha, alpha_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        return r1.and(r2).and(r3).and(r4);
+                    }
                     let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                     // RDNA3 dGPU opt-in: qkv/z are large aligned projections
                     // where the MMQ set path is profitable, while beta/alpha
@@ -4620,6 +4658,34 @@ impl Gpu {
                     true
                 };
                 if use_mmq {
+                    if self.flags.rdna3_hfq4_set_a16_k32
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && q_m % 64 == 0
+                        && k_m % 64 == 0
+                        && v_m % 64 == 0
+                        && k == 5_120
+                        && batch_size % 128 == 0
+                    {
+                        let x_f16_ptr = self.convert_fp16_x_uncached(x, batch_size * k)?;
+                        let r1 = self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                            a_q, x_f16_ptr, y_q, q_m, k, batch_size,
+                        );
+                        let r2 = if r1.is_ok() {
+                            self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                                a_k, x_f16_ptr, y_k, k_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        let r3 = if r2.is_ok() {
+                            self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                                a_v, x_f16_ptr, y_v, v_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        return r1.and(r2).and(r3);
+                    }
                     let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                     let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
                     let r2 = if r1.is_ok() {
@@ -5494,6 +5560,29 @@ impl Gpu {
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
             }
+            if (self.flags.rdna3_hfq4_gate_up_a16_k32 || self.flags.rdna3_hfq4_set_a16_k32)
+                && self.arch_caps.is_rdna3_dgpu()
+                && gate_m == 17_408
+                && up_m == 17_408
+                && k == 5_120
+                && batch_size % 128 == 0
+            {
+                // Prefill reuses activation buffer addresses across layers, so
+                // pointer-keyed conversion caching can observe stale contents.
+                // Convert once for this gate/up pair and share that exact tile.
+                let x_f16_ptr = self.convert_fp16_x_uncached(x, batch_size * k)?;
+                let r1 = self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                    a_gate, x_f16_ptr, y_gate, gate_m, k, batch_size,
+                );
+                let r2 = if r1.is_ok() {
+                    self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+                        a_up, x_f16_ptr, y_up, up_m, k, batch_size,
+                    )
+                } else {
+                    Ok(())
+                };
+                return r1.and(r2);
+            }
             if self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_gate, gate_m, k)
@@ -5503,6 +5592,37 @@ impl Gpu {
                 };
                 if use_mmq {
                     let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    if self.flags.rdna3_hfq4_gate_up_x256y64
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && gate_m == 17_408
+                        && up_m == 17_408
+                        && k == 5_120
+                        && batch_size % 256 == 0
+                    {
+                        let r1 = if self.flags.rdna3_hfq4_perm_nibble {
+                            self.gemm_hfq4g256_mmq_set_prequant_x256y64_perm(
+                                a_gate, xq, y_gate, gate_m, k, batch_size,
+                            )
+                        } else {
+                            self.gemm_hfq4g256_mmq_set_prequant_x256y64(
+                                a_gate, xq, y_gate, gate_m, k, batch_size,
+                            )
+                        };
+                        let r2 = if r1.is_ok() {
+                            if self.flags.rdna3_hfq4_perm_nibble {
+                                self.gemm_hfq4g256_mmq_set_prequant_x256y64_perm(
+                                    a_up, xq, y_up, up_m, k, batch_size,
+                                )
+                            } else {
+                                self.gemm_hfq4g256_mmq_set_prequant_x256y64(
+                                    a_up, xq, y_up, up_m, k, batch_size,
+                                )
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        return r1.and(r2);
+                    }
                     let r1 = self
                         .gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
                     let r2 = if r1.is_ok() {
@@ -9958,7 +10078,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_gate_up_hfq4g256_wmma_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -13373,6 +13496,19 @@ impl Gpu {
             }
         }
 
+        if self.flags.rdna3_hfq4_residual_a16_k32
+            && self.arch_caps.is_rdna3_dgpu()
+            && batch_size > 1
+            && batch_size % 128 == 0
+            && m == 5_120
+            && matches!(k, 6_144 | 17_408)
+        {
+            let x_f16_ptr = self.convert_fp16_x_uncached(x, batch_size * k)?;
+            return self.gemm_hfq4g256_a16_wmma_128x64_k32_add_preconverted(
+                a_raw, x_f16_ptr, y, m, k, batch_size,
+            );
+        }
+
         // HFQ4 wave32 MMQ residual on RDNA2+. Default-on for the allowlist
         // arch set (issue #300 gate removal — +210% prefill on gfx1031 4B
         // MQ4 pp128, KLD-neutral; escape hatch HIPFIRE_HFQ4_MMQ_RDNA2=0).
@@ -13449,6 +13585,34 @@ impl Gpu {
                     true
                 };
                 if use_mmq {
+                    if self.flags.rdna3_hfq4_residual_x256y64
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && m == 5_120
+                        && k == 17_408
+                        && batch_size == 2_048
+                    {
+                        return if self.flags.rdna3_hfq4_perm_nibble {
+                            self.gemm_hfq4g256_residual_mmq_x256y64_perm(
+                                a_raw, x, y, m, k, batch_size,
+                            )
+                        } else {
+                            self.gemm_hfq4g256_residual_mmq_x256y64(a_raw, x, y, m, k, batch_size)
+                        };
+                    }
+                    if self.flags.rdna3_hfq4_aux_x256y64
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && m == 5_120
+                        && k == 6_144
+                        && batch_size == 2_048
+                    {
+                        return if self.flags.rdna3_hfq4_perm_nibble {
+                            self.gemm_hfq4g256_residual_mmq_x256y64_perm(
+                                a_raw, x, y, m, k, batch_size,
+                            )
+                        } else {
+                            self.gemm_hfq4g256_residual_mmq_x256y64(a_raw, x, y, m, k, batch_size)
+                        };
+                    }
                     return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
                 }
             }
@@ -14179,8 +14343,13 @@ impl Gpu {
 
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_mmq", bytes);
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mmq",
+            [m, k, batch_size],
+            bytes,
+        );
         let result =
             self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -14907,7 +15076,13 @@ impl Gpu {
         };
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_mmq_set",
+            [m, k, batch_size],
+            bytes,
+        );
         let result =
             self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -14945,6 +15120,20 @@ impl Gpu {
                 "gemm_hfq4g256_mmq_set_prequant is not supported on gfx906; \
                  callers should route to gemm_hfq4g256_residual_mmq_gfx906 directly",
             ));
+        }
+        if self.flags.rdna3_hfq4_aux_x256y64
+            && self.arch_caps.is_rdna3_dgpu()
+            && k == 5_120
+            && batch_size == 2_048
+            && matches!(m, 6_144 | 10_240 | 12_288)
+        {
+            return if self.flags.rdna3_hfq4_perm_nibble {
+                self.gemm_hfq4g256_mmq_set_prequant_x256y64_perm(
+                    a_raw, x_q8_ptr, y, m, k, batch_size,
+                )
+            } else {
+                self.gemm_hfq4g256_mmq_set_prequant_x256y64(a_raw, x_q8_ptr, y, m, k, batch_size)
+            };
         }
         let is_gfx12 = self.arch_caps.is_rdna4();
         let combine_zero = !is_gfx12 && m % 128 == 0 && batch_size % 128 == 0;
@@ -15020,9 +15209,375 @@ impl Gpu {
                 0
             };
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_mmq_set",
+            [m, k, batch_size],
+            bytes,
+        );
         let result =
             self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Standalone gfx11 probe for a wider activation tile. This keeps the
+    /// production kernel's eight-wave/64-accumulator budget, but maps each
+    /// wave to 16 output rows by 128 batch columns (`MMQ_X=256`, `MMQ_Y=64`).
+    /// It is intentionally not selected by any production dispatcher.
+    pub fn gemm_hfq4g256_mmq_set_prequant_x256y64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_hfq4g256_mmq_prequant_x256y64_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, false, false,
+        )
+    }
+
+    /// X256/Y64 probe using two `v_perm_b32` operations to widen eight
+    /// packed HFQ4 nibbles into two int8 words.
+    pub fn gemm_hfq4g256_mmq_set_prequant_x256y64_perm(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_hfq4g256_mmq_prequant_x256y64_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, false, true,
+        )
+    }
+
+    /// Standalone gfx11 large-M W4A16 probe. This is not selected by the
+    /// production dispatcher; it validates a 128-token x 64-output topology
+    /// with cooperative HFQ4 decode and cross-wave weight-tile reuse.
+    pub fn gemm_hfq4g256_a16_wmma_128x64_set(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "A16 128x64 probe requires gfx11 dGPU and M%64=K%256=N%128=0",
+            ));
+        }
+        const NAME: &str = "gemm_hfq4g256_a16_wmma_128x64_set";
+        self.ensure_kernel(NAME, kernels::GEMM_HFQ4G256_A16_WMMA_128X64_SRC, NAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            NAME,
+            [(m / 64) as u32, (batch_size / 128) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    pub fn gemm_hfq4g256_a16_wmma_128x64_k32_set(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "A16 128x64 K32 probe requires gfx11 dGPU and M%64=K%256=N%128=0",
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_a16_wmma_128x64_set";
+        const NAME: &str = "gemm_hfq4g256_a16_wmma_128x64_k32_set";
+        self.ensure_kernel(MODULE, kernels::GEMM_HFQ4G256_A16_WMMA_128X64_SRC, NAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        self.gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+            a_raw, x_f16_ptr, y, m, k, batch_size,
+        )
+    }
+
+    pub fn gemm_hfq4g256_a16_wmma_128x64_k32_add(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        self.gemm_hfq4g256_a16_wmma_128x64_k32_add_preconverted(
+            a_raw, x_f16_ptr, y, m, k, batch_size,
+        )
+    }
+
+    fn gemm_hfq4g256_a16_wmma_128x64_k32_set_preconverted(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_hfq4g256_a16_wmma_128x64_k32_preconverted_impl(
+            a_raw, x_f16_ptr, y, m, k, batch_size, false,
+        )
+    }
+
+    fn gemm_hfq4g256_a16_wmma_128x64_k32_add_preconverted(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_hfq4g256_a16_wmma_128x64_k32_preconverted_impl(
+            a_raw, x_f16_ptr, y, m, k, batch_size, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_hfq4g256_a16_wmma_128x64_k32_preconverted_impl(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add_residual: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "A16 128x64 K32 preconverted path requires gfx11 dGPU and M%64=K%256=N%128=0",
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_a16_wmma_128x64_set";
+        let name = if add_residual {
+            "gemm_hfq4g256_a16_wmma_128x64_k32_add"
+        } else {
+            "gemm_hfq4g256_a16_wmma_128x64_k32_set"
+        };
+        self.ensure_kernel(MODULE, kernels::GEMM_HFQ4G256_A16_WMMA_128X64_SRC, name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [(m / 64) as u32, (batch_size / 128) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// Residual-add sibling of the standalone X256/Y64 probe.
+    pub fn gemm_hfq4g256_residual_mmq_x256y64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        self.gemm_hfq4g256_mmq_prequant_x256y64_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, true, false,
+        )
+    }
+
+    /// Residual-add sibling of the `v_perm_b32` nibble-widening probe.
+    pub fn gemm_hfq4g256_residual_mmq_x256y64_perm(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        self.gemm_hfq4g256_mmq_prequant_x256y64_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, true, true,
+        )
+    }
+
+    fn gemm_hfq4g256_mmq_prequant_x256y64_impl(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+        perm_nibble: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "x256y64 MMQ probe requires gfx11 dGPU and M%64=K%256=N%256=0",
+            ));
+        }
+
+        let module = if perm_nibble {
+            "gemm_hfq4g256_residual_mmq_x256y64_perm"
+        } else {
+            "gemm_hfq4g256_residual_mmq_x256y64"
+        };
+        let kernel = match (add, perm_nibble) {
+            (true, false) => "gemm_hfq4g256_residual_mmq_x256y64_full_add",
+            (false, false) => "gemm_hfq4g256_residual_mmq_x256y64_full_set",
+            (true, true) => "gemm_hfq4g256_residual_mmq_x256y64_perm_full_add",
+            (false, true) => "gemm_hfq4g256_residual_mmq_x256y64_perm_full_set",
+        };
+        static X256Y64_SRC: OnceLock<String> = OnceLock::new();
+        static X256Y64_PERM_SRC: OnceLock<String> = OnceLock::new();
+        let src_cache = if perm_nibble {
+            &X256Y64_PERM_SRC
+        } else {
+            &X256Y64_SRC
+        };
+        let src = src_cache.get_or_init(|| {
+            let stem = if perm_nibble {
+                "gemm_hfq4g256_residual_mmq_x256y64_perm"
+            } else {
+                "gemm_hfq4g256_residual_mmq_x256y64"
+            };
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                "gemm_hfq4g256_residual_mmq",
+                stem,
+            );
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 1\n#define MMQ_PERM_NIBBLE {}\n{body}",
+                i32::from(perm_nibble),
+            )
+        });
+        self.ensure_kernel(module, src, kernel)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+
+        const MMQ_X: usize = 256;
+        const MMQ_Y: usize = 64;
+        const MMQ_TILE_Y_K: usize = 36;
+        const MMQ_TILE_X_K: usize = 76;
+        let grid = [(m / MMQ_Y) as u32, (batch_size / MMQ_X) as u32, 1];
+        let shared_mem = ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K)
+            * std::mem::size_of::<i32>()
+            + MMQ_X * std::mem::size_of::<f32>()) as u32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let profile_name = if perm_nibble {
+            "gemm_hfq4g256_mmq_set_x256y64_perm"
+        } else if add {
+            "gemm_hfq4g256_residual_mmq_x256y64"
+        } else {
+            "gemm_hfq4g256_mmq_set_x256y64"
+        };
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "gemm",
+            profile_name,
+            [m, k, batch_size],
+            bytes,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let result =
+            self.launch_maybe_blob(kernel, grid, [32, 8, 1], shared_mem, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(xq_ptr);
@@ -15062,7 +15617,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
             let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;

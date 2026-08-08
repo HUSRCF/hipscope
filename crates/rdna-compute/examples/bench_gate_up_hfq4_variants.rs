@@ -41,8 +41,10 @@ fn main() {
     let peak = 170.6_f64; // gfx1201 fp16 WMMA peak TFLOPS (microbenched)
     eprintln!("arch={arch}  peak(fp16 WMMA)={peak} TFLOPS");
 
-    let gate_m = 16384usize;
-    let up_m = 16384usize;
+    // Complete Qwen3.6-27B FFN projections. 17,408 is 136 aligned 128-row
+    // MMQ tiles; 16,384 would omit the final eight tiles.
+    let gate_m = 17_408usize;
+    let up_m = 17_408usize;
     let k = 5120usize;
 
     let a_gate = gpu.upload_raw(&build_hfq4g256(gate_m, k, 0xD4), &[gate_m, k]).unwrap();

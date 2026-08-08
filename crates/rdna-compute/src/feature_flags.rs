@@ -36,6 +36,27 @@ pub struct FeatureFlags {
     pub hfq3_dp4a: Option<bool>,
     pub hfq3_mmq: Option<bool>,
     pub hfq4_mmq_rdna2: Option<bool>,
+    /// Wider gfx11 gate/up prefill tile. Kept opt-in until full-model A/B
+    /// confirms the standalone M17408/K5120/N2048 result.
+    pub rdna3_hfq4_gate_up_x256y64: bool,
+    /// Large-M W4A16 gate/up probe using a 128-token x 64-output gfx11 tile.
+    /// Strictly opt-in until full-model prefill A/B validates conversion cost.
+    pub rdna3_hfq4_gate_up_a16_k32: bool,
+    /// Extend the audited W4A16 K32 topology to aligned QKV/QKVZA set
+    /// projections. Kept separate from the gate/up-only production probe.
+    pub rdna3_hfq4_set_a16_k32: bool,
+    /// Large-M W4A16 K32 residual-add probe for the two Qwen3.6 projection
+    /// shapes validated by the standalone benchmark.
+    pub rdna3_hfq4_residual_a16_k32: bool,
+    /// Wider gfx11 FFN-down residual tile. Separate from gate/up so its
+    /// smaller model-level contribution can be validated independently.
+    pub rdna3_hfq4_residual_x256y64: bool,
+    /// Wider gfx11 tile for the remaining PP2048 shapes certified by the
+    /// full-shape probe. Kept separate from gate/up and FFN-down A/B gates.
+    pub rdna3_hfq4_aux_x256y64: bool,
+    /// Use gfx11 `v_perm_b32` nibble widening inside certified X256/Y64
+    /// shapes. Independent so production A/B can isolate decode changes.
+    pub rdna3_hfq4_perm_nibble: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -354,6 +375,17 @@ impl FeatureFlags {
             hfq3_dp4a: parse_bool("HIPFIRE_HFQ3_DP4A"),
             hfq3_mmq: parse_bool("HIPFIRE_HFQ3_MMQ"),
             hfq4_mmq_rdna2: parse_bool("HIPFIRE_HFQ4_MMQ_RDNA2"),
+            rdna3_hfq4_gate_up_x256y64: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_gate_up_a16_k32: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_A16_K32").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_set_a16_k32: value("HIPFIRE_RDNA3_HFQ4_SET_A16_K32").as_deref() == Ok("1"),
+            rdna3_hfq4_residual_a16_k32: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_A16_K32").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_residual_x256y64: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_aux_x256y64: value("HIPFIRE_RDNA3_HFQ4_AUX_X256Y64").as_deref() == Ok("1"),
+            rdna3_hfq4_perm_nibble: value("HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE").as_deref() == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -610,6 +642,13 @@ impl FeatureFlags {
             hfq3_dp4a: None,
             hfq3_mmq: None,
             hfq4_mmq_rdna2: None,
+            rdna3_hfq4_gate_up_x256y64: false,
+            rdna3_hfq4_gate_up_a16_k32: false,
+            rdna3_hfq4_set_a16_k32: false,
+            rdna3_hfq4_residual_a16_k32: false,
+            rdna3_hfq4_residual_x256y64: false,
+            rdna3_hfq4_aux_x256y64: false,
+            rdna3_hfq4_perm_nibble: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
@@ -706,7 +745,7 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
