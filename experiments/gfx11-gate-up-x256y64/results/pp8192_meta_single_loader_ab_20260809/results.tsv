@@ -1,0 +1,11 @@
+pair	order	mode	prefill_tok_s	gen_tok_s
+1	0	base	923.2	33.2
+1	1	meta1	907.8	33.1
+2	0	meta1	896.9	33.0
+2	1	base	886.0	32.9
+3	0	base	880.6	32.8
+3	1	meta1	884.0	32.8
+4	0	meta1	884.2	32.8
+4	1	base	882.1	32.8
+5	0	base	878.5	32.8
+5	1	meta1	879.3	32.8

@@ -690,8 +690,14 @@ impl ScratchState {
         x: &GpuTensor,
         batch_size: usize,
         k: usize,
+        group128: bool,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
+        let quantize_kernel = if group128 {
+            "quantize_q8_1_mmq_ds4_group128"
+        } else {
+            "quantize_q8_1_mmq_ds4"
+        };
         compile_and_load_kernel(
             compiler,
             hip,
@@ -699,7 +705,7 @@ impl ScratchState {
             functions,
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            "quantize_q8_1_mmq_ds4",
+            quantize_kernel,
         )?;
 
         let blocks_k = (k + 127) / 128;
@@ -735,7 +741,7 @@ impl ScratchState {
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                "quantize_q8_1_mmq_ds4",
+                quantize_kernel,
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
                 0,
