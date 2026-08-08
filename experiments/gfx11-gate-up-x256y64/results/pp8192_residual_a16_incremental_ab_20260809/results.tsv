@@ -1,0 +1,11 @@
+pair	order	mode	prefill_tok_s	gen_tok_s
+1	0	x256	888.4	32.9
+1	1	residual_a16	877.3	32.7
+2	0	residual_a16	871.6	32.8
+2	1	x256	875.4	32.8
+3	0	x256	878.1	32.8
+3	1	residual_a16	884.1	32.8
+4	0	residual_a16	882.5	32.8
+4	1	x256	878.4	32.8
+5	0	x256	880.1	32.8
+5	1	residual_a16	882.2	32.8

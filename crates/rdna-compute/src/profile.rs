@@ -128,6 +128,8 @@ pub fn begin_timer(
 }
 
 /// Profile a kernel while retaining its logical matrix shape as `(M, K, N)`.
+/// This is intended for attribution when one symbol serves several projection
+/// families. It has no effect while profiling is disabled.
 pub fn begin_timer_shape(
     hip: &HipRuntime,
     category: &'static str,

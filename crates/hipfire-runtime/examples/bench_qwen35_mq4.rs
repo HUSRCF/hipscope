@@ -497,10 +497,12 @@ fn main() {
         };
         if let Some(ref report) = report {
             let entries = &report.internal;
-            let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =
-                Default::default();
+            let mut by_kernel: std::collections::HashMap<
+                (&str, Option<[usize; 3]>),
+                (f64, usize, usize),
+            > = Default::default();
             for e in entries {
-                let (time, count, bytes) = by_kernel.entry(e.kernel).or_default();
+                let (time, count, bytes) = by_kernel.entry((e.kernel, e.shape)).or_default();
                 *time += e.time_us;
                 *count += 1;
                 *bytes += e.bytes;
@@ -513,14 +515,17 @@ fn main() {
             let mut kerns: Vec<_> = by_kernel.iter().collect();
             kerns.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
             let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
-            for (kern, (us, n, bytes)) in &kerns {
+            for ((kern, shape), (us, n, bytes)) in &kerns {
                 let gib_s = if *us > 0.0 {
                     (*bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (*us / 1_000_000.0)
                 } else {
                     0.0
                 };
+                let shape = shape.map_or_else(String::new, |[m, k, n]| {
+                    format!("M{m} K{k} N{n}")
+                });
                 eprintln!(
-                    "  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
+                    "  {kern:45} {shape:24} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
                     us / 1000.0,
                     us / *n as f64,
                     us / total_us * 100.0,
@@ -528,8 +533,9 @@ fn main() {
                 );
             }
             eprintln!(
-                "  {:45} {:5}   {:.1}ms",
+                "  {:45} {:24} {:5}   {:.1}ms",
                 "TOTAL (serialized)",
+                "",
                 "",
                 total_us / 1000.0
             );
@@ -676,6 +682,11 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut generated_token_ids = dump_tokens.then(|| vec![next_token]);
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
@@ -698,6 +709,9 @@ fn main() {
         .expect("warmup forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
+        if let Some(tokens) = generated_token_ids.as_mut() {
+            tokens.push(next_token);
+        }
     }
     let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -752,6 +766,9 @@ fn main() {
         let t_ms = t.elapsed().as_secs_f64() * 1000.0;
         per_token_ms.push(t_ms);
         next_token = llama::argmax(&logits);
+        if let Some(tokens) = generated_token_ids.as_mut() {
+            tokens.push(next_token);
+        }
     }
     let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
     if let Some(tokens) = generated_tokens {
@@ -823,6 +840,9 @@ fn main() {
     let p90_ms = sorted[(n * 90) / 100];
     let p99_ms = sorted[(n.saturating_sub(1) * 99) / 100];
     let gen_tok_s = n as f64 / (gen_total_ms / 1000.0);
+    if let Some(tokens) = generated_token_ids.as_ref() {
+        eprintln!("TOKEN_IDS {tokens:?}");
+    }
 
     // BW estimate: each gen token reads ~all weights (minus KV cache writes,
     // which are separate). Effective BW = model_bytes × tok/s.
