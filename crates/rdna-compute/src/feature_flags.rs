@@ -68,6 +68,9 @@ pub struct FeatureFlags {
     /// retaining four independent sums. Only the matching gfx11 X256/Y64
     /// kernels exploit the reduced scale work; default dispatch is unchanged.
     pub rdna3_q8_group128: bool,
+    /// Split each 64-row group128 MMQ tile across two row fragments and four
+    /// column groups, reducing duplicate activation-fragment loads on gfx11.
+    pub rdna3_q8_group128_row2: bool,
     /// Fuse dense FFN SwiGLU, FWHT rotation, and group128 Q8 packing directly
     /// into MMQ scratch. Requires rdna3_q8_group128 and remains opt-in.
     pub rdna3_fused_swiglu_q8_group128: bool,
@@ -435,6 +438,7 @@ impl FeatureFlags {
                 .as_deref()
                 == Ok("1"),
             rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
+            rdna3_q8_group128_row2: value("HIPFIRE_RDNA3_Q8_GROUP128_ROW2").as_deref() == Ok("1"),
             rdna3_fused_swiglu_q8_group128: value("HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128")
                 .as_deref()
                 == Ok("1"),
@@ -723,6 +727,7 @@ impl FeatureFlags {
             rdna3_hfq4_perm_nibble: false,
             rdna3_hfq4_meta_single_loader: false,
             rdna3_q8_group128: false,
+            rdna3_q8_group128_row2: false,
             rdna3_fused_swiglu_q8_group128: false,
             fp8_wmma: false,
             dot2_gemv: false,
