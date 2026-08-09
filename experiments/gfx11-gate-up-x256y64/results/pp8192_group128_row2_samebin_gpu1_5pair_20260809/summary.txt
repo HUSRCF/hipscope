@@ -1,0 +1,5 @@
+row1: prefill_median=695.800 decode_median=33.100 raw_prefill=[697.1, 695.6, 695.8, 696.6, 695.6]
+row2: prefill_median=702.200 decode_median=33.000 raw_prefill=[703.0, 702.1, 703.9, 701.9, 702.2]
+trim_each_side=1 row1_trimmed_median=695.800 row2_trimmed_median=702.200
+row2_vs_row1=1.0092x (+0.92%)
+token_ids_match=True row1_variants=1 row2_variants=1

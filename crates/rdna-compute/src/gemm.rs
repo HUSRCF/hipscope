@@ -15381,7 +15381,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_hfq4g256_mmq_prequant_x256y64_perm_group128_impl(
-            a_raw, x_q8_ptr, y, m, k, batch_size, false,
+            a_raw,
+            x_q8_ptr,
+            y,
+            m,
+            k,
+            batch_size,
+            false,
+            self.flags.rdna3_q8_group128_row2,
         )
     }
 
@@ -15410,7 +15417,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_hfq4g256_mmq_prequant_x256y64_perm_group128_impl(
-            a_raw, x_q8_ptr, y, m, k, batch_size, true,
+            a_raw,
+            x_q8_ptr,
+            y,
+            m,
+            k,
+            batch_size,
+            true,
+            self.flags.rdna3_q8_group128_row2,
         )
     }
 
@@ -15424,35 +15438,53 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         add: bool,
+        row2: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_rdna3_dgpu()
-            || m % 64 != 0
-            || k % 256 != 0
-            || batch_size % 256 != 0
-        {
+        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "group128 x256y64 probe requires gfx11 dGPU and M%64=K%256=N%256=0",
             ));
         }
         const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_perm_group128";
+        const ROW2_MODULE: &str = "gemm_hfq4g256_mmq_x256y64_perm_group128_row2";
+        let module = if row2 { ROW2_MODULE } else { MODULE };
         let kernel = if add {
-            "gemm_hfq4g256_mmq_x256y64_perm_group128_full_add"
+            if row2 {
+                "gemm_hfq4g256_mmq_x256y64_perm_group128_row2_full_add"
+            } else {
+                "gemm_hfq4g256_mmq_x256y64_perm_group128_full_add"
+            }
+        } else if row2 {
+            "gemm_hfq4g256_mmq_x256y64_perm_group128_row2_full_set"
         } else {
             "gemm_hfq4g256_mmq_x256y64_perm_group128_full_set"
         };
         static SRC: OnceLock<String> = OnceLock::new();
-        let src = SRC.get_or_init(|| {
-            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
-                "gemm_hfq4g256_residual_mmq",
-                MODULE,
-            );
-            format!(
-                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 1\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP128 1\n{body}",
-            )
-        });
-        self.ensure_kernel(MODULE, src, kernel)?;
+        static ROW2_SRC: OnceLock<String> = OnceLock::new();
+        let src = if row2 {
+            ROW2_SRC.get_or_init(|| {
+                let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                    "gemm_hfq4g256_residual_mmq",
+                    ROW2_MODULE,
+                );
+                format!(
+                    "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP128 1\n{body}",
+                )
+            })
+        } else {
+            SRC.get_or_init(|| {
+                let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                    "gemm_hfq4g256_residual_mmq",
+                    MODULE,
+                );
+                format!(
+                    "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 1\n#define MMQ_COL_GROUPS 2\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP128 1\n{body}",
+                )
+            })
+        };
+        self.ensure_kernel(module, src, kernel)?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
         let mut y_ptr = y.buf.as_ptr();
