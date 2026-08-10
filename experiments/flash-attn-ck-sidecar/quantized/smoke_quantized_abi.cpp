@@ -32,6 +32,17 @@ int main()
         hipfire_flash_attn_ck_quantized_prefill_workspace_bytes(q_rows, q_heads, head_dim);
     require(workspace == static_cast<size_t>(q_rows) * q_heads * head_dim * 4,
             "workspace size");
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+    constexpr int kv_rows = 2048;
+    const size_t staged_workspace =
+        hipfire_flash_attn_ck_quantized_staged_workspace_bytes(
+            q_rows, kv_rows, q_heads, kv_heads, head_dim);
+    const size_t expected_staged =
+        2 * (static_cast<size_t>(q_rows) * q_heads * head_dim +
+             static_cast<size_t>(kv_rows) * kv_heads * head_dim) *
+        sizeof(uint16_t);
+    require(staged_workspace == expected_staged, "staged workspace size");
+#endif
 
     hipfire_flash_attn_ck_quantized_prefill_params params{};
     params.abi_version = HIPFIRE_FLASH_ATTN_CK_QUANTIZED_ABI_VERSION;
@@ -58,7 +69,18 @@ int main()
     require(hipfire_flash_attn_ck_quantized_prefill_supported(
                 &params, error, sizeof(error)) == 0,
             "validated shape should be supported");
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+    params.workspace_bytes = staged_workspace;
+    require(hipfire_flash_attn_ck_quantized_staged_supported(
+                &params, error, sizeof(error)) == 0,
+            "validated staged shape should be supported");
+    params.workspace_bytes = staged_workspace - 1;
+    require(hipfire_flash_attn_ck_quantized_staged_supported(
+                &params, error, sizeof(error)) != 0,
+            "undersized staged workspace must be rejected");
+#endif
 
+    params.workspace_bytes = workspace;
     params.seqlen_q = 64;
     require(hipfire_flash_attn_ck_quantized_prefill_supported(
                 &params, error, sizeof(error)) != 0,
@@ -69,8 +91,15 @@ int main()
                 &params, error, sizeof(error)) != 0,
             "undersized workspace must be rejected");
 
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+    std::printf("quantized ABI smoke passed: abi=%u workspace=%zu staged=%zu bytes\n",
+                HIPFIRE_FLASH_ATTN_CK_QUANTIZED_ABI_VERSION,
+                workspace,
+                staged_workspace);
+#else
     std::printf("quantized ABI smoke passed: abi=%u workspace=%zu bytes\n",
                 HIPFIRE_FLASH_ATTN_CK_QUANTIZED_ABI_VERSION,
                 workspace);
+#endif
     return 0;
 }

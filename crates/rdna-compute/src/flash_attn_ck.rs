@@ -256,6 +256,7 @@ impl Error for FlashAttnCkError {
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type FwdFn = unsafe extern "C" fn(*const FlashAttnCkFwdParams, *mut c_char, usize) -> i32;
 type QuantizedWorkspaceFn = unsafe extern "C" fn(i32, i32, i32) -> usize;
+type QuantizedStagedWorkspaceFn = unsafe extern "C" fn(i32, i32, i32, i32, i32) -> usize;
 type QuantizedFwdFn =
     unsafe extern "C" fn(*const FlashAttnCkQuantizedPrefillParams, *mut c_char, usize) -> i32;
 type QuantizedMqQ8Fn =
@@ -361,6 +362,9 @@ pub struct FlashAttnCkQuantized {
     workspace_bytes: QuantizedWorkspaceFn,
     prefill_supported: QuantizedFwdFn,
     prefill: QuantizedFwdFn,
+    staged_workspace_bytes: Option<QuantizedStagedWorkspaceFn>,
+    staged_supported: Option<QuantizedFwdFn>,
+    staged_prefill: Option<QuantizedFwdFn>,
     mq_q8_supported: Option<QuantizedMqQ8Fn>,
     prefill_mq_q8: Option<QuantizedMqQ8Fn>,
 }
@@ -379,7 +383,16 @@ impl FlashAttnCkQuantized {
                 source,
             })?;
 
-        let (workspace_bytes, prefill_supported, prefill, mq_q8_supported, prefill_mq_q8) = unsafe {
+        let (
+            workspace_bytes,
+            prefill_supported,
+            prefill,
+            staged_workspace_bytes,
+            staged_supported,
+            staged_prefill,
+            mq_q8_supported,
+            prefill_mq_q8,
+        ) = unsafe {
             let abi_version: Symbol<'_, AbiVersionFn> = symbol(
                 &library,
                 b"hipfire_flash_attn_ck_quantized_abi_version",
@@ -400,6 +413,28 @@ impl FlashAttnCkQuantized {
                 b"hipfire_flash_attn_ck_quantized_prefill",
                 "quantized_prefill",
             )?;
+            let mut staged_workspace_bytes = library
+                .get::<QuantizedStagedWorkspaceFn>(
+                    b"hipfire_flash_attn_ck_quantized_staged_workspace_bytes",
+                )
+                .ok()
+                .map(|symbol| *symbol);
+            let mut staged_supported = library
+                .get::<QuantizedFwdFn>(b"hipfire_flash_attn_ck_quantized_staged_supported")
+                .ok()
+                .map(|symbol| *symbol);
+            let mut staged_prefill = library
+                .get::<QuantizedFwdFn>(b"hipfire_flash_attn_ck_quantized_staged_prefill")
+                .ok()
+                .map(|symbol| *symbol);
+            if staged_workspace_bytes.is_none()
+                || staged_supported.is_none()
+                || staged_prefill.is_none()
+            {
+                staged_workspace_bytes = None;
+                staged_supported = None;
+                staged_prefill = None;
+            }
             let mq_q8_supported = library
                 .get::<QuantizedMqQ8Fn>(b"hipfire_flash_attn_ck_quantized_mq_q8_supported")
                 .ok()
@@ -420,6 +455,9 @@ impl FlashAttnCkQuantized {
                 *workspace_bytes,
                 *prefill_supported,
                 *prefill,
+                staged_workspace_bytes,
+                staged_supported,
+                staged_prefill,
                 mq_q8_supported,
                 prefill_mq_q8,
             )
@@ -430,6 +468,9 @@ impl FlashAttnCkQuantized {
             workspace_bytes,
             prefill_supported,
             prefill,
+            staged_workspace_bytes,
+            staged_supported,
+            staged_prefill,
             mq_q8_supported,
             prefill_mq_q8,
         })
@@ -437,6 +478,56 @@ impl FlashAttnCkQuantized {
 
     pub fn workspace_bytes(&self, seqlen_q: i32, nhead_q: i32, head_dim: i32) -> usize {
         unsafe { (self.workspace_bytes)(seqlen_q, nhead_q, head_dim) }
+    }
+
+    pub fn has_staged_route(&self) -> bool {
+        self.staged_workspace_bytes.is_some()
+            && self.staged_supported.is_some()
+            && self.staged_prefill.is_some()
+    }
+
+    pub fn staged_workspace_bytes(
+        &self,
+        seqlen_q: i32,
+        seqlen_k: i32,
+        nhead_q: i32,
+        nhead_k: i32,
+        head_dim: i32,
+    ) -> Option<usize> {
+        self.staged_workspace_bytes
+            .map(|function| unsafe { function(seqlen_q, seqlen_k, nhead_q, nhead_k, head_dim) })
+    }
+
+    pub fn is_staged_supported(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self
+            .staged_supported
+            .ok_or_else(|| FlashAttnCkError::Call {
+                operation: "staged support check",
+                status: -1,
+                message: "sidecar does not export the optional staged CK route".to_string(),
+            })?;
+        self.call("staged support check", function, params)
+    }
+
+    /// Launch staged quantized prefill on the stream stored in `params`.
+    ///
+    /// # Safety
+    ///
+    /// Device pointers and workspace must satisfy the sidecar contract and
+    /// remain valid until the asynchronous stream work completes.
+    pub unsafe fn staged_prefill(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self.staged_prefill.ok_or_else(|| FlashAttnCkError::Call {
+            operation: "staged prefill",
+            status: -1,
+            message: "sidecar does not export the optional staged CK route".to_string(),
+        })?;
+        self.call("staged prefill", function, params)
     }
 
     pub fn is_supported(
@@ -652,6 +743,13 @@ mod tests {
         let sidecar = unsafe { FlashAttnCkQuantized::load(path) }
             .expect("load explicit quantized test sidecar");
         assert_eq!(sidecar.workspace_bytes(128, 24, 256), 3_145_728);
+
+        if std::env::var_os("HIPFIRE_FLASH_ATTN_CK_EXPECT_STAGED").is_some() {
+            assert!(
+                sidecar.has_staged_route(),
+                "explicit sidecar must export the complete staged route"
+            );
+        }
 
         if std::env::var_os("HIPFIRE_FLASH_ATTN_CK_EXPECT_MQ_Q8").is_some() {
             assert!(

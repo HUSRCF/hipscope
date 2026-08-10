@@ -46,6 +46,10 @@ HIP_VISIBLE_DEVICES=0 GPU_ARCH=gfx1100 TRIALS=3 \
 GPU_ARCH=gfx1100 \
   ./experiments/flash-attn-ck-sidecar/quantized/build_quantized_sidecar.sh
 
+GPU_ARCH=gfx1100 STAGED=1 \
+  OUT=/tmp/libhipfire_flash_attn_ck_quantized_staged.so \
+  ./experiments/flash-attn-ck-sidecar/quantized/build_quantized_sidecar.sh
+
 ./experiments/flash-attn-ck-sidecar/quantized/audit_quantized_ck_resources.sh
 ```
 
@@ -64,7 +68,38 @@ workspace containing rotated FP16 Q followed by FP16 CK output. The sidecar
 launches Q rotation, the CK attention kernel, and a vectorized half2-to-FP32
 bridge without a host synchronization. Its current gate intentionally accepts
 only bottom-right causal D256 24Q/4KV prefill with Q>=128, contiguous Asym3 K,
-and contiguous Q8 V. The built gfx1100 library is about 108 KiB.
+and contiguous Q8 V. The built gfx1100 legacy/staged libraries are about
+120/124 KiB, excluding the separately built dense CK sidecar.
+
+An additive staged ABI provides the selected production route for the same
+contract. It decodes every physical Asym3-K/Q8-V KV head once into dense FP16
+scratch, then invokes the mature dense CK pipeline. This removes repeated
+quantized decode from each query-head/tile load while retaining GQA reuse. Old
+ABI-v1 sidecars remain loadable: the Rust loader resolves the staged symbols
+optionally and falls back to the packed-view route when they are absent,
+unsupported, or do not fit the caller-owned scratch buffer. `STAGED=1` is an
+explicit build variant and links the dense CK sidecar; the default build remains
+standalone and does not acquire that dependency. The staged route is still
+excluded from graph capture and performs no allocation or host sync.
+
+At Q=2048 with 24 query heads, 4 KV heads, and D256, the complete reusable
+workspace (rotated Q, FP16 output, dense K, and dense V) is about 59/67/75/84
+MiB for K=2K/4K/6K/8K. A same-process, alternating seven-trial benchmark of
+the exported production C API measured:
+
+| K rows | Packed CK | Staged CK | Attention-local speedup | Max abs |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | `3.447 ms` | `1.417 ms` | `2.433x` | `6.10e-5` |
+| 4,096 | `9.474 ms` | `3.324 ms` | `2.850x` | `1.91e-6` |
+| 6,144 | `14.698 ms` | `5.489 ms` | `2.678x` | `9.54e-7` |
+| 8,192 | `20.725 ms` | `7.867 ms` | `2.634x` | `4.77e-7` |
+
+The corresponding Qwen3.6-27B PP8192 production A/B measured a **+6.05%**
+median paired throughput gain across three alternating process pairs:
+`1127.3 -> 1188.1`, `1106.9 -> 1180.3`, and `1106.5 -> 1173.5 tok/s`.
+This is a model-level backend improvement, not a route to 1.5k tok/s by itself;
+packed-MQ4 projections remain the dominant wall-time target. Raw logs and the
+summary are under `results/staged_model_ab_warm_20260811/`.
 
 The loader smoke also compares scalar element decoding with a 32-dimension
 batch decoder. The latter shares one Asym3 cnorm, four packed words, and one Q8
