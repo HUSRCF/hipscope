@@ -56,12 +56,16 @@ WMMA kernels with a different numerical contract.
 | Packed weights in LDS, X128/Y64 | 0.560x | closed |
 | Exact Q8 as two IU4 planes | 0.462x | closed |
 | FP16 metadata-only repack | 0.934-1.006x | closed |
-| Expanded-I8 execution copy with current kernel | about 0.989x | closed for gate/up |
+| Expanded-I8 execution copy, aligned quad-row | 0.9997x gate/up, 1.0045x down | rejected |
+| Remove affine zero correction | 0.9995x gate/up, 0.9910x down | rejected |
+| Remove scale accumulation and zero correction | 1.0166x gate/up, 1.0431x down | rejected upper bound |
 | K128 phased X256/Y64 | 0.416x | closed |
 | K128 X256/Y128, 512 threads | 0.622x | closed |
 | Signed-A4 gate/up | +4.89% PP8192, failed long-prompt quality | rejected |
 | Symmetric signed-int4, no affine zero correction | 1.027x gate/up, 1.039x down | rejected |
 | Mature Q8_0 WMMA execution copy, 2x weight bytes | 0.279x gate/up, 0.310x down | rejected |
+| Current HFP4G32 kernel implementation | 0.361x gate/up, 0.330x down | rejected implementation, not format |
+| rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -103,15 +107,15 @@ affine correction alone is closed and no checkpoint-level quantizer was added.
 Native IU4 remains a separate follow-up only if one pass can preserve the
 activation contract; the exact two-pass IU4 result is already closed.
 
-### 2. Bounded-correction IU4 contract
+### 2. Bounded-correction IU4 contract (closed)
 
 The only native 4-bit path with a positive throughput signal used signed-A4
-activations, but its approximation failed the long-prompt quality gate. A
-successor would need a single IU4 WMMA main pass plus a sparse or otherwise
-bounded correction that recovers the Q8 result closely enough for model-level
-quality. The correction density and bytes must be measured before writing a
-production kernel. If the correction makes the local gate/up or down shape
-slower than 1.30x over retained Q8, stop.
+activations, but its uncorrected full-shape gate/up kernel reached only 1.087x
+over retained Q8 and failed the long-prompt quality gate after 32 matching
+output tokens. Because 1.087x is already below the 1.30x admission line, any
+non-free correction cannot produce an admitted backend. Group32 A4 was slower
+and less accurate. Do not implement a correction kernel unless a new IU4 main
+primitive first demonstrates at least 1.30x on both gate/up and down.
 
 ### 3. Other quantized weight contracts
 
@@ -135,6 +139,11 @@ the model's affine quantization semantics without a full expanded-weight copy,
 or if its measured speedup is large enough to justify that copy as an explicit
 high-memory profile. A dense FP16 peak comparison is not evidence for this
 path.
+
+The current HFP4G32 implementation and a complete rocBLAS rowwise-W8A8 hot
+path have both been screened and rejected. These results do not disprove all
+HFP4 numerical formats or future vendor primitives, but neither existing
+implementation is a viable production fallback for this workload.
 
 ## Required coverage
 
