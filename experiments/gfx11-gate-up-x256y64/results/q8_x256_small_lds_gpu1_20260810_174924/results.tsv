@@ -1,0 +1,5 @@
+variant	median_ms	baseline_speedup	max_abs	mean_abs
+current_x256y64_group256	6.6009	1.0000	0	0
+q8_small_lds_x128y64_k32	8.1134	0.8136	2.86102295e-6	1.97867147e-7
+q8_small_lds_x256y64_k32	7.9044	0.8351	2.86102295e-6	1.97867147e-7
+q8_small_lds_x128y64_k64	7.9046	0.8351	2.86102295e-6	2.01041340e-7

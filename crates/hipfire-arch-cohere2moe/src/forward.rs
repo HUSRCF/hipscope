@@ -264,6 +264,7 @@ fn decode_step_body(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &state.fa_attn_out,
         };
@@ -746,6 +747,7 @@ pub fn forward_batch(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &attn_out,
         };

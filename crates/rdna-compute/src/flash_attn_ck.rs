@@ -4,10 +4,10 @@
 
 //! Optional dynamic loader for the FlashAttention CK sidecar experiment.
 //!
-//! This module only exposes the raw all-FP16 sidecar ABI. It deliberately does
-//! not route hipfire attention calls or allocate conversion scratch. Callers
-//! must opt in at build time, load an explicit library path, and provide device
-//! buffers whose lifetimes cover the asynchronous launch.
+//! This module exposes the raw dense and quantized sidecar ABIs. It deliberately
+//! does not route hipfire attention calls or allocate conversion scratch.
+//! Callers must opt in at build time, load an explicit library path, and provide
+//! device buffers whose lifetimes cover the asynchronous launch.
 
 use libloading::{Library, Symbol};
 use std::error::Error;
@@ -16,6 +16,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 1;
+pub const FLASH_ATTN_CK_QUANTIZED_ABI_VERSION: u32 = 1;
 const ERROR_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -106,6 +107,93 @@ impl Default for FlashAttnCkFwdParams {
     }
 }
 
+/// Stable C layout shared with `hipfire_flash_attn_ck_quantized.h`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnCkQuantizedPrefillParams {
+    pub abi_version: u32,
+    pub struct_size: u32,
+
+    pub q: *const f32,
+    pub packed_k: *const u8,
+    pub packed_v: *const u8,
+    pub out: *mut f32,
+    pub workspace: *mut c_void,
+    pub workspace_bytes: usize,
+    pub cos_theta: *const f32,
+    pub sin_theta: *const f32,
+    pub stream: *mut c_void,
+
+    pub softmax_scale: f32,
+    pub seqlen_q: i32,
+    pub seqlen_k: i32,
+    pub nhead_q: i32,
+    pub nhead_k: i32,
+    pub head_dim: i32,
+    pub causal: i32,
+    pub k_row_stride_bytes: i32,
+    pub v_row_stride_bytes: i32,
+}
+
+impl FlashAttnCkQuantizedPrefillParams {
+    pub fn new() -> Self {
+        Self {
+            abi_version: FLASH_ATTN_CK_QUANTIZED_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            q: std::ptr::null(),
+            packed_k: std::ptr::null(),
+            packed_v: std::ptr::null(),
+            out: std::ptr::null_mut(),
+            workspace: std::ptr::null_mut(),
+            workspace_bytes: 0,
+            cos_theta: std::ptr::null(),
+            sin_theta: std::ptr::null(),
+            stream: std::ptr::null_mut(),
+            softmax_scale: 0.0,
+            seqlen_q: 0,
+            seqlen_k: 0,
+            nhead_q: 0,
+            nhead_k: 0,
+            head_dim: 0,
+            causal: 0,
+            k_row_stride_bytes: 0,
+            v_row_stride_bytes: 0,
+        }
+    }
+}
+
+impl Default for FlashAttnCkQuantizedPrefillParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnCkQuantizedMqQ8Params {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub prefill: FlashAttnCkQuantizedPrefillParams,
+    pub gate: *const f32,
+    pub signs1: *const f32,
+    pub signs2: *const f32,
+    pub q8_1_out: *mut c_void,
+}
+
+impl FlashAttnCkQuantizedMqQ8Params {
+    pub fn new(prefill: FlashAttnCkQuantizedPrefillParams) -> Self {
+        Self {
+            abi_version: FLASH_ATTN_CK_QUANTIZED_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            prefill,
+            gate: std::ptr::null(),
+            signs1: std::ptr::null(),
+            signs2: std::ptr::null(),
+            q8_1_out: std::ptr::null_mut(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum FlashAttnCkError {
     Load {
@@ -167,6 +255,11 @@ impl Error for FlashAttnCkError {
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type FwdFn = unsafe extern "C" fn(*const FlashAttnCkFwdParams, *mut c_char, usize) -> i32;
+type QuantizedWorkspaceFn = unsafe extern "C" fn(i32, i32, i32) -> usize;
+type QuantizedFwdFn =
+    unsafe extern "C" fn(*const FlashAttnCkQuantizedPrefillParams, *mut c_char, usize) -> i32;
+type QuantizedMqQ8Fn =
+    unsafe extern "C" fn(*const FlashAttnCkQuantizedMqQ8Params, *mut c_char, usize) -> i32;
 
 /// Loaded sidecar and its stable function table.
 pub struct FlashAttnCk {
@@ -262,6 +355,177 @@ impl FlashAttnCk {
     }
 }
 
+/// Loaded quantized-prefill sidecar and its stable function table.
+pub struct FlashAttnCkQuantized {
+    _library: &'static Library,
+    workspace_bytes: QuantizedWorkspaceFn,
+    prefill_supported: QuantizedFwdFn,
+    prefill: QuantizedFwdFn,
+    mq_q8_supported: Option<QuantizedMqQ8Fn>,
+    prefill_mq_q8: Option<QuantizedMqQ8Fn>,
+}
+
+impl FlashAttnCkQuantized {
+    /// Load one explicit quantized sidecar path without changing runtime dispatch.
+    ///
+    /// # Safety
+    ///
+    /// `path` must identify a trusted native library implementing the declared ABI.
+    pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self, FlashAttnCkError> {
+        let path = path.as_ref();
+        let library =
+            unsafe { Library::new(path.as_os_str()) }.map_err(|source| FlashAttnCkError::Load {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        let (workspace_bytes, prefill_supported, prefill, mq_q8_supported, prefill_mq_q8) = unsafe {
+            let abi_version: Symbol<'_, AbiVersionFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_quantized_abi_version",
+                "quantized_abi_version",
+            )?;
+            let workspace_bytes: Symbol<'_, QuantizedWorkspaceFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_quantized_prefill_workspace_bytes",
+                "quantized_prefill_workspace_bytes",
+            )?;
+            let prefill_supported: Symbol<'_, QuantizedFwdFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_quantized_prefill_supported",
+                "quantized_prefill_supported",
+            )?;
+            let prefill: Symbol<'_, QuantizedFwdFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_quantized_prefill",
+                "quantized_prefill",
+            )?;
+            let mq_q8_supported = library
+                .get::<QuantizedMqQ8Fn>(b"hipfire_flash_attn_ck_quantized_mq_q8_supported")
+                .ok()
+                .map(|symbol| *symbol);
+            let prefill_mq_q8 = library
+                .get::<QuantizedMqQ8Fn>(b"hipfire_flash_attn_ck_quantized_prefill_mq_q8")
+                .ok()
+                .map(|symbol| *symbol);
+            let actual = abi_version();
+            if actual != FLASH_ATTN_CK_QUANTIZED_ABI_VERSION {
+                return Err(FlashAttnCkError::AbiVersion {
+                    expected: FLASH_ATTN_CK_QUANTIZED_ABI_VERSION,
+                    actual,
+                });
+            }
+
+            (
+                *workspace_bytes,
+                *prefill_supported,
+                *prefill,
+                mq_q8_supported,
+                prefill_mq_q8,
+            )
+        };
+        let library = Box::leak(Box::new(library));
+        Ok(Self {
+            _library: library,
+            workspace_bytes,
+            prefill_supported,
+            prefill,
+            mq_q8_supported,
+            prefill_mq_q8,
+        })
+    }
+
+    pub fn workspace_bytes(&self, seqlen_q: i32, nhead_q: i32, head_dim: i32) -> usize {
+        unsafe { (self.workspace_bytes)(seqlen_q, nhead_q, head_dim) }
+    }
+
+    pub fn is_supported(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        self.call("quantized support check", self.prefill_supported, params)
+    }
+
+    /// Launch quantized prefill on the stream stored in `params`.
+    ///
+    /// # Safety
+    ///
+    /// Device pointers, packed layouts, and workspace must satisfy the sidecar
+    /// contract and remain valid until the asynchronous stream work completes.
+    pub unsafe fn prefill(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        self.call("quantized prefill", self.prefill, params)
+    }
+
+    pub fn has_mq_q8_bridge(&self) -> bool {
+        self.mq_q8_supported.is_some() && self.prefill_mq_q8.is_some()
+    }
+
+    pub fn is_mq_q8_supported(
+        &self,
+        params: &FlashAttnCkQuantizedMqQ8Params,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self.mq_q8_supported.ok_or_else(|| FlashAttnCkError::Call {
+            operation: "MQ-Q8 support check",
+            status: -1,
+            message: "sidecar does not export the optional MQ-Q8 bridge".to_string(),
+        })?;
+        self.call_mq_q8("MQ-Q8 support check", function, params)
+    }
+
+    pub unsafe fn prefill_mq_q8(
+        &self,
+        params: &FlashAttnCkQuantizedMqQ8Params,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self.prefill_mq_q8.ok_or_else(|| FlashAttnCkError::Call {
+            operation: "MQ-Q8 prefill",
+            status: -1,
+            message: "sidecar does not export the optional MQ-Q8 bridge".to_string(),
+        })?;
+        self.call_mq_q8("MQ-Q8 prefill", function, params)
+    }
+
+    fn call(
+        &self,
+        operation: &'static str,
+        function: QuantizedFwdFn,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        let mut error = [0u8; ERROR_CAPACITY];
+        let status = unsafe { function(params, error.as_mut_ptr().cast::<c_char>(), error.len()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FlashAttnCkError::Call {
+                operation,
+                status,
+                message: error_message(&error),
+            })
+        }
+    }
+
+    fn call_mq_q8(
+        &self,
+        operation: &'static str,
+        function: QuantizedMqQ8Fn,
+        params: &FlashAttnCkQuantizedMqQ8Params,
+    ) -> Result<(), FlashAttnCkError> {
+        let mut error = [0u8; ERROR_CAPACITY];
+        let status = unsafe { function(params, error.as_mut_ptr().cast::<c_char>(), error.len()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FlashAttnCkError::Call {
+                operation,
+                status,
+                message: error_message(&error),
+            })
+        }
+    }
+}
+
 unsafe fn symbol<'library, T>(
     library: &'library Library,
     bytes: &[u8],
@@ -310,6 +574,46 @@ mod tests {
     }
 
     #[test]
+    fn quantized_params_match_c_abi_layout() {
+        assert_eq!(
+            std::mem::size_of::<FlashAttnCkQuantizedPrefillParams>(),
+            120
+        );
+        assert_eq!(std::mem::align_of::<FlashAttnCkQuantizedPrefillParams>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedPrefillParams, q),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedPrefillParams, workspace_bytes),
+            48
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedPrefillParams, softmax_scale),
+            80
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedPrefillParams, v_row_stride_bytes),
+            112
+        );
+
+        assert_eq!(std::mem::size_of::<FlashAttnCkQuantizedMqQ8Params>(), 160);
+        assert_eq!(std::mem::align_of::<FlashAttnCkQuantizedMqQ8Params>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedMqQ8Params, prefill),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedMqQ8Params, gate),
+            128
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkQuantizedMqQ8Params, q8_1_out),
+            152
+        );
+    }
+
+    #[test]
     fn missing_sidecar_is_recoverable() {
         let error = unsafe {
             FlashAttnCk::load(OsStr::new(
@@ -334,6 +638,35 @@ mod tests {
             error,
             FlashAttnCkError::Call {
                 operation: "support check",
+                status: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_quantized_sidecar_loads_and_checks_gate() {
+        let Ok(path) = std::env::var("HIPFIRE_FLASH_ATTN_CK_QUANTIZED_TEST_LIB") else {
+            return;
+        };
+        let sidecar = unsafe { FlashAttnCkQuantized::load(path) }
+            .expect("load explicit quantized test sidecar");
+        assert_eq!(sidecar.workspace_bytes(128, 24, 256), 3_145_728);
+
+        if std::env::var_os("HIPFIRE_FLASH_ATTN_CK_EXPECT_MQ_Q8").is_some() {
+            assert!(
+                sidecar.has_mq_q8_bridge(),
+                "explicit sidecar must export the optional MQ-Q8 bridge"
+            );
+        }
+
+        let error = sidecar
+            .is_supported(&FlashAttnCkQuantizedPrefillParams::default())
+            .expect_err("zero-shape quantized parameters must be rejected");
+        assert!(matches!(
+            error,
+            FlashAttnCkError::Call {
+                operation: "quantized support check",
                 status: 1,
                 ..
             }

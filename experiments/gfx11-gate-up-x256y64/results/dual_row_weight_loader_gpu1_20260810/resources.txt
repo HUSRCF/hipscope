@@ -1,0 +1,22 @@
+gfx1100 full_set/full_add resource summary
+
+production group128 row2 reference:
+  VGPR: 252
+  SGPR: 31
+  VGPR spills: 0
+  private segment: 0 B
+  wavefront: 32
+
+dual-row aligned u32x2:
+  VGPR: 256
+  SGPR: 27
+  VGPR spills: 9
+  private segment: 40 B
+  wavefront: 32
+
+dual-row sequential scalar u32 x2:
+  VGPR: 256
+  SGPR: 27
+  VGPR spills: 9
+  private segment: 40 B
+  wavefront: 32

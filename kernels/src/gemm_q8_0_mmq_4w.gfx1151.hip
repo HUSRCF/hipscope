@@ -2,7 +2,7 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx1151).
+// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx11).
 //
 // i8 port of gemm_q8_0_wmma_4w: same 64 M-row × 64 N-col tile and LDS-staged
 // activations, but runs i8 WMMA (i32_16x16x16_iu8, ~2x FP16 rate) on Q8_1
@@ -19,7 +19,7 @@
 //
 // Grid: [ceil(M/64), ceil(N/64)]. Block: [128]. LDS: 2KB int8 + 256B scales.
 
-#if defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1151__)
 
 #define M_TILE 64
 #define N_TILE 64

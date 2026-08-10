@@ -1,0 +1,5 @@
+q8: prefill_median=1056.300 decode_median=33.000 raw_prefill=[1067.3, 1058.2, 1054.9, 1055.7, 1056.3]
+a4: prefill_median=1105.700 decode_median=33.000 raw_prefill=[1106.5, 1105.1, 1105.7, 1104.4, 1106.0]
+trim_each_side=1 q8_trimmed_median=1056.300 a4_trimmed_median=1105.700
+a4_vs_q8=1.0468x (+4.68%)
+token_ids_match=True q8_variants=1 a4_variants=1

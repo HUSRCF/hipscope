@@ -1,0 +1,5 @@
+baseline: prefill_median=1050.200 decode_median=32.900 raw_prefill=[1096.8, 1050.2, 1047.5]
+compact: prefill_median=1061.600 decode_median=33.000 raw_prefill=[1077.7, 1061.6, 1046.3]
+trim_each_side=0 baseline_trimmed_median=1050.200 compact_trimmed_median=1061.600
+compact_vs_baseline=1.0109x (+1.09%)
+token_ids_match=True baseline_variants=1 compact_variants=1

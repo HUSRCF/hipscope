@@ -1,0 +1,13 @@
+=== PROFILE (4300 launches, 7462.2ms wall) ===
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M17408 K5120 N2048         512x  2412.8ms  (4712µs/call)  37.5%  37.6 GiB/s
+  gemm_hfq4g256_residual_mmq_x256y64_perm_group128_quad_row M5120 K17408 N2048         256x  1248.2ms  (4876µs/call)  19.4%  17.1 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M10240 K5120 N2048         192x  534.4ms  (2783µs/call)  8.3%  37.4 GiB/s
+  gemm_hfq4g256_residual_mmq_x256y64_perm_group128_quad_row M5120 K6144 N2048          256x  443.0ms  (1731µs/call)  6.9%  31.6 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M6144 K5120 N2048          192x  320.8ms  (1671µs/call)  5.0%  37.4 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M12288 K5120 N2048          64x  214.5ms  (3352µs/call)  3.3%  37.3 GiB/s
+  fused_silu_mul_mq_rotate_batched                                         256x  190.5ms  (744µs/call)  3.0%  540.7 GiB/s
+  gemm_hfq4g256_mmq_set                         M48 K5120 N2048            384x  134.2ms  (349µs/call)  2.1%  1.5 GiB/s
+  gemm_hfq4g256_mmq_set                         M1024 K5120 N2048          128x  61.7ms  (482µs/call)  1.0%  21.7 GiB/s
+  TOTAL (serialized)                                                             6435.6ms
+PREFILL_SUMMARY  prefill_tok_s=1097.8  prefill_wall_ms=7462.19  prefill_tok_s_kernel=1272.9  prefill_kernel_ms=6435.59  startup_overhead_ms=1026.60  cold_overhead_pct=13.8
+SUMMARY  gen_tok_s=33.1  bw_gib_s=461.9  prefill_tok_s=1097.8  avg_ms=29.93  p50_ms=29.93  prefill_tok_s_kernel=1272.9  prefill_kernel_ms=6435.59  startup_overhead_ms=1026.60  cold_overhead_pct=13.8

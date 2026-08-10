@@ -1,0 +1,5 @@
+f32: prefill_median=1098.500 decode_median=33.100 raw_prefill=[1137.8, 1098.5, 1100.1, 1098.5, 1097.2]
+f16: prefill_median=1115.400 decode_median=33.100 raw_prefill=[1128.5, 1119.2, 1115.4, 1108.7, 1111.6]
+f16_vs_f32=1.0154x (+1.54%)
+paired_ratio_median=1.0131x positive_pairs=4/5 raw_pair_ratios=[0.9918, 1.0188, 1.0139, 1.0093, 1.0131]
+token_ids_match=True f32_variants=1 f16_variants=1

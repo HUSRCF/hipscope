@@ -276,6 +276,7 @@ impl Llama {
                     tree_bias: None,
                     block_start: 0,
                     block_cols: 0,
+                    contiguous_prefix: false,
                     output_gate: None,
                     output: &scratch.attn_out,
                 };

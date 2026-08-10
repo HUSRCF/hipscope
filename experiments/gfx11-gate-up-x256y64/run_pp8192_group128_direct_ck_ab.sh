@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+STAMP=$(date +%Y%m%d_%H%M%S)
+OUT_DIR=${OUT_DIR:-$ROOT/experiments/gfx11-gate-up-x256y64/results/pp8192_group128_direct_ck_gpu1_$STAMP}
+MODEL=${MODEL:-$HOME/.hipfire/models/qwen3.6-27b.mq4}
+GPU_ID=${GPU_ID:-1}
+TRIALS=${TRIALS:-5}
+TRIM_EACH_SIDE=${TRIM_EACH_SIDE:-1}
+SLEEP_SECS=${SLEEP_SECS:-5}
+PREFILL_RUNS=${PREFILL_RUNS:-3}
+DIRECT_VARIANT=${DIRECT_VARIANT:-x256}
+BIN=${BIN:-$ROOT/target/release/examples/bench_qwen35_mq4}
+CK_LIB=${HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB:-$ROOT/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized.so}
+
+for path in "$MODEL" "$BIN" "$CK_LIB"; do
+  [[ -e "$path" ]] || { echo "missing required path: $path" >&2; exit 1; }
+done
+
+mkdir -p "$OUT_DIR"
+printf 'pair\torder\tmode\tprefill_tok_s\tgen_tok_s\ttoken_ids\n' >"$OUT_DIR/results.tsv"
+sha256sum "$BIN" "$CK_LIB" "$MODEL" >"$OUT_DIR/artifacts.sha256"
+
+run_command() {
+  local log=$1 direct=$2 direct_x256=0 direct_x512=0
+  if [[ "$direct" == 1 ]]; then
+    case "$DIRECT_VARIANT" in
+      x256) direct_x256=1 ;;
+      x512) direct_x512=1 ;;
+      *) echo "invalid DIRECT_VARIANT=$DIRECT_VARIANT; expected x256 or x512" >&2; return 1 ;;
+    esac
+  fi
+  timeout --signal=INT --kill-after=5s 240s env \
+    HIP_VISIBLE_DEVICES="$GPU_ID" \
+    HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB="$CK_LIB" \
+    HIPFIRE_KV_MODE=asym3 \
+    HIPFIRE_GRAPH=0 \
+    HIPFIRE_PREFILL_MAX_BATCH=2048 \
+    HIPFIRE_FLASH_PARTIALS_BATCH=32 \
+    HIPFIRE_DPM_WARMUP_SECS=5 \
+    HIPFIRE_QKVZA_SPLIT_TAIL=1 \
+    HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64=1 \
+    HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64=1 \
+    HIPFIRE_RDNA3_HFQ4_AUX_X256Y64=1 \
+    HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE=1 \
+    HIPFIRE_RDNA3_Q8_GROUP128=1 \
+    HIPFIRE_RDNA3_Q8_GROUP128_ROW2=1 \
+    HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128=1 \
+    HIPFIRE_RDNA3_Q8_GROUP128_DIRECT="$direct_x256" \
+    HIPFIRE_RDNA3_Q8_GROUP128_DIRECT_X512="$direct_x512" \
+    HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW=0 \
+    HIPFIRE_BENCH_DUMP_TOKENS=1 \
+    "$BIN" "$MODEL" \
+    --prefill 8192 --prefill-runs "$PREFILL_RUNS" --warmup 2 --gen 32 \
+    >"$log" 2>&1
+
+  rg -q '^loaded optional quantized FlashAttention CK sidecar:' "$log"
+  rg -q '^quantized FlashAttention CK prefill active:' "$log"
+  if [[ "$direct" == 1 ]]; then
+    if [[ "$DIRECT_VARIANT" == x512 ]]; then
+      rg -q '^RDNA3 Q8 group128 X512 direct gate/up prefill active' "$log"
+    else
+      rg -q '^RDNA3 Q8 group128 direct prefill active:' "$log"
+    fi
+  fi
+}
+
+run_one() {
+  local pair=$1 order=$2 mode=$3 direct=0
+  [[ "$mode" == direct ]] && direct=1
+  local log="$OUT_DIR/pair_${pair}_${order}_${mode}.log"
+  run_command "$log" "$direct"
+  local summary prefill gen token_ids
+  summary=$(rg '^SUMMARY ' "$log" | tail -n 1)
+  prefill=$(awk '{for(i=1;i<=NF;i++) if($i~/^prefill_tok_s=/){split($i,a,"=");print a[2]}}' <<<"$summary")
+  gen=$(awk '{for(i=1;i<=NF;i++) if($i~/^gen_tok_s=/){split($i,a,"=");print a[2]}}' <<<"$summary")
+  token_ids=$(rg '^TOKEN_IDS ' "$log" | tail -n 1 | sed 's/^TOKEN_IDS //')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pair" "$order" "$mode" "$prefill" "$gen" "$token_ids" | tee -a "$OUT_DIR/results.tsv"
+}
+
+run_command "$OUT_DIR/prewarm_baseline.log" 0
+sleep "$SLEEP_SECS"
+run_command "$OUT_DIR/prewarm_direct.log" 1
+sleep "$SLEEP_SECS"
+
+for ((pair=1; pair<=TRIALS; pair++)); do
+  if ((pair % 2)); then modes=(baseline direct); else modes=(direct baseline); fi
+  for order in 0 1; do
+    run_one "$pair" "$order" "${modes[$order]}"
+    sleep "$SLEEP_SECS"
+  done
+done
+
+python3 - "$OUT_DIR/results.tsv" "$TRIM_EACH_SIDE" <<'PY' | tee "$OUT_DIR/summary.txt"
+import csv, statistics, sys
+rows=list(csv.DictReader(open(sys.argv[1], newline=""), delimiter="\t")); trim=int(sys.argv[2])
+def vals(mode, field, trimmed=False):
+    out=[float(r[field]) for r in rows if r["mode"]==mode]
+    if trimmed and trim: out=sorted(out)[trim:-trim]
+    return out
+for mode in ("baseline","direct"):
+    p=vals(mode,"prefill_tok_s"); d=vals(mode,"gen_tok_s")
+    print(f"{mode}: prefill_median={statistics.median(p):.3f} decode_median={statistics.median(d):.3f} raw_prefill={p}")
+b=statistics.median(vals("baseline","prefill_tok_s",True)); c=statistics.median(vals("direct","prefill_tok_s",True))
+tokens={m:{r["token_ids"] for r in rows if r["mode"]==m} for m in ("baseline","direct")}
+print(f"trim_each_side={trim} baseline_trimmed_median={b:.3f} direct_trimmed_median={c:.3f}")
+print(f"direct_vs_baseline={c/b:.4f}x ({(c/b-1)*100:+.2f}%)")
+print(f"token_ids_match={tokens['baseline']==tokens['direct']} baseline_variants={len(tokens['baseline'])} direct_variants={len(tokens['direct'])}")
+PY
+
+printf 'out_dir=%s\n' "$OUT_DIR"

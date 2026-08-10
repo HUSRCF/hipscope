@@ -1,0 +1,5 @@
+k32: prefill_median=1055.400 decode_median=33.000 raw_prefill=[1061.3, 1055.4, 1056.1, 1051.4, 1055.4]
+k128: prefill_median=1034.000 decode_median=33.000 raw_prefill=[1037.9, 1032.8, 1034.0, 1032.0, 1035.2]
+trim_each_side=1 k32_trimmed_median=1055.400 k128_trimmed_median=1034.000
+k128_vs_k32=0.9797x (-2.03%)
+token_ids_match=True k32_variants=1 k128_variants=1

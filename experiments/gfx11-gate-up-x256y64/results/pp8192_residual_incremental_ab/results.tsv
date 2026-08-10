@@ -1,0 +1,11 @@
+pair	order	mode	prefill_tok_s	gen_tok_s
+1	0	gate	887.9	33.0
+1	1	gate_residual	873.7	32.9
+2	0	gate_residual	862.7	32.7
+2	1	gate	857.3	32.8
+3	0	gate	861.7	32.9
+3	1	gate_residual	868.6	33.0
+4	0	gate_residual	868.0	32.8
+4	1	gate	860.9	32.7
+5	0	gate	862.5	32.8
+5	1	gate_residual	867.3	32.7

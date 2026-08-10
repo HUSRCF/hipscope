@@ -1,0 +1,10 @@
+gfx1100 min-blocks-1 full_set/full_add
+  VGPR: 256
+  SGPR: 27
+  VGPR spills: 4
+  SGPR spills: 0
+  private segment: 20 B
+  wavefront: 32
+
+Extracted from:
+  .hipfire_kernels/gfx1100/gemm_hfq4g256_mmq_x256y64_group128_quad_row_min1.hsaco

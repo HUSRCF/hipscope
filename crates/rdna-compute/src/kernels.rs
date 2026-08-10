@@ -2527,6 +2527,10 @@ pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+/// Gfx11 packed-MQ4 x signed-A4 IU4-WMMA experiment. Production dispatch can
+/// select it only through the shape-specific, default-off A4 feature flag.
+pub const GEMM_HFQ4G256_MMQ_IU4_A4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_mmq_iu4_a4.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

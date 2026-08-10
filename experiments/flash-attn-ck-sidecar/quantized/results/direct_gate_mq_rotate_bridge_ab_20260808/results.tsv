@@ -1,0 +1,11 @@
+mode	run	prefill_tokens	wall_ms	tok_s	correctness
+base_ck_runtime_postprocess	1	8192	11709.3	699.6	exact_tokens
+base_ck_runtime_postprocess	2	8192	11853.6	691.1	exact_tokens
+base_ck_runtime_postprocess	3	8192	11936.4	686.3	exact_tokens
+base_ck_runtime_postprocess	4	8192	11956.6	685.1	exact_tokens
+base_ck_runtime_postprocess	5	8192	11972.1	684.3	exact_tokens
+direct_ck_gate_mq_rotate	1	8192	11726.1	698.6	exact_tokens
+direct_ck_gate_mq_rotate	2	8192	11892.3	688.8	exact_tokens
+direct_ck_gate_mq_rotate	3	8192	11961.4	684.9	exact_tokens
+direct_ck_gate_mq_rotate	4	8192	12001.3	682.6	exact_tokens
+direct_ck_gate_mq_rotate	5	8192	12017.4	681.7	exact_tokens

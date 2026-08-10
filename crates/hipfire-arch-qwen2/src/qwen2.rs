@@ -2167,6 +2167,7 @@ impl DenseArch for Qwen2Dense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &st.attn_out,
         };
