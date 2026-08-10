@@ -143,6 +143,23 @@ affine correction alone is closed and no checkpoint-level quantizer was added.
 Native IU4 remains a separate follow-up only if one pass can preserve the
 activation contract; the exact two-pass IU4 result is already closed.
 
+### Coarse-scale int32 accumulation (closed)
+
+A matched Wave32-WMMA probe shared weight and activation metadata across four
+adjacent group128 blocks and retained the i32 accumulator for all 512 K values
+before applying scale and zero correction. This reduced dequant/correction
+flushes by 4x and reduced standalone resident weight bytes by about 8%, while
+remaining exact on a synthetic input whose four sub-groups intentionally used
+the same metadata. Two independent GPU1 runs measured only 1.016x-1.034x on
+gate/up and 1.066x-1.078x on down. The kernels used 73 VGPRs, Wave32, no LDS,
+and no spills, so resource failure does not explain the small gain.
+
+This closes scale coarsening and delayed dequantization as a >=1.30x execution
+backend candidate. It is not a checkpoint-quality result: changing a trained
+model from group128 to group512 remains an approximate quantization change.
+The full standalone record is in
+`experiments/gfx11-mq4-v2/coarse-scale-int32-accum/`.
+
 ### 2. Bounded-correction IU4 contract (closed)
 
 The only native 4-bit path with a positive throughput signal used signed-A4

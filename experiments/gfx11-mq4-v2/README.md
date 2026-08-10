@@ -196,6 +196,12 @@ vgpr_spill_count
 
 Candidates below 1.30x on either large FFN shape stop at standalone.
 
+The coarse-scale/int32-accumulation probe also stopped here. Sharing metadata
+over 512 K values and reducing FP32 dequant/correction flushes by 4x produced
+only 1.016x-1.034x on gate/up and 1.066x-1.078x on down across two runs. See
+`coarse-scale-int32-accum/` for source, raw timing, resource metadata, and the
+synthetic exactness boundary.
+
 Passing the local speed threshold is necessary but not sufficient for routing.
 Exact candidates must also match the retained output tolerance. Approximate
 candidates must pass long-prompt generation and a task-level quality suite.
