@@ -1,0 +1,18 @@
+timestamp=20260810_174924
+git_head=06a758197968c2cfa2727ee81c08fccaae3ac1e8
+git_dirty=true
+gpu=AMD_Radeon_Pro_W7900
+arch=gfx1100
+visible_gpu=1
+hip_runtime=7.14
+shape_m=17408
+shape_k=5120
+shape_n=2048
+pairs=21
+command=HIP_VISIBLE_DEVICES=1 target/release/examples/bench_hfq4_mmq_x256y64 --pairs 21 --perm-nibble --base-x256y64
+residual_smoke_command=HIP_VISIBLE_DEVICES=1 target/release/examples/bench_hfq4_mmq_x256y64 --pairs 3 --residual --perm-nibble --base-x256y64
+kernel_sha256=24ce0d90d8755766e6946a9a94244540e6073ceb487edeb1a0a72e4ccbfdc763
+gemm_rs_sha256=f2427d4d2105f3fbc38d73adf6cb8fe33b4395bfc480f36ec6375b4f52083f60
+benchmark_sha256=a2a40bb20604d2f7e4d01ee604908865b83b8f40f667b7ae63b5d44c6068daeb
+spark_review=/tmp/hfq4_x256_spark_review.txt
+raw_set_log=/tmp/hfq4_x256_microtile_gpu1.log

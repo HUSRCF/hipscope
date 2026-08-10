@@ -1,0 +1,8 @@
+m=17408 k=5120 n=2048
+add=false
+group128_lds_ms=5.0547
+group256_mode=group128-direct-x512
+group256_ms=5.0364
+group256_speedup=1.0036x
+max_abs=1.43051147e-6
+mean_abs=1.10157155e-7

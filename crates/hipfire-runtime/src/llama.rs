@@ -2753,6 +2753,7 @@ fn forward_prefill_chunk(
                 tree_bias,
                 tree_block_start,
                 tree_block_cols,
+                tree_mask.is_none() && start_pos == 0,
             )?;
         } else if kv_cache.quant_asym2 {
             assert!(
@@ -3729,6 +3730,7 @@ fn llama_kv_write_attend(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &scratch.attn_out,
         };
@@ -4112,6 +4114,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &s.attn_out,
         };
@@ -4248,6 +4251,7 @@ pub fn forward_scratch_layers(
                 tree_bias: None,
                 block_start: 0,
                 block_cols: 0,
+                contiguous_prefix: false,
                 output_gate: None,
                 output: &scratch.attn_out,
             };
@@ -4839,6 +4843,7 @@ pub fn forward_scratch_compute_capture(
                 tree_bias: None,
                 block_start: 0,
                 block_cols: 0,
+                contiguous_prefix: false,
                 output_gate: None,
                 output: &scratch.attn_out,
             };

@@ -1,0 +1,9 @@
+  gemm_hfq4g256_residual_mmq: pre-compiled blob has no hash file, recompiling
+  gemm_hfq4g256_mmq_x256y64_group128_quad_row_u32x2: pre-compiled blob has no hash file, recompiling
+=== PROFILE (2828 launches, 7412.0ms wall) ===
+  fused_silu_mul_mq_rotate_batched                                         256x  190.0ms  (742µs/call)  15.1%  542.0 GiB/s
+  gemm_hfq4g256_mmq_set                         M48 K5120 N2048            384x  133.9ms  (349µs/call)  10.6%  1.5 GiB/s
+  gemm_hfq4g256_mmq_set                         M1024 K5120 N2048          128x  61.6ms  (481µs/call)  4.9%  21.7 GiB/s
+  TOTAL (serialized)                                                             1258.0ms
+PREFILL_SUMMARY  prefill_tok_s=1105.2  prefill_wall_ms=7412.04  prefill_tok_s_kernel=6512.0  prefill_kernel_ms=1257.98  startup_overhead_ms=6154.06  cold_overhead_pct=83.0
+SUMMARY  gen_tok_s=33.2  bw_gib_s=463.6  prefill_tok_s=1105.2  avg_ms=29.82  p50_ms=29.84  prefill_tok_s_kernel=6512.0  prefill_kernel_ms=1257.98  startup_overhead_ms=6154.06  cold_overhead_pct=83.0

@@ -7194,6 +7194,8 @@ pub struct PrefillBatchScratch {
     // FFN intermediates [N × hidden_dim]
     pub gate_ffn_batch: GpuTensor,
     pub up_batch: GpuTensor,
+    pub gate_ffn_f16_batch: Option<GpuTensor>,
+    pub up_f16_batch: Option<GpuTensor>,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
 
@@ -7375,6 +7377,17 @@ impl PrefillBatchScratch {
         let grouped_m_total_max =
             moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts);
         let grouped_total_slots_max = max_batch * config.num_experts_per_tok;
+        let use_f16_ffn_scratch = gpu.flags.rdna3_ffn_f16_intermediate
+            && gpu.arch_caps.is_gfx1100()
+            && gpu.flags.rdna3_hfq4_gate_up_x256y64
+            && gpu.flags.rdna3_hfq4_residual_x256y64
+            && gpu.flags.rdna3_hfq4_perm_nibble
+            && gpu.flags.rdna3_q8_group128
+            && gpu.flags.rdna3_q8_group128_quad_row_weight
+            && gpu.flags.rdna3_fused_swiglu_q8_group128
+            && dim == 5_120
+            && hidden_dim == 17_408
+            && max_batch % 256 == 0;
 
         Ok(Self {
             max_batch,
@@ -7394,6 +7407,16 @@ impl PrefillBatchScratch {
             dn_normed_batch: alloc!(&[max_batch * v_dim], DType::F32),
             gate_ffn_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             up_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            gate_ffn_f16_batch: alloc_opt!(
+                use_f16_ffn_scratch,
+                &[max_batch * hidden_dim],
+                DType::F16
+            ),
+            up_f16_batch: alloc_opt!(
+                use_f16_ffn_scratch,
+                &[max_batch * hidden_dim],
+                DType::F16
+            ),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
@@ -7572,6 +7595,8 @@ impl PrefillBatchScratch {
             note(gpu.free_tensor(t));
         }
         for t in [
+            self.gate_ffn_f16_batch,
+            self.up_f16_batch,
             self.moe_router_logits_batch,
             self.moe_shared_scalar_batch,
             self.moe_shared_gate_batch,
@@ -12856,10 +12881,16 @@ fn try_run_hfq4_group128_swiglu_down(
         || w_down.m != 5_120
         || w_down.k != 17_408
         || n % 256 != 0
+        || gate.dtype != up.dtype
+        || !matches!(gate.dtype, DType::F32 | DType::F16)
     {
         return Ok(false);
     }
-    let xq = gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?;
+    let xq = if gate.dtype == DType::F16 {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_f16_batched(gate, up, w_down.k, n)?
+    } else {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?
+    };
     gpu.gemm_hfq4g256_mmq_add_prequant_x256y64_perm_group128(
         &w_down.buf,
         xq,
@@ -15021,6 +15052,19 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
+                let use_f16_ffn = pbs.gate_ffn_f16_batch.is_some()
+                    && pbs.up_f16_batch.is_some()
+                    && n % 256 == 0
+                    && layer.w_gate.gpu_dtype == DType::MQ4G256
+                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                    && layer.w_down.gpu_dtype == DType::MQ4G256
+                    && layer.w_gate.m == 17_408
+                    && layer.w_up.m == 17_408
+                    && layer.w_gate.k == 5_120
+                    && layer.w_down.m == 5_120
+                    && layer.w_down.k == 17_408
+                    && layer.w_down.awq_scale.is_none();
+
                 // Batched gate+up projection.
                 // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
                 // (batched-prefill gate+up variant) via run_fused_gate_up_key.
@@ -15126,19 +15170,32 @@ fn forward_batch_chunk_impl(
                         n,
                     )?;
                 } else {
-                    run_fused_gate_up_key(
-                        gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch,
-                        &pbs.up_batch,
-                        layer.w_gate.m,
-                        layer.w_up.m,
-                        layer.w_gate.k,
-                        n,
-                    )?;
+                    if use_f16_ffn {
+                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                            pbs.up_f16_batch.as_ref().unwrap(),
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    } else {
+                        run_fused_gate_up_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    }
                 }
 
                 // SwiGLU activation feeding w_down. For MQ, we need the
@@ -15162,14 +15219,25 @@ fn forward_batch_chunk_impl(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-                let direct_group128_down = try_run_hfq4_group128_swiglu_down(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.x_batch,
-                    n,
-                )?;
+                let direct_group128_down = if use_f16_ffn {
+                    try_run_hfq4_group128_swiglu_down(
+                        gpu,
+                        &layer.w_down,
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                        &pbs.x_batch,
+                        n,
+                    )?
+                } else {
+                    try_run_hfq4_group128_swiglu_down(
+                        gpu,
+                        &layer.w_down,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        &pbs.x_batch,
+                        n,
+                    )?
+                };
                 if !direct_group128_down && w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
@@ -15670,6 +15738,7 @@ fn forward_batch_chunk_impl(
                     tree_bias,
                     block_start,
                     block_cols,
+                    contiguous_prefix: tree_verify.is_none() && kv_cache.compact_offset == 0,
                     output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
@@ -15873,6 +15942,19 @@ fn forward_batch_chunk_impl(
                         config.norm_eps,
                     )?;
                 }
+                let use_f16_ffn = pbs.gate_ffn_f16_batch.is_some()
+                    && pbs.up_f16_batch.is_some()
+                    && n % 256 == 0
+                    && layer.w_gate.gpu_dtype == DType::MQ4G256
+                    && layer.w_up.gpu_dtype == DType::MQ4G256
+                    && layer.w_down.gpu_dtype == DType::MQ4G256
+                    && layer.w_gate.m == 17_408
+                    && layer.w_up.m == 17_408
+                    && layer.w_gate.k == 5_120
+                    && layer.w_down.m == 5_120
+                    && layer.w_down.k == 17_408
+                    && layer.w_down.awq_scale.is_none();
+
                 // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
                 // (batched-prefill gate+up variant), mirroring the LA-FFN block
                 // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
@@ -15975,19 +16057,32 @@ fn forward_batch_chunk_impl(
                         n,
                     )?;
                 } else {
-                    run_fused_gate_up_key(
-                        gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch,
-                        &pbs.up_batch,
-                        layer.w_gate.m,
-                        layer.w_up.m,
-                        layer.w_gate.k,
-                        n,
-                    )?;
+                    if use_f16_ffn {
+                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                            pbs.up_f16_batch.as_ref().unwrap(),
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    } else {
+                        run_fused_gate_up_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    }
                 }
                 let fa_w_down_is_mq = matches!(
                     layer.w_down.gpu_dtype,
@@ -16004,14 +16099,25 @@ fn forward_batch_chunk_impl(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-                let direct_group128_down = try_run_hfq4_group128_swiglu_down(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.x_batch,
-                    n,
-                )?;
+                let direct_group128_down = if use_f16_ffn {
+                    try_run_hfq4_group128_swiglu_down(
+                        gpu,
+                        &layer.w_down,
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                        &pbs.x_batch,
+                        n,
+                    )?
+                } else {
+                    try_run_hfq4_group128_swiglu_down(
+                        gpu,
+                        &layer.w_down,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        &pbs.x_batch,
+                        n,
+                    )?
+                };
                 if !direct_group128_down && fa_w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
@@ -17309,6 +17415,7 @@ fn forward_batch_chunk_impl(
                     tree_bias,
                     block_start,
                     block_cols,
+                    contiguous_prefix: tree_verify.is_none() && kv_cache.compact_offset == 0,
                     output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
@@ -19425,6 +19532,7 @@ fn kv_cache_attention_dispatch(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        contiguous_prefix: false,
         output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
     };

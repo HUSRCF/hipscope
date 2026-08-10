@@ -1,0 +1,9 @@
+workload	mode	trial	prompt_tokens	prefill_ms	prefill_tok_s	decode_tok_s	result
+synthetic_pp8192	native	1	8192	14931.6	548.6	34.4	ok
+synthetic_pp8192	native	2	8192	15194.3	539.1	34.4	ok
+synthetic_pp8192	native	3	8192	15265.5	536.6	34.4	ok
+synthetic_pp8192	ck_sidecar	1	8192	11799.0	694.3	34.2	ok
+synthetic_pp8192	ck_sidecar	2	8192	11846.0	691.5	34.2	ok
+synthetic_pp8192	ck_sidecar	3	8192	11918.4	687.3	34.2	ok
+real_text_greedy_ar	native	1	3369	10246.9	328.78	35.53	32_token_ids_recorded
+real_text_greedy_ar	ck_sidecar	1	3369	5337.9	631.15	35.48	32_token_ids_exact_match

@@ -1,0 +1,4 @@
+baseline: prefill_median=1030.400 decode_median=33.000 raw_prefill=[1068.3, 1028.1, 1030.4]
+fused: prefill_median=1049.100 decode_median=33.000 raw_prefill=[1064.6, 1049.1, 1047.8]
+fused_vs_baseline=1.0181x (+1.81%)
+token_ids_match=True baseline_variants=1 fused_variants=1

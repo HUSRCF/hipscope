@@ -42,6 +42,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+flash-attn-ck = ["rdna-compute/flash-attn-ck"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []

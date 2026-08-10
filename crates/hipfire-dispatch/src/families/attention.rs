@@ -57,6 +57,11 @@ pub struct AttnParams<'a> {
     pub block_start: usize,
     /// Tree window cols (0 for plain causal).
     pub block_cols: usize,
+    /// The caller proves that KV is a dense prefix `0..max_ctx_len` and the
+    /// query rows are its contiguous suffix. Optional bottom-right causal
+    /// backends require this stronger contract; generic and decode callers
+    /// leave it false.
+    pub contiguous_prefix: bool,
     /// Optional Qwen decode gate. When present on the narrow Q8 single-token
     /// path, the family pairs the K/V writes and applies the gate plus MQ
     /// rotation in the flash-reduce epilogue; all other callers leave this
@@ -1195,6 +1200,7 @@ fn dispatch_attend(
                     io.tree_bias,
                     io.block_start,
                     io.block_cols,
+                    io.contiguous_prefix,
                 ))
             }
             KernelKey::AttnFlashAsym3FwhtBatchedMasked => {

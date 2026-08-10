@@ -1,0 +1,7 @@
+trial	order	mode	prefill_ms	prefill_tok_s	gen_tok_s	ck_active
+1	1	native	15207.46	538.7	33.0	0
+1	2	ck	9500.88	862.2	32.8	1
+2	1	ck	9620.27	851.5	32.6	1
+2	2	native	13534.35	605.3	32.6	0
+3	1	native	13460.62	608.6	32.7	0
+3	2	ck	9574.43	855.6	32.8	1

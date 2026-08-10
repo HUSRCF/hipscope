@@ -1,0 +1,7 @@
+label	m	k	n	log
+gate_up	17408	5120	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/gate_up.log
+ffn_down	5120	17408	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/ffn_down.log
+qkv_large	10240	5120	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/qkv_large.log
+gdn_mid	6144	5120	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/gdn_mid.log
+qkvza_large	12288	5120	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/qkvza_large.log
+residual_aux	5120	6144	2048	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/gfx11-gate-up-x256y64/results/group256_serial_hot_shapes_gpu1_20260810_011812/residual_aux.log

@@ -17,10 +17,11 @@ Current scope:
 - head dimensions 64, 128, and 256;
 - raw HIP stream and element-stride inputs.
 
-It does not support hipfire's Q8/asym/FWHT KV layouts. Those layouts must stay
-on hipfire's native attention kernels. The first possible runtime consumer is
-`AttnFullF16`, after adding reusable FP32-to-FP16 query/output scratch because
-that hipfire boundary currently carries Q and output in FP32.
+The dense sidecar does not consume hipfire's quantized layouts. A separate
+quantized experiment under `quantized/` adds a narrow D256 24Q/4KV prefill
+instance for contiguous Asym3 K and Q8 V. It includes a versioned C ABI and an
+explicit, fail-closed Rust runtime route; decode and unsupported layouts remain
+on hipfire's native kernels.
 
 ## Build
 
@@ -86,8 +87,8 @@ HIP_VISIBLE_DEVICES=0 \
 ```
 
 The pure-HIP smoke runs FP16 MHA, MQA, and GQA cases against a CPU reference.
-The causal GQA case uses a non-default HIP stream. A runtime route is out of
-scope until this passes under the same ROCm runtime used to build hipfire.
+The causal GQA case uses a non-default HIP stream. The optional quantized route
+has its own ABI smoke and controlled runtime A/B under `quantized/`.
 
 Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 
@@ -110,11 +111,12 @@ Maximum absolute error across its four cases was `5.501509e-05`.
 ## Optional Rust loader
 
 `rdna-compute` exposes the versioned C ABI only when built with the
-`flash-attn-ck` feature. Enabling the feature does not search for or load a
-library and does not alter attention dispatch. A caller must pass an explicit,
-trusted sidecar path to the unsafe
-`rdna_compute::flash_attn_ck::FlashAttnCk::load` boundary. A successfully loaded
-library is intentionally pinned for the process lifetime because its HIP
+`flash-attn-ck` feature. The dense loader remains library-only: a caller must
+pass an explicit, trusted sidecar path to the unsafe
+`rdna_compute::flash_attn_ck::FlashAttnCk::load` boundary. The quantized loader
+is also default-off, but `Gpu` will load and route its narrow prefill contract
+when `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` is explicitly set. Successfully
+loaded libraries are pinned for the process lifetime because their HIP
 launches are asynchronous.
 
 The loader can be checked without changing the default backend:
@@ -126,8 +128,8 @@ HIPFIRE_FLASH_ATTN_CK_TEST_LIB="$PWD/experiments/flash-attn-ck-sidecar/build/lib
 ```
 
 The current hipfire `AttnFullF16` contract still uses FP32 Q and output tensors,
-so it is not routed to this all-FP16 sidecar. A production route requires
-preallocated conversion scratch owned outside the attention hot path.
+so it is not routed to the all-FP16 dense sidecar. The quantized route reuses
+existing preallocated attention scratch for its FP32/FP16 bridges.
 
 ## Performance probe
 
@@ -242,6 +244,47 @@ experiment must preserve that Q8 KV write for decode, convert the current
 prefill Q/K/V to preallocated FP16 scratch, run CK causal attention, and
 convert output back to FP32. This sidecar benchmark does not yet compare that
 route against the specialized Q8 M16 prefill path.
+
+### Quantized production-route result
+
+The optional quantized sidecar now consumes hipfire's live contiguous Asym3 K
+and Q8 V cache directly for the validated Qwen3.6 D256 GQA prefill shape. The
+caller must explicitly prove that KV is a dense prefix and that the query rows
+are its contiguous suffix. Decode, compacted KV, tree verification, graph
+capture, and unsupported shapes remain on the native path.
+
+On an otherwise idle Radeon Pro W7900 / gfx1100, Qwen3.6-27B MQ4, Asym3 KV,
+PP8192, prefill chunk 2048, three alternating fresh-process trials produced:
+
+| trial | order | route | prefill tok/s | decode tok/s |
+| ---: | ---: | --- | ---: | ---: |
+| 1 | 1 | native | 596.8 | 33.0 |
+| 1 | 2 | CK | 806.4 | 33.0 |
+| 2 | 1 | CK | 808.1 | 33.1 |
+| 2 | 2 | native | 591.2 | 33.1 |
+| 3 | 1 | native | 593.9 | 33.1 |
+| 3 | 2 | CK | 817.2 | 33.0 |
+
+The medians are **593.9 tok/s native** and **808.1 tok/s CK**, a **1.3607x
+(+36.07%)** prefill improvement. Decode is unchanged because this contract is
+prefill-only. A separate 3369-token real-prompt greedy-AR check, split into
+256-token chunks, emitted the same 16 token IDs on native and CK. In that
+correctness run, prefill was 580.62 versus 635.93 tok/s; it is a plumbing and
+numerical check, not the primary performance result.
+
+Reproduce the alternating A/B with:
+
+```bash
+GPU_ID=1 \
+PREFILL=8192 \
+PREFILL_CHUNK=2048 \
+TRIALS=3 \
+CK_LIB=/path/to/libhipfire_flash_attn_ck_quantized.so \
+  experiments/flash-attn-ck-sidecar/quantized/run_all_chunk_model_ab.sh
+```
+
+Raw tables, hashes, and correctness logs are under
+[`quantized/results/w7900_qwen36_27b_pp8192_chunk2048_20260808`](quantized/results/w7900_qwen36_27b_pp8192_chunk2048_20260808).
 
 ### R9700 sidecar result
 

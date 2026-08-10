@@ -1,0 +1,3 @@
+547001f4c4afbed5e20535dbaaf416cfc7bfcb870706e96c61bbe82357f465a2  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_qwen35_mq4
+0693f67b2354a68f7dcadaf50da3adc099f764de205b6e73720d706f1a1d8929  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized.so
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4

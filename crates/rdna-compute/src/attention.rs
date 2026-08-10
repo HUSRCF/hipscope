@@ -4719,12 +4719,14 @@ impl Gpu {
             None,
             0,
             0,
+            false,
         )
     }
 
-    /// Tree-mask variant of `attention_flash_asym3_batched`. asym3 is the
-    /// default live KV path on 9B MQ4 — this is the primary target for
-    /// DDTree batched verify on the hybrid arch.
+    /// Tree-mask variant of `attention_flash_asym3_batched`. `contiguous_prefix`
+    /// may be set only when KV is a dense prefix and the query rows are its
+    /// contiguous suffix; it enables the optional CK bottom-right causal path.
+    /// Generic callers keep it false and retain the position-aware kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym3_batched_masked(
         &mut self,
@@ -4745,8 +4747,72 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        contiguous_prefix: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
+        #[cfg(not(feature = "flash-attn-ck"))]
+        let _ = contiguous_prefix;
+
+        #[cfg(feature = "flash-attn-ck")]
+        if !self.graphs.capture_mode
+            && contiguous_prefix
+            && tree_bias.is_none()
+            && block_start == 0
+            && block_cols == 0
+            && batch_size >= 128
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+        {
+            if let Some(sidecar) = self.flash_attn_ck_quantized.as_ref() {
+                use crate::flash_attn_ck::FlashAttnCkQuantizedPrefillParams;
+
+                let required = sidecar.workspace_bytes(batch_size as i32, 24, 256);
+                if required > 0 && partials.buf.size() >= required {
+                    let mut params = FlashAttnCkQuantizedPrefillParams::new();
+                    params.q = q.buf.as_ptr().cast::<f32>();
+                    params.packed_k = k_cache.buf.as_ptr().cast::<u8>();
+                    params.packed_v = v_cache.buf.as_ptr().cast::<u8>();
+                    params.out = out.buf.as_ptr().cast::<f32>();
+                    params.workspace = partials.buf.as_ptr();
+                    params.workspace_bytes = partials.buf.size();
+                    params.cos_theta = cos_theta.buf.as_ptr().cast::<f32>();
+                    params.sin_theta = sin_theta.buf.as_ptr().cast::<f32>();
+                    params.stream = self
+                        .active_stream
+                        .as_ref()
+                        .map_or(std::ptr::null_mut(), hip_bridge::Stream::as_raw);
+                    params.softmax_scale = 1.0 / (head_dim as f32).sqrt();
+                    params.seqlen_q = batch_size as i32;
+                    params.seqlen_k = max_ctx_len as i32;
+                    params.nhead_q = n_heads as i32;
+                    params.nhead_k = n_kv_heads as i32;
+                    params.head_dim = head_dim as i32;
+                    params.causal = 1;
+                    params.k_row_stride_bytes = (n_kv_heads * 100) as i32;
+                    params.v_row_stride_bytes = (n_kv_heads * 272) as i32;
+
+                    if sidecar.is_supported(&params).is_ok() {
+                        unsafe { sidecar.prefill(&params) }.map_err(|error| {
+                            hip_bridge::HipError::new(
+                                0,
+                                &format!("quantized FlashAttention CK launch failed: {error}"),
+                            )
+                        })?;
+                        static REPORT_ACTIVE: std::sync::Once = std::sync::Once::new();
+                        REPORT_ACTIVE.call_once(|| {
+                            eprintln!(
+                                "quantized FlashAttention CK prefill active: Q={} K={} Hq={} Hkv={} D={}",
+                                batch_size, max_ctx_len, n_heads, n_kv_heads, head_dim
+                            );
+                        });
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
             kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,

@@ -1,0 +1,17 @@
+gfx1100 planar full_set/full_add
+  VGPR: 256
+  SGPR: 25
+  VGPR spills: 4
+  SGPR spills: 0
+  private segment: 20 B
+  wavefront: 32
+
+Extracted from:
+  .hipfire_kernels/gfx1100/gemm_hfq4g256_mmq_x256y64_group128_planar_quad_row_uint4.hsaco
+
+Commands:
+  /opt/rocm/llvm/bin/clang-offload-bundler --unbundle --type=o \
+    --targets=hipv4-amdgcn-amd-amdhsa--gfx1100 \
+    --input=.hipfire_kernels/gfx1100/gemm_hfq4g256_mmq_x256y64_group128_planar_quad_row_uint4.hsaco \
+    --output=/tmp/planar_quad_gfx1100.co
+  /opt/rocm/llvm/bin/llvm-readobj --notes /tmp/planar_quad_gfx1100.co

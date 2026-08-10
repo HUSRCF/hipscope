@@ -1,0 +1,11 @@
+pair	order	mode	prefill_tok_s	gen_tok_s
+1	0	base	912.1	33.4
+1	1	perm	902.0	33.1
+2	0	perm	888.0	33.0
+2	1	base	875.4	32.9
+3	0	base	874.1	33.0
+3	1	perm	880.5	32.9
+4	0	perm	878.9	32.9
+4	1	base	875.6	32.9
+5	0	base	874.2	33.0
+5	1	perm	880.6	33.0

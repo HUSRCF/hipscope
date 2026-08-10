@@ -17,17 +17,23 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 using int4x_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using int8x_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
-template <bool ADD_RESIDUAL, int K_TILE>
+template <bool ADD_RESIDUAL, int K_TILE, bool GROUP128 = false,
+          int TOKEN_TILE = 128>
 static __device__ __forceinline__ void gemm_hfq4g256_q8_wmma_128x64_k32_impl(
     const char* __restrict__ weights,
     const block_q8_1_mmq* __restrict__ activations,
     float* __restrict__ output, int output_dim, int k_dim, int tokens) {
-    static_assert(K_TILE == 32 || K_TILE == 64, "unsupported K tile");
+    static_assert(K_TILE == 32 || K_TILE == 64 || K_TILE == 128,
+                  "unsupported K tile");
+    static_assert(!GROUP128 || K_TILE == 128,
+                  "group128 path requires K128 staging");
+    static_assert(TOKEN_TILE == 128 || TOKEN_TILE == 256,
+                  "unsupported token tile");
     constexpr int k_ints = K_TILE / 4;
     constexpr int k_stride = k_ints + 2;
     constexpr int q8_subblocks = K_TILE / 32;
     constexpr int output_tile_size = 64;
-    constexpr int token_tile_size = 128;
+    constexpr int token_tile_size = TOKEN_TILE;
 
     const int output_tile = blockIdx.x * output_tile_size;
     const int token_tile = blockIdx.y * token_tile_size;
@@ -42,14 +48,20 @@ static __device__ __forceinline__ void gemm_hfq4g256_q8_wmma_128x64_k32_impl(
     const int actual_token = token_tile + wave * 16 + lane_lo;
 
     float sum[4][8] = {};
+    int8x_t group_dot[4] = {};
+    float group_activation_sum = 0.0f;
+    float group_activation_scale = 0.0f;
     __shared__ int weight_lds[2][output_tile_size][k_stride];
     __shared__ half2 weight_dm[2][output_tile_size];
 
     auto stage_k32 = [&](int buffer, int k_tile) __attribute__((always_inline)) {
+        // A 64xK_TILE weight tile needs only 256 staging lanes.  The X256
+        // probe launches 16 waves so the upper half skips staging and joins
+        // the compute after the workgroup barrier.
         const int weight_row = tid >> 2;
         const int weight_segment = tid & 3;
         const int actual_output = output_tile + weight_row;
-        if (actual_output < output_dim) {
+        if (tid < 256 && actual_output < output_dim) {
             const int group_index = k_tile >> 8;
             const char* group = weights
                 + ((long long)actual_output * groups_per_row + group_index) * 136;
@@ -91,8 +103,8 @@ static __device__ __forceinline__ void gemm_hfq4g256_q8_wmma_128x64_k32_impl(
         for (int subblock = 0; subblock < q8_subblocks; ++subblock) {
             int8x_t activation_fragment = {0, 0, 0, 0, 0, 0, 0, 0};
             float2 ds = make_float2(0, 0);
+            const int subblock_k = k_tile + subblock * 32;
             if (actual_token < tokens) {
-                const int subblock_k = k_tile + subblock * 32;
                 const int q8_block = subblock_k >> 7;
                 const int q8_subblock = (subblock_k & 127) >> 5;
                 const block_q8_1_mmq* block =
@@ -103,6 +115,13 @@ static __device__ __forceinline__ void gemm_hfq4g256_q8_wmma_128x64_k32_impl(
             }
             const int4x_t* activation_halves =
                 reinterpret_cast<const int4x_t*>(&activation_fragment);
+            if constexpr (GROUP128) {
+                if ((subblock_k & 127) == 0) {
+                    group_activation_sum = 0.0f;
+                    group_activation_scale = ds.x;
+                }
+                group_activation_sum += ds.y;
+            }
 
 #pragma unroll
             for (int output_group = 0; output_group < 4; ++output_group) {
@@ -111,18 +130,37 @@ static __device__ __forceinline__ void gemm_hfq4g256_q8_wmma_128x64_k32_impl(
                     &weight_lds[current][weight_row][subblock * 8]);
                 const int4x_t* weight_halves =
                     reinterpret_cast<const int4x_t*>(&weight_fragment);
-                int8x_t dot = {0, 0, 0, 0, 0, 0, 0, 0};
+                int8x_t dot = GROUP128
+                    ? group_dot[output_group]
+                    : int8x_t{0, 0, 0, 0, 0, 0, 0, 0};
                 dot = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
                     true, weight_halves[0], true, activation_halves[0], dot, true);
                 dot = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
                     true, weight_halves[1], true, activation_halves[1], dot, true);
+                if constexpr (GROUP128) group_dot[output_group] = dot;
 
 #pragma unroll
                 for (int element = 0; element < 8; ++element) {
                     const int output_row = output_group * 16 + 2 * element + lane_hi;
                     const float2 dm = __half22float2(weight_dm[current][output_row]);
-                    sum[output_group][element] +=
-                        dm.x * ds.x * (float)dot[element] + dm.y * ds.y;
+                    if constexpr (GROUP128) {
+                        if ((subblock_k & 127) == 96) {
+                            sum[output_group][element] +=
+                                dm.x * group_activation_scale * (float)dot[element]
+                                + dm.y * group_activation_sum;
+                        }
+                    } else {
+                        sum[output_group][element] +=
+                            dm.x * ds.x * (float)dot[element] + dm.y * ds.y;
+                    }
+                }
+            }
+            if constexpr (GROUP128) {
+                if ((subblock_k & 127) == 96) {
+#pragma unroll
+                    for (int output_group = 0; output_group < 4; ++output_group) {
+                        group_dot[output_group] = int8x_t{0, 0, 0, 0, 0, 0, 0, 0};
+                    }
                 }
             }
         }
@@ -163,6 +201,38 @@ gemm_hfq4g256_q8_wmma_128x64_k32_add(
     const char* weights, const block_q8_1_mmq* activations, float* output,
     int output_dim, int k_dim, int tokens) {
     gemm_hfq4g256_q8_wmma_128x64_k32_impl<true, 32>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
+
+__launch_bounds__(512, 1) extern "C" __global__ void
+gemm_hfq4g256_q8_wmma_256x64_k32_set(
+    const char* weights, const block_q8_1_mmq* activations, float* output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_q8_wmma_128x64_k32_impl<false, 32, false, 256>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
+
+__launch_bounds__(512, 1) extern "C" __global__ void
+gemm_hfq4g256_q8_wmma_256x64_k32_add(
+    const char* weights, const block_q8_1_mmq* activations, float* output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_q8_wmma_128x64_k32_impl<true, 32, false, 256>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
+
+__launch_bounds__(256, 2) extern "C" __global__ void
+gemm_hfq4g256_q8_wmma_128x64_k128_group128_set(
+    const char* weights, const block_q8_1_mmq* activations, float* output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_q8_wmma_128x64_k32_impl<false, 128, true>(
+        weights, activations, output, output_dim, k_dim, tokens);
+}
+
+__launch_bounds__(256, 2) extern "C" __global__ void
+gemm_hfq4g256_q8_wmma_128x64_k128_group128_add(
+    const char* weights, const block_q8_1_mmq* activations, float* output,
+    int output_dim, int k_dim, int tokens) {
+    gemm_hfq4g256_q8_wmma_128x64_k32_impl<true, 128, true>(
         weights, activations, output, output_dim, k_dim, tokens);
 }
 
@@ -330,6 +400,14 @@ struct block_q8_1_mmq;
 extern "C" __global__ void gemm_hfq4g256_q8_wmma_128x64_k32_set(
     const char*, const block_q8_1_mmq*, float*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_q8_wmma_128x64_k32_add(
+    const char*, const block_q8_1_mmq*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_q8_wmma_256x64_k32_set(
+    const char*, const block_q8_1_mmq*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_q8_wmma_256x64_k32_add(
+    const char*, const block_q8_1_mmq*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_q8_wmma_128x64_k128_group128_set(
+    const char*, const block_q8_1_mmq*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_q8_wmma_128x64_k128_group128_add(
     const char*, const block_q8_1_mmq*, float*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_q8_wmma_128x64_k64_set(
     const char*, const block_q8_1_mmq*, float*, int, int, int) {}

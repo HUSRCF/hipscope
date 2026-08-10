@@ -3077,6 +3077,75 @@ impl Gpu {
         result.map(|_| out_ptr)
     }
 
+    /// Standalone FFN dataflow probe using FP16 gate/up intermediates. This is
+    /// intentionally not selected by serving dispatch.
+    pub fn fused_silu_mul_rotate_mq_q8_group128_f16_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu()
+            || gate.dtype != DType::F16
+            || up.dtype != DType::F16
+            || k % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused FP16 group128 SwiGLU pack requires gfx11 dGPU, FP16 inputs, and K%256=0",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "fused_silu_mul_mq_rotate_q8_group128";
+        const KERNEL: &str = "fused_silu_mul_mq_rotate_q8_group128_f16";
+        self.ensure_kernel(
+            MODULE,
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC,
+            KERNEL,
+        )?;
+
+        let out_ptr = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut signs1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut signs2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut q8_ptr = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut q8_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_ptr(q8_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        Ok(out_ptr)
+    }
+
     /// Phase A Stage A — F2 AWQ-aware variant of `fused_silu_mul_rotate_mq`.
     ///
     /// After computing silu(gate)*up, divides element-wise by `awq_scale[i]`

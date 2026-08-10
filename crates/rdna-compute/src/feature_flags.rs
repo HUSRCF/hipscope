@@ -71,9 +71,37 @@ pub struct FeatureFlags {
     /// Split each 64-row group128 MMQ tile across two row fragments and four
     /// column groups, reducing duplicate activation-fragment loads on gfx11.
     pub rdna3_q8_group128_row2: bool,
+    /// Stage two packed-weight rows per wave for the gfx1100 X256/Y64 row2
+    /// kernel. Opt-in while full-model A/B validates the higher VGPR footprint.
+    pub rdna3_q8_group128_dual_row_weight: bool,
+    /// Stage four packed-weight rows per wave for the gfx1100 X256/Y64 row2
+    /// kernel. Separate opt-in for production A/B against the retained path.
+    pub rdna3_q8_group128_quad_row_weight: bool,
+    /// Use the 128-token x 64-output K128 cooperative WMMA kernel for the
+    /// certified group128 prefill shapes. Opt-in pending CK-on model A/B.
+    pub rdna3_q8_group128_k128: bool,
+    /// Read group128 Q8 activations directly from prequantized scratch instead
+    /// of staging the full activation tile in LDS. gfx1100 opt-in.
+    pub rdna3_q8_group128_direct: bool,
+    /// Gate/up-only X512 direct-Q8 probe. Sixteen waves share one expanded
+    /// weight tile across twice as many prefill tokens.
+    pub rdna3_q8_group128_direct_x512: bool,
+    /// Share one activation scale across adjacent 128-value Q8 blocks and
+    /// consume the group256 layout with the spill-free serial-row gfx1100 MMQ.
+    pub rdna3_q8_group256_serial_row: bool,
+    /// Apply the group256 serial-row path only to the Qwen3.6 dense FFN
+    /// gate/up pair. This isolates its quality and performance from QKV and
+    /// residual projections before considering wider production routing.
+    pub rdna3_q8_group256_gate_up: bool,
+    /// Approximate signed-A4 activation path using native packed IU4 WMMA for
+    /// the validated gfx1100 Qwen3.6 gate/up N=2048 prefill shape. Opt-in.
+    pub rdna3_hfq4_gate_up_iu4_a4: bool,
     /// Fuse dense FFN SwiGLU, FWHT rotation, and group128 Q8 packing directly
     /// into MMQ scratch. Requires rdna3_q8_group128 and remains opt-in.
     pub rdna3_fused_swiglu_q8_group128: bool,
+    /// Store the validated gfx1100 Qwen dense-FFN gate/up intermediates as
+    /// FP16 and consume them directly in the fused SwiGLU/Q8 producer.
+    pub rdna3_ffn_f16_intermediate: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -409,8 +437,32 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
             rdna3_q8_group128_row2: value("HIPFIRE_RDNA3_Q8_GROUP128_ROW2").as_deref() == Ok("1"),
+            rdna3_q8_group128_dual_row_weight: value(
+                "HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_quad_row_weight: value(
+                "HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT",
+            )
+            .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_k128: value("HIPFIRE_RDNA3_Q8_GROUP128_K128").as_deref() == Ok("1"),
+            rdna3_q8_group128_direct: value("HIPFIRE_RDNA3_Q8_GROUP128_DIRECT").as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_direct_x512: value("HIPFIRE_RDNA3_Q8_GROUP128_DIRECT_X512")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group256_serial_row: value("HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW").as_deref()
+                == Ok("1"),
+            rdna3_q8_group256_gate_up: value("HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_gate_up_iu4_a4: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_IU4_A4").as_deref()
+                == Ok("1"),
             rdna3_fused_swiglu_q8_group128: value("HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128")
                 .as_deref()
+                == Ok("1"),
+            rdna3_ffn_f16_intermediate: value("HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE").as_deref()
                 == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
@@ -679,7 +731,16 @@ impl FeatureFlags {
             rdna3_hfq4_meta_single_loader: false,
             rdna3_q8_group128: false,
             rdna3_q8_group128_row2: false,
+            rdna3_q8_group128_dual_row_weight: false,
+            rdna3_q8_group128_quad_row_weight: false,
+            rdna3_q8_group128_k128: false,
+            rdna3_q8_group128_direct: false,
+            rdna3_q8_group128_direct_x512: false,
+            rdna3_q8_group256_serial_row: false,
+            rdna3_q8_group256_gate_up: false,
+            rdna3_hfq4_gate_up_iu4_a4: false,
             rdna3_fused_swiglu_q8_group128: false,
+            rdna3_ffn_f16_intermediate: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
