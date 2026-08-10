@@ -225,6 +225,16 @@ row-scale/full-K-accumulator/K128-staging architecture rather than Wave32
 WMMA or execution-format work in general. Full data and reproduction commands
 are in `results/row-scale-full-k-wmma-gpu1-20260811/`.
 
+The mature Composable Kernel gfx11 A16 x packed-I4 universal GEMM family was
+also screened before building another custom A16 backend. All nine default
+Wave32-WMMA instances were enumerated on both production FFN shapes. BF16 x
+I4 reached only 0.894x gate/up and 0.857x down relative to retained MQ4. FP16
+x I4 improved to 1.061x and 1.015x, still far below the 1.30x admission line,
+despite using an optimistic signed-I4 contract without retained affine group
+scales. This closes serving integration of the current CK universal A16 x I4
+family. Sources, raw logs, and reproduction commands are in
+`ck-a16-i4-admission/`.
+
 Passing the local speed threshold is necessary but not sufficient for routing.
 Exact candidates must also match the retained output tolerance. Approximate
 candidates must pass long-prompt generation and a task-level quality suite.
