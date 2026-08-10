@@ -49,6 +49,9 @@
 #ifndef MMQ_WEIGHT_EXPANDED_I8
 #define MMQ_WEIGHT_EXPANDED_I8 0
 #endif
+#ifndef MMQ_WEIGHT_EXPANDED_I8_QUAD_ROW
+#define MMQ_WEIGHT_EXPANDED_I8_QUAD_ROW 0
+#endif
 #ifndef MMQ_Q8_GROUP128
 #define MMQ_Q8_GROUP128 0
 #endif
@@ -90,6 +93,9 @@
 #endif
 #ifndef MMQ_SKIP_ZERO_CORRECTION
 #define MMQ_SKIP_ZERO_CORRECTION 0
+#endif
+#ifndef MMQ_SKIP_SCALE_ACCUM
+#define MMQ_SKIP_SCALE_ACCUM 0
 #endif
 #ifndef MMQ_SYMMETRIC_I4
 #define MMQ_SYMMETRIC_I4 0
@@ -146,7 +152,8 @@
                          MMQ_STREAM_K128_PHASED_X256 || MMQ_STREAM_K128_X256Y128)
 #error "MMQ_SYMMETRIC_I4 only supports the direct quad-row loader"
 #endif
-#define HFQ4_GROUP_BYTES (MMQ_WEIGHT_EXPANDED_I8 ? 264 : 136)
+#define HFQ4_GROUP_BYTES \
+    (MMQ_WEIGHT_EXPANDED_I8 ? (MMQ_WEIGHT_EXPANDED_I8_QUAD_ROW ? 272 : 264) : 136)
 #define WARP_SIZE 32
 #define QK8_1 32
 #define QI8_1 8
@@ -656,6 +663,32 @@ static __device__ __forceinline__ void load_hfq4_tile(
             dst[4 * pair + 3] =
                 (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
         }
+    }
+    #elif MMQ_WEIGHT_EXPANDED_I8_QUAD_ROW
+    static_assert(MMQ_WEIGHT_EXPANDED_I8,
+                  "expanded-I8 quad-row loader requires expanded groups");
+    static_assert((MMQ_Y % (4 * MMQ_NWARPS)) == 0,
+                  "expanded-I8 quad-row loader requires complete row groups");
+    const int txi = threadIdx.x & 7;
+    for (int i0 = 0; i0 < MMQ_Y; i0 += 4 * MMQ_NWARPS) {
+        const int i = i0 + 4 * threadIdx.y + (threadIdx.x >> 3);
+        const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+        const char* gp =
+            A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
+        // The quad-row execution copy pads the 8-byte affine header to 16
+        // bytes, so every group and every uint4 payload load stays aligned.
+        const uint4* src = (const uint4*)(gp + 16 + txi * 32);
+        const uint4 lo = src[0];
+        const uint4 hi = src[1];
+        int* dst = x_qs + i * MMQ_TILE_X_K + 8 * txi;
+        dst[0] = (int)lo.x;
+        dst[1] = (int)lo.y;
+        dst[2] = (int)lo.z;
+        dst[3] = (int)lo.w;
+        dst[4] = (int)hi.x;
+        dst[5] = (int)hi.y;
+        dst[6] = (int)hi.z;
+        dst[7] = (int)hi.w;
     }
     #elif MMQ_WEIGHT_QUAD_ROW_U32X2
     #if MMQ_WARP_SPECIALIZED_STAGE
@@ -1848,12 +1881,21 @@ static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
             }
         }
 
+#if !MMQ_SKIP_SCALE_ACCUM
         const int j = j0 + tile_C::get_j(0);
         const float d_x = __half22float2(y_dm[j * MMQ_TILE_Y_K]).x;
+#endif
         #pragma unroll
         for (int n = 0; n < row_frags; ++n) {
             #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
+#if MMQ_SKIP_SCALE_ACCUM
+                const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
+                mmq_accum_add(
+                    sum,
+                    acc * tile_C::ne + l,
+                    (float)c_acc[n].x[l]);
+#else
                 const int i = i0 + n * tile_A::I + tile_C::get_i(l);
                 const float scale_w = __half22float2(load_group128_weight_dm(
                     x_dm, plane_row + i, k00)).x;
@@ -1862,6 +1904,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
                     sum,
                     acc * tile_C::ne + l,
                     scale_w * d_x * (float)c_acc[n].x[l]);
+#endif
             }
         }
 #endif

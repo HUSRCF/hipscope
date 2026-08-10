@@ -18060,6 +18060,81 @@ impl Gpu {
         )
     }
 
+    /// Timing-only upper bound that retains the quad-row Wave32 WMMA body but
+    /// removes per-group scale accumulation and affine zero correction.
+    /// Outputs are intentionally not numerically meaningful.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_quad_row_skip_scale(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "quad-row skip-scale requires gfx1100 and M%64=K%256=N%256=0",
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_quad_row_skip_scale";
+        let kernel = if add {
+            "gemm_hfq4g256_mmq_x256y64_quad_row_skip_scale_full_add"
+        } else {
+            "gemm_hfq4g256_mmq_x256y64_quad_row_skip_scale_full_set"
+        };
+        static SRC: OnceLock<String> = OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                "gemm_hfq4g256_residual_mmq",
+                MODULE,
+            );
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_Q8_GROUP128 1\n#define MMQ_WEIGHT_QUAD_ROW_U32X2 1\n#define MMQ_SKIP_ZERO_CORRECTION 1\n#define MMQ_SKIP_SCALE_ACCUM 1\n{body}",
+            )
+        });
+        self.ensure_kernel(MODULE, src, kernel)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((256 * 36 + 64 * 76) * std::mem::size_of::<i32>()) as u32;
+        self.launch_maybe_blob(
+            kernel,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        )
+    }
+
     /// Standalone symmetric-int4 probe. The payload stores signed values with
     /// a +8 nibble bias; the kernel recenters them and omits affine correction.
     #[allow(clippy::too_many_arguments)]
@@ -18933,6 +19008,96 @@ impl Gpu {
         self.launch_maybe_blob(
             KERNEL,
             [(m / MMQ_Y) as u32, (batch_size / MMQ_X) as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        )
+    }
+
+    /// High-memory MQ4-v2 upper bound. The exact affine MQ4 weights are
+    /// expanded to unsigned I8 offline, then four rows are staged per wave
+    /// without runtime nibble unpacking. This is standalone-only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_group128_expanded_i8_quad_row(
+        &mut self,
+        a_expanded: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "expanded-I8 quad-row requires gfx1100 and M%64=K%256=N%256=0",
+            ));
+        }
+        let expected_weight_bytes = m
+            .checked_mul(k / 256)
+            .and_then(|groups| groups.checked_mul(272))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "expanded-I8 weight size overflow"))?;
+        if a_expanded.byte_size() != expected_weight_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "expanded-I8 quad-row expects {expected_weight_bytes} bytes (272 bytes/group), got {}",
+                    a_expanded.byte_size()
+                ),
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group128_expanded_i8_quad_row_aligned16";
+        let kernel = if add {
+            "gemm_hfq4g256_mmq_x256y64_group128_expanded_i8_quad_row_aligned16_full_add"
+        } else {
+            "gemm_hfq4g256_mmq_x256y64_group128_expanded_i8_quad_row_aligned16_full_set"
+        };
+        static SRC: OnceLock<String> = OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                "gemm_hfq4g256_residual_mmq",
+                MODULE,
+            );
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_Q8_GROUP128 1\n#define MMQ_WEIGHT_EXPANDED_I8 1\n#define MMQ_WEIGHT_EXPANDED_I8_QUAD_ROW 1\n{body}",
+            )
+        });
+        self.ensure_kernel(MODULE, src, kernel)?;
+
+        let mut a_ptr = a_expanded.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((256 * 36 + 64 * 76) * std::mem::size_of::<i32>()
+            + 256 * std::mem::size_of::<f32>()) as u32;
+        self.launch_maybe_blob(
+            kernel,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
             [32, 8, 1],
             shared_mem,
             &mut params,
